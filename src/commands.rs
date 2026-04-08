@@ -75,9 +75,20 @@ pub fn plan_create(
     harness: Option<&str>,
     agent: Option<&str>,
     tests: &[String],
+    depends_on: &[String],
 ) -> Result<()> {
     let desc = description.unwrap_or(slug);
     let branch_name = branch.unwrap_or(slug);
+
+    // Resolve dependency slugs to plan IDs BEFORE creating the plan so we
+    // fail fast if any are missing. We must look them up in the same
+    // project.
+    let mut resolved_deps: Vec<(String, String)> = Vec::with_capacity(depends_on.len());
+    for dep_slug in depends_on {
+        let dep = storage::get_plan_by_slug(conn, dep_slug, project)?
+            .with_context(|| format!("Dependency plan not found: {dep_slug}"))?;
+        resolved_deps.push((dep_slug.clone(), dep.id));
+    }
 
     let plan = storage::create_plan(
         conn,
@@ -90,6 +101,14 @@ pub fn plan_create(
         tests,
     )?;
 
+    // Attach each resolved dependency. Self-references and cycles are
+    // rejected by the storage layer (the new plan has no deps yet, so a
+    // cycle is impossible, but self-reference is guarded anyway).
+    for (dep_slug, dep_id) in &resolved_deps {
+        storage::add_plan_dependency(conn, &plan.id, dep_id)
+            .with_context(|| format!("Failed to add dependency on '{dep_slug}'"))?;
+    }
+
     println!(
         "{} Created plan: \x1b[1m{}\x1b[0m",
         status_icon("complete"),
@@ -98,6 +117,117 @@ pub fn plan_create(
     if !tests.is_empty() {
         println!("  Tests: {}", tests.join(", "));
     }
+    if !resolved_deps.is_empty() {
+        let slugs: Vec<&str> = resolved_deps.iter().map(|(s, _)| s.as_str()).collect();
+        println!("  Depends on: {}", slugs.join(", "));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Plan dependency commands
+// ---------------------------------------------------------------------------
+
+/// Add one or more plan dependency edges to `slug`.
+pub fn plan_dependency_add(
+    conn: &Connection,
+    slug: &str,
+    project: &str,
+    depends_on_slugs: &[String],
+) -> Result<()> {
+    if depends_on_slugs.is_empty() {
+        bail!("At least one --depends-on slug is required");
+    }
+
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    for dep_slug in depends_on_slugs {
+        let dep = storage::get_plan_by_slug(conn, dep_slug, project)?
+            .with_context(|| format!("Dependency plan not found: {dep_slug}"))?;
+        storage::add_plan_dependency(conn, &plan.id, &dep.id)?;
+        println!(
+            "{} Added dependency: {} -> {}",
+            status_icon("complete"),
+            slug,
+            dep_slug
+        );
+    }
+
+    Ok(())
+}
+
+/// Remove one or more plan dependency edges from `slug`.
+pub fn plan_dependency_remove(
+    conn: &Connection,
+    slug: &str,
+    project: &str,
+    depends_on_slugs: &[String],
+) -> Result<()> {
+    if depends_on_slugs.is_empty() {
+        bail!("At least one --depends-on slug is required");
+    }
+
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    for dep_slug in depends_on_slugs {
+        let dep = storage::get_plan_by_slug(conn, dep_slug, project)?
+            .with_context(|| format!("Dependency plan not found: {dep_slug}"))?;
+        storage::remove_plan_dependency(conn, &plan.id, &dep.id)?;
+        println!(
+            "{} Removed dependency: {} -> {}",
+            status_icon("complete"),
+            slug,
+            dep_slug
+        );
+    }
+
+    Ok(())
+}
+
+/// Print the direct dependencies and dependents of `slug`.
+pub fn plan_dependency_list(conn: &Connection, slug: &str, project: &str) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    let dep_ids = storage::list_plan_dependencies(conn, &plan.id)?;
+    let dependent_ids = storage::list_dependent_plans(conn, &plan.id)?;
+
+    let mut dep_slugs: Vec<String> = Vec::with_capacity(dep_ids.len());
+    for id in &dep_ids {
+        if let Some(s) = storage::get_plan_slug_by_id(conn, id)? {
+            dep_slugs.push(s);
+        }
+    }
+    dep_slugs.sort();
+
+    let mut dependent_slugs: Vec<String> = Vec::with_capacity(dependent_ids.len());
+    for id in &dependent_ids {
+        if let Some(s) = storage::get_plan_slug_by_id(conn, id)? {
+            dependent_slugs.push(s);
+        }
+    }
+    dependent_slugs.sort();
+
+    println!("\x1b[1m{}\x1b[0m", slug);
+    println!("  depends on:");
+    if dep_slugs.is_empty() {
+        println!("    (none)");
+    } else {
+        for s in &dep_slugs {
+            println!("    - {s}");
+        }
+    }
+    println!("  depended on by:");
+    if dependent_slugs.is_empty() {
+        println!("    (none)");
+    } else {
+        for s in &dependent_slugs {
+            println!("    - {s}");
+        }
+    }
+
     Ok(())
 }
 
@@ -1048,6 +1178,7 @@ mod tests {
             None,
             None,
             &["cargo build".to_string()],
+            &[],
         )
         .unwrap();
 
@@ -1064,7 +1195,7 @@ mod tests {
     fn test_plan_approve() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
         plan_approve(&conn, "my-plan", &project).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
@@ -1077,7 +1208,7 @@ mod tests {
     fn test_plan_approve_rejects_non_planning() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
         plan_approve(&conn, "my-plan", &project).unwrap();
 
         // Second approve should fail - plan is now ready, not planning
@@ -1089,7 +1220,7 @@ mod tests {
     fn test_plan_delete_forced() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
         plan_delete(&conn, "my-plan", &project, true).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project).unwrap();
@@ -1100,7 +1231,7 @@ mod tests {
     fn test_step_add_and_list() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
         step_add(
             &conn,
             "my-plan",
@@ -1137,7 +1268,7 @@ mod tests {
     fn test_step_add_after() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
         step_add(&conn, "my-plan", &project, "First", None, None, None, None).unwrap();
         step_add(&conn, "my-plan", &project, "Third", None, None, None, None).unwrap();
         // Insert after position 1
@@ -1167,7 +1298,7 @@ mod tests {
     fn test_step_remove_forced() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
         step_add(&conn, "my-plan", &project, "First", None, None, None, None).unwrap();
         step_add(&conn, "my-plan", &project, "Second", None, None, None, None).unwrap();
 
@@ -1185,7 +1316,7 @@ mod tests {
     fn test_step_edit() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
         step_add(
             &conn,
             "my-plan",
@@ -1220,7 +1351,7 @@ mod tests {
     fn test_step_reset() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
         step_add(&conn, "my-plan", &project, "Step", None, None, None, None).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
@@ -1240,7 +1371,7 @@ mod tests {
     fn test_step_move() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
         step_add(&conn, "my-plan", &project, "A", None, None, None, None).unwrap();
         step_add(&conn, "my-plan", &project, "B", None, None, None, None).unwrap();
         step_add(&conn, "my-plan", &project, "C", None, None, None, None).unwrap();
@@ -1261,7 +1392,7 @@ mod tests {
     fn test_step_move_to_end() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
         step_add(&conn, "my-plan", &project, "A", None, None, None, None).unwrap();
         step_add(&conn, "my-plan", &project, "B", None, None, None, None).unwrap();
         step_add(&conn, "my-plan", &project, "C", None, None, None, None).unwrap();
@@ -1278,11 +1409,186 @@ mod tests {
         assert_eq!(steps[2].title, "A");
     }
 
+    // -- plan dependency tests --
+
+    #[test]
+    fn test_plan_create_with_deps() {
+        let (conn, project) = setup();
+
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(
+            &conn,
+            "plan-c",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &["plan-a".to_string(), "plan-b".to_string()],
+        )
+        .unwrap();
+
+        let c = storage::get_plan_by_slug(&conn, "plan-c", &project)
+            .unwrap()
+            .unwrap();
+        let deps = storage::list_plan_dependencies(&conn, &c.id).unwrap();
+        assert_eq!(deps.len(), 2);
+
+        // Resolve the IDs back to slugs to confirm the correct plans were linked.
+        let mut dep_slugs: Vec<String> = deps
+            .iter()
+            .map(|id| storage::get_plan_slug_by_id(&conn, id).unwrap().unwrap())
+            .collect();
+        dep_slugs.sort();
+        assert_eq!(dep_slugs, vec!["plan-a".to_string(), "plan-b".to_string()]);
+    }
+
+    #[test]
+    fn test_plan_create_with_missing_dep_errors() {
+        let (conn, project) = setup();
+
+        let result = plan_create(
+            &conn,
+            "plan-x",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &["nonexistent".to_string()],
+        );
+        assert!(result.is_err());
+
+        // The plan should NOT have been created since we fail before insert.
+        let p = storage::get_plan_by_slug(&conn, "plan-x", &project).unwrap();
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn test_plan_dependency_add_happy_path() {
+        let (conn, project) = setup();
+
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[]).unwrap();
+
+        plan_dependency_add(&conn, "plan-b", &project, &["plan-a".to_string()]).unwrap();
+
+        let b = storage::get_plan_by_slug(&conn, "plan-b", &project)
+            .unwrap()
+            .unwrap();
+        let deps = storage::list_plan_dependencies(&conn, &b.id).unwrap();
+        assert_eq!(deps.len(), 1);
+    }
+
+    #[test]
+    fn test_plan_dependency_add_rejects_self_reference() {
+        let (conn, project) = setup();
+
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
+
+        let result = plan_dependency_add(&conn, "plan-a", &project, &["plan-a".to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_plan_dependency_add_rejects_cycle() {
+        let (conn, project) = setup();
+
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[]).unwrap();
+
+        // a -> b is fine.
+        plan_dependency_add(&conn, "plan-a", &project, &["plan-b".to_string()]).unwrap();
+        // b -> a would close a cycle and should error.
+        let result = plan_dependency_add(&conn, "plan-b", &project, &["plan-a".to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_plan_dependency_remove() {
+        let (conn, project) = setup();
+
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(
+            &conn,
+            "plan-b",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &["plan-a".to_string()],
+        )
+        .unwrap();
+
+        let b = storage::get_plan_by_slug(&conn, "plan-b", &project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage::list_plan_dependencies(&conn, &b.id).unwrap().len(),
+            1
+        );
+
+        plan_dependency_remove(&conn, "plan-b", &project, &["plan-a".to_string()]).unwrap();
+        assert_eq!(
+            storage::list_plan_dependencies(&conn, &b.id).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_plan_dependency_list_resolves_both_directions() {
+        let (conn, project) = setup();
+
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(
+            &conn,
+            "plan-b",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &["plan-a".to_string()],
+        )
+        .unwrap();
+        plan_create(
+            &conn,
+            "plan-c",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &["plan-a".to_string()],
+        )
+        .unwrap();
+
+        // plan-a has no deps but two dependents (b and c).
+        let a = storage::get_plan_by_slug(&conn, "plan-a", &project)
+            .unwrap()
+            .unwrap();
+        let a_deps = storage::list_plan_dependencies(&conn, &a.id).unwrap();
+        let a_dependents = storage::list_dependent_plans(&conn, &a.id).unwrap();
+        assert!(a_deps.is_empty());
+        assert_eq!(a_dependents.len(), 2);
+
+        // plan_dependency_list should run without error.
+        plan_dependency_list(&conn, "plan-a", &project).unwrap();
+        plan_dependency_list(&conn, "plan-b", &project).unwrap();
+    }
+
     #[test]
     fn test_step_out_of_range() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
         step_add(&conn, "my-plan", &project, "Step", None, None, None, None).unwrap();
 
         let result = step_remove(&conn, "my-plan", &project, 5, true);

@@ -48,7 +48,12 @@ pub enum Command {
         #[arg(long)]
         plan: Option<String>,
 
-        /// Run all remaining steps, not just the next one.
+        /// Run only the next pending step instead of all remaining.
+        #[arg(long)]
+        step: bool,
+
+        /// Run all plans in dependency order (chains plans). Plan slug
+        /// is ignored when set.
         #[arg(long)]
         all: bool,
 
@@ -67,6 +72,10 @@ pub enum Command {
         /// Skip preflight checks before running.
         #[arg(long)]
         skip_preflight: bool,
+
+        /// Skip branch creation and use the current git branch.
+        #[arg(long)]
+        current_branch: bool,
 
         /// Override the harness for this run.
         #[arg(long)]
@@ -196,6 +205,10 @@ pub enum PlanCommand {
         /// Deterministic test command(s) to validate each step.
         #[arg(long = "test")]
         tests: Vec<String>,
+
+        /// Slug of another plan this plan depends on (can be repeated).
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
     },
 
     /// List plans.
@@ -225,6 +238,10 @@ pub enum PlanCommand {
         slug: String,
     },
 
+    /// Manage plan-level dependencies.
+    #[command(subcommand)]
+    Dependency(PlanDependencyCommand),
+
     /// Delete a plan and all its steps/logs.
     Delete {
         /// Plan slug.
@@ -243,6 +260,39 @@ pub enum PlanCommand {
 
     /// Restore an archived plan.
     Unarchive {
+        /// Plan slug.
+        slug: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Plan dependency subcommands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum PlanDependencyCommand {
+    /// Add one or more dependency edges to a plan.
+    Add {
+        /// Plan slug to add dependencies to.
+        slug: String,
+
+        /// Slug of another plan this plan depends on (can be repeated).
+        #[arg(long = "depends-on", num_args = 1.., required = true)]
+        depends_on: Vec<String>,
+    },
+
+    /// Remove one or more dependency edges from a plan.
+    Remove {
+        /// Plan slug to remove dependencies from.
+        slug: String,
+
+        /// Slug of the dependency to remove (can be repeated).
+        #[arg(long = "depends-on", num_args = 1..)]
+        depends_on: Vec<String>,
+    },
+
+    /// List a plan's direct dependencies and dependents.
+    List {
         /// Plan slug.
         slug: String,
     },
@@ -508,6 +558,152 @@ mod tests {
             assert!(all);
         } else {
             panic!("Expected Run");
+        }
+    }
+
+    #[test]
+    fn test_parse_run_step() {
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "run", "--plan", "my-feature", "--step"]).unwrap();
+        if let Command::Run {
+            plan, step, all, ..
+        } = cli.command
+        {
+            assert_eq!(plan.as_deref(), Some("my-feature"));
+            assert!(step);
+            assert!(!all);
+        } else {
+            panic!("Expected Run");
+        }
+    }
+
+    #[test]
+    fn test_parse_run_all_plans() {
+        let cli = Cli::try_parse_from(["ralph-rs", "run", "--all"]).unwrap();
+        if let Command::Run { all, step, .. } = cli.command {
+            assert!(all);
+            assert!(!step);
+        } else {
+            panic!("Expected Run");
+        }
+    }
+
+    #[test]
+    fn test_parse_run_current_branch() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "run",
+            "--plan",
+            "my-feature",
+            "--current-branch",
+        ])
+        .unwrap();
+        if let Command::Run {
+            plan,
+            current_branch,
+            ..
+        } = cli.command
+        {
+            assert_eq!(plan.as_deref(), Some("my-feature"));
+            assert!(current_branch);
+        } else {
+            panic!("Expected Run");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_create_with_deps() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "create",
+            "my-feature",
+            "--depends-on",
+            "a",
+            "--depends-on",
+            "b",
+        ])
+        .unwrap();
+
+        if let Command::Plan(PlanCommand::Create {
+            slug, depends_on, ..
+        }) = cli.command
+        {
+            assert_eq!(slug, "my-feature");
+            assert_eq!(depends_on, vec!["a".to_string(), "b".to_string()]);
+        } else {
+            panic!("Expected Plan Create");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_dependency_add() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "dependency",
+            "add",
+            "foo",
+            "--depends-on",
+            "bar",
+        ])
+        .unwrap();
+
+        if let Command::Plan(PlanCommand::Dependency(PlanDependencyCommand::Add {
+            slug,
+            depends_on,
+        })) = cli.command
+        {
+            assert_eq!(slug, "foo");
+            assert_eq!(depends_on, vec!["bar".to_string()]);
+        } else {
+            panic!("Expected Plan Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_dependency_add_requires_depends_on() {
+        // Missing --depends-on should error because of num_args = 1..
+        let result = Cli::try_parse_from(["ralph-rs", "plan", "dependency", "add", "foo"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_plan_dependency_remove() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "dependency",
+            "remove",
+            "foo",
+            "--depends-on",
+            "bar",
+            "--depends-on",
+            "baz",
+        ])
+        .unwrap();
+
+        if let Command::Plan(PlanCommand::Dependency(PlanDependencyCommand::Remove {
+            slug,
+            depends_on,
+        })) = cli.command
+        {
+            assert_eq!(slug, "foo");
+            assert_eq!(depends_on, vec!["bar".to_string(), "baz".to_string()]);
+        } else {
+            panic!("Expected Plan Dependency Remove");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_dependency_list() {
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "dependency", "list", "foo"]).unwrap();
+        if let Command::Plan(PlanCommand::Dependency(PlanDependencyCommand::List { slug })) =
+            cli.command
+        {
+            assert_eq!(slug, "foo");
+        } else {
+            panic!("Expected Plan Dependency List");
         }
     }
 

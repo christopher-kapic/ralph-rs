@@ -36,6 +36,9 @@ pub struct ImportedPlanMeta {
     pub agent: Option<String>,
     #[serde(default)]
     pub deterministic_tests: Vec<String>,
+    /// Slugs of plans this plan directly depends on.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 /// Step from the portable JSON.
@@ -118,6 +121,24 @@ pub fn import_plan_from_data(
             &step_data.acceptance_criteria,
             step_data.max_retries,
         )?;
+    }
+
+    // Attach any plan dependencies declared in the export. Plans that
+    // can't be resolved (e.g. the user imported plans in the wrong order)
+    // are warned about on stderr but do not fail the import. Cycle errors
+    // from the storage layer still propagate.
+    for dep_slug in &data.plan.depends_on {
+        match storage::get_plan_by_slug(conn, dep_slug, options.project)? {
+            Some(dep) => {
+                storage::add_plan_dependency(conn, &plan.id, &dep.id)?;
+            }
+            None => {
+                eprintln!(
+                    "warning: dependency '{}' of imported plan '{}' not found in project '{}'; skipping",
+                    dep_slug, slug, options.project
+                );
+            }
+        }
     }
 
     Ok(plan.id)
@@ -508,7 +529,7 @@ mod tests {
 
         // Export
         let steps = storage::list_steps(&conn, &original.id).unwrap();
-        let exported = export::build_exported_plan(&original, &steps);
+        let exported = export::build_exported_plan(&original, &steps, Vec::new());
         let json = serde_json::to_string_pretty(&exported).unwrap();
 
         // Import into a different project
@@ -625,6 +646,106 @@ mod tests {
 
         let result = read_plan_file(&file_path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_roundtrip_with_dependencies() {
+        let conn = setup();
+
+        // A and B live together in the source project.
+        let plan_a = storage::create_plan(
+            &conn,
+            "dep-a",
+            "/tmp/src",
+            "branch-a",
+            "Plan A",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let plan_b = storage::create_plan(
+            &conn,
+            "dep-b",
+            "/tmp/src",
+            "branch-b",
+            "Plan B",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        // B depends on A.
+        storage::add_plan_dependency(&conn, &plan_b.id, &plan_a.id).unwrap();
+
+        // Build the export payload for B manually, resolving A's slug.
+        let b_steps = storage::list_steps(&conn, &plan_b.id).unwrap();
+        let exported_b = export::build_exported_plan(&plan_b, &b_steps, vec!["dep-a".to_string()]);
+        assert_eq!(exported_b.plan.depends_on, vec!["dep-a".to_string()]);
+        let json_b = serde_json::to_string_pretty(&exported_b).unwrap();
+
+        // Import B into a fresh project that ALREADY contains A (import A
+        // first, then B). Use a slug override for the imported B to avoid
+        // colliding with any future projects.
+        let plan_a_dest = storage::create_plan(
+            &conn,
+            "dep-a",
+            "/tmp/dst",
+            "branch-a",
+            "Plan A copy",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let imported_data: ImportedPlan = serde_json::from_str(&json_b).unwrap();
+        let options = ImportOptions {
+            slug: Some("dep-b2"),
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+        };
+        let b2_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
+
+        // Verify the imported B2's deps resolve to the destination A.
+        let b2_deps = storage::list_plan_dependencies(&conn, &b2_id).unwrap();
+        assert_eq!(b2_deps.len(), 1);
+        assert_eq!(b2_deps[0], plan_a_dest.id);
+    }
+
+    #[test]
+    fn test_import_with_missing_dep_warns_but_succeeds() {
+        let conn = setup();
+
+        let json = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {
+                "slug": "needs-dep",
+                "branch_name": "branch",
+                "description": "desc",
+                "depends_on": ["missing-plan"]
+            },
+            "steps": []
+        }"#;
+
+        let data: ImportedPlan = serde_json::from_str(json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj",
+        };
+
+        // Import should succeed despite the missing dependency.
+        let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
+
+        // No dependency edge should have been created.
+        let deps = storage::list_plan_dependencies(&conn, &plan_id).unwrap();
+        assert!(deps.is_empty());
     }
 
     #[test]

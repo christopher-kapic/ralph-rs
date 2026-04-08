@@ -5,6 +5,7 @@
 // managing plan-level status transitions.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -25,8 +26,11 @@ use crate::storage;
 /// Options controlling a plan run.
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
-    /// Run all remaining steps (vs. just the next one).
-    pub all: bool,
+    /// Run all plans in dependency order, chaining branches between plans.
+    /// Plan slug is ignored when set.
+    pub all_plans: bool,
+    /// Run only the next pending step instead of all remaining steps.
+    pub step: bool,
     /// Start from a specific step number (1-based).
     pub from: Option<usize>,
     /// Stop after a specific step number (1-based).
@@ -89,7 +93,7 @@ pub async fn run_plan(
 
     // 2. Optionally create and checkout branch.
     if !options.current_branch && !options.dry_run {
-        setup_branch(workdir, &effective_plan)?;
+        setup_branch(workdir, &effective_plan, None)?;
     }
 
     // Load steps.
@@ -240,6 +244,296 @@ pub async fn run_plan(
     Ok(result)
 }
 
+// ---------------------------------------------------------------------------
+// Multi-plan orchestration (run_all_plans)
+// ---------------------------------------------------------------------------
+
+/// For a plan being run as part of `run_all_plans`, the branch-setup decision
+/// that the orchestrator made for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanBranchPlan {
+    /// Plan ID (primary key).
+    pub plan_id: String,
+    /// SHA to branch off of. `None` means "no explicit parent; the caller
+    /// will stay on the current HEAD" — this happens when
+    /// `current_branch: true`.
+    pub parent_sha: Option<String>,
+    /// Additional SHAs to merge in after branch creation (for plans with
+    /// multiple dependencies). Entries correspond to deps OTHER than the
+    /// one whose SHA became the parent.
+    pub merge_shas: Vec<String>,
+}
+
+/// Pure helper: given a topo-sorted plan order, the deps edges, the
+/// run's starting SHA, and the tip SHA recorded after each plan finished,
+/// compute the branching decision for the plan at position `index`.
+///
+/// This is factored out of `run_all_plans` so it can be unit-tested
+/// without spinning up a real harness.
+fn compute_branch_plan(
+    topo_order: &[String],
+    index: usize,
+    deps_of: &HashMap<String, Vec<String>>,
+    tip_sha_map: &HashMap<String, String>,
+    run_start_sha: &str,
+    current_branch: bool,
+) -> PlanBranchPlan {
+    let plan_id = topo_order[index].clone();
+
+    if current_branch {
+        return PlanBranchPlan {
+            plan_id,
+            parent_sha: None,
+            merge_shas: Vec::new(),
+        };
+    }
+
+    // Filter deps to those that appear in the topo list (same rule as topo_sort).
+    let in_scope: Vec<String> = deps_of
+        .get(&plan_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| topo_order.iter().any(|p| p == d))
+        .collect();
+
+    if in_scope.is_empty() {
+        return PlanBranchPlan {
+            plan_id,
+            parent_sha: Some(run_start_sha.to_string()),
+            merge_shas: Vec::new(),
+        };
+    }
+
+    // Pick the most-recently-completed dep (highest topo index) as the parent.
+    // All other deps' SHAs will be merged in afterward.
+    let mut parent_dep: Option<(usize, String)> = None;
+    let mut others: Vec<String> = Vec::new();
+    for d in &in_scope {
+        let idx = topo_order.iter().position(|p| p == d).unwrap_or(0);
+        match &parent_dep {
+            None => parent_dep = Some((idx, d.clone())),
+            Some((cur_idx, _)) if idx > *cur_idx => {
+                // Demote the previous parent to the "others" list.
+                if let Some((_, prev)) = parent_dep.take() {
+                    others.push(prev);
+                }
+                parent_dep = Some((idx, d.clone()));
+            }
+            Some(_) => others.push(d.clone()),
+        }
+    }
+
+    let parent_sha = parent_dep
+        .and_then(|(_, id)| tip_sha_map.get(&id).cloned())
+        .unwrap_or_else(|| run_start_sha.to_string());
+    let merge_shas: Vec<String> = others
+        .into_iter()
+        .filter_map(|id| tip_sha_map.get(&id).cloned())
+        .collect();
+
+    PlanBranchPlan {
+        plan_id,
+        parent_sha: Some(parent_sha),
+        merge_shas,
+    }
+}
+
+/// Run all plans in a project in dependency order.
+///
+/// Loads runnable plans, topologically sorts them, then runs each plan via
+/// [`run_plan`] while chaining branches based on the dependency graph:
+///
+/// - Plans with no in-scope dependencies branch off the run's starting HEAD
+///   (captured once at the start of the run).
+/// - Plans with one in-scope dependency branch off that dep's captured tip
+///   SHA.
+/// - Plans with multiple in-scope dependencies branch off the
+///   most-recently-completed dep (highest position in topo order) and then
+///   merge the remaining deps' tip SHAs via `git merge --no-ff`. Merge
+///   conflicts abort the run and require manual resolution.
+///
+/// If `options.current_branch` is true, the orchestrator stays on the
+/// current branch for every plan and does not set up any branches itself.
+///
+/// Plans in `Planning`, `Complete`, `Aborted`, or `Archived` state are
+/// skipped (only `Ready`, `InProgress`, and `Failed` are considered
+/// runnable).
+pub async fn run_all_plans(
+    conn: &Connection,
+    project: &str,
+    config: &Config,
+    workdir: &Path,
+    options: &RunOptions,
+    abort_rx: watch::Receiver<bool>,
+) -> Result<Vec<PlanRunResult>> {
+    // 1. Load runnable plans.
+    let all = storage::list_plans(conn, project, false)?;
+    let runnable: Vec<Plan> = all
+        .into_iter()
+        .filter(|p| {
+            matches!(
+                p.status,
+                PlanStatus::Ready | PlanStatus::InProgress | PlanStatus::Failed
+            )
+        })
+        .collect();
+
+    if runnable.is_empty() {
+        eprintln!("No runnable plans found for project '{project}'.");
+        return Ok(Vec::new());
+    }
+
+    // 2. Topo-sort them.
+    let plan_ids: Vec<String> = runnable.iter().map(|p| p.id.clone()).collect();
+    let topo_order = storage::topo_sort_plans(conn, &plan_ids)?;
+
+    // Index for quick lookup.
+    let plan_by_id: HashMap<String, Plan> =
+        runnable.into_iter().map(|p| (p.id.clone(), p)).collect();
+
+    // 3. Capture the run's starting SHA (used for plans with no deps).
+    let run_start_sha = if options.current_branch || options.dry_run {
+        String::new()
+    } else {
+        git::get_commit_hash(workdir).context("could not capture starting HEAD SHA")?
+    };
+
+    // 4. Build deps_of map for the in-scope plan set.
+    let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
+    for pid in &topo_order {
+        deps_of.insert(pid.clone(), storage::list_plan_dependencies(conn, pid)?);
+    }
+
+    // 5. Iterate through plans in topo order.
+    let mut tip_sha_map: HashMap<String, String> = HashMap::new();
+    let mut results: Vec<PlanRunResult> = Vec::new();
+    let total = topo_order.len();
+
+    for (i, plan_id) in topo_order.iter().enumerate() {
+        // Abort check between plans.
+        if *abort_rx.borrow() {
+            eprintln!("Aborted before plan {}/{}", i + 1, total);
+            return Ok(results);
+        }
+
+        let plan = plan_by_id
+            .get(plan_id)
+            .with_context(|| format!("internal: missing plan {plan_id}"))?;
+
+        let branch_plan = compute_branch_plan(
+            &topo_order,
+            i,
+            &deps_of,
+            &tip_sha_map,
+            &run_start_sha,
+            options.current_branch,
+        );
+
+        // Print header.
+        eprintln!("=== Plan {}/{}: {} ===", i + 1, total, plan.slug);
+        match (&branch_plan.parent_sha, options.current_branch) {
+            (_, true) => {
+                eprintln!("  Using current branch (no branch setup)");
+            }
+            (Some(sha), false) => {
+                let short = sha.chars().take(10).collect::<String>();
+                eprintln!("  Branch '{}' from parent SHA {}", plan.branch_name, short);
+                if !branch_plan.merge_shas.is_empty() {
+                    eprintln!(
+                        "  Will merge {} additional dep SHA(s) into '{}'",
+                        branch_plan.merge_shas.len(),
+                        plan.branch_name
+                    );
+                }
+            }
+            (None, false) => {
+                eprintln!("  Branch '{}' from current HEAD", plan.branch_name);
+            }
+        }
+
+        // Set up the branch ourselves (unless the user wants current-branch mode).
+        if !options.current_branch && !options.dry_run {
+            setup_branch(workdir, plan, branch_plan.parent_sha.as_deref())?;
+
+            // Merge any additional deps' SHAs for multi-parent plans.
+            for other_sha in &branch_plan.merge_shas {
+                if let Err(e) = git::merge_sha(workdir, other_sha) {
+                    // Try to find a human-readable slug for the conflicting SHA.
+                    let other_slug = tip_sha_map
+                        .iter()
+                        .find(|(_, v)| *v == other_sha)
+                        .and_then(|(k, _)| plan_by_id.get(k).map(|p| p.slug.clone()))
+                        .unwrap_or_else(|| other_sha.clone());
+                    bail!(
+                        "Plan '{}' has multiple dependencies whose branches diverge. \
+                         Failed to merge {} into {}'s branch. \
+                         Resolve manually with: git merge {}\n\
+                         Underlying error: {}",
+                        plan.slug,
+                        other_slug,
+                        plan.slug,
+                        other_sha,
+                        e
+                    );
+                }
+            }
+        }
+
+        // Build the inner RunOptions. Force `current_branch: true` so the
+        // inner run_plan doesn't try to re-do branch setup — we've already
+        // handled it at the orchestrator level. Also force `all_plans: false`
+        // to avoid any chance of recursion.
+        let inner_options = RunOptions {
+            all_plans: false,
+            step: options.step,
+            from: options.from,
+            to: options.to,
+            current_branch: true,
+            harness_override: options.harness_override.clone(),
+            dry_run: options.dry_run,
+        };
+
+        let result = run_plan(
+            conn,
+            plan,
+            config,
+            workdir,
+            &inner_options,
+            abort_rx.clone(),
+        )
+        .await?;
+
+        let final_status = result.final_status;
+        results.push(result);
+
+        // Stop on failure or abort.
+        match final_status {
+            PlanStatus::Complete => {
+                // Capture the tip SHA of this plan's branch for downstream deps.
+                if !options.current_branch && !options.dry_run {
+                    let sha = git::get_commit_hash(workdir)
+                        .context("could not capture tip SHA after plan completed")?;
+                    tip_sha_map.insert(plan_id.clone(), sha);
+                }
+            }
+            PlanStatus::Failed | PlanStatus::Aborted => {
+                eprintln!(
+                    "Plan '{}' ended with status {}; stopping multi-plan run.",
+                    plan.slug, final_status
+                );
+                return Ok(results);
+            }
+            _ => {
+                // InProgress or other — treat as "stopped cleanly but incomplete".
+                return Ok(results);
+            }
+        }
+    }
+
+    Ok(results)
+}
+
 /// Resume a plan from the last failed or in-progress step.
 ///
 /// Finds the first step that is failed or in_progress, resets it to pending,
@@ -267,13 +561,13 @@ pub async fn resume_plan(
         plan.slug, step_num, step.title
     );
 
+    // With the Phase 3 default flip, omitting `step` means "run all remaining
+    // steps", so resume only needs the starting step and the current-branch
+    // flag (we don't want to create a new branch when resuming).
     let options = RunOptions {
-        all: true,
         from: Some(step_num),
-        to: None,
-        current_branch: true, // Don't try to create branch on resume
-        harness_override: None,
-        dry_run: false,
+        current_branch: true,
+        ..Default::default()
     };
 
     run_plan(conn, plan, config, workdir, &options, abort_rx).await
@@ -355,8 +649,13 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
 /// Set up the git branch for the plan.
 ///
 /// If the current branch matches the plan's branch, no action is taken.
-/// Otherwise, creates and checks out the branch.
-fn setup_branch(workdir: &Path, plan: &Plan) -> Result<()> {
+/// Otherwise:
+/// - If `parent_sha` is `Some`, creates the branch rooted explicitly at that
+///   SHA (`git checkout -b <branch> <sha>`). If the branch already exists the
+///   parent SHA is ignored and the existing branch is checked out.
+/// - If `parent_sha` is `None`, creates the branch from the current HEAD
+///   (legacy behavior).
+fn setup_branch(workdir: &Path, plan: &Plan, parent_sha: Option<&str>) -> Result<()> {
     let current = git::get_current_branch(workdir).context("Failed to get current git branch")?;
 
     if current == plan.branch_name {
@@ -374,7 +673,13 @@ fn setup_branch(workdir: &Path, plan: &Plan) -> Result<()> {
 
     // Try to create and checkout the branch. If it already exists,
     // just check it out.
-    if git::create_and_checkout_branch(workdir, &plan.branch_name).is_err() {
+    let create_result = if let Some(sha) = parent_sha {
+        git::create_branch_from_sha(workdir, &plan.branch_name, sha)
+    } else {
+        git::create_and_checkout_branch(workdir, &plan.branch_name)
+    };
+
+    if create_result.is_err() {
         // Branch might already exist; try a plain checkout.
         checkout_existing_branch(workdir, &plan.branch_name)?;
     }
@@ -399,12 +704,19 @@ fn checkout_existing_branch(workdir: &Path, branch: &str) -> Result<()> {
 }
 
 /// Select which steps to run based on RunOptions.
+///
+/// Phase 3 defaults:
+/// - If `step` is set, return only the next pending/failed/in_progress step.
+/// - If `from`/`to` are set, return that inclusive range.
+/// - Otherwise, return all remaining steps (the new default).
+///
+/// `all_plans` is orthogonal to this function and is handled by the
+/// multi-plan orchestrator, not the step selector.
 fn select_steps(all_steps: &[Step], options: &RunOptions) -> Result<Vec<Step>> {
     let total = all_steps.len();
 
-    // If neither --all nor --from/--to is specified, just return the next
-    // actionable step (first pending/failed/in_progress).
-    if !options.all && options.from.is_none() && options.to.is_none() {
+    // --step: only run the next actionable step (first pending/failed/in_progress).
+    if options.step {
         let next = all_steps.iter().find(|s| {
             s.status == StepStatus::Pending
                 || s.status == StepStatus::Failed
@@ -413,7 +725,8 @@ fn select_steps(all_steps: &[Step], options: &RunOptions) -> Result<Vec<Step>> {
         return Ok(next.cloned().into_iter().collect());
     }
 
-    // Determine range (1-based, inclusive).
+    // Determine range (1-based, inclusive). When neither `from` nor `to` is
+    // provided this yields the full step list (the new "run all" default).
     let from_idx = options.from.unwrap_or(1).saturating_sub(1);
     let to_idx = options.to.unwrap_or(total);
 
@@ -619,24 +932,25 @@ mod tests {
     }
 
     #[test]
-    fn test_select_steps_next_pending() {
+    fn test_select_steps_default_returns_all_remaining() {
+        // Phase 3: the default (no flags) now means "all remaining steps".
         let steps = make_steps(3);
         let options = RunOptions::default();
         let selected = select_steps(&steps, &options).unwrap();
-        // Should select only the first pending step.
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].id, "s0");
+        assert_eq!(selected.len(), 3);
     }
 
     #[test]
-    fn test_select_steps_all() {
+    fn test_select_steps_step_flag_returns_only_next() {
+        // Phase 3: `step: true` returns just the next pending step.
         let steps = make_steps(3);
         let options = RunOptions {
-            all: true,
+            step: true,
             ..Default::default()
         };
         let selected = select_steps(&steps, &options).unwrap();
-        assert_eq!(selected.len(), 3);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "s0");
     }
 
     #[test]
@@ -665,23 +979,43 @@ mod tests {
     }
 
     #[test]
-    fn test_select_steps_skips_completed_in_default_mode() {
+    fn test_select_steps_step_flag_skips_completed() {
+        // `--step` should skip already-complete steps and pick the next pending.
         let mut steps = make_steps(3);
         steps[0].status = StepStatus::Complete;
-        let options = RunOptions::default();
+        let options = RunOptions {
+            step: true,
+            ..Default::default()
+        };
         let selected = select_steps(&steps, &options).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "s1");
     }
 
     #[test]
-    fn test_select_steps_none_pending() {
+    fn test_select_steps_step_flag_none_pending() {
+        // When all steps are complete, `--step` returns empty.
         let mut steps = make_steps(2);
         steps[0].status = StepStatus::Complete;
         steps[1].status = StepStatus::Complete;
-        let options = RunOptions::default();
+        let options = RunOptions {
+            step: true,
+            ..Default::default()
+        };
         let selected = select_steps(&steps, &options).unwrap();
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn test_select_steps_default_returns_all_even_completed() {
+        // With the new default (no flags), select_steps returns the full slice;
+        // it's up to run_plan itself to skip already-completed steps at
+        // execution time.
+        let mut steps = make_steps(3);
+        steps[0].status = StepStatus::Complete;
+        let options = RunOptions::default();
+        let selected = select_steps(&steps, &options).unwrap();
+        assert_eq!(selected.len(), 3);
     }
 
     #[test]
@@ -857,7 +1191,8 @@ mod tests {
     #[test]
     fn test_run_options_default() {
         let opts = RunOptions::default();
-        assert!(!opts.all);
+        assert!(!opts.all_plans);
+        assert!(!opts.step);
         assert!(opts.from.is_none());
         assert!(opts.to.is_none());
         assert!(!opts.current_branch);
@@ -946,11 +1281,14 @@ mod tests {
     // -- select_steps with mixed statuses --
 
     #[test]
-    fn test_select_steps_picks_failed_as_next() {
+    fn test_select_steps_step_picks_failed_as_next() {
         let mut steps = make_steps(3);
         steps[0].status = StepStatus::Complete;
         steps[1].status = StepStatus::Failed;
-        let options = RunOptions::default();
+        let options = RunOptions {
+            step: true,
+            ..Default::default()
+        };
         let selected = select_steps(&steps, &options).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "s1"); // the failed step
@@ -960,11 +1298,226 @@ mod tests {
     fn test_select_steps_to_only() {
         let steps = make_steps(5);
         let options = RunOptions {
-            all: true,
             to: Some(3),
             ..Default::default()
         };
         let selected = select_steps(&steps, &options).unwrap();
         assert_eq!(selected.len(), 3);
+    }
+
+    // -- compute_branch_plan tests (pure helper for run_all_plans) --
+
+    #[test]
+    fn test_compute_branch_plan_no_deps_uses_run_start_sha() {
+        let topo = vec!["a".to_string()];
+        let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        deps_of.insert("a".to_string(), vec![]);
+        let tip = HashMap::new();
+        let plan = compute_branch_plan(&topo, 0, &deps_of, &tip, "SHA_START", false);
+        assert_eq!(plan.parent_sha.as_deref(), Some("SHA_START"));
+        assert!(plan.merge_shas.is_empty());
+    }
+
+    #[test]
+    fn test_compute_branch_plan_current_branch_skips_parent() {
+        let topo = vec!["a".to_string()];
+        let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        deps_of.insert("a".to_string(), vec![]);
+        let tip = HashMap::new();
+        let plan = compute_branch_plan(&topo, 0, &deps_of, &tip, "SHA_START", true);
+        assert_eq!(plan.parent_sha, None);
+        assert!(plan.merge_shas.is_empty());
+    }
+
+    #[test]
+    fn test_compute_branch_plan_single_dep_uses_dep_tip() {
+        // b depends on a; a's tip is captured as SHA_A.
+        let topo = vec!["a".to_string(), "b".to_string()];
+        let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        deps_of.insert("a".to_string(), vec![]);
+        deps_of.insert("b".to_string(), vec!["a".to_string()]);
+        let mut tip = HashMap::new();
+        tip.insert("a".to_string(), "SHA_A".to_string());
+
+        let plan = compute_branch_plan(&topo, 1, &deps_of, &tip, "SHA_START", false);
+        assert_eq!(plan.parent_sha.as_deref(), Some("SHA_A"));
+        assert!(plan.merge_shas.is_empty());
+    }
+
+    #[test]
+    fn test_compute_branch_plan_multiple_deps_picks_most_recent() {
+        // c depends on both a and b; topo is [a, b, c], so b is "more recent" than a.
+        // c should branch off b's SHA and merge a's SHA.
+        let topo = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        deps_of.insert("a".to_string(), vec![]);
+        deps_of.insert("b".to_string(), vec![]);
+        deps_of.insert("c".to_string(), vec!["a".to_string(), "b".to_string()]);
+        let mut tip = HashMap::new();
+        tip.insert("a".to_string(), "SHA_A".to_string());
+        tip.insert("b".to_string(), "SHA_B".to_string());
+
+        let plan = compute_branch_plan(&topo, 2, &deps_of, &tip, "SHA_START", false);
+        assert_eq!(plan.parent_sha.as_deref(), Some("SHA_B"));
+        assert_eq!(plan.merge_shas, vec!["SHA_A".to_string()]);
+    }
+
+    #[test]
+    fn test_compute_branch_plan_ignores_out_of_scope_deps() {
+        // c depends on a and on "ext" (which is NOT in the topo list).
+        // Only a should be considered.
+        let topo = vec!["a".to_string(), "c".to_string()];
+        let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        deps_of.insert("a".to_string(), vec![]);
+        deps_of.insert("c".to_string(), vec!["a".to_string(), "ext".to_string()]);
+        let mut tip = HashMap::new();
+        tip.insert("a".to_string(), "SHA_A".to_string());
+
+        let plan = compute_branch_plan(&topo, 1, &deps_of, &tip, "SHA_START", false);
+        assert_eq!(plan.parent_sha.as_deref(), Some("SHA_A"));
+        assert!(plan.merge_shas.is_empty());
+    }
+
+    // -- run_all_plans tests --
+
+    #[test]
+    fn test_run_all_plans_cycle_detection() {
+        // Insert two plans with a direct cycle via raw SQL and verify that
+        // run_all_plans (via topo_sort_plans) surfaces a cycle error.
+        use tokio::sync::watch;
+
+        let conn = setup();
+        let p1 =
+            storage::create_plan(&conn, "cyc-a", "/tmp/cyc", "b1", "d1", None, None, &[]).unwrap();
+        let p2 =
+            storage::create_plan(&conn, "cyc-b", "/tmp/cyc", "b2", "d2", None, None, &[]).unwrap();
+
+        // Mark both as Ready so they're runnable.
+        storage::update_plan_status(&conn, &p1.id, PlanStatus::Ready).unwrap();
+        storage::update_plan_status(&conn, &p2.id, PlanStatus::Ready).unwrap();
+
+        // Create a cycle directly in the DB, bypassing the cycle check
+        // that add_plan_dependency would apply.
+        conn.execute(
+            "INSERT INTO plan_dependencies (plan_id, depends_on_plan_id) VALUES (?1, ?2)",
+            rusqlite::params![p1.id, p2.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO plan_dependencies (plan_id, depends_on_plan_id) VALUES (?1, ?2)",
+            rusqlite::params![p2.id, p1.id],
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let workdir = std::path::Path::new("/tmp");
+        let options = RunOptions {
+            all_plans: true,
+            dry_run: true,
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            run_all_plans(&conn, "/tmp/cyc", &config, workdir, &options, rx).await
+        });
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("cycle"),
+            "expected cycle error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_all_plans_no_runnable_plans() {
+        use tokio::sync::watch;
+
+        let conn = setup();
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let workdir = std::path::Path::new("/tmp");
+        let options = RunOptions {
+            all_plans: true,
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let results = rt
+            .block_on(async {
+                run_all_plans(&conn, "/tmp/empty", &config, workdir, &options, rx).await
+            })
+            .unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    // -- setup_branch with parent_sha --
+
+    #[test]
+    fn test_setup_branch_with_parent_sha() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        // Initialize repo with one commit.
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "t@t.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        fs::write(dir.join("README.md"), "# hi").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        let initial_sha = git::get_commit_hash(&dir).unwrap();
+
+        // Make a second commit.
+        fs::write(dir.join("second.txt"), "second").unwrap();
+        git::commit_changes(&dir, "second").unwrap();
+
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: dir.to_string_lossy().to_string(),
+            branch_name: "feat/rooted".to_string(),
+            description: String::new(),
+            status: PlanStatus::Ready,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Should create feat/rooted rooted at initial_sha.
+        setup_branch(&dir, &plan, Some(&initial_sha)).unwrap();
+        assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/rooted");
+        assert_eq!(git::get_commit_hash(&dir).unwrap(), initial_sha);
+        // The second commit's file should not be visible on the new branch.
+        assert!(!dir.join("second.txt").exists());
     }
 }

@@ -10,11 +10,11 @@ use crate::config;
 
 /// Current schema version. Bump this and add a new migration function
 /// to `MIGRATIONS` whenever the schema changes.
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 
 /// Each migration is a function that receives a connection (already inside a transaction).
 /// Migrations are 1-indexed: MIGRATIONS[0] migrates from version 0 → 1.
-const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[migrate_v1];
+const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[migrate_v1, migrate_v2];
 
 /// Returns the path to the SQLite database file.
 pub fn db_path() -> Result<PathBuf> {
@@ -148,6 +148,28 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
 
         CREATE INDEX idx_logs_step_id ON execution_logs(step_id);
         CREATE INDEX idx_logs_step_attempt ON execution_logs(step_id, attempt);
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V2: plan-level dependencies
+// ---------------------------------------------------------------------------
+
+fn migrate_v2(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE plan_dependencies (
+            plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+            depends_on_plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            PRIMARY KEY (plan_id, depends_on_plan_id),
+            CHECK (plan_id != depends_on_plan_id)
+        );
+
+        CREATE INDEX idx_plan_deps_plan ON plan_dependencies(plan_id);
+        CREATE INDEX idx_plan_deps_dep  ON plan_dependencies(depends_on_plan_id);
         ",
     )?;
     Ok(())
@@ -314,6 +336,95 @@ mod tests {
         assert!(path.ends_with("ralph.db"));
         let parent = path.parent().unwrap();
         assert!(parent.ends_with("ralph-rs"));
+    }
+
+    #[test]
+    fn test_plan_dependencies_table_and_check_constraint() {
+        let conn = open_memory().expect("open_memory");
+
+        // Table should exist.
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='plan_dependencies'",
+            )
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(tables, vec!["plan_dependencies".to_string()]);
+
+        // Insert two plans so the FK is satisfied.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug1", "/proj", "b1", "d1"],
+        )
+        .expect("insert plan 1");
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p2", "slug2", "/proj", "b2", "d2"],
+        )
+        .expect("insert plan 2");
+
+        // Happy path insert.
+        conn.execute(
+            "INSERT INTO plan_dependencies (plan_id, depends_on_plan_id) VALUES (?1, ?2)",
+            rusqlite::params!["p1", "p2"],
+        )
+        .expect("insert dep");
+
+        // CHECK constraint: self-reference must fail.
+        let result = conn.execute(
+            "INSERT INTO plan_dependencies (plan_id, depends_on_plan_id) VALUES (?1, ?2)",
+            rusqlite::params!["p1", "p1"],
+        );
+        assert!(result.is_err(), "self-reference should be rejected");
+    }
+
+    #[test]
+    fn test_plan_dependencies_cascade_delete() {
+        let conn = open_memory().expect("open_memory");
+
+        // Three plans: p1 depends on p2, p3 depends on p1.
+        for (id, slug) in &[("p1", "s1"), ("p2", "s2"), ("p3", "s3")] {
+            conn.execute(
+                "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, slug, "/proj", "b", "d"],
+            )
+            .expect("insert plan");
+        }
+
+        conn.execute(
+            "INSERT INTO plan_dependencies (plan_id, depends_on_plan_id) VALUES (?1, ?2)",
+            rusqlite::params!["p1", "p2"],
+        )
+        .expect("insert p1 -> p2");
+        conn.execute(
+            "INSERT INTO plan_dependencies (plan_id, depends_on_plan_id) VALUES (?1, ?2)",
+            rusqlite::params!["p3", "p1"],
+        )
+        .expect("insert p3 -> p1");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM plan_dependencies", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(count, 2);
+
+        // Deleting p1 should cascade in both directions (p1 -> p2 and p3 -> p1).
+        conn.execute("DELETE FROM plans WHERE id = ?1", ["p1"])
+            .expect("delete p1");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM plan_dependencies", [], |row| {
+                row.get(0)
+            })
+            .expect("count after delete");
+        assert_eq!(
+            count, 0,
+            "cascade delete should remove both the outgoing and incoming edges"
+        );
     }
 
     #[test]

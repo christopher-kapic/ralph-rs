@@ -36,6 +36,9 @@ pub struct ExportedPlanMeta {
     pub harness: Option<String>,
     pub agent: Option<String>,
     pub deterministic_tests: Vec<String>,
+    /// Slugs of plans this plan directly depends on (empty by default).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 /// Step stripped of internal fields.
@@ -54,7 +57,14 @@ pub struct ExportedStep {
 // ---------------------------------------------------------------------------
 
 /// Build an ExportedPlan from a Plan and its steps.
-pub fn build_exported_plan(plan: &Plan, steps: &[Step]) -> ExportedPlan {
+///
+/// `depends_on_slugs` is the caller-supplied list of slugs this plan
+/// depends on (resolved by [`export_plan`] from the dependency graph).
+pub fn build_exported_plan(
+    plan: &Plan,
+    steps: &[Step],
+    depends_on_slugs: Vec<String>,
+) -> ExportedPlan {
     let version = env!("CARGO_PKG_VERSION").to_string();
     let exported_at = Utc::now().to_rfc3339();
 
@@ -65,6 +75,7 @@ pub fn build_exported_plan(plan: &Plan, steps: &[Step]) -> ExportedPlan {
         harness: plan.harness.clone(),
         agent: plan.agent.clone(),
         deterministic_tests: plan.deterministic_tests.clone(),
+        depends_on: depends_on_slugs,
     };
 
     let exported_steps: Vec<ExportedStep> = steps
@@ -98,7 +109,19 @@ pub fn export_plan(
         .with_context(|| format!("Plan not found: {slug}"))?;
 
     let steps = storage::list_steps(conn, &plan.id)?;
-    let exported = build_exported_plan(&plan, &steps);
+
+    // Resolve the plan's direct dependency IDs to slugs. Any dependency
+    // we can't resolve (shouldn't happen in practice) is silently dropped.
+    let dep_ids = storage::list_plan_dependencies(conn, &plan.id)?;
+    let mut dep_slugs: Vec<String> = Vec::with_capacity(dep_ids.len());
+    for id in &dep_ids {
+        if let Some(s) = storage::get_plan_slug_by_id(conn, id)? {
+            dep_slugs.push(s);
+        }
+    }
+    dep_slugs.sort();
+
+    let exported = build_exported_plan(&plan, &steps, dep_slugs);
     let json = serde_json::to_string_pretty(&exported)?;
 
     match output {
@@ -171,7 +194,7 @@ mod tests {
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps);
+        let exported = build_exported_plan(&plan, &steps, Vec::new());
 
         // Check version and timestamp are present
         assert!(!exported.ralph_rs_version.is_empty());
@@ -222,7 +245,7 @@ mod tests {
         storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps);
+        let exported = build_exported_plan(&plan, &steps, Vec::new());
         let json = serde_json::to_string_pretty(&exported).unwrap();
 
         // The JSON should NOT contain internal fields
@@ -271,7 +294,7 @@ mod tests {
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps);
+        let exported = build_exported_plan(&plan, &steps, Vec::new());
         let json = serde_json::to_string(&exported).unwrap();
 
         // Should parse back as valid JSON
@@ -337,7 +360,7 @@ mod tests {
         storage::create_step(&conn, &plan.id, "Gamma", "d", None, None, &[], None).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps);
+        let exported = build_exported_plan(&plan, &steps, Vec::new());
 
         assert_eq!(exported.steps[0].title, "Alpha");
         assert_eq!(exported.steps[1].title, "Beta");
@@ -367,7 +390,7 @@ mod tests {
 
         // Export should NOT include status at all (the ExportedStep struct has no status field)
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps);
+        let exported = build_exported_plan(&plan, &steps, Vec::new());
         let json = serde_json::to_string(&exported).unwrap();
 
         // The steps array shouldn't have "status" or "attempts" fields

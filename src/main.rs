@@ -23,7 +23,10 @@ mod tui;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use crate::cli::{AgentsCommand, Cli, Command, PlanCommand, PlanHarnessCommand, StepCommand};
+use crate::cli::{
+    AgentsCommand, Cli, Command, PlanCommand, PlanDependencyCommand, PlanHarnessCommand,
+    StepCommand,
+};
 use crate::commands::resolve_project;
 use crate::runner::RunOptions;
 
@@ -55,6 +58,7 @@ fn main() -> Result<()> {
                 harness,
                 agent,
                 tests,
+                depends_on,
             } => {
                 let h = cli.harness.as_deref().or(harness.as_deref());
                 commands::plan_create(
@@ -66,6 +70,7 @@ fn main() -> Result<()> {
                     h,
                     agent.as_deref(),
                     &tests,
+                    &depends_on,
                 )
             }
             PlanCommand::List {
@@ -80,6 +85,17 @@ fn main() -> Result<()> {
             }
             PlanCommand::Archive { slug } => commands::plan_archive(&conn, &slug, &project),
             PlanCommand::Unarchive { slug } => commands::plan_unarchive(&conn, &slug, &project),
+            PlanCommand::Dependency(dep_cmd) => match dep_cmd {
+                PlanDependencyCommand::Add { slug, depends_on } => {
+                    commands::plan_dependency_add(&conn, &slug, &project, &depends_on)
+                }
+                PlanDependencyCommand::Remove { slug, depends_on } => {
+                    commands::plan_dependency_remove(&conn, &slug, &project, &depends_on)
+                }
+                PlanDependencyCommand::List { slug } => {
+                    commands::plan_dependency_list(&conn, &slug, &project)
+                }
+            },
         },
 
         // -- Step --
@@ -160,21 +176,109 @@ fn main() -> Result<()> {
         // -- Run --
         Command::Run {
             plan: plan_slug,
+            step,
             all,
             from,
             to,
             dry_run,
             skip_preflight,
+            current_branch,
             harness: run_harness,
         } => {
+            let workdir = std::path::Path::new(&project);
+            let harness_override = cli.harness.or(run_harness);
+
+            let options = RunOptions {
+                all_plans: all,
+                step,
+                from,
+                to,
+                current_branch,
+                harness_override,
+                dry_run,
+            };
+
+            if all {
+                if from.is_some() || to.is_some() {
+                    anyhow::bail!(
+                        "--from/--to cannot be combined with --all (step numbers are per-plan and not comparable across plans)"
+                    );
+                }
+                if plan_slug.is_some() {
+                    eprintln!("Warning: --plan is ignored when --all is set.");
+                }
+
+                // Preflight every runnable plan before starting the chain so we
+                // fail fast if anything is misconfigured.
+                if !skip_preflight && !dry_run {
+                    let runnable: Vec<_> = storage::list_plans(&conn, &project, false)?
+                        .into_iter()
+                        .filter(|p| {
+                            matches!(
+                                p.status,
+                                plan::PlanStatus::Ready
+                                    | plan::PlanStatus::InProgress
+                                    | plan::PlanStatus::Failed
+                            )
+                        })
+                        .collect();
+
+                    let mut any_errors = false;
+                    for p in &runnable {
+                        eprintln!("Running preflight checks for '{}'...", p.slug);
+                        let results = preflight::run_preflight_checks(p, &_config, workdir)?;
+                        results.print_report();
+                        if !results.is_ok() {
+                            any_errors = true;
+                        }
+                    }
+                    if any_errors {
+                        anyhow::bail!(
+                            "Preflight checks failed for one or more plans. Use --skip-preflight to bypass."
+                        );
+                    }
+
+                    // Auto-stash dirty git state once before the whole chain.
+                    if preflight::auto_stash_dirty_state(workdir)? {
+                        eprintln!("  Auto-committed dirty state before run.");
+                    }
+                }
+
+                let rt = tokio::runtime::Runtime::new()?;
+                let results = rt.block_on(async {
+                    let abort_rx = signal::install_and_spawn();
+                    runner::run_all_plans(&conn, &project, &_config, workdir, &options, abort_rx)
+                        .await
+                })?;
+
+                let total = results.len();
+                let mut succeeded = 0usize;
+                let mut failed = 0usize;
+                for r in &results {
+                    eprintln!(
+                        "  - {}: {} ({}/{} steps succeeded)",
+                        r.plan_slug, r.final_status, r.steps_succeeded, r.steps_executed
+                    );
+                    if r.final_status == plan::PlanStatus::Complete {
+                        succeeded += 1;
+                    } else {
+                        failed += 1;
+                    }
+                }
+                eprintln!(
+                    "Ran {} plan(s): {} succeeded, {} failed",
+                    total, succeeded, failed
+                );
+                return Ok(());
+            }
+
+            // Single-plan run path.
             let slug = plan_slug.unwrap_or_default();
             if slug.is_empty() {
-                anyhow::bail!("--plan is required for run");
+                anyhow::bail!("--plan is required for run (or use --all)");
             }
             let plan = storage::get_plan_by_slug(&conn, &slug, &project)?
                 .with_context(|| format!("Plan not found: {slug}"))?;
-
-            let workdir = std::path::Path::new(&project);
 
             // Preflight checks
             if !skip_preflight && !dry_run {
@@ -191,16 +295,6 @@ fn main() -> Result<()> {
                     eprintln!("  Auto-committed dirty state before run.");
                 }
             }
-
-            let harness_override = cli.harness.or(run_harness);
-            let options = RunOptions {
-                all,
-                from,
-                to,
-                current_branch: false,
-                harness_override,
-                dry_run,
-            };
 
             let rt = tokio::runtime::Runtime::new()?;
             let result = rt.block_on(async {

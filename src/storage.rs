@@ -62,6 +62,16 @@ fn get_plan_by_id(conn: &Connection, id: &str) -> Result<Plan> {
     .with_context(|| format!("Plan not found: {id}"))
 }
 
+/// Fetch just the slug for a plan by its primary key.
+pub fn get_plan_slug_by_id(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT slug FROM plans WHERE id = ?1")?;
+    let mut rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
 /// List plans. If `all` is false, only return plans for `project`.
 pub fn list_plans(conn: &Connection, project: &str, all: bool) -> Result<Vec<Plan>> {
     let mut plans = Vec::new();
@@ -486,6 +496,181 @@ fn get_execution_log_by_id(conn: &Connection, id: i64) -> Result<ExecutionLog> {
 }
 
 // ---------------------------------------------------------------------------
+// Plan dependency operations
+// ---------------------------------------------------------------------------
+
+/// Record that `plan_id` depends on `depends_on_plan_id`.
+///
+/// Bails with a user-friendly error if the two IDs are the same, or if adding
+/// the edge would create a cycle in the dependency graph. Cycle detection runs
+/// before the insert via [`would_create_cycle`], so callers never need to
+/// invoke it themselves.
+pub fn add_plan_dependency(
+    conn: &Connection,
+    plan_id: &str,
+    depends_on_plan_id: &str,
+) -> Result<()> {
+    if plan_id == depends_on_plan_id {
+        anyhow::bail!("A plan cannot depend on itself");
+    }
+
+    if would_create_cycle(conn, plan_id, depends_on_plan_id)? {
+        anyhow::bail!("Adding dependency {plan_id} -> {depends_on_plan_id} would create a cycle");
+    }
+
+    conn.execute(
+        "INSERT INTO plan_dependencies (plan_id, depends_on_plan_id) VALUES (?1, ?2)",
+        params![plan_id, depends_on_plan_id],
+    )
+    .with_context(|| format!("Failed to add dependency {plan_id} -> {depends_on_plan_id}"))?;
+
+    Ok(())
+}
+
+/// Remove a specific dependency edge. No-op if the row does not exist.
+pub fn remove_plan_dependency(
+    conn: &Connection,
+    plan_id: &str,
+    depends_on_plan_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM plan_dependencies WHERE plan_id = ?1 AND depends_on_plan_id = ?2",
+        params![plan_id, depends_on_plan_id],
+    )
+    .with_context(|| format!("Failed to remove dependency {plan_id} -> {depends_on_plan_id}"))?;
+    Ok(())
+}
+
+/// List the plan IDs that `plan_id` directly depends on.
+pub fn list_plan_dependencies(conn: &Connection, plan_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT depends_on_plan_id FROM plan_dependencies WHERE plan_id = ?1 ORDER BY depends_on_plan_id ASC",
+    )?;
+    let rows = stmt.query_map(params![plan_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// List the plan IDs that directly depend on `plan_id` (reverse edges).
+pub fn list_dependent_plans(conn: &Connection, plan_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT plan_id FROM plan_dependencies WHERE depends_on_plan_id = ?1 ORDER BY plan_id ASC",
+    )?;
+    let rows = stmt.query_map(params![plan_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Check whether adding `plan_id -> new_dep_id` would create a cycle.
+///
+/// Walks the transitive dependencies of `new_dep_id`; if `plan_id` appears in
+/// that set, the edge would close a cycle. A self-edge (`plan_id == new_dep_id`)
+/// is also reported as a cycle.
+pub fn would_create_cycle(conn: &Connection, plan_id: &str, new_dep_id: &str) -> Result<bool> {
+    if plan_id == new_dep_id {
+        return Ok(true);
+    }
+
+    let mut stack: Vec<String> = vec![new_dep_id.to_string()];
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        if current == plan_id {
+            return Ok(true);
+        }
+        let deps = list_plan_dependencies(conn, &current)?;
+        for d in deps {
+            if !visited.contains(&d) {
+                stack.push(d);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// Topologically sort the given plan IDs so that dependencies come before
+/// their dependents.
+///
+/// Only edges where *both* endpoints appear in `plan_ids` are considered;
+/// dependencies on plans outside the input slice are treated as already
+/// satisfied. Uses Kahn's algorithm. If a cycle is detected the function
+/// returns an error listing the plan IDs that could not be ordered.
+pub fn topo_sort_plans(conn: &Connection, plan_ids: &[String]) -> Result<Vec<String>> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let id_set: HashSet<&str> = plan_ids.iter().map(|s| s.as_str()).collect();
+
+    // Build adjacency: for each plan, which plans within the input set does it depend on?
+    // edges_in_degree[p] = number of dependencies of p that are in the input set.
+    // reverse[dep] = list of plans that depend on dep (both within the input set).
+    let mut in_degree: HashMap<String, usize> = HashMap::new();
+    let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
+
+    for p in plan_ids {
+        in_degree.insert(p.clone(), 0);
+        reverse.entry(p.clone()).or_default();
+    }
+
+    for p in plan_ids {
+        let deps = list_plan_dependencies(conn, p)?;
+        for d in deps {
+            if id_set.contains(d.as_str()) {
+                *in_degree.entry(p.clone()).or_insert(0) += 1;
+                reverse.entry(d).or_default().push(p.clone());
+            }
+        }
+    }
+
+    // Kahn's algorithm: seed queue with zero-in-degree nodes, preserving input
+    // order for a stable result.
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for p in plan_ids {
+        if in_degree.get(p).copied().unwrap_or(0) == 0 {
+            queue.push_back(p.clone());
+        }
+    }
+
+    let mut sorted: Vec<String> = Vec::with_capacity(plan_ids.len());
+    while let Some(node) = queue.pop_front() {
+        sorted.push(node.clone());
+        if let Some(dependents) = reverse.get(&node).cloned() {
+            for dep in dependents {
+                if let Some(deg) = in_degree.get_mut(&dep) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(dep);
+                    }
+                }
+            }
+        }
+    }
+
+    if sorted.len() != plan_ids.len() {
+        let remaining: Vec<String> = plan_ids
+            .iter()
+            .filter(|p| !sorted.contains(p))
+            .cloned()
+            .collect();
+        anyhow::bail!(
+            "dependency cycle detected involving plans: {}",
+            remaining.join(", ")
+        );
+    }
+
+    Ok(sorted)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -833,5 +1018,222 @@ mod tests {
 
         let step = create_step(&conn, &plan.id, "Step", "d", None, None, &[], None).unwrap();
         assert!(step.acceptance_criteria.is_empty());
+    }
+
+    // -- Plan dependency tests --
+
+    /// Create `n` plans named p1..pn in the same project and return their IDs.
+    fn make_plans(conn: &Connection, n: usize) -> Vec<String> {
+        (1..=n)
+            .map(|i| {
+                let slug = format!("p{i}");
+                create_plan(conn, &slug, "/proj", "branch", "desc", None, None, &[])
+                    .expect("create_plan")
+                    .id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_add_plan_dependency_happy_path() {
+        let conn = setup();
+        let ids = make_plans(&conn, 2);
+
+        add_plan_dependency(&conn, &ids[0], &ids[1]).expect("add dep");
+
+        let deps = list_plan_dependencies(&conn, &ids[0]).unwrap();
+        assert_eq!(deps, vec![ids[1].clone()]);
+    }
+
+    #[test]
+    fn test_add_plan_dependency_rejects_self_reference() {
+        let conn = setup();
+        let ids = make_plans(&conn, 1);
+
+        let err = add_plan_dependency(&conn, &ids[0], &ids[0]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cannot depend on itself"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_add_plan_dependency_rejects_cycle() {
+        let conn = setup();
+        let ids = make_plans(&conn, 2);
+
+        // A -> B
+        add_plan_dependency(&conn, &ids[0], &ids[1]).expect("add A->B");
+
+        // B -> A would create a 2-node cycle
+        let err = add_plan_dependency(&conn, &ids[1], &ids[0]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cycle"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_remove_plan_dependency() {
+        let conn = setup();
+        let ids = make_plans(&conn, 2);
+
+        add_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        assert_eq!(list_plan_dependencies(&conn, &ids[0]).unwrap().len(), 1);
+
+        remove_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        assert!(list_plan_dependencies(&conn, &ids[0]).unwrap().is_empty());
+
+        // Removing a non-existent edge is a no-op.
+        remove_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
+    }
+
+    #[test]
+    fn test_list_plan_dependencies_and_dependents() {
+        let conn = setup();
+        let ids = make_plans(&conn, 3);
+
+        // p1 depends on p2 and p3.
+        add_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_plan_dependency(&conn, &ids[0], &ids[2]).unwrap();
+
+        let mut deps = list_plan_dependencies(&conn, &ids[0]).unwrap();
+        deps.sort();
+        let mut expected = vec![ids[1].clone(), ids[2].clone()];
+        expected.sort();
+        assert_eq!(deps, expected);
+
+        // p2 and p3 should both see p1 as a dependent.
+        let dependents_p2 = list_dependent_plans(&conn, &ids[1]).unwrap();
+        assert_eq!(dependents_p2, vec![ids[0].clone()]);
+
+        let dependents_p3 = list_dependent_plans(&conn, &ids[2]).unwrap();
+        assert_eq!(dependents_p3, vec![ids[0].clone()]);
+
+        // p1 has no dependents.
+        assert!(list_dependent_plans(&conn, &ids[0]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_would_create_cycle_direct() {
+        let conn = setup();
+        let ids = make_plans(&conn, 2);
+
+        // Self-edge is always a cycle.
+        assert!(would_create_cycle(&conn, &ids[0], &ids[0]).unwrap());
+
+        // A -> B. Adding B -> A closes a direct cycle.
+        add_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        assert!(would_create_cycle(&conn, &ids[1], &ids[0]).unwrap());
+    }
+
+    #[test]
+    fn test_would_create_cycle_transitive() {
+        let conn = setup();
+        let ids = make_plans(&conn, 3);
+
+        // A -> B -> C. Adding C -> A would create a 3-node cycle.
+        add_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_plan_dependency(&conn, &ids[1], &ids[2]).unwrap();
+
+        assert!(would_create_cycle(&conn, &ids[2], &ids[0]).unwrap());
+    }
+
+    #[test]
+    fn test_would_create_cycle_no_cycle() {
+        let conn = setup();
+        let ids = make_plans(&conn, 3);
+
+        // A -> B. Adding A -> C does not create a cycle.
+        add_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
+
+        assert!(!would_create_cycle(&conn, &ids[0], &ids[2]).unwrap());
+    }
+
+    #[test]
+    fn test_topo_sort_linear_chain() {
+        let conn = setup();
+        let ids = make_plans(&conn, 3);
+
+        // p1 -> p2 -> p3 (p1 depends on p2, p2 depends on p3)
+        // Expected order: p3, p2, p1.
+        add_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_plan_dependency(&conn, &ids[1], &ids[2]).unwrap();
+
+        let sorted = topo_sort_plans(&conn, &ids).unwrap();
+        assert_eq!(sorted, vec![ids[2].clone(), ids[1].clone(), ids[0].clone()]);
+    }
+
+    #[test]
+    fn test_topo_sort_diamond() {
+        let conn = setup();
+        let ids = make_plans(&conn, 4);
+        // p1=A, p2=B, p3=C, p4=D
+        // A -> B, A -> C, B -> D, C -> D
+        // (A depends on B and C; B and C both depend on D.)
+        // Expected order has D before B and C, and B and C before A.
+        add_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_plan_dependency(&conn, &ids[0], &ids[2]).unwrap();
+        add_plan_dependency(&conn, &ids[1], &ids[3]).unwrap();
+        add_plan_dependency(&conn, &ids[2], &ids[3]).unwrap();
+
+        let sorted = topo_sort_plans(&conn, &ids).unwrap();
+        assert_eq!(sorted.len(), 4);
+
+        let pos = |id: &str| sorted.iter().position(|p| p == id).unwrap();
+        assert!(pos(&ids[3]) < pos(&ids[1]));
+        assert!(pos(&ids[3]) < pos(&ids[2]));
+        assert!(pos(&ids[1]) < pos(&ids[0]));
+        assert!(pos(&ids[2]) < pos(&ids[0]));
+    }
+
+    #[test]
+    fn test_topo_sort_independent_plans() {
+        let conn = setup();
+        let ids = make_plans(&conn, 3);
+
+        // No dependencies — topo sort should preserve input order.
+        let sorted = topo_sort_plans(&conn, &ids).unwrap();
+        assert_eq!(sorted, ids);
+    }
+
+    #[test]
+    fn test_topo_sort_cycle_detection_error() {
+        let conn = setup();
+        let ids = make_plans(&conn, 3);
+
+        // Build A -> B -> C via add_plan_dependency (which rejects cycles),
+        // then bypass the cycle check and insert C -> A directly so we can
+        // test topo_sort's own detection.
+        add_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_plan_dependency(&conn, &ids[1], &ids[2]).unwrap();
+        conn.execute(
+            "INSERT INTO plan_dependencies (plan_id, depends_on_plan_id) VALUES (?1, ?2)",
+            params![&ids[2], &ids[0]],
+        )
+        .unwrap();
+
+        let err = topo_sort_plans(&conn, &ids).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cycle"), "unexpected error: {msg}");
+        // All three plans should be named in the remaining set.
+        for id in &ids {
+            assert!(msg.contains(id), "missing plan id in error: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_topo_sort_ignores_edges_outside_input() {
+        let conn = setup();
+        let ids = make_plans(&conn, 3);
+
+        // p1 depends on p2 (in input) and p3 (NOT in input).
+        add_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_plan_dependency(&conn, &ids[0], &ids[2]).unwrap();
+
+        // Sort only {p1, p2}. The p1 -> p3 edge should be ignored as
+        // already-satisfied, so p2 must come before p1.
+        let input = vec![ids[0].clone(), ids[1].clone()];
+        let sorted = topo_sort_plans(&conn, &input).unwrap();
+        assert_eq!(sorted, vec![ids[1].clone(), ids[0].clone()]);
     }
 }

@@ -182,6 +182,27 @@ pub fn get_commit_hash(workdir: &Path) -> Result<String> {
     Ok(out.trim().to_string())
 }
 
+/// Create a new branch rooted at the given SHA and switch to it.
+///
+/// Equivalent to `git checkout -b <branch_name> <sha>`. Fails if the branch
+/// already exists or the SHA is invalid; callers that need a "create-or-check
+/// out" semantic should handle that at the call site.
+pub fn create_branch_from_sha(workdir: &Path, branch_name: &str, sha: &str) -> Result<()> {
+    git(workdir, &["checkout", "-b", branch_name, sha])
+        .with_context(|| format!("could not create branch '{branch_name}' rooted at {sha}"))?;
+    Ok(())
+}
+
+/// Merge the given SHA into the current branch using `git merge --no-ff`.
+///
+/// Fails if the merge cannot be completed (e.g. due to conflicts); the error
+/// message contains the git stderr so callers can surface it to the user.
+pub fn merge_sha(workdir: &Path, sha: &str) -> Result<()> {
+    git(workdir, &["merge", "--no-ff", sha])
+        .with_context(|| format!("could not merge {sha} into current branch"))?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -316,5 +337,72 @@ mod tests {
         let dir = tmp.path().to_path_buf();
         // Not a git repo – should fail.
         assert!(get_current_branch(&dir).is_err());
+    }
+
+    #[test]
+    fn test_create_branch_from_sha() {
+        let (_tmp, dir) = init_repo();
+        let initial_sha = get_commit_hash(&dir).unwrap();
+
+        // Make a second commit on the default branch so we have history.
+        fs::write(dir.join("second.txt"), "second").unwrap();
+        commit_changes(&dir, "second").unwrap();
+        let second_sha = get_commit_hash(&dir).unwrap();
+        assert_ne!(initial_sha, second_sha);
+
+        // Create a branch rooted at the initial SHA.
+        create_branch_from_sha(&dir, "feature/from-initial", &initial_sha).unwrap();
+
+        // We should now be on the new branch.
+        assert_eq!(get_current_branch(&dir).unwrap(), "feature/from-initial");
+        // And HEAD should match the initial SHA.
+        assert_eq!(get_commit_hash(&dir).unwrap(), initial_sha);
+        // The second commit's file should not exist in this branch.
+        assert!(!dir.join("second.txt").exists());
+    }
+
+    #[test]
+    fn test_merge_sha_clean() {
+        let (_tmp, dir) = init_repo();
+        let base_sha = get_commit_hash(&dir).unwrap();
+
+        // Create branch A off base and add a file.
+        create_branch_from_sha(&dir, "branch-a", &base_sha).unwrap();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        commit_changes(&dir, "a change").unwrap();
+        let a_sha = get_commit_hash(&dir).unwrap();
+
+        // Create branch B off base and add a different file.
+        create_branch_from_sha(&dir, "branch-b", &base_sha).unwrap();
+        fs::write(dir.join("b.txt"), "b").unwrap();
+        commit_changes(&dir, "b change").unwrap();
+
+        // Merge A into B — should succeed cleanly.
+        merge_sha(&dir, &a_sha).unwrap();
+
+        // Both files should now be present.
+        assert!(dir.join("a.txt").exists());
+        assert!(dir.join("b.txt").exists());
+    }
+
+    #[test]
+    fn test_merge_sha_conflict() {
+        let (_tmp, dir) = init_repo();
+        let base_sha = get_commit_hash(&dir).unwrap();
+
+        // Branch A modifies README.md one way.
+        create_branch_from_sha(&dir, "branch-a", &base_sha).unwrap();
+        fs::write(dir.join("README.md"), "# version A").unwrap();
+        commit_changes(&dir, "a version").unwrap();
+        let a_sha = get_commit_hash(&dir).unwrap();
+
+        // Branch B modifies README.md a different way.
+        create_branch_from_sha(&dir, "branch-b", &base_sha).unwrap();
+        fs::write(dir.join("README.md"), "# version B").unwrap();
+        commit_changes(&dir, "b version").unwrap();
+
+        // Merging A into B should fail with conflicts.
+        let result = merge_sha(&dir, &a_sha);
+        assert!(result.is_err());
     }
 }
