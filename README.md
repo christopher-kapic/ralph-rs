@@ -16,17 +16,17 @@ A deterministic orchestrator for coding agent harnesses. Takes step-based plans 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/device-ai/ralph-rs/master/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/christopher-kapic/ralph-rs/master/scripts/install.sh | bash
 ```
 
 To install a specific version or to a custom directory:
 
 ```bash
 # Specific version
-curl -fsSL https://raw.githubusercontent.com/device-ai/ralph-rs/master/scripts/install.sh | bash -s v0.2.0
+curl -fsSL https://raw.githubusercontent.com/christopher-kapic/ralph-rs/master/scripts/install.sh | bash -s v0.2.0
 
 # Custom directory
-curl -fsSL https://raw.githubusercontent.com/device-ai/ralph-rs/master/scripts/install.sh | INSTALL_DIR=~/.local/bin bash
+curl -fsSL https://raw.githubusercontent.com/christopher-kapic/ralph-rs/master/scripts/install.sh | INSTALL_DIR=~/.local/bin bash
 ```
 
 Or build from source:
