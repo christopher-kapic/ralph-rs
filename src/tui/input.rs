@@ -231,7 +231,10 @@ mod tests {
     #[test]
     fn test_ctrl_c_quits() {
         let mut app = make_app(3);
-        let action = handle_key(&mut app, key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let action = handle_key(
+            &mut app,
+            key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
         assert_eq!(action, InputAction::Quit);
         assert!(app.should_quit);
     }

@@ -154,7 +154,7 @@ mod tests {
     fn test_first_failure_short_circuits() {
         let tests = vec![
             "true".to_string(),
-            "false".to_string(),      // fails
+            "false".to_string(), // fails
             "echo should_not_run".to_string(),
         ];
         let res = run_tests(&tests, &cwd());
@@ -194,7 +194,10 @@ mod tests {
     #[test]
     fn test_tail_lines_truncation() {
         // Generate 100 lines; tail should keep only last 50.
-        let many_lines: String = (0..100).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let many_lines: String = (0..100)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let tail = tail_lines(&many_lines, 50);
         let lines: Vec<&str> = tail.lines().collect();
         assert_eq!(lines.len(), 50);

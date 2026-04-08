@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::frac_index;
@@ -307,7 +307,9 @@ pub fn create_execution_log(
          VALUES (?1, ?2, ?3, ?4)",
         params![step_id, attempt, prompt_text, session_id],
     )
-    .with_context(|| format!("Failed to create execution log for step '{step_id}' attempt {attempt}"))?;
+    .with_context(|| {
+        format!("Failed to create execution log for step '{step_id}' attempt {attempt}")
+    })?;
 
     let id = conn.last_insert_rowid();
     get_execution_log_by_id(conn, id)
@@ -383,10 +385,7 @@ pub fn update_execution_log(
 }
 
 /// List execution logs for a step, ordered by attempt.
-pub fn list_execution_logs_for_step(
-    conn: &Connection,
-    step_id: &str,
-) -> Result<Vec<ExecutionLog>> {
+pub fn list_execution_logs_for_step(conn: &Connection, step_id: &str) -> Result<Vec<ExecutionLog>> {
     let mut stmt = conn.prepare(
         "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id
          FROM execution_logs WHERE step_id = ?1 ORDER BY attempt ASC",
@@ -609,8 +608,18 @@ mod tests {
         let s3 = create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None).unwrap();
 
         // Sort keys should be monotonically increasing
-        assert!(s1.sort_key < s2.sort_key, "{} < {}", s1.sort_key, s2.sort_key);
-        assert!(s2.sort_key < s3.sort_key, "{} < {}", s2.sort_key, s3.sort_key);
+        assert!(
+            s1.sort_key < s2.sort_key,
+            "{} < {}",
+            s1.sort_key,
+            s2.sort_key
+        );
+        assert!(
+            s2.sort_key < s3.sort_key,
+            "{} < {}",
+            s2.sort_key,
+            s3.sort_key
+        );
 
         // First key should be initial_key
         assert_eq!(s1.sort_key, frac_index::initial_key());
@@ -643,7 +652,17 @@ mod tests {
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
         let criteria = vec!["tests pass".to_string(), "lint clean".to_string()];
-        let step = create_step(&conn, &plan.id, "Step", "desc", None, None, &criteria, Some(3)).unwrap();
+        let step = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &criteria,
+            Some(3),
+        )
+        .unwrap();
 
         assert_eq!(step.acceptance_criteria, criteria);
         assert_eq!(step.max_retries, Some(3));
@@ -710,7 +729,8 @@ mod tests {
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let step = create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
 
-        let log = create_execution_log(&conn, &step.id, 1, Some("do the thing"), Some("sess-1")).unwrap();
+        let log =
+            create_execution_log(&conn, &step.id, 1, Some("do the thing"), Some("sess-1")).unwrap();
 
         assert_eq!(log.step_id, step.id);
         assert_eq!(log.attempt, 1);

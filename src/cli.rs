@@ -506,9 +506,8 @@ mod tests {
 
     #[test]
     fn test_parse_export() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "export", "my-plan", "--output", "plan.json"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "export", "my-plan", "--output", "plan.json"])
+            .unwrap();
         if let Command::Export { plan, output } = cli.command {
             assert_eq!(plan, "my-plan");
             assert_eq!(output.unwrap().to_str().unwrap(), "plan.json");
@@ -539,8 +538,7 @@ mod tests {
 
     #[test]
     fn test_parse_log() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "log", "--step", "2", "--limit", "10"]).unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "log", "--step", "2", "--limit", "10"]).unwrap();
         if let Command::Log { step, limit, .. } = cli.command {
             assert_eq!(step, Some(2));
             assert_eq!(limit, Some(10));
@@ -558,10 +556,7 @@ mod tests {
     #[test]
     fn test_parse_agents_list() {
         let cli = Cli::try_parse_from(["ralph-rs", "agents", "list"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Agents(AgentsCommand::List)
-        ));
+        assert!(matches!(cli.command, Command::Agents(AgentsCommand::List)));
     }
 
     #[test]
@@ -580,30 +575,20 @@ mod tests {
 
     #[test]
     fn test_global_project_flag() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "--project",
-            "/tmp/my-project",
-            "status",
-        ])
-        .unwrap();
-        assert_eq!(
-            cli.project.unwrap().to_str().unwrap(),
-            "/tmp/my-project"
-        );
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "--project", "/tmp/my-project", "status"]).unwrap();
+        assert_eq!(cli.project.unwrap().to_str().unwrap(), "/tmp/my-project");
     }
 
     #[test]
     fn test_global_harness_flag() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "--harness", "codex", "doctor"]).unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "--harness", "codex", "doctor"]).unwrap();
         assert_eq!(cli.harness.as_deref(), Some("codex"));
     }
 
     #[test]
     fn test_step_move() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "step", "move", "3", "--to", "1"]).unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "move", "3", "--to", "1"]).unwrap();
         if let Command::Step(StepCommand::Move { step, to, .. }) = cli.command {
             assert_eq!(step, 3);
             assert_eq!(to, 1);
@@ -624,8 +609,7 @@ mod tests {
 
     #[test]
     fn test_step_remove() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "step", "remove", "1", "--force"]).unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "remove", "1", "--force"]).unwrap();
         if let Command::Step(StepCommand::Remove { step, force, .. }) = cli.command {
             assert_eq!(step, 1);
             assert!(force);

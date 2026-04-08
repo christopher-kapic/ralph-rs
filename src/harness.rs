@@ -32,10 +32,12 @@ pub fn resolve_harness<'a>(
     config: &'a Config,
 ) -> Result<(&'a str, &'a HarnessConfig)> {
     let name = resolve_harness_name(step, plan, config);
-    let harness_config = config
-        .harnesses
-        .get(&name)
-        .with_context(|| format!("Unknown harness '{name}'. Available: {:?}", config.harnesses.keys().collect::<Vec<_>>()))?;
+    let harness_config = config.harnesses.get(&name).with_context(|| {
+        format!(
+            "Unknown harness '{name}'. Available: {:?}",
+            config.harnesses.keys().collect::<Vec<_>>()
+        )
+    })?;
     // Return a reference tied to the config lifetime
     let name_ref = config.harnesses.get_key_value(&name).unwrap().0.as_str();
     Ok((name_ref, harness_config))
@@ -208,17 +210,18 @@ pub async fn spawn_harness_interactive(
         cmd.env(key, value);
     }
 
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to spawn interactive harness '{}'", harness_config.command))?;
+    let child = cmd.spawn().with_context(|| {
+        format!(
+            "Failed to spawn interactive harness '{}'",
+            harness_config.command
+        )
+    })?;
 
     Ok(child)
 }
 
 /// Wait for a spawned harness process to complete and capture its output.
-pub async fn wait_for_harness(
-    child: tokio::process::Child,
-) -> Result<HarnessOutput> {
+pub async fn wait_for_harness(child: tokio::process::Child) -> Result<HarnessOutput> {
     let output = child
         .wait_with_output()
         .await

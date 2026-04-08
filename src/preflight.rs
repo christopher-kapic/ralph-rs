@@ -44,21 +44,26 @@ pub struct PreflightResults {
 impl PreflightResults {
     /// Returns true if there are no errors (warnings are OK).
     pub fn is_ok(&self) -> bool {
-        !self.checks.iter().any(|c| c.severity == CheckSeverity::Error)
+        !self
+            .checks
+            .iter()
+            .any(|c| c.severity == CheckSeverity::Error)
     }
 
     /// Returns true if every check passed with no warnings or errors.
     pub fn all_passed(&self) -> bool {
-        self.checks.iter().all(|c| c.severity == CheckSeverity::Pass)
+        self.checks
+            .iter()
+            .all(|c| c.severity == CheckSeverity::Pass)
     }
 
     /// Print all check results to stderr.
     pub fn print_report(&self) {
         for check in &self.checks {
             let icon = match check.severity {
-                CheckSeverity::Pass => "\x1b[32m\u{2714}\x1b[0m",    // green check
+                CheckSeverity::Pass => "\x1b[32m\u{2714}\x1b[0m", // green check
                 CheckSeverity::Warning => "\x1b[33m\u{26a0}\x1b[0m", // yellow warning
-                CheckSeverity::Error => "\x1b[31m\u{2718}\x1b[0m",   // red X
+                CheckSeverity::Error => "\x1b[31m\u{2718}\x1b[0m", // red X
             };
             eprintln!("  {} {}: {}", icon, check.name, check.message);
         }
@@ -89,10 +94,7 @@ pub fn run_preflight_checks(
     }
 
     // 3. Harness authentication
-    let harness_name = plan
-        .harness
-        .as_deref()
-        .unwrap_or(&config.default_harness);
+    let harness_name = plan.harness.as_deref().unwrap_or(&config.default_harness);
     if let Some(harness_config) = config.harnesses.get(harness_name) {
         checks.push(check_harness_auth(harness_name, harness_config));
     }
@@ -173,8 +175,7 @@ fn check_test_binaries(test_commands: &[String]) -> Vec<CheckResult> {
 fn check_harness_auth(harness_name: &str, _harness_config: &HarnessConfig) -> CheckResult {
     // Copilot (gh copilot) requires GH_TOKEN or GITHUB_TOKEN
     if harness_name == "copilot" {
-        let has_token = std::env::var("GH_TOKEN").is_ok()
-            || std::env::var("GITHUB_TOKEN").is_ok();
+        let has_token = std::env::var("GH_TOKEN").is_ok() || std::env::var("GITHUB_TOKEN").is_ok();
 
         if has_token {
             CheckResult {
@@ -231,11 +232,7 @@ fn check_git_state(workdir: &Path) -> CheckResult {
 fn extract_binary_from_command(cmd: &str) -> String {
     let trimmed = cmd.trim();
     // Split on whitespace and take the first token.
-    trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string()
+    trimmed.split_whitespace().next().unwrap_or("").to_string()
 }
 
 /// Check if a binary is available on PATH using `which`.

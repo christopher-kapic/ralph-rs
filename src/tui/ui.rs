@@ -5,11 +5,11 @@
 
 #![allow(dead_code)]
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
-use ratatui::Frame;
 
 use super::app::{App, InputMode};
 use crate::plan::StepStatus;
@@ -85,13 +85,12 @@ fn draw_step_list(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_step_detail(frame: &mut Frame, app: &App, area: Rect) {
     if app.steps.is_empty() {
-        let empty = Paragraph::new("No steps in this plan.")
-            .block(
-                Block::default()
-                    .title(" Details ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            );
+        let empty = Paragraph::new("No steps in this plan.").block(
+            Block::default()
+                .title(" Details ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
         frame.render_widget(empty, area);
         return;
     }
@@ -191,10 +190,7 @@ fn draw_step_detail(frame: &mut Frame, app: &App, area: Rect) {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                &app.input_buffer,
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(&app.input_buffer, Style::default().fg(Color::White)),
             Span::styled("_", Style::default().fg(Color::Cyan)),
         ]));
     }
@@ -204,7 +200,9 @@ fn draw_step_detail(frame: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let paragraph = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
@@ -234,8 +232,7 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
         ],
     };
 
-    let help = Paragraph::new(Line::from(spans))
-        .style(Style::default().fg(Color::DarkGray));
+    let help = Paragraph::new(Line::from(spans)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(help, area);
 }
 

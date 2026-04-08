@@ -82,8 +82,7 @@ pub fn auto_commit_dirty_state(workdir: &Path, message: &str) -> Result<()> {
 
 /// Return a list of all changed files (staged, unstaged, and untracked).
 pub fn get_all_changed_files(workdir: &Path) -> Result<Vec<String>> {
-    let out = git(workdir, &["status", "--porcelain"])
-        .context("could not list changed files")?;
+    let out = git(workdir, &["status", "--porcelain"]).context("could not list changed files")?;
     let files: Vec<String> = out
         .lines()
         .filter(|l| !l.is_empty())
@@ -119,17 +118,14 @@ pub fn get_diff(workdir: &Path) -> Result<String> {
 ///
 /// Equivalent to `git checkout -- . && git clean -fd`.
 pub fn rollback_changes(workdir: &Path) -> Result<()> {
-    git(workdir, &["checkout", "--", "."])
-        .context("git checkout -- . failed")?;
-    git(workdir, &["clean", "-fd"])
-        .context("git clean -fd failed")?;
+    git(workdir, &["checkout", "--", "."]).context("git checkout -- . failed")?;
+    git(workdir, &["clean", "-fd"]).context("git clean -fd failed")?;
     Ok(())
 }
 
 /// Return the full SHA of the current HEAD commit.
 pub fn get_commit_hash(workdir: &Path) -> Result<String> {
-    let out = git(workdir, &["rev-parse", "HEAD"])
-        .context("could not get current commit hash")?;
+    let out = git(workdir, &["rev-parse", "HEAD"]).context("could not get current commit hash")?;
     Ok(out.trim().to_string())
 }
 
@@ -244,7 +240,10 @@ mod tests {
         rollback_changes(&dir).unwrap();
         assert!(!has_uncommitted_changes(&dir).unwrap());
         // Original file restored.
-        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "# hello");
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
         // Untracked file removed.
         assert!(!dir.join("extra.txt").exists());
     }

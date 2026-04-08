@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use tokio::sync::watch;
 
@@ -38,7 +38,6 @@ pub struct RunOptions {
     /// Dry-run mode: print what would happen without executing.
     pub dry_run: bool,
 }
-
 
 // ---------------------------------------------------------------------------
 // PlanRunResult
@@ -139,8 +138,7 @@ pub async fn run_plan(
 
         // Skip already-completed or skipped steps.
         let current_step = storage::get_step(conn, &step.id)?;
-        if current_step.status == StepStatus::Complete
-            || current_step.status == StepStatus::Skipped
+        if current_step.status == StepStatus::Complete || current_step.status == StepStatus::Skipped
         {
             if current_step.status == StepStatus::Skipped {
                 result.steps_skipped += 1;
@@ -206,12 +204,7 @@ pub async fn run_plan(
                 return Ok(result);
             }
             StepOutcome::Aborted => {
-                eprintln!(
-                    "[{}/{}] > {} ... ABORTED",
-                    i + 1,
-                    total,
-                    current_step.title
-                );
+                eprintln!("[{}/{}] > {} ... ABORTED", i + 1, total, current_step.title);
                 storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
                 result.final_status = PlanStatus::Aborted;
                 result.step_results.push(step_result);
@@ -219,12 +212,7 @@ pub async fn run_plan(
             }
             StepOutcome::Timeout => {
                 result.steps_failed += 1;
-                eprintln!(
-                    "[{}/{}] > {} ... TIMEOUT",
-                    i + 1,
-                    total,
-                    current_step.title
-                );
+                eprintln!("[{}/{}] > {} ... TIMEOUT", i + 1, total, current_step.title);
                 storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
                 result.final_status = PlanStatus::Failed;
                 result.step_results.push(step_result);
@@ -330,10 +318,7 @@ pub fn skip_step(
     }
 
     storage::update_step_status(conn, &step.id, StepStatus::Skipped)?;
-    eprintln!(
-        "Skipped step {} '{}'",
-        actual_num, step.title
-    );
+    eprintln!("Skipped step {} '{}'", actual_num, step.title);
 
     Ok(actual_num)
 }
@@ -367,8 +352,7 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
 /// If the current branch matches the plan's branch, no action is taken.
 /// Otherwise, creates and checks out the branch.
 fn setup_branch(workdir: &Path, plan: &Plan) -> Result<()> {
-    let current = git::get_current_branch(workdir)
-        .context("Failed to get current git branch")?;
+    let current = git::get_current_branch(workdir).context("Failed to get current git branch")?;
 
     if current == plan.branch_name {
         return Ok(());
@@ -377,7 +361,10 @@ fn setup_branch(workdir: &Path, plan: &Plan) -> Result<()> {
     // Auto-commit any dirty state before switching branches.
     git::auto_commit_dirty_state(
         workdir,
-        &format!("ralph: auto-save before switching to branch '{}'", plan.branch_name),
+        &format!(
+            "ralph: auto-save before switching to branch '{}'",
+            plan.branch_name
+        ),
     )?;
 
     // Try to create and checkout the branch. If it already exists,
@@ -454,7 +441,10 @@ fn step_number_in_plan(all_steps: &[Step], step: &Step) -> usize {
 /// Find the resume point: the first step that is failed or in_progress.
 fn find_resume_point(steps: &[Step]) -> Result<usize> {
     // First look for an in_progress step.
-    if let Some(idx) = steps.iter().position(|s| s.status == StepStatus::InProgress) {
+    if let Some(idx) = steps
+        .iter()
+        .position(|s| s.status == StepStatus::InProgress)
+    {
         return Ok(idx);
     }
 
@@ -485,11 +475,7 @@ fn find_current_step(steps: &[Step]) -> Result<usize> {
 }
 
 /// Produce a dry-run report without executing anything.
-fn dry_run_report(
-    plan: &Plan,
-    all_steps: &[Step],
-    steps_to_run: &[Step],
-) -> Result<PlanRunResult> {
+fn dry_run_report(plan: &Plan, all_steps: &[Step], steps_to_run: &[Step]) -> Result<PlanRunResult> {
     eprintln!("Dry run for plan '{}':", plan.slug);
     eprintln!("  Branch: {}", plan.branch_name);
     if !plan.deterministic_tests.is_empty() {
@@ -883,17 +869,23 @@ mod tests {
 
         // planning -> ready
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
-        let p = storage::get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        let p = storage::get_plan_by_slug(&conn, "s", "/p")
+            .unwrap()
+            .unwrap();
         assert_eq!(p.status, PlanStatus::Ready);
 
         // ready -> in_progress
         storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
-        let p = storage::get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        let p = storage::get_plan_by_slug(&conn, "s", "/p")
+            .unwrap()
+            .unwrap();
         assert_eq!(p.status, PlanStatus::InProgress);
 
         // in_progress -> complete
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Complete).unwrap();
-        let p = storage::get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        let p = storage::get_plan_by_slug(&conn, "s", "/p")
+            .unwrap()
+            .unwrap();
         assert_eq!(p.status, PlanStatus::Complete);
     }
 
@@ -904,7 +896,9 @@ mod tests {
 
         storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Failed).unwrap();
-        let p = storage::get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        let p = storage::get_plan_by_slug(&conn, "s", "/p")
+            .unwrap()
+            .unwrap();
         assert_eq!(p.status, PlanStatus::Failed);
     }
 

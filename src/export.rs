@@ -195,10 +195,7 @@ mod tests {
         assert_eq!(exported.steps[0].description, "First step desc");
         assert_eq!(exported.steps[0].agent.as_deref(), Some("sonnet"));
         assert!(exported.steps[0].harness.is_none());
-        assert_eq!(
-            exported.steps[0].acceptance_criteria,
-            vec!["tests pass"]
-        );
+        assert_eq!(exported.steps[0].acceptance_criteria, vec!["tests pass"]);
         assert_eq!(exported.steps[0].max_retries, Some(3));
 
         assert_eq!(exported.steps[1].title, "Step two");
@@ -362,17 +359,8 @@ mod tests {
         )
         .unwrap();
 
-        let step = storage::create_step(
-            &conn,
-            &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-        )
-        .unwrap();
+        let step =
+            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
 
         // Mark step as complete
         storage::update_step_status(&conn, &step.id, StepStatus::Complete).unwrap();

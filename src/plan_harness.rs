@@ -62,12 +62,10 @@ Use these ralph-rs CLI commands to manage plans and steps:
 /// Build the initial prompt for the plan-harness session.
 fn build_initial_prompt(project: &str, description: Option<&str>) -> String {
     match description {
-        Some(desc) => format!(
-            "Create a ralph-rs plan for the project at {project}. Description: {desc}"
-        ),
-        None => format!(
-            "Help me create or update a ralph-rs plan for the project at {project}."
-        ),
+        Some(desc) => {
+            format!("Create a ralph-rs plan for the project at {project}. Description: {desc}")
+        }
+        None => format!("Help me create or update a ralph-rs plan for the project at {project}."),
     }
 }
 
@@ -121,10 +119,7 @@ fn build_plan_harness_env(
         && !harness_config.supports_agent_file
         && let Some(path) = agent_file_path
     {
-        env_vars.push((
-            env_name.clone(),
-            path.to_string_lossy().to_string(),
-        ));
+        env_vars.push((env_name.clone(), path.to_string_lossy().to_string()));
     }
 
     env_vars
@@ -140,15 +135,12 @@ pub async fn run_plan_harness(
     project: &str,
     description: Option<&str>,
 ) -> Result<i32> {
-    let harness_config = config
-        .harnesses
-        .get(harness_name)
-        .with_context(|| {
-            format!(
-                "Unknown harness '{harness_name}'. Available: {:?}",
-                config.harnesses.keys().collect::<Vec<_>>()
-            )
-        })?;
+    let harness_config = config.harnesses.get(harness_name).with_context(|| {
+        format!(
+            "Unknown harness '{harness_name}'. Available: {:?}",
+            config.harnesses.keys().collect::<Vec<_>>()
+        )
+    })?;
 
     // Write the agent definition to a temporary file.
     // This file lives for the duration of the harness process.
@@ -198,18 +190,18 @@ impl Drop for TempAgentFile {
 
 /// Write the embedded agent definition to a temporary file.
 fn write_agent_temp_file() -> Result<TempAgentFile> {
-    let file_name = format!(
-        "ralph-rs-plan-agent-{}.md",
-        std::process::id()
-    );
+    let file_name = format!("ralph-rs-plan-agent-{}.md", std::process::id());
     let path = std::env::temp_dir().join(file_name);
 
-    let mut file = std::fs::File::create(&path)
-        .with_context(|| format!("Failed to create temporary agent file at {}", path.display()))?;
+    let mut file = std::fs::File::create(&path).with_context(|| {
+        format!(
+            "Failed to create temporary agent file at {}",
+            path.display()
+        )
+    })?;
     file.write_all(HARNESS_PLAN_AGENT.as_bytes())
         .context("Failed to write agent definition to temp file")?;
-    file.flush()
-        .context("Failed to flush agent temp file")?;
+    file.flush().context("Failed to flush agent temp file")?;
 
     Ok(TempAgentFile { path })
 }
@@ -242,12 +234,8 @@ mod tests {
     fn test_build_plan_harness_args_claude() {
         let config = Config::default();
         let agent_file = write_agent_temp_file().unwrap();
-        let args = build_plan_harness_args(
-            "claude",
-            &config,
-            Some(agent_file.path()),
-            "Create a plan",
-        );
+        let args =
+            build_plan_harness_args("claude", &config, Some(agent_file.path()), "Create a plan");
 
         // Claude should get --system-prompt-file and the prompt as separate args
         assert!(args.contains(&"--system-prompt-file".to_string()));
@@ -260,12 +248,8 @@ mod tests {
     fn test_build_plan_harness_args_codex_prepends_agent() {
         let config = Config::default();
         let agent_file = write_agent_temp_file().unwrap();
-        let args = build_plan_harness_args(
-            "codex",
-            &config,
-            Some(agent_file.path()),
-            "Create a plan",
-        );
+        let args =
+            build_plan_harness_args("codex", &config, Some(agent_file.path()), "Create a plan");
 
         // Codex doesn't support agent files, so agent content should be prepended
         assert!(!args.iter().any(|a| a == "--system-prompt-file"));
@@ -277,12 +261,7 @@ mod tests {
     fn test_build_plan_harness_args_pi_prepends_agent() {
         let config = Config::default();
         let agent_file = write_agent_temp_file().unwrap();
-        let args = build_plan_harness_args(
-            "pi",
-            &config,
-            Some(agent_file.path()),
-            "Help me plan",
-        );
+        let args = build_plan_harness_args("pi", &config, Some(agent_file.path()), "Help me plan");
 
         assert!(!args.iter().any(|a| a == "--system-prompt-file"));
         assert!(args.iter().any(|a| a.contains("ralph-rs Plan Agent")));

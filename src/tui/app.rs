@@ -100,11 +100,7 @@ impl App {
         let title = self.input_buffer.trim().to_string();
         self.input_buffer.clear();
         self.input_mode = InputMode::Normal;
-        if title.is_empty() {
-            None
-        } else {
-            Some(title)
-        }
+        if title.is_empty() { None } else { Some(title) }
     }
 
     /// Cancel inline input and return to Normal mode.
@@ -162,7 +158,9 @@ impl App {
 
     /// Find the first step with `InProgress` status.
     pub fn current_in_progress_step(&self) -> Option<&Step> {
-        self.steps.iter().find(|s| s.status == StepStatus::InProgress)
+        self.steps
+            .iter()
+            .find(|s| s.status == StepStatus::InProgress)
     }
 
     // -- Timer ------------------------------------------------------------

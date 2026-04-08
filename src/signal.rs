@@ -76,10 +76,7 @@ impl ShutdownController {
     }
 
     /// Internal listener loop.
-    async fn listen(
-        abort_tx: watch::Sender<bool>,
-        first_received: &'static AtomicBool,
-    ) {
+    async fn listen(abort_tx: watch::Sender<bool>, first_received: &'static AtomicBool) {
         loop {
             // Wait for the next Ctrl+C.
             if tokio::signal::ctrl_c().await.is_err() {

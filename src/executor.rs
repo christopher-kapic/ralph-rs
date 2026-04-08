@@ -96,15 +96,9 @@ fn try_parse_json(text: &str) -> Option<ParsedHarnessOutput> {
     }
 
     Some(ParsedHarnessOutput {
-        cost_usd: obj
-            .get("cost_usd")
-            .and_then(|v| v.as_f64()),
-        input_tokens: obj
-            .get("input_tokens")
-            .and_then(|v| v.as_i64()),
-        output_tokens: obj
-            .get("output_tokens")
-            .and_then(|v| v.as_i64()),
+        cost_usd: obj.get("cost_usd").and_then(|v| v.as_f64()),
+        input_tokens: obj.get("input_tokens").and_then(|v| v.as_i64()),
+        output_tokens: obj.get("output_tokens").and_then(|v| v.as_i64()),
         session_id: obj
             .get("session_id")
             .and_then(|v| v.as_str())
@@ -143,8 +137,7 @@ pub async fn execute_step(
     let timeout = Duration::from_secs(config.timeout_secs);
 
     // Resolve harness once (doesn't change between retries).
-    let (harness_name, harness_config) =
-        harness::resolve_harness(step, plan, config)?;
+    let (harness_name, harness_config) = harness::resolve_harness(step, plan, config)?;
 
     // Resolve agent file path.
     let agent_file_path: Option<PathBuf> = resolve_agent_file(step, plan);
@@ -191,9 +184,7 @@ pub async fn execute_step(
         };
 
         // Read agent file content.
-        let agent_content = agent_file_path
-            .as_deref()
-            .and_then(prompt::read_agent_file);
+        let agent_content = agent_file_path.as_deref().and_then(prompt::read_agent_file);
 
         // Build prompt.
         let prompt_text = prompt::build_step_prompt(
@@ -206,13 +197,8 @@ pub async fn execute_step(
         );
 
         // Create execution log entry.
-        let exec_log = storage::create_execution_log(
-            conn,
-            &step.id,
-            attempt,
-            Some(&prompt_text),
-            None,
-        )?;
+        let exec_log =
+            storage::create_execution_log(conn, &step.id, attempt, Some(&prompt_text), None)?;
         let started_at = std::time::Instant::now();
 
         // Build harness args and env.
@@ -222,10 +208,7 @@ pub async fn execute_step(
             &prompt_text,
             agent_file_path.as_deref(),
         );
-        let env_vars = harness::build_harness_env(
-            harness_config,
-            agent_file_path.as_deref(),
-        );
+        let env_vars = harness::build_harness_env(harness_config, agent_file_path.as_deref());
 
         // Spawn harness subprocess.
         let child = harness::spawn_harness(harness_config, &args, &env_vars, workdir).await?;
@@ -256,17 +239,12 @@ pub async fn execute_step(
                 let (test_passed, test_result_strings) = if has_changes
                     && !plan.deterministic_tests.is_empty()
                 {
-                    let test_results =
-                        test_runner::run_tests(&plan.deterministic_tests, workdir);
+                    let test_results = test_runner::run_tests(&plan.deterministic_tests, workdir);
                     let strings: Vec<String> = test_results
                         .results
                         .iter()
                         .map(|r| {
-                            format!(
-                                "{}: {}",
-                                r.command,
-                                if r.passed { "pass" } else { "FAIL" }
-                            )
+                            format!("{}: {}", r.command, if r.passed { "pass" } else { "FAIL" })
                         })
                         .collect();
                     (test_results.all_passed, strings)
@@ -294,8 +272,8 @@ pub async fn execute_step(
                         Some(duration_secs),
                         diff.as_deref(),
                         &test_result_strings,
-                        false,  // not rolled back
-                        true,   // committed
+                        false, // not rolled back
+                        true,  // committed
                         Some(&commit_hash),
                         Some(&output.stdout),
                         Some(&output.stderr),
@@ -611,8 +589,7 @@ fn build_prior_step_summaries(
         }
         if s.status == StepStatus::Complete || s.status == StepStatus::Skipped {
             // Try to get changed files from the latest execution log.
-            let files_changed = if let Ok(Some(log)) =
-                storage::get_latest_log_for_step(conn, &s.id)
+            let files_changed = if let Ok(Some(log)) = storage::get_latest_log_for_step(conn, &s.id)
             {
                 if let Some(diff) = &log.diff {
                     extract_changed_files_from_diff(diff)
@@ -688,7 +665,8 @@ mod tests {
 
     #[test]
     fn test_parse_harness_json_embedded_in_output() {
-        let stdout = "Some harness output\nProcessing...\n{\"cost_usd\": 0.03, \"session_id\": \"abc\"}\n";
+        let stdout =
+            "Some harness output\nProcessing...\n{\"cost_usd\": 0.03, \"session_id\": \"abc\"}\n";
         let parsed = parse_harness_json(stdout);
         assert_eq!(parsed.cost_usd, Some(0.03));
         assert_eq!(parsed.session_id.as_deref(), Some("abc"));
@@ -751,14 +729,9 @@ diff --git a/src/lib.rs b/src/lib.rs
     #[test]
     fn test_increment_step_attempts() {
         let conn = crate::db::open_memory().unwrap();
-        let plan = storage::create_plan(
-            &conn, "s", "/p", "b", "d", None, None, &[],
-        )
-        .unwrap();
-        let step = storage::create_step(
-            &conn, &plan.id, "Step", "desc", None, None, &[], None,
-        )
-        .unwrap();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let step =
+            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
         assert_eq!(step.attempts, 0);
 
         super::increment_step_attempts(&conn, &step.id, 3).unwrap();
@@ -769,23 +742,14 @@ diff --git a/src/lib.rs b/src/lib.rs
     #[test]
     fn test_build_prior_step_summaries() {
         let conn = crate::db::open_memory().unwrap();
-        let plan = storage::create_plan(
-            &conn, "s", "/p", "b", "d", None, None, &[],
-        )
-        .unwrap();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let s1 = storage::create_step(
-            &conn, &plan.id, "First", "d1", None, None, &[], None,
-        )
-        .unwrap();
-        let s2 = storage::create_step(
-            &conn, &plan.id, "Second", "d2", None, None, &[], None,
-        )
-        .unwrap();
-        let s3 = storage::create_step(
-            &conn, &plan.id, "Third", "d3", None, None, &[], None,
-        )
-        .unwrap();
+        let s1 =
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
+        let s2 =
+            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None).unwrap();
+        let s3 =
+            storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None).unwrap();
 
         // Mark first two as complete.
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -800,23 +764,14 @@ diff --git a/src/lib.rs b/src/lib.rs
     #[test]
     fn test_build_prior_step_summaries_skips_non_complete() {
         let conn = crate::db::open_memory().unwrap();
-        let plan = storage::create_plan(
-            &conn, "s", "/p", "b", "d", None, None, &[],
-        )
-        .unwrap();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let s1 = storage::create_step(
-            &conn, &plan.id, "First", "d1", None, None, &[], None,
-        )
-        .unwrap();
-        let _s2 = storage::create_step(
-            &conn, &plan.id, "Second", "d2", None, None, &[], None,
-        )
-        .unwrap();
-        let s3 = storage::create_step(
-            &conn, &plan.id, "Third", "d3", None, None, &[], None,
-        )
-        .unwrap();
+        let s1 =
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
+        let _s2 =
+            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None).unwrap();
+        let s3 =
+            storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None).unwrap();
 
         // Only first is complete; second is pending.
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();

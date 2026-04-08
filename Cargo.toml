@@ -2,6 +2,9 @@
 name = "ralph-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Deterministic execution planner and orchestrator for coding agents"
+license = "MIT"
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1"

@@ -549,10 +549,7 @@ mod tests {
         assert_eq!(imported_steps[0].description, "Initial setup");
         assert_eq!(imported_steps[0].agent.as_deref(), Some("sonnet"));
         assert!(imported_steps[0].harness.is_none());
-        assert_eq!(
-            imported_steps[0].acceptance_criteria,
-            vec!["setup done"]
-        );
+        assert_eq!(imported_steps[0].acceptance_criteria, vec!["setup done"]);
         assert_eq!(imported_steps[0].max_retries, Some(2));
 
         assert_eq!(imported_steps[1].title, "Implement");

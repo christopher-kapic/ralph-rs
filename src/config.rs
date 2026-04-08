@@ -160,8 +160,8 @@ pub fn load_or_create_config() -> Result<Config> {
     let path = dir.join("config.json");
 
     if path.exists() {
-        let contents =
-            fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
         let config: Config = serde_json::from_str(&contents)
             .with_context(|| format!("Failed to parse {}", path.display()))?;
         Ok(config)

@@ -57,9 +57,7 @@ pub fn build_step_prompt(
     // 1. Agent definition
     // Only prepend agent content for harnesses without native agent file support.
     // Harnesses with native support (e.g., claude) receive the agent file via flag/env.
-    if !harness_supports_agent_file
-        && let Some(agent_content) = agent_file_content
-    {
+    if !harness_supports_agent_file && let Some(agent_content) = agent_file_content {
         sections.push(format_agent_definition(agent_content));
     }
 
@@ -127,16 +125,12 @@ fn format_retry_context(ctx: &RetryContext) -> String {
 
     if let Some(diff) = &ctx.previous_diff {
         let truncated = truncate_text(diff, 200);
-        parts.push(format!(
-            "## Previous Diff\n\n```diff\n{truncated}\n```"
-        ));
+        parts.push(format!("## Previous Diff\n\n```diff\n{truncated}\n```"));
     }
 
     if let Some(test_output) = &ctx.previous_test_output {
         let truncated = truncate_text(test_output, 100);
-        parts.push(format!(
-            "## Previous Test Output\n\n```\n{truncated}\n```"
-        ));
+        parts.push(format!("## Previous Test Output\n\n```\n{truncated}\n```"));
     }
 
     parts.join("\n\n")
@@ -237,10 +231,7 @@ fn truncate_text(text: &str, max_lines: usize) -> String {
     } else {
         let omitted = lines.len() - max_lines;
         let tail = &lines[lines.len() - max_lines..];
-        format!(
-            "... ({omitted} lines omitted) ...\n{}",
-            tail.join("\n")
-        )
+        format!("... ({omitted} lines omitted) ...\n{}", tail.join("\n"))
     }
 }
 
@@ -400,14 +391,7 @@ mod tests {
             files_modified: vec!["src/harness.rs".to_string(), "src/main.rs".to_string()],
         };
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &[],
-            None,
-            Some(&retry),
-            true,
-        );
+        let prompt = build_step_prompt(&plan, &step, &[], None, Some(&retry), true);
 
         assert!(prompt.contains("# Retry Context"));
         assert!(prompt.contains("attempt 2 of 3"));
@@ -550,14 +534,8 @@ mod tests {
             files_modified: vec![],
         };
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &prior,
-            Some("agent def"),
-            Some(&retry),
-            false,
-        );
+        let prompt =
+            build_step_prompt(&plan, &step, &prior, Some("agent def"), Some(&retry), false);
 
         // Verify ordering: agent -> retry -> plan -> prior -> step -> criteria -> tests -> focus
         let agent_pos = prompt.find("# Agent Definition").unwrap();

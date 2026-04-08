@@ -149,21 +149,24 @@ impl Plan {
     /// harness, agent, deterministic_tests, created_at, updated_at
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
-        let status: PlanStatus = status_str
-            .parse()
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?;
+        let status: PlanStatus = status_str.parse().map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+        })?;
 
         let tests_json: String = row.get(8)?;
-        let deterministic_tests: Vec<String> = serde_json::from_str(&tests_json)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e)))?;
+        let deterministic_tests: Vec<String> = serde_json::from_str(&tests_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        })?;
 
         let created_str: String = row.get(9)?;
-        let created_at = parse_datetime(&created_str)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e)))?;
+        let created_at = parse_datetime(&created_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+        })?;
 
         let updated_str: String = row.get(10)?;
-        let updated_at = parse_datetime(&updated_str)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e)))?;
+        let updated_at = parse_datetime(&updated_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
+        })?;
 
         Ok(Plan {
             id: row.get(0)?,
@@ -211,21 +214,29 @@ impl Step {
     /// acceptance_criteria, status, attempts, max_retries, created_at, updated_at
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let criteria_json: String = row.get(7)?;
-        let acceptance_criteria: Vec<String> = serde_json::from_str(&criteria_json)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e)))?;
+        let acceptance_criteria: Vec<String> =
+            serde_json::from_str(&criteria_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
 
         let status_str: String = row.get(8)?;
-        let status: StepStatus = status_str
-            .parse()
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e)))?;
+        let status: StepStatus = status_str.parse().map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        })?;
 
         let created_str: String = row.get(11)?;
-        let created_at = parse_datetime(&created_str)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(e)))?;
+        let created_at = parse_datetime(&created_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(e))
+        })?;
 
         let updated_str: String = row.get(12)?;
-        let updated_at = parse_datetime(&updated_str)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e)))?;
+        let updated_at = parse_datetime(&updated_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e))
+        })?;
 
         Ok(Step {
             id: row.get(0)?,
@@ -280,12 +291,14 @@ impl ExecutionLog {
     /// harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let started_str: String = row.get(3)?;
-        let started_at = parse_datetime(&started_str)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e)))?;
+        let started_at = parse_datetime(&started_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        })?;
 
         let tests_json: String = row.get(7)?;
-        let test_results: Vec<String> = serde_json::from_str(&tests_json)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e)))?;
+        let test_results: Vec<String> = serde_json::from_str(&tests_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+        })?;
 
         let rolled_back_int: i32 = row.get(8)?;
         let committed_int: i32 = row.get(9)?;

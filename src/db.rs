@@ -212,10 +212,7 @@ mod tests {
             "idx_steps_plan_sort",
         ];
         for idx in &expected {
-            assert!(
-                indexes.contains(&idx.to_string()),
-                "Missing index: {idx}"
-            );
+            assert!(indexes.contains(&idx.to_string()), "Missing index: {idx}");
         }
     }
 
