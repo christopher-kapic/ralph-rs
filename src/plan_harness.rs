@@ -13,41 +13,41 @@ use crate::harness;
 ///
 /// This instructs the harness to investigate the codebase and create plans
 /// by calling ralph-rs CLI commands.
-const HARNESS_PLAN_AGENT: &str = r#"# ralph-rs Plan Agent
+const HARNESS_PLAN_AGENT: &str = r#"# ralph Plan Agent
 
-You are helping the user create or update a ralph-rs execution plan. ralph-rs is a deterministic
+You are helping the user create or update a ralph execution plan. ralph is a deterministic
 orchestrator for coding agent harnesses. Your job is to investigate the codebase and create a
 structured plan with steps that can be executed by coding agents.
 
 ## Available Commands
 
-Use these ralph-rs CLI commands to manage plans and steps:
+Use these ralph CLI commands to manage plans and steps:
 
 ### Plan Management
-- `ralph-rs plan create <slug> --description "<desc>" [--branch <branch>] [--test "<cmd>"]`
-- `ralph-rs plan list`
-- `ralph-rs plan show <slug>`
-- `ralph-rs plan approve <slug>`
-- `ralph-rs plan delete <slug> --force`
+- `ralph plan create <slug> --description "<desc>" [--branch <branch>] [--test "<cmd>"]`
+- `ralph plan list`
+- `ralph plan show <slug>`
+- `ralph plan approve <slug>`
+- `ralph plan delete <slug> --force`
 
 ### Step Management
-- `ralph-rs step add "<title>" --plan <slug> [--description "<desc>"] [--after <n>]`
-- `ralph-rs step list --plan <slug>`
-- `ralph-rs step edit <n> --plan <slug> [--title "<title>"] [--description "<desc>"]`
-- `ralph-rs step remove <n> --plan <slug> --force`
-- `ralph-rs step move <n> --to <m> --plan <slug>`
-- `ralph-rs step reset <n> --plan <slug>`
+- `ralph step add "<title>" --plan <slug> [--description "<desc>"] [--after <n>]`
+- `ralph step list --plan <slug>`
+- `ralph step edit <n> --plan <slug> [--title "<title>"] [--description "<desc>"]`
+- `ralph step remove <n> --plan <slug> --force`
+- `ralph step move <n> --to <m> --plan <slug>`
+- `ralph step reset <n> --plan <slug>`
 
 ## Workflow
 
 1. Investigate the project structure, code, and any existing plans.
 2. Discuss the approach with the user if needed.
-3. Create a plan with `ralph-rs plan create`.
-4. Add steps with `ralph-rs step add`, each with a clear title and detailed description.
+3. Create a plan with `ralph plan create`.
+4. Add steps with `ralph step add`, each with a clear title and detailed description.
 5. Include acceptance criteria and context in step descriptions.
 6. Set deterministic test commands on the plan (e.g., `--test "cargo build" --test "cargo test"`).
-7. Show the final plan with `ralph-rs plan show` for user review.
-8. Approve the plan with `ralph-rs plan approve` when the user is satisfied.
+7. Show the final plan with `ralph plan show` for user review.
+8. Approve the plan with `ralph plan approve` when the user is satisfied.
 
 ## Guidelines
 
@@ -63,9 +63,9 @@ Use these ralph-rs CLI commands to manage plans and steps:
 fn build_initial_prompt(project: &str, description: Option<&str>) -> String {
     match description {
         Some(desc) => {
-            format!("Create a ralph-rs plan for the project at {project}. Description: {desc}")
+            format!("Create a ralph plan for the project at {project}. Description: {desc}")
         }
-        None => format!("Help me create or update a ralph-rs plan for the project at {project}."),
+        None => format!("Help me create or update a ralph plan for the project at {project}."),
     }
 }
 
@@ -220,7 +220,7 @@ mod tests {
         let prompt = build_initial_prompt("/tmp/project", Some("Add authentication"));
         assert!(prompt.contains("/tmp/project"));
         assert!(prompt.contains("Add authentication"));
-        assert!(prompt.starts_with("Create a ralph-rs plan"));
+        assert!(prompt.starts_with("Create a ralph plan"));
     }
 
     #[test]
@@ -241,7 +241,7 @@ mod tests {
         assert!(args.contains(&"--system-prompt-file".to_string()));
         assert!(args.contains(&"Create a plan".to_string()));
         // Agent content should NOT be in the prompt
-        assert!(!args.iter().any(|a| a.contains("ralph-rs Plan Agent")));
+        assert!(!args.iter().any(|a| a.contains("ralph Plan Agent")));
     }
 
     #[test]
@@ -253,7 +253,7 @@ mod tests {
 
         // Codex doesn't support agent files, so agent content should be prepended
         assert!(!args.iter().any(|a| a == "--system-prompt-file"));
-        assert!(args.iter().any(|a| a.contains("ralph-rs Plan Agent")));
+        assert!(args.iter().any(|a| a.contains("ralph Plan Agent")));
         assert!(args.iter().any(|a| a.contains("Create a plan")));
     }
 
@@ -264,7 +264,7 @@ mod tests {
         let args = build_plan_harness_args("pi", &config, Some(agent_file.path()), "Help me plan");
 
         assert!(!args.iter().any(|a| a == "--system-prompt-file"));
-        assert!(args.iter().any(|a| a.contains("ralph-rs Plan Agent")));
+        assert!(args.iter().any(|a| a.contains("ralph Plan Agent")));
         assert!(args.iter().any(|a| a.contains("Help me plan")));
     }
 
@@ -306,9 +306,9 @@ mod tests {
     fn test_write_agent_temp_file() {
         let agent_file = write_agent_temp_file().unwrap();
         let content = std::fs::read_to_string(agent_file.path()).unwrap();
-        assert!(content.contains("ralph-rs Plan Agent"));
-        assert!(content.contains("ralph-rs plan create"));
-        assert!(content.contains("ralph-rs step add"));
+        assert!(content.contains("ralph Plan Agent"));
+        assert!(content.contains("ralph plan create"));
+        assert!(content.contains("ralph step add"));
     }
 
     #[test]
@@ -318,8 +318,8 @@ mod tests {
         assert!(HARNESS_PLAN_AGENT.contains("Step Management"));
         assert!(HARNESS_PLAN_AGENT.contains("Workflow"));
         assert!(HARNESS_PLAN_AGENT.contains("Guidelines"));
-        assert!(HARNESS_PLAN_AGENT.contains("ralph-rs plan create"));
-        assert!(HARNESS_PLAN_AGENT.contains("ralph-rs step add"));
-        assert!(HARNESS_PLAN_AGENT.contains("ralph-rs plan approve"));
+        assert!(HARNESS_PLAN_AGENT.contains("ralph plan create"));
+        assert!(HARNESS_PLAN_AGENT.contains("ralph step add"));
+        assert!(HARNESS_PLAN_AGENT.contains("ralph plan approve"));
     }
 }

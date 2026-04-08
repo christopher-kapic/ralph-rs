@@ -110,7 +110,7 @@ pub fn run_preflight_checks(
 /// If the working tree is clean, this is a no-op.
 pub fn auto_stash_dirty_state(workdir: &Path) -> Result<bool> {
     if git::has_uncommitted_changes(workdir)? {
-        git::commit_changes(workdir, "ralph-rs: [skip] auto-stash before run")?;
+        git::commit_changes(workdir, "ralph: [skip] auto-stash before run")?;
         Ok(true)
     } else {
         Ok(false)
@@ -173,9 +173,13 @@ fn check_test_binaries(test_commands: &[String]) -> Vec<CheckResult> {
 
 /// Check harness-specific authentication requirements.
 fn check_harness_auth(harness_name: &str, _harness_config: &HarnessConfig) -> CheckResult {
-    // Copilot (gh copilot) requires GH_TOKEN or GITHUB_TOKEN
+    // Standalone Copilot CLI accepts COPILOT_GITHUB_TOKEN, GH_TOKEN, or
+    // GITHUB_TOKEN (in that precedence order). Without one of these set,
+    // `copilot` requires an interactive `copilot login` device flow.
     if harness_name == "copilot" {
-        let has_token = std::env::var("GH_TOKEN").is_ok() || std::env::var("GITHUB_TOKEN").is_ok();
+        let has_token = std::env::var("COPILOT_GITHUB_TOKEN").is_ok()
+            || std::env::var("GH_TOKEN").is_ok()
+            || std::env::var("GITHUB_TOKEN").is_ok();
 
         if has_token {
             CheckResult {
@@ -188,7 +192,7 @@ fn check_harness_auth(harness_name: &str, _harness_config: &HarnessConfig) -> Ch
                 name: "harness-auth".to_string(),
                 severity: CheckSeverity::Warning,
                 message: format!(
-                    "{harness_name}: GH_TOKEN or GITHUB_TOKEN not set; `gh` may prompt for login"
+                    "{harness_name}: no token in COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN; run `copilot login` or set a token"
                 ),
             }
         }
@@ -399,21 +403,23 @@ mod tests {
 
     #[test]
     fn test_check_harness_auth_copilot_no_token() {
-        // Temporarily ensure neither token is set.
+        // Temporarily ensure no copilot tokens are set.
+        let copilot = std::env::var("COPILOT_GITHUB_TOKEN").ok();
         let gh = std::env::var("GH_TOKEN").ok();
         let github = std::env::var("GITHUB_TOKEN").ok();
         // SAFETY: This test runs single-threaded; no concurrent env access.
         unsafe {
+            std::env::remove_var("COPILOT_GITHUB_TOKEN");
             std::env::remove_var("GH_TOKEN");
             std::env::remove_var("GITHUB_TOKEN");
         }
 
         let harness = crate::config::HarnessConfig {
-            command: "gh".to_string(),
-            args: vec!["copilot".to_string()],
+            command: "copilot".to_string(),
+            args: vec!["-p".to_string(), "{prompt}".to_string()],
             supports_agent_file: false,
-            supports_json_output: false,
-            json_output_args: vec![],
+            supports_json_output: true,
+            json_output_args: vec!["--output-format".to_string(), "json".to_string()],
             agent_file_env: None,
         };
         let result = check_harness_auth("copilot", &harness);
@@ -421,6 +427,9 @@ mod tests {
 
         // Restore
         unsafe {
+            if let Some(v) = copilot {
+                std::env::set_var("COPILOT_GITHUB_TOKEN", v);
+            }
             if let Some(v) = gh {
                 std::env::set_var("GH_TOKEN", v);
             }

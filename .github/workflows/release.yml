@@ -98,13 +98,13 @@ jobs:
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../ralph-rs-${{ matrix.target }}.tar.gz ralph-rs
+          tar czf ../../../ralph-${{ matrix.target }}.tar.gz ralph
           cd ../../..
 
       - name: Generate checksum
-        run: shasum -a 256 ralph-rs-${{ matrix.target }}.tar.gz > ralph-rs-${{ matrix.target }}.tar.gz.sha256
+        run: shasum -a 256 ralph-${{ matrix.target }}.tar.gz > ralph-${{ matrix.target }}.tar.gz.sha256
 
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "v${{ inputs.version || needs.create-release.outputs.version }}" ralph-rs-${{ matrix.target }}.tar.gz ralph-rs-${{ matrix.target }}.tar.gz.sha256
+        run: gh release upload "v${{ inputs.version || needs.create-release.outputs.version }}" ralph-${{ matrix.target }}.tar.gz ralph-${{ matrix.target }}.tar.gz.sha256

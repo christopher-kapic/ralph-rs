@@ -1,4 +1,4 @@
-<p align="center"><img src="header.png" alt="ralph-rs — Deterministic execution planner for coding agent harnesses" width="100%" /></p>
+<p align="center"><img src="header.png" alt="ralph — Deterministic execution planner for coding agent harnesses" width="100%" /></p>
 
 # ralph-rs
 
@@ -39,18 +39,18 @@ cargo install --path .
 
 ```bash
 # Initialize config and database
-ralph-rs init
+ralph init
 
 # Create a plan
-ralph-rs plan create "Add user authentication" --test "cargo build" --test "cargo test"
+ralph plan create "Add user authentication" --test "cargo build" --test "cargo test"
 
 # Add steps
-ralph-rs step add auth --title "Add user model" --description "Create User struct with id, email, password_hash fields" --criteria "User struct exists in src/models/user.rs" --criteria "Tests pass"
-ralph-rs step add auth --title "Add API endpoints" --description "Create login/register endpoints" --criteria "/api/login returns 200 with valid credentials"
+ralph step add auth --title "Add user model" --description "Create User struct with id, email, password_hash fields" --criteria "User struct exists in src/models/user.rs" --criteria "Tests pass"
+ralph step add auth --title "Add API endpoints" --description "Create login/register endpoints" --criteria "/api/login returns 200 with valid credentials"
 
 # Approve and run
-ralph-rs approve auth
-ralph-rs run auth
+ralph approve auth
+ralph run auth
 ```
 
 ## Usage
@@ -58,55 +58,55 @@ ralph-rs run auth
 ### Plan Management
 
 ```bash
-ralph-rs plan create <description>        # Create a new plan
+ralph plan create <description>        # Create a new plan
   [--test <cmd>]...                       #   Repeatable: deterministic test commands
   [--harness <h>]                         #   Plan-level harness override
   [--agent <name>]                        #   Plan-level agent definition
   [--branch <name>]                       #   Custom branch name
 
-ralph-rs plan list [--all]                # List plans
-ralph-rs plan show <slug>                 # Show plan details
-ralph-rs plan approve <slug>              # Approve plan (planning -> ready)
-ralph-rs plan delete <slug>               # Delete a plan
+ralph plan list [--all]                # List plans
+ralph plan show <slug>                 # Show plan details
+ralph plan approve <slug>              # Approve plan (planning -> ready)
+ralph plan delete <slug>               # Delete a plan
 ```
 
 ### Step Management
 
 ```bash
-ralph-rs step list <slug>                 # List steps in a plan
-ralph-rs step add <slug>                  # Add a step
+ralph step list <slug>                 # List steps in a plan
+ralph step add <slug>                  # Add a step
   --title <t> --description <d>
   [--criteria <c>]...                     #   Acceptance criteria
   [--agent <name>]                        #   Step-level agent override
   [--after <num>]                         #   Insert after step number
 
-ralph-rs step remove <slug> <num>         # Remove step by position
-ralph-rs step edit <slug> <num>           # Edit step fields
-ralph-rs step reset <slug> <num>          # Reset step to pending
-ralph-rs step move <slug> <from> <to>     # Reorder step
+ralph step remove <slug> <num>         # Remove step by position
+ralph step edit <slug> <num>           # Edit step fields
+ralph step reset <slug> <num>          # Reset step to pending
+ralph step move <slug> <from> <to>     # Reorder step
 ```
 
 ### Execution
 
 ```bash
-ralph-rs run [<slug>]                     # Run plan (interactive TUI)
-ralph-rs run [<slug>] --noninteractive    # Run plan (stdout progress)
-ralph-rs run [<slug>] --current-branch    # Run on current branch
-ralph-rs resume [<slug>]                  # Resume from last failed step
-ralph-rs skip [<slug>]                    # Skip failed step, continue
+ralph run [<slug>]                     # Run plan (interactive TUI)
+ralph run [<slug>] --noninteractive    # Run plan (stdout progress)
+ralph run [<slug>] --current-branch    # Run on current branch
+ralph resume [<slug>]                  # Resume from last failed step
+ralph skip [<slug>]                    # Skip failed step, continue
 ```
 
 ### Planning with a Harness
 
 ```bash
-ralph-rs plan:harness [<harness>] [<description>]   # Delegate planning to an AI harness
+ralph plan:harness [<harness>] [<description>]   # Delegate planning to an AI harness
 ```
 
 ### Portability
 
 ```bash
-ralph-rs export <slug> [-o <file>]        # Export plan to JSON
-ralph-rs import <file>                    # Import plan from JSON
+ralph export <slug> [-o <file>]        # Export plan to JSON
+ralph import <file>                    # Import plan from JSON
   [--project <path>]
   [--slug <name>]
   [--harness <h>]
@@ -115,10 +115,10 @@ ralph-rs import <file>                    # Import plan from JSON
 ### Utilities
 
 ```bash
-ralph-rs status [<slug>]                  # Show execution status
-ralph-rs log <slug> [<step-num>]          # Show execution logs
-ralph-rs agents                           # List agent definitions
-ralph-rs doctor                           # Check config, DB, harness availability
+ralph status [<slug>]                  # Show execution status
+ralph log <slug> [<step-num>]          # Show execution logs
+ralph agents                           # List agent definitions
+ralph doctor                           # Check config, DB, harness availability
 ```
 
 ## Harness Comparison
@@ -127,16 +127,16 @@ Export a plan and run it with different harnesses to compare results:
 
 ```bash
 # Create and export a plan
-ralph-rs plan:harness claude "Add user auth"
-ralph-rs export auth
+ralph plan:harness claude "Add user auth"
+ralph export auth
 
 # Import into separate project copies with different harnesses
-ralph-rs import auth.json --project ~/myapp-claude --slug auth-claude --harness claude
-ralph-rs import auth.json --project ~/myapp-codex --slug auth-codex --harness codex
+ralph import auth.json --project ~/myapp-claude --slug auth-claude --harness claude
+ralph import auth.json --project ~/myapp-codex --slug auth-codex --harness codex
 
 # Run both
-cd ~/myapp-claude && ralph-rs run auth-claude --noninteractive &
-cd ~/myapp-codex  && ralph-rs run auth-codex  --noninteractive &
+cd ~/myapp-claude && ralph run auth-claude --noninteractive &
+cd ~/myapp-codex  && ralph run auth-codex  --noninteractive &
 ```
 
 ## Configuration

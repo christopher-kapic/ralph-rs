@@ -642,7 +642,7 @@ pub fn cmd_init() -> Result<()> {
     println!("\x1b[32m\u{2714}\x1b[0m Database: {}", db_path.display());
 
     println!();
-    println!("ralph-rs initialized successfully.");
+    println!("ralph initialized successfully.");
     Ok(())
 }
 
@@ -651,7 +651,7 @@ pub fn cmd_init() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 pub fn cmd_doctor(config: &config::Config) -> Result<()> {
-    println!("ralph-rs doctor");
+    println!("ralph doctor");
     println!();
 
     let checks = preflight::run_doctor_checks(config);
@@ -940,7 +940,7 @@ pub fn cmd_agents_list() -> Result<()> {
 
     if !agents_dir.exists() {
         println!("Agents directory not found: {}", agents_dir.display());
-        println!("Run `ralph-rs init` to create it.");
+        println!("Run `ralph init` to create it.");
         return Ok(());
     }
 

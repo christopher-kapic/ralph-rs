@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO="christopher-kapic/ralph-rs"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
-BINARY="ralph-rs"
+BINARY="ralph"
 
 CLEANUP_DIR=""
 trap 'rm -rf "$CLEANUP_DIR"' EXIT

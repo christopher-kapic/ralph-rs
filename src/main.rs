@@ -336,12 +336,7 @@ fn main() -> Result<()> {
         // -- Completions --
         Command::Completions { shell } => {
             use clap::CommandFactory;
-            clap_complete::generate(
-                shell,
-                &mut Cli::command(),
-                "ralph-rs",
-                &mut std::io::stdout(),
-            );
+            clap_complete::generate(shell, &mut Cli::command(), "ralph", &mut std::io::stdout());
             Ok(())
         }
     }

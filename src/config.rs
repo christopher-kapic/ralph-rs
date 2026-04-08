@@ -97,11 +97,20 @@ impl Default for Config {
         harnesses.insert(
             "copilot".to_string(),
             HarnessConfig {
-                command: "gh".to_string(),
-                args: vec!["copilot".to_string()],
+                // The standalone GitHub Copilot CLI binary, NOT the older
+                // `gh copilot` extension. Auth uses COPILOT_GITHUB_TOKEN
+                // (or falls back to GH_TOKEN / GITHUB_TOKEN).
+                command: "copilot".to_string(),
+                args: vec![
+                    "-p".to_string(),
+                    "{prompt}".to_string(),
+                    "--silent".to_string(),
+                    "--allow-all-paths".to_string(),
+                    "--allow-all".to_string(),
+                ],
                 supports_agent_file: false,
-                supports_json_output: false,
-                json_output_args: vec![],
+                supports_json_output: true,
+                json_output_args: vec!["--output-format".to_string(), "json".to_string()],
                 agent_file_env: None,
             },
         );
@@ -127,18 +136,27 @@ impl Default for Config {
     }
 }
 
-/// Returns the platform-specific configuration directory for ralph-rs.
+/// Returns the configuration directory for ralph-rs.
 ///
-/// - Linux: `~/.config/ralph-rs`
-/// - macOS: `~/Library/Application Support/ralph-rs`
-/// - Windows: `{FOLDERID_RoamingAppData}/ralph-rs`
+/// Uses XDG semantics on every platform so the config can live alongside
+/// the user's other dotfiles:
+/// - `$XDG_CONFIG_HOME/ralph-rs` if set
+/// - otherwise `$HOME/.config/ralph-rs`
+///
+/// We deliberately do not use `dirs::config_dir()`, which on macOS returns
+/// `~/Library/Application Support` and breaks dotfile workflows.
 pub fn config_dir() -> Result<PathBuf> {
-    let base = dirs::config_dir().context("Could not determine config directory")?;
-    Ok(base.join("ralph-rs"))
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(xdg).join("ralph-rs"));
+    }
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    Ok(home.join(".config").join("ralph-rs"))
 }
 
 /// Returns the platform-specific data directory for ralph-rs.
 ///
+/// This holds runtime state (the SQLite database), not user-curated config,
+/// so it follows platform conventions via `dirs::data_dir()`:
 /// - Linux: `~/.local/share/ralph-rs`
 /// - macOS: `~/Library/Application Support/ralph-rs`
 /// - Windows: `{FOLDERID_RoamingAppData}/ralph-rs`
@@ -147,11 +165,13 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(base.join("ralph-rs"))
 }
 
-/// Returns the directory where agent files are stored.
+/// Returns the directory where agent definition files are stored.
 ///
-/// This is `<data_dir>/agents`.
+/// Agent files are user-authored markdown — they belong with the rest of
+/// the user's config so they can be checked into dotfiles. Located at
+/// `<config_dir>/agents`.
 pub fn agents_dir() -> Result<PathBuf> {
-    Ok(data_dir()?.join("agents"))
+    Ok(config_dir()?.join("agents"))
 }
 
 /// Loads configuration from disk, or creates a default config file if none exists.
@@ -222,8 +242,17 @@ mod tests {
         assert!(codex.supports_json_output);
 
         let copilot = &config.harnesses["copilot"];
-        assert_eq!(copilot.command, "gh");
-        assert_eq!(copilot.args, vec!["copilot"]);
+        assert_eq!(copilot.command, "copilot");
+        assert!(copilot.args.contains(&"-p".to_string()));
+        assert!(copilot.args.contains(&"{prompt}".to_string()));
+        assert!(copilot.args.contains(&"--silent".to_string()));
+        assert!(copilot.args.contains(&"--allow-all-paths".to_string()));
+        assert!(copilot.args.contains(&"--allow-all".to_string()));
+        assert!(copilot.supports_json_output);
+        assert_eq!(
+            copilot.json_output_args,
+            vec!["--output-format".to_string(), "json".to_string()]
+        );
     }
 
     #[test]

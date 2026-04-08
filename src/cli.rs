@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// ralph-rs: a deterministic orchestrator for coding agent harnesses.
 #[derive(Debug, Parser)]
-#[command(name = "ralph-rs", version, about, long_about = None)]
+#[command(name = "ralph", version, about, long_about = None)]
 pub struct Cli {
     /// Path to the project directory (defaults to current directory).
     #[arg(long, short = 'C', global = true)]
