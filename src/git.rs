@@ -123,6 +123,59 @@ pub fn rollback_changes(workdir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Return a list of untracked files (respecting .gitignore).
+pub fn get_untracked_files(workdir: &Path) -> Result<Vec<String>> {
+    let out = git(workdir, &["ls-files", "--others", "--exclude-standard"])
+        .context("could not list untracked files")?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Stage all changes then unstage the specified files.
+///
+/// This lets us commit new work without accidentally staging pre-existing
+/// untracked files that the user had in their working directory.
+pub fn stage_except(workdir: &Path, exclude: &[String]) -> Result<()> {
+    git(workdir, &["add", "-A"]).context("git add -A failed")?;
+    for file in exclude {
+        // Unstage the file. Ignore errors (file may not have been staged).
+        let _ = git(workdir, &["reset", "HEAD", "--", file]);
+    }
+    Ok(())
+}
+
+/// Commit whatever is currently staged (does not run `git add`).
+pub fn commit_staged(workdir: &Path, message: &str) -> Result<()> {
+    git(workdir, &["commit", "-m", message]).context("git commit failed")?;
+    Ok(())
+}
+
+/// Rollback changes while preserving specified untracked files.
+///
+/// Restores tracked files via `git checkout -- .`, then selectively removes
+/// only untracked files that are NOT in the `preserve` list.
+pub fn rollback_except(workdir: &Path, preserve: &[String]) -> Result<()> {
+    // Restore tracked files.
+    git(workdir, &["checkout", "--", "."]).context("git checkout -- . failed")?;
+
+    // Get current untracked files and remove only those not in preserve list.
+    let untracked = get_untracked_files(workdir)?;
+    for file in &untracked {
+        if !preserve.contains(file) {
+            let path = workdir.join(file);
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Return the full SHA of the current HEAD commit.
 pub fn get_commit_hash(workdir: &Path) -> Result<String> {
     let out = git(workdir, &["rev-parse", "HEAD"]).context("could not get current commit hash")?;

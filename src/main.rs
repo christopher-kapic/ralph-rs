@@ -7,6 +7,7 @@ mod export;
 mod frac_index;
 mod git;
 mod harness;
+mod hooks;
 mod import;
 mod output;
 mod plan;
@@ -67,14 +68,18 @@ fn main() -> Result<()> {
                     &tests,
                 )
             }
-            PlanCommand::List { all, status } => {
-                commands::plan_list(&conn, &project, all, status.as_deref())
-            }
+            PlanCommand::List {
+                all,
+                status,
+                archived,
+            } => commands::plan_list(&conn, &project, all, status.as_deref(), archived),
             PlanCommand::Show { slug } => commands::plan_show(&conn, &slug, &project),
             PlanCommand::Approve { slug } => commands::plan_approve(&conn, &slug, &project),
             PlanCommand::Delete { slug, force } => {
                 commands::plan_delete(&conn, &slug, &project, force)
             }
+            PlanCommand::Archive { slug } => commands::plan_archive(&conn, &slug, &project),
+            PlanCommand::Unarchive { slug } => commands::plan_unarchive(&conn, &slug, &project),
         },
 
         // -- Step --
@@ -327,5 +332,17 @@ fn main() -> Result<()> {
 
         // -- Doctor --
         Command::Doctor => commands::cmd_doctor(&_config),
+
+        // -- Completions --
+        Command::Completions { shell } => {
+            use clap::CommandFactory;
+            clap_complete::generate(
+                shell,
+                &mut Cli::command(),
+                "ralph-rs",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
     }
 }

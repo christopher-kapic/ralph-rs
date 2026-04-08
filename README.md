@@ -1,3 +1,5 @@
+<p align="center"><img src="header.png" alt="ralph-rs — Deterministic execution planner for coding agent harnesses" width="100%" /></p>
+
 # ralph-rs
 
 A deterministic orchestrator for coding agent harnesses. Takes step-based plans and executes them through AI coding agents (Claude, Codex, OpenCode, Copilot, Goose, Pi) with retry loops, test validation, and git integration.

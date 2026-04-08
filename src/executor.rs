@@ -14,6 +14,7 @@ use tokio::sync::watch;
 use crate::config::Config;
 use crate::git;
 use crate::harness::{self, HarnessOutput};
+use crate::hooks;
 use crate::plan::{Plan, Step, StepStatus};
 use crate::prompt::{self, PriorStepSummary, RetryContext};
 use crate::storage;
@@ -145,6 +146,9 @@ pub async fn execute_step(
     // Collect prior step summaries for prompt context.
     let prior_steps = build_prior_step_summaries(conn, plan, step)?;
 
+    // Snapshot pre-existing untracked files so we don't accidentally commit them.
+    let pre_existing_untracked = git::get_untracked_files(workdir)?;
+
     // Previous attempt context for retries.
     let mut prev_diff: Option<String> = None;
     let mut prev_test_output: Option<String> = None;
@@ -201,6 +205,41 @@ pub async fn execute_step(
             storage::create_execution_log(conn, &step.id, attempt, Some(&prompt_text), None)?;
         let started_at = std::time::Instant::now();
 
+        // Run pre-step hook.
+        if let Err(e) = hooks::run_pre_step(plan, step, attempt, workdir) {
+            eprintln!("Pre-step hook failed: {e}");
+            // Treat as a failed attempt — skip harness execution.
+            let test_result_strings = vec![format!("pre-step hook failed: {e}")];
+            storage::update_execution_log(
+                conn,
+                exec_log.id,
+                Some(started_at.elapsed().as_secs_f64()),
+                None,
+                &test_result_strings,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+            if attempt >= max_attempts {
+                storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
+                hooks::run_post_step(plan, step, attempt, "failed", workdir);
+                return Ok(StepResult {
+                    outcome: StepOutcome::Failed,
+                    step_id: step.id.clone(),
+                    attempts_used: attempt,
+                    commit_hash: None,
+                });
+            }
+            prev_test_output = Some(format!("pre-step hook failed: {e}"));
+            hooks::run_post_step(plan, step, attempt, "failed", workdir);
+            continue;
+        }
+
         // Build harness args and env.
         let args = harness::build_harness_args(
             harness_name,
@@ -239,6 +278,11 @@ pub async fn execute_step(
                 let (test_passed, test_result_strings) = if has_changes
                     && !plan.deterministic_tests.is_empty()
                 {
+                    // Pre-test hook.
+                    if let Err(e) = hooks::run_pre_test(plan, step, attempt, workdir) {
+                        eprintln!("Pre-test hook failed: {e}");
+                    }
+
                     let test_results = test_runner::run_tests(&plan.deterministic_tests, workdir);
                     let strings: Vec<String> = test_results
                         .results
@@ -247,6 +291,10 @@ pub async fn execute_step(
                             format!("{}: {}", r.command, if r.passed { "pass" } else { "FAIL" })
                         })
                         .collect();
+
+                    // Post-test hook.
+                    hooks::run_post_test(plan, step, attempt, test_results.all_passed, workdir);
+
                     (test_results.all_passed, strings)
                 } else if has_changes {
                     // No tests defined: treat as passing.
@@ -257,12 +305,13 @@ pub async fn execute_step(
                 };
 
                 if test_passed && has_changes {
-                    // Commit changes.
+                    // Stage changes, excluding pre-existing untracked files.
                     let commit_msg = format!(
                         "ralph: {} [step:{}, plan:{}, attempt:{}]",
                         step.title, step.id, plan.slug, attempt,
                     );
-                    git::commit_changes(workdir, &commit_msg)?;
+                    git::stage_except(workdir, &pre_existing_untracked)?;
+                    git::commit_staged(workdir, &commit_msg)?;
                     let commit_hash = git::get_commit_hash(workdir)?;
 
                     // Update execution log.
@@ -285,6 +334,8 @@ pub async fn execute_step(
                     // Mark step as complete.
                     storage::update_step_status(conn, &step.id, StepStatus::Complete)?;
 
+                    hooks::run_post_step(plan, step, attempt, "complete", workdir);
+
                     return Ok(StepResult {
                         outcome: StepOutcome::Success,
                         step_id: step.id.clone(),
@@ -293,9 +344,9 @@ pub async fn execute_step(
                     });
                 }
 
-                // Test failed or no changes — rollback.
+                // Test failed or no changes — rollback (preserving pre-existing untracked).
                 if has_changes {
-                    git::rollback_changes(workdir)?;
+                    git::rollback_except(workdir, &pre_existing_untracked)?;
                 }
 
                 // Build test output summary for retry context.
@@ -326,6 +377,7 @@ pub async fn execute_step(
                 // If we've exhausted attempts, mark as failed.
                 if attempt >= max_attempts {
                     storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
+                    hooks::run_post_step(plan, step, attempt, "failed", workdir);
                     return Ok(StepResult {
                         outcome: StepOutcome::Failed,
                         step_id: step.id.clone(),
@@ -341,9 +393,9 @@ pub async fn execute_step(
                 attempt -= 1;
                 increment_step_attempts(conn, &step.id, attempt)?;
 
-                // Rollback any partial changes.
+                // Rollback any partial changes (preserve pre-existing untracked).
                 if git::has_uncommitted_changes(workdir)? {
-                    git::rollback_changes(workdir)?;
+                    git::rollback_except(workdir, &pre_existing_untracked)?;
                 }
 
                 // Update execution log.
@@ -364,6 +416,7 @@ pub async fn execute_step(
                 )?;
 
                 storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
+                hooks::run_post_step(plan, step, attempt, "timeout", workdir);
                 return Ok(StepResult {
                     outcome: StepOutcome::Timeout,
                     step_id: step.id.clone(),
@@ -373,9 +426,9 @@ pub async fn execute_step(
             }
 
             WaitResult::Aborted => {
-                // Rollback any partial changes.
+                // Rollback any partial changes (preserve pre-existing untracked).
                 if git::has_uncommitted_changes(workdir)? {
-                    git::rollback_changes(workdir)?;
+                    git::rollback_except(workdir, &pre_existing_untracked)?;
                 }
 
                 storage::update_execution_log(
@@ -395,6 +448,7 @@ pub async fn execute_step(
                 )?;
 
                 storage::update_step_status(conn, &step.id, StepStatus::Aborted)?;
+                hooks::run_post_step(plan, step, attempt, "aborted", workdir);
                 return Ok(StepResult {
                     outcome: StepOutcome::Aborted,
                     step_id: step.id.clone(),

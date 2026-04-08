@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use clap::{Parser, Subcommand};
+use clap_complete::Shell;
 use std::path::PathBuf;
 
 /// ralph-rs: a deterministic orchestrator for coding agent harnesses.
@@ -157,6 +158,12 @@ pub enum Command {
 
     /// Run preflight checks to verify the environment is ready.
     Doctor,
+
+    /// Generate shell completions for bash, zsh, fish, elvish, or powershell.
+    Completions {
+        /// Shell to generate completions for.
+        shell: Shell,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +207,10 @@ pub enum PlanCommand {
         /// Filter by status.
         #[arg(long)]
         status: Option<String>,
+
+        /// Include archived plans in the listing.
+        #[arg(long)]
+        archived: bool,
     },
 
     /// Show details of a plan.
@@ -222,6 +233,18 @@ pub enum PlanCommand {
         /// Skip confirmation prompt.
         #[arg(long, short)]
         force: bool,
+    },
+
+    /// Archive a completed, failed, or aborted plan.
+    Archive {
+        /// Plan slug.
+        slug: String,
+    },
+
+    /// Restore an archived plan.
+    Unarchive {
+        /// Plan slug.
+        slug: String,
     },
 }
 

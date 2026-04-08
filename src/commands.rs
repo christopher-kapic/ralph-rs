@@ -39,6 +39,7 @@ fn status_icon(status: &str) -> &'static str {
         "aborted" => "\x1b[31m⊘\x1b[0m",     // red circle-slash
         "pending" => "\x1b[90m○\x1b[0m",     // gray circle
         "skipped" => "\x1b[90m⊘\x1b[0m",     // gray circle-slash
+        "archived" => "\x1b[90m▪\x1b[0m",    // gray square
         _ => "?",
     }
 }
@@ -54,6 +55,7 @@ fn colored_status(status: &str) -> String {
         "aborted" => "\x1b[31m",     // red
         "pending" => "\x1b[90m",     // gray
         "skipped" => "\x1b[90m",     // gray
+        "archived" => "\x1b[90m",    // gray
         _ => "\x1b[0m",
     };
     format!("{color}{status}\x1b[0m")
@@ -99,7 +101,13 @@ pub fn plan_create(
     Ok(())
 }
 
-pub fn plan_list(conn: &Connection, project: &str, all: bool, status: Option<&str>) -> Result<()> {
+pub fn plan_list(
+    conn: &Connection,
+    project: &str,
+    all: bool,
+    status: Option<&str>,
+    show_archived: bool,
+) -> Result<()> {
     let plans = storage::list_plans(conn, project, all)?;
 
     if plans.is_empty() {
@@ -107,12 +115,17 @@ pub fn plan_list(conn: &Connection, project: &str, all: bool, status: Option<&st
         return Ok(());
     }
 
-    // Filter by status if provided
+    // Filter by status if provided, otherwise hide archived unless --archived
     let plans: Vec<_> = if let Some(s) = status {
         let target: PlanStatus = s
             .parse()
             .map_err(|_| anyhow::anyhow!("Invalid status: {s}"))?;
         plans.into_iter().filter(|p| p.status == target).collect()
+    } else if !show_archived {
+        plans
+            .into_iter()
+            .filter(|p| p.status != PlanStatus::Archived)
+            .collect()
     } else {
         plans
     };
@@ -204,6 +217,46 @@ pub fn plan_approve(conn: &Connection, slug: &str, project: &str) -> Result<()> 
     storage::update_plan_status(conn, &plan.id, PlanStatus::Ready)?;
     println!(
         "{} Plan '{}' approved and ready for execution",
+        status_icon("complete"),
+        slug
+    );
+    Ok(())
+}
+
+pub fn plan_archive(conn: &Connection, slug: &str, project: &str) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    match plan.status {
+        PlanStatus::Complete | PlanStatus::Failed | PlanStatus::Aborted => {}
+        _ => bail!(
+            "Plan '{}' is in status '{}'; only complete, failed, or aborted plans can be archived",
+            slug,
+            plan.status
+        ),
+    }
+
+    storage::update_plan_status(conn, &plan.id, PlanStatus::Archived)?;
+    println!("{} Archived plan '{}'", status_icon("archived"), slug);
+    Ok(())
+}
+
+pub fn plan_unarchive(conn: &Connection, slug: &str, project: &str) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    if plan.status != PlanStatus::Archived {
+        bail!(
+            "Plan '{}' is not archived (status: '{}')",
+            slug,
+            plan.status
+        );
+    }
+
+    // Restore to complete — the most neutral terminal state.
+    storage::update_plan_status(conn, &plan.id, PlanStatus::Complete)?;
+    println!(
+        "{} Unarchived plan '{}' (status: complete)",
         status_icon("complete"),
         slug
     );
@@ -665,6 +718,7 @@ pub fn cmd_status(
         plan::PlanStatus::Complete => "\x1b[32m",
         plan::PlanStatus::Failed => "\x1b[31m",
         plan::PlanStatus::Aborted => "\x1b[31m",
+        plan::PlanStatus::Archived => "\x1b[90m",
     };
 
     println!(

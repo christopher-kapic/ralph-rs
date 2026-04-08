@@ -344,6 +344,11 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
             "Plan '{}' was aborted. Use `resume` to continue or reset steps.",
             plan.slug
         ),
+        PlanStatus::Archived => bail!(
+            "Plan '{}' is archived. Use `plan unarchive {}` to restore it.",
+            plan.slug,
+            plan.slug
+        ),
     }
 }
 

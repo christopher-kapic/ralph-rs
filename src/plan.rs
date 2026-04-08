@@ -20,6 +20,7 @@ pub enum PlanStatus {
     Complete,
     Failed,
     Aborted,
+    Archived,
 }
 
 impl PlanStatus {
@@ -32,6 +33,7 @@ impl PlanStatus {
             Self::Complete => "complete",
             Self::Failed => "failed",
             Self::Aborted => "aborted",
+            Self::Archived => "archived",
         }
     }
 }
@@ -65,6 +67,7 @@ impl std::str::FromStr for PlanStatus {
             "complete" => Ok(Self::Complete),
             "failed" => Ok(Self::Failed),
             "aborted" => Ok(Self::Aborted),
+            "archived" => Ok(Self::Archived),
             other => Err(ParseStatusError(other.to_string())),
         }
     }
