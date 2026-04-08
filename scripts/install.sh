@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="device-ai/ralph-rs"
+REPO="christopher-kapic/ralph-rs"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 BINARY="ralph-rs"
 
