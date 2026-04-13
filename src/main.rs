@@ -188,12 +188,13 @@ fn main() -> Result<()> {
                     &out,
                 )
             }
-            StepCommand::Remove { step, plan, force } => {
+            StepCommand::Remove { step, step_id, plan, force } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::step_remove(&conn, &p.slug, &project, step, force, &out)
+                commands::step_remove(&conn, &p.slug, &project, step, step_id.as_deref(), force, &out)
             }
             StepCommand::Edit {
                 step,
+                step_id,
                 plan,
                 title,
                 description,
@@ -204,37 +205,40 @@ fn main() -> Result<()> {
                     &p.slug,
                     &project,
                     step,
+                    step_id.as_deref(),
                     title.as_deref(),
                     description.as_deref(),
                     &out,
                 )
             }
-            StepCommand::Reset { step, plan } => {
+            StepCommand::Reset { step, step_id, plan } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::step_reset(&conn, &p.slug, &project, step, &out)
+                commands::step_reset(&conn, &p.slug, &project, step, step_id.as_deref(), &out)
             }
-            StepCommand::Move { step, to, plan } => {
+            StepCommand::Move { step, step_id, to, plan } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::step_move(&conn, &p.slug, &project, step, to, &out)
+                commands::step_move(&conn, &p.slug, &project, step, step_id.as_deref(), to, &out)
             }
             StepCommand::SetHook {
                 step,
+                step_id,
                 plan,
                 lifecycle,
                 hook,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::cmd_step_set_hook(&conn, &p.slug, &project, step, lifecycle, &hook, &out)
+                commands::cmd_step_set_hook(&conn, &p.slug, &project, step, step_id.as_deref(), lifecycle, &hook, &out)
             }
             StepCommand::UnsetHook {
                 step,
+                step_id,
                 plan,
                 lifecycle,
                 hook,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::cmd_step_unset_hook(
-                    &conn, &p.slug, &project, step, lifecycle, &hook, &out,
+                    &conn, &p.slug, &project, step, step_id.as_deref(), lifecycle, &hook, &out,
                 )
             }
         },

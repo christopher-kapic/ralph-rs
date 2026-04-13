@@ -30,6 +30,61 @@ pub fn resolve_project(project: Option<&Path>) -> Result<String> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
+use crate::plan::Step;
+
+/// Resolve a step reference: either a 1-based positional number within the
+/// plan's step list, or a UUID string looked up via `storage::get_step_by_id`.
+///
+/// Exactly one of `step_num` / `step_id` must be `Some`; the caller (clap
+/// `conflicts_with`) guarantees they are mutually exclusive, and this function
+/// checks that at least one is present.
+///
+/// Returns `(step, step_display_num)` where `step_display_num` is the 1-based
+/// position in the plan's step list (used for user-facing messages).
+pub fn resolve_step(
+    conn: &Connection,
+    plan_id: &str,
+    step_num: Option<usize>,
+    step_id: Option<&str>,
+) -> Result<(Step, usize)> {
+    let steps = storage::list_steps(conn, plan_id)?;
+
+    match (step_num, step_id) {
+        (Some(num), None) => {
+            if num == 0 || num > steps.len() {
+                bail!(
+                    "Step {} is out of range (plan has {} steps)",
+                    num,
+                    steps.len()
+                );
+            }
+            Ok((steps.into_iter().nth(num - 1).unwrap(), num))
+        }
+        (None, Some(id)) => {
+            let step = storage::get_step_by_id(conn, id)?
+                .with_context(|| format!("Step not found with id: {id}"))?;
+            // Ensure the step belongs to this plan.
+            if step.plan_id != plan_id {
+                bail!("Step {id} does not belong to this plan");
+            }
+            // Find the 1-based position for display.
+            let pos = steps
+                .iter()
+                .position(|s| s.id == step.id)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            Ok((step, pos))
+        }
+        (None, None) => {
+            bail!("Provide either a step number or --step-id");
+        }
+        (Some(_), Some(_)) => {
+            // Should be prevented by clap conflicts_with, but guard anyway.
+            bail!("Cannot specify both a step number and --step-id");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plan commands
 // ---------------------------------------------------------------------------
@@ -554,26 +609,18 @@ pub fn step_remove(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: usize,
+    step_num: Option<usize>,
+    step_id: Option<&str>,
     force: bool,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
-    let steps = storage::list_steps(conn, &plan.id)?;
-    if step_num == 0 || step_num > steps.len() {
-        bail!(
-            "Step {} is out of range (plan has {} steps)",
-            step_num,
-            steps.len()
-        );
-    }
-
-    let step = &steps[step_num - 1];
+    let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
 
     if !force {
-        print!("Remove step #{} '{}'? [y/N] ", step_num, step.title);
+        print!("Remove step #{} '{}'? [y/N] ", display_num, step.title);
         io::stdout().flush()?;
 
         let mut input = String::new();
@@ -588,17 +635,19 @@ pub fn step_remove(
     println!(
         "{} Removed step #{}: {}",
         output::check_icon(out.color),
-        step_num,
+        display_num,
         step.title
     );
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn step_edit(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: usize,
+    step_num: Option<usize>,
+    step_id: Option<&str>,
     title: Option<&str>,
     description: Option<&str>,
     out: &OutputContext,
@@ -606,16 +655,7 @@ pub fn step_edit(
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
-    let steps = storage::list_steps(conn, &plan.id)?;
-    if step_num == 0 || step_num > steps.len() {
-        bail!(
-            "Step {} is out of range (plan has {} steps)",
-            step_num,
-            steps.len()
-        );
-    }
-
-    let step = &steps[step_num - 1];
+    let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
 
     if title.is_none() && description.is_none() {
         bail!("Nothing to edit: provide --title and/or --description");
@@ -625,7 +665,7 @@ pub fn step_edit(
     println!(
         "{} Updated step #{}: {}",
         output::check_icon(out.color),
-        step_num,
+        display_num,
         title.unwrap_or(&step.title)
     );
     Ok(())
@@ -635,27 +675,19 @@ pub fn step_reset(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: usize,
+    step_num: Option<usize>,
+    step_id: Option<&str>,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
-    let steps = storage::list_steps(conn, &plan.id)?;
-    if step_num == 0 || step_num > steps.len() {
-        bail!(
-            "Step {} is out of range (plan has {} steps)",
-            step_num,
-            steps.len()
-        );
-    }
-
-    let step = &steps[step_num - 1];
+    let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
     storage::reset_step(conn, &step.id)?;
     println!(
         "{} Reset step #{} '{}' to pending (0 attempts)",
         output::check_icon(out.color),
-        step_num,
+        display_num,
         step.title
     );
     Ok(())
@@ -665,7 +697,8 @@ pub fn step_move(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: usize,
+    step_num: Option<usize>,
+    step_id: Option<&str>,
     to: usize,
     out: &OutputContext,
 ) -> Result<()> {
@@ -673,13 +706,33 @@ pub fn step_move(
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
     let steps = storage::list_steps(conn, &plan.id)?;
-    if step_num == 0 || step_num > steps.len() {
-        bail!(
-            "Step {} is out of range (plan has {} steps)",
-            step_num,
-            steps.len()
-        );
-    }
+
+    // Resolve the step and its current 1-based position.
+    let (step, display_num) = if let Some(id) = step_id {
+        let s = storage::get_step_by_id(conn, id)?
+            .with_context(|| format!("Step not found with id: {id}"))?;
+        if s.plan_id != plan.id {
+            bail!("Step {id} does not belong to this plan");
+        }
+        let pos = steps
+            .iter()
+            .position(|x| x.id == s.id)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        (s, pos)
+    } else if let Some(num) = step_num {
+        if num == 0 || num > steps.len() {
+            bail!(
+                "Step {} is out of range (plan has {} steps)",
+                num,
+                steps.len()
+            );
+        }
+        (steps[num - 1].clone(), num)
+    } else {
+        bail!("Provide either a step number or --step-id");
+    };
+
     if to == 0 || to > steps.len() {
         bail!(
             "Target position {} is out of range (plan has {} steps)",
@@ -687,12 +740,10 @@ pub fn step_move(
             steps.len()
         );
     }
-    if step_num == to {
+    if display_num == to {
         println!("Step is already at position {}.", to);
         return Ok(());
     }
-
-    let step = &steps[step_num - 1];
 
     // Calculate the new sort_key for the target position.
     // We need a key that places the step at position `to` (1-based)
@@ -1409,11 +1460,13 @@ pub fn cmd_hooks_import(file: &Path, force: bool, _out: &OutputContext) -> Resul
 // Step/plan hook attachment commands
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_step_set_hook(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: usize,
+    step_num: Option<usize>,
+    step_id: Option<&str>,
     lifecycle: Lifecycle,
     hook_name: &str,
     _out: &OutputContext,
@@ -1428,47 +1481,37 @@ pub fn cmd_step_set_hook(
 
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
-    let steps = storage::list_steps(conn, &plan.id)?;
-    if step_num == 0 || step_num > steps.len() {
-        bail!(
-            "Step {step_num} is out of range (plan has {} steps)",
-            steps.len()
-        );
-    }
-    let step = &steps[step_num - 1];
+
+    let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
 
     storage::attach_hook_to_step(conn, &plan.id, &step.id, lifecycle.as_str(), hook_name)?;
     println!(
-        "Attached hook '{hook_name}' to step {step_num} of '{plan_slug}' at {lifecycle}"
+        "Attached hook '{hook_name}' to step {display_num} of '{plan_slug}' at {lifecycle}"
     );
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_step_unset_hook(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: usize,
+    step_num: Option<usize>,
+    step_id: Option<&str>,
     lifecycle: Lifecycle,
     hook_name: &str,
     _out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
-    let steps = storage::list_steps(conn, &plan.id)?;
-    if step_num == 0 || step_num > steps.len() {
-        bail!(
-            "Step {step_num} is out of range (plan has {} steps)",
-            steps.len()
-        );
-    }
-    let step = &steps[step_num - 1];
+
+    let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
 
     let removed = storage::detach_hook(conn, &plan.id, Some(&step.id), lifecycle.as_str(), hook_name)?;
     if removed == 0 {
-        bail!("No hook '{hook_name}' attached to step {step_num} at {lifecycle}");
+        bail!("No hook '{hook_name}' attached to step {display_num} at {lifecycle}");
     }
-    println!("Detached hook '{hook_name}' from step {step_num} of '{plan_slug}'");
+    println!("Detached hook '{hook_name}' from step {display_num} of '{plan_slug}'");
     Ok(())
 }
 
@@ -1794,7 +1837,7 @@ mod tests {
         )
         .unwrap();
 
-        step_remove(&conn, "my-plan", &project, 2, true, &test_out()).unwrap();
+        step_remove(&conn, "my-plan", &project, Some(2), None, true, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1828,7 +1871,8 @@ mod tests {
             &conn,
             "my-plan",
             &project,
-            1,
+            Some(1),
+            None,
             Some("New title"),
             Some("New desc"),
             &test_out(),
@@ -1859,7 +1903,7 @@ mod tests {
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
 
-        step_reset(&conn, "my-plan", &project, 1, &test_out()).unwrap();
+        step_reset(&conn, "my-plan", &project, Some(1), None, &test_out()).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Pending);
@@ -1885,7 +1929,7 @@ mod tests {
         .unwrap();
 
         // Move step 3 (C) to position 1
-        step_move(&conn, "my-plan", &project, 3, 1, &test_out()).unwrap();
+        step_move(&conn, "my-plan", &project, Some(3), None, 1, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1915,7 +1959,7 @@ mod tests {
         .unwrap();
 
         // Move step 1 (A) to position 3
-        step_move(&conn, "my-plan", &project, 1, 3, &test_out()).unwrap();
+        step_move(&conn, "my-plan", &project, Some(1), None, 3, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -2116,7 +2160,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = step_remove(&conn, "my-plan", &project, 5, true, &test_out());
+        let result = step_remove(&conn, "my-plan", &project, Some(5), None, true, &test_out());
         assert!(result.is_err());
     }
 }

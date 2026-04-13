@@ -209,6 +209,23 @@ pub fn get_step(conn: &Connection, step_id: &str) -> Result<Step> {
     .with_context(|| format!("Step not found: {step_id}"))
 }
 
+/// Fetch a single step by ID, returning `None` if no row matches.
+///
+/// Unlike [`get_step`] (which errors on missing), this variant is useful when
+/// the caller wants to handle the "not found" case explicitly (e.g. validating
+/// a user-supplied `--step-id` flag).
+pub fn get_step_by_id(conn: &Connection, step_id: &str) -> Result<Option<Step>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at
+         FROM steps WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map(params![step_id], Step::from_row)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
 /// Update a step's status (and bump attempts if transitioning to in_progress).
 pub fn update_step_status(conn: &Connection, step_id: &str, status: StepStatus) -> Result<()> {
     let affected = conn.execute(
