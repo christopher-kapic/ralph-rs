@@ -28,6 +28,7 @@ use crate::cli::{
     AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
     PlanHarnessCommand, StepCommand,
 };
+
 use crate::commands::resolve_project;
 use crate::output::OutputContext;
 use crate::plan::Plan;
@@ -130,6 +131,27 @@ fn main() -> Result<()> {
                 }
                 PlanDependencyCommand::List { slug } => {
                     commands::plan_dependency_list(&conn, &slug, &project, &out)
+                }
+            },
+            PlanCommand::Harness(harness_cmd) => match harness_cmd {
+                PlanHarnessCommand::Set { .. } => Ok(()),
+                PlanHarnessCommand::Show { .. } => Ok(()),
+                PlanHarnessCommand::Generate {
+                    description,
+                    use_harness,
+                    ..
+                } => {
+                    let harness_name = use_harness
+                        .or(cli.harness)
+                        .unwrap_or_else(|| _config.default_harness.clone());
+                    let rt = tokio::runtime::Runtime::new()?;
+                    let exit_code = rt.block_on(plan_harness::run_plan_harness(
+                        &_config,
+                        &harness_name,
+                        &project,
+                        description.as_deref(),
+                    ))?;
+                    std::process::exit(exit_code);
                 }
             },
         },
@@ -392,27 +414,6 @@ fn main() -> Result<()> {
             runner::skip_step(&conn, &plan, step_num, reason.as_deref())?;
             Ok(())
         }
-
-        // -- Plan-harness --
-        Command::PlanHarness(args) => match args.command {
-            Some(PlanHarnessCommand::Set { .. }) => Ok(()),
-            Some(PlanHarnessCommand::Show { .. }) => Ok(()),
-            None => {
-                // Interactive plan-harness mode: spawn a harness to create/update plans.
-                let harness_name = args
-                    .use_harness
-                    .or(cli.harness)
-                    .unwrap_or_else(|| _config.default_harness.clone());
-                let rt = tokio::runtime::Runtime::new()?;
-                let exit_code = rt.block_on(plan_harness::run_plan_harness(
-                    &_config,
-                    &harness_name,
-                    &project,
-                    args.description.as_deref(),
-                ))?;
-                std::process::exit(exit_code);
-            }
-        },
 
         // -- Export --
         Command::Export { plan, output } => {

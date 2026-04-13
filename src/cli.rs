@@ -121,9 +121,6 @@ pub enum Command {
         reason: Option<String>,
     },
 
-    /// Manage plan-level harness configuration.
-    PlanHarness(PlanHarnessArgs),
-
     /// Export a plan to a portable JSON file.
     Export {
         /// Plan slug to export.
@@ -316,6 +313,10 @@ pub enum PlanCommand {
         /// Plan slug.
         slug: String,
     },
+
+    /// Manage the plan-generation harness.
+    #[command(subcommand)]
+    Harness(PlanHarnessCommand),
 }
 
 // ---------------------------------------------------------------------------
@@ -484,40 +485,40 @@ pub enum StepCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Plan-harness subcommand
+// Plan harness subcommands (nested under `plan harness`)
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Parser)]
-pub struct PlanHarnessArgs {
-    /// Description of what to plan. If omitted, the harness will ask interactively.
-    #[arg(long, short)]
-    pub description: Option<String>,
-
-    /// Override the harness to use for planning.
-    #[arg(long)]
-    pub use_harness: Option<String>,
-
-    #[command(subcommand)]
-    pub command: Option<PlanHarnessCommand>,
-}
 
 #[derive(Debug, Subcommand)]
 pub enum PlanHarnessCommand {
-    /// Set the harness for a plan.
+    /// Set the plan-generation harness.
     Set {
-        /// Plan slug.
-        #[arg(long)]
-        plan: Option<String>,
-
         /// Harness name to assign.
         harness: String,
+
+        /// Plan slug. Defaults to the active plan.
+        #[arg(long)]
+        plan: Option<String>,
     },
 
     /// Show the current harness for a plan.
     Show {
-        /// Plan slug.
+        /// Plan slug. Defaults to the active plan.
         #[arg(long)]
         plan: Option<String>,
+    },
+
+    /// Generate a plan via the configured harness.
+    Generate {
+        /// Description of what to plan.
+        description: Option<String>,
+
+        /// Plan slug. Defaults to the active plan.
+        #[arg(long)]
+        plan: Option<String>,
+
+        /// Override the harness to use for planning.
+        #[arg(long)]
+        use_harness: Option<String>,
     },
 }
 
@@ -960,15 +961,46 @@ mod tests {
 
     #[test]
     fn test_parse_plan_harness_set() {
-        let cli = Cli::try_parse_from(["ralph-rs", "plan-harness", "set", "codex"]).unwrap();
-        if let Command::PlanHarness(PlanHarnessArgs {
-            command: Some(PlanHarnessCommand::Set { harness, .. }),
-            ..
-        }) = cli.command
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "plan", "harness", "set", "codex"]).unwrap();
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Set {
+            harness, ..
+        })) = cli.command
         {
             assert_eq!(harness, "codex");
         } else {
-            panic!("Expected PlanHarness Set");
+            panic!("Expected Plan Harness Set");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_harness_show() {
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "plan", "harness", "show"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { .. }))
+        ));
+    }
+
+    #[test]
+    fn test_parse_plan_harness_generate() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "harness",
+            "generate",
+            "Add feature X",
+        ])
+        .unwrap();
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Generate {
+            description,
+            ..
+        })) = cli.command
+        {
+            assert_eq!(description.as_deref(), Some("Add feature X"));
+        } else {
+            panic!("Expected Plan Harness Generate");
         }
     }
 
