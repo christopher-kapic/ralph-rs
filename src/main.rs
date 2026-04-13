@@ -444,7 +444,17 @@ fn main() -> Result<()> {
             step,
             limit,
             full,
-        } => commands::cmd_log(&conn, &project, plan.as_deref(), step, limit, full, &out),
+            lines,
+        } => {
+            let output_mode = if full {
+                commands::LogOutputMode::Full
+            } else if let Some(n) = lines {
+                commands::LogOutputMode::Truncated(n)
+            } else {
+                commands::LogOutputMode::Hidden
+            };
+            commands::cmd_log(&conn, &project, plan.as_deref(), step, limit, &output_mode, &out)
+        }
 
         // -- Agents --
         Command::Agents(subcmd) => match subcmd {

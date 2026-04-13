@@ -168,9 +168,14 @@ pub enum Command {
         #[arg(long, short)]
         limit: Option<usize>,
 
-        /// Show full log output (stdout/stderr).
-        #[arg(long)]
+        /// Show full log output (stdout/stderr) with no truncation.
+        #[arg(long, conflicts_with = "lines")]
         full: bool,
+
+        /// Maximum number of stdout/stderr lines to show per attempt
+        /// (default: 50). Implies showing output. Conflicts with --full.
+        #[arg(long)]
+        lines: Option<usize>,
     },
 
     /// List and manage agent file templates.

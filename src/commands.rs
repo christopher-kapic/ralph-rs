@@ -913,13 +913,24 @@ pub fn cmd_status(
 // Log command
 // ---------------------------------------------------------------------------
 
+/// Controls how harness stdout/stderr is displayed in log output.
+///
+/// - `Hidden` — don't show output (default when no flags given).
+/// - `Truncated(n)` — show up to `n` lines per stream.
+/// - `Full` — show everything, no truncation.
+pub enum LogOutputMode {
+    Hidden,
+    Truncated(usize),
+    Full,
+}
+
 pub fn cmd_log(
     conn: &Connection,
     project: &str,
     plan_slug: Option<&str>,
     step_num: Option<usize>,
     limit: Option<usize>,
-    full: bool,
+    output_mode: &LogOutputMode,
     out: &OutputContext,
 ) -> Result<()> {
     // Resolve plan
@@ -953,7 +964,7 @@ pub fn cmd_log(
 
         if out.format == OutputFormat::Json {
             for log in &logs {
-                output::emit_ndjson(&output::LogEntrySummary::from(log));
+                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode));
             }
             return Ok(());
         }
@@ -967,7 +978,7 @@ pub fn cmd_log(
         eprintln!();
 
         for log in &logs {
-            print_log_entry(&step.title, log, full, out.color);
+            print_log_entry(&step.title, log, output_mode, out.color);
         }
     } else {
         // Show all logs for the plan
@@ -975,7 +986,7 @@ pub fn cmd_log(
 
         if out.format == OutputFormat::Json {
             for (_, log) in &entries {
-                output::emit_ndjson(&output::LogEntrySummary::from(log));
+                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode));
             }
             return Ok(());
         }
@@ -993,14 +1004,19 @@ pub fn cmd_log(
         eprintln!();
 
         for (step_title, log) in &entries {
-            print_log_entry(step_title, log, full, out.color);
+            print_log_entry(step_title, log, output_mode, out.color);
         }
     }
 
     Ok(())
 }
 
-fn print_log_entry(step_title: &str, log: &ExecutionLog, full: bool, color: bool) {
+fn print_log_entry(
+    step_title: &str,
+    log: &ExecutionLog,
+    output_mode: &LogOutputMode,
+    color: bool,
+) {
     let icon = output::log_status_icon(log.committed, log.rolled_back, color);
 
     let duration_str = log
@@ -1033,12 +1049,21 @@ fn print_log_entry(step_title: &str, log: &ExecutionLog, full: bool, color: bool
         println!("    cost: ${:.4}{}", cost, tokens);
     }
 
-    if full {
+    if !matches!(output_mode, LogOutputMode::Hidden) {
+        let take_n = match output_mode {
+            LogOutputMode::Truncated(n) => Some(*n),
+            _ => None,
+        };
         if let Some(ref stdout) = log.harness_stdout
             && !stdout.is_empty()
         {
             println!("    --- stdout ---");
-            for line in stdout.lines().take(50) {
+            let lines_iter = stdout.lines();
+            let lines: Box<dyn Iterator<Item = &str>> = match take_n {
+                Some(n) => Box::new(lines_iter.take(n)),
+                None => Box::new(lines_iter),
+            };
+            for line in lines {
                 println!("    {line}");
             }
         }
@@ -1046,7 +1071,12 @@ fn print_log_entry(step_title: &str, log: &ExecutionLog, full: bool, color: bool
             && !stderr.is_empty()
         {
             println!("    --- stderr ---");
-            for line in stderr.lines().take(50) {
+            let lines_iter = stderr.lines();
+            let lines: Box<dyn Iterator<Item = &str>> = match take_n {
+                Some(n) => Box::new(lines_iter.take(n)),
+                None => Box::new(lines_iter),
+            };
+            for line in lines {
                 println!("    {line}");
             }
         }

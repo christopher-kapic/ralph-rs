@@ -373,6 +373,51 @@ pub struct LogEntrySummary {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub session_id: Option<String>,
+    /// Included when `--full` or `--lines` is specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    /// Included when `--full` or `--lines` is specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+}
+
+impl LogEntrySummary {
+    /// Build a summary, controlling stdout/stderr inclusion via [`LogOutputMode`].
+    ///
+    /// - `Hidden` → `stdout`/`stderr` are `None` (omitted from JSON).
+    /// - `Truncated(n)` → include up to `n` lines per stream.
+    /// - `Full` → include full text, no truncation.
+    pub fn new(l: &ExecutionLog, mode: &crate::commands::LogOutputMode) -> Self {
+        use crate::commands::LogOutputMode;
+
+        let include = |text: &Option<String>| -> Option<String> {
+            match mode {
+                LogOutputMode::Hidden => None,
+                LogOutputMode::Full => text.clone(),
+                LogOutputMode::Truncated(n) => text.as_ref().map(|s| {
+                    s.lines().take(*n).collect::<Vec<_>>().join("\n")
+                }),
+            }
+        };
+
+        Self {
+            id: l.id,
+            step_id: l.step_id.clone(),
+            attempt: l.attempt,
+            started_at: l.started_at,
+            duration_secs: l.duration_secs,
+            test_results: l.test_results.clone(),
+            rolled_back: l.rolled_back,
+            committed: l.committed,
+            commit_hash: l.commit_hash.clone(),
+            cost_usd: l.cost_usd,
+            input_tokens: l.input_tokens,
+            output_tokens: l.output_tokens,
+            session_id: l.session_id.clone(),
+            stdout: include(&l.harness_stdout),
+            stderr: include(&l.harness_stderr),
+        }
+    }
 }
 
 impl From<&ExecutionLog> for LogEntrySummary {
@@ -391,6 +436,8 @@ impl From<&ExecutionLog> for LogEntrySummary {
             input_tokens: l.input_tokens,
             output_tokens: l.output_tokens,
             session_id: l.session_id.clone(),
+            stdout: None,
+            stderr: None,
         }
     }
 }
@@ -666,6 +713,8 @@ mod tests {
             input_tokens: Some(500),
             output_tokens: Some(200),
             session_id: None,
+            stdout: None,
+            stderr: None,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"step_id\""));
