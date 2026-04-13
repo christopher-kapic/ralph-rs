@@ -72,6 +72,23 @@ pub fn get_plan_slug_by_id(conn: &Connection, id: &str) -> Result<Option<String>
     }
 }
 
+/// Find the most recent active plan for a project. Active means in_progress,
+/// ready, or failed. When `include_complete` is true, completed plans are also
+/// considered (useful for `status` after a plan finishes).
+pub fn find_active_plan(
+    conn: &Connection,
+    project: &str,
+    include_complete: bool,
+) -> Result<Option<Plan>> {
+    let plans = list_plans(conn, project, false)?;
+    Ok(plans.into_iter().find(|p| {
+        matches!(
+            p.status,
+            PlanStatus::InProgress | PlanStatus::Ready | PlanStatus::Failed
+        ) || (include_complete && p.status == PlanStatus::Complete)
+    }))
+}
+
 /// List plans. If `all` is false, only return plans for `project`.
 pub fn list_plans(conn: &Connection, project: &str, all: bool) -> Result<Vec<Plan>> {
     let mut plans = Vec::new();

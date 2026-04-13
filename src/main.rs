@@ -30,7 +30,26 @@ use crate::cli::{
 };
 use crate::commands::resolve_project;
 use crate::output::OutputContext;
+use crate::plan::Plan;
 use crate::runner::RunOptions;
+
+/// Resolve a plan from an optional slug: if provided, look it up; otherwise
+/// find the active plan for the project. `include_complete` controls whether
+/// completed plans count as "active" (useful for status/log).
+fn resolve_plan(
+    conn: &rusqlite::Connection,
+    slug: Option<String>,
+    project: &str,
+    include_complete: bool,
+) -> Result<Plan> {
+    if let Some(s) = slug.filter(|s| !s.is_empty()) {
+        storage::get_plan_by_slug(conn, &s, project)?
+            .with_context(|| format!("Plan not found: {s}"))
+    } else {
+        storage::find_active_plan(conn, project, include_complete)?
+            .context("No active plan found. Specify a plan slug as a positional argument.")
+    }
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -118,11 +137,8 @@ fn main() -> Result<()> {
         // -- Step --
         Command::Step(subcmd) => match subcmd {
             StepCommand::List { plan } => {
-                let slug = plan.unwrap_or_default();
-                if slug.is_empty() {
-                    anyhow::bail!("--plan is required for step list");
-                }
-                commands::step_list(&conn, &slug, &project, &out)
+                let p = resolve_plan(&conn, plan, &project, false)?;
+                commands::step_list(&conn, &p.slug, &project, &out)
             }
             StepCommand::Add {
                 title,
@@ -134,14 +150,11 @@ fn main() -> Result<()> {
                 criteria,
                 max_retries,
             } => {
-                let slug = plan.unwrap_or_default();
-                if slug.is_empty() {
-                    anyhow::bail!("--plan is required for step add");
-                }
+                let p = resolve_plan(&conn, plan, &project, false)?;
                 let h = cli.harness.as_deref().or(harness.as_deref());
                 commands::step_add(
                     &conn,
-                    &slug,
+                    &p.slug,
                     &project,
                     &title,
                     description.as_deref(),
@@ -154,11 +167,8 @@ fn main() -> Result<()> {
                 )
             }
             StepCommand::Remove { step, plan, force } => {
-                let slug = plan.unwrap_or_default();
-                if slug.is_empty() {
-                    anyhow::bail!("--plan is required for step remove");
-                }
-                commands::step_remove(&conn, &slug, &project, step, force, &out)
+                let p = resolve_plan(&conn, plan, &project, false)?;
+                commands::step_remove(&conn, &p.slug, &project, step, force, &out)
             }
             StepCommand::Edit {
                 step,
@@ -166,13 +176,10 @@ fn main() -> Result<()> {
                 title,
                 description,
             } => {
-                let slug = plan.unwrap_or_default();
-                if slug.is_empty() {
-                    anyhow::bail!("--plan is required for step edit");
-                }
+                let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::step_edit(
                     &conn,
-                    &slug,
+                    &p.slug,
                     &project,
                     step,
                     title.as_deref(),
@@ -181,18 +188,12 @@ fn main() -> Result<()> {
                 )
             }
             StepCommand::Reset { step, plan } => {
-                let slug = plan.unwrap_or_default();
-                if slug.is_empty() {
-                    anyhow::bail!("--plan is required for step reset");
-                }
-                commands::step_reset(&conn, &slug, &project, step, &out)
+                let p = resolve_plan(&conn, plan, &project, false)?;
+                commands::step_reset(&conn, &p.slug, &project, step, &out)
             }
             StepCommand::Move { step, to, plan } => {
-                let slug = plan.unwrap_or_default();
-                if slug.is_empty() {
-                    anyhow::bail!("--plan is required for step move");
-                }
-                commands::step_move(&conn, &slug, &project, step, to, &out)
+                let p = resolve_plan(&conn, plan, &project, false)?;
+                commands::step_move(&conn, &p.slug, &project, step, to, &out)
             }
             StepCommand::SetHook {
                 step,
@@ -200,11 +201,8 @@ fn main() -> Result<()> {
                 lifecycle,
                 hook,
             } => {
-                let slug = plan.unwrap_or_default();
-                if slug.is_empty() {
-                    anyhow::bail!("--plan is required for step set-hook");
-                }
-                commands::cmd_step_set_hook(&conn, &slug, &project, step, lifecycle, &hook, &out)
+                let p = resolve_plan(&conn, plan, &project, false)?;
+                commands::cmd_step_set_hook(&conn, &p.slug, &project, step, lifecycle, &hook, &out)
             }
             StepCommand::UnsetHook {
                 step,
@@ -212,11 +210,10 @@ fn main() -> Result<()> {
                 lifecycle,
                 hook,
             } => {
-                let slug = plan.unwrap_or_default();
-                if slug.is_empty() {
-                    anyhow::bail!("--plan is required for step unset-hook");
-                }
-                commands::cmd_step_unset_hook(&conn, &slug, &project, step, lifecycle, &hook, &out)
+                let p = resolve_plan(&conn, plan, &project, false)?;
+                commands::cmd_step_unset_hook(
+                    &conn, &p.slug, &project, step, lifecycle, &hook, &out,
+                )
             }
         },
 
@@ -320,12 +317,8 @@ fn main() -> Result<()> {
             }
 
             // Single-plan run path.
-            let slug = plan_slug.unwrap_or_default();
-            if slug.is_empty() {
-                anyhow::bail!("--plan is required for run (or use --all)");
-            }
-            let plan = storage::get_plan_by_slug(&conn, &slug, &project)?
-                .with_context(|| format!("Plan not found: {slug}"))?;
+            let plan = resolve_plan(&conn, plan_slug, &project, false)?;
+            let slug = plan.slug.clone();
 
             // Preflight checks
             if !skip_preflight && !dry_run {
@@ -365,12 +358,8 @@ fn main() -> Result<()> {
 
         // -- Resume --
         Command::Resume { plan: plan_slug } => {
-            let slug = plan_slug.unwrap_or_default();
-            if slug.is_empty() {
-                anyhow::bail!("--plan is required for resume");
-            }
-            let plan = storage::get_plan_by_slug(&conn, &slug, &project)?
-                .with_context(|| format!("Plan not found: {slug}"))?;
+            let plan = resolve_plan(&conn, plan_slug, &project, false)?;
+            let slug = plan.slug.clone();
 
             let rt = tokio::runtime::Runtime::new()?;
             let result = rt.block_on(async {
@@ -398,12 +387,7 @@ fn main() -> Result<()> {
             step: step_num,
             reason,
         } => {
-            let slug = plan_slug.unwrap_or_default();
-            if slug.is_empty() {
-                anyhow::bail!("--plan is required for skip");
-            }
-            let plan = storage::get_plan_by_slug(&conn, &slug, &project)?
-                .with_context(|| format!("Plan not found: {slug}"))?;
+            let plan = resolve_plan(&conn, plan_slug, &project, false)?;
 
             runner::skip_step(&conn, &plan, step_num, reason.as_deref())?;
             Ok(())

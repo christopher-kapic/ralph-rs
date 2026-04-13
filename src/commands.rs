@@ -843,18 +843,12 @@ pub fn cmd_status(
         storage::get_plan_by_slug(conn, slug, project)?
             .with_context(|| format!("Plan not found: {slug}"))?
     } else {
-        // Find the most recent active plan (in_progress, ready, or failed).
-        let plans = storage::list_plans(conn, project, false)?;
-        let active = plans.into_iter().find(|p| {
-            matches!(
-                p.status,
-                plan::PlanStatus::InProgress | plan::PlanStatus::Ready | plan::PlanStatus::Failed
-            )
-        });
-        match active {
+        // Find the most recent active plan, including completed plans so that
+        // running `status` right after a plan finishes still shows it.
+        match storage::find_active_plan(conn, project, true)? {
             Some(p) => p,
             None => {
-                println!("No active plan found. Use --plan to specify a plan slug.");
+                println!("No active plan found. Specify a plan slug as a positional argument.");
                 return Ok(());
             }
         }
@@ -954,20 +948,10 @@ pub fn cmd_log(
         storage::get_plan_by_slug(conn, slug, project)?
             .with_context(|| format!("Plan not found: {slug}"))?
     } else {
-        let plans = storage::list_plans(conn, project, false)?;
-        let active = plans.into_iter().find(|p| {
-            matches!(
-                p.status,
-                plan::PlanStatus::InProgress
-                    | plan::PlanStatus::Ready
-                    | plan::PlanStatus::Failed
-                    | plan::PlanStatus::Complete
-            )
-        });
-        match active {
+        match storage::find_active_plan(conn, project, true)? {
             Some(p) => p,
             None => {
-                println!("No plan found. Use --plan to specify a plan slug.");
+                println!("No plan found. Specify a plan slug as a positional argument.");
                 return Ok(());
             }
         }

@@ -59,8 +59,7 @@ pub enum Command {
 
     /// Run the next pending step (or all remaining steps) of a plan.
     Run {
-        /// Plan slug to run.
-        #[arg(long)]
+        /// Plan slug to run. Defaults to the active plan.
         plan: Option<String>,
 
         /// Run only the next pending step instead of all remaining.
@@ -99,15 +98,13 @@ pub enum Command {
 
     /// Resume a plan from the last failed or in-progress step.
     Resume {
-        /// Plan slug to resume.
-        #[arg(long)]
+        /// Plan slug to resume. Defaults to the active plan.
         plan: Option<String>,
     },
 
     /// Skip the current or specified step.
     Skip {
-        /// Plan slug.
-        #[arg(long)]
+        /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
         /// Step number to skip (1-based). Defaults to current step.
@@ -149,7 +146,6 @@ pub enum Command {
     /// Show the status of the current or specified plan.
     Status {
         /// Plan slug. Defaults to the active plan.
-        #[arg(long)]
         plan: Option<String>,
 
         /// Show verbose output including step details.
@@ -159,8 +155,7 @@ pub enum Command {
 
     /// Show execution logs.
     Log {
-        /// Plan slug.
-        #[arg(long)]
+        /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
         /// Step number (1-based) to show logs for.
@@ -359,8 +354,7 @@ pub enum PlanDependencyCommand {
 pub enum StepCommand {
     /// List steps in a plan.
     List {
-        /// Plan slug.
-        #[arg(long)]
+        /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
     },
 
@@ -369,8 +363,7 @@ pub enum StepCommand {
         /// Step title.
         title: String,
 
-        /// Plan slug.
-        #[arg(long)]
+        /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
         /// Step description.
@@ -403,8 +396,7 @@ pub enum StepCommand {
         /// Step number (1-based).
         step: usize,
 
-        /// Plan slug.
-        #[arg(long)]
+        /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
         /// Skip confirmation prompt.
@@ -417,8 +409,7 @@ pub enum StepCommand {
         /// Step number (1-based).
         step: usize,
 
-        /// Plan slug.
-        #[arg(long)]
+        /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
         /// New title.
@@ -435,8 +426,7 @@ pub enum StepCommand {
         /// Step number (1-based).
         step: usize,
 
-        /// Plan slug.
-        #[arg(long)]
+        /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
     },
 
@@ -449,8 +439,7 @@ pub enum StepCommand {
         #[arg(long)]
         to: usize,
 
-        /// Plan slug.
-        #[arg(long)]
+        /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
     },
 
@@ -459,8 +448,7 @@ pub enum StepCommand {
         /// Step number (1-based).
         step: usize,
 
-        /// Plan slug.
-        #[arg(long)]
+        /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
         /// Lifecycle event: pre-step, post-step, pre-test, post-test.
@@ -477,8 +465,7 @@ pub enum StepCommand {
         /// Step number (1-based).
         step: usize,
 
-        /// Plan slug.
-        #[arg(long)]
+        /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
         /// Lifecycle event.
@@ -706,7 +693,6 @@ mod tests {
             "step",
             "add",
             "Implement parser",
-            "--plan",
             "my-feature",
             "--description",
             "Build the parser module",
@@ -731,7 +717,7 @@ mod tests {
     #[test]
     fn test_parse_run() {
         let cli =
-            Cli::try_parse_from(["ralph-rs", "run", "--plan", "my-feature", "--all"]).unwrap();
+            Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--all"]).unwrap();
         if let Command::Run { plan, all, .. } = cli.command {
             assert_eq!(plan.as_deref(), Some("my-feature"));
             assert!(all);
@@ -743,7 +729,7 @@ mod tests {
     #[test]
     fn test_parse_run_step() {
         let cli =
-            Cli::try_parse_from(["ralph-rs", "run", "--plan", "my-feature", "--step"]).unwrap();
+            Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--step"]).unwrap();
         if let Command::Run {
             plan, step, all, ..
         } = cli.command
@@ -772,7 +758,6 @@ mod tests {
         let cli = Cli::try_parse_from([
             "ralph-rs",
             "run",
-            "--plan",
             "my-feature",
             "--current-branch",
         ])
@@ -1110,7 +1095,6 @@ mod tests {
             "step",
             "set-hook",
             "1",
-            "--plan",
             "my-plan",
             "--lifecycle",
             "post-test",
@@ -1132,7 +1116,6 @@ mod tests {
             "step",
             "set-hook",
             "1",
-            "--plan",
             "my-plan",
             "--lifecycle",
             "bogus",
