@@ -17,6 +17,7 @@ use crate::config::Config;
 use crate::executor::{self, StepOutcome, StepResult};
 use crate::git;
 use crate::hooks::HookContext;
+use crate::output::{self, OutputContext, OutputFormat, RunEvent};
 use crate::plan::{Plan, PlanStatus, Step, StepStatus};
 use crate::storage;
 
@@ -82,6 +83,7 @@ pub async fn run_plan(
     workdir: &Path,
     options: &RunOptions,
     abort_rx: watch::Receiver<bool>,
+    out: &OutputContext,
 ) -> Result<PlanRunResult> {
     // 1. Validate plan status.
     validate_plan_status(plan)?;
@@ -156,15 +158,24 @@ pub async fn run_plan(
             continue;
         }
 
-        // Print progress header.
+        // Print progress header / emit step_started event.
         let step_num = step_number_in_plan(&all_steps, &current_step);
-        eprintln!(
-            "[{}/{}] > Step {}: {} ...",
-            i + 1,
-            total,
-            step_num,
-            current_step.title
-        );
+        if out.format == OutputFormat::Json {
+            output::emit_ndjson(&RunEvent::StepStarted {
+                step_id: current_step.id.clone(),
+                step_title: current_step.title.clone(),
+                step_num,
+                step_total: total,
+            });
+        } else {
+            eprintln!(
+                "[{}/{}] > Step {}: {} ...",
+                i + 1,
+                total,
+                step_num,
+                current_step.title
+            );
+        }
 
         let started = Instant::now();
 
@@ -183,29 +194,56 @@ pub async fn run_plan(
         let elapsed = started.elapsed();
         result.steps_executed += 1;
 
-        // Print result.
+        // Print result / emit step_finished event.
+        let outcome_str = match step_result.outcome {
+            StepOutcome::Success => "success",
+            StepOutcome::Failed => "failed",
+            StepOutcome::Aborted => "aborted",
+            StepOutcome::Timeout => "timeout",
+        };
+
+        let emit_finished = |outcome: &str| {
+            if out.format == OutputFormat::Json {
+                output::emit_ndjson(&RunEvent::StepFinished {
+                    step_id: current_step.id.clone(),
+                    step_title: current_step.title.clone(),
+                    step_num,
+                    step_total: total,
+                    outcome: outcome.to_string(),
+                    attempts: step_result.attempts_used,
+                    duration_secs: elapsed.as_secs_f64(),
+                });
+            }
+        };
+
         match step_result.outcome {
             StepOutcome::Success => {
                 result.steps_succeeded += 1;
-                eprintln!(
-                    "[{}/{}] > {} ... OK (attempt {}, {:.0}s)",
-                    i + 1,
-                    total,
-                    current_step.title,
-                    step_result.attempts_used,
-                    elapsed.as_secs_f64()
-                );
+                emit_finished(outcome_str);
+                if out.format != OutputFormat::Json {
+                    eprintln!(
+                        "[{}/{}] > {} ... OK (attempt {}, {:.0}s)",
+                        i + 1,
+                        total,
+                        current_step.title,
+                        step_result.attempts_used,
+                        elapsed.as_secs_f64()
+                    );
+                }
             }
             StepOutcome::Failed => {
                 result.steps_failed += 1;
-                eprintln!(
-                    "[{}/{}] > {} ... FAILED (after {} attempts, {:.0}s)",
-                    i + 1,
-                    total,
-                    current_step.title,
-                    step_result.attempts_used,
-                    elapsed.as_secs_f64()
-                );
+                emit_finished(outcome_str);
+                if out.format != OutputFormat::Json {
+                    eprintln!(
+                        "[{}/{}] > {} ... FAILED (after {} attempts, {:.0}s)",
+                        i + 1,
+                        total,
+                        current_step.title,
+                        step_result.attempts_used,
+                        elapsed.as_secs_f64()
+                    );
+                }
                 // Mark plan as failed and stop.
                 storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
                 result.final_status = PlanStatus::Failed;
@@ -213,7 +251,10 @@ pub async fn run_plan(
                 return Ok(result);
             }
             StepOutcome::Aborted => {
-                eprintln!("[{}/{}] > {} ... ABORTED", i + 1, total, current_step.title);
+                emit_finished(outcome_str);
+                if out.format != OutputFormat::Json {
+                    eprintln!("[{}/{}] > {} ... ABORTED", i + 1, total, current_step.title);
+                }
                 storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
                 result.final_status = PlanStatus::Aborted;
                 result.step_results.push(step_result);
@@ -221,7 +262,10 @@ pub async fn run_plan(
             }
             StepOutcome::Timeout => {
                 result.steps_failed += 1;
-                eprintln!("[{}/{}] > {} ... TIMEOUT", i + 1, total, current_step.title);
+                emit_finished(outcome_str);
+                if out.format != OutputFormat::Json {
+                    eprintln!("[{}/{}] > {} ... TIMEOUT", i + 1, total, current_step.title);
+                }
                 storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
                 result.final_status = PlanStatus::Failed;
                 result.step_results.push(step_result);
@@ -244,6 +288,17 @@ pub async fn run_plan(
         result.final_status = PlanStatus::Complete;
     } else {
         result.final_status = PlanStatus::InProgress;
+    }
+
+    // Emit plan_complete event in NDJSON mode.
+    if out.format == OutputFormat::Json {
+        output::emit_ndjson(&RunEvent::PlanComplete {
+            plan_slug: result.plan_slug.clone(),
+            final_status: result.final_status,
+            steps_executed: result.steps_executed,
+            steps_succeeded: result.steps_succeeded,
+            steps_failed: result.steps_failed,
+        });
     }
 
     Ok(result)
@@ -371,6 +426,7 @@ pub async fn run_all_plans(
     workdir: &Path,
     options: &RunOptions,
     abort_rx: watch::Receiver<bool>,
+    out: &OutputContext,
 ) -> Result<Vec<PlanRunResult>> {
     // 1. Load runnable plans.
     let all = storage::list_plans(conn, project, false)?;
@@ -506,6 +562,7 @@ pub async fn run_all_plans(
             workdir,
             &inner_options,
             abort_rx.clone(),
+            out,
         )
         .await?;
 
@@ -549,6 +606,7 @@ pub async fn resume_plan(
     config: &Config,
     workdir: &Path,
     abort_rx: watch::Receiver<bool>,
+    out: &OutputContext,
 ) -> Result<PlanRunResult> {
     // Find the resume point.
     let steps = storage::list_steps(conn, &plan.id)?;
@@ -575,7 +633,7 @@ pub async fn resume_plan(
         ..Default::default()
     };
 
-    run_plan(conn, plan, config, workdir, &options, abort_rx).await
+    run_plan(conn, plan, config, workdir, &options, abort_rx, out).await
 }
 
 /// Skip the current (or specified) step in a plan.
@@ -1426,7 +1484,8 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(async {
-            run_all_plans(&conn, "/tmp/cyc", &config, workdir, &options, rx).await
+            let out = OutputContext::from_cli(false, false, false);
+            run_all_plans(&conn, "/tmp/cyc", &config, workdir, &options, rx, &out).await
         });
 
         let err = result.unwrap_err();
@@ -1453,7 +1512,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let results = rt
             .block_on(async {
-                run_all_plans(&conn, "/tmp/empty", &config, workdir, &options, rx).await
+                let out = OutputContext::from_cli(false, false, false);
+                run_all_plans(&conn, "/tmp/empty", &config, workdir, &options, rx, &out).await
             })
             .unwrap();
 

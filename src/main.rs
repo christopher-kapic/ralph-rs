@@ -313,7 +313,7 @@ fn main() -> Result<()> {
                 let rt = tokio::runtime::Runtime::new()?;
                 let results = rt.block_on(async {
                     let abort_rx = signal::install_and_spawn();
-                    runner::run_all_plans(&conn, &project, &_config, workdir, &options, abort_rx)
+                    runner::run_all_plans(&conn, &project, &_config, workdir, &options, abort_rx, &out)
                         .await
                 })?;
 
@@ -361,7 +361,7 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             let result = rt.block_on(async {
                 let abort_rx = signal::install_and_spawn();
-                runner::run_plan(&conn, &plan, &_config, workdir, &options, abort_rx).await
+                runner::run_plan(&conn, &plan, &_config, workdir, &options, abort_rx, &out).await
             })?;
 
             if result.steps_failed > 0 {
@@ -386,7 +386,7 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             let result = rt.block_on(async {
                 let abort_rx = signal::install_and_spawn();
-                runner::resume_plan(&conn, &plan, &_config, project.as_ref(), abort_rx).await
+                runner::resume_plan(&conn, &plan, &_config, project.as_ref(), abort_rx, &out).await
             })?;
 
             if result.steps_failed > 0 {

@@ -841,7 +841,7 @@ pub fn cmd_status(
                 if out.format == OutputFormat::Json {
                     println!("null");
                 } else {
-                    println!("No active plan found. Specify a plan slug as a positional argument.");
+                    eprintln!("No active plan found. Specify a plan slug as a positional argument.");
                 }
                 return Ok(());
             }
@@ -930,10 +930,8 @@ pub fn cmd_log(
         match storage::find_active_plan(conn, project, true)? {
             Some(p) => p,
             None => {
-                if out.format == OutputFormat::Json {
-                    println!("[]");
-                } else {
-                    println!("No plan found. Specify a plan slug as a positional argument.");
+                if out.format != OutputFormat::Json {
+                    eprintln!("No plan found. Specify a plan slug as a positional argument.");
                 }
                 return Ok(());
             }
@@ -954,19 +952,19 @@ pub fn cmd_log(
         let logs = storage::list_execution_logs_for_step(conn, &step.id)?;
 
         if out.format == OutputFormat::Json {
-            let summaries: Vec<output::LogEntrySummary> =
-                logs.iter().map(output::LogEntrySummary::from).collect();
-            println!("{}", serde_json::to_string(&summaries)?);
+            for log in &logs {
+                output::emit_ndjson(&output::LogEntrySummary::from(log));
+            }
             return Ok(());
         }
 
-        println!(
+        eprintln!(
             "Logs for step #{} '{}' ({} attempts):",
             step_idx,
             step.title,
             logs.len()
         );
-        println!();
+        eprintln!();
 
         for log in &logs {
             print_log_entry(&step.title, log, full, out.color);
@@ -976,25 +974,23 @@ pub fn cmd_log(
         let entries = storage::list_execution_logs_for_plan(conn, &plan.id, limit)?;
 
         if out.format == OutputFormat::Json {
-            let summaries: Vec<output::LogEntrySummary> = entries
-                .iter()
-                .map(|(_, log)| output::LogEntrySummary::from(log))
-                .collect();
-            println!("{}", serde_json::to_string(&summaries)?);
+            for (_, log) in &entries {
+                output::emit_ndjson(&output::LogEntrySummary::from(log));
+            }
             return Ok(());
         }
 
         if entries.is_empty() {
-            println!("No execution logs for plan '{}'.", plan.slug);
+            eprintln!("No execution logs for plan '{}'.", plan.slug);
             return Ok(());
         }
 
-        println!(
+        eprintln!(
             "Execution logs for plan '{}' ({} entries):",
             plan.slug,
             entries.len()
         );
-        println!();
+        eprintln!();
 
         for (step_title, log) in &entries {
             print_log_entry(step_title, log, full, out.color);

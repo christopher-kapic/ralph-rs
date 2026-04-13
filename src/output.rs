@@ -7,6 +7,50 @@ use serde::Serialize;
 use std::io::{self, BufRead, IsTerminal, Write};
 
 // ---------------------------------------------------------------------------
+// NDJSON run events
+// ---------------------------------------------------------------------------
+
+/// Events emitted as NDJSON (one JSON object per line) when `--json` is active
+/// on `run` or `resume`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum RunEvent {
+    StepStarted {
+        step_id: String,
+        step_title: String,
+        step_num: usize,
+        step_total: usize,
+    },
+    StepFinished {
+        step_id: String,
+        step_title: String,
+        step_num: usize,
+        step_total: usize,
+        outcome: String,
+        attempts: i32,
+        duration_secs: f64,
+    },
+    PlanComplete {
+        plan_slug: String,
+        final_status: PlanStatus,
+        steps_executed: usize,
+        steps_succeeded: usize,
+        steps_failed: usize,
+    },
+}
+
+/// Write a single NDJSON record to stdout and flush immediately.
+///
+/// This is the **only** path that writes to stdout in JSON/run mode.
+pub fn emit_ndjson<T: Serialize>(value: &T) {
+    // Ignore write errors (broken pipe, etc.) — same behavior as println!.
+    let mut out = io::stdout().lock();
+    let _ = serde_json::to_writer(&mut out, value);
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
+}
+
+// ---------------------------------------------------------------------------
 // OutputFormat enum
 // ---------------------------------------------------------------------------
 
