@@ -31,7 +31,7 @@ pub struct RunOptions {
     /// Plan slug is ignored when set.
     pub all_plans: bool,
     /// Run only the next pending step instead of all remaining steps.
-    pub step: bool,
+    pub one: bool,
     /// Start from a specific step number (1-based).
     pub from: Option<usize>,
     /// Stop after a specific step number (1-based).
@@ -491,7 +491,7 @@ pub async fn run_all_plans(
         // to avoid any chance of recursion.
         let inner_options = RunOptions {
             all_plans: false,
-            step: options.step,
+            one: options.one,
             from: options.from,
             to: options.to,
             current_branch: true,
@@ -720,8 +720,8 @@ fn checkout_existing_branch(workdir: &Path, branch: &str) -> Result<()> {
 fn select_steps(all_steps: &[Step], options: &RunOptions) -> Result<Vec<Step>> {
     let total = all_steps.len();
 
-    // --step: only run the next actionable step (first pending/failed/in_progress).
-    if options.step {
+    // --one: only run the next actionable step (first pending/failed/in_progress).
+    if options.one {
         let next = all_steps.iter().find(|s| {
             s.status == StepStatus::Pending
                 || s.status == StepStatus::Failed
@@ -947,10 +947,10 @@ mod tests {
 
     #[test]
     fn test_select_steps_step_flag_returns_only_next() {
-        // Phase 3: `step: true` returns just the next pending step.
+        // Phase 3: `one: true` returns just the next pending step.
         let steps = make_steps(3);
         let options = RunOptions {
-            step: true,
+            one: true,
             ..Default::default()
         };
         let selected = select_steps(&steps, &options).unwrap();
@@ -989,7 +989,7 @@ mod tests {
         let mut steps = make_steps(3);
         steps[0].status = StepStatus::Complete;
         let options = RunOptions {
-            step: true,
+            one: true,
             ..Default::default()
         };
         let selected = select_steps(&steps, &options).unwrap();
@@ -1004,7 +1004,7 @@ mod tests {
         steps[0].status = StepStatus::Complete;
         steps[1].status = StepStatus::Complete;
         let options = RunOptions {
-            step: true,
+            one: true,
             ..Default::default()
         };
         let selected = select_steps(&steps, &options).unwrap();
@@ -1197,7 +1197,7 @@ mod tests {
     fn test_run_options_default() {
         let opts = RunOptions::default();
         assert!(!opts.all_plans);
-        assert!(!opts.step);
+        assert!(!opts.one);
         assert!(opts.from.is_none());
         assert!(opts.to.is_none());
         assert!(!opts.current_branch);
@@ -1291,7 +1291,7 @@ mod tests {
         steps[0].status = StepStatus::Complete;
         steps[1].status = StepStatus::Failed;
         let options = RunOptions {
-            step: true,
+            one: true,
             ..Default::default()
         };
         let selected = select_steps(&steps, &options).unwrap();

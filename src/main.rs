@@ -220,7 +220,7 @@ fn main() -> Result<()> {
         // -- Run --
         Command::Run {
             plan: plan_slug,
-            step,
+            one,
             all,
             from,
             to,
@@ -234,7 +234,7 @@ fn main() -> Result<()> {
 
             let options = RunOptions {
                 all_plans: all,
-                step,
+                one,
                 from,
                 to,
                 current_branch,

@@ -58,13 +58,18 @@ pub enum Command {
     Step(StepCommand),
 
     /// Run the next pending step (or all remaining steps) of a plan.
+    ///
+    /// By default, runs all remaining pending steps in the plan sequentially.
+    /// Use --one to run only the next pending step. Use --from/--to to run a
+    /// specific range of steps. Use --all to run every plan in dependency order
+    /// (ignores the plan slug). Precedence: --all > --one > --from/--to > default.
     Run {
         /// Plan slug to run. Defaults to the active plan.
         plan: Option<String>,
 
         /// Run only the next pending step instead of all remaining.
-        #[arg(long)]
-        step: bool,
+        #[arg(long, alias = "single")]
+        one: bool,
 
         /// Run all plans in dependency order (chains plans). Plan slug
         /// is ignored when set.
@@ -727,16 +732,27 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_run_step() {
+    fn test_parse_run_one() {
         let cli =
-            Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--step"]).unwrap();
+            Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--one"]).unwrap();
         if let Command::Run {
-            plan, step, all, ..
+            plan, one, all, ..
         } = cli.command
         {
             assert_eq!(plan.as_deref(), Some("my-feature"));
-            assert!(step);
+            assert!(one);
             assert!(!all);
+        } else {
+            panic!("Expected Run");
+        }
+    }
+
+    #[test]
+    fn test_parse_run_single_alias() {
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--single"]).unwrap();
+        if let Command::Run { one, .. } = cli.command {
+            assert!(one);
         } else {
             panic!("Expected Run");
         }
@@ -745,9 +761,9 @@ mod tests {
     #[test]
     fn test_parse_run_all_plans() {
         let cli = Cli::try_parse_from(["ralph-rs", "run", "--all"]).unwrap();
-        if let Command::Run { all, step, .. } = cli.command {
+        if let Command::Run { all, one, .. } = cli.command {
             assert!(all);
-            assert!(!step);
+            assert!(!one);
         } else {
             panic!("Expected Run");
         }
