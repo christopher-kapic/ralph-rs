@@ -16,6 +16,7 @@ use tokio::sync::watch;
 use crate::config::Config;
 use crate::executor::{self, StepOutcome, StepResult};
 use crate::git;
+use crate::hooks::HookContext;
 use crate::plan::{Plan, PlanStatus, Step, StepStatus};
 use crate::storage;
 
@@ -119,6 +120,9 @@ pub async fn run_plan(
         storage::update_plan_status(conn, &effective_plan.id, PlanStatus::InProgress)?;
     }
 
+    // Load the hook library once for this run, filtered by project scope.
+    let hook_ctx = HookContext::load(workdir)?;
+
     // 4. Iterate through steps.
     let total = steps_to_run.len();
     let mut result = PlanRunResult {
@@ -171,6 +175,7 @@ pub async fn run_plan(
             &current_step,
             config,
             workdir,
+            &hook_ctx,
             abort_rx.clone(),
         )
         .await?;

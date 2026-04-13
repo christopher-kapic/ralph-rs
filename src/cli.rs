@@ -165,6 +165,10 @@ pub enum Command {
     #[command(subcommand)]
     Agents(AgentsCommand),
 
+    /// Manage the hook library (reusable shell commands that run at lifecycle events).
+    #[command(subcommand)]
+    Hooks(HooksCommand),
+
     /// Run preflight checks to verify the environment is ready.
     Doctor,
 
@@ -260,6 +264,40 @@ pub enum PlanCommand {
 
     /// Restore an archived plan.
     Unarchive {
+        /// Plan slug.
+        slug: String,
+    },
+
+    /// Attach a library hook plan-wide (fires for every step in the plan).
+    SetHook {
+        /// Plan slug.
+        slug: String,
+
+        /// Lifecycle event: pre-step, post-step, pre-test, post-test.
+        #[arg(long)]
+        lifecycle: String,
+
+        /// Hook name from the library.
+        #[arg(long)]
+        hook: String,
+    },
+
+    /// Detach a previously-attached plan-wide hook.
+    UnsetHook {
+        /// Plan slug.
+        slug: String,
+
+        /// Lifecycle event.
+        #[arg(long)]
+        lifecycle: String,
+
+        /// Hook name to detach.
+        #[arg(long)]
+        hook: String,
+    },
+
+    /// List every hook attached to the plan (plan-wide and per-step).
+    Hooks {
         /// Plan slug.
         slug: String,
     },
@@ -392,6 +430,42 @@ pub enum StepCommand {
         #[arg(long)]
         plan: Option<String>,
     },
+
+    /// Attach a library hook to a specific step at a lifecycle event.
+    SetHook {
+        /// Step number (1-based).
+        step: usize,
+
+        /// Plan slug.
+        #[arg(long)]
+        plan: Option<String>,
+
+        /// Lifecycle event: pre-step, post-step, pre-test, post-test.
+        #[arg(long)]
+        lifecycle: String,
+
+        /// Hook name from the library.
+        #[arg(long)]
+        hook: String,
+    },
+
+    /// Detach a previously-attached hook from a step.
+    UnsetHook {
+        /// Step number (1-based).
+        step: usize,
+
+        /// Plan slug.
+        #[arg(long)]
+        plan: Option<String>,
+
+        /// Lifecycle event.
+        #[arg(long)]
+        lifecycle: String,
+
+        /// Hook name to detach.
+        #[arg(long)]
+        hook: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +535,88 @@ pub enum AgentsCommand {
     Delete {
         /// Agent template name.
         name: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Hooks subcommands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum HooksCommand {
+    /// List hooks in the library. By default shows only hooks applicable to
+    /// the current project path; pass --all to include everything.
+    List {
+        /// Show every hook in the library, including path-scoped hooks that
+        /// don't apply to the current project.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Show a hook's definition (frontmatter + shell command body).
+    Show {
+        /// Hook name.
+        name: String,
+    },
+
+    /// Add a new hook to the library.
+    Add {
+        /// Hook name (also used as the filename).
+        name: String,
+
+        /// Lifecycle event: pre-step, post-step, pre-test, post-test.
+        #[arg(long)]
+        lifecycle: String,
+
+        /// Shell command to execute. Can be a multi-line script.
+        #[arg(long)]
+        command: String,
+
+        /// Human-readable description.
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Restrict the hook to these absolute path prefixes (repeatable).
+        /// If omitted, the hook is global.
+        #[arg(long = "scope-path")]
+        scope_paths: Vec<PathBuf>,
+
+        /// Overwrite an existing hook with the same name.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Delete a hook from the library.
+    Remove {
+        /// Hook name.
+        name: String,
+    },
+
+    /// Export hooks to a portable JSON bundle.
+    Export {
+        /// Output file path (defaults to stdout).
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+
+        /// Export every hook in the library (by default only hooks
+        /// applicable to the current project are exported).
+        #[arg(long)]
+        all: bool,
+
+        /// Filter hooks applicable to this absolute project path instead
+        /// of the current project.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Import hooks from a portable JSON bundle.
+    Import {
+        /// Path to the bundle file.
+        file: PathBuf,
+
+        /// Overwrite existing hooks on name collision.
+        #[arg(long)]
+        force: bool,
     },
 }
 

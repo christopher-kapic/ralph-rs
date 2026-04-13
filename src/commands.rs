@@ -8,6 +8,7 @@ use std::path::Path;
 use crate::config;
 use crate::db;
 use crate::frac_index;
+use crate::hook_library::{self, Hook, HookBundle, Lifecycle, Scope};
 use crate::plan::{self, ExecutionLog, PlanStatus};
 use crate::preflight;
 use crate::storage;
@@ -1146,6 +1147,332 @@ pub fn cmd_agents_delete(name: &str) -> Result<()> {
 
     std::fs::remove_file(&path).with_context(|| format!("Failed to delete {}", path.display()))?;
     println!("Deleted agent file: {name}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Hooks commands
+// ---------------------------------------------------------------------------
+
+pub fn cmd_hooks_list(project: &str, all: bool) -> Result<()> {
+    let hooks = hook_library::load_all()?;
+
+    let filtered: Vec<Hook> = if all {
+        hooks
+    } else {
+        hook_library::filter_by_project(hooks, Path::new(project))
+    };
+
+    if filtered.is_empty() {
+        if all {
+            println!(
+                "No hooks found in {}",
+                hook_library::hooks_dir()?.display()
+            );
+        } else {
+            println!(
+                "No hooks applicable to {project}. Use `ralph hooks list --all` to see all hooks."
+            );
+        }
+        return Ok(());
+    }
+
+    for hook in &filtered {
+        let scope_str = match &hook.scope {
+            Scope::Global => "global".to_string(),
+            Scope::Paths { paths } => {
+                let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                format!("paths: {}", list.join(", "))
+            }
+        };
+        let desc = if hook.description.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", hook.description)
+        };
+        println!(
+            "  {name:<24} [{lifecycle}] ({scope}){desc}",
+            name = hook.name,
+            lifecycle = hook.lifecycle,
+            scope = scope_str,
+        );
+    }
+
+    Ok(())
+}
+
+pub fn cmd_hooks_show(name: &str) -> Result<()> {
+    let path = hook_library::hooks_dir()?.join(format!("{name}.md"));
+    if !path.exists() {
+        bail!("Hook not found: {name}");
+    }
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    println!("{contents}");
+    Ok(())
+}
+
+pub fn cmd_hooks_add(
+    name: &str,
+    lifecycle: &str,
+    command: &str,
+    description: Option<&str>,
+    scope_paths: &[std::path::PathBuf],
+    force: bool,
+) -> Result<()> {
+    let lifecycle = Lifecycle::parse(lifecycle)?;
+
+    let scope = if scope_paths.is_empty() {
+        Scope::Global
+    } else {
+        for p in scope_paths {
+            if !p.is_absolute() {
+                bail!(
+                    "Scope path '{}' must be absolute (no '~' expansion)",
+                    p.display()
+                );
+            }
+        }
+        Scope::Paths {
+            paths: scope_paths.to_vec(),
+        }
+    };
+
+    let hook = Hook {
+        name: name.to_string(),
+        description: description.unwrap_or("").to_string(),
+        lifecycle,
+        scope,
+        command: command.to_string(),
+    };
+
+    let path = hook_library::save(&hook, force)?;
+    println!("Created hook '{name}' at {}", path.display());
+    Ok(())
+}
+
+pub fn cmd_hooks_remove(name: &str) -> Result<()> {
+    hook_library::delete(name)?;
+    println!("Deleted hook '{name}'");
+    Ok(())
+}
+
+pub fn cmd_hooks_export(
+    project: &str,
+    output: Option<&Path>,
+    all: bool,
+    path: Option<&Path>,
+) -> Result<()> {
+    let hooks = hook_library::load_all()?;
+
+    let filtered: Vec<Hook> = if all {
+        hooks
+    } else {
+        let scope_path = path.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+            std::path::PathBuf::from(project)
+        });
+        hook_library::filter_by_project(hooks, &scope_path)
+    };
+
+    let bundle = HookBundle::new(filtered);
+    let json = serde_json::to_string_pretty(&bundle)?;
+
+    match output {
+        Some(p) => {
+            std::fs::write(p, format!("{json}\n"))
+                .with_context(|| format!("Failed to write {}", p.display()))?;
+            eprintln!(
+                "Exported {} hook(s) to {}",
+                bundle.hooks.len(),
+                p.display()
+            );
+        }
+        None => println!("{json}"),
+    }
+    Ok(())
+}
+
+pub fn cmd_hooks_import(file: &Path, force: bool) -> Result<()> {
+    let contents = std::fs::read_to_string(file)
+        .with_context(|| format!("Failed to read bundle {}", file.display()))?;
+    let bundle: HookBundle = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse bundle {}", file.display()))?;
+
+    if bundle.hooks.is_empty() {
+        println!("Bundle contains no hooks.");
+        return Ok(());
+    }
+
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+
+    for hook in &bundle.hooks {
+        // Check for collisions first (default: error).
+        let existed = hook_library::try_load(&hook.name)?.is_some();
+        if existed && !force {
+            eprintln!(
+                "Error: hook '{}' already exists. Re-run with --force to overwrite.",
+                hook.name
+            );
+            skipped += 1;
+            continue;
+        }
+        hook_library::save(hook, true)?;
+        imported += 1;
+    }
+
+    println!(
+        "Imported {imported} hook(s), skipped {skipped}.{}",
+        if skipped > 0 && !force {
+            " Use --force to overwrite existing hooks."
+        } else {
+            ""
+        }
+    );
+    if skipped > 0 && !force {
+        bail!("{skipped} hook(s) skipped due to collisions");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Step/plan hook attachment commands
+// ---------------------------------------------------------------------------
+
+pub fn cmd_step_set_hook(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    step_num: usize,
+    lifecycle: &str,
+    hook_name: &str,
+) -> Result<()> {
+    // Validate lifecycle string.
+    Lifecycle::parse(lifecycle)?;
+
+    // Warn if the hook isn't in the library (user can still attach — it will
+    // be warn-and-skipped at run time until they import it).
+    if hook_library::try_load(hook_name)?.is_none() {
+        eprintln!(
+            "Warning: hook '{hook_name}' is not in the local library. It will be skipped at run time until imported."
+        );
+    }
+
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+    let steps = storage::list_steps(conn, &plan.id)?;
+    if step_num == 0 || step_num > steps.len() {
+        bail!(
+            "Step {step_num} is out of range (plan has {} steps)",
+            steps.len()
+        );
+    }
+    let step = &steps[step_num - 1];
+
+    storage::attach_hook_to_step(conn, &plan.id, &step.id, lifecycle, hook_name)?;
+    println!(
+        "Attached hook '{hook_name}' to step {step_num} of '{plan_slug}' at {lifecycle}"
+    );
+    Ok(())
+}
+
+pub fn cmd_step_unset_hook(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    step_num: usize,
+    lifecycle: &str,
+    hook_name: &str,
+) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+    let steps = storage::list_steps(conn, &plan.id)?;
+    if step_num == 0 || step_num > steps.len() {
+        bail!(
+            "Step {step_num} is out of range (plan has {} steps)",
+            steps.len()
+        );
+    }
+    let step = &steps[step_num - 1];
+
+    let removed = storage::detach_hook(conn, &plan.id, Some(&step.id), lifecycle, hook_name)?;
+    if removed == 0 {
+        bail!("No hook '{hook_name}' attached to step {step_num} at {lifecycle}");
+    }
+    println!("Detached hook '{hook_name}' from step {step_num} of '{plan_slug}'");
+    Ok(())
+}
+
+pub fn cmd_plan_set_hook(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    lifecycle: &str,
+    hook_name: &str,
+) -> Result<()> {
+    Lifecycle::parse(lifecycle)?;
+
+    if hook_library::try_load(hook_name)?.is_none() {
+        eprintln!(
+            "Warning: hook '{hook_name}' is not in the local library. It will be skipped at run time until imported."
+        );
+    }
+
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+    storage::attach_hook_to_plan(conn, &plan.id, lifecycle, hook_name)?;
+    println!("Attached plan-wide hook '{hook_name}' to '{plan_slug}' at {lifecycle}");
+    Ok(())
+}
+
+pub fn cmd_plan_unset_hook(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    lifecycle: &str,
+    hook_name: &str,
+) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+    let removed = storage::detach_hook(conn, &plan.id, None, lifecycle, hook_name)?;
+    if removed == 0 {
+        bail!("No plan-wide hook '{hook_name}' attached to '{plan_slug}' at {lifecycle}");
+    }
+    println!("Detached plan-wide hook '{hook_name}' from '{plan_slug}'");
+    Ok(())
+}
+
+pub fn cmd_plan_hooks(conn: &Connection, plan_slug: &str, project: &str) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+    let rows = storage::list_all_hooks_for_plan(conn, &plan.id)?;
+
+    if rows.is_empty() {
+        println!("No hooks attached to plan '{plan_slug}'.");
+        return Ok(());
+    }
+
+    let steps = storage::list_steps(conn, &plan.id)?;
+    let step_num = |sid: &str| -> Option<usize> {
+        steps.iter().position(|s| s.id == sid).map(|i| i + 1)
+    };
+
+    println!("Hooks attached to plan '{plan_slug}':");
+    for row in &rows {
+        let target = match &row.step_id {
+            None => "plan-wide".to_string(),
+            Some(sid) => match step_num(sid) {
+                Some(n) => format!("step {n}"),
+                None => format!("step <unknown id {sid}>"),
+            },
+        };
+        println!(
+            "  {target:<12} [{lifecycle:<9}] {hook}",
+            target = target,
+            lifecycle = row.lifecycle,
+            hook = row.hook_name,
+        );
+    }
     Ok(())
 }
 

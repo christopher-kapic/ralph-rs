@@ -10,11 +10,11 @@ use crate::config;
 
 /// Current schema version. Bump this and add a new migration function
 /// to `MIGRATIONS` whenever the schema changes.
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 3;
 
 /// Each migration is a function that receives a connection (already inside a transaction).
 /// Migrations are 1-indexed: MIGRATIONS[0] migrates from version 0 → 1.
-const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[migrate_v1, migrate_v2];
+const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[migrate_v1, migrate_v2, migrate_v3];
 
 /// Returns the path to the SQLite database file.
 pub fn db_path() -> Result<PathBuf> {
@@ -170,6 +170,35 @@ fn migrate_v2(conn: &Connection) -> Result<()> {
 
         CREATE INDEX idx_plan_deps_plan ON plan_dependencies(plan_id);
         CREATE INDEX idx_plan_deps_dep  ON plan_dependencies(depends_on_plan_id);
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V3: hook associations (plan-wide + per-step)
+// ---------------------------------------------------------------------------
+
+fn migrate_v3(conn: &Connection) -> Result<()> {
+    // `step_hooks` records which library-defined hook names apply at each
+    // lifecycle event. `step_id NULL` means plan-wide (applies to every
+    // step in the plan). The actual hook command/scope lives in the user's
+    // hook library on disk, looked up by name at execution time.
+    conn.execute_batch(
+        "
+        CREATE TABLE step_hooks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+            step_id TEXT REFERENCES steps(id) ON DELETE CASCADE,
+            lifecycle TEXT NOT NULL,
+            hook_name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+
+        CREATE INDEX idx_step_hooks_plan ON step_hooks(plan_id);
+        CREATE INDEX idx_step_hooks_step ON step_hooks(step_id);
+        CREATE INDEX idx_step_hooks_plan_lifecycle
+            ON step_hooks(plan_id, lifecycle);
         ",
     )?;
     Ok(())

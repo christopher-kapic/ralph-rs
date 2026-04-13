@@ -145,6 +145,22 @@ Config lives at `~/.config/ralph-rs/config.json` (Linux/macOS) with harness defi
 
 Agent definitions are markdown files in `~/.config/ralph-rs/agents/*.md`.
 
+## Lifecycle Hooks
+
+Ralph supports shell-based lifecycle hooks at four points during step execution: `pre-step`, `post-step`, `pre-test`, and `post-test`. Hooks are defined once in a reusable library at `~/.config/ralph-rs/hooks/*.md` (nothing in your working directory) and then attached to plans or individual steps via CLI:
+
+```bash
+ralph hooks add my-review --lifecycle post-step --command "claude -p 'review this'"
+ralph plan set-hook my-feature --lifecycle post-step --hook my-review       # every step
+ralph step set-hook 3 --plan my-feature --lifecycle post-step --hook my-review  # one step
+ralph hooks export -o bundle.json        # share with teammates
+ralph hooks import bundle.json
+```
+
+Hooks can be `global` or path-scoped to specific project prefixes. When you run `ralph plan:harness`, the plan agent is told which hooks are available and can attach them to steps it thinks deserve review.
+
+For the full model (library layout, scope rules, sharing, worked examples for Claude Code / Codex / clippy), see [docs/review-hooks.md](docs/review-hooks.md).
+
 ## License
 
 MIT

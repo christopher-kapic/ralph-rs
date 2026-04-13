@@ -671,6 +671,131 @@ pub fn topo_sort_plans(conn: &Connection, plan_ids: &[String]) -> Result<Vec<Str
 }
 
 // ---------------------------------------------------------------------------
+// Step hook operations
+// ---------------------------------------------------------------------------
+
+/// A hook association read from the db. `step_id == None` means plan-wide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepHookRow {
+    pub id: i64,
+    pub plan_id: String,
+    pub step_id: Option<String>,
+    pub lifecycle: String,
+    pub hook_name: String,
+}
+
+/// Attach a hook to a specific step at a lifecycle event.
+pub fn attach_hook_to_step(
+    conn: &Connection,
+    plan_id: &str,
+    step_id: &str,
+    lifecycle: &str,
+    hook_name: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, ?2, ?3, ?4)",
+        params![plan_id, step_id, lifecycle, hook_name],
+    )
+    .with_context(|| {
+        format!("Failed to attach hook '{hook_name}' to step {step_id} at {lifecycle}")
+    })?;
+    Ok(())
+}
+
+/// Attach a plan-wide hook (applies to every step in the plan).
+pub fn attach_hook_to_plan(
+    conn: &Connection,
+    plan_id: &str,
+    lifecycle: &str,
+    hook_name: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, NULL, ?2, ?3)",
+        params![plan_id, lifecycle, hook_name],
+    )
+    .with_context(|| {
+        format!("Failed to attach plan-wide hook '{hook_name}' to plan {plan_id} at {lifecycle}")
+    })?;
+    Ok(())
+}
+
+/// Remove a specific (plan, step, lifecycle, hook_name) row. If `step_id` is
+/// `None`, removes the plan-wide association.
+pub fn detach_hook(
+    conn: &Connection,
+    plan_id: &str,
+    step_id: Option<&str>,
+    lifecycle: &str,
+    hook_name: &str,
+) -> Result<usize> {
+    let affected = match step_id {
+        Some(sid) => conn.execute(
+            "DELETE FROM step_hooks WHERE plan_id = ?1 AND step_id = ?2 AND lifecycle = ?3 AND hook_name = ?4",
+            params![plan_id, sid, lifecycle, hook_name],
+        )?,
+        None => conn.execute(
+            "DELETE FROM step_hooks WHERE plan_id = ?1 AND step_id IS NULL AND lifecycle = ?2 AND hook_name = ?3",
+            params![plan_id, lifecycle, hook_name],
+        )?,
+    };
+    Ok(affected)
+}
+
+/// List every hook applicable to a step at a given lifecycle: plan-wide hooks
+/// first, then per-step hooks. Ordered by id so insertion order is preserved.
+pub fn list_hooks_for_step(
+    conn: &Connection,
+    plan_id: &str,
+    step_id: &str,
+    lifecycle: &str,
+) -> Result<Vec<StepHookRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, plan_id, step_id, lifecycle, hook_name
+         FROM step_hooks
+         WHERE plan_id = ?1 AND lifecycle = ?2 AND (step_id IS NULL OR step_id = ?3)
+         ORDER BY (step_id IS NOT NULL), id",
+    )?;
+    let rows = stmt.query_map(params![plan_id, lifecycle, step_id], |row| {
+        Ok(StepHookRow {
+            id: row.get(0)?,
+            plan_id: row.get(1)?,
+            step_id: row.get(2)?,
+            lifecycle: row.get(3)?,
+            hook_name: row.get(4)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// List every hook attached to a plan (either plan-wide or to any of its steps).
+pub fn list_all_hooks_for_plan(conn: &Connection, plan_id: &str) -> Result<Vec<StepHookRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, plan_id, step_id, lifecycle, hook_name
+         FROM step_hooks
+         WHERE plan_id = ?1
+         ORDER BY (step_id IS NOT NULL), id",
+    )?;
+    let rows = stmt.query_map(params![plan_id], |row| {
+        Ok(StepHookRow {
+            id: row.get(0)?,
+            plan_id: row.get(1)?,
+            step_id: row.get(2)?,
+            lifecycle: row.get(3)?,
+            hook_name: row.get(4)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

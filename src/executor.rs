@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use crate::config::Config;
 use crate::git;
 use crate::harness::{self, HarnessOutput};
-use crate::hooks;
+use crate::hooks::{self, HookContext};
 use crate::plan::{Plan, Step, StepStatus};
 use crate::prompt::{self, PriorStepSummary, RetryContext};
 use crate::storage;
@@ -129,6 +129,7 @@ pub async fn execute_step(
     step: &Step,
     config: &Config,
     workdir: &Path,
+    hook_ctx: &HookContext,
     abort_rx: watch::Receiver<bool>,
 ) -> Result<StepResult> {
     let max_retries = step
@@ -206,7 +207,7 @@ pub async fn execute_step(
         let started_at = std::time::Instant::now();
 
         // Run pre-step hook.
-        if let Err(e) = hooks::run_pre_step(plan, step, attempt, workdir) {
+        if let Err(e) = hooks::run_pre_step(conn, hook_ctx, plan, step, attempt, workdir) {
             eprintln!("Pre-step hook failed: {e}");
             // Treat as a failed attempt — skip harness execution.
             let test_result_strings = vec![format!("pre-step hook failed: {e}")];
@@ -227,7 +228,7 @@ pub async fn execute_step(
             )?;
             if attempt >= max_attempts {
                 storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
-                hooks::run_post_step(plan, step, attempt, "failed", workdir);
+                hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir);
                 return Ok(StepResult {
                     outcome: StepOutcome::Failed,
                     step_id: step.id.clone(),
@@ -236,7 +237,7 @@ pub async fn execute_step(
                 });
             }
             prev_test_output = Some(format!("pre-step hook failed: {e}"));
-            hooks::run_post_step(plan, step, attempt, "failed", workdir);
+            hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir);
             continue;
         }
 
@@ -279,7 +280,8 @@ pub async fn execute_step(
                     && !plan.deterministic_tests.is_empty()
                 {
                     // Pre-test hook.
-                    if let Err(e) = hooks::run_pre_test(plan, step, attempt, workdir) {
+                    if let Err(e) = hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir)
+                    {
                         eprintln!("Pre-test hook failed: {e}");
                     }
 
@@ -293,7 +295,15 @@ pub async fn execute_step(
                         .collect();
 
                     // Post-test hook.
-                    hooks::run_post_test(plan, step, attempt, test_results.all_passed, workdir);
+                    hooks::run_post_test(
+                        conn,
+                        hook_ctx,
+                        plan,
+                        step,
+                        attempt,
+                        test_results.all_passed,
+                        workdir,
+                    );
 
                     (test_results.all_passed, strings)
                 } else if has_changes {
@@ -334,7 +344,9 @@ pub async fn execute_step(
                     // Mark step as complete.
                     storage::update_step_status(conn, &step.id, StepStatus::Complete)?;
 
-                    hooks::run_post_step(plan, step, attempt, "complete", workdir);
+                    hooks::run_post_step(
+                        conn, hook_ctx, plan, step, attempt, "complete", workdir,
+                    );
 
                     return Ok(StepResult {
                         outcome: StepOutcome::Success,
@@ -377,7 +389,7 @@ pub async fn execute_step(
                 // If we've exhausted attempts, mark as failed.
                 if attempt >= max_attempts {
                     storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
-                    hooks::run_post_step(plan, step, attempt, "failed", workdir);
+                    hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir);
                     return Ok(StepResult {
                         outcome: StepOutcome::Failed,
                         step_id: step.id.clone(),
@@ -416,7 +428,7 @@ pub async fn execute_step(
                 )?;
 
                 storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
-                hooks::run_post_step(plan, step, attempt, "timeout", workdir);
+                hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "timeout", workdir);
                 return Ok(StepResult {
                     outcome: StepOutcome::Timeout,
                     step_id: step.id.clone(),
@@ -448,7 +460,7 @@ pub async fn execute_step(
                 )?;
 
                 storage::update_step_status(conn, &step.id, StepStatus::Aborted)?;
-                hooks::run_post_step(plan, step, attempt, "aborted", workdir);
+                hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "aborted", workdir);
                 return Ok(StepResult {
                     outcome: StepOutcome::Aborted,
                     step_id: step.id.clone(),

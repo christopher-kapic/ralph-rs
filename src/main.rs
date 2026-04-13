@@ -7,6 +7,7 @@ mod export;
 mod frac_index;
 mod git;
 mod harness;
+mod hook_library;
 mod hooks;
 mod import;
 mod output;
@@ -24,8 +25,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::cli::{
-    AgentsCommand, Cli, Command, PlanCommand, PlanDependencyCommand, PlanHarnessCommand,
-    StepCommand,
+    AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
+    PlanHarnessCommand, StepCommand,
 };
 use crate::commands::resolve_project;
 use crate::runner::RunOptions;
@@ -85,6 +86,17 @@ fn main() -> Result<()> {
             }
             PlanCommand::Archive { slug } => commands::plan_archive(&conn, &slug, &project),
             PlanCommand::Unarchive { slug } => commands::plan_unarchive(&conn, &slug, &project),
+            PlanCommand::SetHook {
+                slug,
+                lifecycle,
+                hook,
+            } => commands::cmd_plan_set_hook(&conn, &slug, &project, &lifecycle, &hook),
+            PlanCommand::UnsetHook {
+                slug,
+                lifecycle,
+                hook,
+            } => commands::cmd_plan_unset_hook(&conn, &slug, &project, &lifecycle, &hook),
+            PlanCommand::Hooks { slug } => commands::cmd_plan_hooks(&conn, &slug, &project),
             PlanCommand::Dependency(dep_cmd) => match dep_cmd {
                 PlanDependencyCommand::Add { slug, depends_on } => {
                     commands::plan_dependency_add(&conn, &slug, &project, &depends_on)
@@ -170,6 +182,30 @@ fn main() -> Result<()> {
                     anyhow::bail!("--plan is required for step move");
                 }
                 commands::step_move(&conn, &slug, &project, step, to)
+            }
+            StepCommand::SetHook {
+                step,
+                plan,
+                lifecycle,
+                hook,
+            } => {
+                let slug = plan.unwrap_or_default();
+                if slug.is_empty() {
+                    anyhow::bail!("--plan is required for step set-hook");
+                }
+                commands::cmd_step_set_hook(&conn, &slug, &project, step, &lifecycle, &hook)
+            }
+            StepCommand::UnsetHook {
+                step,
+                plan,
+                lifecycle,
+                hook,
+            } => {
+                let slug = plan.unwrap_or_default();
+                if slug.is_empty() {
+                    anyhow::bail!("--plan is required for step unset-hook");
+                }
+                commands::cmd_step_unset_hook(&conn, &slug, &project, step, &lifecycle, &hook)
             }
         },
 
@@ -422,6 +458,35 @@ fn main() -> Result<()> {
                 commands::cmd_agents_create(&name, file.as_deref())
             }
             AgentsCommand::Delete { name } => commands::cmd_agents_delete(&name),
+        },
+
+        // -- Hooks --
+        Command::Hooks(subcmd) => match subcmd {
+            HooksCommand::List { all } => commands::cmd_hooks_list(&project, all),
+            HooksCommand::Show { name } => commands::cmd_hooks_show(&name),
+            HooksCommand::Add {
+                name,
+                lifecycle,
+                command,
+                description,
+                scope_paths,
+                force,
+            } => commands::cmd_hooks_add(
+                &name,
+                &lifecycle,
+                &command,
+                description.as_deref(),
+                &scope_paths,
+                force,
+            ),
+            HooksCommand::Remove { name } => commands::cmd_hooks_remove(&name),
+            HooksCommand::Export { output, all, path } => commands::cmd_hooks_export(
+                &project,
+                output.as_deref(),
+                all,
+                path.as_deref(),
+            ),
+            HooksCommand::Import { file, force } => commands::cmd_hooks_import(&file, force),
         },
 
         // -- Doctor --
