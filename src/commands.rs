@@ -240,7 +240,7 @@ pub fn plan_list(
     conn: &Connection,
     project: &str,
     all: bool,
-    status: Option<&str>,
+    status: Option<PlanStatus>,
     show_archived: bool,
     _out: &OutputContext,
 ) -> Result<()> {
@@ -252,10 +252,7 @@ pub fn plan_list(
     }
 
     // Filter by status if provided, otherwise hide archived unless --archived
-    let plans: Vec<_> = if let Some(s) = status {
-        let target: PlanStatus = s
-            .parse()
-            .map_err(|_| anyhow::anyhow!("Invalid status: {s}"))?;
+    let plans: Vec<_> = if let Some(target) = status {
         plans.into_iter().filter(|p| p.status == target).collect()
     } else if !show_archived {
         plans
@@ -1237,15 +1234,13 @@ pub fn cmd_hooks_show(name: &str, _out: &OutputContext) -> Result<()> {
 
 pub fn cmd_hooks_add(
     name: &str,
-    lifecycle: &str,
+    lifecycle: Lifecycle,
     command: &str,
     description: Option<&str>,
     scope_paths: &[std::path::PathBuf],
     force: bool,
     _out: &OutputContext,
 ) -> Result<()> {
-    let lifecycle = Lifecycle::parse(lifecycle)?;
-
     let scope = if scope_paths.is_empty() {
         Scope::Global
     } else {
@@ -1369,13 +1364,10 @@ pub fn cmd_step_set_hook(
     plan_slug: &str,
     project: &str,
     step_num: usize,
-    lifecycle: &str,
+    lifecycle: Lifecycle,
     hook_name: &str,
     _out: &OutputContext,
 ) -> Result<()> {
-    // Validate lifecycle string.
-    Lifecycle::parse(lifecycle)?;
-
     // Warn if the hook isn't in the library (user can still attach — it will
     // be warn-and-skipped at run time until they import it).
     if hook_library::try_load(hook_name)?.is_none() {
@@ -1395,7 +1387,7 @@ pub fn cmd_step_set_hook(
     }
     let step = &steps[step_num - 1];
 
-    storage::attach_hook_to_step(conn, &plan.id, &step.id, lifecycle, hook_name)?;
+    storage::attach_hook_to_step(conn, &plan.id, &step.id, lifecycle.as_str(), hook_name)?;
     println!(
         "Attached hook '{hook_name}' to step {step_num} of '{plan_slug}' at {lifecycle}"
     );
@@ -1407,7 +1399,7 @@ pub fn cmd_step_unset_hook(
     plan_slug: &str,
     project: &str,
     step_num: usize,
-    lifecycle: &str,
+    lifecycle: Lifecycle,
     hook_name: &str,
     _out: &OutputContext,
 ) -> Result<()> {
@@ -1422,7 +1414,7 @@ pub fn cmd_step_unset_hook(
     }
     let step = &steps[step_num - 1];
 
-    let removed = storage::detach_hook(conn, &plan.id, Some(&step.id), lifecycle, hook_name)?;
+    let removed = storage::detach_hook(conn, &plan.id, Some(&step.id), lifecycle.as_str(), hook_name)?;
     if removed == 0 {
         bail!("No hook '{hook_name}' attached to step {step_num} at {lifecycle}");
     }
@@ -1434,12 +1426,10 @@ pub fn cmd_plan_set_hook(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    lifecycle: &str,
+    lifecycle: Lifecycle,
     hook_name: &str,
     _out: &OutputContext,
 ) -> Result<()> {
-    Lifecycle::parse(lifecycle)?;
-
     if hook_library::try_load(hook_name)?.is_none() {
         eprintln!(
             "Warning: hook '{hook_name}' is not in the local library. It will be skipped at run time until imported."
@@ -1448,7 +1438,7 @@ pub fn cmd_plan_set_hook(
 
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
-    storage::attach_hook_to_plan(conn, &plan.id, lifecycle, hook_name)?;
+    storage::attach_hook_to_plan(conn, &plan.id, lifecycle.as_str(), hook_name)?;
     println!("Attached plan-wide hook '{hook_name}' to '{plan_slug}' at {lifecycle}");
     Ok(())
 }
@@ -1457,13 +1447,13 @@ pub fn cmd_plan_unset_hook(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    lifecycle: &str,
+    lifecycle: Lifecycle,
     hook_name: &str,
     _out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
-    let removed = storage::detach_hook(conn, &plan.id, None, lifecycle, hook_name)?;
+    let removed = storage::detach_hook(conn, &plan.id, None, lifecycle.as_str(), hook_name)?;
     if removed == 0 {
         bail!("No plan-wide hook '{hook_name}' attached to '{plan_slug}' at {lifecycle}");
     }

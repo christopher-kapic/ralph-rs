@@ -5,6 +5,9 @@ use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 use std::path::PathBuf;
 
+use crate::hook_library::Lifecycle;
+use crate::plan::PlanStatus;
+
 /// ralph-rs: a deterministic orchestrator for coding agent harnesses.
 #[derive(Debug, Parser)]
 #[command(name = "ralph", version, about, long_about = None)]
@@ -235,7 +238,7 @@ pub enum PlanCommand {
 
         /// Filter by status.
         #[arg(long)]
-        status: Option<String>,
+        status: Option<PlanStatus>,
 
         /// Include archived plans in the listing.
         #[arg(long)]
@@ -264,7 +267,7 @@ pub enum PlanCommand {
         slug: String,
 
         /// Skip confirmation prompt.
-        #[arg(long, short)]
+        #[arg(long, short, alias = "yes")]
         force: bool,
     },
 
@@ -287,7 +290,7 @@ pub enum PlanCommand {
 
         /// Lifecycle event: pre-step, post-step, pre-test, post-test.
         #[arg(long)]
-        lifecycle: String,
+        lifecycle: Lifecycle,
 
         /// Hook name from the library.
         #[arg(long)]
@@ -301,7 +304,7 @@ pub enum PlanCommand {
 
         /// Lifecycle event.
         #[arg(long)]
-        lifecycle: String,
+        lifecycle: Lifecycle,
 
         /// Hook name to detach.
         #[arg(long)]
@@ -405,7 +408,7 @@ pub enum StepCommand {
         plan: Option<String>,
 
         /// Skip confirmation prompt.
-        #[arg(long, short)]
+        #[arg(long, short, alias = "yes")]
         force: bool,
     },
 
@@ -462,7 +465,7 @@ pub enum StepCommand {
 
         /// Lifecycle event: pre-step, post-step, pre-test, post-test.
         #[arg(long)]
-        lifecycle: String,
+        lifecycle: Lifecycle,
 
         /// Hook name from the library.
         #[arg(long)]
@@ -480,7 +483,7 @@ pub enum StepCommand {
 
         /// Lifecycle event.
         #[arg(long)]
-        lifecycle: String,
+        lifecycle: Lifecycle,
 
         /// Hook name to detach.
         #[arg(long)]
@@ -586,7 +589,7 @@ pub enum HooksCommand {
 
         /// Lifecycle event: pre-step, post-step, pre-test, post-test.
         #[arg(long)]
-        lifecycle: String,
+        lifecycle: Lifecycle,
 
         /// Shell command to execute. Can be a multi-line script.
         #[arg(long)]
@@ -1022,6 +1025,140 @@ mod tests {
             assert!(force);
         } else {
             panic!("Expected Plan Delete");
+        }
+    }
+
+    #[test]
+    fn test_plan_delete_yes_alias() {
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "plan", "delete", "old-plan", "--yes"]).unwrap();
+        if let Command::Plan(PlanCommand::Delete { slug, force }) = cli.command {
+            assert_eq!(slug, "old-plan");
+            assert!(force);
+        } else {
+            panic!("Expected Plan Delete");
+        }
+    }
+
+    #[test]
+    fn test_step_remove_yes_alias() {
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "remove", "1", "--yes"]).unwrap();
+        if let Command::Step(StepCommand::Remove { step, force, .. }) = cli.command {
+            assert_eq!(step, 1);
+            assert!(force);
+        } else {
+            panic!("Expected Step Remove");
+        }
+    }
+
+    #[test]
+    fn test_plan_list_status_value_enum() {
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "list", "--status", "in_progress"])
+            .unwrap();
+        if let Command::Plan(PlanCommand::List { status, .. }) = cli.command {
+            assert_eq!(status, Some(crate::plan::PlanStatus::InProgress));
+        } else {
+            panic!("Expected Plan List");
+        }
+    }
+
+    #[test]
+    fn test_plan_list_status_invalid_rejected() {
+        let result = Cli::try_parse_from(["ralph-rs", "plan", "list", "--status", "bogus"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hooks_add_lifecycle_value_enum() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "hooks",
+            "add",
+            "my-hook",
+            "--lifecycle",
+            "pre-step",
+            "--command",
+            "echo hello",
+        ])
+        .unwrap();
+        if let Command::Hooks(HooksCommand::Add { lifecycle, .. }) = cli.command {
+            assert_eq!(lifecycle, crate::hook_library::Lifecycle::PreStep);
+        } else {
+            panic!("Expected Hooks Add");
+        }
+    }
+
+    #[test]
+    fn test_hooks_add_lifecycle_invalid_rejected() {
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "hooks",
+            "add",
+            "my-hook",
+            "--lifecycle",
+            "bogus",
+            "--command",
+            "echo hello",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_step_set_hook_lifecycle_value_enum() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "set-hook",
+            "1",
+            "--plan",
+            "my-plan",
+            "--lifecycle",
+            "post-test",
+            "--hook",
+            "my-hook",
+        ])
+        .unwrap();
+        if let Command::Step(StepCommand::SetHook { lifecycle, .. }) = cli.command {
+            assert_eq!(lifecycle, crate::hook_library::Lifecycle::PostTest);
+        } else {
+            panic!("Expected Step SetHook");
+        }
+    }
+
+    #[test]
+    fn test_step_set_hook_lifecycle_invalid_rejected() {
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "set-hook",
+            "1",
+            "--plan",
+            "my-plan",
+            "--lifecycle",
+            "bogus",
+            "--hook",
+            "my-hook",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_plan_set_hook_lifecycle_value_enum() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "set-hook",
+            "my-plan",
+            "--lifecycle",
+            "pre-test",
+            "--hook",
+            "my-hook",
+        ])
+        .unwrap();
+        if let Command::Plan(PlanCommand::SetHook { lifecycle, .. }) = cli.command {
+            assert_eq!(lifecycle, crate::hook_library::Lifecycle::PreTest);
+        } else {
+            panic!("Expected Plan SetHook");
         }
     }
 }

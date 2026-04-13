@@ -83,7 +83,7 @@ fn main() -> Result<()> {
                 all,
                 status,
                 archived,
-            } => commands::plan_list(&conn, &project, all, status.as_deref(), archived, &out),
+            } => commands::plan_list(&conn, &project, all, status, archived, &out),
             PlanCommand::Show { slug } => commands::plan_show(&conn, &slug, &project, &out),
             PlanCommand::Approve { slug } => commands::plan_approve(&conn, &slug, &project, &out),
             PlanCommand::Delete { slug, force } => {
@@ -95,12 +95,12 @@ fn main() -> Result<()> {
                 slug,
                 lifecycle,
                 hook,
-            } => commands::cmd_plan_set_hook(&conn, &slug, &project, &lifecycle, &hook, &out),
+            } => commands::cmd_plan_set_hook(&conn, &slug, &project, lifecycle, &hook, &out),
             PlanCommand::UnsetHook {
                 slug,
                 lifecycle,
                 hook,
-            } => commands::cmd_plan_unset_hook(&conn, &slug, &project, &lifecycle, &hook, &out),
+            } => commands::cmd_plan_unset_hook(&conn, &slug, &project, lifecycle, &hook, &out),
             PlanCommand::Hooks { slug } => commands::cmd_plan_hooks(&conn, &slug, &project, &out),
             PlanCommand::Dependency(dep_cmd) => match dep_cmd {
                 PlanDependencyCommand::Add { slug, depends_on } => {
@@ -204,7 +204,7 @@ fn main() -> Result<()> {
                 if slug.is_empty() {
                     anyhow::bail!("--plan is required for step set-hook");
                 }
-                commands::cmd_step_set_hook(&conn, &slug, &project, step, &lifecycle, &hook, &out)
+                commands::cmd_step_set_hook(&conn, &slug, &project, step, lifecycle, &hook, &out)
             }
             StepCommand::UnsetHook {
                 step,
@@ -216,7 +216,7 @@ fn main() -> Result<()> {
                 if slug.is_empty() {
                     anyhow::bail!("--plan is required for step unset-hook");
                 }
-                commands::cmd_step_unset_hook(&conn, &slug, &project, step, &lifecycle, &hook, &out)
+                commands::cmd_step_unset_hook(&conn, &slug, &project, step, lifecycle, &hook, &out)
             }
         },
 
@@ -484,7 +484,7 @@ fn main() -> Result<()> {
                 force,
             } => commands::cmd_hooks_add(
                 &name,
-                &lifecycle,
+                lifecycle,
                 &command,
                 description.as_deref(),
                 &scope_paths,

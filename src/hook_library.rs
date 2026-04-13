@@ -32,8 +32,9 @@ use crate::config;
 // ---------------------------------------------------------------------------
 
 /// A lifecycle event at which a hook can fire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
 pub enum Lifecycle {
     PreStep,
     PostStep,
