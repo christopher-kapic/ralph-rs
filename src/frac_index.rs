@@ -190,30 +190,30 @@ mod tests {
     #[test]
     fn test_key_between_simple() {
         let mid = key_between("a0", "a1");
-        assert!(mid > "a0".to_string(), "mid={mid} should be > a0");
-        assert!(mid < "a1".to_string(), "mid={mid} should be < a1");
+        assert!(mid.as_str() > "a0", "mid={mid} should be > a0");
+        assert!(mid.as_str() < "a1", "mid={mid} should be < a1");
     }
 
     #[test]
     fn test_key_between_wide_gap() {
         let mid = key_between("a0", "a9");
-        assert!(mid > "a0".to_string());
-        assert!(mid < "a9".to_string());
+        assert!(mid.as_str() > "a0");
+        assert!(mid.as_str() < "a9");
     }
 
     #[test]
     fn test_key_between_different_lengths() {
         let mid = key_between("a0", "a10");
-        assert!(mid > "a0".to_string());
-        assert!(mid < "a10".to_string());
+        assert!(mid.as_str() > "a0");
+        assert!(mid.as_str() < "a10");
     }
 
     #[test]
     fn test_key_between_adjacent_letters() {
         // a0 and a1 differ by 1, so midpoint requires going deeper
         let mid = key_between("a0", "a1");
-        assert!(mid > "a0".to_string());
-        assert!(mid < "a1".to_string());
+        assert!(mid.as_str() > "a0");
+        assert!(mid.as_str() < "a1");
         // Should be something like "a0V"
         assert!(mid.len() > 2);
     }
@@ -242,17 +242,17 @@ mod tests {
     fn test_key_between_repeated_midpoints() {
         // Insert several keys between a0 and a1
         let mut lo = "a0".to_string();
-        let hi = "a1".to_string();
+        let hi = "a1";
         let mut keys = vec![lo.clone()];
 
         for _ in 0..5 {
-            let mid = key_between(&lo, &hi);
-            assert!(mid > lo, "mid={mid} should be > lo={lo}");
-            assert!(mid < hi, "mid={mid} should be < hi={hi}");
+            let mid = key_between(&lo, hi);
+            assert!(mid.as_str() > lo.as_str(), "mid={mid} should be > lo={lo}");
+            assert!(mid.as_str() < hi, "mid={mid} should be < hi={hi}");
             keys.push(mid.clone());
             lo = mid;
         }
-        keys.push(hi);
+        keys.push(hi.to_string());
 
         for i in 0..keys.len() - 1 {
             assert!(

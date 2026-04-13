@@ -456,7 +456,6 @@ pub fn step_list(conn: &Connection, plan_slug: &str, project: &str) -> Result<()
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 pub fn step_add(
     conn: &Connection,
     plan_slug: &str,
