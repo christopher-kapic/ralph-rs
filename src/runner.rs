@@ -3,7 +3,6 @@
 // Implements the plan-level execution loop: loading a plan, iterating through
 // steps in sort_key order, executing each via the single-step executor, and
 // managing plan-level status transitions.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -27,6 +26,7 @@ use crate::storage;
 
 /// Options controlling a plan run.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct RunOptions {
     /// Run all plans in dependency order, chaining branches between plans.
     /// Plan slug is ignored when set.
@@ -1178,7 +1178,7 @@ mod tests {
     fn test_skip_step_current() {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let s1 =
+        let (s1, _) =
             storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
         storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None).unwrap();
 
@@ -1196,7 +1196,7 @@ mod tests {
     fn test_skip_step_rejects_complete() {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let s1 =
+        let (s1, _) =
             storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
 
@@ -1218,7 +1218,7 @@ mod tests {
     fn test_skip_step_allows_failed() {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let s1 =
+        let (s1, _) =
             storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Failed).unwrap();
 
@@ -1311,7 +1311,7 @@ mod tests {
     fn test_step_status_transitions() {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let step =
+        let (step, _) =
             storage::create_step(&conn, &plan.id, "Step", "d", None, None, &[], None).unwrap();
 
         // pending -> in_progress
@@ -1329,7 +1329,7 @@ mod tests {
     fn test_step_status_failed_and_skipped() {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let step =
+        let (step, _) =
             storage::create_step(&conn, &plan.id, "Step", "d", None, None, &[], None).unwrap();
 
         storage::update_step_status(&conn, &step.id, StepStatus::Failed).unwrap();

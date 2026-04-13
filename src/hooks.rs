@@ -10,7 +10,6 @@
 // current step, resolves them against the library (filtered by project path
 // scope), and runs the resulting shell commands. Unknown hook names produce
 // a warning and are skipped so missing library entries don't block execution.
-#![allow(dead_code)]
 
 use std::path::Path;
 use std::process::Command;
@@ -26,6 +25,7 @@ use crate::storage;
 /// plan run. Passed through to each hook invocation so we don't re-read the
 /// library for every step.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct HookContext {
     /// Hooks loaded from the library and already filtered by project path
     /// scope — so every hook here is guaranteed applicable to the current run.

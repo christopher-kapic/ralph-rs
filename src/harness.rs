@@ -1,5 +1,4 @@
 // Harness subprocess management
-#![allow(dead_code)]
 
 use std::path::Path;
 
@@ -221,6 +220,7 @@ pub async fn spawn_harness_interactive(
 }
 
 /// Wait for a spawned harness process to complete and capture its output.
+#[allow(dead_code)]
 pub async fn wait_for_harness(child: tokio::process::Child) -> Result<HarnessOutput> {
     let output = child
         .wait_with_output()
@@ -242,6 +242,7 @@ pub async fn wait_for_harness(child: tokio::process::Child) -> Result<HarnessOut
 
 /// Output captured from a harness invocation.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct HarnessOutput {
     pub stdout: String,
     pub stderr: String,

@@ -1,5 +1,4 @@
 // Interactive plan-harness: spawn a coding harness to create/update ralph-rs plans.
-#![allow(dead_code)]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

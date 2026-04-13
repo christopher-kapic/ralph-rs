@@ -9,8 +9,6 @@
 // The shutdown flag is communicated via a `tokio::sync::watch` channel that
 // the executor and runner already consume as `abort_rx`.
 
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
@@ -25,6 +23,7 @@ use tokio::sync::watch;
 /// Create one per run via [`ShutdownController::new`], then call
 /// [`ShutdownController::spawn_signal_listener`] before entering the run loop.
 /// Pass [`ShutdownController::abort_rx`] to the runner/executor.
+#[allow(dead_code)]
 pub struct ShutdownController {
     /// Sends `true` on first signal to request graceful abort.
     abort_tx: watch::Sender<bool>,
@@ -101,6 +100,7 @@ impl ShutdownController {
     }
 
     /// Check whether the shutdown flag is currently set.
+    #[allow(dead_code)]
     pub fn is_shutdown_requested(&self) -> bool {
         *self.abort_rx.borrow()
     }
@@ -118,6 +118,7 @@ impl ShutdownController {
 /// let abort_rx = signal::install()?;
 /// rt.block_on(runner::run_plan(&conn, &plan, &cfg, workdir, &opts, abort_rx))?;
 /// ```
+#[allow(dead_code)]
 pub fn install() -> Result<(ShutdownController, watch::Receiver<bool>)> {
     let controller = ShutdownController::new();
     let rx = controller.abort_rx();

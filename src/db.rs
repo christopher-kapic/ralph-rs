@@ -1,5 +1,4 @@
 // SQLite database layer
-#![allow(dead_code)]
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -10,6 +9,7 @@ use crate::config;
 
 /// Current schema version. Bump this and add a new migration function
 /// to `MIGRATIONS` whenever the schema changes.
+#[allow(dead_code)]
 const CURRENT_VERSION: u32 = 3;
 
 /// Each migration is a function that receives a connection (already inside a transaction).
@@ -46,6 +46,7 @@ fn open_at<P: AsRef<std::path::Path>>(path: P) -> Result<Connection> {
 }
 
 /// Opens an in-memory database with migrations applied. Used for tests.
+#[allow(dead_code)]
 pub fn open_memory() -> Result<Connection> {
     let conn = Connection::open_in_memory().context("Failed to open in-memory database")?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;

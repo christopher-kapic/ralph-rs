@@ -4,8 +4,6 @@
 // interpretation from rendering and state so it can be tested without a
 // terminal.
 
-#![allow(dead_code)]
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::app::{App, InputMode};

@@ -3,8 +3,6 @@
 // Layout and widget construction for the interactive TUI, powered by ratatui.
 // Renders the step list, step detail panel, and keybinding help bar.
 
-#![allow(dead_code)]
-
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};

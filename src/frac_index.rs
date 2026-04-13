@@ -2,7 +2,6 @@
 //
 // Uses base-62 strings (0-9, A-Z, a-z) to generate sort keys that allow
 // O(1) insertions between existing steps without reordering.
-#![allow(dead_code)]
 
 /// The base-62 alphabet used for sort keys: 0-9, A-Z, a-z.
 const ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";

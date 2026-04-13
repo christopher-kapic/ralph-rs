@@ -2,7 +2,6 @@
 //
 // Runs a single step through the full lifecycle:
 // resolve harness → build prompt → spawn → wait → test → commit/rollback.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -39,6 +38,7 @@ pub enum StepOutcome {
 
 /// Result returned from [`execute_step`].
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct StepResult {
     pub outcome: StepOutcome,
     pub step_id: String,
@@ -52,6 +52,7 @@ pub struct StepResult {
 
 /// Structured fields that a harness may emit in JSON output.
 #[derive(Debug, Default)]
+#[allow(dead_code)]
 struct ParsedHarnessOutput {
     cost_usd: Option<f64>,
     input_tokens: Option<i64>,
@@ -796,7 +797,7 @@ diff --git a/src/lib.rs b/src/lib.rs
     fn test_increment_step_attempts() {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let step =
+        let (step, _) =
             storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
         assert_eq!(step.attempts, 0);
 
@@ -810,11 +811,11 @@ diff --git a/src/lib.rs b/src/lib.rs
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let s1 =
+        let (s1, _) =
             storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
-        let s2 =
+        let (s2, _) =
             storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None).unwrap();
-        let s3 =
+        let (s3, _) =
             storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None).unwrap();
 
         // Mark first two as complete.
@@ -832,11 +833,11 @@ diff --git a/src/lib.rs b/src/lib.rs
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let s1 =
+        let (s1, _) =
             storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
-        let _s2 =
+        let (_s2, _) =
             storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None).unwrap();
-        let s3 =
+        let (s3, _) =
             storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None).unwrap();
 
         // Only first is complete; second is pending.

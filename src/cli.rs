@@ -1,5 +1,4 @@
 // CLI argument parsing (clap)
-#![allow(dead_code)]
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;

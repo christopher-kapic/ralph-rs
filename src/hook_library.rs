@@ -17,7 +17,6 @@
 //       paths:
 //         - /home/me/projects/rust
 //         - /home/me/work/backend
-#![allow(dead_code)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -341,6 +340,7 @@ pub fn load_all() -> Result<Vec<Hook>> {
 }
 
 /// Load a single hook by name.
+#[allow(dead_code)]
 pub fn load(name: &str) -> Result<Hook> {
     let path = hook_path(name)?;
     if !path.exists() {

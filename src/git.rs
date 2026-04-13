@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Git integration – thin wrappers around `git` CLI via std::process::Command.
 //
 // Every public function accepts a `workdir` parameter so callers can target any
@@ -117,6 +116,7 @@ pub fn get_diff(workdir: &Path) -> Result<String> {
 /// Hard-reset the working directory to the last commit state.
 ///
 /// Equivalent to `git checkout -- . && git clean -fd`.
+#[allow(dead_code)]
 pub fn rollback_changes(workdir: &Path) -> Result<()> {
     git(workdir, &["checkout", "--", "."]).context("git checkout -- . failed")?;
     git(workdir, &["clean", "-fd"]).context("git clean -fd failed")?;

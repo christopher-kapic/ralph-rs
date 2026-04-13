@@ -4,8 +4,6 @@
 // execution timer, and step list. This module is independent of rendering and
 // input handling so that it can be unit-tested without a terminal.
 
-#![allow(dead_code)]
-
 use std::time::Instant;
 
 use crate::plan::{Plan, Step, StepStatus};

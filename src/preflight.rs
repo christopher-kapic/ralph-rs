@@ -5,7 +5,6 @@
 // - Test binary availability: extract binary from test commands, check via `which`
 // - Harness authentication: check GH_TOKEN for copilot
 // - Git dirty state: auto-commit with a descriptive message
-#![allow(dead_code)]
 
 use std::path::Path;
 
@@ -51,6 +50,7 @@ impl PreflightResults {
     }
 
     /// Returns true if every check passed with no warnings or errors.
+    #[allow(dead_code)]
     pub fn all_passed(&self) -> bool {
         self.checks
             .iter()

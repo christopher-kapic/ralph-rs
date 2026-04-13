@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Test validation runner
 //
 // Executes deterministic test commands (shell commands) and collects structured results.
@@ -8,6 +7,7 @@ use std::process::Command;
 
 /// Result of a single test command execution.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TestResult {
     /// The shell command that was executed.
     pub command: String,
@@ -21,6 +21,7 @@ pub struct TestResult {
 
 /// Aggregated results from running a suite of test commands.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct TestResults {
     /// Individual results for each executed test (may be fewer than the input
     /// list if short-circuiting occurred).

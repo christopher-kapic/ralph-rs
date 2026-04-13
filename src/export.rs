@@ -169,7 +169,7 @@ mod tests {
         )
         .unwrap();
 
-        let _s1 = storage::create_step(
+        let (_s1, _) = storage::create_step(
             &conn,
             &plan.id,
             "Step one",
@@ -181,7 +181,7 @@ mod tests {
         )
         .unwrap();
 
-        let _s2 = storage::create_step(
+        let (_s2, _) = storage::create_step(
             &conn,
             &plan.id,
             "Step two",
@@ -382,7 +382,7 @@ mod tests {
         )
         .unwrap();
 
-        let step =
+        let (step, _) =
             storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
 
         // Mark step as complete

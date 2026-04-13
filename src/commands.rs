@@ -530,7 +530,7 @@ pub fn step_add(
 
     let desc = description.unwrap_or("");
 
-    let step = if let Some(after_pos) = after {
+    let (step, pos) = if let Some(after_pos) = after {
         // Insert after a specific position using fractional indexing
         let steps = storage::list_steps(conn, &plan.id)?;
         if after_pos > steps.len() {
@@ -587,14 +587,6 @@ pub fn step_add(
             max_retries,
         )?
     };
-
-    // Determine the position
-    let steps = storage::list_steps(conn, &plan.id)?;
-    let pos = steps
-        .iter()
-        .position(|s| s.id == step.id)
-        .map(|i| i + 1)
-        .unwrap_or(0);
 
     println!(
         "{} Added step #{}: {}",

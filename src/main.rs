@@ -19,6 +19,7 @@ mod runner;
 mod signal;
 mod storage;
 mod test_runner;
+#[allow(dead_code)]
 mod tui;
 
 use anyhow::{Context, Result};

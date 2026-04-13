@@ -1,5 +1,4 @@
 // Plan and step lifecycle
-#![allow(dead_code)]
 
 use chrono::{DateTime, Utc};
 use rusqlite::Row;
