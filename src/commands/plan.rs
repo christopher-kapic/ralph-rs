@@ -1,0 +1,467 @@
+// Plan CLI command implementations (CRUD, dependencies, plan-level hooks)
+
+use anyhow::{Context, Result, bail};
+use rusqlite::Connection;
+use std::io::{self, Write};
+
+use crate::hook_library::{self, Lifecycle};
+use crate::output::{self, OutputContext, OutputFormat};
+use crate::plan::PlanStatus;
+use crate::storage;
+
+// ---------------------------------------------------------------------------
+// Plan commands
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+pub fn plan_create(
+    conn: &Connection,
+    slug: &str,
+    project: &str,
+    description: Option<&str>,
+    branch: Option<&str>,
+    harness: Option<&str>,
+    agent: Option<&str>,
+    tests: &[String],
+    depends_on: &[String],
+    out: &OutputContext,
+) -> Result<()> {
+    let desc = description.unwrap_or(slug);
+    let branch_name = branch.unwrap_or(slug);
+
+    // Resolve dependency slugs to plan IDs BEFORE creating the plan so we
+    // fail fast if any are missing. We must look them up in the same
+    // project.
+    let mut resolved_deps: Vec<(String, String)> = Vec::with_capacity(depends_on.len());
+    for dep_slug in depends_on {
+        let dep = storage::get_plan_by_slug(conn, dep_slug, project)?
+            .with_context(|| format!("Dependency plan not found: {dep_slug}"))?;
+        resolved_deps.push((dep_slug.clone(), dep.id));
+    }
+
+    let plan = storage::create_plan(
+        conn,
+        slug,
+        project,
+        branch_name,
+        desc,
+        harness,
+        agent,
+        tests,
+    )?;
+
+    // Attach each resolved dependency. Self-references and cycles are
+    // rejected by the storage layer (the new plan has no deps yet, so a
+    // cycle is impossible, but self-reference is guarded anyway).
+    for (dep_slug, dep_id) in &resolved_deps {
+        storage::add_plan_dependency(conn, &plan.id, dep_id)
+            .with_context(|| format!("Failed to add dependency on '{dep_slug}'"))?;
+    }
+
+    println!(
+        "{} Created plan: {}",
+        output::check_icon(out.color),
+        output::bold(&plan.slug, out.color),
+    );
+    if !tests.is_empty() {
+        println!("  Tests: {}", tests.join(", "));
+    }
+    if !resolved_deps.is_empty() {
+        let slugs: Vec<&str> = resolved_deps.iter().map(|(s, _)| s.as_str()).collect();
+        println!("  Depends on: {}", slugs.join(", "));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Plan dependency commands
+// ---------------------------------------------------------------------------
+
+/// Add one or more plan dependency edges to `slug`.
+pub fn plan_dependency_add(
+    conn: &Connection,
+    slug: &str,
+    project: &str,
+    depends_on_slugs: &[String],
+    out: &OutputContext,
+) -> Result<()> {
+    if depends_on_slugs.is_empty() {
+        bail!("At least one --depends-on slug is required");
+    }
+
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    for dep_slug in depends_on_slugs {
+        let dep = storage::get_plan_by_slug(conn, dep_slug, project)?
+            .with_context(|| format!("Dependency plan not found: {dep_slug}"))?;
+        storage::add_plan_dependency(conn, &plan.id, &dep.id)?;
+        println!(
+            "{} Added dependency: {} -> {}",
+            output::check_icon(out.color),
+            slug,
+            dep_slug
+        );
+    }
+
+    Ok(())
+}
+
+/// Remove one or more plan dependency edges from `slug`.
+pub fn plan_dependency_remove(
+    conn: &Connection,
+    slug: &str,
+    project: &str,
+    depends_on_slugs: &[String],
+    out: &OutputContext,
+) -> Result<()> {
+    if depends_on_slugs.is_empty() {
+        bail!("At least one --depends-on slug is required");
+    }
+
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    for dep_slug in depends_on_slugs {
+        let dep = storage::get_plan_by_slug(conn, dep_slug, project)?
+            .with_context(|| format!("Dependency plan not found: {dep_slug}"))?;
+        storage::remove_plan_dependency(conn, &plan.id, &dep.id)?;
+        println!(
+            "{} Removed dependency: {} -> {}",
+            output::check_icon(out.color),
+            slug,
+            dep_slug
+        );
+    }
+
+    Ok(())
+}
+
+/// Print the direct dependencies and dependents of `slug`.
+pub fn plan_dependency_list(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    let dep_ids = storage::list_plan_dependencies(conn, &plan.id)?;
+    let dependent_ids = storage::list_dependent_plans(conn, &plan.id)?;
+
+    let mut dep_slugs: Vec<String> = Vec::with_capacity(dep_ids.len());
+    for id in &dep_ids {
+        if let Some(s) = storage::get_plan_slug_by_id(conn, id)? {
+            dep_slugs.push(s);
+        }
+    }
+    dep_slugs.sort();
+
+    let mut dependent_slugs: Vec<String> = Vec::with_capacity(dependent_ids.len());
+    for id in &dependent_ids {
+        if let Some(s) = storage::get_plan_slug_by_id(conn, id)? {
+            dependent_slugs.push(s);
+        }
+    }
+    dependent_slugs.sort();
+
+    if out.format == OutputFormat::Json {
+        let summary = output::DependencyListSummary {
+            slug: slug.to_string(),
+            depends_on: dep_slugs,
+            depended_on_by: dependent_slugs,
+        };
+        println!("{}", serde_json::to_string(&summary)?);
+        return Ok(());
+    }
+
+    println!("{}", output::bold(slug, out.color));
+    println!("  depends on:");
+    if dep_slugs.is_empty() {
+        println!("    (none)");
+    } else {
+        for s in &dep_slugs {
+            println!("    - {s}");
+        }
+    }
+    println!("  depended on by:");
+    if dependent_slugs.is_empty() {
+        println!("    (none)");
+    } else {
+        for s in &dependent_slugs {
+            println!("    - {s}");
+        }
+    }
+
+    Ok(())
+}
+
+pub fn plan_list(
+    conn: &Connection,
+    project: &str,
+    all: bool,
+    status: Option<PlanStatus>,
+    show_archived: bool,
+    out: &OutputContext,
+) -> Result<()> {
+    let plans = storage::list_plans(conn, project, all)?;
+
+    // Filter by status if provided, otherwise hide archived unless --archived
+    let plans: Vec<_> = if let Some(target) = status {
+        plans.into_iter().filter(|p| p.status == target).collect()
+    } else if !show_archived {
+        plans
+            .into_iter()
+            .filter(|p| p.status != PlanStatus::Archived)
+            .collect()
+    } else {
+        plans
+    };
+
+    if out.format == OutputFormat::Json {
+        let summaries: Vec<output::PlanSummary> =
+            plans.iter().map(output::PlanSummary::from).collect();
+        println!("{}", serde_json::to_string(&summaries)?);
+        return Ok(());
+    }
+
+    if plans.is_empty() {
+        println!("No plans found.");
+        return Ok(());
+    }
+
+    for plan in &plans {
+        println!(
+            "  {} {}  {}  [{}]",
+            output::plan_status_icon(plan.status, out.color),
+            output::bold(&plan.slug, out.color),
+            plan.description,
+            output::colored_plan_status(plan.status, out.color),
+        );
+        if all {
+            println!("    project: {}", plan.project);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn plan_show(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    let steps = storage::list_steps(conn, &plan.id)?;
+
+    if out.format == OutputFormat::Json {
+        let summary = output::PlanShowSummary {
+            plan: output::PlanSummary::from(&plan),
+            steps: steps.iter().map(output::StepSummary::from).collect(),
+        };
+        println!("{}", serde_json::to_string(&summary)?);
+        return Ok(());
+    }
+
+    println!(
+        "{}  {}",
+        output::bold(&plan.slug, out.color),
+        output::colored_plan_status(plan.status, out.color),
+    );
+    println!("  Description: {}", plan.description);
+    println!("  Branch:      {}", plan.branch_name);
+    println!("  Project:     {}", plan.project);
+    if let Some(ref h) = plan.harness {
+        println!("  Harness:     {h}");
+    }
+    if let Some(ref a) = plan.agent {
+        println!("  Agent:       {a}");
+    }
+    if !plan.deterministic_tests.is_empty() {
+        println!("  Tests:");
+        for t in &plan.deterministic_tests {
+            println!("    - {t}");
+        }
+    }
+    println!(
+        "  Created:     {}",
+        plan.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+
+    if !steps.is_empty() {
+        println!();
+        println!("  Steps:");
+        for (i, step) in steps.iter().enumerate() {
+            println!(
+                "    {:>3}. {} {} [{}]",
+                i + 1,
+                output::status_icon(step.status, out.color),
+                step.title,
+                output::colored_status(step.status, out.color),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub fn plan_approve(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    if plan.status != PlanStatus::Planning {
+        bail!(
+            "Plan '{}' is in status '{}', can only approve plans in 'planning' status",
+            slug,
+            plan.status
+        );
+    }
+
+    storage::update_plan_status(conn, &plan.id, PlanStatus::Ready)?;
+    println!(
+        "{} Plan '{}' approved and ready for execution",
+        output::check_icon(out.color),
+        slug
+    );
+    Ok(())
+}
+
+pub fn plan_archive(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    match plan.status {
+        PlanStatus::Complete | PlanStatus::Failed | PlanStatus::Aborted => {}
+        _ => bail!(
+            "Plan '{}' is in status '{}'; only complete, failed, or aborted plans can be archived",
+            slug,
+            plan.status
+        ),
+    }
+
+    storage::update_plan_status(conn, &plan.id, PlanStatus::Archived)?;
+    println!(
+        "{} Archived plan '{}'",
+        output::plan_status_icon(PlanStatus::Archived, out.color),
+        slug
+    );
+    Ok(())
+}
+
+pub fn plan_unarchive(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    if plan.status != PlanStatus::Archived {
+        bail!(
+            "Plan '{}' is not archived (status: '{}')",
+            slug,
+            plan.status
+        );
+    }
+
+    // Restore to complete — the most neutral terminal state.
+    storage::update_plan_status(conn, &plan.id, PlanStatus::Complete)?;
+    println!(
+        "{} Unarchived plan '{}' (status: complete)",
+        output::check_icon(out.color),
+        slug
+    );
+    Ok(())
+}
+
+pub fn plan_delete(conn: &Connection, slug: &str, project: &str, force: bool, out: &OutputContext) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+
+    if !force {
+        print!("Delete plan '{}' and all its steps/logs? [y/N] ", slug);
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    storage::delete_plan(conn, &plan.id)?;
+    println!(
+        "{} Deleted plan '{}'",
+        output::check_icon(out.color),
+        slug
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Plan hook attachment commands
+// ---------------------------------------------------------------------------
+
+pub fn cmd_plan_set_hook(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    lifecycle: Lifecycle,
+    hook_name: &str,
+    _out: &OutputContext,
+) -> Result<()> {
+    if hook_library::try_load(hook_name)?.is_none() {
+        eprintln!(
+            "Warning: hook '{hook_name}' is not in the local library. It will be skipped at run time until imported."
+        );
+    }
+
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+    storage::attach_hook_to_plan(conn, &plan.id, lifecycle.as_str(), hook_name)?;
+    println!("Attached plan-wide hook '{hook_name}' to '{plan_slug}' at {lifecycle}");
+    Ok(())
+}
+
+pub fn cmd_plan_unset_hook(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    lifecycle: Lifecycle,
+    hook_name: &str,
+    _out: &OutputContext,
+) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+    let removed = storage::detach_hook(conn, &plan.id, None, lifecycle.as_str(), hook_name)?;
+    if removed == 0 {
+        bail!("No plan-wide hook '{hook_name}' attached to '{plan_slug}' at {lifecycle}");
+    }
+    println!("Detached plan-wide hook '{hook_name}' from '{plan_slug}'");
+    Ok(())
+}
+
+pub fn cmd_plan_hooks(conn: &Connection, plan_slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+    let rows = storage::list_all_hooks_for_plan(conn, &plan.id)?;
+
+    if rows.is_empty() {
+        println!("No hooks attached to plan '{plan_slug}'.");
+        return Ok(());
+    }
+
+    let steps = storage::list_steps(conn, &plan.id)?;
+    let step_num = |sid: &str| -> Option<usize> {
+        steps.iter().position(|s| s.id == sid).map(|i| i + 1)
+    };
+
+    println!("Hooks attached to plan '{plan_slug}':");
+    for row in &rows {
+        let target = match &row.step_id {
+            None => "plan-wide".to_string(),
+            Some(sid) => match step_num(sid) {
+                Some(n) => format!("step {n}"),
+                None => format!("step <unknown id {sid}>"),
+            },
+        };
+        println!(
+            "  {target:<12} [{lifecycle:<9}] {hook}",
+            target = target,
+            lifecycle = row.lifecycle,
+            hook = row.hook_name,
+        );
+    }
+    Ok(())
+}

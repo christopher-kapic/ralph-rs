@@ -24,7 +24,13 @@ The full design spec is in `ralph-rs-plan.md` at the project root. Read it befor
 src/
   main.rs              — Entry point, clap CLI dispatch
   cli.rs               — Clap command/arg definitions
-  commands.rs          — Command handler implementations
+  commands/
+    mod.rs             — Re-exports, shared helpers (resolve_project/step), init, doctor
+    plan.rs            — Plan CRUD, dependency, plan-level hook commands
+    step.rs            — Step CRUD, move, step-level hook commands
+    run.rs             — Status and log commands
+    agents.rs          — Agent file CRUD commands
+    hooks.rs           — Hook library CRUD, export/import commands
   config.rs            — Config loading (~/.config/ralph-rs/config.json)
   db.rs                — SQLite connection, migrations
   plan.rs              — Plan/Step data models and enums
