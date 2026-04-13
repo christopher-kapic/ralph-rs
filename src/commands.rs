@@ -9,6 +9,7 @@ use crate::config;
 use crate::db;
 use crate::frac_index;
 use crate::hook_library::{self, Hook, HookBundle, Lifecycle, Scope};
+use crate::output::OutputContext;
 use crate::plan::{self, ExecutionLog, PlanStatus};
 use crate::preflight;
 use crate::storage;
@@ -77,6 +78,7 @@ pub fn plan_create(
     agent: Option<&str>,
     tests: &[String],
     depends_on: &[String],
+    _out: &OutputContext,
 ) -> Result<()> {
     let desc = description.unwrap_or(slug);
     let branch_name = branch.unwrap_or(slug);
@@ -135,6 +137,7 @@ pub fn plan_dependency_add(
     slug: &str,
     project: &str,
     depends_on_slugs: &[String],
+    _out: &OutputContext,
 ) -> Result<()> {
     if depends_on_slugs.is_empty() {
         bail!("At least one --depends-on slug is required");
@@ -164,6 +167,7 @@ pub fn plan_dependency_remove(
     slug: &str,
     project: &str,
     depends_on_slugs: &[String],
+    _out: &OutputContext,
 ) -> Result<()> {
     if depends_on_slugs.is_empty() {
         bail!("At least one --depends-on slug is required");
@@ -188,7 +192,7 @@ pub fn plan_dependency_remove(
 }
 
 /// Print the direct dependencies and dependents of `slug`.
-pub fn plan_dependency_list(conn: &Connection, slug: &str, project: &str) -> Result<()> {
+pub fn plan_dependency_list(conn: &Connection, slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -238,6 +242,7 @@ pub fn plan_list(
     all: bool,
     status: Option<&str>,
     show_archived: bool,
+    _out: &OutputContext,
 ) -> Result<()> {
     let plans = storage::list_plans(conn, project, all)?;
 
@@ -283,7 +288,7 @@ pub fn plan_list(
     Ok(())
 }
 
-pub fn plan_show(conn: &Connection, slug: &str, project: &str) -> Result<()> {
+pub fn plan_show(conn: &Connection, slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -333,7 +338,7 @@ pub fn plan_show(conn: &Connection, slug: &str, project: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn plan_approve(conn: &Connection, slug: &str, project: &str) -> Result<()> {
+pub fn plan_approve(conn: &Connection, slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -354,7 +359,7 @@ pub fn plan_approve(conn: &Connection, slug: &str, project: &str) -> Result<()> 
     Ok(())
 }
 
-pub fn plan_archive(conn: &Connection, slug: &str, project: &str) -> Result<()> {
+pub fn plan_archive(conn: &Connection, slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -372,7 +377,7 @@ pub fn plan_archive(conn: &Connection, slug: &str, project: &str) -> Result<()> 
     Ok(())
 }
 
-pub fn plan_unarchive(conn: &Connection, slug: &str, project: &str) -> Result<()> {
+pub fn plan_unarchive(conn: &Connection, slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -394,7 +399,7 @@ pub fn plan_unarchive(conn: &Connection, slug: &str, project: &str) -> Result<()
     Ok(())
 }
 
-pub fn plan_delete(conn: &Connection, slug: &str, project: &str, force: bool) -> Result<()> {
+pub fn plan_delete(conn: &Connection, slug: &str, project: &str, force: bool, _out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -419,7 +424,7 @@ pub fn plan_delete(conn: &Connection, slug: &str, project: &str, force: bool) ->
 // Step commands
 // ---------------------------------------------------------------------------
 
-pub fn step_list(conn: &Connection, plan_slug: &str, project: &str) -> Result<()> {
+pub fn step_list(conn: &Connection, plan_slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
@@ -467,6 +472,7 @@ pub fn step_add(
     harness: Option<&str>,
     criteria: &[String],
     max_retries: Option<i32>,
+    _out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -554,6 +560,7 @@ pub fn step_remove(
     project: &str,
     step_num: usize,
     force: bool,
+    _out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -598,6 +605,7 @@ pub fn step_edit(
     step_num: usize,
     title: Option<&str>,
     description: Option<&str>,
+    _out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -632,6 +640,7 @@ pub fn step_reset(
     plan_slug: &str,
     project: &str,
     step_num: usize,
+    _out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -662,6 +671,7 @@ pub fn step_move(
     project: &str,
     step_num: usize,
     to: usize,
+    _out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -739,7 +749,7 @@ pub fn step_move(
 // Init command
 // ---------------------------------------------------------------------------
 
-pub fn cmd_init() -> Result<()> {
+pub fn cmd_init(_out: &OutputContext) -> Result<()> {
     use std::fs;
 
     // Create config dir
@@ -792,7 +802,7 @@ pub fn cmd_init() -> Result<()> {
 // Doctor command
 // ---------------------------------------------------------------------------
 
-pub fn cmd_doctor(config: &config::Config) -> Result<()> {
+pub fn cmd_doctor(config: &config::Config, _out: &OutputContext) -> Result<()> {
     println!("ralph doctor");
     println!();
 
@@ -830,6 +840,7 @@ pub fn cmd_status(
     project: &str,
     plan_slug: Option<&str>,
     verbose: bool,
+    _out: &OutputContext,
 ) -> Result<()> {
     let plan = if let Some(slug) = plan_slug {
         storage::get_plan_by_slug(conn, slug, project)?
@@ -939,6 +950,7 @@ pub fn cmd_log(
     step_num: Option<usize>,
     limit: Option<usize>,
     full: bool,
+    _out: &OutputContext,
 ) -> Result<()> {
     // Resolve plan
     let plan = if let Some(slug) = plan_slug {
@@ -1077,7 +1089,7 @@ fn print_log_entry(step_title: &str, log: &ExecutionLog, full: bool) {
 // Agents commands
 // ---------------------------------------------------------------------------
 
-pub fn cmd_agents_list() -> Result<()> {
+pub fn cmd_agents_list(_out: &OutputContext) -> Result<()> {
     let agents_dir = config::agents_dir()?;
 
     if !agents_dir.exists() {
@@ -1113,7 +1125,7 @@ pub fn cmd_agents_list() -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_agents_show(name: &str) -> Result<()> {
+pub fn cmd_agents_show(name: &str, _out: &OutputContext) -> Result<()> {
     let agents_dir = config::agents_dir()?;
     let path = agents_dir.join(format!("{name}.md"));
 
@@ -1127,7 +1139,7 @@ pub fn cmd_agents_show(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_agents_create(name: &str, file: Option<&std::path::Path>) -> Result<()> {
+pub fn cmd_agents_create(name: &str, file: Option<&std::path::Path>, _out: &OutputContext) -> Result<()> {
     let agents_dir = config::agents_dir()?;
     std::fs::create_dir_all(&agents_dir)?;
     let path = agents_dir.join(format!("{name}.md"));
@@ -1148,7 +1160,7 @@ pub fn cmd_agents_create(name: &str, file: Option<&std::path::Path>) -> Result<(
     Ok(())
 }
 
-pub fn cmd_agents_delete(name: &str) -> Result<()> {
+pub fn cmd_agents_delete(name: &str, _out: &OutputContext) -> Result<()> {
     let agents_dir = config::agents_dir()?;
     let path = agents_dir.join(format!("{name}.md"));
 
@@ -1165,7 +1177,7 @@ pub fn cmd_agents_delete(name: &str) -> Result<()> {
 // Hooks commands
 // ---------------------------------------------------------------------------
 
-pub fn cmd_hooks_list(project: &str, all: bool) -> Result<()> {
+pub fn cmd_hooks_list(project: &str, all: bool, _out: &OutputContext) -> Result<()> {
     let hooks = hook_library::load_all()?;
 
     let filtered: Vec<Hook> = if all {
@@ -1212,7 +1224,7 @@ pub fn cmd_hooks_list(project: &str, all: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_hooks_show(name: &str) -> Result<()> {
+pub fn cmd_hooks_show(name: &str, _out: &OutputContext) -> Result<()> {
     let path = hook_library::hooks_dir()?.join(format!("{name}.md"));
     if !path.exists() {
         bail!("Hook not found: {name}");
@@ -1230,6 +1242,7 @@ pub fn cmd_hooks_add(
     description: Option<&str>,
     scope_paths: &[std::path::PathBuf],
     force: bool,
+    _out: &OutputContext,
 ) -> Result<()> {
     let lifecycle = Lifecycle::parse(lifecycle)?;
 
@@ -1262,7 +1275,7 @@ pub fn cmd_hooks_add(
     Ok(())
 }
 
-pub fn cmd_hooks_remove(name: &str) -> Result<()> {
+pub fn cmd_hooks_remove(name: &str, _out: &OutputContext) -> Result<()> {
     hook_library::delete(name)?;
     println!("Deleted hook '{name}'");
     Ok(())
@@ -1273,6 +1286,7 @@ pub fn cmd_hooks_export(
     output: Option<&Path>,
     all: bool,
     path: Option<&Path>,
+    _out: &OutputContext,
 ) -> Result<()> {
     let hooks = hook_library::load_all()?;
 
@@ -1303,7 +1317,7 @@ pub fn cmd_hooks_export(
     Ok(())
 }
 
-pub fn cmd_hooks_import(file: &Path, force: bool) -> Result<()> {
+pub fn cmd_hooks_import(file: &Path, force: bool, _out: &OutputContext) -> Result<()> {
     let contents = std::fs::read_to_string(file)
         .with_context(|| format!("Failed to read bundle {}", file.display()))?;
     let bundle: HookBundle = serde_json::from_str(&contents)
@@ -1357,6 +1371,7 @@ pub fn cmd_step_set_hook(
     step_num: usize,
     lifecycle: &str,
     hook_name: &str,
+    _out: &OutputContext,
 ) -> Result<()> {
     // Validate lifecycle string.
     Lifecycle::parse(lifecycle)?;
@@ -1394,6 +1409,7 @@ pub fn cmd_step_unset_hook(
     step_num: usize,
     lifecycle: &str,
     hook_name: &str,
+    _out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -1420,6 +1436,7 @@ pub fn cmd_plan_set_hook(
     project: &str,
     lifecycle: &str,
     hook_name: &str,
+    _out: &OutputContext,
 ) -> Result<()> {
     Lifecycle::parse(lifecycle)?;
 
@@ -1442,6 +1459,7 @@ pub fn cmd_plan_unset_hook(
     project: &str,
     lifecycle: &str,
     hook_name: &str,
+    _out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -1453,7 +1471,7 @@ pub fn cmd_plan_unset_hook(
     Ok(())
 }
 
-pub fn cmd_plan_hooks(conn: &Connection, plan_slug: &str, project: &str) -> Result<()> {
+pub fn cmd_plan_hooks(conn: &Connection, plan_slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
     let rows = storage::list_all_hooks_for_plan(conn, &plan.id)?;
@@ -1497,10 +1515,20 @@ mod tests {
     use crate::db;
     use crate::plan::StepStatus;
 
+    use crate::output::{OutputContext, OutputFormat};
+
     fn setup() -> (Connection, String) {
         let conn = db::open_memory().expect("open_memory");
         let project = "/tmp/test-project".to_string();
         (conn, project)
+    }
+
+    fn test_out() -> OutputContext {
+        OutputContext {
+            format: OutputFormat::Plain,
+            quiet: true,
+            color: false,
+        }
     }
 
     #[test]
@@ -1517,6 +1545,7 @@ mod tests {
             None,
             &["cargo build".to_string()],
             &[],
+            &test_out(),
         )
         .unwrap();
 
@@ -1533,8 +1562,8 @@ mod tests {
     fn test_plan_approve() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
-        plan_approve(&conn, "my-plan", &project).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_approve(&conn, "my-plan", &project, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1546,11 +1575,11 @@ mod tests {
     fn test_plan_approve_rejects_non_planning() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
-        plan_approve(&conn, "my-plan", &project).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_approve(&conn, "my-plan", &project, &test_out()).unwrap();
 
         // Second approve should fail - plan is now ready, not planning
-        let result = plan_approve(&conn, "my-plan", &project);
+        let result = plan_approve(&conn, "my-plan", &project, &test_out());
         assert!(result.is_err());
     }
 
@@ -1558,8 +1587,8 @@ mod tests {
     fn test_plan_delete_forced() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
-        plan_delete(&conn, "my-plan", &project, true).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_delete(&conn, "my-plan", &project, true, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project).unwrap();
         assert!(plan.is_none());
@@ -1569,7 +1598,7 @@ mod tests {
     fn test_step_add_and_list() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         step_add(
             &conn,
             "my-plan",
@@ -1581,6 +1610,7 @@ mod tests {
             None,
             &[],
             None,
+            &test_out(),
         )
         .unwrap();
         step_add(
@@ -1594,6 +1624,7 @@ mod tests {
             None,
             &[],
             None,
+            &test_out(),
         )
         .unwrap();
 
@@ -1610,13 +1641,13 @@ mod tests {
     fn test_step_add_after() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         step_add(
-            &conn, "my-plan", &project, "First", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "First", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "Third", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "Third", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
         // Insert after position 1
@@ -1631,6 +1662,7 @@ mod tests {
             None,
             &[],
             None,
+            &test_out(),
         )
         .unwrap();
 
@@ -1648,7 +1680,7 @@ mod tests {
     fn test_step_add_with_criteria_and_max_retries() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         let criteria = vec!["Tests pass".to_string(), "No warnings".to_string()];
         step_add(
             &conn,
@@ -1661,6 +1693,7 @@ mod tests {
             None,
             &criteria,
             Some(5),
+            &test_out(),
         )
         .unwrap();
 
@@ -1677,9 +1710,9 @@ mod tests {
     fn test_step_add_after_with_criteria() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         step_add(
-            &conn, "my-plan", &project, "First", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "First", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
         let criteria = vec!["Inserted check".to_string()];
@@ -1694,6 +1727,7 @@ mod tests {
             None,
             &criteria,
             Some(2),
+            &test_out(),
         )
         .unwrap();
 
@@ -1710,17 +1744,17 @@ mod tests {
     fn test_step_remove_forced() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         step_add(
-            &conn, "my-plan", &project, "First", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "First", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "Second", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "Second", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
 
-        step_remove(&conn, "my-plan", &project, 2, true).unwrap();
+        step_remove(&conn, "my-plan", &project, 2, true, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1734,7 +1768,7 @@ mod tests {
     fn test_step_edit() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         step_add(
             &conn,
             "my-plan",
@@ -1746,6 +1780,7 @@ mod tests {
             None,
             &[],
             None,
+            &test_out(),
         )
         .unwrap();
 
@@ -1756,6 +1791,7 @@ mod tests {
             1,
             Some("New title"),
             Some("New desc"),
+            &test_out(),
         )
         .unwrap();
 
@@ -1771,9 +1807,9 @@ mod tests {
     fn test_step_reset() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         step_add(
-            &conn, "my-plan", &project, "Step", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "Step", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
 
@@ -1783,7 +1819,7 @@ mod tests {
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
 
-        step_reset(&conn, "my-plan", &project, 1).unwrap();
+        step_reset(&conn, "my-plan", &project, 1, &test_out()).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Pending);
@@ -1794,22 +1830,22 @@ mod tests {
     fn test_step_move() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         step_add(
-            &conn, "my-plan", &project, "A", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "A", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "B", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "B", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "C", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "C", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
 
         // Move step 3 (C) to position 1
-        step_move(&conn, "my-plan", &project, 3, 1).unwrap();
+        step_move(&conn, "my-plan", &project, 3, 1, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1824,22 +1860,22 @@ mod tests {
     fn test_step_move_to_end() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         step_add(
-            &conn, "my-plan", &project, "A", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "A", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "B", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "B", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "C", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "C", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
 
         // Move step 1 (A) to position 3
-        step_move(&conn, "my-plan", &project, 1, 3).unwrap();
+        step_move(&conn, "my-plan", &project, 1, 3, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1856,8 +1892,8 @@ mod tests {
     fn test_plan_create_with_deps() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
-        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         plan_create(
             &conn,
             "plan-c",
@@ -1868,6 +1904,7 @@ mod tests {
             None,
             &[],
             &["plan-a".to_string(), "plan-b".to_string()],
+            &test_out(),
         )
         .unwrap();
 
@@ -1900,6 +1937,7 @@ mod tests {
             None,
             &[],
             &["nonexistent".to_string()],
+            &test_out(),
         );
         assert!(result.is_err());
 
@@ -1912,10 +1950,10 @@ mod tests {
     fn test_plan_dependency_add_happy_path() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
-        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
 
-        plan_dependency_add(&conn, "plan-b", &project, &["plan-a".to_string()]).unwrap();
+        plan_dependency_add(&conn, "plan-b", &project, &["plan-a".to_string()], &test_out()).unwrap();
 
         let b = storage::get_plan_by_slug(&conn, "plan-b", &project)
             .unwrap()
@@ -1928,9 +1966,9 @@ mod tests {
     fn test_plan_dependency_add_rejects_self_reference() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
 
-        let result = plan_dependency_add(&conn, "plan-a", &project, &["plan-a".to_string()]);
+        let result = plan_dependency_add(&conn, "plan-a", &project, &["plan-a".to_string()], &test_out());
         assert!(result.is_err());
     }
 
@@ -1938,13 +1976,13 @@ mod tests {
     fn test_plan_dependency_add_rejects_cycle() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
-        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
 
         // a -> b is fine.
-        plan_dependency_add(&conn, "plan-a", &project, &["plan-b".to_string()]).unwrap();
+        plan_dependency_add(&conn, "plan-a", &project, &["plan-b".to_string()], &test_out()).unwrap();
         // b -> a would close a cycle and should error.
-        let result = plan_dependency_add(&conn, "plan-b", &project, &["plan-a".to_string()]);
+        let result = plan_dependency_add(&conn, "plan-b", &project, &["plan-a".to_string()], &test_out());
         assert!(result.is_err());
     }
 
@@ -1952,7 +1990,7 @@ mod tests {
     fn test_plan_dependency_remove() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         plan_create(
             &conn,
             "plan-b",
@@ -1963,6 +2001,7 @@ mod tests {
             None,
             &[],
             &["plan-a".to_string()],
+            &test_out(),
         )
         .unwrap();
 
@@ -1974,7 +2013,7 @@ mod tests {
             1
         );
 
-        plan_dependency_remove(&conn, "plan-b", &project, &["plan-a".to_string()]).unwrap();
+        plan_dependency_remove(&conn, "plan-b", &project, &["plan-a".to_string()], &test_out()).unwrap();
         assert_eq!(
             storage::list_plan_dependencies(&conn, &b.id).unwrap().len(),
             0
@@ -1985,7 +2024,7 @@ mod tests {
     fn test_plan_dependency_list_resolves_both_directions() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         plan_create(
             &conn,
             "plan-b",
@@ -1996,6 +2035,7 @@ mod tests {
             None,
             &[],
             &["plan-a".to_string()],
+            &test_out(),
         )
         .unwrap();
         plan_create(
@@ -2008,6 +2048,7 @@ mod tests {
             None,
             &[],
             &["plan-a".to_string()],
+            &test_out(),
         )
         .unwrap();
 
@@ -2021,21 +2062,21 @@ mod tests {
         assert_eq!(a_dependents.len(), 2);
 
         // plan_dependency_list should run without error.
-        plan_dependency_list(&conn, "plan-a", &project).unwrap();
-        plan_dependency_list(&conn, "plan-b", &project).unwrap();
+        plan_dependency_list(&conn, "plan-a", &project, &test_out()).unwrap();
+        plan_dependency_list(&conn, "plan-b", &project, &test_out()).unwrap();
     }
 
     #[test]
     fn test_step_out_of_range() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
         step_add(
-            &conn, "my-plan", &project, "Step", None, None, None, None, &[], None,
+            &conn, "my-plan", &project, "Step", None, None, None, None, &[], None, &test_out(),
         )
         .unwrap();
 
-        let result = step_remove(&conn, "my-plan", &project, 5, true);
+        let result = step_remove(&conn, "my-plan", &project, 5, true, &test_out());
         assert!(result.is_err());
     }
 }

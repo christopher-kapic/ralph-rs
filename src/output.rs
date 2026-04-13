@@ -20,6 +20,44 @@ pub enum OutputFormat {
 }
 
 // ---------------------------------------------------------------------------
+// OutputContext — threaded through every command handler
+// ---------------------------------------------------------------------------
+
+/// Aggregated output settings derived from CLI flags and environment.
+#[derive(Debug, Clone)]
+pub struct OutputContext {
+    /// Whether to emit JSON or human-readable output.
+    pub format: OutputFormat,
+    /// Suppress progress / banner output when true.
+    pub quiet: bool,
+    /// Whether ANSI color codes should be emitted.
+    pub color: bool,
+}
+
+impl OutputContext {
+    /// Build an `OutputContext` from the parsed CLI flags.
+    ///
+    /// The final `color` value is `false` when any of the following hold:
+    /// - `--no-color` was passed
+    /// - `NO_COLOR` env var is set
+    /// - stdout is not a TTY
+    /// - `--json` was passed (machine output should never contain ANSI)
+    pub fn from_cli(json: bool, quiet: bool, no_color: bool) -> Self {
+        let format = if json {
+            OutputFormat::Json
+        } else {
+            OutputFormat::Plain
+        };
+        let color = !json && !no_color && should_use_color();
+        Self {
+            format,
+            quiet,
+            color,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Color / TTY detection
 // ---------------------------------------------------------------------------
 

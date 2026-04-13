@@ -17,6 +17,18 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub harness: Option<String>,
 
+    /// Emit machine-readable JSON output instead of human-readable text.
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    /// Suppress progress and banner output.
+    #[arg(long, global = true)]
+    pub quiet: bool,
+
+    /// Disable ANSI color output even when stdout is a TTY.
+    #[arg(long, global = true)]
+    pub no_color: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

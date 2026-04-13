@@ -29,6 +29,7 @@ use crate::cli::{
     PlanHarnessCommand, StepCommand,
 };
 use crate::commands::resolve_project;
+use crate::output::OutputContext;
 use crate::runner::RunOptions;
 
 fn main() -> Result<()> {
@@ -43,10 +44,13 @@ fn main() -> Result<()> {
     // Resolve project directory for commands that need it.
     let project = resolve_project(cli.project.as_deref())?;
 
+    // Build output context from global CLI flags.
+    let out = OutputContext::from_cli(cli.json, cli.quiet, cli.no_color);
+
     match cli.command {
         // -- Init --
         Command::Init { .. } => {
-            commands::cmd_init()?;
+            commands::cmd_init(&out)?;
             Ok(())
         }
 
@@ -72,40 +76,41 @@ fn main() -> Result<()> {
                     agent.as_deref(),
                     &tests,
                     &depends_on,
+                    &out,
                 )
             }
             PlanCommand::List {
                 all,
                 status,
                 archived,
-            } => commands::plan_list(&conn, &project, all, status.as_deref(), archived),
-            PlanCommand::Show { slug } => commands::plan_show(&conn, &slug, &project),
-            PlanCommand::Approve { slug } => commands::plan_approve(&conn, &slug, &project),
+            } => commands::plan_list(&conn, &project, all, status.as_deref(), archived, &out),
+            PlanCommand::Show { slug } => commands::plan_show(&conn, &slug, &project, &out),
+            PlanCommand::Approve { slug } => commands::plan_approve(&conn, &slug, &project, &out),
             PlanCommand::Delete { slug, force } => {
-                commands::plan_delete(&conn, &slug, &project, force)
+                commands::plan_delete(&conn, &slug, &project, force, &out)
             }
-            PlanCommand::Archive { slug } => commands::plan_archive(&conn, &slug, &project),
-            PlanCommand::Unarchive { slug } => commands::plan_unarchive(&conn, &slug, &project),
+            PlanCommand::Archive { slug } => commands::plan_archive(&conn, &slug, &project, &out),
+            PlanCommand::Unarchive { slug } => commands::plan_unarchive(&conn, &slug, &project, &out),
             PlanCommand::SetHook {
                 slug,
                 lifecycle,
                 hook,
-            } => commands::cmd_plan_set_hook(&conn, &slug, &project, &lifecycle, &hook),
+            } => commands::cmd_plan_set_hook(&conn, &slug, &project, &lifecycle, &hook, &out),
             PlanCommand::UnsetHook {
                 slug,
                 lifecycle,
                 hook,
-            } => commands::cmd_plan_unset_hook(&conn, &slug, &project, &lifecycle, &hook),
-            PlanCommand::Hooks { slug } => commands::cmd_plan_hooks(&conn, &slug, &project),
+            } => commands::cmd_plan_unset_hook(&conn, &slug, &project, &lifecycle, &hook, &out),
+            PlanCommand::Hooks { slug } => commands::cmd_plan_hooks(&conn, &slug, &project, &out),
             PlanCommand::Dependency(dep_cmd) => match dep_cmd {
                 PlanDependencyCommand::Add { slug, depends_on } => {
-                    commands::plan_dependency_add(&conn, &slug, &project, &depends_on)
+                    commands::plan_dependency_add(&conn, &slug, &project, &depends_on, &out)
                 }
                 PlanDependencyCommand::Remove { slug, depends_on } => {
-                    commands::plan_dependency_remove(&conn, &slug, &project, &depends_on)
+                    commands::plan_dependency_remove(&conn, &slug, &project, &depends_on, &out)
                 }
                 PlanDependencyCommand::List { slug } => {
-                    commands::plan_dependency_list(&conn, &slug, &project)
+                    commands::plan_dependency_list(&conn, &slug, &project, &out)
                 }
             },
         },
@@ -117,7 +122,7 @@ fn main() -> Result<()> {
                 if slug.is_empty() {
                     anyhow::bail!("--plan is required for step list");
                 }
-                commands::step_list(&conn, &slug, &project)
+                commands::step_list(&conn, &slug, &project, &out)
             }
             StepCommand::Add {
                 title,
@@ -145,6 +150,7 @@ fn main() -> Result<()> {
                     h,
                     &criteria,
                     max_retries,
+                    &out,
                 )
             }
             StepCommand::Remove { step, plan, force } => {
@@ -152,7 +158,7 @@ fn main() -> Result<()> {
                 if slug.is_empty() {
                     anyhow::bail!("--plan is required for step remove");
                 }
-                commands::step_remove(&conn, &slug, &project, step, force)
+                commands::step_remove(&conn, &slug, &project, step, force, &out)
             }
             StepCommand::Edit {
                 step,
@@ -171,6 +177,7 @@ fn main() -> Result<()> {
                     step,
                     title.as_deref(),
                     description.as_deref(),
+                    &out,
                 )
             }
             StepCommand::Reset { step, plan } => {
@@ -178,14 +185,14 @@ fn main() -> Result<()> {
                 if slug.is_empty() {
                     anyhow::bail!("--plan is required for step reset");
                 }
-                commands::step_reset(&conn, &slug, &project, step)
+                commands::step_reset(&conn, &slug, &project, step, &out)
             }
             StepCommand::Move { step, to, plan } => {
                 let slug = plan.unwrap_or_default();
                 if slug.is_empty() {
                     anyhow::bail!("--plan is required for step move");
                 }
-                commands::step_move(&conn, &slug, &project, step, to)
+                commands::step_move(&conn, &slug, &project, step, to, &out)
             }
             StepCommand::SetHook {
                 step,
@@ -197,7 +204,7 @@ fn main() -> Result<()> {
                 if slug.is_empty() {
                     anyhow::bail!("--plan is required for step set-hook");
                 }
-                commands::cmd_step_set_hook(&conn, &slug, &project, step, &lifecycle, &hook)
+                commands::cmd_step_set_hook(&conn, &slug, &project, step, &lifecycle, &hook, &out)
             }
             StepCommand::UnsetHook {
                 step,
@@ -209,7 +216,7 @@ fn main() -> Result<()> {
                 if slug.is_empty() {
                     anyhow::bail!("--plan is required for step unset-hook");
                 }
-                commands::cmd_step_unset_hook(&conn, &slug, &project, step, &lifecycle, &hook)
+                commands::cmd_step_unset_hook(&conn, &slug, &project, step, &lifecycle, &hook, &out)
             }
         },
 
@@ -443,7 +450,7 @@ fn main() -> Result<()> {
 
         // -- Status --
         Command::Status { plan, verbose } => {
-            commands::cmd_status(&conn, &project, plan.as_deref(), verbose)
+            commands::cmd_status(&conn, &project, plan.as_deref(), verbose, &out)
         }
 
         // -- Log --
@@ -452,22 +459,22 @@ fn main() -> Result<()> {
             step,
             limit,
             full,
-        } => commands::cmd_log(&conn, &project, plan.as_deref(), step, limit, full),
+        } => commands::cmd_log(&conn, &project, plan.as_deref(), step, limit, full, &out),
 
         // -- Agents --
         Command::Agents(subcmd) => match subcmd {
-            AgentsCommand::List => commands::cmd_agents_list(),
-            AgentsCommand::Show { name } => commands::cmd_agents_show(&name),
+            AgentsCommand::List => commands::cmd_agents_list(&out),
+            AgentsCommand::Show { name } => commands::cmd_agents_show(&name, &out),
             AgentsCommand::Create { name, file } => {
-                commands::cmd_agents_create(&name, file.as_deref())
+                commands::cmd_agents_create(&name, file.as_deref(), &out)
             }
-            AgentsCommand::Delete { name } => commands::cmd_agents_delete(&name),
+            AgentsCommand::Delete { name } => commands::cmd_agents_delete(&name, &out),
         },
 
         // -- Hooks --
         Command::Hooks(subcmd) => match subcmd {
-            HooksCommand::List { all } => commands::cmd_hooks_list(&project, all),
-            HooksCommand::Show { name } => commands::cmd_hooks_show(&name),
+            HooksCommand::List { all } => commands::cmd_hooks_list(&project, all, &out),
+            HooksCommand::Show { name } => commands::cmd_hooks_show(&name, &out),
             HooksCommand::Add {
                 name,
                 lifecycle,
@@ -482,19 +489,21 @@ fn main() -> Result<()> {
                 description.as_deref(),
                 &scope_paths,
                 force,
+                &out,
             ),
-            HooksCommand::Remove { name } => commands::cmd_hooks_remove(&name),
+            HooksCommand::Remove { name } => commands::cmd_hooks_remove(&name, &out),
             HooksCommand::Export { output, all, path } => commands::cmd_hooks_export(
                 &project,
                 output.as_deref(),
                 all,
                 path.as_deref(),
+                &out,
             ),
-            HooksCommand::Import { file, force } => commands::cmd_hooks_import(&file, force),
+            HooksCommand::Import { file, force } => commands::cmd_hooks_import(&file, force, &out),
         },
 
         // -- Doctor --
-        Command::Doctor => commands::cmd_doctor(&_config),
+        Command::Doctor => commands::cmd_doctor(&_config, &out),
 
         // -- Completions --
         Command::Completions { shell } => {
