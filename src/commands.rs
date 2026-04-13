@@ -9,8 +9,8 @@ use crate::config;
 use crate::db;
 use crate::frac_index;
 use crate::hook_library::{self, Hook, HookBundle, Lifecycle, Scope};
-use crate::output::OutputContext;
-use crate::plan::{self, ExecutionLog, PlanStatus};
+use crate::output::{self, OutputContext, OutputFormat};
+use crate::plan::{ExecutionLog, PlanStatus, StepStatus};
 use crate::preflight;
 use crate::storage;
 
@@ -30,39 +30,6 @@ pub fn resolve_project(project: Option<&Path>) -> Result<String> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
-/// Status indicator symbols with ANSI colors.
-fn status_icon(status: &str) -> &'static str {
-    match status {
-        "planning" => "\x1b[33m◯\x1b[0m",    // yellow circle
-        "ready" => "\x1b[36m◉\x1b[0m",       // cyan filled circle
-        "in_progress" => "\x1b[34m▶\x1b[0m", // blue play
-        "complete" => "\x1b[32m✔\x1b[0m",    // green check
-        "failed" => "\x1b[31m✘\x1b[0m",      // red X
-        "aborted" => "\x1b[31m⊘\x1b[0m",     // red circle-slash
-        "pending" => "\x1b[90m○\x1b[0m",     // gray circle
-        "skipped" => "\x1b[90m⊘\x1b[0m",     // gray circle-slash
-        "archived" => "\x1b[90m▪\x1b[0m",    // gray square
-        _ => "?",
-    }
-}
-
-/// Colored status text.
-fn colored_status(status: &str) -> String {
-    let color = match status {
-        "planning" => "\x1b[33m",    // yellow
-        "ready" => "\x1b[36m",       // cyan
-        "in_progress" => "\x1b[34m", // blue
-        "complete" => "\x1b[32m",    // green
-        "failed" => "\x1b[31m",      // red
-        "aborted" => "\x1b[31m",     // red
-        "pending" => "\x1b[90m",     // gray
-        "skipped" => "\x1b[90m",     // gray
-        "archived" => "\x1b[90m",    // gray
-        _ => "\x1b[0m",
-    };
-    format!("{color}{status}\x1b[0m")
-}
-
 // ---------------------------------------------------------------------------
 // Plan commands
 // ---------------------------------------------------------------------------
@@ -78,7 +45,7 @@ pub fn plan_create(
     agent: Option<&str>,
     tests: &[String],
     depends_on: &[String],
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let desc = description.unwrap_or(slug);
     let branch_name = branch.unwrap_or(slug);
@@ -113,9 +80,9 @@ pub fn plan_create(
     }
 
     println!(
-        "{} Created plan: \x1b[1m{}\x1b[0m",
-        status_icon("complete"),
-        plan.slug
+        "{} Created plan: {}",
+        output::check_icon(out.color),
+        output::bold(&plan.slug, out.color),
     );
     if !tests.is_empty() {
         println!("  Tests: {}", tests.join(", "));
@@ -137,7 +104,7 @@ pub fn plan_dependency_add(
     slug: &str,
     project: &str,
     depends_on_slugs: &[String],
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     if depends_on_slugs.is_empty() {
         bail!("At least one --depends-on slug is required");
@@ -152,7 +119,7 @@ pub fn plan_dependency_add(
         storage::add_plan_dependency(conn, &plan.id, &dep.id)?;
         println!(
             "{} Added dependency: {} -> {}",
-            status_icon("complete"),
+            output::check_icon(out.color),
             slug,
             dep_slug
         );
@@ -167,7 +134,7 @@ pub fn plan_dependency_remove(
     slug: &str,
     project: &str,
     depends_on_slugs: &[String],
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     if depends_on_slugs.is_empty() {
         bail!("At least one --depends-on slug is required");
@@ -182,7 +149,7 @@ pub fn plan_dependency_remove(
         storage::remove_plan_dependency(conn, &plan.id, &dep.id)?;
         println!(
             "{} Removed dependency: {} -> {}",
-            status_icon("complete"),
+            output::check_icon(out.color),
             slug,
             dep_slug
         );
@@ -192,7 +159,7 @@ pub fn plan_dependency_remove(
 }
 
 /// Print the direct dependencies and dependents of `slug`.
-pub fn plan_dependency_list(conn: &Connection, slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
+pub fn plan_dependency_list(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -215,7 +182,17 @@ pub fn plan_dependency_list(conn: &Connection, slug: &str, project: &str, _out: 
     }
     dependent_slugs.sort();
 
-    println!("\x1b[1m{}\x1b[0m", slug);
+    if out.format == OutputFormat::Json {
+        let summary = output::DependencyListSummary {
+            slug: slug.to_string(),
+            depends_on: dep_slugs,
+            depended_on_by: dependent_slugs,
+        };
+        println!("{}", serde_json::to_string(&summary)?);
+        return Ok(());
+    }
+
+    println!("{}", output::bold(slug, out.color));
     println!("  depends on:");
     if dep_slugs.is_empty() {
         println!("    (none)");
@@ -242,14 +219,9 @@ pub fn plan_list(
     all: bool,
     status: Option<PlanStatus>,
     show_archived: bool,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let plans = storage::list_plans(conn, project, all)?;
-
-    if plans.is_empty() {
-        println!("No plans found.");
-        return Ok(());
-    }
 
     // Filter by status if provided, otherwise hide archived unless --archived
     let plans: Vec<_> = if let Some(target) = status {
@@ -263,19 +235,25 @@ pub fn plan_list(
         plans
     };
 
+    if out.format == OutputFormat::Json {
+        let summaries: Vec<output::PlanSummary> =
+            plans.iter().map(output::PlanSummary::from).collect();
+        println!("{}", serde_json::to_string(&summaries)?);
+        return Ok(());
+    }
+
     if plans.is_empty() {
-        println!("No plans match the filter.");
+        println!("No plans found.");
         return Ok(());
     }
 
     for plan in &plans {
-        let status_str = plan.status.as_str();
         println!(
-            "  {} \x1b[1m{}\x1b[0m  {}  [{}]",
-            status_icon(status_str),
-            plan.slug,
+            "  {} {}  {}  [{}]",
+            output::plan_status_icon(plan.status, out.color),
+            output::bold(&plan.slug, out.color),
             plan.description,
-            colored_status(status_str),
+            output::colored_plan_status(plan.status, out.color),
         );
         if all {
             println!("    project: {}", plan.project);
@@ -285,15 +263,25 @@ pub fn plan_list(
     Ok(())
 }
 
-pub fn plan_show(conn: &Connection, slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
+pub fn plan_show(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
-    let status_str = plan.status.as_str();
+    let steps = storage::list_steps(conn, &plan.id)?;
+
+    if out.format == OutputFormat::Json {
+        let summary = output::PlanShowSummary {
+            plan: output::PlanSummary::from(&plan),
+            steps: steps.iter().map(output::StepSummary::from).collect(),
+        };
+        println!("{}", serde_json::to_string(&summary)?);
+        return Ok(());
+    }
+
     println!(
-        "\x1b[1m{}\x1b[0m  {}",
-        plan.slug,
-        colored_status(status_str)
+        "{}  {}",
+        output::bold(&plan.slug, out.color),
+        output::colored_plan_status(plan.status, out.color),
     );
     println!("  Description: {}", plan.description);
     println!("  Branch:      {}", plan.branch_name);
@@ -315,19 +303,16 @@ pub fn plan_show(conn: &Connection, slug: &str, project: &str, _out: &OutputCont
         plan.created_at.format("%Y-%m-%d %H:%M:%S UTC")
     );
 
-    // Show steps
-    let steps = storage::list_steps(conn, &plan.id)?;
     if !steps.is_empty() {
         println!();
         println!("  Steps:");
         for (i, step) in steps.iter().enumerate() {
-            let ss = step.status.as_str();
             println!(
                 "    {:>3}. {} {} [{}]",
                 i + 1,
-                status_icon(ss),
+                output::status_icon(step.status, out.color),
                 step.title,
-                colored_status(ss),
+                output::colored_status(step.status, out.color),
             );
         }
     }
@@ -335,7 +320,7 @@ pub fn plan_show(conn: &Connection, slug: &str, project: &str, _out: &OutputCont
     Ok(())
 }
 
-pub fn plan_approve(conn: &Connection, slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
+pub fn plan_approve(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -350,13 +335,13 @@ pub fn plan_approve(conn: &Connection, slug: &str, project: &str, _out: &OutputC
     storage::update_plan_status(conn, &plan.id, PlanStatus::Ready)?;
     println!(
         "{} Plan '{}' approved and ready for execution",
-        status_icon("complete"),
+        output::check_icon(out.color),
         slug
     );
     Ok(())
 }
 
-pub fn plan_archive(conn: &Connection, slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
+pub fn plan_archive(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -370,11 +355,15 @@ pub fn plan_archive(conn: &Connection, slug: &str, project: &str, _out: &OutputC
     }
 
     storage::update_plan_status(conn, &plan.id, PlanStatus::Archived)?;
-    println!("{} Archived plan '{}'", status_icon("archived"), slug);
+    println!(
+        "{} Archived plan '{}'",
+        output::plan_status_icon(PlanStatus::Archived, out.color),
+        slug
+    );
     Ok(())
 }
 
-pub fn plan_unarchive(conn: &Connection, slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
+pub fn plan_unarchive(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -390,13 +379,13 @@ pub fn plan_unarchive(conn: &Connection, slug: &str, project: &str, _out: &Outpu
     storage::update_plan_status(conn, &plan.id, PlanStatus::Complete)?;
     println!(
         "{} Unarchived plan '{}' (status: complete)",
-        status_icon("complete"),
+        output::check_icon(out.color),
         slug
     );
     Ok(())
 }
 
-pub fn plan_delete(conn: &Connection, slug: &str, project: &str, force: bool, _out: &OutputContext) -> Result<()> {
+pub fn plan_delete(conn: &Connection, slug: &str, project: &str, force: bool, out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -413,7 +402,11 @@ pub fn plan_delete(conn: &Connection, slug: &str, project: &str, force: bool, _o
     }
 
     storage::delete_plan(conn, &plan.id)?;
-    println!("{} Deleted plan '{}'", status_icon("complete"), slug);
+    println!(
+        "{} Deleted plan '{}'",
+        output::check_icon(out.color),
+        slug
+    );
     Ok(())
 }
 
@@ -421,11 +414,18 @@ pub fn plan_delete(conn: &Connection, slug: &str, project: &str, force: bool, _o
 // Step commands
 // ---------------------------------------------------------------------------
 
-pub fn step_list(conn: &Connection, plan_slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
+pub fn step_list(conn: &Connection, plan_slug: &str, project: &str, out: &OutputContext) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
     let steps = storage::list_steps(conn, &plan.id)?;
+
+    if out.format == OutputFormat::Json {
+        let summaries: Vec<output::StepSummary> =
+            steps.iter().map(output::StepSummary::from).collect();
+        println!("{}", serde_json::to_string(&summaries)?);
+        return Ok(());
+    }
 
     if steps.is_empty() {
         println!("No steps in plan '{}'.", plan_slug);
@@ -433,18 +433,17 @@ pub fn step_list(conn: &Connection, plan_slug: &str, project: &str, _out: &Outpu
     }
 
     println!(
-        "Steps for \x1b[1m{}\x1b[0m ({} total):",
-        plan_slug,
+        "Steps for {} ({} total):",
+        output::bold(plan_slug, out.color),
         steps.len()
     );
     for (i, step) in steps.iter().enumerate() {
-        let ss = step.status.as_str();
         println!(
-            "  {:>3}. {} \x1b[1m{}\x1b[0m  [{}]",
+            "  {:>3}. {} {}  [{}]",
             i + 1,
-            status_icon(ss),
-            step.title,
-            colored_status(ss),
+            output::status_icon(step.status, out.color),
+            output::bold(&step.title, out.color),
+            output::colored_status(step.status, out.color),
         );
         if !step.description.is_empty() {
             println!("       {}", step.description);
@@ -469,7 +468,7 @@ pub fn step_add(
     harness: Option<&str>,
     criteria: &[String],
     max_retries: Option<i32>,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -543,10 +542,10 @@ pub fn step_add(
         .unwrap_or(0);
 
     println!(
-        "{} Added step #{}: \x1b[1m{}\x1b[0m",
-        status_icon("complete"),
+        "{} Added step #{}: {}",
+        output::check_icon(out.color),
         pos,
-        step.title
+        output::bold(&step.title, out.color),
     );
     Ok(())
 }
@@ -557,7 +556,7 @@ pub fn step_remove(
     project: &str,
     step_num: usize,
     force: bool,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -588,7 +587,7 @@ pub fn step_remove(
     storage::delete_step(conn, &step.id)?;
     println!(
         "{} Removed step #{}: {}",
-        status_icon("complete"),
+        output::check_icon(out.color),
         step_num,
         step.title
     );
@@ -602,7 +601,7 @@ pub fn step_edit(
     step_num: usize,
     title: Option<&str>,
     description: Option<&str>,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -625,7 +624,7 @@ pub fn step_edit(
     storage::update_step_fields(conn, &step.id, title, description)?;
     println!(
         "{} Updated step #{}: {}",
-        status_icon("complete"),
+        output::check_icon(out.color),
         step_num,
         title.unwrap_or(&step.title)
     );
@@ -637,7 +636,7 @@ pub fn step_reset(
     plan_slug: &str,
     project: &str,
     step_num: usize,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -655,7 +654,7 @@ pub fn step_reset(
     storage::reset_step(conn, &step.id)?;
     println!(
         "{} Reset step #{} '{}' to pending (0 attempts)",
-        status_icon("complete"),
+        output::check_icon(out.color),
         step_num,
         step.title
     );
@@ -668,7 +667,7 @@ pub fn step_move(
     project: &str,
     step_num: usize,
     to: usize,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -735,7 +734,7 @@ pub fn step_move(
     storage::update_step_sort_key(conn, &step.id, &new_sort_key)?;
     println!(
         "{} Moved step '{}' to position {}",
-        status_icon("complete"),
+        output::check_icon(out.color),
         step.title,
         to
     );
@@ -746,26 +745,22 @@ pub fn step_move(
 // Init command
 // ---------------------------------------------------------------------------
 
-pub fn cmd_init(_out: &OutputContext) -> Result<()> {
+pub fn cmd_init(out: &OutputContext) -> Result<()> {
     use std::fs;
+
+    let icon = output::check_icon(out.color);
 
     // Create config dir
     let config_dir = config::config_dir()?;
     fs::create_dir_all(&config_dir)
         .with_context(|| format!("Failed to create config directory {}", config_dir.display()))?;
-    println!(
-        "\x1b[32m\u{2714}\x1b[0m Config directory: {}",
-        config_dir.display()
-    );
+    println!("{icon} Config directory: {}", config_dir.display());
 
     // Create agents dir
     let agents_dir = config::agents_dir()?;
     fs::create_dir_all(&agents_dir)
         .with_context(|| format!("Failed to create agents directory {}", agents_dir.display()))?;
-    println!(
-        "\x1b[32m\u{2714}\x1b[0m Agents directory: {}",
-        agents_dir.display()
-    );
+    println!("{icon} Agents directory: {}", agents_dir.display());
 
     // Create default config file if it doesn't exist
     let config_path = config_dir.join("config.json");
@@ -774,21 +769,15 @@ pub fn cmd_init(_out: &OutputContext) -> Result<()> {
         let json = serde_json::to_string_pretty(&default_config)?;
         fs::write(&config_path, &json)
             .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
-        println!(
-            "\x1b[32m\u{2714}\x1b[0m Default config: {}",
-            config_path.display()
-        );
+        println!("{icon} Default config: {}", config_path.display());
     } else {
-        println!(
-            "\x1b[32m\u{2714}\x1b[0m Config exists: {}",
-            config_path.display()
-        );
+        println!("{icon} Config exists: {}", config_path.display());
     }
 
     // Initialize database
     let _conn = db::open()?;
     let db_path = db::db_path()?;
-    println!("\x1b[32m\u{2714}\x1b[0m Database: {}", db_path.display());
+    println!("{icon} Database: {}", db_path.display());
 
     println!();
     println!("ralph initialized successfully.");
@@ -799,7 +788,7 @@ pub fn cmd_init(_out: &OutputContext) -> Result<()> {
 // Doctor command
 // ---------------------------------------------------------------------------
 
-pub fn cmd_doctor(config: &config::Config, _out: &OutputContext) -> Result<()> {
+pub fn cmd_doctor(config: &config::Config, out: &OutputContext) -> Result<()> {
     println!("ralph doctor");
     println!();
 
@@ -807,14 +796,15 @@ pub fn cmd_doctor(config: &config::Config, _out: &OutputContext) -> Result<()> {
 
     let mut has_errors = false;
     for check in &checks {
-        let icon = match check.severity {
-            preflight::CheckSeverity::Pass => "\x1b[32m\u{2714}\x1b[0m",
-            preflight::CheckSeverity::Warning => "\x1b[33m\u{26a0}\x1b[0m",
+        let severity_str = match check.severity {
+            preflight::CheckSeverity::Pass => "pass",
+            preflight::CheckSeverity::Warning => "warning",
             preflight::CheckSeverity::Error => {
                 has_errors = true;
-                "\x1b[31m\u{2718}\x1b[0m"
+                "error"
             }
         };
+        let icon = output::severity_icon(severity_str, out.color);
         println!("  {} {}: {}", icon, check.name, check.message);
     }
 
@@ -837,7 +827,7 @@ pub fn cmd_status(
     project: &str,
     plan_slug: Option<&str>,
     verbose: bool,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let plan = if let Some(slug) = plan_slug {
         storage::get_plan_by_slug(conn, slug, project)?
@@ -848,56 +838,54 @@ pub fn cmd_status(
         match storage::find_active_plan(conn, project, true)? {
             Some(p) => p,
             None => {
-                println!("No active plan found. Specify a plan slug as a positional argument.");
+                if out.format == OutputFormat::Json {
+                    println!("null");
+                } else {
+                    println!("No active plan found. Specify a plan slug as a positional argument.");
+                }
                 return Ok(());
             }
         }
     };
 
-    let status_str = plan.status.as_str();
-    let color = match plan.status {
-        plan::PlanStatus::Planning => "\x1b[33m",
-        plan::PlanStatus::Ready => "\x1b[36m",
-        plan::PlanStatus::InProgress => "\x1b[34m",
-        plan::PlanStatus::Complete => "\x1b[32m",
-        plan::PlanStatus::Failed => "\x1b[31m",
-        plan::PlanStatus::Aborted => "\x1b[31m",
-        plan::PlanStatus::Archived => "\x1b[90m",
-    };
+    let steps = storage::list_steps(conn, &plan.id)?;
+
+    let total = steps.len();
+    let complete = steps.iter().filter(|s| s.status == StepStatus::Complete).count();
+    let failed = steps.iter().filter(|s| s.status == StepStatus::Failed).count();
+    let skipped = steps.iter().filter(|s| s.status == StepStatus::Skipped).count();
+    let pending = steps.iter().filter(|s| s.status == StepStatus::Pending).count();
+    let in_progress = steps.iter().filter(|s| s.status == StepStatus::InProgress).count();
+
+    if out.format == OutputFormat::Json {
+        let summary = output::StatusSummary {
+            slug: plan.slug.clone(),
+            status: plan.status,
+            branch_name: plan.branch_name.clone(),
+            steps: output::StepCounts {
+                total,
+                complete,
+                failed,
+                skipped,
+                pending,
+                in_progress,
+            },
+        };
+        println!("{}", serde_json::to_string(&summary)?);
+        return Ok(());
+    }
 
     println!(
-        "\x1b[1m{}\x1b[0m  {}{}\x1b[0m",
-        plan.slug, color, status_str
+        "{}  {}",
+        output::bold(&plan.slug, out.color),
+        output::colored_plan_status(plan.status, out.color),
     );
     println!("  Branch: {}", plan.branch_name);
 
-    let steps = storage::list_steps(conn, &plan.id)?;
     if steps.is_empty() {
         println!("  No steps.");
         return Ok(());
     }
-
-    let total = steps.len();
-    let complete = steps
-        .iter()
-        .filter(|s| s.status == plan::StepStatus::Complete)
-        .count();
-    let failed = steps
-        .iter()
-        .filter(|s| s.status == plan::StepStatus::Failed)
-        .count();
-    let skipped = steps
-        .iter()
-        .filter(|s| s.status == plan::StepStatus::Skipped)
-        .count();
-    let pending = steps
-        .iter()
-        .filter(|s| s.status == plan::StepStatus::Pending)
-        .count();
-    let in_progress = steps
-        .iter()
-        .filter(|s| s.status == plan::StepStatus::InProgress)
-        .count();
 
     println!(
         "  Progress: {}/{} complete, {} failed, {} skipped, {} pending, {} in-progress",
@@ -907,21 +895,12 @@ pub fn cmd_status(
     if verbose {
         println!();
         for (i, step) in steps.iter().enumerate() {
-            let ss = step.status.as_str();
-            let icon = match step.status {
-                plan::StepStatus::Pending => "\x1b[90m\u{25cb}\x1b[0m",
-                plan::StepStatus::InProgress => "\x1b[34m\u{25b6}\x1b[0m",
-                plan::StepStatus::Complete => "\x1b[32m\u{2714}\x1b[0m",
-                plan::StepStatus::Failed => "\x1b[31m\u{2718}\x1b[0m",
-                plan::StepStatus::Skipped => "\x1b[90m\u{2298}\x1b[0m",
-                plan::StepStatus::Aborted => "\x1b[31m\u{2298}\x1b[0m",
-            };
             println!(
                 "  {:>3}. {} {} [{}] (attempts: {})",
                 i + 1,
-                icon,
+                output::status_icon(step.status, out.color),
                 step.title,
-                ss,
+                output::colored_status(step.status, out.color),
                 step.attempts,
             );
         }
@@ -941,7 +920,7 @@ pub fn cmd_log(
     step_num: Option<usize>,
     limit: Option<usize>,
     full: bool,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     // Resolve plan
     let plan = if let Some(slug) = plan_slug {
@@ -951,7 +930,11 @@ pub fn cmd_log(
         match storage::find_active_plan(conn, project, true)? {
             Some(p) => p,
             None => {
-                println!("No plan found. Specify a plan slug as a positional argument.");
+                if out.format == OutputFormat::Json {
+                    println!("[]");
+                } else {
+                    println!("No plan found. Specify a plan slug as a positional argument.");
+                }
                 return Ok(());
             }
         }
@@ -970,6 +953,13 @@ pub fn cmd_log(
         let step = &steps[step_idx - 1];
         let logs = storage::list_execution_logs_for_step(conn, &step.id)?;
 
+        if out.format == OutputFormat::Json {
+            let summaries: Vec<output::LogEntrySummary> =
+                logs.iter().map(output::LogEntrySummary::from).collect();
+            println!("{}", serde_json::to_string(&summaries)?);
+            return Ok(());
+        }
+
         println!(
             "Logs for step #{} '{}' ({} attempts):",
             step_idx,
@@ -979,11 +969,20 @@ pub fn cmd_log(
         println!();
 
         for log in &logs {
-            print_log_entry(&step.title, log, full);
+            print_log_entry(&step.title, log, full, out.color);
         }
     } else {
         // Show all logs for the plan
         let entries = storage::list_execution_logs_for_plan(conn, &plan.id, limit)?;
+
+        if out.format == OutputFormat::Json {
+            let summaries: Vec<output::LogEntrySummary> = entries
+                .iter()
+                .map(|(_, log)| output::LogEntrySummary::from(log))
+                .collect();
+            println!("{}", serde_json::to_string(&summaries)?);
+            return Ok(());
+        }
 
         if entries.is_empty() {
             println!("No execution logs for plan '{}'.", plan.slug);
@@ -998,21 +997,15 @@ pub fn cmd_log(
         println!();
 
         for (step_title, log) in &entries {
-            print_log_entry(step_title, log, full);
+            print_log_entry(step_title, log, full, out.color);
         }
     }
 
     Ok(())
 }
 
-fn print_log_entry(step_title: &str, log: &ExecutionLog, full: bool) {
-    let status_icon = if log.committed {
-        "\x1b[32m\u{2714}\x1b[0m"
-    } else if log.rolled_back {
-        "\x1b[31m\u{21ba}\x1b[0m"
-    } else {
-        "\x1b[90m\u{25cb}\x1b[0m"
-    };
+fn print_log_entry(step_title: &str, log: &ExecutionLog, full: bool, color: bool) {
+    let icon = output::log_status_icon(log.committed, log.rolled_back, color);
 
     let duration_str = log
         .duration_secs
@@ -1021,7 +1014,7 @@ fn print_log_entry(step_title: &str, log: &ExecutionLog, full: bool) {
 
     println!(
         "  {} [attempt {}] {} ({}) {}",
-        status_icon,
+        icon,
         log.attempt,
         step_title,
         duration_str,
@@ -1070,16 +1063,19 @@ fn print_log_entry(step_title: &str, log: &ExecutionLog, full: bool) {
 // Agents commands
 // ---------------------------------------------------------------------------
 
-pub fn cmd_agents_list(_out: &OutputContext) -> Result<()> {
+pub fn cmd_agents_list(out: &OutputContext) -> Result<()> {
     let agents_dir = config::agents_dir()?;
 
     if !agents_dir.exists() {
-        println!("Agents directory not found: {}", agents_dir.display());
-        println!("Run `ralph init` to create it.");
+        if out.format == OutputFormat::Json {
+            println!("[]");
+        } else {
+            println!("Agents directory not found: {}", agents_dir.display());
+            println!("Run `ralph init` to create it.");
+        }
         return Ok(());
     }
 
-    let mut found = false;
     let mut entries: Vec<_> = std::fs::read_dir(&agents_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
@@ -1087,6 +1083,27 @@ pub fn cmd_agents_list(_out: &OutputContext) -> Result<()> {
 
     entries.sort_by_key(|e| e.file_name());
 
+    if out.format == OutputFormat::Json {
+        let infos: Vec<output::AgentInfo> = entries
+            .iter()
+            .map(|entry| {
+                let name = entry
+                    .file_name()
+                    .to_string_lossy()
+                    .trim_end_matches(".md")
+                    .to_string();
+                let size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
+                output::AgentInfo {
+                    name,
+                    size_bytes: size,
+                }
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&infos)?);
+        return Ok(());
+    }
+
+    let mut found = false;
     for entry in &entries {
         let name = entry
             .file_name()
@@ -1158,7 +1175,7 @@ pub fn cmd_agents_delete(name: &str, _out: &OutputContext) -> Result<()> {
 // Hooks commands
 // ---------------------------------------------------------------------------
 
-pub fn cmd_hooks_list(project: &str, all: bool, _out: &OutputContext) -> Result<()> {
+pub fn cmd_hooks_list(project: &str, all: bool, out: &OutputContext) -> Result<()> {
     let hooks = hook_library::load_all()?;
 
     let filtered: Vec<Hook> = if all {
@@ -1166,6 +1183,29 @@ pub fn cmd_hooks_list(project: &str, all: bool, _out: &OutputContext) -> Result<
     } else {
         hook_library::filter_by_project(hooks, Path::new(project))
     };
+
+    if out.format == OutputFormat::Json {
+        let infos: Vec<output::HookInfo> = filtered
+            .iter()
+            .map(|h| {
+                let scope_str = match &h.scope {
+                    Scope::Global => "global".to_string(),
+                    Scope::Paths { paths } => {
+                        let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                        format!("paths: {}", list.join(", "))
+                    }
+                };
+                output::HookInfo {
+                    name: h.name.clone(),
+                    lifecycle: h.lifecycle.to_string(),
+                    scope: scope_str,
+                    description: h.description.clone(),
+                }
+            })
+            .collect();
+        println!("{}", serde_json::to_string(&infos)?);
+        return Ok(());
+    }
 
     if filtered.is_empty() {
         if all {

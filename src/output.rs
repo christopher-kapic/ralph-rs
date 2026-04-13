@@ -1,6 +1,4 @@
 // Output formatting — centralized helpers for display and JSON serialization.
-#![allow(dead_code)]
-// ↑ Items are defined now but callers will be wired in a later step.
 
 use crate::plan::{ExecutionLog, Plan, PlanStatus, Step, StepStatus};
 use anyhow::Result;
@@ -29,6 +27,7 @@ pub struct OutputContext {
     /// Whether to emit JSON or human-readable output.
     pub format: OutputFormat,
     /// Suppress progress / banner output when true.
+    #[allow(dead_code)] // Wired in a later step.
     pub quiet: bool,
     /// Whether ANSI color codes should be emitted.
     pub color: bool,
@@ -157,6 +156,53 @@ pub fn colored_plan_status(status: PlanStatus, color: bool) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// General formatting helpers
+// ---------------------------------------------------------------------------
+
+/// Wrap text in ANSI bold when `color` is true, otherwise return as-is.
+pub fn bold(text: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[1m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+/// A green checkmark icon, colored when `color` is true.
+pub fn check_icon(color: bool) -> &'static str {
+    if color {
+        "\x1b[32m\u{2714}\x1b[0m"
+    } else {
+        "\u{2714}"
+    }
+}
+
+/// A colored severity icon for doctor checks.
+pub fn severity_icon(severity: &str, color: bool) -> &'static str {
+    match (severity, color) {
+        ("pass", true) => "\x1b[32m\u{2714}\x1b[0m",
+        ("warning", true) => "\x1b[33m\u{26a0}\x1b[0m",
+        ("error", true) => "\x1b[31m\u{2718}\x1b[0m",
+        ("pass", false) => "\u{2714}",
+        ("warning", false) => "\u{26a0}",
+        ("error", false) => "\u{2718}",
+        _ => "?",
+    }
+}
+
+/// A log-entry status icon: committed (green check), rolled-back (red ↺), or pending (gray ○).
+pub fn log_status_icon(committed: bool, rolled_back: bool, color: bool) -> &'static str {
+    match (committed, rolled_back, color) {
+        (true, _, true) => "\x1b[32m\u{2714}\x1b[0m",
+        (_, true, true) => "\x1b[31m\u{21ba}\x1b[0m",
+        (_, _, true) => "\x1b[90m\u{25cb}\x1b[0m",
+        (true, _, false) => "\u{2714}",
+        (_, true, false) => "\u{21ba}",
+        (_, _, false) => "\u{25cb}",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Interactive confirmation
 // ---------------------------------------------------------------------------
 
@@ -164,11 +210,13 @@ pub fn colored_plan_status(status: PlanStatus, color: bool) -> String {
 ///
 /// Accepts `y`, `Y`, `yes`, `YES`, `Yes` (and similar) as affirmative.
 /// Returns `false` for everything else (including empty input and EOF).
+#[allow(dead_code)] // Used by interactive commands wired later.
 pub fn confirm(prompt: &str) -> Result<bool> {
     confirm_with_reader(prompt, &mut io::stdin().lock(), &mut io::stderr())
 }
 
 /// Testable confirmation implementation that reads from an arbitrary reader.
+#[allow(dead_code)] // Called by `confirm` and tests.
 fn confirm_with_reader(
     prompt: &str,
     reader: &mut dyn BufRead,
@@ -301,6 +349,58 @@ impl From<&ExecutionLog> for LogEntrySummary {
             session_id: l.session_id.clone(),
         }
     }
+}
+
+/// JSON output for the `status` command.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusSummary {
+    pub slug: String,
+    pub status: PlanStatus,
+    pub branch_name: String,
+    pub steps: StepCounts,
+}
+
+/// Step count breakdown for the status command.
+#[derive(Debug, Clone, Serialize)]
+pub struct StepCounts {
+    pub total: usize,
+    pub complete: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub pending: usize,
+    pub in_progress: usize,
+}
+
+/// JSON output for the `plan dependency list` command.
+#[derive(Debug, Clone, Serialize)]
+pub struct DependencyListSummary {
+    pub slug: String,
+    pub depends_on: Vec<String>,
+    pub depended_on_by: Vec<String>,
+}
+
+/// JSON output for the `plan show` command (plan + steps).
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanShowSummary {
+    #[serde(flatten)]
+    pub plan: PlanSummary,
+    pub steps: Vec<StepSummary>,
+}
+
+/// JSON output for the `agents list` command.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentInfo {
+    pub name: String,
+    pub size_bytes: u64,
+}
+
+/// JSON output for the `hooks list` command.
+#[derive(Debug, Clone, Serialize)]
+pub struct HookInfo {
+    pub name: String,
+    pub lifecycle: String,
+    pub scope: String,
+    pub description: String,
 }
 
 // ---------------------------------------------------------------------------
