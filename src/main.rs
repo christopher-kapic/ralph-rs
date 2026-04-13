@@ -126,6 +126,8 @@ fn main() -> Result<()> {
                 after,
                 agent,
                 harness,
+                criteria,
+                max_retries,
             } => {
                 let slug = plan.unwrap_or_default();
                 if slug.is_empty() {
@@ -141,6 +143,8 @@ fn main() -> Result<()> {
                     after,
                     agent.as_deref(),
                     h,
+                    &criteria,
+                    max_retries,
                 )
             }
             StepCommand::Remove { step, plan, force } => {

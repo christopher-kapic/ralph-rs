@@ -373,6 +373,14 @@ pub enum StepCommand {
         /// Harness override for this step.
         #[arg(long)]
         harness: Option<String>,
+
+        /// Acceptance criterion (repeatable).
+        #[arg(long = "criteria")]
+        criteria: Vec<String>,
+
+        /// Step-level max retries override.
+        #[arg(long)]
+        max_retries: Option<i32>,
     },
 
     /// Remove a step from a plan.

@@ -456,6 +456,7 @@ pub fn step_list(conn: &Connection, plan_slug: &str, project: &str) -> Result<()
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn step_add(
     conn: &Connection,
     plan_slug: &str,
@@ -465,6 +466,8 @@ pub fn step_add(
     after: Option<usize>,
     agent: Option<&str>,
     harness: Option<&str>,
+    criteria: &[String],
+    max_retries: Option<i32>,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
@@ -512,12 +515,21 @@ pub fn step_add(
             desc,
             agent,
             harness,
-            &[],
-            None,
+            criteria,
+            max_retries,
         )?
     } else {
         // Append at the end (default)
-        storage::create_step(conn, &plan.id, title, desc, agent, harness, &[], None)?
+        storage::create_step(
+            conn,
+            &plan.id,
+            title,
+            desc,
+            agent,
+            harness,
+            criteria,
+            max_retries,
+        )?
     };
 
     // Determine the position
@@ -1568,6 +1580,8 @@ mod tests {
             None,
             None,
             None,
+            &[],
+            None,
         )
         .unwrap();
         step_add(
@@ -1578,6 +1592,8 @@ mod tests {
             Some("Do another thing"),
             None,
             None,
+            None,
+            &[],
             None,
         )
         .unwrap();
@@ -1596,8 +1612,14 @@ mod tests {
         let (conn, project) = setup();
 
         plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
-        step_add(&conn, "my-plan", &project, "First", None, None, None, None).unwrap();
-        step_add(&conn, "my-plan", &project, "Third", None, None, None, None).unwrap();
+        step_add(
+            &conn, "my-plan", &project, "First", None, None, None, None, &[], None,
+        )
+        .unwrap();
+        step_add(
+            &conn, "my-plan", &project, "Third", None, None, None, None, &[], None,
+        )
+        .unwrap();
         // Insert after position 1
         step_add(
             &conn,
@@ -1607,6 +1629,8 @@ mod tests {
             None,
             Some(1),
             None,
+            None,
+            &[],
             None,
         )
         .unwrap();
@@ -1622,12 +1646,80 @@ mod tests {
     }
 
     #[test]
+    fn test_step_add_with_criteria_and_max_retries() {
+        let (conn, project) = setup();
+
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        let criteria = vec!["Tests pass".to_string(), "No warnings".to_string()];
+        step_add(
+            &conn,
+            "my-plan",
+            &project,
+            "Build it",
+            None,
+            None,
+            None,
+            None,
+            &criteria,
+            Some(5),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].acceptance_criteria, criteria);
+        assert_eq!(steps[0].max_retries, Some(5));
+    }
+
+    #[test]
+    fn test_step_add_after_with_criteria() {
+        let (conn, project) = setup();
+
+        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
+        step_add(
+            &conn, "my-plan", &project, "First", None, None, None, None, &[], None,
+        )
+        .unwrap();
+        let criteria = vec!["Inserted check".to_string()];
+        step_add(
+            &conn,
+            "my-plan",
+            &project,
+            "Inserted",
+            None,
+            Some(1),
+            None,
+            None,
+            &criteria,
+            Some(2),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[1].title, "Inserted");
+        assert_eq!(steps[1].acceptance_criteria, criteria);
+        assert_eq!(steps[1].max_retries, Some(2));
+    }
+
+    #[test]
     fn test_step_remove_forced() {
         let (conn, project) = setup();
 
         plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
-        step_add(&conn, "my-plan", &project, "First", None, None, None, None).unwrap();
-        step_add(&conn, "my-plan", &project, "Second", None, None, None, None).unwrap();
+        step_add(
+            &conn, "my-plan", &project, "First", None, None, None, None, &[], None,
+        )
+        .unwrap();
+        step_add(
+            &conn, "my-plan", &project, "Second", None, None, None, None, &[], None,
+        )
+        .unwrap();
 
         step_remove(&conn, "my-plan", &project, 2, true).unwrap();
 
@@ -1652,6 +1744,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            &[],
             None,
         )
         .unwrap();
@@ -1679,7 +1773,10 @@ mod tests {
         let (conn, project) = setup();
 
         plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
-        step_add(&conn, "my-plan", &project, "Step", None, None, None, None).unwrap();
+        step_add(
+            &conn, "my-plan", &project, "Step", None, None, None, None, &[], None,
+        )
+        .unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1699,9 +1796,18 @@ mod tests {
         let (conn, project) = setup();
 
         plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
-        step_add(&conn, "my-plan", &project, "A", None, None, None, None).unwrap();
-        step_add(&conn, "my-plan", &project, "B", None, None, None, None).unwrap();
-        step_add(&conn, "my-plan", &project, "C", None, None, None, None).unwrap();
+        step_add(
+            &conn, "my-plan", &project, "A", None, None, None, None, &[], None,
+        )
+        .unwrap();
+        step_add(
+            &conn, "my-plan", &project, "B", None, None, None, None, &[], None,
+        )
+        .unwrap();
+        step_add(
+            &conn, "my-plan", &project, "C", None, None, None, None, &[], None,
+        )
+        .unwrap();
 
         // Move step 3 (C) to position 1
         step_move(&conn, "my-plan", &project, 3, 1).unwrap();
@@ -1720,9 +1826,18 @@ mod tests {
         let (conn, project) = setup();
 
         plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
-        step_add(&conn, "my-plan", &project, "A", None, None, None, None).unwrap();
-        step_add(&conn, "my-plan", &project, "B", None, None, None, None).unwrap();
-        step_add(&conn, "my-plan", &project, "C", None, None, None, None).unwrap();
+        step_add(
+            &conn, "my-plan", &project, "A", None, None, None, None, &[], None,
+        )
+        .unwrap();
+        step_add(
+            &conn, "my-plan", &project, "B", None, None, None, None, &[], None,
+        )
+        .unwrap();
+        step_add(
+            &conn, "my-plan", &project, "C", None, None, None, None, &[], None,
+        )
+        .unwrap();
 
         // Move step 1 (A) to position 3
         step_move(&conn, "my-plan", &project, 1, 3).unwrap();
@@ -1916,7 +2031,10 @@ mod tests {
         let (conn, project) = setup();
 
         plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[]).unwrap();
-        step_add(&conn, "my-plan", &project, "Step", None, None, None, None).unwrap();
+        step_add(
+            &conn, "my-plan", &project, "Step", None, None, None, None, &[], None,
+        )
+        .unwrap();
 
         let result = step_remove(&conn, "my-plan", &project, 5, true);
         assert!(result.is_err());
