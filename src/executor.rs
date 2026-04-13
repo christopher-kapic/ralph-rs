@@ -109,6 +109,141 @@ fn try_parse_json(text: &str) -> Option<ParsedHarnessOutput> {
 }
 
 // ---------------------------------------------------------------------------
+// Failure handling
+// ---------------------------------------------------------------------------
+
+/// Reason a step execution failed terminally.
+#[derive(Debug, Clone, Copy)]
+enum FailureReason {
+    /// Harness exceeded timeout.
+    Timeout,
+    /// Execution was aborted via signal.
+    Aborted,
+    /// Tests failed (or no changes) after exhausting all attempts.
+    TestFailed,
+    /// Harness produced no changes (reserved for future use).
+    #[allow(dead_code)]
+    NoChanges,
+}
+
+impl FailureReason {
+    fn to_step_status(self) -> StepStatus {
+        match self {
+            Self::Aborted => StepStatus::Aborted,
+            _ => StepStatus::Failed,
+        }
+    }
+
+    fn to_outcome(self) -> StepOutcome {
+        match self {
+            Self::Timeout => StepOutcome::Timeout,
+            Self::Aborted => StepOutcome::Aborted,
+            _ => StepOutcome::Failed,
+        }
+    }
+
+    fn hook_label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Aborted => "aborted",
+            _ => "failed",
+        }
+    }
+}
+
+/// Shared references that stay constant for the duration of a step execution.
+struct ExecCtx<'a> {
+    conn: &'a Connection,
+    plan: &'a Plan,
+    step: &'a Step,
+    workdir: &'a Path,
+    pre_existing_untracked: &'a [String],
+    hook_ctx: &'a HookContext,
+}
+
+/// Optional harness output fields attached to a terminal failure.
+struct FailureOutput<'a> {
+    diff: Option<&'a str>,
+    test_results: &'a [String],
+    stdout: &'a str,
+    stderr: &'a str,
+    parsed: &'a ParsedHarnessOutput,
+    has_changes: bool,
+}
+
+/// Handle a terminal step failure: rollback changes, update the execution log,
+/// set step status, run post-step hook, and return the appropriate [`StepResult`].
+fn finalize_failure(
+    ctx: &ExecCtx<'_>,
+    exec_log_id: i64,
+    duration_secs: f64,
+    attempt: i32,
+    reason: FailureReason,
+    output: Option<&FailureOutput<'_>>,
+) -> Result<StepResult> {
+    // Rollback any uncommitted changes, preserving pre-existing untracked files.
+    let rolled_back = if git::has_uncommitted_changes(ctx.workdir)? {
+        git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)?;
+        true
+    } else {
+        false
+    };
+
+    // Update execution log — use harness output fields when available.
+    if let Some(o) = output {
+        storage::update_execution_log(
+            ctx.conn,
+            exec_log_id,
+            Some(duration_secs),
+            o.diff,
+            o.test_results,
+            o.has_changes,
+            false,
+            None,
+            Some(o.stdout),
+            Some(o.stderr),
+            o.parsed.cost_usd,
+            o.parsed.input_tokens,
+            o.parsed.output_tokens,
+        )?;
+    } else {
+        storage::update_execution_log(
+            ctx.conn,
+            exec_log_id,
+            Some(duration_secs),
+            None,
+            &[],
+            rolled_back,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?;
+    }
+
+    storage::update_step_status(ctx.conn, &ctx.step.id, reason.to_step_status())?;
+    hooks::run_post_step(
+        ctx.conn,
+        ctx.hook_ctx,
+        ctx.plan,
+        ctx.step,
+        attempt,
+        reason.hook_label(),
+        ctx.workdir,
+    );
+
+    Ok(StepResult {
+        outcome: reason.to_outcome(),
+        step_id: ctx.step.id.clone(),
+        attempts_used: attempt,
+        commit_hash: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Core executor
 // ---------------------------------------------------------------------------
 
@@ -150,6 +285,16 @@ pub async fn execute_step(
 
     // Snapshot pre-existing untracked files so we don't accidentally commit them.
     let pre_existing_untracked = git::get_untracked_files(workdir)?;
+
+    // Shared context for failure handling.
+    let ctx = ExecCtx {
+        conn,
+        plan,
+        step,
+        workdir,
+        pre_existing_untracked: &pre_existing_untracked,
+        hook_ctx,
+    };
 
     // Previous attempt context for retries.
     let mut prev_diff: Option<String> = None;
@@ -281,7 +426,8 @@ pub async fn execute_step(
                     && !plan.deterministic_tests.is_empty()
                 {
                     // Pre-test hook.
-                    if let Err(e) = hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir)
+                    if let Err(e) =
+                        hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir)
                     {
                         eprintln!("Pre-test hook failed: {e}");
                     }
@@ -357,15 +503,31 @@ pub async fn execute_step(
                     });
                 }
 
-                // Test failed or no changes — rollback (preserving pre-existing untracked).
+                // Terminal failure — exhausted all attempts.
+                if attempt >= max_attempts {
+                    let fail_output = FailureOutput {
+                        diff: diff.as_deref(),
+                        test_results: &test_result_strings,
+                        stdout: &output.stdout,
+                        stderr: &output.stderr,
+                        parsed: &parsed,
+                        has_changes,
+                    };
+                    return finalize_failure(
+                        &ctx,
+                        exec_log.id,
+                        duration_secs,
+                        attempt,
+                        FailureReason::TestFailed,
+                        Some(&fail_output),
+                    );
+                }
+
+                // Retry: rollback, log failure, stash context for next attempt.
                 if has_changes {
                     git::rollback_except(workdir, &pre_existing_untracked)?;
                 }
-
-                // Build test output summary for retry context.
                 let test_output_summary = test_result_strings.join("\n");
-
-                // Update execution log.
                 storage::update_execution_log(
                     conn,
                     exec_log.id,
@@ -381,93 +543,34 @@ pub async fn execute_step(
                     parsed.input_tokens,
                     parsed.output_tokens,
                 )?;
-
-                // Stash context for next retry.
                 prev_diff = diff;
                 prev_test_output = Some(test_output_summary);
                 prev_files_modified = changed_files;
-
-                // If we've exhausted attempts, mark as failed.
-                if attempt >= max_attempts {
-                    storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
-                    hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir);
-                    return Ok(StepResult {
-                        outcome: StepOutcome::Failed,
-                        step_id: step.id.clone(),
-                        attempts_used: attempt,
-                        commit_hash: None,
-                    });
-                }
-                // Otherwise loop to retry.
             }
 
             WaitResult::Timeout => {
                 // Timeout: don't count as an attempt (revert the increment).
                 attempt -= 1;
                 increment_step_attempts(conn, &step.id, attempt)?;
-
-                // Rollback any partial changes (preserve pre-existing untracked).
-                if git::has_uncommitted_changes(workdir)? {
-                    git::rollback_except(workdir, &pre_existing_untracked)?;
-                }
-
-                // Update execution log.
-                storage::update_execution_log(
-                    conn,
+                return finalize_failure(
+                    &ctx,
                     exec_log.id,
-                    Some(duration_secs),
+                    duration_secs,
+                    attempt,
+                    FailureReason::Timeout,
                     None,
-                    &[],
-                    git::has_uncommitted_changes(workdir).unwrap_or(false),
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
-
-                storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
-                hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "timeout", workdir);
-                return Ok(StepResult {
-                    outcome: StepOutcome::Timeout,
-                    step_id: step.id.clone(),
-                    attempts_used: attempt,
-                    commit_hash: None,
-                });
+                );
             }
 
             WaitResult::Aborted => {
-                // Rollback any partial changes (preserve pre-existing untracked).
-                if git::has_uncommitted_changes(workdir)? {
-                    git::rollback_except(workdir, &pre_existing_untracked)?;
-                }
-
-                storage::update_execution_log(
-                    conn,
+                return finalize_failure(
+                    &ctx,
                     exec_log.id,
-                    Some(duration_secs),
+                    duration_secs,
+                    attempt,
+                    FailureReason::Aborted,
                     None,
-                    &[],
-                    git::has_uncommitted_changes(workdir).unwrap_or(false),
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
-
-                storage::update_step_status(conn, &step.id, StepStatus::Aborted)?;
-                hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "aborted", workdir);
-                return Ok(StepResult {
-                    outcome: StepOutcome::Aborted,
-                    step_id: step.id.clone(),
-                    attempts_used: attempt,
-                    commit_hash: None,
-                });
+                );
             }
         }
     }
