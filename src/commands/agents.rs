@@ -83,7 +83,11 @@ pub fn cmd_agents_show(name: &str, _out: &OutputContext) -> Result<()> {
     Ok(())
 }
 
-pub fn cmd_agents_create(name: &str, file: Option<&std::path::Path>, _out: &OutputContext) -> Result<()> {
+pub fn cmd_agents_create(
+    name: &str,
+    file: Option<&std::path::Path>,
+    _out: &OutputContext,
+) -> Result<()> {
     let agents_dir = config::agents_dir()?;
     std::fs::create_dir_all(&agents_dir)?;
     let path = agents_dir.join(format!("{name}.md"));

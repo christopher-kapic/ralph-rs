@@ -26,7 +26,8 @@ pub fn cmd_hooks_list(project: &str, all: bool, out: &OutputContext) -> Result<(
                 let scope_str = match &h.scope {
                     Scope::Global => "global".to_string(),
                     Scope::Paths { paths } => {
-                        let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                        let list: Vec<String> =
+                            paths.iter().map(|p| p.display().to_string()).collect();
                         format!("paths: {}", list.join(", "))
                     }
                 };
@@ -44,10 +45,7 @@ pub fn cmd_hooks_list(project: &str, all: bool, out: &OutputContext) -> Result<(
 
     if filtered.is_empty() {
         if all {
-            eprintln!(
-                "No hooks found in {}",
-                hook_library::hooks_dir()?.display()
-            );
+            eprintln!("No hooks found in {}", hook_library::hooks_dir()?.display());
         } else {
             eprintln!(
                 "No hooks applicable to {project}. Use `ralph hooks list --all` to see all hooks."
@@ -147,9 +145,9 @@ pub fn cmd_hooks_export(
     let filtered: Vec<Hook> = if all {
         hooks
     } else {
-        let scope_path = path.map(|p| p.to_path_buf()).unwrap_or_else(|| {
-            std::path::PathBuf::from(project)
-        });
+        let scope_path = path
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from(project));
         hook_library::filter_by_project(hooks, &scope_path)
     };
 
@@ -160,11 +158,7 @@ pub fn cmd_hooks_export(
         Some(p) => {
             std::fs::write(p, format!("{json}\n"))
                 .with_context(|| format!("Failed to write {}", p.display()))?;
-            eprintln!(
-                "Exported {} hook(s) to {}",
-                bundle.hooks.len(),
-                p.display()
-            );
+            eprintln!("Exported {} hook(s) to {}", bundle.hooks.len(), p.display());
         }
         None => println!("{json}"),
     }

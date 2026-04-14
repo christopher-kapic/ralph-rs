@@ -30,7 +30,9 @@ pub fn cmd_status(
                 if out.format == OutputFormat::Json {
                     println!("null");
                 } else {
-                    eprintln!("No active plan found. Specify a plan slug as a positional argument.");
+                    eprintln!(
+                        "No active plan found. Specify a plan slug as a positional argument."
+                    );
                 }
                 return Ok(());
             }
@@ -40,11 +42,26 @@ pub fn cmd_status(
     let steps = storage::list_steps(conn, &plan.id)?;
 
     let total = steps.len();
-    let complete = steps.iter().filter(|s| s.status == StepStatus::Complete).count();
-    let failed = steps.iter().filter(|s| s.status == StepStatus::Failed).count();
-    let skipped = steps.iter().filter(|s| s.status == StepStatus::Skipped).count();
-    let pending = steps.iter().filter(|s| s.status == StepStatus::Pending).count();
-    let in_progress = steps.iter().filter(|s| s.status == StepStatus::InProgress).count();
+    let complete = steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Complete)
+        .count();
+    let failed = steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Failed)
+        .count();
+    let skipped = steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Skipped)
+        .count();
+    let pending = steps
+        .iter()
+        .filter(|s| s.status == StepStatus::Pending)
+        .count();
+    let in_progress = steps
+        .iter()
+        .filter(|s| s.status == StepStatus::InProgress)
+        .count();
 
     if out.format == OutputFormat::Json {
         let summary = output::StatusSummary {
@@ -200,12 +217,7 @@ pub fn cmd_log(
     Ok(())
 }
 
-fn print_log_entry(
-    step_title: &str,
-    log: &ExecutionLog,
-    output_mode: &LogOutputMode,
-    color: bool,
-) {
+fn print_log_entry(step_title: &str, log: &ExecutionLog, output_mode: &LogOutputMode, color: bool) {
     let icon = output::log_status_icon(log.committed, log.rolled_back, color);
 
     let duration_str = log

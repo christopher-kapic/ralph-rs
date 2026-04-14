@@ -122,7 +122,9 @@ fn main() -> Result<()> {
                 commands::plan_delete(&conn, &slug, &project, force, &out)
             }
             PlanCommand::Archive { slug } => commands::plan_archive(&conn, &slug, &project, &out),
-            PlanCommand::Unarchive { slug } => commands::plan_unarchive(&conn, &slug, &project, &out),
+            PlanCommand::Unarchive { slug } => {
+                commands::plan_unarchive(&conn, &slug, &project, &out)
+            }
             PlanCommand::SetHook {
                 slug,
                 lifecycle,
@@ -146,10 +148,7 @@ fn main() -> Result<()> {
                 }
             },
             PlanCommand::Harness(harness_cmd) => match harness_cmd {
-                PlanHarnessCommand::Set {
-                    harness,
-                    plan,
-                } => {
+                PlanHarnessCommand::Set { harness, plan } => {
                     let p = resolve_plan(&conn, plan, &project, false)?;
                     commands::plan_harness_set(&conn, &p.slug, &project, &harness, &out)
                 }
@@ -218,9 +217,22 @@ fn main() -> Result<()> {
                     )
                 }
             }
-            StepCommand::Remove { step, step_id, plan, force } => {
+            StepCommand::Remove {
+                step,
+                step_id,
+                plan,
+                force,
+            } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::step_remove(&conn, &p.slug, &project, step, step_id.as_deref(), force, &out)
+                commands::step_remove(
+                    &conn,
+                    &p.slug,
+                    &project,
+                    step,
+                    step_id.as_deref(),
+                    force,
+                    &out,
+                )
             }
             StepCommand::Edit {
                 step,
@@ -251,11 +263,20 @@ fn main() -> Result<()> {
                     &out,
                 )
             }
-            StepCommand::Reset { step, step_id, plan } => {
+            StepCommand::Reset {
+                step,
+                step_id,
+                plan,
+            } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::step_reset(&conn, &p.slug, &project, step, step_id.as_deref(), &out)
             }
-            StepCommand::Move { step, step_id, to, plan } => {
+            StepCommand::Move {
+                step,
+                step_id,
+                to,
+                plan,
+            } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::step_move(&conn, &p.slug, &project, step, step_id.as_deref(), to, &out)
             }
@@ -267,7 +288,16 @@ fn main() -> Result<()> {
                 hook,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::cmd_step_set_hook(&conn, &p.slug, &project, step, step_id.as_deref(), lifecycle, &hook, &out)
+                commands::cmd_step_set_hook(
+                    &conn,
+                    &p.slug,
+                    &project,
+                    step,
+                    step_id.as_deref(),
+                    lifecycle,
+                    &hook,
+                    &out,
+                )
             }
             StepCommand::UnsetHook {
                 step,
@@ -278,7 +308,14 @@ fn main() -> Result<()> {
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::cmd_step_unset_hook(
-                    &conn, &p.slug, &project, step, step_id.as_deref(), lifecycle, &hook, &out,
+                    &conn,
+                    &p.slug,
+                    &project,
+                    step,
+                    step_id.as_deref(),
+                    lifecycle,
+                    &hook,
+                    &out,
                 )
             }
         },
@@ -357,18 +394,15 @@ fn main() -> Result<()> {
                             "Preflight checks failed for one or more plans. Use --skip-preflight to bypass."
                         );
                     }
-
-                    // Auto-stash dirty git state once before the whole chain.
-                    if preflight::auto_stash_dirty_state(workdir)? {
-                        eprintln!("  Auto-committed dirty state before run.");
-                    }
                 }
 
                 let rt = tokio::runtime::Runtime::new()?;
                 let results = rt.block_on(async {
                     let abort_rx = signal::install_and_spawn();
-                    runner::run_all_plans(&conn, &project, &_config, workdir, &options, abort_rx, &out)
-                        .await
+                    runner::run_all_plans(
+                        &conn, &project, &_config, workdir, &options, abort_rx, &out,
+                    )
+                    .await
                 })?;
 
                 let total = results.len();
@@ -418,11 +452,6 @@ fn main() -> Result<()> {
 
                 if !preflight_results.is_ok() {
                     anyhow::bail!("Preflight checks failed. Use --skip-preflight to bypass.");
-                }
-
-                // Auto-stash dirty git state
-                if preflight::auto_stash_dirty_state(workdir)? {
-                    eprintln!("  Auto-committed dirty state before run.");
                 }
             }
 
@@ -521,7 +550,15 @@ fn main() -> Result<()> {
             } else {
                 commands::LogOutputMode::Hidden
             };
-            commands::cmd_log(&conn, &project, plan.as_deref(), step, limit, &output_mode, &out)
+            commands::cmd_log(
+                &conn,
+                &project,
+                plan.as_deref(),
+                step,
+                limit,
+                &output_mode,
+                &out,
+            )
         }
 
         // -- Agents --
@@ -555,13 +592,9 @@ fn main() -> Result<()> {
                 &out,
             ),
             HooksCommand::Remove { name } => commands::cmd_hooks_remove(&name, &out),
-            HooksCommand::Export { output, all, path } => commands::cmd_hooks_export(
-                &project,
-                output.as_deref(),
-                all,
-                path.as_deref(),
-                &out,
-            ),
+            HooksCommand::Export { output, all, path } => {
+                commands::cmd_hooks_export(&project, output.as_deref(), all, path.as_deref(), &out)
+            }
             HooksCommand::Import { file, force } => commands::cmd_hooks_import(&file, force, &out),
         },
 

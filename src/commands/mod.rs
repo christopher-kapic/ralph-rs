@@ -221,10 +221,7 @@ fn print_harness_availability(availability: &[(String, bool)], out: &OutputConte
 }
 
 /// Select which harness to record as the config default.
-fn choose_default_harness(
-    opts: &InitOptions,
-    availability: &[(String, bool)],
-) -> Result<String> {
+fn choose_default_harness(opts: &InitOptions, availability: &[(String, bool)]) -> Result<String> {
     use std::io::IsTerminal;
 
     // Explicit flag always wins and is validated against the known harness
@@ -419,7 +416,19 @@ mod tests {
     fn test_plan_approve() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         plan_approve(&conn, "my-plan", &project, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
@@ -432,7 +441,19 @@ mod tests {
     fn test_plan_approve_rejects_non_planning() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         plan_approve(&conn, "my-plan", &project, &test_out()).unwrap();
 
         // Second approve should fail - plan is now ready, not planning
@@ -444,7 +465,19 @@ mod tests {
     fn test_plan_delete_forced() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         plan_delete(&conn, "my-plan", &project, true, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project).unwrap();
@@ -455,7 +488,19 @@ mod tests {
     fn test_step_add_and_list() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         step_add(
             &conn,
             "my-plan",
@@ -498,13 +543,45 @@ mod tests {
     fn test_step_add_after() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
-        step_add(
-            &conn, "my-plan", &project, "First", None, None, None, None, &[], None, &test_out(),
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "Third", None, None, None, None, &[], None, &test_out(),
+            &conn,
+            "my-plan",
+            &project,
+            "First",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
+        )
+        .unwrap();
+        step_add(
+            &conn,
+            "my-plan",
+            &project,
+            "Third",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
         )
         .unwrap();
         // Insert after position 1
@@ -537,7 +614,19 @@ mod tests {
     fn test_step_add_with_criteria_and_max_retries() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         let criteria = vec!["Tests pass".to_string(), "No warnings".to_string()];
         step_add(
             &conn,
@@ -567,9 +656,31 @@ mod tests {
     fn test_step_add_after_with_criteria() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         step_add(
-            &conn, "my-plan", &project, "First", None, None, None, None, &[], None, &test_out(),
+            &conn,
+            "my-plan",
+            &project,
+            "First",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
         )
         .unwrap();
         let criteria = vec!["Inserted check".to_string()];
@@ -601,13 +712,45 @@ mod tests {
     fn test_step_remove_forced() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
-        step_add(
-            &conn, "my-plan", &project, "First", None, None, None, None, &[], None, &test_out(),
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "Second", None, None, None, None, &[], None, &test_out(),
+            &conn,
+            "my-plan",
+            &project,
+            "First",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
+        )
+        .unwrap();
+        step_add(
+            &conn,
+            "my-plan",
+            &project,
+            "Second",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
         )
         .unwrap();
 
@@ -625,7 +768,19 @@ mod tests {
     fn test_step_edit() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         step_add(
             &conn,
             "my-plan",
@@ -670,9 +825,31 @@ mod tests {
     fn test_step_reset() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         step_add(
-            &conn, "my-plan", &project, "Step", None, None, None, None, &[], None, &test_out(),
+            &conn,
+            "my-plan",
+            &project,
+            "Step",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
         )
         .unwrap();
 
@@ -693,17 +870,59 @@ mod tests {
     fn test_step_move() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
-        step_add(
-            &conn, "my-plan", &project, "A", None, None, None, None, &[], None, &test_out(),
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "B", None, None, None, None, &[], None, &test_out(),
+            &conn,
+            "my-plan",
+            &project,
+            "A",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "C", None, None, None, None, &[], None, &test_out(),
+            &conn,
+            "my-plan",
+            &project,
+            "B",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
+        )
+        .unwrap();
+        step_add(
+            &conn,
+            "my-plan",
+            &project,
+            "C",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
         )
         .unwrap();
 
@@ -723,17 +942,59 @@ mod tests {
     fn test_step_move_to_end() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
-        step_add(
-            &conn, "my-plan", &project, "A", None, None, None, None, &[], None, &test_out(),
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "B", None, None, None, None, &[], None, &test_out(),
+            &conn,
+            "my-plan",
+            &project,
+            "A",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
         )
         .unwrap();
         step_add(
-            &conn, "my-plan", &project, "C", None, None, None, None, &[], None, &test_out(),
+            &conn,
+            "my-plan",
+            &project,
+            "B",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
+        )
+        .unwrap();
+        step_add(
+            &conn,
+            "my-plan",
+            &project,
+            "C",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
         )
         .unwrap();
 
@@ -755,8 +1016,32 @@ mod tests {
     fn test_plan_create_with_deps() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
-        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "plan-a",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+        plan_create(
+            &conn,
+            "plan-b",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         plan_create(
             &conn,
             "plan-c",
@@ -813,10 +1098,41 @@ mod tests {
     fn test_plan_dependency_add_happy_path() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
-        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "plan-a",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+        plan_create(
+            &conn,
+            "plan-b",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
 
-        plan_dependency_add(&conn, "plan-b", &project, &["plan-a".to_string()], &test_out()).unwrap();
+        plan_dependency_add(
+            &conn,
+            "plan-b",
+            &project,
+            &["plan-a".to_string()],
+            &test_out(),
+        )
+        .unwrap();
 
         let b = storage::get_plan_by_slug(&conn, "plan-b", &project)
             .unwrap()
@@ -829,9 +1145,27 @@ mod tests {
     fn test_plan_dependency_add_rejects_self_reference() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "plan-a",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
 
-        let result = plan_dependency_add(&conn, "plan-a", &project, &["plan-a".to_string()], &test_out());
+        let result = plan_dependency_add(
+            &conn,
+            "plan-a",
+            &project,
+            &["plan-a".to_string()],
+            &test_out(),
+        );
         assert!(result.is_err());
     }
 
@@ -839,13 +1173,50 @@ mod tests {
     fn test_plan_dependency_add_rejects_cycle() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
-        plan_create(&conn, "plan-b", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "plan-a",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+        plan_create(
+            &conn,
+            "plan-b",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
 
         // a -> b is fine.
-        plan_dependency_add(&conn, "plan-a", &project, &["plan-b".to_string()], &test_out()).unwrap();
+        plan_dependency_add(
+            &conn,
+            "plan-a",
+            &project,
+            &["plan-b".to_string()],
+            &test_out(),
+        )
+        .unwrap();
         // b -> a would close a cycle and should error.
-        let result = plan_dependency_add(&conn, "plan-b", &project, &["plan-a".to_string()], &test_out());
+        let result = plan_dependency_add(
+            &conn,
+            "plan-b",
+            &project,
+            &["plan-a".to_string()],
+            &test_out(),
+        );
         assert!(result.is_err());
     }
 
@@ -853,7 +1224,19 @@ mod tests {
     fn test_plan_dependency_remove() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "plan-a",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         plan_create(
             &conn,
             "plan-b",
@@ -876,7 +1259,14 @@ mod tests {
             1
         );
 
-        plan_dependency_remove(&conn, "plan-b", &project, &["plan-a".to_string()], &test_out()).unwrap();
+        plan_dependency_remove(
+            &conn,
+            "plan-b",
+            &project,
+            &["plan-a".to_string()],
+            &test_out(),
+        )
+        .unwrap();
         assert_eq!(
             storage::list_plan_dependencies(&conn, &b.id).unwrap().len(),
             0
@@ -887,7 +1277,19 @@ mod tests {
     fn test_plan_dependency_list_resolves_both_directions() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "plan-a", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "plan-a",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         plan_create(
             &conn,
             "plan-b",
@@ -933,9 +1335,31 @@ mod tests {
     fn test_step_out_of_range() {
         let (conn, project) = setup();
 
-        plan_create(&conn, "my-plan", &project, None, None, None, None, &[], &[], &test_out()).unwrap();
+        plan_create(
+            &conn,
+            "my-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
         step_add(
-            &conn, "my-plan", &project, "Step", None, None, None, None, &[], None, &test_out(),
+            &conn,
+            "my-plan",
+            &project,
+            "Step",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            &test_out(),
         )
         .unwrap();
 

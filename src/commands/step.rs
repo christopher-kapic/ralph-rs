@@ -1,6 +1,6 @@
 // Step CLI command implementations (CRUD, move, hooks)
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use std::io::Read;
 
@@ -319,7 +319,9 @@ pub fn step_edit(
         && max_retries.is_none()
         && !clear_max_retries
     {
-        bail!("Nothing to edit: provide at least one of --title, --description, --agent, --harness, --criteria, --max-retries, or --clear-max-retries");
+        bail!(
+            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --criteria, --max-retries, or --clear-max-retries"
+        );
     }
 
     // We only pass non-None fields to the update function for fields the

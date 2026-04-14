@@ -346,9 +346,11 @@ mod tests {
         // carry the prompt placeholder.
         assert!(!claude.plan_args.is_empty());
         assert!(claude.plan_args.contains(&"{prompt}".to_string()));
-        assert!(claude
-            .plan_args
-            .contains(&"--system-prompt-file".to_string()));
+        assert!(
+            claude
+                .plan_args
+                .contains(&"--system-prompt-file".to_string())
+        );
         assert!(claude.plan_args.contains(&"{agent_file}".to_string()));
 
         let codex = &config.harnesses["codex"];
