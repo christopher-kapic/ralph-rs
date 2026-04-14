@@ -15,6 +15,7 @@ mod plan;
 mod plan_harness;
 mod preflight;
 mod prompt;
+mod run_lock;
 mod runner;
 mod signal;
 mod storage;
@@ -281,6 +282,7 @@ fn main() -> Result<()> {
             skip_preflight,
             current_branch,
             harness: run_harness,
+            force,
         } => {
             let workdir = std::path::Path::new(&project);
             let harness_override = cli.harness.or(run_harness);
@@ -304,6 +306,15 @@ fn main() -> Result<()> {
                 if plan_slug.is_some() {
                     eprintln!("Warning: --plan is ignored when --all is set.");
                 }
+
+                // Acquire the per-project run lock so two concurrent `ralph run`
+                // invocations can't clobber each other. Dry runs skip the lock
+                // since they don't mutate state.
+                let _run_lock = if !dry_run {
+                    Some(run_lock::acquire(&conn, &project, None, None, force)?)
+                } else {
+                    None
+                };
 
                 // Preflight every runnable plan before starting the chain so we
                 // fail fast if anything is misconfigured.
@@ -372,6 +383,20 @@ fn main() -> Result<()> {
             // Single-plan run path.
             let plan = resolve_plan(&conn, plan_slug, &project, false)?;
             let slug = plan.slug.clone();
+
+            // Acquire the per-project run lock before doing any mutating work.
+            // Dry runs skip the lock.
+            let _run_lock = if !dry_run {
+                Some(run_lock::acquire(
+                    &conn,
+                    &project,
+                    Some(&plan.slug),
+                    Some(&plan.id),
+                    force,
+                )?)
+            } else {
+                None
+            };
 
             // Preflight checks
             if !skip_preflight && !dry_run {

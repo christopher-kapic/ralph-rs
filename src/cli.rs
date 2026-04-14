@@ -114,6 +114,10 @@ pub enum Command {
         /// Override the harness for this run.
         #[arg(long)]
         harness: Option<String>,
+
+        /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Resume a plan from the last failed or in-progress step.

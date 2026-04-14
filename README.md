@@ -10,7 +10,6 @@ A deterministic orchestrator for coding agent harnesses. Takes step-based plans 
 - **Multi-harness support**: Works with Claude Code, Codex, OpenCode, Copilot, Goose, Pi, and more
 - **Deterministic execution**: Subprocess orchestration with test validation, git commits, and rollback on failure
 - **Retry with context**: Failed attempts inject diffs and test output into retry prompts
-- **Interactive TUI**: Ratatui-based terminal UI with vim keybindings for live plan execution
 - **Plan portability**: Export/import plans as JSON for harness comparison and reuse
 
 ## Install
@@ -42,14 +41,14 @@ cargo install --path .
 ralph init
 
 # Create a plan
-ralph plan create "Add user authentication" --test "cargo build" --test "cargo test"
+ralph plan create auth --description "Add user authentication" --test "cargo build" --test "cargo test"
 
-# Add steps
-ralph step add auth --title "Add user model" --description "Create User struct with id, email, password_hash fields" --criteria "User struct exists in src/models/user.rs" --criteria "Tests pass"
-ralph step add auth --title "Add API endpoints" --description "Create login/register endpoints" --criteria "/api/login returns 200 with valid credentials"
+# Add steps (first positional is the step title, second is the plan slug)
+ralph step add "Add user model" auth --description "Create User struct with id, email, password_hash fields" --criteria "User struct exists in src/models/user.rs" --criteria "Tests pass"
+ralph step add "Add API endpoints" auth --description "Create login/register endpoints" --criteria "/api/login returns 200 with valid credentials"
 
 # Approve and run
-ralph approve auth
+ralph plan approve auth
 ralph run auth
 ```
 
@@ -58,40 +57,48 @@ ralph run auth
 ### Plan Management
 
 ```bash
-ralph plan create <description>        # Create a new plan
+ralph plan create <slug>               # Create a new plan
+  [--description <d>]                     #   Plan description (also -d)
   [--test <cmd>]...                       #   Repeatable: deterministic test commands
   [--harness <h>]                         #   Plan-level harness override
   [--agent <name>]                        #   Plan-level agent definition
   [--branch <name>]                       #   Custom branch name
+  [--depends-on <slug>]...                #   Plan-level dependencies
 
-ralph plan list [--all]                # List plans
+ralph plan list [--all] [--status <s>] [--archived]   # List plans
 ralph plan show <slug>                 # Show plan details
 ralph plan approve <slug>              # Approve plan (planning -> ready)
 ralph plan delete <slug>               # Delete a plan
+ralph plan archive <slug>              # Archive a completed/failed plan
 ```
 
 ### Step Management
 
 ```bash
-ralph step list <slug>                 # List steps in a plan
-ralph step add <slug>                  # Add a step
-  --title <t> --description <d>
+ralph step list [<slug>]               # List steps in a plan (defaults to active plan)
+ralph step add <title> [<slug>]        # Add a step (title is positional)
+  [--description <d>]                     #   Step description (also -d)
   [--criteria <c>]...                     #   Acceptance criteria
   [--agent <name>]                        #   Step-level agent override
   [--after <num>]                         #   Insert after step number
+  [--import-json <FILE|->]                #   Bulk-insert from JSON (array or object)
 
-ralph step remove <slug> <num>         # Remove step by position
-ralph step edit <slug> <num>           # Edit step fields
-ralph step reset <slug> <num>          # Reset step to pending
-ralph step move <slug> <from> <to>     # Reorder step
+ralph step remove <num> [<slug>]       # Remove step by position
+ralph step edit <num> [<slug>]         # Edit step fields (--title/--description)
+ralph step reset <num> [<slug>]        # Reset step to pending
+ralph step move <num> [<slug>] --to <n># Reorder step
 ```
 
 ### Execution
 
 ```bash
-ralph run [<slug>]                     # Run plan (interactive TUI)
-ralph run [<slug>] --noninteractive    # Run plan (stdout progress)
-ralph run [<slug>] --current-branch    # Run on current branch
+ralph run [<slug>]                     # Run all pending steps in a plan
+ralph run [<slug>] --one               # Run only the next pending step
+ralph run --all                        # Run every plan in dependency order
+ralph run [<slug>] --from <n> --to <m> # Run a specific step range
+ralph run [<slug>] --dry-run           # Print what would happen without executing
+ralph run [<slug>] --current-branch    # Run on current branch (skip branch creation)
+ralph run [<slug>] --harness <h>       # Override harness for this run
 ralph resume [<slug>]                  # Resume from last failed step
 ralph skip [<slug>]                    # Skip failed step, continue
 ```
@@ -99,7 +106,9 @@ ralph skip [<slug>]                    # Skip failed step, continue
 ### Planning with a Harness
 
 ```bash
-ralph plan:harness [<harness>] [<description>]   # Delegate planning to an AI harness
+ralph plan harness generate <description>        # Delegate planning to an AI harness
+ralph plan harness set <harness> [<slug>]        # Set the plan-generation harness
+ralph plan harness show [<slug>]                 # Show the current harness for a plan
 ```
 
 ### Portability
@@ -107,17 +116,16 @@ ralph plan:harness [<harness>] [<description>]   # Delegate planning to an AI ha
 ```bash
 ralph export <slug> [-o <file>]        # Export plan to JSON
 ralph import <file>                    # Import plan from JSON
-  [--project <path>]
-  [--slug <name>]
-  [--harness <h>]
+  [--slug <name>]                         #   Override the plan slug on import
+  [--branch <name>]                       #   Override the branch name on import
 ```
 
 ### Utilities
 
 ```bash
-ralph status [<slug>]                  # Show execution status
-ralph log <slug> [<step-num>]          # Show execution logs
-ralph agents                           # List agent definitions
+ralph status [<slug>] [--verbose]      # Show execution status
+ralph log [<slug>] [--step <n>] [--limit <n>] [--full|--lines <n>]   # Show execution logs
+ralph agents <list|show|create|delete> # Manage agent file templates
 ralph doctor                           # Check config, DB, harness availability
 ```
 
@@ -127,16 +135,17 @@ Export a plan and run it with different harnesses to compare results:
 
 ```bash
 # Create and export a plan
-ralph plan:harness claude "Add user auth"
-ralph export auth
+ralph plan harness generate "Add user auth"
+ralph export auth -o auth.json
 
-# Import into separate project copies with different harnesses
-ralph import auth.json --project ~/myapp-claude --slug auth-claude --harness claude
-ralph import auth.json --project ~/myapp-codex --slug auth-codex --harness codex
+# Import into each project copy (import writes to the DB scoped to the current cwd;
+# use --slug to give each copy a distinct name if they share a database)
+cd ~/myapp-claude && ralph import ~/auth.json --slug auth-claude
+cd ~/myapp-codex  && ralph import ~/auth.json --slug auth-codex
 
-# Run both
-cd ~/myapp-claude && ralph run auth-claude --noninteractive &
-cd ~/myapp-codex  && ralph run auth-codex  --noninteractive &
+# Run each copy with a different harness
+cd ~/myapp-claude && ralph run auth-claude --harness claude &
+cd ~/myapp-codex  && ralph run auth-codex  --harness codex  &
 ```
 
 ## Configuration
@@ -157,7 +166,7 @@ ralph hooks export -o bundle.json        # share with teammates
 ralph hooks import bundle.json
 ```
 
-Hooks can be `global` or path-scoped to specific project prefixes. When you run `ralph plan:harness`, the plan agent is told which hooks are available and can attach them to steps it thinks deserve review.
+Hooks can be `global` or path-scoped to specific project prefixes. When you run `ralph plan harness generate`, the plan agent is told which hooks are available and can attach them to steps it thinks deserve review.
 
 For the full model (library layout, scope rules, sharing, worked examples for Claude Code / Codex / clippy), see [docs/review-hooks.md](docs/review-hooks.md).
 

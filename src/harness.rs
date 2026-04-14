@@ -352,6 +352,7 @@ mod tests {
         let hc = HarnessConfig {
             command: "test-harness".to_string(),
             args: vec!["-p".to_string(), "{prompt}".to_string()],
+            plan_args: vec![],
             supports_agent_file: false,
             supports_json_output: false,
             json_output_args: vec![],
@@ -367,6 +368,7 @@ mod tests {
         let hc = HarnessConfig {
             command: "codex".to_string(),
             args: vec![],
+            plan_args: vec![],
             supports_agent_file: false,
             supports_json_output: false,
             json_output_args: vec![],
@@ -396,6 +398,7 @@ mod tests {
         let hc = HarnessConfig {
             command: "fake".to_string(),
             args: vec!["--run".to_string(), "{prompt}".to_string()],
+            plan_args: vec![],
             supports_agent_file: false,
             supports_json_output: false,
             json_output_args: vec!["--this-should-not-appear".to_string()],
@@ -482,6 +485,7 @@ mod tests {
         let hc = HarnessConfig {
             command: "goose".to_string(),
             args: vec![],
+            plan_args: vec![],
             supports_agent_file: false,
             supports_json_output: false,
             json_output_args: vec![],
@@ -500,6 +504,7 @@ mod tests {
         let hc = HarnessConfig {
             command: "goose".to_string(),
             args: vec![],
+            plan_args: vec![],
             supports_agent_file: false,
             supports_json_output: false,
             json_output_args: vec![],
@@ -547,6 +552,7 @@ mod tests {
         let hc = HarnessConfig {
             command: "test".to_string(),
             args: vec!["--prompt={prompt}".to_string()],
+            plan_args: vec![],
             supports_agent_file: false,
             supports_json_output: false,
             json_output_args: vec![],
@@ -566,6 +572,7 @@ mod tests {
                 "--agent-file".to_string(),
                 "{agent_file}".to_string(),
             ],
+            plan_args: vec![],
             supports_agent_file: true,
             supports_json_output: false,
             json_output_args: vec![],

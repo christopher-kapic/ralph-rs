@@ -136,10 +136,21 @@ fn build_initial_prompt(project: &str, description: Option<&str>) -> String {
 
 /// Build harness arguments for interactive plan-harness mode.
 ///
-/// Different harnesses receive the agent definition differently:
-/// - **claude**: Gets `--system-prompt-file <temp_file>` pointing to the agent definition
-/// - **goose**: Gets `GOOSE_SYSTEM_PROMPT_FILE_PATH` env var set to the agent file path
-/// - **others** (codex, pi, opencode, copilot): Agent content is prepended to the prompt
+/// The argv is built from the per-harness `plan_args` template in
+/// [`HarnessConfig`]. Two placeholders are supported:
+/// - `{prompt}` — replaced with the initial prompt. If the harness has no
+///   external mechanism for loading the agent definition (neither a
+///   `{agent_file}` CLI flag nor an `agent_file_env` env var), the agent
+///   definition is prepended so it still reaches the model via the single
+///   prompt turn.
+/// - `{agent_file}` — replaced with the absolute path to the agent
+///   definition tempfile. Only meaningful when `supports_agent_file` is true.
+///
+/// If a harness's `plan_args` is empty (legacy user configs that predate
+/// this field), this falls back to the pre-template behavior: claude gets
+/// `--system-prompt-file <path>` followed by the prompt, and every other
+/// harness receives just the (possibly agent-prepended) prompt as a single
+/// positional argument.
 fn build_plan_harness_args(
     harness_name: &str,
     config: &Config,
@@ -148,24 +159,51 @@ fn build_plan_harness_args(
     prompt: &str,
 ) -> Vec<String> {
     let harness_config = &config.harnesses[harness_name];
-    let mut args = Vec::new();
 
-    // For claude, add --system-prompt-file flag
-    if harness_config.supports_agent_file
-        && let Some(path) = agent_file_path
-    {
-        args.push("--system-prompt-file".to_string());
-        args.push(path.to_string_lossy().to_string());
+    // Goose-style harnesses load the system prompt from an env var that
+    // fully replaces the default, so inlining the agent content into the
+    // prompt would duplicate it and eat the context window. Only prepend
+    // the agent definition when the harness has no external loading path
+    // at all.
+    let has_external_agent_loading =
+        harness_config.supports_agent_file || harness_config.agent_file_env.is_some();
+    let effective_prompt = if !has_external_agent_loading && agent_file_path.is_some() {
+        format!("{agent_content}\n\n---\n\n{prompt}")
+    } else {
+        prompt.to_string()
+    };
+
+    // Legacy fallback for user configs that predate plan_args.
+    if harness_config.plan_args.is_empty() {
+        let mut args = Vec::new();
+        if harness_config.supports_agent_file
+            && let Some(path) = agent_file_path
+        {
+            args.push("--system-prompt-file".to_string());
+            args.push(path.to_string_lossy().to_string());
+        }
+        args.push(effective_prompt);
+        return args;
     }
 
-    // Add the prompt. For harnesses without native agent file support,
-    // prepend the agent content to the prompt.
-    if !harness_config.supports_agent_file && agent_file_path.is_some() {
-        // Prepend agent definition to the prompt
-        let full_prompt = format!("{agent_content}\n\n---\n\n{prompt}");
-        args.push(full_prompt);
+    // Template path: substitute {prompt} and {agent_file} in place using
+    // substring replacement so tokens like "--prompt={prompt}" and
+    // "--agent-file={agent_file}" work, matching build_harness_args semantics.
+    let mut args: Vec<String> = harness_config
+        .plan_args
+        .iter()
+        .map(|tok| tok.replace("{prompt}", &effective_prompt))
+        .collect();
+
+    if let Some(path) = agent_file_path {
+        let agent_file_str = path.to_string_lossy();
+        for arg in args.iter_mut() {
+            *arg = arg.replace("{agent_file}", &agent_file_str);
+        }
     } else {
-        args.push(prompt.to_string());
+        // Mirror build_harness_args's no-agent-file behavior: strip any
+        // `{agent_file}` placeholder tokens and the preceding flag they go with.
+        harness::remove_agent_file_args(&mut args);
     }
 
     args
@@ -337,6 +375,78 @@ mod tests {
         assert!(args.contains(&"Create a plan".to_string()));
         // Agent content should NOT be in the prompt
         assert!(!args.iter().any(|a| a.contains("ralph Plan Agent")));
+        // {agent_file} placeholder should have been substituted with the real path
+        let path_str = agent_file.path().to_string_lossy().into_owned();
+        assert!(args.contains(&path_str));
+        assert!(!args.iter().any(|a| a.contains("{agent_file}")));
+    }
+
+    #[test]
+    fn test_build_plan_harness_args_copilot_uses_interactive_flag() {
+        // The whole point of the plan_args template: copilot's run-mode -p
+        // is one-shot and rejects a seeded positional prompt, so plan-harness
+        // mode must invoke it with -i instead.
+        let config = Config::default();
+        let agent_content = test_agent_content();
+        let agent_file = write_agent_temp_file(&agent_content).unwrap();
+        let args = build_plan_harness_args(
+            "copilot",
+            &config,
+            Some(agent_file.path()),
+            &agent_content,
+            "Plan this",
+        );
+
+        assert!(
+            args.contains(&"-i".to_string()),
+            "copilot plan_args must use -i, got: {args:?}"
+        );
+        assert!(
+            !args.contains(&"-p".to_string()),
+            "copilot plan_args must NOT use -p (one-shot, non-interactive): {args:?}"
+        );
+        assert!(args.contains(&"--allow-all".to_string()));
+        assert!(args.contains(&"--allow-all-paths".to_string()));
+        // The prompt (with prepended agent content) should still be present.
+        assert!(args.iter().any(|a| a.contains("Plan this")));
+        assert!(args.iter().any(|a| a.contains("ralph Plan Agent")));
+    }
+
+    #[test]
+    fn test_build_plan_harness_args_legacy_empty_template() {
+        // A user config that predates plan_args ships an empty Vec. The
+        // builder must fall back to the pre-template behavior (claude gets
+        // --system-prompt-file + prompt; everything else gets the prepended
+        // prompt as a bare positional).
+        let mut config = Config::default();
+        for harness in config.harnesses.values_mut() {
+            harness.plan_args.clear();
+        }
+        let agent_content = test_agent_content();
+        let agent_file = write_agent_temp_file(&agent_content).unwrap();
+
+        let claude_args = build_plan_harness_args(
+            "claude",
+            &config,
+            Some(agent_file.path()),
+            &agent_content,
+            "Plan",
+        );
+        assert_eq!(claude_args[0], "--system-prompt-file");
+        assert_eq!(claude_args[1], agent_file.path().to_string_lossy());
+        assert_eq!(claude_args[2], "Plan");
+        assert_eq!(claude_args.len(), 3);
+
+        let codex_args = build_plan_harness_args(
+            "codex",
+            &config,
+            Some(agent_file.path()),
+            &agent_content,
+            "Plan",
+        );
+        assert_eq!(codex_args.len(), 1);
+        assert!(codex_args[0].contains("ralph Plan Agent"));
+        assert!(codex_args[0].contains("Plan"));
     }
 
     #[test]
@@ -374,6 +484,34 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--system-prompt-file"));
         assert!(args.iter().any(|a| a.contains("ralph Plan Agent")));
         assert!(args.iter().any(|a| a.contains("Help me plan")));
+    }
+
+    #[test]
+    fn test_build_plan_harness_args_goose_does_not_inline_agent() {
+        // Goose loads the agent definition via GOOSE_SYSTEM_PROMPT_FILE_PATH,
+        // which fully replaces the default system prompt. If we ALSO inline
+        // the definition into the -t prompt (as the old behavior did), goose
+        // sees it twice: once as system, once as user. Pin the fix so any
+        // future change to the prepend logic has to re-justify itself.
+        let config = Config::default();
+        let agent_content = test_agent_content();
+        let agent_file = write_agent_temp_file(&agent_content).unwrap();
+        let args = build_plan_harness_args(
+            "goose",
+            &config,
+            Some(agent_file.path()),
+            &agent_content,
+            "Help me plan",
+        );
+
+        assert!(
+            args.iter().any(|a| a.contains("Help me plan")),
+            "user prompt missing from argv: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("ralph Plan Agent")),
+            "agent definition was inlined into goose argv (double-load bug): {args:?}"
+        );
     }
 
     #[test]
@@ -468,5 +606,96 @@ mod tests {
         let content = render_plan_agent(&[]);
         assert!(content.contains("No hooks are currently available"));
         assert!(content.contains("ralph hooks add"));
+    }
+
+    /// Synthetic harness config builder used by the substring-replacement
+    /// tests below. `HarnessConfig` doesn't derive `Default`, so we spell out
+    /// all fields here to keep the tests independent of `Config::default()`.
+    fn synthetic_harness(plan_args: Vec<String>, supports_agent_file: bool) -> Config {
+        use crate::config::HarnessConfig;
+        use std::collections::HashMap;
+        let mut harnesses = HashMap::new();
+        harnesses.insert(
+            "synth".to_string(),
+            HarnessConfig {
+                command: "synth".to_string(),
+                args: vec![],
+                plan_args,
+                supports_agent_file,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+            },
+        );
+        Config {
+            default_harness: "synth".to_string(),
+            max_retries_per_step: 0,
+            timeout_secs: 0,
+            harnesses,
+        }
+    }
+
+    #[test]
+    fn test_plan_harness_args_substring_replacement() {
+        // A plan_args template that embeds {prompt} inside a larger token
+        // (e.g. `--prompt={prompt}`) must be substring-substituted, not
+        // matched as a whole token — otherwise users copying run-mode
+        // patterns into plan_args get the literal placeholder in argv.
+        let config = synthetic_harness(vec!["--prompt={prompt}".to_string()], false);
+        let agent_content = test_agent_content();
+        let agent_file = write_agent_temp_file(&agent_content).unwrap();
+        let args = build_plan_harness_args(
+            "synth",
+            &config,
+            Some(agent_file.path()),
+            &agent_content,
+            "Create a plan",
+        );
+
+        assert_eq!(args.len(), 1, "expected a single arg, got {args:?}");
+        // Because supports_agent_file=false, the agent content is prepended
+        // to the effective prompt — so the arg begins with "--prompt=" and
+        // contains both the agent content and the original prompt.
+        assert!(args[0].starts_with("--prompt="));
+        assert!(args[0].contains("Create a plan"));
+        assert!(
+            !args[0].contains("{prompt}"),
+            "literal placeholder leaked into argv: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_plan_harness_args_agent_file_substring() {
+        // Same story for {agent_file}: a token like `--agent-file={agent_file}`
+        // must substring-substitute to the real path, not leak the literal.
+        let config = synthetic_harness(
+            vec![
+                "--agent-file={agent_file}".to_string(),
+                "{prompt}".to_string(),
+            ],
+            true,
+        );
+        let agent_content = test_agent_content();
+        let agent_file = write_agent_temp_file(&agent_content).unwrap();
+        let args = build_plan_harness_args(
+            "synth",
+            &config,
+            Some(agent_file.path()),
+            &agent_content,
+            "Create a plan",
+        );
+
+        let path_str = agent_file.path().to_string_lossy().into_owned();
+        assert_eq!(args.len(), 2, "expected two args, got {args:?}");
+        assert!(args[0].starts_with("--agent-file="));
+        assert!(
+            args[0].contains(&path_str),
+            "expected path substring in first arg: {args:?}"
+        );
+        assert!(
+            !args[0].contains("{agent_file}"),
+            "literal {{agent_file}} leaked into argv: {args:?}"
+        );
+        assert_eq!(args[1], "Create a plan");
     }
 }

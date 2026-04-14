@@ -10,11 +10,12 @@ use crate::config;
 /// Current schema version. Bump this and add a new migration function
 /// to `MIGRATIONS` whenever the schema changes.
 #[allow(dead_code)]
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 4;
 
 /// Each migration is a function that receives a connection (already inside a transaction).
 /// Migrations are 1-indexed: MIGRATIONS[0] migrates from version 0 → 1.
-const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[migrate_v1, migrate_v2, migrate_v3];
+const MIGRATIONS: &[fn(&Connection) -> Result<()>] =
+    &[migrate_v1, migrate_v2, migrate_v3, migrate_v4];
 
 /// Returns the path to the SQLite database file.
 pub fn db_path() -> Result<PathBuf> {
@@ -205,6 +206,29 @@ fn migrate_v3(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Migration V4: per-project run lock
+// ---------------------------------------------------------------------------
+
+fn migrate_v4(conn: &Connection) -> Result<()> {
+    // `run_locks` prevents two `ralph run` invocations from executing
+    // concurrently against the same project. Keyed on absolute project path;
+    // `pid` is the OS process id of the active runner and is checked for
+    // liveness when a new run tries to acquire the lock.
+    conn.execute_batch(
+        "
+        CREATE TABLE run_locks (
+            project TEXT PRIMARY KEY,
+            pid INTEGER NOT NULL,
+            plan_id TEXT,
+            plan_slug TEXT,
+            started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+        ",
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +265,7 @@ mod tests {
         assert!(tables.contains(&"plans".to_string()));
         assert!(tables.contains(&"steps".to_string()));
         assert!(tables.contains(&"execution_logs".to_string()));
+        assert!(tables.contains(&"run_locks".to_string()));
     }
 
     #[test]

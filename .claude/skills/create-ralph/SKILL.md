@@ -63,7 +63,7 @@ ralph plan approve <slug>
 - **Include acceptance criteria**: "The struct should derive `Debug`, `Clone`, and `Serialize`. Tests in `src/services/user_test.rs` should cover all three methods."
 - **Keep steps focused**: One concern per step. Don't combine "add the model" and "add the API endpoint" into one step.
 - **Order dependencies correctly**: Create types before using them, add modules before importing them
-- **3-8 steps is typical**: Fewer than 3 usually means the steps are too coarse; more than 8 means they might be too granular
+- **Size the plan to the scope, not a default**: Plans can reasonably range from ~3 steps (focused bugfix) to ~300 steps (greenfield service or multi-week refactor). Pick granularity based on the work, not a target count. Rough bands: bugfix 3–5, small feature 5–15, medium feature 15–40, large refactor or greenfield 40–300. Don't compress a big task into a handful of mega-steps — you lose the checkpointing, retry, and rollback that ralph gives you per step. Don't inflate a small task into many trivial steps either. Whatever the size, every step must still be atomic and independently verifiable.
 
 ## Important
 

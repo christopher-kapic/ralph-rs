@@ -14,6 +14,17 @@ pub struct HarnessConfig {
     /// Default arguments passed to the command.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Argument template for the `plan harness generate` interactive session.
+    /// Supports two placeholders substituted at spawn time:
+    /// - `{prompt}` — the initial user prompt (with agent content prepended
+    ///   if the harness does not support agent files natively)
+    /// - `{agent_file}` — path to the agent definition tempfile (only useful
+    ///   if `supports_agent_file` is true)
+    ///
+    /// Empty means "fall back to the legacy hardcoded behavior" so existing
+    /// user configs that predate this field keep working.
+    #[serde(default)]
+    pub plan_args: Vec<String>,
     /// Whether this harness supports an agent file (e.g. CLAUDE.md).
     #[serde(default)]
     pub supports_agent_file: bool,
@@ -50,6 +61,14 @@ impl Default for Config {
             HarnessConfig {
                 command: "claude".to_string(),
                 args: vec!["-p".to_string()],
+                // Claude's `--system-prompt-file` natively loads the agent
+                // definition, and the prompt is a positional argument that
+                // keeps the session interactive.
+                plan_args: vec![
+                    "--system-prompt-file".to_string(),
+                    "{agent_file}".to_string(),
+                    "{prompt}".to_string(),
+                ],
                 supports_agent_file: true,
                 supports_json_output: true,
                 json_output_args: vec!["--output-format".to_string(), "json".to_string()],
@@ -76,6 +95,14 @@ impl Default for Config {
                     "-c".to_string(),
                     "approval_policy=never".to_string(),
                 ],
+                // Codex's interactive TUI is the default subcommand (no
+                // `exec`). It accepts a positional PROMPT that seeds the
+                // first user turn (see codex-rs/tui/src/cli.rs). `--full-auto`
+                // is the codex-blessed low-friction combo that maps to
+                // `-a on-request --sandbox workspace-write`, letting the
+                // model run tools freely inside the workspace while still
+                // asking for confirmation on anything truly risky.
+                plan_args: vec!["--full-auto".to_string(), "{prompt}".to_string()],
                 supports_agent_file: false,
                 supports_json_output: true,
                 json_output_args: vec!["--json".to_string()],
@@ -91,6 +118,13 @@ impl Default for Config {
                 // (NDJSON events), NOT a generic --json flag.
                 command: "pi".to_string(),
                 args: vec!["-p".to_string()],
+                // Interactive is pi's default when no `-p` is passed, and
+                // positional arguments become the initial user message
+                // (see packages/coding-agent/src/main.ts resolveAppMode).
+                // Pi has no permission/approval flags by design ("No
+                // permission popups" — user drives the session), so there
+                // is nothing to add beyond the seeded prompt itself.
+                plan_args: vec!["{prompt}".to_string()],
                 supports_agent_file: false,
                 supports_json_output: true,
                 json_output_args: vec!["--mode".to_string(), "json".to_string()],
@@ -105,6 +139,14 @@ impl Default for Config {
                 // not as a top-level argument. JSON output uses `--format json`.
                 command: "opencode".to_string(),
                 args: vec!["run".to_string()],
+                // OpenCode's interactive TUI is the default command (no
+                // subcommand). The TUI accepts `--prompt <text>`, which
+                // auto-submits the first user turn when it opens (see
+                // packages/opencode/src/cli/cmd/tui/thread.ts and home.tsx).
+                // Per-call permissions are config-only (OPENCODE_PERMISSION
+                // env / opencode.json), so we leave those to the user's
+                // ambient config and only seed the prompt here.
+                plan_args: vec!["--prompt".to_string(), "{prompt}".to_string()],
                 supports_agent_file: false,
                 supports_json_output: true,
                 json_output_args: vec!["--format".to_string(), "json".to_string()],
@@ -125,6 +167,18 @@ impl Default for Config {
                     "--silent".to_string(),
                     "--allow-all-paths".to_string(),
                     "--allow-all".to_string(),
+                ],
+                // Copilot's `-p` mode is one-shot non-interactive. For
+                // interactive plan-harness sessions we use `-i`, which
+                // starts a REPL and seeds the first user turn from the
+                // prompt argument. `--allow-all` / `--allow-all-paths`
+                // skip permission gating, which is what we want since
+                // the user is driving the session interactively anyway.
+                plan_args: vec![
+                    "--allow-all-paths".to_string(),
+                    "--allow-all".to_string(),
+                    "-i".to_string(),
+                    "{prompt}".to_string(),
                 ],
                 supports_agent_file: false,
                 supports_json_output: true,
@@ -153,6 +207,25 @@ impl Default for Config {
                     "-t".to_string(),
                     "{prompt}".to_string(),
                     "--no-session".to_string(),
+                ],
+                // Goose's `session` subcommand does NOT accept a seeded
+                // prompt, but `goose run -t <text> -s` does exactly what
+                // we need: process the initial input, then drop into the
+                // REPL via the `-s`/`--interactive` flag (see
+                // crates/goose-cli/src/cli.rs around line 320 and the
+                // `session.interactive(input_config.contents)` call site).
+                // The agent definition is still loaded via the
+                // GOOSE_SYSTEM_PROMPT_FILE_PATH env var set by
+                // build_plan_harness_env, so {prompt} only needs to carry
+                // the user turn. Goose has no CLI autonomy flags —
+                // autonomy is controlled by the GOOSE_MODE env var
+                // (auto / approve / smart_approve / chat), which we leave
+                // to the user's ambient environment.
+                plan_args: vec![
+                    "run".to_string(),
+                    "-t".to_string(),
+                    "{prompt}".to_string(),
+                    "-s".to_string(),
                 ],
                 supports_agent_file: false,
                 supports_json_output: true,
@@ -269,6 +342,16 @@ mod tests {
         assert!(claude.supports_json_output);
         assert!(!claude.json_output_args.is_empty());
         assert!(claude.agent_file_env.is_some());
+        // Claude plan_args must reference the agent file natively and
+        // carry the prompt placeholder.
+        assert!(!claude.plan_args.is_empty());
+        assert!(claude.plan_args.contains(&"{prompt}".to_string()));
+        assert!(
+            claude
+                .plan_args
+                .contains(&"--system-prompt-file".to_string())
+        );
+        assert!(claude.plan_args.contains(&"{agent_file}".to_string()));
 
         let codex = &config.harnesses["codex"];
         assert_eq!(codex.command, "codex");
@@ -282,6 +365,21 @@ mod tests {
         assert!(codex.args.contains(&"--ephemeral".to_string()));
         assert!(codex.args.contains(&"--skip-git-repo-check".to_string()));
         assert!(codex.args.contains(&"approval_policy=never".to_string()));
+        // Plan-harness mode for codex must enter the interactive TUI
+        // (default subcommand, NOT `exec`) with a seeded positional
+        // prompt and the low-friction `--full-auto` autonomy combo.
+        assert!(!codex.plan_args.is_empty());
+        assert!(codex.plan_args.contains(&"{prompt}".to_string()));
+        assert!(
+            codex.plan_args.contains(&"--full-auto".to_string()),
+            "codex plan_args must request --full-auto, got: {:?}",
+            codex.plan_args
+        );
+        assert!(
+            !codex.plan_args.contains(&"exec".to_string()),
+            "codex plan_args must NOT use the `exec` subcommand (one-shot, non-interactive): {:?}",
+            codex.plan_args
+        );
 
         let pi = &config.harnesses["pi"];
         assert_eq!(pi.args, vec!["-p".to_string()]);
@@ -290,6 +388,16 @@ mod tests {
             pi.json_output_args,
             vec!["--mode".to_string(), "json".to_string()]
         );
+        // Pi's interactive mode is the default when `-p` is absent, and a
+        // positional seeds the first turn. Pi has no permission flags by
+        // design, so plan_args should be just the prompt placeholder.
+        assert!(!pi.plan_args.is_empty());
+        assert!(pi.plan_args.contains(&"{prompt}".to_string()));
+        assert!(
+            !pi.plan_args.contains(&"-p".to_string()),
+            "pi plan_args must NOT use -p (print/one-shot mode): {:?}",
+            pi.plan_args
+        );
 
         let opencode = &config.harnesses["opencode"];
         assert_eq!(opencode.args, vec!["run".to_string()]);
@@ -297,6 +405,21 @@ mod tests {
         assert_eq!(
             opencode.json_output_args,
             vec!["--format".to_string(), "json".to_string()]
+        );
+        // opencode's TUI is the default command — plan_args must NOT
+        // invoke the `run` subcommand (that's one-shot non-interactive).
+        // The TUI accepts `--prompt <text>`, which auto-submits.
+        assert!(!opencode.plan_args.is_empty());
+        assert!(opencode.plan_args.contains(&"{prompt}".to_string()));
+        assert!(
+            opencode.plan_args.contains(&"--prompt".to_string()),
+            "opencode plan_args must use --prompt to seed the TUI: {:?}",
+            opencode.plan_args
+        );
+        assert!(
+            !opencode.plan_args.contains(&"run".to_string()),
+            "opencode plan_args must NOT invoke the `run` subcommand (one-shot): {:?}",
+            opencode.plan_args
         );
 
         let copilot = &config.harnesses["copilot"];
@@ -310,6 +433,48 @@ mod tests {
         assert_eq!(
             copilot.json_output_args,
             vec!["--output-format".to_string(), "json".to_string()]
+        );
+        // Copilot plan-harness mode uses `-i` (interactive REPL, seeded
+        // via positional) and keeps the --allow-all* flags to skip
+        // permission gating in the interactive session.
+        assert!(!copilot.plan_args.is_empty());
+        assert!(copilot.plan_args.contains(&"{prompt}".to_string()));
+        assert!(
+            copilot.plan_args.contains(&"-i".to_string()),
+            "copilot plan_args must use -i (interactive): {:?}",
+            copilot.plan_args
+        );
+        assert!(
+            !copilot.plan_args.contains(&"-p".to_string()),
+            "copilot plan_args must NOT use -p (one-shot): {:?}",
+            copilot.plan_args
+        );
+
+        let goose = &config.harnesses["goose"];
+        assert_eq!(goose.command, "goose");
+        assert_eq!(
+            goose.agent_file_env,
+            Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string())
+        );
+        // goose's `session` subcommand can't seed a prompt, so plan-harness
+        // mode uses `goose run -t {prompt} -s` — the `-s`/--interactive
+        // flag drops into the REPL after processing the initial input.
+        assert!(!goose.plan_args.is_empty());
+        assert!(goose.plan_args.contains(&"{prompt}".to_string()));
+        assert!(
+            goose.plan_args.contains(&"run".to_string()),
+            "goose plan_args must start from `goose run`: {:?}",
+            goose.plan_args
+        );
+        assert!(
+            goose.plan_args.contains(&"-t".to_string()),
+            "goose plan_args must pass -t <prompt>: {:?}",
+            goose.plan_args
+        );
+        assert!(
+            goose.plan_args.contains(&"-s".to_string()),
+            "goose plan_args must include -s (stay interactive after initial input): {:?}",
+            goose.plan_args
         );
     }
 

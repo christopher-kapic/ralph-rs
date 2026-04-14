@@ -417,6 +417,7 @@ mod tests {
         let harness = crate::config::HarnessConfig {
             command: "copilot".to_string(),
             args: vec!["-p".to_string(), "{prompt}".to_string()],
+            plan_args: vec![],
             supports_agent_file: false,
             supports_json_output: true,
             json_output_args: vec!["--output-format".to_string(), "json".to_string()],
@@ -444,6 +445,7 @@ mod tests {
         let harness = crate::config::HarnessConfig {
             command: "claude".to_string(),
             args: vec![],
+            plan_args: vec![],
             supports_agent_file: true,
             supports_json_output: true,
             json_output_args: vec![],
