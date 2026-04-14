@@ -76,8 +76,9 @@ impl PreflightResults {
 
 /// Run all preflight checks for a plan execution.
 ///
-/// This does NOT auto-commit git state; that is a separate step called
-/// via [`auto_stash_dirty_state`].
+/// Dirty git state is reported as a warning but not modified; the executor
+/// commits only files the agent touches on a per-step basis, leaving any
+/// pre-existing uncommitted changes untouched in the working tree.
 pub fn run_preflight_checks(
     plan: &Plan,
     config: &Config,
@@ -99,22 +100,10 @@ pub fn run_preflight_checks(
         checks.push(check_harness_auth(harness_name, harness_config));
     }
 
-    // 4. Git dirty state (informational only; auto-commit is separate)
+    // 4. Git dirty state (informational only)
     checks.push(check_git_state(workdir));
 
     Ok(PreflightResults { checks })
-}
-
-/// Auto-commit any dirty git state before a plan run.
-///
-/// If the working tree is clean, this is a no-op.
-pub fn auto_stash_dirty_state(workdir: &Path) -> Result<bool> {
-    if git::has_uncommitted_changes(workdir)? {
-        git::commit_changes(workdir, "ralph: [skip] auto-stash before run")?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +200,9 @@ fn check_git_state(workdir: &Path) -> CheckResult {
         Ok(true) => CheckResult {
             name: "git-state".to_string(),
             severity: CheckSeverity::Warning,
-            message: "uncommitted changes detected; will auto-commit before run".to_string(),
+            message:
+                "uncommitted changes detected; only files the agent modifies will be committed"
+                    .to_string(),
         },
         Ok(false) => CheckResult {
             name: "git-state".to_string(),

@@ -57,7 +57,9 @@ impl Lifecycle {
             "post-step" => Ok(Self::PostStep),
             "pre-test" => Ok(Self::PreTest),
             "post-test" => Ok(Self::PostTest),
-            other => bail!("Unknown lifecycle '{other}' (expected pre-step, post-step, pre-test, post-test)"),
+            other => bail!(
+                "Unknown lifecycle '{other}' (expected pre-step, post-step, pre-test, post-test)"
+            ),
         }
     }
 }
@@ -213,9 +215,7 @@ pub fn parse_hook(contents: &str, fallback_name: &str) -> Result<Hook> {
                 } else if value == "global" {
                     scope_kind = Some("global".to_string());
                 } else {
-                    bail!(
-                        "Unknown scope value '{value}' (expected 'global' or a paths block)"
-                    );
+                    bail!("Unknown scope value '{value}' (expected 'global' or a paths block)");
                 }
             }
             _ => {
@@ -387,8 +387,7 @@ pub fn delete(name: &str) -> Result<()> {
     if !path.exists() {
         bail!("Hook not found: {name}");
     }
-    fs::remove_file(&path)
-        .with_context(|| format!("Failed to delete hook {}", path.display()))?;
+    fs::remove_file(&path).with_context(|| format!("Failed to delete hook {}", path.display()))?;
     Ok(())
 }
 

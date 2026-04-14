@@ -495,9 +495,7 @@ pub async fn execute_step(
                     // Mark step as complete.
                     storage::update_step_status(conn, &step.id, StepStatus::Complete)?;
 
-                    hooks::run_post_step(
-                        conn, hook_ctx, plan, step, attempt, "complete", workdir,
-                    );
+                    hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir);
 
                     return Ok(StepResult {
                         outcome: StepOutcome::Success,

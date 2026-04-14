@@ -11,12 +11,14 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::db;
 
+type ReleaseFn = Box<dyn FnOnce(&str) -> Result<()> + Send>;
+
 /// RAII guard that releases a run-lock row when dropped. The release strategy
 /// is injected at construction time so tests can swap in a no-op closure that
 /// doesn't touch the on-disk database.
 pub struct RunLock {
     project: String,
-    release: Option<Box<dyn FnOnce(&str) -> Result<()> + Send>>,
+    release: Option<ReleaseFn>,
 }
 
 impl std::fmt::Debug for RunLock {
@@ -68,7 +70,7 @@ pub fn acquire(
     // Production release: reopen a fresh connection (the caller's `conn` is a
     // borrow, not an owned value we could stash in the guard) and pid-scope
     // the DELETE so a racing reclaim of a stale row can't be clobbered.
-    let release: Box<dyn FnOnce(&str) -> Result<()> + Send> = Box::new(|project: &str| {
+    let release: ReleaseFn = Box::new(|project: &str| {
         let conn = Connection::open(db::db_path()?)
             .with_context(|| "reopening database to release run lock")?;
         conn.execute("PRAGMA foreign_keys = ON;", [])?;
@@ -91,16 +93,13 @@ fn acquire_inner(
     plan_slug: Option<&str>,
     plan_id: Option<&str>,
     force: bool,
-    release: Box<dyn FnOnce(&str) -> Result<()> + Send>,
+    release: ReleaseFn,
 ) -> Result<RunLock> {
     let my_pid = std::process::id() as i64;
 
     if force {
-        conn.execute(
-            "DELETE FROM run_locks WHERE project = ?1",
-            params![project],
-        )
-        .context("clearing run_locks row for --force")?;
+        conn.execute("DELETE FROM run_locks WHERE project = ?1", params![project])
+            .context("clearing run_locks row for --force")?;
     } else {
         let existing: Option<(i64, Option<String>, String)> = conn
             .query_row(
@@ -122,11 +121,8 @@ fn acquire_inner(
                      manually remove the row: sqlite3 {db_path_display} \"DELETE FROM run_locks WHERE project = '{project}';\""
                 );
             }
-            conn.execute(
-                "DELETE FROM run_locks WHERE project = ?1",
-                params![project],
-            )
-            .context("clearing stale run_locks row")?;
+            conn.execute("DELETE FROM run_locks WHERE project = ?1", params![project])
+                .context("clearing stale run_locks row")?;
         }
     }
 
@@ -180,7 +176,7 @@ mod tests {
 
     /// No-op release closure for tests: avoids reopening the on-disk database
     /// when the guard drops.
-    fn noop_release() -> Box<dyn FnOnce(&str) -> Result<()> + Send> {
+    fn noop_release() -> ReleaseFn {
         Box::new(|_| Ok(()))
     }
 
@@ -304,7 +300,7 @@ mod tests {
         let conn = mem_db();
         let flag = Arc::new(AtomicBool::new(false));
         let flag_clone = Arc::clone(&flag);
-        let release: Box<dyn FnOnce(&str) -> Result<()> + Send> = Box::new(move |_project| {
+        let release: ReleaseFn = Box::new(move |_project| {
             flag_clone.store(true, Ordering::SeqCst);
             Ok(())
         });

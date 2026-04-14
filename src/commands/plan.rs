@@ -1,6 +1,6 @@
 // Plan CLI command implementations (CRUD, dependencies, plan-level hooks)
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
 use crate::hook_library::{self, Lifecycle};

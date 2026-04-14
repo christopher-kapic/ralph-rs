@@ -1,7 +1,7 @@
 // Storage abstraction: high-level CRUD operations wrapping db.rs
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::frac_index;
