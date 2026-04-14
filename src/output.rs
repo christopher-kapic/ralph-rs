@@ -254,13 +254,11 @@ pub fn log_status_icon(committed: bool, rolled_back: bool, color: bool) -> &'sta
 ///
 /// Accepts `y`, `Y`, `yes`, `YES`, `Yes` (and similar) as affirmative.
 /// Returns `false` for everything else (including empty input and EOF).
-#[allow(dead_code)] // Used by interactive commands wired later.
 pub fn confirm(prompt: &str) -> Result<bool> {
     confirm_with_reader(prompt, &mut io::stdin().lock(), &mut io::stderr())
 }
 
 /// Testable confirmation implementation that reads from an arbitrary reader.
-#[allow(dead_code)] // Called by `confirm` and tests.
 fn confirm_with_reader(
     prompt: &str,
     reader: &mut dyn BufRead,

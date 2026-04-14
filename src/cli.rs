@@ -369,36 +369,51 @@ pub enum StepCommand {
     },
 
     /// Add a new step to a plan.
+    ///
+    /// The single-step form takes a positional title plus per-field flags.
+    /// For bulk insertion use `--import-json <FILE|->` to read an array of
+    /// step objects (or a single object) from a file or stdin; the positional
+    /// title and per-field flags are mutually exclusive with `--import-json`.
     Add {
-        /// Step title.
-        title: String,
+        /// Step title. Required unless `--import-json` is used.
+        #[arg(required_unless_present = "import_json",
+              conflicts_with = "import_json")]
+        title: Option<String>,
 
         /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
         /// Step description.
-        #[arg(long, short)]
+        #[arg(long, short, conflicts_with = "import_json")]
         description: Option<String>,
 
         /// Position to insert at (1-based). Defaults to end.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "import_json")]
         after: Option<usize>,
 
         /// Agent/model override for this step.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "import_json")]
         agent: Option<String>,
 
         /// Harness override for this step.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "import_json")]
         harness: Option<String>,
 
         /// Acceptance criterion (repeatable).
-        #[arg(long = "criteria")]
+        #[arg(long = "criteria", conflicts_with = "import_json")]
         criteria: Vec<String>,
 
         /// Step-level max retries override.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "import_json")]
         max_retries: Option<i32>,
+
+        /// Bulk-insert steps from a JSON file or stdin (use `-` for stdin).
+        /// Accepts a JSON array of step objects, or a single object. Each
+        /// object requires `title`; `description`, `acceptance_criteria`,
+        /// `agent`, `harness`, and `max_retries` are optional. Steps are
+        /// appended in array order; the whole batch is atomic.
+        #[arg(long, value_name = "FILE|-")]
+        import_json: Option<String>,
     },
 
     /// Remove a step from a plan.
@@ -549,14 +564,12 @@ pub enum PlanHarnessCommand {
         harness: String,
 
         /// Plan slug. Defaults to the active plan.
-        #[arg(long)]
         plan: Option<String>,
     },
 
     /// Show the current harness for a plan.
     Show {
         /// Plan slug. Defaults to the active plan.
-        #[arg(long)]
         plan: Option<String>,
     },
 
@@ -566,7 +579,6 @@ pub enum PlanHarnessCommand {
         description: Option<String>,
 
         /// Plan slug. Defaults to the active plan.
-        #[arg(long)]
         plan: Option<String>,
 
         /// Override the harness to use for planning.
@@ -765,12 +777,52 @@ mod tests {
             ..
         }) = cli.command
         {
-            assert_eq!(title, "Implement parser");
+            assert_eq!(title.as_deref(), Some("Implement parser"));
             assert_eq!(plan.as_deref(), Some("my-feature"));
             assert_eq!(description.as_deref(), Some("Build the parser module"));
         } else {
             panic!("Expected Step Add");
         }
+    }
+
+    #[test]
+    fn test_parse_step_add_import_json() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "--import-json",
+            "-",
+        ])
+        .unwrap();
+        if let Command::Step(StepCommand::Add {
+            title, import_json, ..
+        }) = cli.command
+        {
+            assert!(title.is_none());
+            assert_eq!(import_json.as_deref(), Some("-"));
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_import_json_conflicts_with_title() {
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "some title",
+            "--import-json",
+            "-",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_step_add_requires_title_without_import() {
+        let result = Cli::try_parse_from(["ralph-rs", "step", "add"]);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1017,23 +1069,98 @@ mod tests {
         let cli =
             Cli::try_parse_from(["ralph-rs", "plan", "harness", "set", "codex"]).unwrap();
         if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Set {
-            harness, ..
+            harness,
+            plan,
         })) = cli.command
         {
             assert_eq!(harness, "codex");
+            assert!(plan.is_none());
         } else {
             panic!("Expected Plan Harness Set");
         }
     }
 
     #[test]
+    fn test_parse_plan_harness_set_with_positional_plan() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "harness",
+            "set",
+            "codex",
+            "my-plan",
+        ])
+        .unwrap();
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Set {
+            harness,
+            plan,
+        })) = cli.command
+        {
+            assert_eq!(harness, "codex");
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+        } else {
+            panic!("Expected Plan Harness Set");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_harness_set_rejects_plan_flag() {
+        // `--plan` used to be a flag but is now positional only. Clean break.
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "harness",
+            "set",
+            "codex",
+            "--plan",
+            "my-plan",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_parse_plan_harness_show() {
         let cli =
             Cli::try_parse_from(["ralph-rs", "plan", "harness", "show"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { .. }))
-        ));
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) =
+            cli.command
+        {
+            assert!(plan.is_none());
+        } else {
+            panic!("Expected Plan Harness Show");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_harness_show_with_positional_plan() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "harness",
+            "show",
+            "my-plan",
+        ])
+        .unwrap();
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) =
+            cli.command
+        {
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+        } else {
+            panic!("Expected Plan Harness Show");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_harness_show_rejects_plan_flag() {
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "harness",
+            "show",
+            "--plan",
+            "my-plan",
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1048,13 +1175,53 @@ mod tests {
         .unwrap();
         if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Generate {
             description,
+            plan,
             ..
         })) = cli.command
         {
             assert_eq!(description.as_deref(), Some("Add feature X"));
+            assert!(plan.is_none());
         } else {
             panic!("Expected Plan Harness Generate");
         }
+    }
+
+    #[test]
+    fn test_parse_plan_harness_generate_with_positional_plan() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "harness",
+            "generate",
+            "Add feature X",
+            "my-plan",
+        ])
+        .unwrap();
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Generate {
+            description,
+            plan,
+            ..
+        })) = cli.command
+        {
+            assert_eq!(description.as_deref(), Some("Add feature X"));
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+        } else {
+            panic!("Expected Plan Harness Generate");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_harness_generate_rejects_plan_flag() {
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "harness",
+            "generate",
+            "Add feature X",
+            "--plan",
+            "my-plan",
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]

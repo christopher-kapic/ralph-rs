@@ -135,13 +135,21 @@ fn main() -> Result<()> {
                 }
             },
             PlanCommand::Harness(harness_cmd) => match harness_cmd {
-                PlanHarnessCommand::Set { .. } => Ok(()),
-                PlanHarnessCommand::Show { .. } => Ok(()),
+                PlanHarnessCommand::Set { plan, .. } => {
+                    // Resolve (or default) the plan slug for future implementation.
+                    let _ = plan;
+                    Ok(())
+                }
+                PlanHarnessCommand::Show { plan } => {
+                    let _ = plan;
+                    Ok(())
+                }
                 PlanHarnessCommand::Generate {
                     description,
+                    plan,
                     use_harness,
-                    ..
                 } => {
+                    let _ = plan;
                     let harness_name = use_harness
                         .or(cli.harness)
                         .unwrap_or_else(|| _config.default_harness.clone());
@@ -172,22 +180,30 @@ fn main() -> Result<()> {
                 harness,
                 criteria,
                 max_retries,
+                import_json,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 let h = cli.harness.as_deref().or(harness.as_deref());
-                commands::step_add(
-                    &conn,
-                    &p.slug,
-                    &project,
-                    &title,
-                    description.as_deref(),
-                    after,
-                    agent.as_deref(),
-                    h,
-                    &criteria,
-                    max_retries,
-                    &out,
-                )
+                if let Some(source) = import_json {
+                    commands::step_add_bulk(&conn, &p.slug, &project, &source, &out)
+                } else {
+                    // clap enforces that `title` is Some when `--import-json`
+                    // is absent via `required_unless_present`.
+                    let title = title.as_deref().expect("clap guarantees title is present");
+                    commands::step_add(
+                        &conn,
+                        &p.slug,
+                        &project,
+                        title,
+                        description.as_deref(),
+                        after,
+                        agent.as_deref(),
+                        h,
+                        &criteria,
+                        max_retries,
+                        &out,
+                    )
+                }
             }
             StepCommand::Remove { step, step_id, plan, force } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;

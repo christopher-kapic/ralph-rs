@@ -44,12 +44,12 @@ pub fn cmd_hooks_list(project: &str, all: bool, out: &OutputContext) -> Result<(
 
     if filtered.is_empty() {
         if all {
-            println!(
+            eprintln!(
                 "No hooks found in {}",
                 hook_library::hooks_dir()?.display()
             );
         } else {
-            println!(
+            eprintln!(
                 "No hooks applicable to {project}. Use `ralph hooks list --all` to see all hooks."
             );
         }
@@ -125,13 +125,13 @@ pub fn cmd_hooks_add(
     };
 
     let path = hook_library::save(&hook, force)?;
-    println!("Created hook '{name}' at {}", path.display());
+    eprintln!("Created hook '{name}' at {}", path.display());
     Ok(())
 }
 
 pub fn cmd_hooks_remove(name: &str, _out: &OutputContext) -> Result<()> {
     hook_library::delete(name)?;
-    println!("Deleted hook '{name}'");
+    eprintln!("Deleted hook '{name}'");
     Ok(())
 }
 
@@ -178,7 +178,7 @@ pub fn cmd_hooks_import(file: &Path, force: bool, _out: &OutputContext) -> Resul
         .with_context(|| format!("Failed to parse bundle {}", file.display()))?;
 
     if bundle.hooks.is_empty() {
-        println!("Bundle contains no hooks.");
+        eprintln!("Bundle contains no hooks.");
         return Ok(());
     }
 
@@ -200,7 +200,7 @@ pub fn cmd_hooks_import(file: &Path, force: bool, _out: &OutputContext) -> Resul
         imported += 1;
     }
 
-    println!(
+    eprintln!(
         "Imported {imported} hook(s), skipped {skipped}.{}",
         if skipped > 0 && !force {
             " Use --force to overwrite existing hooks."

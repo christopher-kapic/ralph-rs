@@ -857,12 +857,12 @@ fn find_current_step(steps: &[Step]) -> Result<usize> {
 
 /// Produce a dry-run report without executing anything.
 fn dry_run_report(plan: &Plan, all_steps: &[Step], steps_to_run: &[Step]) -> Result<PlanRunResult> {
-    eprintln!("Dry run for plan '{}':", plan.slug);
-    eprintln!("  Branch: {}", plan.branch_name);
+    println!("Dry run for plan '{}':", plan.slug);
+    println!("  Branch: {}", plan.branch_name);
     if !plan.deterministic_tests.is_empty() {
-        eprintln!("  Tests:  {}", plan.deterministic_tests.join(", "));
+        println!("  Tests:  {}", plan.deterministic_tests.join(", "));
     }
-    eprintln!();
+    println!();
 
     for (i, step) in steps_to_run.iter().enumerate() {
         let step_num = step_number_in_plan(all_steps, step);
@@ -874,7 +874,7 @@ fn dry_run_report(plan: &Plan, all_steps: &[Step], steps_to_run: &[Step]) -> Res
             StepStatus::InProgress => "WOULD RESUME",
             StepStatus::Aborted => "WOULD RETRY",
         };
-        eprintln!(
+        println!(
             "  [{}/{}] Step {}: {} [{}]",
             i + 1,
             steps_to_run.len(),

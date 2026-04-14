@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
-use std::io::{self, Write};
 
 use crate::hook_library::{self, Lifecycle};
 use crate::output::{self, OutputContext, OutputFormat};
@@ -58,17 +57,17 @@ pub fn plan_create(
             .with_context(|| format!("Failed to add dependency on '{dep_slug}'"))?;
     }
 
-    println!(
+    eprintln!(
         "{} Created plan: {}",
         output::check_icon(out.color),
         output::bold(&plan.slug, out.color),
     );
     if !tests.is_empty() {
-        println!("  Tests: {}", tests.join(", "));
+        eprintln!("  Tests: {}", tests.join(", "));
     }
     if !resolved_deps.is_empty() {
         let slugs: Vec<&str> = resolved_deps.iter().map(|(s, _)| s.as_str()).collect();
-        println!("  Depends on: {}", slugs.join(", "));
+        eprintln!("  Depends on: {}", slugs.join(", "));
     }
     Ok(())
 }
@@ -96,7 +95,7 @@ pub fn plan_dependency_add(
         let dep = storage::get_plan_by_slug(conn, dep_slug, project)?
             .with_context(|| format!("Dependency plan not found: {dep_slug}"))?;
         storage::add_plan_dependency(conn, &plan.id, &dep.id)?;
-        println!(
+        eprintln!(
             "{} Added dependency: {} -> {}",
             output::check_icon(out.color),
             slug,
@@ -126,7 +125,7 @@ pub fn plan_dependency_remove(
         let dep = storage::get_plan_by_slug(conn, dep_slug, project)?
             .with_context(|| format!("Dependency plan not found: {dep_slug}"))?;
         storage::remove_plan_dependency(conn, &plan.id, &dep.id)?;
-        println!(
+        eprintln!(
             "{} Removed dependency: {} -> {}",
             output::check_icon(out.color),
             slug,
@@ -222,7 +221,7 @@ pub fn plan_list(
     }
 
     if plans.is_empty() {
-        println!("No plans found.");
+        eprintln!("No plans found.");
         return Ok(());
     }
 
@@ -312,7 +311,7 @@ pub fn plan_approve(conn: &Connection, slug: &str, project: &str, out: &OutputCo
     }
 
     storage::update_plan_status(conn, &plan.id, PlanStatus::Ready)?;
-    println!(
+    eprintln!(
         "{} Plan '{}' approved and ready for execution",
         output::check_icon(out.color),
         slug
@@ -334,7 +333,7 @@ pub fn plan_archive(conn: &Connection, slug: &str, project: &str, out: &OutputCo
     }
 
     storage::update_plan_status(conn, &plan.id, PlanStatus::Archived)?;
-    println!(
+    eprintln!(
         "{} Archived plan '{}'",
         output::plan_status_icon(PlanStatus::Archived, out.color),
         slug
@@ -356,7 +355,7 @@ pub fn plan_unarchive(conn: &Connection, slug: &str, project: &str, out: &Output
 
     // Restore to complete — the most neutral terminal state.
     storage::update_plan_status(conn, &plan.id, PlanStatus::Complete)?;
-    println!(
+    eprintln!(
         "{} Unarchived plan '{}' (status: complete)",
         output::check_icon(out.color),
         slug
@@ -369,19 +368,15 @@ pub fn plan_delete(conn: &Connection, slug: &str, project: &str, force: bool, ou
         .with_context(|| format!("Plan not found: {slug}"))?;
 
     if !force {
-        print!("Delete plan '{}' and all its steps/logs? [y/N] ", slug);
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("Aborted.");
+        let prompt = format!("Delete plan '{}' and all its steps/logs?", slug);
+        if !output::confirm(&prompt)? {
+            eprintln!("Aborted.");
             return Ok(());
         }
     }
 
     storage::delete_plan(conn, &plan.id)?;
-    println!(
+    eprintln!(
         "{} Deleted plan '{}'",
         output::check_icon(out.color),
         slug
@@ -410,7 +405,7 @@ pub fn cmd_plan_set_hook(
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
     storage::attach_hook_to_plan(conn, &plan.id, lifecycle.as_str(), hook_name)?;
-    println!("Attached plan-wide hook '{hook_name}' to '{plan_slug}' at {lifecycle}");
+    eprintln!("Attached plan-wide hook '{hook_name}' to '{plan_slug}' at {lifecycle}");
     Ok(())
 }
 
@@ -428,7 +423,7 @@ pub fn cmd_plan_unset_hook(
     if removed == 0 {
         bail!("No plan-wide hook '{hook_name}' attached to '{plan_slug}' at {lifecycle}");
     }
-    println!("Detached plan-wide hook '{hook_name}' from '{plan_slug}'");
+    eprintln!("Detached plan-wide hook '{hook_name}' from '{plan_slug}'");
     Ok(())
 }
 
@@ -438,7 +433,7 @@ pub fn cmd_plan_hooks(conn: &Connection, plan_slug: &str, project: &str, _out: &
     let rows = storage::list_all_hooks_for_plan(conn, &plan.id)?;
 
     if rows.is_empty() {
-        println!("No hooks attached to plan '{plan_slug}'.");
+        eprintln!("No hooks attached to plan '{plan_slug}'.");
         return Ok(());
     }
 
@@ -447,7 +442,7 @@ pub fn cmd_plan_hooks(conn: &Connection, plan_slug: &str, project: &str, _out: &
         steps.iter().position(|s| s.id == sid).map(|i| i + 1)
     };
 
-    println!("Hooks attached to plan '{plan_slug}':");
+    eprintln!("Hooks attached to plan '{plan_slug}':");
     for row in &rows {
         let target = match &row.step_id {
             None => "plan-wide".to_string(),

@@ -30,12 +30,16 @@ Use these ralph CLI commands to manage plans and steps:
 - `ralph plan delete <slug> --force`
 
 ### Step Management
-- `ralph step add "<title>" --plan <slug> [--description "<desc>"] [--after <n>]`
-- `ralph step list --plan <slug>`
-- `ralph step edit <n> --plan <slug> [--title "<title>"] [--description "<desc>"]`
-- `ralph step remove <n> --plan <slug> --force`
-- `ralph step move <n> --to <m> --plan <slug>`
-- `ralph step reset <n> --plan <slug>`
+
+Plan slug is a trailing positional argument on every step command and defaults
+to the active plan when omitted.
+
+- `ralph step add "<title>" <slug> [--description "<desc>"] [--after <n>]`
+- `ralph step list <slug>`
+- `ralph step edit <n> <slug> [--title "<title>"] [--description "<desc>"]`
+- `ralph step remove <n> <slug> --force`
+- `ralph step move <n> --to <m> <slug>`
+- `ralph step reset <n> <slug>`
 
 ### Hook Attachment
 
@@ -47,7 +51,7 @@ to create it with `ralph hooks add`.
 
 - `ralph plan set-hook <slug> --lifecycle <l> --hook <name>` — attach a plan-wide hook
   (fires for every step in the plan). Use this for things like "review every completed step".
-- `ralph step set-hook <n> --plan <slug> --lifecycle <l> --hook <name>` — attach a hook to
+- `ralph step set-hook <n> <slug> --lifecycle <l> --hook <name>` — attach a hook to
   a specific step. Use this when only certain steps need review, linting, or extra checks.
 - `ralph plan hooks <slug>` — show all hooks attached to a plan.
 

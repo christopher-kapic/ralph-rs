@@ -109,13 +109,13 @@ pub fn cmd_init(out: &OutputContext) -> Result<()> {
     let config_dir = config::config_dir()?;
     fs::create_dir_all(&config_dir)
         .with_context(|| format!("Failed to create config directory {}", config_dir.display()))?;
-    println!("{icon} Config directory: {}", config_dir.display());
+    eprintln!("{icon} Config directory: {}", config_dir.display());
 
     // Create agents dir
     let agents_dir = config::agents_dir()?;
     fs::create_dir_all(&agents_dir)
         .with_context(|| format!("Failed to create agents directory {}", agents_dir.display()))?;
-    println!("{icon} Agents directory: {}", agents_dir.display());
+    eprintln!("{icon} Agents directory: {}", agents_dir.display());
 
     // Create default config file if it doesn't exist
     let config_path = config_dir.join("config.json");
@@ -124,18 +124,18 @@ pub fn cmd_init(out: &OutputContext) -> Result<()> {
         let json = serde_json::to_string_pretty(&default_config)?;
         fs::write(&config_path, &json)
             .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
-        println!("{icon} Default config: {}", config_path.display());
+        eprintln!("{icon} Default config: {}", config_path.display());
     } else {
-        println!("{icon} Config exists: {}", config_path.display());
+        eprintln!("{icon} Config exists: {}", config_path.display());
     }
 
     // Initialize database
     let _conn = db::open()?;
     let db_path = db::db_path()?;
-    println!("{icon} Database: {}", db_path.display());
+    eprintln!("{icon} Database: {}", db_path.display());
 
-    println!();
-    println!("ralph initialized successfully.");
+    eprintln!();
+    eprintln!("ralph initialized successfully.");
     Ok(())
 }
 
