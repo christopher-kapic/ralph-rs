@@ -39,6 +39,8 @@ pub struct ExportedPlanMeta {
     /// Slugs of plans this plan directly depends on (empty by default).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_harness: Option<String>,
 }
 
 /// Step stripped of internal fields.
@@ -76,6 +78,7 @@ pub fn build_exported_plan(
         agent: plan.agent.clone(),
         deterministic_tests: plan.deterministic_tests.clone(),
         depends_on: depends_on_slugs,
+        plan_harness: plan.plan_harness.clone(),
     };
 
     let exported_steps: Vec<ExportedStep> = steps

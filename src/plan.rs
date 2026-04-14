@@ -140,6 +140,7 @@ pub struct Plan {
     pub harness: Option<String>,
     pub agent: Option<String>,
     pub deterministic_tests: Vec<String>,
+    pub plan_harness: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -149,7 +150,7 @@ impl Plan {
     ///
     /// Expected column order:
     /// id, slug, project, branch_name, description, status,
-    /// harness, agent, deterministic_tests, created_at, updated_at
+    /// harness, agent, deterministic_tests, plan_harness, created_at, updated_at
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -161,14 +162,14 @@ impl Plan {
             rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
-        let created_str: String = row.get(9)?;
+        let created_str: String = row.get(10)?;
         let created_at = parse_datetime(&created_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
-        let updated_str: String = row.get(10)?;
+        let updated_str: String = row.get(11)?;
         let updated_at = parse_datetime(&updated_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
         Ok(Plan {
@@ -181,6 +182,7 @@ impl Plan {
             harness: row.get(6)?,
             agent: row.get(7)?,
             deterministic_tests,
+            plan_harness: row.get(9)?,
             created_at,
             updated_at,
         })
@@ -394,8 +396,8 @@ mod tests {
         let conn = db::open_memory().expect("open_memory");
 
         conn.execute(
-            "INSERT INTO plans (id, slug, project, branch_name, description, harness, agent, deterministic_tests)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO plans (id, slug, project, branch_name, description, harness, agent, deterministic_tests, plan_harness)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 "p1",
                 "my-plan",
@@ -405,13 +407,14 @@ mod tests {
                 "claude-code",
                 "opus",
                 r#"["cargo test","cargo clippy"]"#,
+                "goose",
             ],
         )
         .expect("insert plan");
 
         let plan = conn
             .query_row(
-                "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at FROM plans WHERE id = ?1",
+                "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at FROM plans WHERE id = ?1",
                 ["p1"],
                 Plan::from_row,
             )
@@ -426,6 +429,7 @@ mod tests {
         assert_eq!(plan.harness.as_deref(), Some("claude-code"));
         assert_eq!(plan.agent.as_deref(), Some("opus"));
         assert_eq!(plan.deterministic_tests, vec!["cargo test", "cargo clippy"]);
+        assert_eq!(plan.plan_harness.as_deref(), Some("goose"));
     }
 
     #[test]

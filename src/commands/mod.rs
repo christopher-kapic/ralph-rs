@@ -649,6 +649,11 @@ mod tests {
             None,
             Some("New title"),
             Some("New desc"),
+            None,
+            None,
+            &[],
+            None,
+            false,
             &test_out(),
         )
         .unwrap();

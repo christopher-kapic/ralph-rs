@@ -146,14 +146,16 @@ fn main() -> Result<()> {
                 }
             },
             PlanCommand::Harness(harness_cmd) => match harness_cmd {
-                PlanHarnessCommand::Set { plan, .. } => {
-                    // Resolve (or default) the plan slug for future implementation.
-                    let _ = plan;
-                    Ok(())
+                PlanHarnessCommand::Set {
+                    harness,
+                    plan,
+                } => {
+                    let p = resolve_plan(&conn, plan, &project, false)?;
+                    commands::plan_harness_set(&conn, &p.slug, &project, &harness, &out)
                 }
                 PlanHarnessCommand::Show { plan } => {
-                    let _ = plan;
-                    Ok(())
+                    let p = resolve_plan(&conn, plan, &project, true)?;
+                    commands::plan_harness_show(&conn, &p, &_config, &out)
                 }
                 PlanHarnessCommand::Generate {
                     description,
@@ -226,6 +228,11 @@ fn main() -> Result<()> {
                 plan,
                 title,
                 description,
+                agent,
+                harness,
+                criteria,
+                max_retries,
+                clear_max_retries,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::step_edit(
@@ -236,6 +243,11 @@ fn main() -> Result<()> {
                     step_id.as_deref(),
                     title.as_deref(),
                     description.as_deref(),
+                    agent.as_deref(),
+                    harness.as_deref(),
+                    &criteria,
+                    max_retries,
+                    clear_max_retries,
                     &out,
                 )
             }

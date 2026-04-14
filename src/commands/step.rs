@@ -1,6 +1,6 @@
 // Step CLI command implementations (CRUD, move, hooks)
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 use std::io::Read;
 
@@ -16,7 +16,12 @@ use super::resolve_step;
 // Step commands
 // ---------------------------------------------------------------------------
 
-pub fn step_list(conn: &Connection, plan_slug: &str, project: &str, out: &OutputContext) -> Result<()> {
+pub fn step_list(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    out: &OutputContext,
+) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
@@ -294,6 +299,11 @@ pub fn step_edit(
     step_id: Option<&str>,
     title: Option<&str>,
     description: Option<&str>,
+    agent: Option<&str>,
+    harness: Option<&str>,
+    criteria: &[String],
+    max_retries: Option<i32>,
+    clear_max_retries: bool,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
@@ -301,11 +311,48 @@ pub fn step_edit(
 
     let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
 
-    if title.is_none() && description.is_none() {
-        bail!("Nothing to edit: provide --title and/or --description");
+    if title.is_none()
+        && description.is_none()
+        && agent.is_none()
+        && harness.is_none()
+        && criteria.is_empty()
+        && max_retries.is_none()
+        && !clear_max_retries
+    {
+        bail!("Nothing to edit: provide at least one of --title, --description, --agent, --harness, --criteria, --max-retries, or --clear-max-retries");
     }
 
-    storage::update_step_fields(conn, &step.id, title, description)?;
+    // We only pass non-None fields to the update function for fields the
+    // user explicitly changed. The "None means don't change" rule applies
+    // for agent/harness when the user passed the flag; empty string means
+    // "clear".
+    let agent_update = agent.map(|a| if a.is_empty() { None } else { Some(a) });
+
+    let harness_update = harness.map(|h| if h.is_empty() { None } else { Some(h) });
+
+    // For max_retries: Some(N) means set to N, clear_max_retries means
+    // set to NULL (use plan default), None means don't change.
+    let retries_update: Option<Option<i32>> = if clear_max_retries {
+        Some(None) // Set to NULL
+    } else {
+        max_retries.map(Some) // Set to specific value
+    };
+
+    storage::update_step_fields_ext(
+        conn,
+        &step.id,
+        title,
+        description,
+        agent_update,
+        harness_update,
+        if criteria.is_empty() {
+            None
+        } else {
+            Some(criteria)
+        },
+        retries_update,
+    )?;
+
     eprintln!(
         "{} Updated step #{}: {}",
         output::check_icon(out.color),
@@ -465,9 +512,7 @@ pub fn cmd_step_set_hook(
     let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
 
     storage::attach_hook_to_step(conn, &plan.id, &step.id, lifecycle.as_str(), hook_name)?;
-    eprintln!(
-        "Attached hook '{hook_name}' to step {display_num} of '{plan_slug}' at {lifecycle}"
-    );
+    eprintln!("Attached hook '{hook_name}' to step {display_num} of '{plan_slug}' at {lifecycle}");
     Ok(())
 }
 
@@ -487,7 +532,13 @@ pub fn cmd_step_unset_hook(
 
     let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
 
-    let removed = storage::detach_hook(conn, &plan.id, Some(&step.id), lifecycle.as_str(), hook_name)?;
+    let removed = storage::detach_hook(
+        conn,
+        &plan.id,
+        Some(&step.id),
+        lifecycle.as_str(),
+        hook_name,
+    )?;
     if removed == 0 {
         bail!("No hook '{hook_name}' attached to step {display_num} at {lifecycle}");
     }
@@ -518,7 +569,16 @@ mod tests {
         let conn = db::open_memory().expect("open_memory");
         let project = "/tmp/bulk-test".to_string();
         plan_create(
-            &conn, "bulk-plan", &project, None, None, None, None, &[], &[], &test_out(),
+            &conn,
+            "bulk-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &test_out(),
         )
         .unwrap();
         (conn, project)

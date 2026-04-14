@@ -1,7 +1,7 @@
 // Storage abstraction: high-level CRUD operations wrapping db.rs
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use uuid::Uuid;
 
 use crate::frac_index;
@@ -39,7 +39,7 @@ pub fn create_plan(
 /// Find a plan by its (slug, project) combination.
 pub fn get_plan_by_slug(conn: &Connection, slug: &str, project: &str) -> Result<Option<Plan>> {
     let mut stmt = conn.prepare(
-        "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at
+        "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at
          FROM plans WHERE slug = ?1 AND project = ?2",
     )?;
 
@@ -53,8 +53,7 @@ pub fn get_plan_by_slug(conn: &Connection, slug: &str, project: &str) -> Result<
 /// Fetch a plan by its primary key.
 fn get_plan_by_id(conn: &Connection, id: &str) -> Result<Plan> {
     conn.query_row(
-        "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at
-         FROM plans WHERE id = ?1",
+        "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at FROM plans WHERE id = ?1",
         params![id],
         Plan::from_row,
     )
@@ -94,7 +93,7 @@ pub fn list_plans(conn: &Connection, project: &str, all: bool) -> Result<Vec<Pla
 
     if all {
         let mut stmt = conn.prepare(
-            "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at
+            "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at
              FROM plans ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], Plan::from_row)?;
@@ -103,7 +102,7 @@ pub fn list_plans(conn: &Connection, project: &str, all: bool) -> Result<Vec<Pla
         }
     } else {
         let mut stmt = conn.prepare(
-            "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at
+            "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at
              FROM plans WHERE project = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![project], Plan::from_row)?;
@@ -131,6 +130,18 @@ pub fn update_plan_status(conn: &Connection, plan_id: &str, status: PlanStatus) 
 /// Delete a plan (cascades to steps and execution_logs via FK).
 pub fn delete_plan(conn: &Connection, plan_id: &str) -> Result<()> {
     let affected = conn.execute("DELETE FROM plans WHERE id = ?1", params![plan_id])?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// Set the plan-generation harness for a plan.
+pub fn set_plan_harness_gen(conn: &Connection, plan_id: &str, harness: Option<&str>) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET plan_harness = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![harness, plan_id],
+    )?;
     if affected == 0 {
         anyhow::bail!("Plan not found: {plan_id}");
     }
@@ -306,6 +317,58 @@ pub fn update_step_fields(
         conn.execute(
             "UPDATE steps SET description = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
             params![d, step_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Extended step update: title, description, agent, harness, criteria, max_retries.
+///
+/// - `agent_update`: `Some(Some("name"))` sets the agent, `Some(None)` clears it
+///   (sets to NULL), `None` means don't change.
+/// - `harness_update`: same pattern as agent.
+/// - `criteria_update`: `Some(slice)` replaces the entire criteria list,
+///   `None` means don't change.
+/// - `retries_update`: `Some(Some(N))` sets max_retries to N,
+///   `Some(None)` clears it (sets to NULL / plan default),
+///   `None` means don't change.
+#[allow(clippy::too_many_arguments)]
+pub fn update_step_fields_ext(
+    conn: &Connection,
+    step_id: &str,
+    title: Option<&str>,
+    description: Option<&str>,
+    agent_update: Option<Option<&str>>,
+    harness_update: Option<Option<&str>>,
+    criteria_update: Option<&[String]>,
+    retries_update: Option<Option<i32>>,
+) -> Result<()> {
+    // Delegate to the simple updater for title/description.
+    update_step_fields(conn, step_id, title, description)?;
+
+    if let Some(agent) = agent_update {
+        conn.execute(
+            "UPDATE steps SET agent = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![agent, step_id],
+        )?;
+    }
+    if let Some(harness) = harness_update {
+        conn.execute(
+            "UPDATE steps SET harness = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![harness, step_id],
+        )?;
+    }
+    if let Some(criteria) = criteria_update {
+        let criteria_json = serde_json::to_string(criteria)?;
+        conn.execute(
+            "UPDATE steps SET acceptance_criteria = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![criteria_json, step_id],
+        )?;
+    }
+    if let Some(retries) = retries_update {
+        conn.execute(
+            "UPDATE steps SET max_retries = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![retries, step_id],
         )?;
     }
     Ok(())
@@ -936,7 +999,8 @@ mod tests {
     fn test_delete_plan_cascades() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) = create_step(&conn, &plan.id, "step", "desc", None, None, &[], None).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "step", "desc", None, None, &[], None).unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         delete_plan(&conn, &plan.id).unwrap();
@@ -1034,7 +1098,8 @@ mod tests {
     fn test_update_step_status() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) = create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
 
         update_step_status(&conn, &step.id, StepStatus::Complete).unwrap();
 
@@ -1046,7 +1111,8 @@ mod tests {
     fn test_delete_step() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) = create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         delete_step(&conn, &step.id).unwrap();
@@ -1087,7 +1153,8 @@ mod tests {
     fn test_create_and_get_execution_log() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) = create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
 
         let log =
             create_execution_log(&conn, &step.id, 1, Some("do the thing"), Some("sess-1")).unwrap();
@@ -1105,7 +1172,8 @@ mod tests {
     fn test_get_latest_log_for_step() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) = create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
 
         create_execution_log(&conn, &step.id, 1, Some("first"), None).unwrap();
         create_execution_log(&conn, &step.id, 2, Some("second"), None).unwrap();
@@ -1119,7 +1187,8 @@ mod tests {
     fn test_update_execution_log() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) = create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         let test_results = vec!["test1: pass".to_string(), "test2: fail".to_string()];
@@ -1179,7 +1248,8 @@ mod tests {
             "No clippy warnings".to_string(),
             "Code coverage > 80%".to_string(),
         ];
-        let (step, _) = create_step(&conn, &plan.id, "Step", "d", None, None, &criteria, None).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "d", None, None, &criteria, None).unwrap();
 
         let fetched = get_step(&conn, &step.id).unwrap();
         assert_eq!(fetched.acceptance_criteria, criteria);

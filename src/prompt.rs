@@ -264,6 +264,7 @@ mod tests {
                 "cargo test".to_string(),
                 "cargo clippy -- -D warnings".to_string(),
             ],
+            plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

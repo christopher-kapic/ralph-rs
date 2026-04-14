@@ -396,8 +396,10 @@ pub enum StepCommand {
     /// title and per-field flags are mutually exclusive with `--import-json`.
     Add {
         /// Step title. Required unless `--import-json` is used.
-        #[arg(required_unless_present = "import_json",
-              conflicts_with = "import_json")]
+        #[arg(
+            required_unless_present = "import_json",
+            conflicts_with = "import_json"
+        )]
         title: Option<String>,
 
         /// Plan slug. Defaults to the active plan.
@@ -458,7 +460,7 @@ pub enum StepCommand {
         force: bool,
     },
 
-    /// Edit a step's title or description.
+    /// Edit a step's title, description, agent, harness, criteria, or max-retries.
     ///
     /// Identify the step by positional number (1-based) **or** by UUID via
     /// `--step-id`. The two are mutually exclusive.
@@ -481,6 +483,26 @@ pub enum StepCommand {
         /// New description.
         #[arg(long)]
         description: Option<String>,
+
+        /// New agent override. Pass empty string to clear.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// New harness override. Pass empty string to clear.
+        #[arg(long)]
+        harness: Option<String>,
+
+        /// Replace acceptance criteria (repeatable). Clears existing criteria.
+        #[arg(long = "criteria")]
+        criteria: Vec<String>,
+
+        /// New max retries override. Pass 0 to clear (sets to plan/global default).
+        #[arg(long)]
+        max_retries: Option<i32>,
+
+        /// Explicitly clear the max-retries override (sets to NULL/plan default).
+        #[arg(long)]
+        clear_max_retries: bool,
     },
 
     /// Reset a step's status back to pending.
@@ -807,14 +829,7 @@ mod tests {
 
     #[test]
     fn test_parse_step_add_import_json() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "step",
-            "add",
-            "--import-json",
-            "-",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "add", "--import-json", "-"]).unwrap();
         if let Command::Step(StepCommand::Add {
             title, import_json, ..
         }) = cli.command
@@ -847,8 +862,7 @@ mod tests {
 
     #[test]
     fn test_parse_run() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--all"]).unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--all"]).unwrap();
         if let Command::Run { plan, all, .. } = cli.command {
             assert_eq!(plan.as_deref(), Some("my-feature"));
             assert!(all);
@@ -859,12 +873,8 @@ mod tests {
 
     #[test]
     fn test_parse_run_one() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--one"]).unwrap();
-        if let Command::Run {
-            plan, one, all, ..
-        } = cli.command
-        {
+        let cli = Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--one"]).unwrap();
+        if let Command::Run { plan, one, all, .. } = cli.command {
             assert_eq!(plan.as_deref(), Some("my-feature"));
             assert!(one);
             assert!(!all);
@@ -875,8 +885,7 @@ mod tests {
 
     #[test]
     fn test_parse_run_single_alias() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--single"]).unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--single"]).unwrap();
         if let Command::Run { one, .. } = cli.command {
             assert!(one);
         } else {
@@ -897,13 +906,8 @@ mod tests {
 
     #[test]
     fn test_parse_run_current_branch() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "run",
-            "my-feature",
-            "--current-branch",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--current-branch"]).unwrap();
         if let Command::Run {
             plan,
             current_branch,
@@ -1086,12 +1090,9 @@ mod tests {
 
     #[test]
     fn test_parse_plan_harness_set() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "plan", "harness", "set", "codex"]).unwrap();
-        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Set {
-            harness,
-            plan,
-        })) = cli.command
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "harness", "set", "codex"]).unwrap();
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Set { harness, plan })) =
+            cli.command
         {
             assert_eq!(harness, "codex");
             assert!(plan.is_none());
@@ -1102,19 +1103,10 @@ mod tests {
 
     #[test]
     fn test_parse_plan_harness_set_with_positional_plan() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "plan",
-            "harness",
-            "set",
-            "codex",
-            "my-plan",
-        ])
-        .unwrap();
-        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Set {
-            harness,
-            plan,
-        })) = cli.command
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "harness", "set", "codex", "my-plan"])
+            .unwrap();
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Set { harness, plan })) =
+            cli.command
         {
             assert_eq!(harness, "codex");
             assert_eq!(plan.as_deref(), Some("my-plan"));
@@ -1127,23 +1119,15 @@ mod tests {
     fn test_parse_plan_harness_set_rejects_plan_flag() {
         // `--plan` used to be a flag but is now positional only. Clean break.
         let result = Cli::try_parse_from([
-            "ralph-rs",
-            "plan",
-            "harness",
-            "set",
-            "codex",
-            "--plan",
-            "my-plan",
+            "ralph-rs", "plan", "harness", "set", "codex", "--plan", "my-plan",
         ]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_plan_harness_show() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "plan", "harness", "show"]).unwrap();
-        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) =
-            cli.command
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "harness", "show"]).unwrap();
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) = cli.command
         {
             assert!(plan.is_none());
         } else {
@@ -1153,16 +1137,8 @@ mod tests {
 
     #[test]
     fn test_parse_plan_harness_show_with_positional_plan() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "plan",
-            "harness",
-            "show",
-            "my-plan",
-        ])
-        .unwrap();
-        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) =
-            cli.command
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "harness", "show", "my-plan"]).unwrap();
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) = cli.command
         {
             assert_eq!(plan.as_deref(), Some("my-plan"));
         } else {
@@ -1172,27 +1148,15 @@ mod tests {
 
     #[test]
     fn test_parse_plan_harness_show_rejects_plan_flag() {
-        let result = Cli::try_parse_from([
-            "ralph-rs",
-            "plan",
-            "harness",
-            "show",
-            "--plan",
-            "my-plan",
-        ]);
+        let result =
+            Cli::try_parse_from(["ralph-rs", "plan", "harness", "show", "--plan", "my-plan"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_plan_harness_generate() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "plan",
-            "harness",
-            "generate",
-            "Add feature X",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "harness", "generate", "Add feature X"])
+            .unwrap();
         if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Generate {
             description,
             plan,
@@ -1303,8 +1267,7 @@ mod tests {
 
     #[test]
     fn test_plan_delete_yes_alias() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "plan", "delete", "old-plan", "--yes"]).unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "delete", "old-plan", "--yes"]).unwrap();
         if let Command::Plan(PlanCommand::Delete { slug, force }) = cli.command {
             assert_eq!(slug, "old-plan");
             assert!(force);
@@ -1326,8 +1289,8 @@ mod tests {
 
     #[test]
     fn test_plan_list_status_value_enum() {
-        let cli = Cli::try_parse_from(["ralph-rs", "plan", "list", "--status", "in_progress"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "plan", "list", "--status", "in_progress"]).unwrap();
         if let Command::Plan(PlanCommand::List { status, .. }) = cli.command {
             assert_eq!(status, Some(crate::plan::PlanStatus::InProgress));
         } else {

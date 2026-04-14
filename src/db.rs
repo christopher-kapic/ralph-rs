@@ -10,12 +10,12 @@ use crate::config;
 /// Current schema version. Bump this and add a new migration function
 /// to `MIGRATIONS` whenever the schema changes.
 #[allow(dead_code)]
-const CURRENT_VERSION: u32 = 4;
+const CURRENT_VERSION: u32 = 5;
 
 /// Each migration is a function that receives a connection (already inside a transaction).
 /// Migrations are 1-indexed: MIGRATIONS[0] migrates from version 0 → 1.
 const MIGRATIONS: &[fn(&Connection) -> Result<()>] =
-    &[migrate_v1, migrate_v2, migrate_v3, migrate_v4];
+    &[migrate_v1, migrate_v2, migrate_v3, migrate_v4, migrate_v5];
 
 /// Returns the path to the SQLite database file.
 pub fn db_path() -> Result<PathBuf> {
@@ -224,6 +224,19 @@ fn migrate_v4(conn: &Connection) -> Result<()> {
             plan_slug TEXT,
             started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         );
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V5: plan_harness column on plans
+// ---------------------------------------------------------------------------
+
+fn migrate_v5(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN plan_harness TEXT;
         ",
     )?;
     Ok(())
@@ -506,5 +519,43 @@ mod tests {
                 .expect("query");
             assert_eq!(slug, "slug");
         }
+    }
+
+    #[test]
+    fn test_plan_harness_column_exists() {
+        let conn = open_memory().expect("open_memory");
+
+        // The plan_harness column should exist after migration V5.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, plan_harness)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p1", "slug", "/proj", "branch", "desc", "goose"],
+        )
+        .expect("insert plan with plan_harness");
+
+        let ph: Option<String> = conn
+            .query_row(
+                "SELECT plan_harness FROM plans WHERE id = ?1",
+                ["p1"],
+                |row| row.get(0),
+            )
+            .expect("query plan_harness");
+        assert_eq!(ph.as_deref(), Some("goose"));
+
+        // NULL plan_harness should also work
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p2", "slug2", "/proj", "branch", "desc"],
+        )
+        .expect("insert plan without plan_harness");
+
+        let ph2: Option<String> = conn
+            .query_row(
+                "SELECT plan_harness FROM plans WHERE id = ?1",
+                ["p2"],
+                |row| row.get(0),
+            )
+            .expect("query plan_harness null");
+        assert_eq!(ph2, None);
     }
 }

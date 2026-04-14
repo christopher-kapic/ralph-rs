@@ -272,7 +272,11 @@ pub async fn execute_step(
         .max_retries
         .unwrap_or(config.max_retries_per_step as i32);
     let max_attempts = max_retries + 1; // first attempt + retries
-    let timeout = Duration::from_secs(config.timeout_secs);
+    let timeout = if config.timeout_secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(config.timeout_secs))
+    };
 
     // Resolve harness once (doesn't change between retries).
     let (harness_name, harness_config) = harness::resolve_harness(step, plan, config)?;
@@ -599,14 +603,17 @@ enum WaitResult {
     Aborted,
 }
 
-/// Wait for a child process, racing against a timeout and an abort signal.
+/// Wait for a child process, racing against an optional timeout and an abort signal.
 ///
-/// - On **timeout**: the process is killed immediately.
+/// - When timeout is `None`: the process runs indefinitely (only the abort
+///   signal can stop it early).
+/// - When timeout is `Some(d)`: the process is killed after `d` if it
+///   hasn't completed.
 /// - On **abort**: SIGTERM is sent, followed by a 5-second grace period,
 ///   then SIGKILL if still running.
 async fn wait_with_timeout_and_abort(
     mut child: tokio::process::Child,
-    timeout: Duration,
+    timeout: Option<Duration>,
     mut abort_rx: watch::Receiver<bool>,
 ) -> WaitResult {
     // Take stdout/stderr handles before entering select! so we can still
@@ -614,31 +621,57 @@ async fn wait_with_timeout_and_abort(
     let stdout_handle = child.stdout.take();
     let stderr_handle = child.stderr.take();
 
-    tokio::select! {
-        status = child.wait() => {
-            match status {
-                Ok(exit_status) => {
-                    let stdout = read_stdout(stdout_handle).await;
-                    let stderr = read_stderr(stderr_handle).await;
-                    WaitResult::Completed(Ok(HarnessOutput {
-                        stdout,
-                        stderr,
-                        exit_code: exit_status.code(),
-                        success: exit_status.success(),
-                    }))
+    match timeout {
+        Some(dur) => {
+            tokio::select! {
+                status = child.wait() => {
+                    match status {
+                        Ok(exit_status) => {
+                            let stdout = read_stdout(stdout_handle).await;
+                            let stderr = read_stderr(stderr_handle).await;
+                            WaitResult::Completed(Ok(HarnessOutput {
+                                stdout,
+                                stderr,
+                                exit_code: exit_status.code(),
+                                success: exit_status.success(),
+                            }))
+                        }
+                        Err(e) => WaitResult::Completed(Err(e.into())),
+                    }
                 }
-                Err(e) => WaitResult::Completed(Err(e.into())),
+                _ = tokio::time::sleep(dur) => {
+                    let _ = child.kill().await;
+                    WaitResult::Timeout
+                }
+                _ = wait_for_abort(&mut abort_rx) => {
+                    graceful_shutdown(&mut child).await;
+                    WaitResult::Aborted
+                }
             }
         }
-        _ = tokio::time::sleep(timeout) => {
-            // Timeout – kill immediately.
-            let _ = child.kill().await;
-            WaitResult::Timeout
-        }
-        _ = wait_for_abort(&mut abort_rx) => {
-            // Abort – graceful shutdown: SIGTERM -> 5s -> SIGKILL.
-            graceful_shutdown(&mut child).await;
-            WaitResult::Aborted
+        None => {
+            // No timeout — wait for completion or abort.
+            tokio::select! {
+                status = child.wait() => {
+                    match status {
+                        Ok(exit_status) => {
+                            let stdout = read_stdout(stdout_handle).await;
+                            let stderr = read_stderr(stderr_handle).await;
+                            WaitResult::Completed(Ok(HarnessOutput {
+                                stdout,
+                                stderr,
+                                exit_code: exit_status.code(),
+                                success: exit_status.success(),
+                            }))
+                        }
+                        Err(e) => WaitResult::Completed(Err(e.into())),
+                    }
+                }
+                _ = wait_for_abort(&mut abort_rx) => {
+                    graceful_shutdown(&mut child).await;
+                    WaitResult::Aborted
+                }
+            }
         }
     }
 }

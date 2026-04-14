@@ -237,7 +237,7 @@ impl Default for Config {
         Self {
             default_harness: "claude".to_string(),
             max_retries_per_step: 3,
-            timeout_secs: 300,
+            timeout_secs: 0,
             harnesses,
         }
     }
@@ -312,7 +312,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.default_harness, "claude");
         assert_eq!(config.max_retries_per_step, 3);
-        assert_eq!(config.timeout_secs, 300);
+        assert_eq!(config.timeout_secs, 0);
 
         let expected_harnesses = ["claude", "codex", "pi", "opencode", "copilot", "goose"];
         for name in &expected_harnesses {
@@ -346,11 +346,9 @@ mod tests {
         // carry the prompt placeholder.
         assert!(!claude.plan_args.is_empty());
         assert!(claude.plan_args.contains(&"{prompt}".to_string()));
-        assert!(
-            claude
-                .plan_args
-                .contains(&"--system-prompt-file".to_string())
-        );
+        assert!(claude
+            .plan_args
+            .contains(&"--system-prompt-file".to_string()));
         assert!(claude.plan_args.contains(&"{agent_file}".to_string()));
 
         let codex = &config.harnesses["codex"];

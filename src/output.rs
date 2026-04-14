@@ -273,10 +273,7 @@ fn confirm_with_reader(
         return Ok(false);
     }
     let trimmed = line.trim();
-    Ok(matches!(
-        trimmed,
-        "y" | "Y" | "yes" | "Yes" | "YES"
-    ))
+    Ok(matches!(trimmed, "y" | "Y" | "yes" | "Yes" | "YES"))
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +292,7 @@ pub struct PlanSummary {
     pub harness: Option<String>,
     pub agent: Option<String>,
     pub deterministic_tests: Vec<String>,
+    pub plan_harness: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -311,6 +309,7 @@ impl From<&Plan> for PlanSummary {
             harness: p.harness.clone(),
             agent: p.agent.clone(),
             deterministic_tests: p.deterministic_tests.clone(),
+            plan_harness: p.plan_harness.clone(),
             created_at: p.created_at,
             updated_at: p.updated_at,
         }
@@ -392,9 +391,9 @@ impl LogEntrySummary {
             match mode {
                 LogOutputMode::Hidden => None,
                 LogOutputMode::Full => text.clone(),
-                LogOutputMode::Truncated(n) => text.as_ref().map(|s| {
-                    s.lines().take(*n).collect::<Vec<_>>().join("\n")
-                }),
+                LogOutputMode::Truncated(n) => text
+                    .as_ref()
+                    .map(|s| s.lines().take(*n).collect::<Vec<_>>().join("\n")),
             }
         };
 
@@ -522,7 +521,10 @@ mod tests {
     #[test]
     fn test_status_icon_with_color() {
         let icon = status_icon(StepStatus::Complete, true);
-        assert!(icon.contains('\x1b'), "expected ANSI escape in colored icon");
+        assert!(
+            icon.contains('\x1b'),
+            "expected ANSI escape in colored icon"
+        );
         assert!(icon.contains('✔'));
     }
 
@@ -654,6 +656,7 @@ mod tests {
             harness: Some("claude-code".into()),
             agent: None,
             deterministic_tests: vec!["cargo test".into()],
+            plan_harness: Some("goose".into()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

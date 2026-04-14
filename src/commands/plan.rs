@@ -1,6 +1,6 @@
 // Plan CLI command implementations (CRUD, dependencies, plan-level hooks)
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::hook_library::{self, Lifecycle};
@@ -137,7 +137,12 @@ pub fn plan_dependency_remove(
 }
 
 /// Print the direct dependencies and dependents of `slug`.
-pub fn plan_dependency_list(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
+pub fn plan_dependency_list(
+    conn: &Connection,
+    slug: &str,
+    project: &str,
+    out: &OutputContext,
+) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -298,7 +303,12 @@ pub fn plan_show(conn: &Connection, slug: &str, project: &str, out: &OutputConte
     Ok(())
 }
 
-pub fn plan_approve(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
+pub fn plan_approve(
+    conn: &Connection,
+    slug: &str,
+    project: &str,
+    out: &OutputContext,
+) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -319,7 +329,12 @@ pub fn plan_approve(conn: &Connection, slug: &str, project: &str, out: &OutputCo
     Ok(())
 }
 
-pub fn plan_archive(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
+pub fn plan_archive(
+    conn: &Connection,
+    slug: &str,
+    project: &str,
+    out: &OutputContext,
+) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -341,7 +356,12 @@ pub fn plan_archive(conn: &Connection, slug: &str, project: &str, out: &OutputCo
     Ok(())
 }
 
-pub fn plan_unarchive(conn: &Connection, slug: &str, project: &str, out: &OutputContext) -> Result<()> {
+pub fn plan_unarchive(
+    conn: &Connection,
+    slug: &str,
+    project: &str,
+    out: &OutputContext,
+) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -363,7 +383,13 @@ pub fn plan_unarchive(conn: &Connection, slug: &str, project: &str, out: &Output
     Ok(())
 }
 
-pub fn plan_delete(conn: &Connection, slug: &str, project: &str, force: bool, out: &OutputContext) -> Result<()> {
+pub fn plan_delete(
+    conn: &Connection,
+    slug: &str,
+    project: &str,
+    force: bool,
+    out: &OutputContext,
+) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
 
@@ -376,11 +402,7 @@ pub fn plan_delete(conn: &Connection, slug: &str, project: &str, force: bool, ou
     }
 
     storage::delete_plan(conn, &plan.id)?;
-    eprintln!(
-        "{} Deleted plan '{}'",
-        output::check_icon(out.color),
-        slug
-    );
+    eprintln!("{} Deleted plan '{}'", output::check_icon(out.color), slug);
     Ok(())
 }
 
@@ -427,7 +449,12 @@ pub fn cmd_plan_unset_hook(
     Ok(())
 }
 
-pub fn cmd_plan_hooks(conn: &Connection, plan_slug: &str, project: &str, _out: &OutputContext) -> Result<()> {
+pub fn cmd_plan_hooks(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    _out: &OutputContext,
+) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
     let rows = storage::list_all_hooks_for_plan(conn, &plan.id)?;
@@ -438,9 +465,8 @@ pub fn cmd_plan_hooks(conn: &Connection, plan_slug: &str, project: &str, _out: &
     }
 
     let steps = storage::list_steps(conn, &plan.id)?;
-    let step_num = |sid: &str| -> Option<usize> {
-        steps.iter().position(|s| s.id == sid).map(|i| i + 1)
-    };
+    let step_num =
+        |sid: &str| -> Option<usize> { steps.iter().position(|s| s.id == sid).map(|i| i + 1) };
 
     eprintln!("Hooks attached to plan '{plan_slug}':");
     for row in &rows {
@@ -457,6 +483,61 @@ pub fn cmd_plan_hooks(conn: &Connection, plan_slug: &str, project: &str, _out: &
             lifecycle = row.lifecycle,
             hook = row.hook_name,
         );
+    }
+    Ok(())
+}
+
+pub fn plan_harness_set(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    harness: &str,
+    out: &OutputContext,
+) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+    storage::set_plan_harness_gen(conn, &plan.id, Some(harness))?;
+    if out.format == OutputFormat::Json {
+        let json = serde_json::json!({
+            "plan": plan_slug,
+            "plan_harness": harness,
+        });
+        println!("{}", serde_json::to_string(&json)?);
+    } else {
+        eprintln!(
+            "Set plan-generation harness for '{}' to '{}'.",
+            plan_slug, harness
+        );
+    }
+    Ok(())
+}
+
+pub fn plan_harness_show(
+    _conn: &Connection,
+    plan: &crate::plan::Plan,
+    config: &crate::config::Config,
+    out: &OutputContext,
+) -> Result<()> {
+    let harness_name = plan
+        .plan_harness
+        .as_deref()
+        .unwrap_or(&config.default_harness);
+    if out.format == OutputFormat::Json {
+        let json = serde_json::json!({
+            "plan": plan.slug,
+            "plan_harness": plan.plan_harness,
+            "default_harness": config.default_harness,
+            "effective_harness": harness_name,
+        });
+        println!("{}", serde_json::to_string(&json)?);
+    } else {
+        match &plan.plan_harness {
+            Some(h) => eprintln!("Plan '{}' plan-generation harness: {}", plan.slug, h),
+            None => eprintln!(
+                "Plan '{}' plan-generation harness: (default: {})",
+                plan.slug, config.default_harness
+            ),
+        }
     }
     Ok(())
 }

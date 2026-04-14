@@ -272,6 +272,7 @@ mod tests {
             harness: harness.map(|s| s.to_string()),
             agent: None,
             deterministic_tests: vec!["cargo test".to_string()],
+            plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

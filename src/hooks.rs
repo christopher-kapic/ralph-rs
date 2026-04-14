@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
 
 use crate::hook_library::{self, Hook, Lifecycle};
@@ -52,12 +52,7 @@ impl HookContext {
 }
 
 /// Build the base environment passed to every hook invocation.
-fn base_env(
-    plan: &Plan,
-    step: &Step,
-    attempt: i32,
-    workdir: &Path,
-) -> Vec<(&'static str, String)> {
+fn base_env(plan: &Plan, step: &Step, attempt: i32, workdir: &Path) -> Vec<(&'static str, String)> {
     vec![
         ("RALPH_PLAN_SLUG", plan.slug.clone()),
         ("RALPH_PLAN_ID", plan.id.clone()),
@@ -150,7 +145,16 @@ pub fn run_pre_step(
     attempt: i32,
     workdir: &Path,
 ) -> Result<()> {
-    run_lifecycle(conn, ctx, plan, step, attempt, Lifecycle::PreStep, workdir, &[])
+    run_lifecycle(
+        conn,
+        ctx,
+        plan,
+        step,
+        attempt,
+        Lifecycle::PreStep,
+        workdir,
+        &[],
+    )
 }
 
 /// Run post-step hooks. Failures are logged as warnings but do not propagate.
@@ -187,7 +191,16 @@ pub fn run_pre_test(
     attempt: i32,
     workdir: &Path,
 ) -> Result<()> {
-    run_lifecycle(conn, ctx, plan, step, attempt, Lifecycle::PreTest, workdir, &[])
+    run_lifecycle(
+        conn,
+        ctx,
+        plan,
+        step,
+        attempt,
+        Lifecycle::PreTest,
+        workdir,
+        &[],
+    )
 }
 
 /// Run post-test hooks. Failures are logged as warnings but do not propagate.
@@ -242,6 +255,7 @@ mod tests {
             harness: None,
             agent: None,
             deterministic_tests: vec![],
+            plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -353,8 +367,7 @@ mod tests {
             project_dir: tmp.path().to_path_buf(),
         };
 
-        storage::attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "nonexistent")
-            .unwrap();
+        storage::attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "nonexistent").unwrap();
 
         // Missing hook should NOT error — just warn and skip.
         run_pre_step(&conn, &ctx, &plan, &step, 1, tmp.path()).unwrap();

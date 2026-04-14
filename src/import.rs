@@ -39,6 +39,8 @@ pub struct ImportedPlanMeta {
     /// Slugs of plans this plan directly depends on.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub plan_harness: Option<String>,
 }
 
 /// Step from the portable JSON.
@@ -108,6 +110,13 @@ pub fn import_plan_from_data(
 
     // Set plan status to ready
     storage::update_plan_status(conn, &plan.id, crate::plan::PlanStatus::Ready)?;
+
+    // Set plan-generation harness if present in the import data and not
+    // already set by a CLI override (harness override in ImportOptions
+    // sets the execution-time harness, not plan_harness).
+    if data.plan.plan_harness.is_some() {
+        storage::set_plan_harness_gen(conn, &plan.id, data.plan.plan_harness.as_deref())?;
+    }
 
     // Create all steps in order (pending, 0 attempts by default from DB schema)
     for step_data in &data.steps {

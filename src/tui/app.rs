@@ -98,7 +98,11 @@ impl App {
         let title = self.input_buffer.trim().to_string();
         self.input_buffer.clear();
         self.input_mode = InputMode::Normal;
-        if title.is_empty() { None } else { Some(title) }
+        if title.is_empty() {
+            None
+        } else {
+            Some(title)
+        }
     }
 
     /// Cancel inline input and return to Normal mode.
