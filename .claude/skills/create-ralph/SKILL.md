@@ -33,28 +33,27 @@ You are helping the user create a **ralph** — a structured, deterministic exec
    - Each step with its title and description
    Wait for the user to approve or request changes.
 
-6. **Create the plan using ralph-rs CLI**: Once approved, run the commands:
+6. **Create the plan using the `ralph` CLI**: Once approved, run the commands:
 
 ```bash
 # Create the plan
-ralph-rs plan create <slug> \
+ralph plan create <slug> \
   --description "<plan description>" \
   --test "<test command 1>" \
   --test "<test command 2>"
 
-# Add steps in order
-ralph-rs step add "<Step 1 title>" \
-  --plan <slug> \
+# Add steps in order. The plan slug is a positional argument after the
+# step title (or omit it to use the active plan).
+ralph step add "<Step 1 title>" <slug> \
   --description "<detailed description with acceptance criteria>"
 
-ralph-rs step add "<Step 2 title>" \
-  --plan <slug> \
+ralph step add "<Step 2 title>" <slug> \
   --description "<detailed description with acceptance criteria>"
 
 # ... continue for all steps
 
 # Approve the plan so it's ready to run
-ralph-rs plan approve <slug>
+ralph plan approve <slug>
 ```
 
 ## Guidelines for good steps
@@ -68,6 +67,6 @@ ralph-rs plan approve <slug>
 
 ## Important
 
-- Always run `ralph-rs init` first if this is a new project that hasn't been initialized
+- Always run `ralph init` first if this is a new project that hasn't been initialized (it will detect installed harnesses and prompt for a default; pass `--non-interactive` in scripted contexts)
 - Make sure the project directory is a git repo with a clean working tree before running
 - The plan slug should be short, descriptive, and use hyphens (e.g., `add-auth`, `fix-parser-bug`, `refactor-db-layer`)

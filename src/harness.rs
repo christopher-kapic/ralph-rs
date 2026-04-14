@@ -390,12 +390,52 @@ mod tests {
 
     #[test]
     fn test_build_harness_args_no_json_when_unsupported() {
+        // All default harnesses now support JSON, so construct a synthetic
+        // harness with `supports_json_output: false` to exercise the "no
+        // JSON appended" branch in isolation.
+        let hc = HarnessConfig {
+            command: "fake".to_string(),
+            args: vec!["--run".to_string(), "{prompt}".to_string()],
+            supports_agent_file: false,
+            supports_json_output: false,
+            json_output_args: vec!["--this-should-not-appear".to_string()],
+            agent_file_env: None,
+        };
+
+        let args = build_harness_args("fake", &hc, "do stuff", None);
+        assert_eq!(args, vec!["--run".to_string(), "do stuff".to_string()]);
+    }
+
+    #[test]
+    fn test_build_harness_args_pi_uses_mode_json() {
         let config = Config::default();
         let hc = &config.harnesses["pi"];
 
         let args = build_harness_args("pi", hc, "do stuff", None);
-        assert!(!args.contains(&"--json".to_string()));
-        assert!(!args.contains(&"--output-format".to_string()));
+        // pi -p "do stuff" --mode json
+        assert_eq!(
+            args,
+            vec!["-p", "do stuff", "--mode", "json"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_build_harness_args_opencode_uses_run_subcommand() {
+        let config = Config::default();
+        let hc = &config.harnesses["opencode"];
+
+        let args = build_harness_args("opencode", hc, "do stuff", None);
+        // opencode run "do stuff" --format json
+        assert_eq!(
+            args,
+            vec!["run", "do stuff", "--format", "json"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -445,13 +485,13 @@ mod tests {
             supports_agent_file: false,
             supports_json_output: false,
             json_output_args: vec![],
-            agent_file_env: Some("GOOSE_AGENT_FILE".to_string()),
+            agent_file_env: Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string()),
         };
 
         let agent_path = Path::new("/home/user/.ralph2/agents/default.md");
         let env = build_harness_env(&hc, Some(agent_path));
         assert_eq!(env.len(), 1);
-        assert_eq!(env[0].0, "GOOSE_AGENT_FILE");
+        assert_eq!(env[0].0, "GOOSE_SYSTEM_PROMPT_FILE_PATH");
         assert_eq!(env[0].1, "/home/user/.ralph2/agents/default.md");
     }
 
@@ -463,7 +503,7 @@ mod tests {
             supports_agent_file: false,
             supports_json_output: false,
             json_output_args: vec![],
-            agent_file_env: Some("GOOSE_AGENT_FILE".to_string()),
+            agent_file_env: Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string()),
         };
 
         let env = build_harness_env(&hc, None);

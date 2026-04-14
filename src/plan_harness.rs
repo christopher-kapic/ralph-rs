@@ -378,26 +378,25 @@ mod tests {
 
     #[test]
     fn test_build_plan_harness_env_goose() {
+        // Goose's default config sets `agent_file_env` to
+        // GOOSE_SYSTEM_PROMPT_FILE_PATH, so an agent file should be exported
+        // as that env var to the subprocess.
         let config = Config::default();
-        let agent_file = write_agent_temp_file(&test_agent_content()).unwrap();
-        let env = build_plan_harness_env("goose", &config, Some(agent_file.path()));
-
-        // Goose config has agent_file_env: None in default config
-        assert!(env.is_empty());
-    }
-
-    #[test]
-    fn test_build_plan_harness_env_goose_with_env() {
-        let mut config = Config::default();
-        // Simulate goose having the env var configured
-        if let Some(goose) = config.harnesses.get_mut("goose") {
-            goose.agent_file_env = Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string());
-        }
         let agent_file = write_agent_temp_file(&test_agent_content()).unwrap();
         let env = build_plan_harness_env("goose", &config, Some(agent_file.path()));
 
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].0, "GOOSE_SYSTEM_PROMPT_FILE_PATH");
+        assert_eq!(env[0].1, agent_file.path().to_string_lossy());
+    }
+
+    #[test]
+    fn test_build_plan_harness_env_goose_no_agent_file() {
+        // With no agent file, nothing should be exported even if the env
+        // var is configured.
+        let config = Config::default();
+        let env = build_plan_harness_env("goose", &config, None);
+        assert!(env.is_empty());
     }
 
     #[test]

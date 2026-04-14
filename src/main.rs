@@ -70,8 +70,18 @@ fn main() -> Result<()> {
 
     match cli.command {
         // -- Init --
-        Command::Init { .. } => {
-            commands::cmd_init(&out)?;
+        Command::Init {
+            non_interactive,
+            default_harness,
+            force,
+            ..
+        } => {
+            let opts = commands::InitOptions {
+                non_interactive,
+                default_harness,
+                force,
+            };
+            commands::cmd_init(&opts, &out)?;
             Ok(())
         }
 

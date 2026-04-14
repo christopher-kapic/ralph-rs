@@ -37,7 +37,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Initialize ralph-rs in the current project directory.
+    /// Initialize ralph-rs: create config/agents directories, detect
+    /// installed harnesses, and write the default config.
     Init {
         /// Slug for the initial plan.
         #[arg(long)]
@@ -46,6 +47,21 @@ pub enum Command {
         /// Git branch name to use.
         #[arg(long)]
         branch: Option<String>,
+
+        /// Skip the interactive default-harness prompt (picks the first
+        /// installed harness, preferring `claude`).
+        #[arg(long)]
+        non_interactive: bool,
+
+        /// Explicitly set the default harness. Must be one of the known
+        /// harness names. Skips the interactive prompt.
+        #[arg(long, value_name = "NAME")]
+        default_harness: Option<String>,
+
+        /// Overwrite an existing config file. Without this, an existing
+        /// config is preserved and init will not re-prompt.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Manage plans.

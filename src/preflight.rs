@@ -240,7 +240,7 @@ fn extract_binary_from_command(cmd: &str) -> String {
 }
 
 /// Check if a binary is available on PATH using `which`.
-fn is_binary_available(binary: &str) -> bool {
+pub(crate) fn is_binary_available(binary: &str) -> bool {
     std::process::Command::new("which")
         .arg(binary)
         .stdout(std::process::Stdio::null())

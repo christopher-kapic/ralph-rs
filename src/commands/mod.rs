@@ -100,43 +100,232 @@ pub fn resolve_step(
 // Init command
 // ---------------------------------------------------------------------------
 
-pub fn cmd_init(out: &OutputContext) -> Result<()> {
+/// Options controlling the `init` command flow.
+#[derive(Debug, Default, Clone)]
+pub struct InitOptions {
+    /// Skip interactive prompting. Used in CI / scripted setup.
+    pub non_interactive: bool,
+    /// Explicitly pre-select the default harness. Skips prompting.
+    pub default_harness: Option<String>,
+    /// Overwrite an existing config file. Without this, an existing config
+    /// is preserved and init is a no-op for the config itself.
+    pub force: bool,
+}
+
+pub fn cmd_init(opts: &InitOptions, out: &OutputContext) -> Result<()> {
     use std::fs;
+    use std::io::IsTerminal;
 
     let icon = output::check_icon(out.color);
 
-    // Create config dir
+    // 1. Create directories (idempotent).
     let config_dir = config::config_dir()?;
     fs::create_dir_all(&config_dir)
         .with_context(|| format!("Failed to create config directory {}", config_dir.display()))?;
     eprintln!("{icon} Config directory: {}", config_dir.display());
 
-    // Create agents dir
     let agents_dir = config::agents_dir()?;
     fs::create_dir_all(&agents_dir)
         .with_context(|| format!("Failed to create agents directory {}", agents_dir.display()))?;
     eprintln!("{icon} Agents directory: {}", agents_dir.display());
 
-    // Create default config file if it doesn't exist
+    // 2. Build the default config so we can scan its harnesses regardless
+    //    of whether we end up writing it to disk.
+    let mut new_config = config::Config::default();
+
+    // 3. Detect which harnesses are currently installed on PATH. We report
+    //    this every run so `ralph init` doubles as a quick "what's available"
+    //    check, even if we're not rewriting the config.
+    let availability = detect_harnesses(&new_config);
+    print_harness_availability(&availability, out);
+
+    // 4. Decide whether to write a config file.
     let config_path = config_dir.join("config.json");
-    if !config_path.exists() {
-        let default_config = config::Config::default();
-        let json = serde_json::to_string_pretty(&default_config)?;
+    let config_exists = config_path.exists();
+
+    if config_exists && !opts.force {
+        eprintln!("{icon} Config exists: {}", config_path.display());
+        eprintln!("  (use --force to regenerate)");
+    } else {
+        // Pick the default harness: explicit flag > interactive prompt >
+        // first-available fallback > hard default ("claude").
+        let chosen = choose_default_harness(opts, &availability)?;
+        new_config.default_harness = chosen.clone();
+
+        let json = serde_json::to_string_pretty(&new_config)?;
         fs::write(&config_path, &json)
             .with_context(|| format!("Failed to write config to {}", config_path.display()))?;
-        eprintln!("{icon} Default config: {}", config_path.display());
-    } else {
-        eprintln!("{icon} Config exists: {}", config_path.display());
+
+        let verb = if config_exists { "Rewrote" } else { "Wrote" };
+        eprintln!(
+            "{icon} {verb} config: {} (default harness: {chosen})",
+            config_path.display()
+        );
     }
 
-    // Initialize database
+    // 5. Initialize database (idempotent — `db::open` runs migrations).
     let _conn = db::open()?;
     let db_path = db::db_path()?;
     eprintln!("{icon} Database: {}", db_path.display());
 
     eprintln!();
     eprintln!("ralph initialized successfully.");
+
+    // Hint about non-interactive mode when stdin isn't a TTY and we had to
+    // silently fall back, so users notice why no prompt appeared.
+    if !std::io::stdin().is_terminal() && !opts.non_interactive && opts.default_harness.is_none() {
+        eprintln!();
+        eprintln!(
+            "  note: stdin is not a TTY — skipped interactive harness prompt. \
+             Pass --default-harness <name> or edit {} to change the default.",
+            config_path.display()
+        );
+    }
+
     Ok(())
+}
+
+/// Probe each harness in the config for a binary on PATH. Returns pairs of
+/// `(harness_name, installed)` sorted alphabetically for stable output.
+fn detect_harnesses(config: &config::Config) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = config
+        .harnesses
+        .iter()
+        .map(|(name, hc)| (name.clone(), preflight::is_binary_available(&hc.command)))
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn print_harness_availability(availability: &[(String, bool)], out: &OutputContext) {
+    let found: Vec<&str> = availability
+        .iter()
+        .filter_map(|(n, ok)| if *ok { Some(n.as_str()) } else { None })
+        .collect();
+    let missing: Vec<&str> = availability
+        .iter()
+        .filter_map(|(n, ok)| if !*ok { Some(n.as_str()) } else { None })
+        .collect();
+
+    let check = output::check_icon(out.color);
+    let warn = output::severity_icon("warning", out.color);
+
+    if found.is_empty() {
+        eprintln!("{warn} No known harnesses found on PATH.");
+    } else {
+        eprintln!("{check} Harnesses found on PATH: {}", found.join(", "));
+    }
+    if !missing.is_empty() {
+        eprintln!("  Not found: {}", missing.join(", "));
+    }
+}
+
+/// Select which harness to record as the config default.
+fn choose_default_harness(
+    opts: &InitOptions,
+    availability: &[(String, bool)],
+) -> Result<String> {
+    use std::io::IsTerminal;
+
+    // Explicit flag always wins and is validated against the known harness
+    // list so typos fail loudly rather than writing a dead default.
+    if let Some(name) = &opts.default_harness {
+        let known: Vec<&str> = availability.iter().map(|(n, _)| n.as_str()).collect();
+        if !known.contains(&name.as_str()) {
+            bail!(
+                "Unknown harness '{name}' passed to --default-harness. Known: {}",
+                known.join(", ")
+            );
+        }
+        return Ok(name.clone());
+    }
+
+    let installed: Vec<&str> = availability
+        .iter()
+        .filter_map(|(n, ok)| if *ok { Some(n.as_str()) } else { None })
+        .collect();
+
+    // Non-interactive or no TTY: pick the best available without asking.
+    // Preference order: claude (historical default) > first installed >
+    // fall back to "claude" even if missing, so the config is still valid
+    // and the user can install claude later.
+    if opts.non_interactive || !std::io::stdin().is_terminal() {
+        if installed.contains(&"claude") {
+            return Ok("claude".to_string());
+        }
+        if let Some(first) = installed.first() {
+            return Ok((*first).to_string());
+        }
+        return Ok("claude".to_string());
+    }
+
+    // Interactive: prompt from the installed list. If nothing is installed,
+    // fall back to claude and warn — the user might install it after init.
+    if installed.is_empty() {
+        eprintln!(
+            "  No harnesses detected — defaulting to `claude`. \
+             Install one (or edit config.json) before running plans."
+        );
+        return Ok("claude".to_string());
+    }
+
+    prompt_for_default(&installed)
+}
+
+/// Prompt the user to pick a default harness from the installed list.
+/// Returns the chosen harness name. Re-prompts on invalid input up to 3x.
+fn prompt_for_default(installed: &[&str]) -> Result<String> {
+    use std::io::{BufRead, Write};
+
+    // Suggest claude if it's present, otherwise the first entry.
+    let suggested_idx = installed.iter().position(|n| *n == "claude").unwrap_or(0);
+
+    eprintln!();
+    eprintln!("Select a default harness:");
+    for (i, name) in installed.iter().enumerate() {
+        let marker = if i == suggested_idx { "*" } else { " " };
+        eprintln!("  {marker} {}) {name}", i + 1);
+    }
+
+    let stdin = std::io::stdin();
+    let mut handle = stdin.lock();
+    let mut line = String::new();
+
+    for _ in 0..3 {
+        eprint!(
+            "Choice [1-{}, default={}]: ",
+            installed.len(),
+            installed[suggested_idx]
+        );
+        std::io::stderr().flush().ok();
+
+        line.clear();
+        let n = handle
+            .read_line(&mut line)
+            .context("Failed to read from stdin")?;
+        if n == 0 {
+            // EOF — accept the suggestion silently.
+            return Ok(installed[suggested_idx].to_string());
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(installed[suggested_idx].to_string());
+        }
+
+        // Accept either a 1-based number or a harness name.
+        if let Ok(idx) = trimmed.parse::<usize>() {
+            if idx >= 1 && idx <= installed.len() {
+                return Ok(installed[idx - 1].to_string());
+            }
+        } else if installed.contains(&trimmed) {
+            return Ok(trimmed.to_string());
+        }
+
+        eprintln!("  Invalid choice '{trimmed}'. Enter a number or harness name.");
+    }
+
+    bail!("No valid harness selection after 3 attempts");
 }
 
 // ---------------------------------------------------------------------------

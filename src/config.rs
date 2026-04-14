@@ -60,8 +60,22 @@ impl Default for Config {
         harnesses.insert(
             "codex".to_string(),
             HarnessConfig {
+                // Codex non-interactive invocation is `codex exec "<prompt>"`:
+                // the `exec` subcommand takes the prompt as a positional. JSON
+                // output is JSONL via `--json`. The extra `-c` / `--ephemeral`
+                // / `--skip-git-repo-check` flags are the recommended defaults
+                // for programmatic, non-interactive use — they prevent codex
+                // from blocking on approval prompts and avoid persisting
+                // session files that ralph-rs doesn't need.
                 command: "codex".to_string(),
-                args: vec![],
+                args: vec![
+                    "exec".to_string(),
+                    "{prompt}".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                    "--ephemeral".to_string(),
+                    "-c".to_string(),
+                    "approval_policy=never".to_string(),
+                ],
                 supports_agent_file: false,
                 supports_json_output: true,
                 json_output_args: vec!["--json".to_string()],
@@ -72,11 +86,14 @@ impl Default for Config {
         harnesses.insert(
             "pi".to_string(),
             HarnessConfig {
+                // Pi's non-interactive "print" mode is triggered by -p / --print,
+                // with the prompt as a positional. JSON output uses `--mode json`
+                // (NDJSON events), NOT a generic --json flag.
                 command: "pi".to_string(),
-                args: vec![],
+                args: vec!["-p".to_string()],
                 supports_agent_file: false,
-                supports_json_output: false,
-                json_output_args: vec![],
+                supports_json_output: true,
+                json_output_args: vec!["--mode".to_string(), "json".to_string()],
                 agent_file_env: None,
             },
         );
@@ -84,11 +101,13 @@ impl Default for Config {
         harnesses.insert(
             "opencode".to_string(),
             HarnessConfig {
+                // OpenCode takes prompts via the `run` subcommand (positional),
+                // not as a top-level argument. JSON output uses `--format json`.
                 command: "opencode".to_string(),
-                args: vec![],
+                args: vec!["run".to_string()],
                 supports_agent_file: false,
-                supports_json_output: false,
-                json_output_args: vec![],
+                supports_json_output: true,
+                json_output_args: vec!["--format".to_string(), "json".to_string()],
                 agent_file_env: None,
             },
         );
@@ -117,12 +136,28 @@ impl Default for Config {
         harnesses.insert(
             "goose".to_string(),
             HarnessConfig {
+                // Goose non-interactive invocation is `goose run -t "<prompt>"`.
+                // `--no-session` prevents session file creation so automated
+                // runs don't litter the filesystem. JSON output is controlled
+                // by `--output-format json` (single trailing object) or
+                // `stream-json` (JSONL events) — we pick the simpler `json`.
+                //
+                // Agent files are injected via the `GOOSE_SYSTEM_PROMPT_FILE_PATH`
+                // env var, which completely replaces the default system prompt
+                // with the contents of the given file. `supports_agent_file`
+                // stays false because goose has no native file-path flag; the
+                // env-var path in `build_harness_env` handles it.
                 command: "goose".to_string(),
-                args: vec![],
+                args: vec![
+                    "run".to_string(),
+                    "-t".to_string(),
+                    "{prompt}".to_string(),
+                    "--no-session".to_string(),
+                ],
                 supports_agent_file: false,
-                supports_json_output: false,
-                json_output_args: vec![],
-                agent_file_env: None,
+                supports_json_output: true,
+                json_output_args: vec!["--output-format".to_string(), "json".to_string()],
+                agent_file_env: Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string()),
             },
         );
 
@@ -239,6 +274,30 @@ mod tests {
         assert_eq!(codex.command, "codex");
         assert!(!codex.supports_agent_file);
         assert!(codex.supports_json_output);
+        assert_eq!(codex.json_output_args, vec!["--json".to_string()]);
+        // Uses the `exec` subcommand with `{prompt}` placeholder replaced
+        // in-place, plus non-interactive hardening flags.
+        assert_eq!(codex.args[0], "exec");
+        assert_eq!(codex.args[1], "{prompt}");
+        assert!(codex.args.contains(&"--ephemeral".to_string()));
+        assert!(codex.args.contains(&"--skip-git-repo-check".to_string()));
+        assert!(codex.args.contains(&"approval_policy=never".to_string()));
+
+        let pi = &config.harnesses["pi"];
+        assert_eq!(pi.args, vec!["-p".to_string()]);
+        assert!(pi.supports_json_output);
+        assert_eq!(
+            pi.json_output_args,
+            vec!["--mode".to_string(), "json".to_string()]
+        );
+
+        let opencode = &config.harnesses["opencode"];
+        assert_eq!(opencode.args, vec!["run".to_string()]);
+        assert!(opencode.supports_json_output);
+        assert_eq!(
+            opencode.json_output_args,
+            vec!["--format".to_string(), "json".to_string()]
+        );
 
         let copilot = &config.harnesses["copilot"];
         assert_eq!(copilot.command, "copilot");
