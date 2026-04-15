@@ -209,6 +209,11 @@ pub struct Step {
     pub max_retries: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Per-step model override forwarded via the harness's `model_args`
+    /// template. `None` means "fall back to the harness's `default_model`
+    /// (or omit the model flag entirely if that's also None)".
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl Step {
@@ -216,7 +221,8 @@ impl Step {
     ///
     /// Expected column order:
     /// id, plan_id, sort_key, title, description, agent, harness,
-    /// acceptance_criteria, status, attempts, max_retries, created_at, updated_at
+    /// acceptance_criteria, status, attempts, max_retries, created_at,
+    /// updated_at, model
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let criteria_json: String = row.get(7)?;
         let acceptance_criteria: Vec<String> =
@@ -257,6 +263,7 @@ impl Step {
             max_retries: row.get(10)?,
             created_at,
             updated_at,
+            model: row.get(13)?,
         })
     }
 }
@@ -463,7 +470,7 @@ mod tests {
 
         let step = conn
             .query_row(
-                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at FROM steps WHERE id = ?1",
+                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model FROM steps WHERE id = ?1",
                 ["s1"],
                 Step::from_row,
             )

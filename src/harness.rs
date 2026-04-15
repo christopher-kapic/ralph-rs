@@ -14,6 +14,9 @@ const PROMPT_PLACEHOLDER: &str = "{prompt}";
 /// Placeholder token in harness args for the agent file path.
 const AGENT_FILE_PLACEHOLDER: &str = "{agent_file}";
 
+/// Placeholder token in `model_args` for the selected model identifier.
+const MODEL_PLACEHOLDER: &str = "{model}";
+
 /// Resolve which harness name to use, following the precedence chain:
 /// step.harness -> plan.harness -> config.default_harness
 pub fn resolve_harness_name(step: &Step, plan: &Plan, config: &Config) -> String {
@@ -48,12 +51,18 @@ pub fn resolve_harness<'a>(
 /// 1. Starts from the harness config's default args
 /// 2. Replaces `{prompt}` placeholders with the actual prompt text
 /// 3. Handles agent file injection based on harness type
-/// 4. Appends JSON output args if supported
+/// 4. Forwards the model override (or config default) via model_args
+/// 5. Appends JSON output args if supported
+///
+/// Model precedence: `model_override` (e.g. from `Step.model`) takes
+/// priority over `harness_config.default_model`. If both are `None` the
+/// harness is invoked without any model flag.
 pub fn build_harness_args(
     harness_name: &str,
     harness_config: &HarnessConfig,
     prompt: &str,
     agent_file: Option<&Path>,
+    model_override: Option<&str>,
 ) -> Vec<String> {
     let mut args = harness_config.args.clone();
 
@@ -78,6 +87,20 @@ pub fn build_harness_args(
     // Remove {agent_file} placeholder and its surrounding flag if no agent file
     if agent_file.is_none() {
         remove_agent_file_args(&mut args);
+    }
+
+    // Forward an optional model selection via the harness's model_args
+    // template. Precedence: explicit override (e.g. `Step.model`) first,
+    // then the harness's config-level `default_model`. If both are None,
+    // or if the harness has no model_args template, the model flag is
+    // omitted entirely.
+    let resolved_model = model_override.or(harness_config.default_model.as_deref());
+    if let Some(model) = resolved_model
+        && !harness_config.model_args.is_empty()
+    {
+        for arg in &harness_config.model_args {
+            args.push(arg.replace(MODEL_PLACEHOLDER, model));
+        }
     }
 
     // Append JSON output args if supported
@@ -293,6 +316,7 @@ mod tests {
             max_retries: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            model: None,
         }
     }
 
@@ -358,9 +382,11 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: None,
+            model_args: vec![],
+            default_model: None,
         };
 
-        let args = build_harness_args("test", &hc, "do the thing", None);
+        let args = build_harness_args("test", &hc, "do the thing", None, None);
         assert_eq!(args, vec!["-p", "do the thing"]);
     }
 
@@ -374,9 +400,11 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: None,
+            model_args: vec![],
+            default_model: None,
         };
 
-        let args = build_harness_args("codex", &hc, "implement feature", None);
+        let args = build_harness_args("codex", &hc, "implement feature", None, None);
         assert_eq!(args, vec!["implement feature"]);
     }
 
@@ -385,7 +413,7 @@ mod tests {
         let config = Config::default();
         let hc = &config.harnesses["claude"];
 
-        let args = build_harness_args("claude", hc, "do stuff", None);
+        let args = build_harness_args("claude", hc, "do stuff", None, None);
         // Should contain -p, prompt, and JSON output args
         assert!(args.contains(&"--output-format".to_string()));
         assert!(args.contains(&"json".to_string()));
@@ -404,9 +432,11 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec!["--this-should-not-appear".to_string()],
             agent_file_env: None,
+            model_args: vec![],
+            default_model: None,
         };
 
-        let args = build_harness_args("fake", &hc, "do stuff", None);
+        let args = build_harness_args("fake", &hc, "do stuff", None, None);
         assert_eq!(args, vec!["--run".to_string(), "do stuff".to_string()]);
     }
 
@@ -415,7 +445,7 @@ mod tests {
         let config = Config::default();
         let hc = &config.harnesses["pi"];
 
-        let args = build_harness_args("pi", hc, "do stuff", None);
+        let args = build_harness_args("pi", hc, "do stuff", None, None);
         // pi -p "do stuff" --mode json
         assert_eq!(
             args,
@@ -431,7 +461,7 @@ mod tests {
         let config = Config::default();
         let hc = &config.harnesses["opencode"];
 
-        let args = build_harness_args("opencode", hc, "do stuff", None);
+        let args = build_harness_args("opencode", hc, "do stuff", None, None);
         // opencode run "do stuff" --format json
         assert_eq!(
             args,
@@ -448,7 +478,7 @@ mod tests {
         let hc = &config.harnesses["claude"];
         let agent_path = Path::new("/home/user/.ralph2/agents/default.md");
 
-        let args = build_harness_args("claude", hc, "do stuff", Some(agent_path));
+        let args = build_harness_args("claude", hc, "do stuff", Some(agent_path), None);
         assert!(args.contains(&"--agent-file".to_string()));
         assert!(args.contains(&"/home/user/.ralph2/agents/default.md".to_string()));
     }
@@ -458,8 +488,70 @@ mod tests {
         let config = Config::default();
         let hc = &config.harnesses["claude"];
 
-        let args = build_harness_args("claude", hc, "do stuff", None);
+        let args = build_harness_args("claude", hc, "do stuff", None, None);
         assert!(!args.contains(&"--agent-file".to_string()));
+    }
+
+    #[test]
+    fn test_build_harness_args_no_model_args_when_neither_set() {
+        // Baseline for the new model precedence logic: when neither the
+        // per-step override nor the harness's default_model is set, no
+        // model flag should appear in the final args. Pi is a good fit
+        // here because its real config has a real model_args template
+        // (["--model", "{model}"]), so "no flag" must come from the
+        // precedence check, not from an empty template.
+        let config = Config::default();
+        let hc = &config.harnesses["pi"];
+        assert!(hc.default_model.is_none());
+        assert!(!hc.model_args.is_empty());
+
+        let args = build_harness_args("pi", hc, "q", None, None);
+        assert!(
+            !args.contains(&"--model".to_string()),
+            "expected no --model flag when both override and default are None, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_harness_args_uses_default_model_when_no_override() {
+        // default_model on the harness config should be forwarded when
+        // the caller doesn't pass a per-step override.
+        let mut hc = Config::default().harnesses["pi"].clone();
+        hc.default_model = Some("sonnet-4.6".to_string());
+
+        let args = build_harness_args("pi", &hc, "q", None, None);
+        // pi's model_args is ["--model", "{model}"], so we expect the
+        // substituted pair to land at the end of the args.
+        assert!(args.windows(2).any(|w| w[0] == "--model" && w[1] == "sonnet-4.6"));
+    }
+
+    #[test]
+    fn test_build_harness_args_override_beats_default_model() {
+        // Per-step override must take priority over the harness default.
+        let mut hc = Config::default().harnesses["pi"].clone();
+        hc.default_model = Some("sonnet-4.6".to_string());
+
+        let args = build_harness_args("pi", &hc, "q", None, Some("opus-4.6"));
+        assert!(args.windows(2).any(|w| w[0] == "--model" && w[1] == "opus-4.6"));
+        assert!(
+            !args.iter().any(|a| a == "sonnet-4.6"),
+            "default_model should have been overridden, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_harness_args_override_ignored_when_no_model_args() {
+        // If the resolved harness has no `model_args` template, any
+        // override is silently dropped — the harness literally has no
+        // flag to forward it through. (Mirrors kctx-local's semantics.)
+        let mut hc = Config::default().harnesses["pi"].clone();
+        hc.model_args.clear();
+
+        let args = build_harness_args("pi", &hc, "q", None, Some("opus-4.6"));
+        assert!(
+            !args.iter().any(|a| a == "opus-4.6"),
+            "override should be silently ignored when model_args is empty, got: {args:?}"
+        );
     }
 
     #[test]
@@ -491,6 +583,8 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string()),
+            model_args: vec![],
+            default_model: None,
         };
 
         let agent_path = Path::new("/home/user/.ralph2/agents/default.md");
@@ -510,6 +604,8 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string()),
+            model_args: vec![],
+            default_model: None,
         };
 
         let env = build_harness_env(&hc, None);
@@ -558,9 +654,11 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: None,
+            model_args: vec![],
+            default_model: None,
         };
 
-        let args = build_harness_args("test", &hc, "hello world", None);
+        let args = build_harness_args("test", &hc, "hello world", None, None);
         assert_eq!(args, vec!["--prompt=hello world"]);
     }
 
@@ -578,10 +676,12 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: None,
+            model_args: vec![],
+            default_model: None,
         };
 
         let agent_path = Path::new("/tmp/agent.md");
-        let args = build_harness_args("claude", &hc, "do stuff", Some(agent_path));
+        let args = build_harness_args("claude", &hc, "do stuff", Some(agent_path), None);
         assert!(args.contains(&"/tmp/agent.md".to_string()));
         assert!(!args.iter().any(|a| a.contains("{agent_file}")));
     }

@@ -37,6 +37,22 @@ pub struct HarnessConfig {
     /// Environment variable name used to point to the agent file.
     #[serde(default)]
     pub agent_file_env: Option<String>,
+    /// Argument template for forwarding a model selection to the harness.
+    /// Supports the `{model}` placeholder, substituted at spawn time with
+    /// either [`Self::default_model`] or a future per-invocation override.
+    ///
+    /// Empty means the harness has no model-selection flag, and any model
+    /// value is silently ignored. Examples:
+    /// - claude / pi / goose: `["--model", "{model}"]`
+    /// - codex / opencode: `["-m", "{model}"]`
+    /// - copilot: `["--model={model}"]` (combined form)
+    #[serde(default)]
+    pub model_args: Vec<String>,
+    /// Default model identifier forwarded via [`Self::model_args`] on every
+    /// invocation. `None` means "let the harness pick its own default".
+    /// Users opt in by editing config.json — init leaves this empty.
+    #[serde(default)]
+    pub default_model: Option<String>,
 }
 
 /// Top-level ralph-rs configuration.
@@ -73,6 +89,8 @@ impl Default for Config {
                 supports_json_output: true,
                 json_output_args: vec!["--output-format".to_string(), "json".to_string()],
                 agent_file_env: Some("CLAUDE_AGENT_FILE".to_string()),
+                model_args: vec!["--model".to_string(), "{model}".to_string()],
+                default_model: None,
             },
         );
 
@@ -107,6 +125,9 @@ impl Default for Config {
                 supports_json_output: true,
                 json_output_args: vec!["--json".to_string()],
                 agent_file_env: None,
+                // codex accepts `-m <model>` / `--model <model>`.
+                model_args: vec!["-m".to_string(), "{model}".to_string()],
+                default_model: None,
             },
         );
 
@@ -129,6 +150,10 @@ impl Default for Config {
                 supports_json_output: true,
                 json_output_args: vec!["--mode".to_string(), "json".to_string()],
                 agent_file_env: None,
+                // Pi accepts `--model <pattern>` (e.g. `gpt-4o-mini`,
+                // `openai/gpt-4o`, `sonnet:high`).
+                model_args: vec!["--model".to_string(), "{model}".to_string()],
+                default_model: None,
             },
         );
 
@@ -151,6 +176,11 @@ impl Default for Config {
                 supports_json_output: true,
                 json_output_args: vec!["--format".to_string(), "json".to_string()],
                 agent_file_env: None,
+                // opencode expects `-m provider/model` — the user supplies
+                // the full `provider/model` string as the model value
+                // (e.g. `anthropic/claude-sonnet-4-20250514`).
+                model_args: vec!["-m".to_string(), "{model}".to_string()],
+                default_model: None,
             },
         );
 
@@ -184,6 +214,9 @@ impl Default for Config {
                 supports_json_output: true,
                 json_output_args: vec!["--output-format".to_string(), "json".to_string()],
                 agent_file_env: None,
+                // copilot uses `=`-style: `--model=<name>`.
+                model_args: vec!["--model={model}".to_string()],
+                default_model: None,
             },
         );
 
@@ -231,6 +264,11 @@ impl Default for Config {
                 supports_json_output: true,
                 json_output_args: vec!["--output-format".to_string(), "json".to_string()],
                 agent_file_env: Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string()),
+                // goose accepts `--model <name>` on `run`. If your build
+                // instead requires GOOSE_MODEL env var, clear this and set
+                // the env var ambient.
+                model_args: vec!["--model".to_string(), "{model}".to_string()],
+                default_model: None,
             },
         );
 

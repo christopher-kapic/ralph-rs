@@ -991,6 +991,7 @@ mod tests {
                 max_retries: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                model: None,
             })
             .collect()
     }
@@ -1165,8 +1166,8 @@ mod tests {
     fn test_skip_step_by_number() {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
-        storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None).unwrap();
+        storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+        storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None).unwrap();
 
         let skipped = skip_step(&conn, &plan, Some(2), None).unwrap();
         assert_eq!(skipped, 2);
@@ -1180,8 +1181,8 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) =
-            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
-        storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+        storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None).unwrap();
 
         // Mark first as complete so current is "Second".
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -1198,7 +1199,7 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) =
-            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
 
         let result = skip_step(&conn, &plan, Some(1), None);
@@ -1209,7 +1210,7 @@ mod tests {
     fn test_skip_step_out_of_range() {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
+        storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
 
         let result = skip_step(&conn, &plan, Some(5), None);
         assert!(result.is_err());
@@ -1220,7 +1221,7 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) =
-            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Failed).unwrap();
 
         let skipped = skip_step(&conn, &plan, Some(1), None).unwrap();
@@ -1313,7 +1314,7 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            storage::create_step(&conn, &plan.id, "Step", "d", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None).unwrap();
 
         // pending -> in_progress
         storage::update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();
@@ -1331,7 +1332,7 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            storage::create_step(&conn, &plan.id, "Step", "d", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None).unwrap();
 
         storage::update_step_status(&conn, &step.id, StepStatus::Failed).unwrap();
         let s = storage::get_step(&conn, &step.id).unwrap();

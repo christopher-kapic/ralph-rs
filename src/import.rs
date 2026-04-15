@@ -54,6 +54,8 @@ pub struct ImportedStep {
     #[serde(default)]
     pub acceptance_criteria: Vec<String>,
     pub max_retries: Option<i32>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +131,7 @@ pub fn import_plan_from_data(
             step_data.harness.as_deref(),
             &step_data.acceptance_criteria,
             step_data.max_retries,
+            step_data.model.as_deref(),
         )?;
     }
 
@@ -517,6 +520,7 @@ mod tests {
             None,
             &["setup done".to_string()],
             Some(2),
+            None,
         )
         .unwrap();
 
@@ -528,6 +532,7 @@ mod tests {
             None,
             Some("codex"),
             &["code written".to_string(), "tests pass".to_string()],
+            None,
             None,
         )
         .unwrap();

@@ -73,6 +73,7 @@ pub fn step_add(
     after: Option<usize>,
     agent: Option<&str>,
     harness: Option<&str>,
+    model: Option<&str>,
     criteria: &[String],
     max_retries: Option<i32>,
     out: &OutputContext,
@@ -125,6 +126,7 @@ pub fn step_add(
             harness,
             criteria,
             max_retries,
+            model,
         )?
     } else {
         // Append at the end (default)
@@ -137,6 +139,7 @@ pub fn step_add(
             harness,
             criteria,
             max_retries,
+            model,
         )?
     };
 
@@ -223,6 +226,7 @@ pub fn step_add_bulk(
                 s.harness.as_deref(),
                 &s.acceptance_criteria,
                 s.max_retries,
+                s.model.as_deref(),
             )?;
             inserted.push((step, pos));
         }
@@ -301,6 +305,7 @@ pub fn step_edit(
     description: Option<&str>,
     agent: Option<&str>,
     harness: Option<&str>,
+    model: Option<&str>,
     criteria: &[String],
     max_retries: Option<i32>,
     clear_max_retries: bool,
@@ -315,22 +320,25 @@ pub fn step_edit(
         && description.is_none()
         && agent.is_none()
         && harness.is_none()
+        && model.is_none()
         && criteria.is_empty()
         && max_retries.is_none()
         && !clear_max_retries
     {
         bail!(
-            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --criteria, --max-retries, or --clear-max-retries"
+            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --max-retries, or --clear-max-retries"
         );
     }
 
     // We only pass non-None fields to the update function for fields the
     // user explicitly changed. The "None means don't change" rule applies
-    // for agent/harness when the user passed the flag; empty string means
+    // for agent/harness/model when the user passed the flag; empty string means
     // "clear".
     let agent_update = agent.map(|a| if a.is_empty() { None } else { Some(a) });
 
     let harness_update = harness.map(|h| if h.is_empty() { None } else { Some(h) });
+
+    let model_update = model.map(|m| if m.is_empty() { None } else { Some(m) });
 
     // For max_retries: Some(N) means set to N, clear_max_retries means
     // set to NULL (use plan default), None means don't change.
@@ -353,6 +361,7 @@ pub fn step_edit(
             Some(criteria)
         },
         retries_update,
+        model_update,
     )?;
 
     eprintln!(

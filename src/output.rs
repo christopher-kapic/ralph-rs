@@ -332,6 +332,8 @@ pub struct StepSummary {
     pub max_retries: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl From<&Step> for StepSummary {
@@ -350,6 +352,7 @@ impl From<&Step> for StepSummary {
             max_retries: s.max_retries,
             created_at: s.created_at,
             updated_at: s.updated_at,
+            model: s.model.clone(),
         }
     }
 }
@@ -688,6 +691,7 @@ mod tests {
             max_retries: Some(3),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            model: None,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"plan_id\""));

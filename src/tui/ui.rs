@@ -270,6 +270,7 @@ mod tests {
                 max_retries: Some(3),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                model: None,
             })
             .collect();
         App::new(plan, steps)

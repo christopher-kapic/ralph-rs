@@ -52,6 +52,8 @@ pub struct ExportedStep {
     pub harness: Option<String>,
     pub acceptance_criteria: Vec<String>,
     pub max_retries: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +92,7 @@ pub fn build_exported_plan(
             harness: s.harness.clone(),
             acceptance_criteria: s.acceptance_criteria.clone(),
             max_retries: s.max_retries,
+            model: s.model.clone(),
         })
         .collect();
 
@@ -181,6 +184,7 @@ mod tests {
             None,
             &["tests pass".to_string()],
             Some(3),
+            None,
         )
         .unwrap();
 
@@ -192,6 +196,7 @@ mod tests {
             None,
             Some("codex"),
             &[],
+            None,
             None,
         )
         .unwrap();
@@ -245,7 +250,7 @@ mod tests {
         )
         .unwrap();
 
-        storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+        storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         let exported = build_exported_plan(&plan, &steps, Vec::new());
@@ -293,6 +298,7 @@ mod tests {
             None,
             &["criterion".to_string()],
             Some(2),
+            None,
         )
         .unwrap();
 
@@ -323,7 +329,7 @@ mod tests {
         )
         .unwrap();
 
-        storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+        storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("exported.json");
@@ -358,9 +364,9 @@ mod tests {
         .unwrap();
 
         // Steps are created in order and have ascending sort_keys
-        storage::create_step(&conn, &plan.id, "Alpha", "d", None, None, &[], None).unwrap();
-        storage::create_step(&conn, &plan.id, "Beta", "d", None, None, &[], None).unwrap();
-        storage::create_step(&conn, &plan.id, "Gamma", "d", None, None, &[], None).unwrap();
+        storage::create_step(&conn, &plan.id, "Alpha", "d", None, None, &[], None, None).unwrap();
+        storage::create_step(&conn, &plan.id, "Beta", "d", None, None, &[], None, None).unwrap();
+        storage::create_step(&conn, &plan.id, "Gamma", "d", None, None, &[], None, None).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         let exported = build_exported_plan(&plan, &steps, Vec::new());
@@ -386,7 +392,7 @@ mod tests {
         .unwrap();
 
         let (step, _) =
-            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
 
         // Mark step as complete
         storage::update_step_status(&conn, &step.id, StepStatus::Complete).unwrap();

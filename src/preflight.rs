@@ -413,6 +413,8 @@ mod tests {
             supports_json_output: true,
             json_output_args: vec!["--output-format".to_string(), "json".to_string()],
             agent_file_env: None,
+            model_args: vec![],
+            default_model: None,
         };
         let result = check_harness_auth("copilot", &harness);
         assert_eq!(result.severity, CheckSeverity::Warning);
@@ -441,6 +443,8 @@ mod tests {
             supports_json_output: true,
             json_output_args: vec![],
             agent_file_env: None,
+            model_args: vec![],
+            default_model: None,
         };
         let result = check_harness_auth("claude", &harness);
         assert_eq!(result.severity, CheckSeverity::Pass);
