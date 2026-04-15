@@ -57,8 +57,15 @@ fn resolve_plan(
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Load configuration (creates default if absent).
-    let _config = config::load_or_create_config()?;
+    // Load configuration. For `init`, use an in-memory default so we don't
+    // write config.json before cmd_init runs — otherwise its "does the config
+    // already exist?" check would always be true on a fresh install, silently
+    // skipping the interactive harness prompt.
+    let _config = if matches!(&cli.command, Command::Init { .. }) {
+        config::Config::default()
+    } else {
+        config::load_or_create_config()?
+    };
 
     // Open (or create) the database and run any pending migrations.
     let conn = db::open()?;
