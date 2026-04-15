@@ -10,12 +10,13 @@ use crate::config;
 /// Current schema version. Bump this and add a new migration function
 /// to `MIGRATIONS` whenever the schema changes.
 #[allow(dead_code)]
-const CURRENT_VERSION: u32 = 5;
+const CURRENT_VERSION: u32 = 6;
 
 /// Each migration is a function that receives a connection (already inside a transaction).
 /// Migrations are 1-indexed: MIGRATIONS[0] migrates from version 0 → 1.
-const MIGRATIONS: &[fn(&Connection) -> Result<()>] =
-    &[migrate_v1, migrate_v2, migrate_v3, migrate_v4, migrate_v5];
+const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
+    migrate_v1, migrate_v2, migrate_v3, migrate_v4, migrate_v5, migrate_v6,
+];
 
 /// Returns the path to the SQLite database file.
 pub fn db_path() -> Result<PathBuf> {
@@ -237,6 +238,21 @@ fn migrate_v5(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         ALTER TABLE plans ADD COLUMN plan_harness TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V6: per-step model override
+// ---------------------------------------------------------------------------
+
+fn migrate_v6(conn: &Connection) -> Result<()> {
+    // Nullable: `NULL` means "no override — fall back to the harness's
+    // default_model from config, or omit the model flag entirely".
+    conn.execute_batch(
+        "
+        ALTER TABLE steps ADD COLUMN model TEXT;
         ",
     )?;
     Ok(())

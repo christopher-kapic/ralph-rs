@@ -625,6 +625,8 @@ mod tests {
                 supports_json_output: false,
                 json_output_args: vec![],
                 agent_file_env: None,
+                model_args: vec![],
+                default_model: None,
             },
         );
         Config {

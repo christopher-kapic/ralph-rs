@@ -166,6 +166,7 @@ pub fn create_step(
     harness: Option<&str>,
     acceptance_criteria: &[String],
     max_retries: Option<i32>,
+    model: Option<&str>,
 ) -> Result<(Step, usize)> {
     let id = Uuid::new_v4().to_string();
     let criteria_json = serde_json::to_string(acceptance_criteria)?;
@@ -185,9 +186,9 @@ pub fn create_step(
     };
 
     conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries],
+        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model],
     )
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
@@ -204,7 +205,7 @@ pub fn create_step(
 /// List steps for a plan, ordered by sort_key.
 pub fn list_steps(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
          FROM steps WHERE plan_id = ?1 ORDER BY sort_key ASC",
     )?;
 
@@ -219,7 +220,7 @@ pub fn list_steps(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
 /// Fetch a single step by ID.
 pub fn get_step(conn: &Connection, step_id: &str) -> Result<Step> {
     conn.query_row(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
          FROM steps WHERE id = ?1",
         params![step_id],
         Step::from_row,
@@ -234,7 +235,7 @@ pub fn get_step(conn: &Connection, step_id: &str) -> Result<Step> {
 /// a user-supplied `--step-id` flag).
 pub fn get_step_by_id(conn: &Connection, step_id: &str) -> Result<Option<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
          FROM steps WHERE id = ?1",
     )?;
     let mut rows = stmt.query_map(params![step_id], Step::from_row)?;
@@ -279,14 +280,15 @@ pub fn create_step_at(
     harness: Option<&str>,
     acceptance_criteria: &[String],
     max_retries: Option<i32>,
+    model: Option<&str>,
 ) -> Result<(Step, usize)> {
     let id = Uuid::new_v4().to_string();
     let criteria_json = serde_json::to_string(acceptance_criteria)?;
 
     conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries],
+        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model],
     )
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
@@ -322,7 +324,7 @@ pub fn update_step_fields(
     Ok(())
 }
 
-/// Extended step update: title, description, agent, harness, criteria, max_retries.
+/// Extended step update: title, description, agent, harness, criteria, max_retries, model.
 ///
 /// - `agent_update`: `Some(Some("name"))` sets the agent, `Some(None)` clears it
 ///   (sets to NULL), `None` means don't change.
@@ -332,6 +334,8 @@ pub fn update_step_fields(
 /// - `retries_update`: `Some(Some(N))` sets max_retries to N,
 ///   `Some(None)` clears it (sets to NULL / plan default),
 ///   `None` means don't change.
+/// - `model_update`: same pattern as agent — `Some(Some("name"))` sets the
+///   per-step model override, `Some(None)` clears it, `None` means don't change.
 #[allow(clippy::too_many_arguments)]
 pub fn update_step_fields_ext(
     conn: &Connection,
@@ -342,6 +346,7 @@ pub fn update_step_fields_ext(
     harness_update: Option<Option<&str>>,
     criteria_update: Option<&[String]>,
     retries_update: Option<Option<i32>>,
+    model_update: Option<Option<&str>>,
 ) -> Result<()> {
     // Delegate to the simple updater for title/description.
     update_step_fields(conn, step_id, title, description)?;
@@ -369,6 +374,12 @@ pub fn update_step_fields_ext(
         conn.execute(
             "UPDATE steps SET max_retries = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
             params![retries, step_id],
+        )?;
+    }
+    if let Some(model) = model_update {
+        conn.execute(
+            "UPDATE steps SET model = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![model, step_id],
         )?;
     }
     Ok(())
@@ -402,7 +413,7 @@ pub fn update_step_sort_key(conn: &Connection, step_id: &str, sort_key: &str) ->
 #[allow(dead_code)]
 pub fn get_next_pending_step(conn: &Connection, plan_id: &str) -> Result<Option<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
          FROM steps WHERE plan_id = ?1 AND status = 'pending' ORDER BY sort_key ASC LIMIT 1",
     )?;
 
@@ -1000,7 +1011,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "step", "desc", None, None, &[], None).unwrap();
+            create_step(&conn, &plan.id, "step", "desc", None, None, &[], None, None).unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         delete_plan(&conn, &plan.id).unwrap();
@@ -1027,9 +1038,12 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let (s1, _) = create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
-        let (s2, _) = create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None).unwrap();
-        let (s3, _) = create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None).unwrap();
+        let (s1, _) =
+            create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+        let (s2, _) =
+            create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None).unwrap();
+        let (s3, _) =
+            create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None).unwrap();
 
         // Sort keys should be monotonically increasing
         assert!(
@@ -1054,9 +1068,9 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        create_step(&conn, &plan.id, "First", "d", None, None, &[], None).unwrap();
-        create_step(&conn, &plan.id, "Second", "d", None, None, &[], None).unwrap();
-        create_step(&conn, &plan.id, "Third", "d", None, None, &[], None).unwrap();
+        create_step(&conn, &plan.id, "First", "d", None, None, &[], None, None).unwrap();
+        create_step(&conn, &plan.id, "Second", "d", None, None, &[], None, None).unwrap();
+        create_step(&conn, &plan.id, "Third", "d", None, None, &[], None, None).unwrap();
 
         let steps = list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps.len(), 3);
@@ -1085,6 +1099,7 @@ mod tests {
             None,
             &criteria,
             Some(3),
+            None,
         )
         .unwrap();
 
@@ -1099,7 +1114,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
 
         update_step_status(&conn, &step.id, StepStatus::Complete).unwrap();
 
@@ -1112,7 +1127,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         delete_step(&conn, &step.id).unwrap();
@@ -1127,8 +1142,10 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let (s1, _) = create_step(&conn, &plan.id, "First", "d", None, None, &[], None).unwrap();
-        let (s2, _) = create_step(&conn, &plan.id, "Second", "d", None, None, &[], None).unwrap();
+        let (s1, _) =
+            create_step(&conn, &plan.id, "First", "d", None, None, &[], None, None).unwrap();
+        let (s2, _) =
+            create_step(&conn, &plan.id, "Second", "d", None, None, &[], None, None).unwrap();
 
         // Both pending — should return first by sort_key
         let next = get_next_pending_step(&conn, &plan.id).unwrap().unwrap();
@@ -1154,7 +1171,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
 
         let log =
             create_execution_log(&conn, &step.id, 1, Some("do the thing"), Some("sess-1")).unwrap();
@@ -1173,7 +1190,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
 
         create_execution_log(&conn, &step.id, 1, Some("first"), None).unwrap();
         create_execution_log(&conn, &step.id, 2, Some("second"), None).unwrap();
@@ -1188,7 +1205,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         let test_results = vec!["test1: pass".to_string(), "test2: fail".to_string()];
@@ -1248,8 +1265,10 @@ mod tests {
             "No clippy warnings".to_string(),
             "Code coverage > 80%".to_string(),
         ];
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "d", None, None, &criteria, None).unwrap();
+        let (step, _) = create_step(
+            &conn, &plan.id, "Step", "d", None, None, &criteria, None, None,
+        )
+        .unwrap();
 
         let fetched = get_step(&conn, &step.id).unwrap();
         assert_eq!(fetched.acceptance_criteria, criteria);
@@ -1261,7 +1280,8 @@ mod tests {
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         assert!(plan.deterministic_tests.is_empty());
 
-        let (step, _) = create_step(&conn, &plan.id, "Step", "d", None, None, &[], None).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None).unwrap();
         assert!(step.acceptance_criteria.is_empty());
     }
 

@@ -391,12 +391,15 @@ pub async fn execute_step(
             continue;
         }
 
-        // Build harness args and env.
+        // Build harness args and env. `step.model` (if set) overrides the
+        // harness's config-level `default_model`; None on both sides means
+        // the harness is invoked without any model flag.
         let args = harness::build_harness_args(
             harness_name,
             harness_config,
             &prompt_text,
             agent_file_path.as_deref(),
+            step.model.as_deref(),
         );
         let env_vars = harness::build_harness_env(harness_config, agent_file_path.as_deref());
 
@@ -932,7 +935,8 @@ diff --git a/src/lib.rs b/src/lib.rs
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None)
+                .unwrap();
         assert_eq!(step.attempts, 0);
 
         super::increment_step_attempts(&conn, &step.id, 3).unwrap();
@@ -946,11 +950,14 @@ diff --git a/src/lib.rs b/src/lib.rs
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
         let (s1, _) =
-            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
         let (s2, _) =
-            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None)
+                .unwrap();
         let (s3, _) =
-            storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None)
+                .unwrap();
 
         // Mark first two as complete.
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -968,11 +975,14 @@ diff --git a/src/lib.rs b/src/lib.rs
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
         let (s1, _) =
-            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
         let (_s2, _) =
-            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None)
+                .unwrap();
         let (s3, _) =
-            storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None).unwrap();
+            storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None)
+                .unwrap();
 
         // Only first is complete; second is pending.
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();

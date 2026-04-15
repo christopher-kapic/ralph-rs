@@ -421,6 +421,12 @@ pub enum StepCommand {
         #[arg(long, conflicts_with = "import_json")]
         harness: Option<String>,
 
+        /// Per-step model override, forwarded via the harness's `model_args`
+        /// template (e.g. `--model sonnet-4.6`). Silently ignored if the
+        /// resolved harness has no `model_args` configured.
+        #[arg(long, conflicts_with = "import_json")]
+        model: Option<String>,
+
         /// Acceptance criterion (repeatable).
         #[arg(long = "criteria", conflicts_with = "import_json")]
         criteria: Vec<String>,
@@ -491,6 +497,10 @@ pub enum StepCommand {
         /// New harness override. Pass empty string to clear.
         #[arg(long)]
         harness: Option<String>,
+
+        /// New per-step model override. Pass empty string to clear.
+        #[arg(long)]
+        model: Option<String>,
 
         /// Replace acceptance criteria (repeatable). Clears existing criteria.
         #[arg(long = "criteria")]
