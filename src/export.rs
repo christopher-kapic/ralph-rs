@@ -392,7 +392,8 @@ mod tests {
         .unwrap();
 
         let (step, _) =
-            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None)
+                .unwrap();
 
         // Mark step as complete
         storage::update_step_status(&conn, &step.id, StepStatus::Complete).unwrap();

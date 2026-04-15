@@ -1181,7 +1181,8 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) =
-            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
         storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None).unwrap();
 
         // Mark first as complete so current is "Second".
@@ -1199,7 +1200,8 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) =
-            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
 
         let result = skip_step(&conn, &plan, Some(1), None);
@@ -1221,7 +1223,8 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) =
-            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Failed).unwrap();
 
         let skipped = skip_step(&conn, &plan, Some(1), None).unwrap();
@@ -1314,7 +1317,8 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            storage::create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None).unwrap();
+            storage::create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None)
+                .unwrap();
 
         // pending -> in_progress
         storage::update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();
@@ -1332,7 +1336,8 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            storage::create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None).unwrap();
+            storage::create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None)
+                .unwrap();
 
         storage::update_step_status(&conn, &step.id, StepStatus::Failed).unwrap();
         let s = storage::get_step(&conn, &step.id).unwrap();

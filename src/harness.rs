@@ -522,7 +522,10 @@ mod tests {
         let args = build_harness_args("pi", &hc, "q", None, None);
         // pi's model_args is ["--model", "{model}"], so we expect the
         // substituted pair to land at the end of the args.
-        assert!(args.windows(2).any(|w| w[0] == "--model" && w[1] == "sonnet-4.6"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "sonnet-4.6")
+        );
     }
 
     #[test]
@@ -532,7 +535,10 @@ mod tests {
         hc.default_model = Some("sonnet-4.6".to_string());
 
         let args = build_harness_args("pi", &hc, "q", None, Some("opus-4.6"));
-        assert!(args.windows(2).any(|w| w[0] == "--model" && w[1] == "opus-4.6"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--model" && w[1] == "opus-4.6")
+        );
         assert!(
             !args.iter().any(|a| a == "sonnet-4.6"),
             "default_model should have been overridden, got: {args:?}"

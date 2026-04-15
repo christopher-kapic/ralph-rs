@@ -1038,9 +1038,12 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let (s1, _) = create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
-        let (s2, _) = create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None).unwrap();
-        let (s3, _) = create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None).unwrap();
+        let (s1, _) =
+            create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+        let (s2, _) =
+            create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None).unwrap();
+        let (s3, _) =
+            create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None).unwrap();
 
         // Sort keys should be monotonically increasing
         assert!(
@@ -1139,8 +1142,10 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let (s1, _) = create_step(&conn, &plan.id, "First", "d", None, None, &[], None, None).unwrap();
-        let (s2, _) = create_step(&conn, &plan.id, "Second", "d", None, None, &[], None, None).unwrap();
+        let (s1, _) =
+            create_step(&conn, &plan.id, "First", "d", None, None, &[], None, None).unwrap();
+        let (s2, _) =
+            create_step(&conn, &plan.id, "Second", "d", None, None, &[], None, None).unwrap();
 
         // Both pending — should return first by sort_key
         let next = get_next_pending_step(&conn, &plan.id).unwrap().unwrap();
@@ -1260,8 +1265,10 @@ mod tests {
             "No clippy warnings".to_string(),
             "Code coverage > 80%".to_string(),
         ];
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "d", None, None, &criteria, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn, &plan.id, "Step", "d", None, None, &criteria, None, None,
+        )
+        .unwrap();
 
         let fetched = get_step(&conn, &step.id).unwrap();
         assert_eq!(fetched.acceptance_criteria, criteria);
@@ -1273,7 +1280,8 @@ mod tests {
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         assert!(plan.deterministic_tests.is_empty());
 
-        let (step, _) = create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None).unwrap();
         assert!(step.acceptance_criteria.is_empty());
     }
 
