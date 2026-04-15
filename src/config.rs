@@ -34,9 +34,21 @@ pub struct HarnessConfig {
     /// Additional args to enable JSON output mode.
     #[serde(default)]
     pub json_output_args: Vec<String>,
-    /// Environment variable name used to point to the agent file.
+    /// Environment variable name used to point to the agent file. Only read
+    /// when `supports_agent_file` is false — harnesses that take a flag set
+    /// this to `None`. Used by goose (`GOOSE_SYSTEM_PROMPT_FILE_PATH`).
     #[serde(default)]
     pub agent_file_env: Option<String>,
+    /// Argument template for forwarding an agent file path via a CLI flag.
+    /// Supports the `{agent_file}` placeholder, substituted at spawn time
+    /// when `supports_agent_file` is true.
+    ///
+    /// Empty means the harness has no flag to forward the agent file through
+    /// — and if `agent_file_env` is also None, no agent file is passed.
+    /// Examples:
+    /// - claude: `["--system-prompt-file", "{agent_file}"]`
+    #[serde(default)]
+    pub agent_file_args: Vec<String>,
     /// Argument template for forwarding a model selection to the harness.
     /// Supports the `{model}` placeholder, substituted at spawn time with
     /// either [`Self::default_model`] or a future per-invocation override.
@@ -88,7 +100,14 @@ impl Default for Config {
                 supports_agent_file: true,
                 supports_json_output: true,
                 json_output_args: vec!["--output-format".to_string(), "json".to_string()],
-                agent_file_env: Some("CLAUDE_AGENT_FILE".to_string()),
+                // Claude takes the agent file via `--system-prompt-file`,
+                // not via env var — `supports_agent_file` is true so the
+                // env var path in `build_harness_env` is unreachable.
+                agent_file_env: None,
+                agent_file_args: vec![
+                    "--system-prompt-file".to_string(),
+                    "{agent_file}".to_string(),
+                ],
                 model_args: vec!["--model".to_string(), "{model}".to_string()],
                 default_model: None,
             },
@@ -125,6 +144,7 @@ impl Default for Config {
                 supports_json_output: true,
                 json_output_args: vec!["--json".to_string()],
                 agent_file_env: None,
+                agent_file_args: vec![],
                 // codex accepts `-m <model>` / `--model <model>`.
                 model_args: vec!["-m".to_string(), "{model}".to_string()],
                 default_model: None,
@@ -150,6 +170,7 @@ impl Default for Config {
                 supports_json_output: true,
                 json_output_args: vec!["--mode".to_string(), "json".to_string()],
                 agent_file_env: None,
+                agent_file_args: vec![],
                 // Pi accepts `--model <pattern>` (e.g. `gpt-4o-mini`,
                 // `openai/gpt-4o`, `sonnet:high`).
                 model_args: vec!["--model".to_string(), "{model}".to_string()],
@@ -176,6 +197,7 @@ impl Default for Config {
                 supports_json_output: true,
                 json_output_args: vec!["--format".to_string(), "json".to_string()],
                 agent_file_env: None,
+                agent_file_args: vec![],
                 // opencode expects `-m provider/model` — the user supplies
                 // the full `provider/model` string as the model value
                 // (e.g. `anthropic/claude-sonnet-4-20250514`).
@@ -214,6 +236,7 @@ impl Default for Config {
                 supports_json_output: true,
                 json_output_args: vec!["--output-format".to_string(), "json".to_string()],
                 agent_file_env: None,
+                agent_file_args: vec![],
                 // copilot uses `=`-style: `--model=<name>`.
                 model_args: vec!["--model={model}".to_string()],
                 default_model: None,
@@ -264,6 +287,7 @@ impl Default for Config {
                 supports_json_output: true,
                 json_output_args: vec!["--output-format".to_string(), "json".to_string()],
                 agent_file_env: Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string()),
+                agent_file_args: vec![],
                 // goose accepts `--model <name>` on `run`. If your build
                 // instead requires GOOSE_MODEL env var, clear this and set
                 // the env var ambient.
@@ -379,7 +403,17 @@ mod tests {
         assert!(claude.supports_agent_file);
         assert!(claude.supports_json_output);
         assert!(!claude.json_output_args.is_empty());
-        assert!(claude.agent_file_env.is_some());
+        // Claude takes the agent file via --system-prompt-file, not via env.
+        // `agent_file_env` is only read when supports_agent_file is false,
+        // so setting it on claude would be dead config.
+        assert!(claude.agent_file_env.is_none());
+        assert_eq!(
+            claude.agent_file_args,
+            vec![
+                "--system-prompt-file".to_string(),
+                "{agent_file}".to_string(),
+            ]
+        );
         // Claude plan_args must reference the agent file natively and
         // carry the prompt placeholder.
         assert!(!claude.plan_args.is_empty());

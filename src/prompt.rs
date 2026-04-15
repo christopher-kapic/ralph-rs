@@ -1,7 +1,5 @@
 // Prompt generation
 
-use std::path::Path;
-
 use crate::plan::{Plan, Step, StepStatus};
 
 /// Context from a previous failed attempt, used when retrying a step.
@@ -35,7 +33,7 @@ pub struct PriorStepSummary {
 /// Build the full prompt for a step execution.
 ///
 /// The prompt is assembled from 8 parts:
-/// 1. Agent definition (from agent file content, if available)
+/// 1. Agent pointer (instructs the harness to fetch the agent profile itself)
 /// 2. Retry context (if this is a retry attempt)
 /// 3. Plan context (plan description and overall goal)
 /// 4. Prior steps summary (what has been done so far)
@@ -47,17 +45,20 @@ pub fn build_step_prompt(
     plan: &Plan,
     step: &Step,
     prior_steps: &[PriorStepSummary],
-    agent_file_content: Option<&str>,
+    agent_name: Option<&str>,
     retry_context: Option<&RetryContext>,
     harness_supports_agent_file: bool,
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
 
-    // 1. Agent definition
-    // Only prepend agent content for harnesses without native agent file support.
-    // Harnesses with native support (e.g., claude) receive the agent file via flag/env.
-    if !harness_supports_agent_file && let Some(agent_content) = agent_file_content {
-        sections.push(format_agent_definition(agent_content));
+    // 1. Agent pointer
+    // For harnesses without native agent-file support, point the agent at
+    // `ralph agents show <name>` rather than inlining the full file — the
+    // agent can fetch it on demand and we save tokens in every prompt.
+    // Native-support harnesses (e.g. claude --agent-file) already receive
+    // the file by reference, so no pointer is needed.
+    if !harness_supports_agent_file && let Some(name) = agent_name {
+        sections.push(format_agent_pointer(name));
     }
 
     // 2. Retry context
@@ -96,10 +97,11 @@ pub fn build_step_prompt(
 // Section formatters
 // ---------------------------------------------------------------------------
 
-fn format_agent_definition(content: &str) -> String {
+fn format_agent_pointer(name: &str) -> String {
     format!(
-        "# Agent Definition\n\n\
-         {content}"
+        "# Agent Profile\n\n\
+         You are executing a ralph step. Before starting, run \
+         `ralph agents show {name}` to read your assigned agent guidance."
     )
 }
 
@@ -234,11 +236,6 @@ fn truncate_text(text: &str, max_lines: usize) -> String {
     }
 }
 
-/// Read agent file content from a path, returning None if the file doesn't exist.
-pub fn read_agent_file(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path).ok()
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -341,43 +338,60 @@ mod tests {
     }
 
     #[test]
-    fn test_build_step_prompt_with_agent_file_prepend() {
+    fn test_build_step_prompt_emits_pointer_for_non_native_harness() {
         let plan = make_plan();
         let step = make_step();
-        let agent_content = "You are a senior engineer. Follow best practices.";
 
         let prompt = build_step_prompt(
             &plan,
             &step,
             &[],
-            Some(agent_content),
+            Some("senior-engineer"),
             None,
             false, // harness does NOT support agent file natively
         );
 
-        // Agent definition should be prepended
-        assert!(prompt.starts_with("# Agent Definition"));
-        assert!(prompt.contains("senior engineer"));
+        // A short pointer should be prepended telling the agent to run
+        // `ralph agents show <name>` rather than inlining the full file.
+        assert!(prompt.starts_with("# Agent Profile"));
+        assert!(prompt.contains("ralph agents show senior-engineer"));
     }
 
     #[test]
-    fn test_build_step_prompt_no_agent_prepend_when_native() {
+    fn test_build_step_prompt_no_agent_pointer_when_native() {
         let plan = make_plan();
         let step = make_step();
-        let agent_content = "You are a senior engineer.";
 
         let prompt = build_step_prompt(
             &plan,
             &step,
             &[],
-            Some(agent_content),
+            Some("senior-engineer"),
             None,
             true, // harness supports agent file natively
         );
 
-        // Agent definition should NOT be in the prompt
-        assert!(!prompt.contains("# Agent Definition"));
-        assert!(!prompt.contains("senior engineer"));
+        // Pointer section should NOT be in the prompt — the harness gets
+        // the agent file by reference via its native flag/env var.
+        assert!(!prompt.contains("# Agent Profile"));
+        assert!(!prompt.contains("ralph agents show"));
+    }
+
+    #[test]
+    fn test_build_step_prompt_no_agent_pointer_when_no_agent() {
+        let plan = make_plan();
+        let step = make_step();
+
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &[],
+            None,
+            None,
+            false, // non-native, but no agent assigned
+        );
+
+        assert!(!prompt.contains("# Agent Profile"));
     }
 
     #[test]
@@ -512,12 +526,6 @@ mod tests {
     }
 
     #[test]
-    fn test_read_agent_file_nonexistent() {
-        let result = read_agent_file(Path::new("/nonexistent/path/agent.md"));
-        assert!(result.is_none());
-    }
-
-    #[test]
     fn test_prompt_section_order() {
         let plan = make_plan();
         let step = make_step();
@@ -535,11 +543,17 @@ mod tests {
             files_modified: vec![],
         };
 
-        let prompt =
-            build_step_prompt(&plan, &step, &prior, Some("agent def"), Some(&retry), false);
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &prior,
+            Some("senior-engineer"),
+            Some(&retry),
+            false,
+        );
 
         // Verify ordering: agent -> retry -> plan -> prior -> step -> criteria -> tests -> focus
-        let agent_pos = prompt.find("# Agent Definition").unwrap();
+        let agent_pos = prompt.find("# Agent Profile").unwrap();
         let retry_pos = prompt.find("# Retry Context").unwrap();
         let plan_pos = prompt.find("# Plan:").unwrap();
         let prior_pos = prompt.find("Context from Prior Steps").unwrap();

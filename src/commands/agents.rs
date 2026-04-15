@@ -99,13 +99,45 @@ pub fn cmd_agents_create(
     let contents = if let Some(src) = file {
         std::fs::read_to_string(src).with_context(|| format!("Failed to read {}", src.display()))?
     } else {
-        format!("# {name}\n\nAgent instructions go here.\n")
+        default_agent_scaffold(name)
     };
 
     std::fs::write(&path, &contents)
         .with_context(|| format!("Failed to write {}", path.display()))?;
     eprintln!("Created agent file: {}", path.display());
     Ok(())
+}
+
+/// Default scaffold for a freshly-created agent file. Gives the author a
+/// handful of prompts to fill in rather than a blank page.
+fn default_agent_scaffold(name: &str) -> String {
+    format!(
+        "# {name}\n\
+         \n\
+         ## Role\n\
+         \n\
+         Describe who this agent is and what perspective it brings. \
+         One or two sentences.\n\
+         \n\
+         ## Responsibilities\n\
+         \n\
+         - What should this agent do on every step?\n\
+         - What decisions is it empowered to make?\n\
+         \n\
+         ## Constraints\n\
+         \n\
+         - What should this agent never do?\n\
+         - Any files, directories, or tools that are off-limits?\n\
+         \n\
+         ## Output Expectations\n\
+         \n\
+         Describe the shape of a good result: tone, commit style, \
+         how to surface uncertainty, when to ask for help.\n\
+         \n\
+         ## Notes\n\
+         \n\
+         Free-form context, links, or reminders for future runs.\n"
+    )
 }
 
 pub fn cmd_agents_delete(name: &str, _out: &OutputContext) -> Result<()> {

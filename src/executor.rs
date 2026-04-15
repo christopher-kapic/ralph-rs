@@ -338,15 +338,16 @@ pub async fn execute_step(
             None
         };
 
-        // Read agent file content.
-        let agent_content = agent_file_path.as_deref().and_then(prompt::read_agent_file);
+        // Resolve the assigned agent name (used for the pointer section in
+        // prompts when the harness can't take an agent file directly).
+        let agent_name = step.agent.as_deref().or(plan.agent.as_deref());
 
         // Build prompt.
         let prompt_text = prompt::build_step_prompt(
             plan,
             step,
             &prior_steps,
-            agent_content.as_deref(),
+            agent_name,
             retry_context.as_ref(),
             harness_config.supports_agent_file,
         );

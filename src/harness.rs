@@ -113,34 +113,37 @@ pub fn build_harness_args(
 
 /// Inject the agent file path into the args based on harness type.
 ///
-/// - **claude**: Uses native `--agent-file` flag (supports_agent_file = true)
-/// - **codex, pi, opencode, copilot**: Agent content is prepended to the prompt
-///   (handled externally in prompt construction, not here)
-/// - **goose**: Uses environment variable (handled via agent_file_env)
+/// - **claude**: Uses native `--system-prompt-file` flag via `agent_file_args`
+///   (supports_agent_file = true)
+/// - **codex, pi, opencode, copilot**: Prompt carries a `ralph agents show`
+///   pointer (see prompt.rs) — this function is a no-op for them.
+/// - **goose**: Uses environment variable (handled via agent_file_env in
+///   `build_harness_env`, not here)
 fn inject_agent_file(
     _harness_name: &str,
     harness_config: &HarnessConfig,
     args: &mut Vec<String>,
     agent_path: &str,
 ) {
-    if harness_config.supports_agent_file {
-        // Native flag support (e.g., claude --agent-file <path>)
-        // Replace any {agent_file} placeholder, or add the flag
-        let has_placeholder = args.iter().any(|a| a.contains(AGENT_FILE_PLACEHOLDER));
-        if has_placeholder {
-            *args = args
-                .iter()
-                .map(|a| a.replace(AGENT_FILE_PLACEHOLDER, agent_path))
-                .collect();
-        } else {
-            args.push("--agent-file".to_string());
-            args.push(agent_path.to_string());
-        }
+    if !harness_config.supports_agent_file {
+        return;
     }
-    // For harnesses using agent_file_env (goose), environment variable is set
-    // on the Command, not in args — handled in spawn_harness().
-    // For harnesses without native support (codex, pi, opencode, copilot),
-    // the agent file content is prepended to the prompt in prompt.rs.
+
+    // If the harness's args already contain an `{agent_file}` placeholder
+    // (e.g. a user custom config embedding the flag inline), substitute
+    // in place. Otherwise, apply the `agent_file_args` template.
+    let has_inline_placeholder = args.iter().any(|a| a.contains(AGENT_FILE_PLACEHOLDER));
+    if has_inline_placeholder {
+        *args = args
+            .iter()
+            .map(|a| a.replace(AGENT_FILE_PLACEHOLDER, agent_path))
+            .collect();
+        return;
+    }
+
+    for arg in &harness_config.agent_file_args {
+        args.push(arg.replace(AGENT_FILE_PLACEHOLDER, agent_path));
+    }
 }
 
 /// Remove `{agent_file}` placeholder tokens and their associated flags from args.
@@ -382,6 +385,7 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: None,
+            agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
         };
@@ -400,6 +404,7 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: None,
+            agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
         };
@@ -432,6 +437,7 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec!["--this-should-not-appear".to_string()],
             agent_file_env: None,
+            agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
         };
@@ -479,8 +485,13 @@ mod tests {
         let agent_path = Path::new("/home/user/.ralph2/agents/default.md");
 
         let args = build_harness_args("claude", hc, "do stuff", Some(agent_path), None);
-        assert!(args.contains(&"--agent-file".to_string()));
-        assert!(args.contains(&"/home/user/.ralph2/agents/default.md".to_string()));
+        // Claude's real flag is --system-prompt-file (not --agent-file),
+        // forwarded via the agent_file_args template.
+        assert!(
+            args.windows(2).any(|w| w[0] == "--system-prompt-file"
+                && w[1] == "/home/user/.ralph2/agents/default.md"),
+            "expected --system-prompt-file <path> pair in args, got: {args:?}"
+        );
     }
 
     #[test]
@@ -489,7 +500,7 @@ mod tests {
         let hc = &config.harnesses["claude"];
 
         let args = build_harness_args("claude", hc, "do stuff", None, None);
-        assert!(!args.contains(&"--agent-file".to_string()));
+        assert!(!args.contains(&"--system-prompt-file".to_string()));
     }
 
     #[test]
@@ -589,6 +600,7 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string()),
+            agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
         };
@@ -610,6 +622,7 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: Some("GOOSE_SYSTEM_PROMPT_FILE_PATH".to_string()),
+            agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
         };
@@ -660,6 +673,7 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: None,
+            agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
         };
@@ -682,6 +696,7 @@ mod tests {
             supports_json_output: false,
             json_output_args: vec![],
             agent_file_env: None,
+            agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
         };
