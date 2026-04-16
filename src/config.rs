@@ -4,7 +4,8 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 /// Configuration for a single coding agent harness.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -411,25 +412,70 @@ pub fn agents_dir() -> Result<PathBuf> {
 pub fn load_or_create_config() -> Result<Config> {
     let dir = config_dir()?;
     let path = dir.join("config.json");
+    load_or_create_config_at(&dir, &path)
+}
 
+/// Core logic for `load_or_create_config`, parameterized on paths so tests
+/// can exercise concurrent callers. Writes the default to a unique tmp
+/// file and uses `hard_link` to atomically publish it, closing the
+/// TOCTOU gap: concurrent readers never observe a partially-written file,
+/// and at most one writer wins the link race. Losers fall back to reading
+/// the winner's file.
+fn load_or_create_config_at(dir: &Path, path: &Path) -> Result<Config> {
     if path.exists() {
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let config: Config = serde_json::from_str(&contents)
-            .with_context(|| format!("Failed to parse {}", path.display()))?;
-        config
-            .validate()
-            .with_context(|| format!("Invalid config at {}", path.display()))?;
-        Ok(config)
-    } else {
-        let config = Config::default();
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create config directory {}", dir.display()))?;
-        let json = serde_json::to_string_pretty(&config)?;
-        fs::write(&path, &json)
-            .with_context(|| format!("Failed to write default config to {}", path.display()))?;
-        Ok(config)
+        return read_and_validate(path);
     }
+
+    fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create config directory {}", dir.display()))?;
+
+    let default = Config::default();
+    let json = serde_json::to_string_pretty(&default)?;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        "config.json.tmp-{}-{}-{:x}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        nanos,
+    ));
+
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("Failed to create tmp file {}", tmp.display()))?;
+    let write_result = f
+        .write_all(json.as_bytes())
+        .and_then(|_| f.sync_all())
+        .with_context(|| format!("Failed to write tmp file {}", tmp.display()));
+    drop(f);
+
+    let result = write_result.and_then(|_| match fs::hard_link(&tmp, path) {
+        Ok(()) => Ok(default),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => read_and_validate(path),
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("Failed to publish {}", path.display())),
+    });
+
+    let _ = fs::remove_file(&tmp);
+    result
+}
+
+fn read_and_validate(path: &Path) -> Result<Config> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let config: Config = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    config
+        .validate()
+        .with_context(|| format!("Invalid config at {}", path.display()))?;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -687,6 +733,44 @@ mod tests {
         let contents = std::fs::read_to_string(&config_path).expect("read");
         let loaded: Config = serde_json::from_str(&contents).expect("deserialize");
         assert_eq!(config, loaded);
+    }
+
+    #[test]
+    fn test_load_or_create_config_at_is_toctou_safe() {
+        // L22: simultaneous callers must end with exactly one config file
+        // and no errors — a naive exists()/write() pair lets the last
+        // writer clobber an earlier writer's contents.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("ralph-rs");
+        let path = dir.join("config.json");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let dir = dir.clone();
+                let path = path.clone();
+                let barrier = barrier.clone();
+                s.spawn(move || {
+                    barrier.wait();
+                    load_or_create_config_at(&dir, &path)
+                        .expect("concurrent load_or_create_config_at must not fail");
+                });
+            }
+        });
+
+        assert!(path.exists(), "config.json must exist after contention");
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one file should exist, got: {:?}",
+            entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+        let contents = std::fs::read_to_string(&path).expect("read");
+        let _: Config = serde_json::from_str(&contents).expect("parse");
     }
 
     #[test]
