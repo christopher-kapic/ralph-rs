@@ -376,6 +376,7 @@ mod tests {
             PlanStatus::Complete,
             PlanStatus::Failed,
             PlanStatus::Aborted,
+            PlanStatus::Archived,
         ];
         for status in &statuses {
             let s = status.as_str();
