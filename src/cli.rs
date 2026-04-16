@@ -373,7 +373,7 @@ pub enum PlanDependencyCommand {
         slug: String,
 
         /// Slug of the dependency to remove (can be repeated).
-        #[arg(long = "depends-on", num_args = 1..)]
+        #[arg(long = "depends-on", num_args = 1.., required = true)]
         depends_on: Vec<String>,
     },
 
