@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::config;
 use crate::output::{self, OutputContext, OutputFormat};
+use crate::validate::validate_name;
 
 // ---------------------------------------------------------------------------
 // Agents commands
@@ -70,6 +71,7 @@ pub fn cmd_agents_list(out: &OutputContext) -> Result<()> {
 }
 
 pub fn cmd_agents_show(name: &str, _out: &OutputContext) -> Result<()> {
+    validate_name(name)?;
     let agents_dir = config::agents_dir()?;
     let path = agents_dir.join(format!("{name}.md"));
 
@@ -88,6 +90,7 @@ pub fn cmd_agents_create(
     file: Option<&std::path::Path>,
     _out: &OutputContext,
 ) -> Result<()> {
+    validate_name(name)?;
     let agents_dir = config::agents_dir()?;
     std::fs::create_dir_all(&agents_dir)?;
     let path = agents_dir.join(format!("{name}.md"));
@@ -141,6 +144,7 @@ fn default_agent_scaffold(name: &str) -> String {
 }
 
 pub fn cmd_agents_delete(name: &str, _out: &OutputContext) -> Result<()> {
+    validate_name(name)?;
     let agents_dir = config::agents_dir()?;
     let path = agents_dir.join(format!("{name}.md"));
 

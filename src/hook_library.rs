@@ -25,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+use crate::validate::validate_name;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -113,6 +114,7 @@ pub fn hooks_dir() -> Result<PathBuf> {
 }
 
 fn hook_path(name: &str) -> Result<PathBuf> {
+    validate_name(name)?;
     Ok(hooks_dir()?.join(format!("{name}.md")))
 }
 
@@ -365,6 +367,7 @@ pub fn try_load(name: &str) -> Result<Option<Hook>> {
 /// Save a hook to disk. Fails if a hook with the same name already exists
 /// and `force` is false.
 pub fn save(hook: &Hook, force: bool) -> Result<PathBuf> {
+    validate_name(&hook.name)?;
     let dir = hooks_dir()?;
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create hooks directory {}", dir.display()))?;

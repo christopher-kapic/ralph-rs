@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::hook_library::{self, Hook, HookBundle, Lifecycle, Scope};
 use crate::output::{self, OutputContext, OutputFormat};
+use crate::validate::validate_name;
 
 // ---------------------------------------------------------------------------
 // Hooks commands
@@ -79,6 +80,7 @@ pub fn cmd_hooks_list(project: &str, all: bool, out: &OutputContext) -> Result<(
 }
 
 pub fn cmd_hooks_show(name: &str, _out: &OutputContext) -> Result<()> {
+    validate_name(name)?;
     let path = hook_library::hooks_dir()?.join(format!("{name}.md"));
     if !path.exists() {
         bail!("Hook not found: {name}");
@@ -98,6 +100,7 @@ pub fn cmd_hooks_add(
     force: bool,
     _out: &OutputContext,
 ) -> Result<()> {
+    validate_name(name)?;
     let scope = if scope_paths.is_empty() {
         Scope::Global
     } else {
@@ -128,6 +131,7 @@ pub fn cmd_hooks_add(
 }
 
 pub fn cmd_hooks_remove(name: &str, _out: &OutputContext) -> Result<()> {
+    validate_name(name)?;
     hook_library::delete(name)?;
     eprintln!("Deleted hook '{name}'");
     Ok(())

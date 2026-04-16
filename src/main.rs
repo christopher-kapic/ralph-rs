@@ -20,6 +20,7 @@ mod runner;
 mod signal;
 mod storage;
 mod test_runner;
+mod validate;
 #[allow(dead_code)]
 mod tui;
 
