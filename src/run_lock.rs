@@ -196,22 +196,23 @@ fn acquire_txn(
     force: bool,
 ) -> Result<()> {
     let my_pid = std::process::id() as i64;
+    let my_start_token = process_start_token(my_pid);
 
     if force {
         conn.execute("DELETE FROM run_locks WHERE project = ?1", params![project])
             .context("clearing run_locks row for --force")?;
     } else {
-        let existing: Option<(i64, Option<String>, String)> = conn
+        let existing: Option<(i64, Option<String>, Option<String>, String)> = conn
             .query_row(
-                "SELECT pid, plan_slug, started_at FROM run_locks WHERE project = ?1",
+                "SELECT pid, pid_start_token, plan_slug, started_at FROM run_locks WHERE project = ?1",
                 params![project],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .context("querying run_locks")?;
 
-        if let Some((pid, existing_slug, started_at)) = existing {
-            if pid_is_alive(pid) {
+        if let Some((pid, stored_start_token, existing_slug, started_at)) = existing {
+            if is_same_live_process(pid, stored_start_token.as_deref()) {
                 let plan_label = existing_slug.as_deref().unwrap_or("<all plans>");
                 let db_path = db::db_path()?;
                 let db_path_display = db_path.display();
@@ -228,8 +229,8 @@ fn acquire_txn(
     }
 
     conn.execute(
-        "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
-        params![project, my_pid, plan_id, plan_slug],
+        "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![project, my_pid, my_start_token, plan_id, plan_slug],
     )
     .context("inserting run_locks row")?;
 
@@ -259,6 +260,67 @@ fn pid_is_alive(pid: i64) -> bool {
     {
         let _ = Command::new("true").status();
         true
+    }
+}
+
+/// Returns true only if `pid` is alive AND the current process at that pid is
+/// the same one that wrote the lock row. Without the second check, a recycled
+/// pid — i.e. an unrelated live process that inherited the dead runner's pid —
+/// would make `pid_is_alive` falsely report the lock as active and block the
+/// new run forever. When `stored_start_token` is `None` (pre-v9 row or
+/// unknown-platform writer) we fall back to liveness alone; when we can't
+/// read the live process's current token we conservatively assume same
+/// process, because blocking a duplicate run is strictly safer than
+/// clobbering a live one.
+fn is_same_live_process(pid: i64, stored_start_token: Option<&str>) -> bool {
+    if !pid_is_alive(pid) {
+        return false;
+    }
+    let Some(expected) = stored_start_token else {
+        return true;
+    };
+    match process_start_token(pid) {
+        Some(current) => current == expected,
+        None => true,
+    }
+}
+
+/// Returns a stable identifier for the process `pid`'s lifetime — distinct
+/// across every `pid` reuse. On Linux reads field 22 (starttime in clock
+/// ticks since boot) from `/proc/<pid>/stat`. On other Unix falls back to
+/// `ps -o lstart=`. Returns `None` when we can't determine a token, in which
+/// case callers should fall back to liveness-only checking.
+fn process_start_token(pid: i64) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let contents = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // `comm` (field 2) is wrapped in parens and may itself contain
+        // whitespace or parens, so split on the LAST ')' to skip over it
+        // safely. After that, fields[0] is `state` (field 3), fields[1] is
+        // `ppid` (field 4), …, fields[19] is `starttime` (field 22).
+        let after_comm = contents.rfind(')')?;
+        let rest = contents[after_comm + 1..].trim_start();
+        rest.split_whitespace().nth(19).map(|s| s.to_string())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let output = Command::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let s = String::from_utf8(output.stdout).ok()?;
+        let s = s.trim();
+        if s.is_empty() { None } else { Some(s.to_string()) }
+    }
+    #[cfg(not(unix))]
+    {
+        None
     }
 }
 
@@ -566,9 +628,89 @@ mod tests {
         assert!(!pid_is_alive(-1));
     }
 
+    #[test]
+    fn is_same_live_process_missing_stored_token_falls_back_to_liveness() {
+        // Pre-v9 rows lack a token — we must not treat that as a mismatch, or
+        // every upgrade would spuriously reclaim a live lock.
+        assert!(is_same_live_process(std::process::id() as i64, None));
+        assert!(!is_same_live_process(0x7FFF_FFFE, None));
+    }
+
+    /// Linux-gated because reliable PID→start-token resolution happens via
+    /// `/proc/<pid>/stat`. On other platforms we fall back to `ps -o lstart=`
+    /// (or `None` on Windows) and the conservative-same-process branch hides
+    /// the mismatch we want to exercise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_reuse_with_mismatched_start_token_reclaims_lock() {
+        // Simulate the PID-reuse scenario: an earlier ralph process had the
+        // same pid we now have but a different start token. Liveness alone
+        // (`kill -0 <my_pid>`) would report the lock as active; the start
+        // token comparison must catch the reuse and let us reclaim.
+        let conn = mem_db();
+        let my_pid = std::process::id() as i64;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "/tmp/proj-pidreuse",
+                my_pid,
+                "fabricated-stale-token",
+                "p-old",
+                "old",
+            ],
+        )
+        .unwrap();
+
+        let _lock = acquire_inner(
+            &conn,
+            "/tmp/proj-pidreuse",
+            Some("new"),
+            Some("p-new"),
+            false,
+            noop_release(),
+        )
+        .expect(
+            "acquire should reclaim: pid matches but the recorded start token \
+             differs from the live process's current start token",
+        );
+
+        // The row should now reflect our identity, with a real token (Some).
+        let (pid, token, slug): (i64, Option<String>, String) = conn
+            .query_row(
+                "SELECT pid, pid_start_token, plan_slug FROM run_locks WHERE project = ?1",
+                params!["/tmp/proj-pidreuse"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pid, my_pid);
+        assert_eq!(slug, "new");
+        assert!(
+            token.is_some() && token.as_deref() != Some("fabricated-stale-token"),
+            "stored token should be the live process's real token, got {token:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_start_token_self_is_stable_and_nonempty() {
+        let me = std::process::id() as i64;
+        let a = process_start_token(me).expect("linux /proc should yield a token");
+        let b = process_start_token(me).expect("linux /proc should yield a token");
+        assert!(!a.is_empty());
+        assert_eq!(
+            a, b,
+            "start token for the same process should be stable across reads"
+        );
+        // Dead/invalid pids must not surface a token.
+        assert_eq!(process_start_token(0), None);
+        assert_eq!(process_start_token(-1), None);
+        assert_eq!(process_start_token(0x7FFF_FFFE), None);
+    }
+
     /// Opens a file-backed connection with just the `run_locks` table so the
     /// concurrent-acquire test can drive multiple connections against the same
-    /// underlying database. Mirrors migration v4's schema.
+    /// underlying database. Mirrors migrations v4 + v9.
     fn open_file_db(path: &std::path::Path) -> Connection {
         let conn = Connection::open(path).expect("open file db");
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
@@ -579,7 +721,8 @@ mod tests {
                 pid INTEGER NOT NULL,
                 plan_id TEXT,
                 plan_slug TEXT,
-                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                pid_start_token TEXT
             );
             ",
         )

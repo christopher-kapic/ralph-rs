@@ -18,6 +18,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v6,
     migrate_v7,
     migrate_v8,
+    migrate_v9,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -312,6 +313,27 @@ fn migrate_v8(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         ALTER TABLE steps ADD COLUMN skipped_reason TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V9: pid_start_token on run_locks (PID-reuse mitigation)
+// ---------------------------------------------------------------------------
+
+fn migrate_v9(conn: &Connection) -> Result<()> {
+    // `pid` alone isn't enough to prove the recorded process is still the one
+    // that wrote the lock: the kernel recycles PIDs, so an unrelated live
+    // process can inherit a dead ralph's PID and make `kill -0` falsely report
+    // the lock as still active. Store a per-process start token (Linux:
+    // /proc/<pid>/stat starttime; other Unix: ps -o lstart) so acquire can
+    // also compare the token against the live process's current token and
+    // detect PID reuse. Nullable for rows written by pre-v9 binaries — those
+    // fall back to liveness-only checking.
+    conn.execute_batch(
+        "
+        ALTER TABLE run_locks ADD COLUMN pid_start_token TEXT;
         ",
     )?;
     Ok(())
