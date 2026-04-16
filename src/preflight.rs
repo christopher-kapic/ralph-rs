@@ -106,6 +106,17 @@ pub fn run_preflight_checks(
     let harness_name = plan.harness.as_deref().unwrap_or(&config.default_harness);
     if let Some(harness_config) = config.harnesses.get(harness_name) {
         checks.push(check_harness_auth(harness_name, harness_config));
+    } else {
+        let mut known: Vec<&str> = config.harnesses.keys().map(|s| s.as_str()).collect();
+        known.sort_unstable();
+        checks.push(CheckResult {
+            name: "harness-auth".to_string(),
+            severity: CheckSeverity::Error,
+            message: format!(
+                "unknown harness '{harness_name}'; not in config.harnesses (known: [{}])",
+                known.join(", ")
+            ),
+        });
     }
 
     // 4. Git dirty state (informational only)
@@ -585,6 +596,70 @@ mod tests {
         }
         assert_eq!(result.severity, CheckSeverity::Pass);
         assert!(result.message.contains("env var"));
+    }
+
+    #[test]
+    fn test_preflight_unknown_harness_fails_strict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut harnesses = HashMap::new();
+        harnesses.insert(
+            "claude".to_string(),
+            crate::config::HarnessConfig {
+                command: "claude".to_string(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: true,
+                supports_json_output: true,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+            },
+        );
+        let config = Config {
+            default_harness: "claude".to_string(),
+            max_retries_per_step: 3,
+            timeout_secs: Some(300),
+            hook_timeout_secs: 120,
+            auto_stash: false,
+            harnesses,
+        };
+        let now = chrono::Utc::now();
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "demo".to_string(),
+            project: tmp.path().display().to_string(),
+            branch_name: "demo".to_string(),
+            description: String::new(),
+            status: crate::plan::PlanStatus::Ready,
+            harness: Some("bogus-harness".to_string()),
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let results = run_preflight_checks(&plan, &config, tmp.path()).unwrap();
+        let auth = results
+            .checks
+            .iter()
+            .find(|c| c.name == "harness-auth")
+            .expect("harness-auth check must be present for unknown harness");
+        assert_eq!(auth.severity, CheckSeverity::Error);
+        assert!(
+            auth.message.contains("unknown harness")
+                && auth.message.contains("bogus-harness")
+                && auth.message.contains("claude"),
+            "message should name the unknown harness and list known ones, got: {}",
+            auth.message
+        );
+        assert!(
+            !results.is_ok(),
+            "preflight must fail in strict mode when harness is unknown"
+        );
     }
 
     #[test]
