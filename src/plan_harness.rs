@@ -125,12 +125,28 @@ pub fn render_plan_agent(applicable_hooks: &[Hook]) -> String {
 }
 
 /// Build the initial prompt for the plan-harness session.
-fn build_initial_prompt(project: &str, description: Option<&str>) -> String {
-    match description {
-        Some(desc) => {
+///
+/// When `plan_slug` is set, the prompt names that plan as the target so the
+/// harness updates it in place rather than creating a new one or touching
+/// whichever plan happens to be active.
+fn build_initial_prompt(
+    project: &str,
+    description: Option<&str>,
+    plan_slug: Option<&str>,
+) -> String {
+    match (plan_slug, description) {
+        (Some(slug), Some(desc)) => format!(
+            "Update the ralph plan '{slug}' for the project at {project}. Description: {desc}"
+        ),
+        (Some(slug), None) => {
+            format!("Help me update the ralph plan '{slug}' for the project at {project}.")
+        }
+        (None, Some(desc)) => {
             format!("Create a ralph plan for the project at {project}. Description: {desc}")
         }
-        None => format!("Help me create or update a ralph plan for the project at {project}."),
+        (None, None) => {
+            format!("Help me create or update a ralph plan for the project at {project}.")
+        }
     }
 }
 
@@ -246,6 +262,7 @@ pub async fn run_plan_harness(
     harness_name: &str,
     project: &str,
     description: Option<&str>,
+    plan_slug: Option<&str>,
 ) -> Result<i32> {
     let harness_config = config.harnesses.get(harness_name).with_context(|| {
         format!(
@@ -267,7 +284,7 @@ pub async fn run_plan_harness(
     let agent_file_path = agent_temp_file.path();
 
     // Build the initial prompt
-    let prompt = build_initial_prompt(project, description);
+    let prompt = build_initial_prompt(project, description, plan_slug);
 
     // Build per-harness args and env
     let args = build_plan_harness_args(
@@ -348,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_build_initial_prompt_with_description() {
-        let prompt = build_initial_prompt("/tmp/project", Some("Add authentication"));
+        let prompt = build_initial_prompt("/tmp/project", Some("Add authentication"), None);
         assert!(prompt.contains("/tmp/project"));
         assert!(prompt.contains("Add authentication"));
         assert!(prompt.starts_with("Create a ralph plan"));
@@ -356,9 +373,33 @@ mod tests {
 
     #[test]
     fn test_build_initial_prompt_without_description() {
-        let prompt = build_initial_prompt("/tmp/project", None);
+        let prompt = build_initial_prompt("/tmp/project", None, None);
         assert!(prompt.contains("/tmp/project"));
         assert!(prompt.starts_with("Help me create or update"));
+    }
+
+    #[test]
+    fn test_build_initial_prompt_with_plan_slug_and_description() {
+        // Regression: `ralph plan harness generate <desc> my-plan` used to
+        // discard the slug. The prompt must now name the target plan so the
+        // harness updates it instead of touching the active plan.
+        let prompt = build_initial_prompt(
+            "/tmp/project",
+            Some("Wire up the API"),
+            Some("my-plan"),
+        );
+        assert!(prompt.contains("/tmp/project"));
+        assert!(prompt.contains("Wire up the API"));
+        assert!(prompt.contains("'my-plan'"));
+        assert!(prompt.starts_with("Update the ralph plan"));
+    }
+
+    #[test]
+    fn test_build_initial_prompt_with_plan_slug_only() {
+        let prompt = build_initial_prompt("/tmp/project", None, Some("my-plan"));
+        assert!(prompt.contains("/tmp/project"));
+        assert!(prompt.contains("'my-plan'"));
+        assert!(prompt.starts_with("Help me update the ralph plan"));
     }
 
     fn test_agent_content() -> String {

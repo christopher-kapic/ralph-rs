@@ -169,7 +169,15 @@ fn main() -> Result<()> {
                     plan,
                     use_harness,
                 } => {
-                    let _ = plan;
+                    // When the user names a plan, resolve it so the harness
+                    // receives a verified existing slug as its target. A
+                    // missing plan is a hard error here rather than a silent
+                    // fallthrough to "create something new" — if the user
+                    // wanted a new plan, they'd omit the slug.
+                    let plan_slug = match plan {
+                        Some(slug) => Some(resolve_plan(&conn, Some(slug), &project, true)?.slug),
+                        None => None,
+                    };
                     let harness_name = use_harness
                         .or(cli.harness)
                         .unwrap_or_else(|| _config.default_harness.clone());
@@ -179,6 +187,7 @@ fn main() -> Result<()> {
                         &harness_name,
                         &project,
                         description.as_deref(),
+                        plan_slug.as_deref(),
                     ))?;
                     std::process::exit(exit_code);
                 }
