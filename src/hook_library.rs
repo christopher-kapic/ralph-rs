@@ -147,11 +147,30 @@ pub fn parse_hook(contents: &str, fallback_name: &str) -> Result<Hook> {
         .context("Hook file must start with '---' frontmatter delimiter")?;
     let rest = rest.strip_prefix('\n').unwrap_or(rest);
 
-    let end = rest
-        .find("\n---")
-        .context("Hook file missing closing '---' frontmatter delimiter")?;
+    // Walk line-by-line so the closing `---` only matches when it's exactly
+    // that (optionally with trailing whitespace) at column 0. A substring
+    // search would match `\n--- a/file` inside diff output in the body.
+    let (end, body_start) = {
+        let mut end: Option<usize> = None;
+        let mut body_start: Option<usize> = None;
+        let mut pos = 0usize;
+        for line in rest.split_inclusive('\n') {
+            let stripped = line.strip_suffix('\n').unwrap_or(line);
+            let stripped = stripped.strip_suffix('\r').unwrap_or(stripped);
+            if stripped.trim_end_matches([' ', '\t']) == "---" {
+                end = Some(pos);
+                body_start = Some(pos + line.len());
+                break;
+            }
+            pos += line.len();
+        }
+        (
+            end.context("Hook file missing closing '---' frontmatter delimiter")?,
+            body_start.unwrap(),
+        )
+    };
     let frontmatter_str = &rest[..end];
-    let body = rest[end + 4..].trim_start_matches('\n').trim_end();
+    let body = rest[body_start..].trim_start_matches('\n').trim_end();
 
     let mut name: Option<String> = None;
     let mut description = String::new();
@@ -731,6 +750,38 @@ mod tests {
         let serialized = serialize_hook(&hook);
         let parsed = parse_hook(&serialized, "slashy").unwrap();
         assert_eq!(parsed.description, hook.description);
+    }
+
+    #[test]
+    fn test_parse_body_with_diff_markers_does_not_close_frontmatter_early() {
+        let src = "---\nname: diffy\ndescription: body has diff markers\nlifecycle: post-step\nscope: global\n---\ngit diff <<'EOF'\n--- a/old_file\n+++ b/new_file\n@@ -1 +1 @@\n-old\n+new\nEOF\n";
+        let hook = parse_hook(src, "diffy").unwrap();
+        assert_eq!(hook.name, "diffy");
+        assert_eq!(hook.description, "body has diff markers");
+        assert_eq!(hook.lifecycle, Lifecycle::PostStep);
+        assert_eq!(hook.scope, Scope::Global);
+        assert!(
+            hook.command.contains("--- a/old_file"),
+            "body should retain diff marker line, got: {:?}",
+            hook.command
+        );
+        assert!(hook.command.contains("+++ b/new_file"));
+    }
+
+    #[test]
+    fn test_parse_accepts_closing_delimiter_with_trailing_whitespace() {
+        let src = "---\nname: ws\nlifecycle: post-step\nscope: global\n---  \necho hi\n";
+        let hook = parse_hook(src, "ws").unwrap();
+        assert_eq!(hook.name, "ws");
+        assert_eq!(hook.command, "echo hi");
+    }
+
+    #[test]
+    fn test_parse_rejects_indented_closing_delimiter() {
+        // An indented `---` line must NOT close the frontmatter — the closer
+        // must be at column 0.
+        let src = "---\nname: x\nlifecycle: post-step\nscope: global\n  ---\necho hi\n";
+        assert!(parse_hook(src, "x").is_err());
     }
 
     #[test]
