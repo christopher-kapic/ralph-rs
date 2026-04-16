@@ -115,31 +115,30 @@ pub fn cmd_agents_create(
 /// handful of prompts to fill in rather than a blank page.
 fn default_agent_scaffold(name: &str) -> String {
     format!(
-        "# {name}\n\
-         \n\
-         ## Role\n\
-         \n\
-         Describe who this agent is and what perspective it brings. \
-         One or two sentences.\n\
-         \n\
-         ## Responsibilities\n\
-         \n\
-         - What should this agent do on every step?\n\
-         - What decisions is it empowered to make?\n\
-         \n\
-         ## Constraints\n\
-         \n\
-         - What should this agent never do?\n\
-         - Any files, directories, or tools that are off-limits?\n\
-         \n\
-         ## Output Expectations\n\
-         \n\
-         Describe the shape of a good result: tone, commit style, \
-         how to surface uncertainty, when to ask for help.\n\
-         \n\
-         ## Notes\n\
-         \n\
-         Free-form context, links, or reminders for future runs.\n"
+"# {name}
+
+## Role
+
+Describe who this agent is and what perspective it brings. One or two sentences.
+
+## Responsibilities
+
+- What should this agent do on every step?
+- What decisions is it empowered to make?
+
+## Constraints
+
+- What should this agent never do?
+- Any files, directories, or tools that are off-limits?
+
+## Output Expectations
+
+Describe the shape of a good result: tone, commit style, how to surface uncertainty, when to ask for help.
+
+## Notes
+
+Free-form context, links, or reminders for future runs.
+"
     )
 }
 
@@ -155,4 +154,48 @@ pub fn cmd_agents_delete(name: &str, _out: &OutputContext) -> Result<()> {
     std::fs::remove_file(&path).with_context(|| format!("Failed to delete {}", path.display()))?;
     eprintln!("Deleted agent file: {name}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scaffold_has_no_leading_whitespace_drift() {
+        let scaffold = default_agent_scaffold("example");
+        for line in scaffold.lines() {
+            assert!(
+                !line.starts_with(' ') && !line.starts_with('\t'),
+                "scaffold line has leading whitespace: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scaffold_matches_expected_snapshot() {
+        let expected = "# example\n\
+                        \n\
+                        ## Role\n\
+                        \n\
+                        Describe who this agent is and what perspective it brings. One or two sentences.\n\
+                        \n\
+                        ## Responsibilities\n\
+                        \n\
+                        - What should this agent do on every step?\n\
+                        - What decisions is it empowered to make?\n\
+                        \n\
+                        ## Constraints\n\
+                        \n\
+                        - What should this agent never do?\n\
+                        - Any files, directories, or tools that are off-limits?\n\
+                        \n\
+                        ## Output Expectations\n\
+                        \n\
+                        Describe the shape of a good result: tone, commit style, how to surface uncertainty, when to ask for help.\n\
+                        \n\
+                        ## Notes\n\
+                        \n\
+                        Free-form context, links, or reminders for future runs.\n";
+        assert_eq!(default_agent_scaffold("example"), expected);
+    }
 }
