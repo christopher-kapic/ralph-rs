@@ -5,7 +5,7 @@ use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::frac_index;
-use crate::plan::{ExecutionLog, Plan, PlanStatus, Step, StepStatus};
+use crate::plan::{ExecutionLog, PLAN_COLUMNS, Plan, PlanStatus, Step, StepStatus};
 
 // ---------------------------------------------------------------------------
 // Plan operations
@@ -38,10 +38,8 @@ pub fn create_plan(
 
 /// Find a plan by its (slug, project) combination.
 pub fn get_plan_by_slug(conn: &Connection, slug: &str, project: &str) -> Result<Option<Plan>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at
-         FROM plans WHERE slug = ?1 AND project = ?2",
-    )?;
+    let query = format!("SELECT {PLAN_COLUMNS} FROM plans WHERE slug = ?1 AND project = ?2");
+    let mut stmt = conn.prepare(&query)?;
 
     let mut rows = stmt.query_map(params![slug, project], Plan::from_row)?;
     match rows.next() {
@@ -52,12 +50,9 @@ pub fn get_plan_by_slug(conn: &Connection, slug: &str, project: &str) -> Result<
 
 /// Fetch a plan by its primary key.
 fn get_plan_by_id(conn: &Connection, id: &str) -> Result<Plan> {
-    conn.query_row(
-        "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at FROM plans WHERE id = ?1",
-        params![id],
-        Plan::from_row,
-    )
-    .with_context(|| format!("Plan not found: {id}"))
+    let query = format!("SELECT {PLAN_COLUMNS} FROM plans WHERE id = ?1");
+    conn.query_row(&query, params![id], Plan::from_row)
+        .with_context(|| format!("Plan not found: {id}"))
 }
 
 /// Fetch just the slug for a plan by its primary key.
@@ -92,19 +87,16 @@ pub fn list_plans(conn: &Connection, project: &str, all: bool) -> Result<Vec<Pla
     let mut plans = Vec::new();
 
     if all {
-        let mut stmt = conn.prepare(
-            "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at
-             FROM plans ORDER BY created_at DESC",
-        )?;
+        let query = format!("SELECT {PLAN_COLUMNS} FROM plans ORDER BY created_at DESC");
+        let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map([], Plan::from_row)?;
         for row in rows {
             plans.push(row?);
         }
     } else {
-        let mut stmt = conn.prepare(
-            "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at
-             FROM plans WHERE project = ?1 ORDER BY created_at DESC",
-        )?;
+        let query =
+            format!("SELECT {PLAN_COLUMNS} FROM plans WHERE project = ?1 ORDER BY created_at DESC");
+        let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map(params![project], Plan::from_row)?;
         for row in rows {
             plans.push(row?);

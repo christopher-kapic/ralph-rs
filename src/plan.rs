@@ -128,6 +128,15 @@ impl std::str::FromStr for StepStatus {
 // Plan struct
 // ---------------------------------------------------------------------------
 
+/// Canonical column list for `SELECT` queries against the `plans` table.
+///
+/// Matches the physical table layout after all migrations: V1 defined every
+/// column through `updated_at`, and V5 appended `plan_harness` via
+/// `ALTER TABLE ... ADD COLUMN`, which places it last. Every `Plan`-returning
+/// query MUST use this list so [`Plan::from_row`]'s indices line up — a raw
+/// `SELECT *` would otherwise swap `plan_harness` into the `created_at` slot.
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness";
+
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Plan {
@@ -148,9 +157,9 @@ pub struct Plan {
 impl Plan {
     /// Read a Plan from a SQLite row.
     ///
-    /// Expected column order:
+    /// Expected column order matches [`PLAN_COLUMNS`]:
     /// id, slug, project, branch_name, description, status,
-    /// harness, agent, deterministic_tests, plan_harness, created_at, updated_at
+    /// harness, agent, deterministic_tests, created_at, updated_at, plan_harness
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -162,14 +171,14 @@ impl Plan {
             rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
-        let created_str: String = row.get(10)?;
+        let created_str: String = row.get(9)?;
         let created_at = parse_datetime(&created_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
-        let updated_str: String = row.get(11)?;
+        let updated_str: String = row.get(10)?;
         let updated_at = parse_datetime(&updated_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
         Ok(Plan {
@@ -182,7 +191,7 @@ impl Plan {
             harness: row.get(6)?,
             agent: row.get(7)?,
             deterministic_tests,
-            plan_harness: row.get(9)?,
+            plan_harness: row.get(11)?,
             created_at,
             updated_at,
         })
@@ -419,12 +428,9 @@ mod tests {
         )
         .expect("insert plan");
 
+        let query = format!("SELECT {PLAN_COLUMNS} FROM plans WHERE id = ?1");
         let plan = conn
-            .query_row(
-                "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at FROM plans WHERE id = ?1",
-                ["p1"],
-                Plan::from_row,
-            )
+            .query_row(&query, ["p1"], Plan::from_row)
             .expect("query plan");
 
         assert_eq!(plan.id, "p1");
@@ -437,6 +443,71 @@ mod tests {
         assert_eq!(plan.agent.as_deref(), Some("opus"));
         assert_eq!(plan.deterministic_tests, vec!["cargo test", "cargo clippy"]);
         assert_eq!(plan.plan_harness.as_deref(), Some("goose"));
+    }
+
+    #[test]
+    fn test_plan_columns_matches_physical_table_order() {
+        // PLAN_COLUMNS must enumerate columns in the order SQLite stores them,
+        // so `from_row` indices line up even if a caller were to use
+        // `SELECT *`. Guard against someone editing PLAN_COLUMNS without
+        // checking the migration layout.
+        let conn = db::open_memory().expect("open_memory");
+        let physical: Vec<String> = conn
+            .prepare("SELECT * FROM plans LIMIT 0")
+            .expect("prepare")
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let canonical: Vec<&str> = PLAN_COLUMNS.split(", ").collect();
+        assert_eq!(
+            physical.iter().map(String::as_str).collect::<Vec<_>>(),
+            canonical,
+            "PLAN_COLUMNS drifted from the physical plans table layout"
+        );
+    }
+
+    #[test]
+    fn test_plan_from_row_roundtrip_via_plan_columns() {
+        // Round-trip every field through the canonical SELECT list.
+        let conn = db::open_memory().expect("open_memory");
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                "p1",
+                "my-plan",
+                "/tmp/proj",
+                "feat/branch",
+                "A test plan",
+                "in_progress",
+                "claude-code",
+                "opus",
+                r#"["cargo test"]"#,
+                "goose",
+            ],
+        )
+        .expect("insert plan");
+
+        let query = format!("SELECT {PLAN_COLUMNS} FROM plans WHERE id = ?1");
+        let plan = conn
+            .query_row(&query, ["p1"], Plan::from_row)
+            .expect("query plan");
+
+        assert_eq!(plan.id, "p1");
+        assert_eq!(plan.slug, "my-plan");
+        assert_eq!(plan.project, "/tmp/proj");
+        assert_eq!(plan.branch_name, "feat/branch");
+        assert_eq!(plan.description, "A test plan");
+        assert_eq!(plan.status, PlanStatus::InProgress);
+        assert_eq!(plan.harness.as_deref(), Some("claude-code"));
+        assert_eq!(plan.agent.as_deref(), Some("opus"));
+        assert_eq!(plan.deterministic_tests, vec!["cargo test"]);
+        assert_eq!(plan.plan_harness.as_deref(), Some("goose"));
+        // Confirm timestamps parsed as real DateTimes rather than swapped with
+        // plan_harness — the bug this refactor prevents.
+        assert!(plan.created_at <= plan.updated_at);
     }
 
     #[test]
