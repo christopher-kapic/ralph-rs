@@ -14,6 +14,8 @@ A deterministic orchestrator for coding agent harnesses. Takes step-based plans 
 
 ## Install
 
+**Requirements:** git >= 2.23 (uses `git restore`).
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/christopher-kapic/ralph-rs/master/scripts/install.sh | bash
 ```
@@ -98,7 +100,8 @@ ralph run --all                        # Run every plan in dependency order
 ralph run [<slug>] --from <n> --to <m> # Run a specific step range
 ralph run [<slug>] --dry-run           # Print what would happen without executing
 ralph run [<slug>] --current-branch    # Run on current branch (skip branch creation)
-ralph run [<slug>] --harness <h>       # Override harness for this run
+ralph run [<slug>] --auto-stash        # Auto-commit a dirty tree instead of bailing
+ralph run [<slug>] --harness <h>       # Override harness for this run (beats the global --harness)
 ralph resume [<slug>]                  # Resume from last failed step
 ralph skip [<slug>]                    # Skip failed step, continue
 ```
@@ -152,6 +155,14 @@ cd ~/myapp-codex  && ralph run auth-codex  --harness codex  &
 
 Config lives at `~/.config/ralph-rs/config.json` (Linux/macOS) with harness definitions, default harness, retry settings, and timeout configuration.
 
+Relevant top-level keys:
+
+- `default_harness` — harness used when none is specified (must match a key under `harnesses`).
+- `max_retries_per_step` — retry budget per step (default: 3).
+- `timeout_secs` — harness invocation timeout in seconds. `null`, omitting the field, or the legacy value `0` all disable the timeout (default: disabled).
+- `hook_timeout_secs` — lifecycle hook timeout (`0` disables; default: 120).
+- `auto_stash` — when `true`, `ralph run` auto-commits a dirty working tree before switching to the plan branch. When `false` (default) `ralph run` lists the dirty files and bails so you can stage or discard them intentionally; pass `--auto-stash` to override for a single run.
+
 Agent definitions are markdown files in `~/.config/ralph-rs/agents/*.md`.
 
 ## Lifecycle Hooks
@@ -167,6 +178,8 @@ ralph hooks import bundle.json
 ```
 
 Hooks can be `global` or path-scoped to specific project prefixes. When you run `ralph plan harness generate`, the plan agent is told which hooks are available and can attach them to steps it thinks deserve review.
+
+Each hook runs with a wall-clock budget controlled by `hook_timeout_secs` in `config.json` (default: 120; set to `0` to disable). A hook that exceeds the budget is killed and its step attempt is marked failed.
 
 For the full model (library layout, scope rules, sharing, worked examples for Claude Code / Codex / clippy), see [docs/review-hooks.md](docs/review-hooks.md).
 

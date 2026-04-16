@@ -119,10 +119,9 @@ enum FailureReason {
     Timeout,
     /// Execution was aborted via signal.
     Aborted,
-    /// Tests failed (or no changes) after exhausting all attempts.
+    /// Tests failed after exhausting all attempts.
     TestFailed,
-    /// Harness produced no changes (reserved for future use).
-    #[allow(dead_code)]
+    /// Harness produced no changes after exhausting all attempts.
     NoChanges,
 }
 
@@ -146,7 +145,8 @@ impl FailureReason {
         match self {
             Self::Timeout => "timeout",
             Self::Aborted => "aborted",
-            _ => "failed",
+            Self::NoChanges => "no_changes",
+            Self::TestFailed => "failed",
         }
     }
 }
@@ -173,7 +173,7 @@ struct FailureOutput<'a> {
 
 /// Handle a terminal step failure: rollback changes, update the execution log,
 /// set step status, run post-step hook, and return the appropriate [`StepResult`].
-fn finalize_failure(
+async fn finalize_failure(
     ctx: &ExecCtx<'_>,
     exec_log_id: i64,
     duration_secs: f64,
@@ -205,6 +205,7 @@ fn finalize_failure(
             o.parsed.cost_usd,
             o.parsed.input_tokens,
             o.parsed.output_tokens,
+            o.parsed.session_id.as_deref(),
         )?;
     } else {
         storage::update_execution_log(
@@ -215,6 +216,7 @@ fn finalize_failure(
             &[],
             rolled_back,
             false,
+            None,
             None,
             None,
             None,
@@ -233,7 +235,8 @@ fn finalize_failure(
         attempt,
         reason.hook_label(),
         ctx.workdir,
-    );
+    )
+    .await?;
 
     Ok(StepResult {
         outcome: reason.to_outcome(),
@@ -288,11 +291,7 @@ pub async fn execute_step(
         );
     }
 
-    let timeout = if config.timeout_secs == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(config.timeout_secs))
-    };
+    let timeout = config.timeout_secs.map(Duration::from_secs);
 
     // Resolve harness once (doesn't change between retries).
     let (harness_name, harness_config) = harness::resolve_harness(step, plan, config)?;
@@ -326,8 +325,28 @@ pub async fn execute_step(
     while attempt < max_attempts {
         attempt += 1;
 
-        // Check abort before starting.
+        // Check abort before starting. Persist the bumped attempt count and
+        // drop an execution-log row so the DB reflects the same attempt number
+        // that StepResult reports and the abort has a visible audit trail.
         if *abort_rx.borrow() {
+            set_step_attempts(conn, &step.id, attempt)?;
+            let exec_log = storage::create_execution_log(conn, &step.id, attempt, None, None)?;
+            storage::update_execution_log(
+                conn,
+                exec_log.id,
+                Some(0.0),
+                None,
+                &["aborted before harness started".to_string()],
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
             storage::update_step_status(conn, &step.id, StepStatus::Aborted)?;
             return Ok(StepResult {
                 outcome: StepOutcome::Aborted,
@@ -374,7 +393,7 @@ pub async fn execute_step(
         let started_at = std::time::Instant::now();
 
         // Run pre-step hook.
-        if let Err(e) = hooks::run_pre_step(conn, hook_ctx, plan, step, attempt, workdir) {
+        if let Err(e) = hooks::run_pre_step(conn, hook_ctx, plan, step, attempt, workdir).await {
             eprintln!("Pre-step hook failed: {e}");
             // Treat as a failed attempt — skip harness execution.
             let test_result_strings = vec![format!("pre-step hook failed: {e}")];
@@ -392,10 +411,12 @@ pub async fn execute_step(
                 None,
                 None,
                 None,
+                None,
             )?;
             if attempt >= max_attempts {
                 storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
-                hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir);
+                hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir)
+                    .await?;
                 return Ok(StepResult {
                     outcome: StepOutcome::Failed,
                     step_id: step.id.clone(),
@@ -404,7 +425,7 @@ pub async fn execute_step(
                 });
             }
             prev_test_output = Some(format!("pre-step hook failed: {e}"));
-            hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir);
+            hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir).await?;
             continue;
         }
 
@@ -446,44 +467,67 @@ pub async fn execute_step(
                 };
 
                 // Run tests if there are changes and tests are defined.
-                let (test_passed, test_result_strings) = if has_changes
-                    && !plan.deterministic_tests.is_empty()
-                {
-                    // Pre-test hook.
-                    if let Err(e) =
-                        hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir)
-                    {
-                        eprintln!("Pre-test hook failed: {e}");
+                let (test_passed, test_result_strings, test_aborted) =
+                    if has_changes && !plan.deterministic_tests.is_empty() {
+                        // Pre-test hook.
+                        if let Err(e) =
+                            hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir).await
+                        {
+                            eprintln!("Pre-test hook failed: {e}");
+                        }
+
+                        let test_results = test_runner::run_tests(
+                            &plan.deterministic_tests,
+                            workdir,
+                            abort_rx.clone(),
+                        )
+                        .await;
+                        let strings: Vec<String> = test_results
+                            .results
+                            .iter()
+                            .map(|r| {
+                                format!("{}: {}", r.command, if r.passed { "pass" } else { "FAIL" })
+                            })
+                            .collect();
+
+                        // Post-test hook.
+                        hooks::run_post_test(
+                            conn,
+                            hook_ctx,
+                            plan,
+                            step,
+                            attempt,
+                            test_results.all_passed,
+                            workdir,
+                        )
+                        .await?;
+
+                        (test_results.all_passed, strings, test_results.aborted)
+                    } else if has_changes {
+                        // No tests defined: treat as passing.
+                        (true, Vec::new(), false)
+                    } else {
+                        // No changes at all: harness produced nothing useful.
+                        (false, vec!["no changes detected".to_string()], false)
+                    };
+
+                // If Ctrl+C landed mid-test, the test runner will have killed
+                // its child; surface this as Aborted rather than a retry-worthy
+                // test failure.
+                if test_aborted {
+                    if has_changes {
+                        git::rollback_except(workdir, &pre_existing_untracked)?;
                     }
-
-                    let test_results = test_runner::run_tests(&plan.deterministic_tests, workdir);
-                    let strings: Vec<String> = test_results
-                        .results
-                        .iter()
-                        .map(|r| {
-                            format!("{}: {}", r.command, if r.passed { "pass" } else { "FAIL" })
-                        })
-                        .collect();
-
-                    // Post-test hook.
-                    hooks::run_post_test(
-                        conn,
-                        hook_ctx,
-                        plan,
-                        step,
+                    return finalize_failure(
+                        &ctx,
+                        exec_log.id,
+                        duration_secs,
                         attempt,
-                        test_results.all_passed,
-                        workdir,
-                    );
-
-                    (test_results.all_passed, strings)
-                } else if has_changes {
-                    // No tests defined: treat as passing.
-                    (true, Vec::new())
-                } else {
-                    // No changes at all: harness produced nothing useful.
-                    (false, vec!["no changes detected".to_string()])
-                };
+                        FailureReason::Aborted,
+                        None,
+                    )
+                    .await;
+                }
 
                 if test_passed && has_changes {
                     // Stage changes, excluding pre-existing untracked files.
@@ -510,12 +554,14 @@ pub async fn execute_step(
                         parsed.cost_usd,
                         parsed.input_tokens,
                         parsed.output_tokens,
+                        parsed.session_id.as_deref(),
                     )?;
 
                     // Mark step as complete.
                     storage::update_step_status(conn, &step.id, StepStatus::Complete)?;
 
-                    hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir);
+                    hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir)
+                        .await?;
 
                     return Ok(StepResult {
                         outcome: StepOutcome::Success,
@@ -535,14 +581,20 @@ pub async fn execute_step(
                         parsed: &parsed,
                         has_changes,
                     };
+                    let reason = if has_changes {
+                        FailureReason::TestFailed
+                    } else {
+                        FailureReason::NoChanges
+                    };
                     return finalize_failure(
                         &ctx,
                         exec_log.id,
                         duration_secs,
                         attempt,
-                        FailureReason::TestFailed,
+                        reason,
                         Some(&fail_output),
-                    );
+                    )
+                    .await;
                 }
 
                 // Retry: rollback, log failure, stash context for next attempt.
@@ -564,6 +616,7 @@ pub async fn execute_step(
                     parsed.cost_usd,
                     parsed.input_tokens,
                     parsed.output_tokens,
+                    parsed.session_id.as_deref(),
                 )?;
                 prev_diff = diff;
                 prev_test_output = Some(test_output_summary);
@@ -603,7 +656,8 @@ pub async fn execute_step(
                     attempt,
                     FailureReason::Timeout,
                     Some(&fail_output),
-                );
+                )
+                .await;
             }
 
             WaitResult::Aborted => {
@@ -614,7 +668,8 @@ pub async fn execute_step(
                     attempt,
                     FailureReason::Aborted,
                     None,
-                );
+                )
+                .await;
             }
         }
     }
@@ -679,6 +734,8 @@ async fn wait_with_timeout_and_abort(
                 }
                 _ = tokio::time::sleep(dur) => {
                     let _ = child.kill().await;
+                    // Reap the child so it doesn't linger as a zombie on Unix.
+                    let _ = child.wait().await;
                     // Drain whatever the harness managed to emit before
                     // the kill — otherwise the user gets zero diagnostic
                     // output for a timeout, which now costs a real retry.
@@ -829,11 +886,18 @@ fn build_prior_step_summaries(
     let all_steps = storage::list_steps(conn, &plan.id)?;
     let mut summaries = Vec::new();
 
-    for s in &all_steps {
+    for (idx, s) in all_steps.iter().enumerate() {
         if s.sort_key >= current_step.sort_key {
             break;
         }
-        if s.status == StepStatus::Complete || s.status == StepStatus::Skipped {
+        // Include any step that has produced an outcome — success, skip, or
+        // failure. Failed/Aborted steps give the agent useful "here's what
+        // did not work" context. Pending/InProgress are excluded because
+        // they have nothing to report yet.
+        if matches!(
+            s.status,
+            StepStatus::Complete | StepStatus::Skipped | StepStatus::Failed | StepStatus::Aborted
+        ) {
             // Try to get changed files from the latest execution log.
             let files_changed = if let Ok(Some(log)) = storage::get_latest_log_for_step(conn, &s.id)
             {
@@ -847,6 +911,10 @@ fn build_prior_step_summaries(
             };
 
             summaries.push(PriorStepSummary {
+                // Real 1-based position in the plan — not the summary slice
+                // index, so skipped/pending steps keep their numbering
+                // stable when some predecessors are filtered out.
+                number: idx + 1,
                 title: s.title.clone(),
                 status: s.status,
                 files_changed,
@@ -859,16 +927,26 @@ fn build_prior_step_summaries(
 }
 
 /// Extract file paths from a unified diff.
+///
+/// Captures additions and modifications (`+++ b/`), deletions (`--- a/` paired
+/// with `+++ /dev/null`), and both sides of renames (`rename from`/`rename to`,
+/// or the `--- a/` and `+++ b/` pair when rename detection emits a diff body).
 fn extract_changed_files_from_diff(diff: &str) -> Vec<String> {
     let mut files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for line in diff.lines() {
-        if let Some(path) = line.strip_prefix("+++ b/")
+        let path = line
+            .strip_prefix("+++ b/")
+            .or_else(|| line.strip_prefix("--- a/"))
+            .or_else(|| line.strip_prefix("rename from "))
+            .or_else(|| line.strip_prefix("rename to "));
+        if let Some(path) = path
             && path != "/dev/null"
+            && seen.insert(path.to_string())
         {
             files.push(path.to_string());
         }
     }
-    files.dedup();
     files
 }
 
@@ -959,6 +1037,39 @@ diff --git a/src/lib.rs b/src/lib.rs
     }
 
     #[test]
+    fn test_extract_changed_files_from_diff_delete_rename_add() {
+        let diff = "\
+diff --git a/deleted.txt b/deleted.txt
+deleted file mode 100644
+--- a/deleted.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-gone
+diff --git a/old_name.rs b/new_name.rs
+similarity index 80%
+rename from old_name.rs
+rename to new_name.rs
+--- a/old_name.rs
++++ b/new_name.rs
+@@ -1,2 +1,2 @@
+-fn old() {}
++fn new() {}
+diff --git a/added.rs b/added.rs
+new file mode 100644
+--- /dev/null
++++ b/added.rs
+@@ -0,0 +1 @@
++pub fn x() {}
+";
+        let files = extract_changed_files_from_diff(diff);
+        assert!(files.contains(&"deleted.txt".to_string()));
+        assert!(files.contains(&"old_name.rs".to_string()));
+        assert!(files.contains(&"new_name.rs".to_string()));
+        assert!(files.contains(&"added.rs".to_string()));
+        assert_eq!(files.len(), 4);
+    }
+
+    #[test]
     fn test_step_outcome_variants() {
         // Ensure all variants are constructible.
         let outcomes = [
@@ -970,6 +1081,27 @@ diff --git a/src/lib.rs b/src/lib.rs
         assert_eq!(outcomes.len(), 4);
         assert_eq!(StepOutcome::Success, StepOutcome::Success);
         assert_ne!(StepOutcome::Success, StepOutcome::Failed);
+    }
+
+    #[test]
+    fn test_failure_reason_mappings() {
+        assert_eq!(FailureReason::Timeout.hook_label(), "timeout");
+        assert_eq!(FailureReason::Aborted.hook_label(), "aborted");
+        assert_eq!(FailureReason::TestFailed.hook_label(), "failed");
+        assert_eq!(FailureReason::NoChanges.hook_label(), "no_changes");
+
+        assert_eq!(FailureReason::Aborted.to_step_status(), StepStatus::Aborted);
+        assert_eq!(
+            FailureReason::NoChanges.to_step_status(),
+            StepStatus::Failed
+        );
+        assert_eq!(
+            FailureReason::TestFailed.to_step_status(),
+            StepStatus::Failed
+        );
+
+        assert_eq!(FailureReason::NoChanges.to_outcome(), StepOutcome::Failed);
+        assert_eq!(FailureReason::TestFailed.to_outcome(), StepOutcome::Failed);
     }
 
     #[test]
@@ -1032,5 +1164,125 @@ diff --git a/src/lib.rs b/src/lib.rs
         let summaries = build_prior_step_summaries(&conn, &plan, &s3).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].title, "First");
+        assert_eq!(summaries[0].number, 1);
+    }
+
+    /// Prior-step summaries must carry each step's real 1-based position in
+    /// the plan, not the index in the filtered slice. When a pending step
+    /// sits between two completed steps, the second summary should be
+    /// numbered 3 (its plan position) rather than 2 (its slice index).
+    #[test]
+    fn test_build_prior_step_summaries_preserves_real_numbers_with_gap() {
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+
+        let (s1, _) =
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
+        let (_s2, _) =
+            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None)
+                .unwrap();
+        let (s3, _) =
+            storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None)
+                .unwrap();
+        let (s4, _) =
+            storage::create_step(&conn, &plan.id, "Fourth", "d4", None, None, &[], None, None)
+                .unwrap();
+
+        // s1 and s3 are complete; s2 is pending (the gap).
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        storage::update_step_status(&conn, &s3.id, StepStatus::Complete).unwrap();
+
+        let summaries = build_prior_step_summaries(&conn, &plan, &s4).unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].title, "First");
+        assert_eq!(summaries[0].number, 1);
+        assert_eq!(summaries[1].title, "Third");
+        // Plan position (3), not slice index (2).
+        assert_eq!(summaries[1].number, 3);
+    }
+
+    /// Regression: aborting at the pre-log boundary must persist the bumped
+    /// attempt count and leave behind an execution_log row so the DB agrees
+    /// with `StepResult.attempts_used`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_abort_before_pre_log_persists_attempts_and_log() {
+        use std::fs;
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        fs::write(dir.join("README.md"), "init").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("claude"),
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _) =
+            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None)
+                .unwrap();
+        assert_eq!(step.attempts, 0);
+
+        let (tx, rx) = watch::channel(false);
+        tx.send(true).unwrap();
+
+        let config = Config::default();
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 120,
+        };
+
+        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Aborted);
+        assert_eq!(result.attempts_used, 1);
+
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Aborted);
+        assert_eq!(
+            updated.attempts, result.attempts_used,
+            "DB attempts must match StepResult.attempts_used"
+        );
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1, "exactly one execution_log row for the abort");
+        assert_eq!(logs[0].attempt, 1);
     }
 }

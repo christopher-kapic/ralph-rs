@@ -1,10 +1,25 @@
 // Configuration management
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+/// Accepts either `null`, a missing field, or `0` as "no timeout" so configs
+/// written before `timeout_secs` became `Option<u64>` keep loading. Positive
+/// integers become `Some(n)`.
+fn deserialize_timeout_secs<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<u64>::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(0) | None => None,
+        Some(n) => Some(n),
+    })
+}
 
 /// Configuration for a single coding agent harness.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -65,6 +80,31 @@ pub struct HarnessConfig {
     /// Users opt in by editing config.json — init leaves this empty.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Environment variables that, when any one is set, signal that the
+    /// harness is authenticated. Consulted by the preflight harness-auth
+    /// check before falling back to [`Self::auth_probe_args`]. Empty means
+    /// "no env-var-based auth check".
+    #[serde(default)]
+    pub auth_env_vars: Vec<String>,
+    /// Argument vector for a non-interactive auth probe. When no
+    /// [`Self::auth_env_vars`] matched, preflight runs
+    /// `<command> <auth_probe_args...>` and treats a zero exit as
+    /// authenticated. Empty means "no probe".
+    #[serde(default)]
+    pub auth_probe_args: Vec<String>,
+}
+
+/// Default timeout in seconds for a single lifecycle hook invocation.
+/// Applied when `Config::hook_timeout_secs` is missing from a user's config.
+fn default_hook_timeout_secs() -> u64 {
+    120
+}
+
+/// Default for `Config::auto_stash`. Off by default so `ralph run` never
+/// silently sweeps a dirty working tree into a commit — users must opt in
+/// either globally here or per-run via `--auto-stash`.
+fn default_auto_stash() -> bool {
+    false
 }
 
 /// Top-level ralph-rs configuration.
@@ -74,10 +114,51 @@ pub struct Config {
     pub default_harness: String,
     /// Maximum number of retries per step before giving up.
     pub max_retries_per_step: u32,
-    /// Timeout in seconds for a single harness invocation.
-    pub timeout_secs: u64,
+    /// Timeout in seconds for a single harness invocation. `None` (or the
+    /// legacy `0` value) disables the timeout.
+    #[serde(default, deserialize_with = "deserialize_timeout_secs")]
+    pub timeout_secs: Option<u64>,
+    /// Timeout in seconds for a single lifecycle hook (pre/post-step,
+    /// pre/post-test). `0` disables the timeout. Defaults to 120.
+    #[serde(default = "default_hook_timeout_secs")]
+    pub hook_timeout_secs: u64,
+    /// When true, `ralph run` auto-commits any dirty working-tree state
+    /// before switching to the plan branch. When false (default), a dirty
+    /// working tree causes the run to bail and print the files that would
+    /// have been swept up, so the user can stage intentionally. The
+    /// `--auto-stash` CLI flag overrides this per-run.
+    #[serde(default = "default_auto_stash")]
+    pub auto_stash: bool,
     /// Available harness definitions keyed by name.
     pub harnesses: HashMap<String, HarnessConfig>,
+}
+
+impl Config {
+    /// Verifies the loaded config is internally consistent.
+    ///
+    /// Catches misconfigured `default_harness` values (empty or pointing at
+    /// a harness name that isn't defined) at load time rather than at first
+    /// run, so the user sees a clear error instead of a cryptic runtime
+    /// failure deep in harness resolution.
+    pub fn validate(&self) -> Result<()> {
+        if self.default_harness.is_empty() {
+            return Err(anyhow!("config.default_harness must not be empty"));
+        }
+        if !self.harnesses.contains_key(&self.default_harness) {
+            let mut available: Vec<&str> = self.harnesses.keys().map(String::as_str).collect();
+            available.sort_unstable();
+            return Err(anyhow!(
+                "config.default_harness '{}' is not defined in harnesses (available: {})",
+                self.default_harness,
+                if available.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for Config {
@@ -119,6 +200,8 @@ impl Default for Config {
                 ],
                 model_args: vec!["--model".to_string(), "{model}".to_string()],
                 default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
             },
         );
 
@@ -157,6 +240,8 @@ impl Default for Config {
                 // codex accepts `-m <model>` / `--model <model>`.
                 model_args: vec!["-m".to_string(), "{model}".to_string()],
                 default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
             },
         );
 
@@ -184,6 +269,8 @@ impl Default for Config {
                 // `openai/gpt-4o`, `sonnet:high`).
                 model_args: vec!["--model".to_string(), "{model}".to_string()],
                 default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
             },
         );
 
@@ -212,6 +299,8 @@ impl Default for Config {
                 // (e.g. `anthropic/claude-sonnet-4-20250514`).
                 model_args: vec!["-m".to_string(), "{model}".to_string()],
                 default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
             },
         );
 
@@ -249,6 +338,15 @@ impl Default for Config {
                 // copilot uses `=`-style: `--model=<name>`.
                 model_args: vec!["--model={model}".to_string()],
                 default_model: None,
+                // Standalone Copilot CLI accepts COPILOT_GITHUB_TOKEN,
+                // GH_TOKEN, or GITHUB_TOKEN. Without one of these, `copilot`
+                // requires an interactive `copilot login` device flow.
+                auth_env_vars: vec![
+                    "COPILOT_GITHUB_TOKEN".to_string(),
+                    "GH_TOKEN".to_string(),
+                    "GITHUB_TOKEN".to_string(),
+                ],
+                auth_probe_args: vec![],
             },
         );
 
@@ -302,13 +400,17 @@ impl Default for Config {
                 // the env var ambient.
                 model_args: vec!["--model".to_string(), "{model}".to_string()],
                 default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
             },
         );
 
         Self {
             default_harness: "claude".to_string(),
             max_retries_per_step: 3,
-            timeout_secs: 0,
+            timeout_secs: None,
+            hook_timeout_secs: default_hook_timeout_secs(),
+            auto_stash: default_auto_stash(),
             harnesses,
         }
     }
@@ -356,22 +458,70 @@ pub fn agents_dir() -> Result<PathBuf> {
 pub fn load_or_create_config() -> Result<Config> {
     let dir = config_dir()?;
     let path = dir.join("config.json");
+    load_or_create_config_at(&dir, &path)
+}
 
+/// Core logic for `load_or_create_config`, parameterized on paths so tests
+/// can exercise concurrent callers. Writes the default to a unique tmp
+/// file and uses `hard_link` to atomically publish it, closing the
+/// TOCTOU gap: concurrent readers never observe a partially-written file,
+/// and at most one writer wins the link race. Losers fall back to reading
+/// the winner's file.
+fn load_or_create_config_at(dir: &Path, path: &Path) -> Result<Config> {
     if path.exists() {
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        let config: Config = serde_json::from_str(&contents)
-            .with_context(|| format!("Failed to parse {}", path.display()))?;
-        Ok(config)
-    } else {
-        let config = Config::default();
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create config directory {}", dir.display()))?;
-        let json = serde_json::to_string_pretty(&config)?;
-        fs::write(&path, &json)
-            .with_context(|| format!("Failed to write default config to {}", path.display()))?;
-        Ok(config)
+        return read_and_validate(path);
     }
+
+    fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create config directory {}", dir.display()))?;
+
+    let default = Config::default();
+    let json = serde_json::to_string_pretty(&default)?;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        "config.json.tmp-{}-{}-{:x}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        nanos,
+    ));
+
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("Failed to create tmp file {}", tmp.display()))?;
+    let write_result = f
+        .write_all(json.as_bytes())
+        .and_then(|_| f.sync_all())
+        .with_context(|| format!("Failed to write tmp file {}", tmp.display()));
+    drop(f);
+
+    let result = write_result.and_then(|_| match fs::hard_link(&tmp, path) {
+        Ok(()) => Ok(default),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => read_and_validate(path),
+        Err(e) => Err(anyhow::Error::new(e))
+            .with_context(|| format!("Failed to publish {}", path.display())),
+    });
+
+    let _ = fs::remove_file(&tmp);
+    result
+}
+
+fn read_and_validate(path: &Path) -> Result<Config> {
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let config: Config = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", path.display()))?;
+    config
+        .validate()
+        .with_context(|| format!("Invalid config at {}", path.display()))?;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -383,7 +533,10 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.default_harness, "claude");
         assert_eq!(config.max_retries_per_step, 3);
-        assert_eq!(config.timeout_secs, 0);
+        assert_eq!(config.timeout_secs, None);
+        // L10: auto_stash is opt-in; default config must preserve the safer
+        // "refuse to sweep a dirty tree" behavior.
+        assert!(!config.auto_stash);
 
         let expected_harnesses = ["claude", "codex", "pi", "opencode", "copilot", "goose"];
         for name in &expected_harnesses {
@@ -418,11 +571,7 @@ mod tests {
         assert!(claude.args.contains(&"--permission-mode".to_string()));
         assert!(claude.args.contains(&"bypassPermissions".to_string()));
         assert!(claude.plan_args.contains(&"--permission-mode".to_string()));
-        assert!(
-            claude
-                .plan_args
-                .contains(&"bypassPermissions".to_string())
-        );
+        assert!(claude.plan_args.contains(&"bypassPermissions".to_string()));
         // Claude takes the agent file via --system-prompt-file, not via env.
         // `agent_file_env` is only read when supports_agent_file is false,
         // so setting it on claude would be dead config.
@@ -626,6 +775,152 @@ mod tests {
         let contents = std::fs::read_to_string(&config_path).expect("read");
         let loaded: Config = serde_json::from_str(&contents).expect("deserialize");
         assert_eq!(config, loaded);
+    }
+
+    #[test]
+    fn test_load_or_create_config_at_is_toctou_safe() {
+        // L22: simultaneous callers must end with exactly one config file
+        // and no errors — a naive exists()/write() pair lets the last
+        // writer clobber an earlier writer's contents.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("ralph-rs");
+        let path = dir.join("config.json");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let dir = dir.clone();
+                let path = path.clone();
+                let barrier = barrier.clone();
+                s.spawn(move || {
+                    barrier.wait();
+                    load_or_create_config_at(&dir, &path)
+                        .expect("concurrent load_or_create_config_at must not fail");
+                });
+            }
+        });
+
+        assert!(path.exists(), "config.json must exist after contention");
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one file should exist, got: {:?}",
+            entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+        let contents = std::fs::read_to_string(&path).expect("read");
+        let _: Config = serde_json::from_str(&contents).expect("parse");
+    }
+
+    #[test]
+    fn test_validate_rejects_missing_default_harness() {
+        let mut config = Config::default();
+        config.default_harness = "nope".to_string();
+        let err = config
+            .validate()
+            .expect_err("validate must reject missing harness");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nope"),
+            "error should name the offending harness: {msg}"
+        );
+        assert!(
+            msg.contains("default_harness"),
+            "error should reference default_harness: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_default_harness() {
+        let mut config = Config::default();
+        config.default_harness = String::new();
+        let err = config.validate().expect_err("validate must reject empty");
+        assert!(
+            format!("{err}").contains("default_harness"),
+            "error should reference default_harness"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_default_config() {
+        Config::default()
+            .validate()
+            .expect("default config must validate");
+    }
+
+    #[test]
+    fn test_auto_stash_defaults_to_false_when_missing_in_json() {
+        // L10: older configs (written before the key existed) must keep
+        // working and default to the safer opt-in behavior.
+        let json = r#"{
+            "default_harness": "claude",
+            "max_retries_per_step": 3,
+            "timeout_secs": 0,
+            "harnesses": {
+                "claude": {"command": "claude"}
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).expect("deserialize");
+        assert!(!config.auto_stash);
+    }
+
+    #[test]
+    fn test_timeout_secs_deserializes_zero_and_null_as_none() {
+        // L23: legacy configs wrote `"timeout_secs": 0` to disable the
+        // timeout. Keep that working alongside the new `null`/missing forms,
+        // and preserve positive values as-is.
+        let base = r#"{
+            "default_harness": "claude",
+            "max_retries_per_step": 3,
+            "harnesses": {"claude": {"command": "claude"}}
+        }"#;
+
+        // Legacy zero — stays disabled.
+        let legacy_zero = base.replacen(
+            "\"max_retries_per_step\": 3",
+            "\"max_retries_per_step\": 3, \"timeout_secs\": 0",
+            1,
+        );
+        let c: Config = serde_json::from_str(&legacy_zero).expect("legacy zero");
+        assert_eq!(c.timeout_secs, None);
+
+        // Explicit null — disabled.
+        let explicit_null = base.replacen(
+            "\"max_retries_per_step\": 3",
+            "\"max_retries_per_step\": 3, \"timeout_secs\": null",
+            1,
+        );
+        let c: Config = serde_json::from_str(&explicit_null).expect("explicit null");
+        assert_eq!(c.timeout_secs, None);
+
+        // Missing entirely — disabled (serde default).
+        let c: Config = serde_json::from_str(base).expect("missing field");
+        assert_eq!(c.timeout_secs, None);
+
+        // Positive value — preserved.
+        let positive = base.replacen(
+            "\"max_retries_per_step\": 3",
+            "\"max_retries_per_step\": 3, \"timeout_secs\": 600",
+            1,
+        );
+        let c: Config = serde_json::from_str(&positive).expect("positive");
+        assert_eq!(c.timeout_secs, Some(600));
+
+        // Round-trip Some(n) through JSON.
+        let mut cfg = Config::default();
+        cfg.timeout_secs = Some(42);
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.timeout_secs, Some(42));
+
+        // Round-trip None through JSON.
+        cfg.timeout_secs = None;
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.timeout_secs, None);
     }
 
     #[test]

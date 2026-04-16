@@ -3,16 +3,48 @@
 // Uses base-62 strings (0-9, A-Z, a-z) to generate sort keys that allow
 // O(1) insertions between existing steps without reordering.
 
+use std::fmt;
+
 /// The base-62 alphabet used for sort keys: 0-9, A-Z, a-z.
 const ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
+/// Errors returned by fractional indexing operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FracIndexError {
+    /// No fractional index key exists between `a` and `b` under this scheme.
+    ///
+    /// Triggered when `b` is `a` followed by one or more `'0'` characters
+    /// (or other inputs that leave no room for a midpoint to be synthesized).
+    NoKeyBetween { a: String, b: String },
+    /// A sort key contained a character outside the base-62 alphabet.
+    InvalidChar(char),
+}
+
+impl fmt::Display for FracIndexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FracIndexError::NoKeyBetween { a, b } => {
+                write!(
+                    f,
+                    "cannot find fractional index key between {a:?} and {b:?}"
+                )
+            }
+            FracIndexError::InvalidChar(c) => {
+                write!(f, "invalid fractional index character: {c:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FracIndexError {}
+
 /// Returns the index of a character in the base-62 alphabet.
-fn char_index(c: u8) -> usize {
+fn char_index(c: u8) -> Result<usize, FracIndexError> {
     match c {
-        b'0'..=b'9' => (c - b'0') as usize,
-        b'A'..=b'Z' => (c - b'A') as usize + 10,
-        b'a'..=b'z' => (c - b'a') as usize + 36,
-        _ => panic!("Invalid fractional index character: {}", c as char),
+        b'0'..=b'9' => Ok((c - b'0') as usize),
+        b'A'..=b'Z' => Ok((c - b'A') as usize + 10),
+        b'a'..=b'z' => Ok((c - b'a') as usize + 36),
+        _ => Err(FracIndexError::InvalidChar(c as char)),
     }
 }
 
@@ -24,10 +56,14 @@ pub fn initial_key() -> String {
 /// Returns a key that sorts after the given key.
 ///
 /// Increments the last character. If it overflows, appends a '0'.
-pub fn key_after(key: &str) -> String {
+///
+/// # Errors
+/// Returns [`FracIndexError::InvalidChar`] if the last character of `key` is
+/// outside the base-62 alphabet.
+pub fn key_after(key: &str) -> Result<String, FracIndexError> {
     let bytes = key.as_bytes();
     let last = bytes[bytes.len() - 1];
-    let idx = char_index(last);
+    let idx = char_index(last)?;
 
     if idx + 1 < ALPHABET.len() {
         // Increment last character
@@ -37,20 +73,22 @@ pub fn key_after(key: &str) -> String {
         unsafe {
             result.as_bytes_mut()[len - 1] = ALPHABET[idx + 1];
         }
-        result
+        Ok(result)
     } else {
         // Last char is 'z', append '0' to go after
-        format!("{key}0")
+        Ok(format!("{key}0"))
     }
 }
 
 /// Returns a key that is lexicographically between `a` and `b`.
 ///
-/// If `b` is `None`, returns `key_after(a)`.
+/// # Errors
+/// Returns [`FracIndexError::NoKeyBetween`] when the inputs admit no key
+/// between them under this scheme (e.g. `a = "0"`, `b = "00"`).
 ///
 /// # Panics
-/// Panics if `a >= b`.
-pub fn key_between(a: &str, b: &str) -> String {
+/// Panics if `a >= b`. Callers must ensure the ordering precondition.
+pub fn key_between(a: &str, b: &str) -> Result<String, FracIndexError> {
     assert!(a < b, "key_between requires a < b, got a={a:?} b={b:?}");
 
     let a_bytes = a.as_bytes();
@@ -59,9 +97,14 @@ pub fn key_between(a: &str, b: &str) -> String {
     // Find the first position where they differ
     let min_len = a_bytes.len().min(b_bytes.len());
 
+    let make_err = || FracIndexError::NoKeyBetween {
+        a: a.to_string(),
+        b: b.to_string(),
+    };
+
     for i in 0..min_len {
-        let ai = char_index(a_bytes[i]);
-        let bi = char_index(b_bytes[i]);
+        let ai = char_index(a_bytes[i])?;
+        let bi = char_index(b_bytes[i])?;
 
         if ai == bi {
             continue;
@@ -72,7 +115,7 @@ pub fn key_between(a: &str, b: &str) -> String {
             let mid = ai + (bi - ai) / 2;
             let mut result = a[..i].to_string();
             result.push(ALPHABET[mid] as char);
-            return result;
+            return Ok(result);
         }
 
         // Difference is exactly 1. We need to go deeper.
@@ -84,8 +127,8 @@ pub fn key_between(a: &str, b: &str) -> String {
         } else {
             ""
         };
-        result.push_str(&suffix_between(a_suffix, None));
-        return result;
+        result.push_str(&suffix_between(a_suffix, None).map_err(|_| make_err())?);
+        return Ok(result);
     }
 
     // One is a prefix of the other. Since a < b, a must be the shorter one.
@@ -93,52 +136,57 @@ pub fn key_between(a: &str, b: &str) -> String {
     // Take a as prefix, then find between "" and b's remaining suffix.
     let b_suffix = &b[min_len..];
     let mut result = a.to_string();
-    result.push_str(&suffix_between("", Some(b_suffix)));
-    result
+    result.push_str(&suffix_between("", Some(b_suffix)).map_err(|_| make_err())?);
+    Ok(result)
 }
 
 /// Finds a suffix string that is lexicographically between `a_suffix` and `b_suffix`.
 /// If `b_suffix` is None, it means "no upper bound" — just go higher.
-fn suffix_between(a: &str, b: Option<&str>) -> String {
+fn suffix_between(a: &str, b: Option<&str>) -> Result<String, FracIndexError> {
     match b {
         None => {
             // No upper bound — just pick the midpoint of the alphabet after a
             if a.is_empty() {
                 // Midpoint of the full alphabet
-                return String::from(ALPHABET[31] as char); // 'V'
+                return Ok(String::from(ALPHABET[31] as char)); // 'V'
             }
             let a_bytes = a.as_bytes();
-            let first_idx = char_index(a_bytes[0]);
+            let first_idx = char_index(a_bytes[0])?;
             if first_idx + 1 < ALPHABET.len() {
                 let mid = first_idx + (ALPHABET.len() - first_idx) / 2;
-                return String::from(ALPHABET[mid] as char);
+                return Ok(String::from(ALPHABET[mid] as char));
             }
             // first char is 'z'; recurse on the rest
             let mut result = String::from('z');
-            result.push_str(&suffix_between(&a[1..], None));
-            result
+            result.push_str(&suffix_between(&a[1..], None)?);
+            Ok(result)
         }
         Some(b_str) => {
             if b_str.is_empty() {
-                panic!("suffix_between: b_suffix is empty but should be > a_suffix");
+                // No room to synthesize a key — bubble up; key_between will
+                // rewrite this with the original (full) a/b for the user.
+                return Err(FracIndexError::NoKeyBetween {
+                    a: a.to_string(),
+                    b: String::new(),
+                });
             }
             let b_bytes = b_str.as_bytes();
-            let bi = char_index(b_bytes[0]);
+            let bi = char_index(b_bytes[0])?;
 
             if a.is_empty() {
                 if bi > 1 {
                     // Pick midpoint between 0 and b[0]
                     let mid = bi / 2;
-                    return String::from(ALPHABET[mid] as char);
+                    return Ok(String::from(ALPHABET[mid] as char));
                 }
                 // b[0] is 0 or 1, go deeper
                 let mut result = String::from(ALPHABET[0] as char);
-                result.push_str(&suffix_between("", Some(&b_str[1..])));
-                return result;
+                result.push_str(&suffix_between("", Some(&b_str[1..]))?);
+                return Ok(result);
             }
 
             let a_bytes = a.as_bytes();
-            let ai = char_index(a_bytes[0]);
+            let ai = char_index(a_bytes[0])?;
 
             if ai == bi {
                 let mut result = String::from(ALPHABET[ai] as char);
@@ -148,21 +196,21 @@ fn suffix_between(a: &str, b: Option<&str>) -> String {
                 } else {
                     None
                 };
-                result.push_str(&suffix_between(a_rest, b_rest));
-                return result;
+                result.push_str(&suffix_between(a_rest, b_rest)?);
+                return Ok(result);
             }
 
             // ai < bi since a < b
             if bi - ai > 1 {
                 let mid = ai + (bi - ai) / 2;
-                return String::from(ALPHABET[mid] as char);
+                return Ok(String::from(ALPHABET[mid] as char));
             }
 
             // Difference is 1, go deeper after a[0]
             let mut result = String::from(ALPHABET[ai] as char);
             let a_rest = if a.len() > 1 { &a[1..] } else { "" };
-            result.push_str(&suffix_between(a_rest, None));
-            result
+            result.push_str(&suffix_between(a_rest, None)?);
+            Ok(result)
         }
     }
 }
@@ -178,31 +226,31 @@ mod tests {
 
     #[test]
     fn test_key_after() {
-        assert_eq!(key_after("a0"), "a1");
-        assert_eq!(key_after("a9"), "aA");
-        assert_eq!(key_after("aZ"), "aa");
-        assert_eq!(key_after("ay"), "az");
+        assert_eq!(key_after("a0").unwrap(), "a1");
+        assert_eq!(key_after("a9").unwrap(), "aA");
+        assert_eq!(key_after("aZ").unwrap(), "aa");
+        assert_eq!(key_after("ay").unwrap(), "az");
         // Overflow: 'z' wraps by appending
-        assert_eq!(key_after("az"), "az0");
+        assert_eq!(key_after("az").unwrap(), "az0");
     }
 
     #[test]
     fn test_key_between_simple() {
-        let mid = key_between("a0", "a1");
+        let mid = key_between("a0", "a1").unwrap();
         assert!(mid.as_str() > "a0", "mid={mid} should be > a0");
         assert!(mid.as_str() < "a1", "mid={mid} should be < a1");
     }
 
     #[test]
     fn test_key_between_wide_gap() {
-        let mid = key_between("a0", "a9");
+        let mid = key_between("a0", "a9").unwrap();
         assert!(mid.as_str() > "a0");
         assert!(mid.as_str() < "a9");
     }
 
     #[test]
     fn test_key_between_different_lengths() {
-        let mid = key_between("a0", "a10");
+        let mid = key_between("a0", "a10").unwrap();
         assert!(mid.as_str() > "a0");
         assert!(mid.as_str() < "a10");
     }
@@ -210,7 +258,7 @@ mod tests {
     #[test]
     fn test_key_between_adjacent_letters() {
         // a0 and a1 differ by 1, so midpoint requires going deeper
-        let mid = key_between("a0", "a1");
+        let mid = key_between("a0", "a1").unwrap();
         assert!(mid.as_str() > "a0");
         assert!(mid.as_str() < "a1");
         // Should be something like "a0V"
@@ -223,7 +271,7 @@ mod tests {
         // Insert 10 keys after each previous one
         for _ in 0..10 {
             let last = keys.last().unwrap();
-            keys.push(key_after(last));
+            keys.push(key_after(last).unwrap());
         }
 
         for i in 0..keys.len() - 1 {
@@ -245,7 +293,7 @@ mod tests {
         let mut keys = vec![lo.clone()];
 
         for _ in 0..5 {
-            let mid = key_between(&lo, hi);
+            let mid = key_between(&lo, hi).unwrap();
             assert!(mid.as_str() > lo.as_str(), "mid={mid} should be > lo={lo}");
             assert!(mid.as_str() < hi, "mid={mid} should be < hi={hi}");
             keys.push(mid.clone());
@@ -267,19 +315,90 @@ mod tests {
     #[test]
     fn test_char_index_roundtrip() {
         for (i, &ch) in ALPHABET.iter().enumerate() {
-            assert_eq!(char_index(ch), i, "char_index failed for {}", ch as char);
+            assert_eq!(
+                char_index(ch).unwrap(),
+                i,
+                "char_index failed for {}",
+                ch as char
+            );
         }
+    }
+
+    #[test]
+    fn test_char_index_invalid_returns_err() {
+        for &c in &[b'!', b'-', b'.', b'/', b'@', b'[', b'`', b'{', 0u8, 0xFFu8] {
+            let result = char_index(c);
+            assert_eq!(
+                result,
+                Err(FracIndexError::InvalidChar(c as char)),
+                "expected Err for byte {c:#x}, got {result:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_key_after_invalid_char_returns_err() {
+        // Last byte '!' is outside the base-62 alphabet.
+        let result = key_after("a!");
+        assert_eq!(result, Err(FracIndexError::InvalidChar('!')));
+    }
+
+    #[test]
+    fn test_key_between_invalid_char_returns_err() {
+        // First byte '!' is outside the alphabet; should surface as InvalidChar.
+        let result = key_between("!0", "!1");
+        assert_eq!(result, Err(FracIndexError::InvalidChar('!')));
     }
 
     #[test]
     #[should_panic(expected = "key_between requires a < b")]
     fn test_key_between_panics_when_a_ge_b() {
-        key_between("a1", "a0");
+        let _ = key_between("a1", "a0");
     }
 
     #[test]
     #[should_panic(expected = "key_between requires a < b")]
     fn test_key_between_panics_when_equal() {
-        key_between("a0", "a0");
+        let _ = key_between("a0", "a0");
+    }
+
+    #[test]
+    fn test_key_between_zero_prefix_returns_error() {
+        // b is a followed by only '0' characters — no key can be synthesized.
+        let err = key_between("0", "00").expect_err("expected error for '0' vs '00'");
+        assert_eq!(
+            err,
+            FracIndexError::NoKeyBetween {
+                a: "0".to_string(),
+                b: "00".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_key_between_zero_suffix_edge_pairs_return_error() {
+        // Each of these pairs has b = a + some "0" characters, so the recursion
+        // hits an empty upper-bound suffix and must surface an error.
+        for (a, b) in [
+            ("0", "00"),
+            ("0", "000"),
+            ("00", "000"),
+            ("a0", "a00"),
+            ("a0", "a000"),
+        ] {
+            let result = key_between(a, b);
+            assert!(
+                result.is_err(),
+                "expected Err for key_between({a:?}, {b:?}), got {result:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_frac_index_error_display_mentions_inputs() {
+        let err = key_between("0", "00").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("\"0\""), "message should mention a: {msg}");
+        assert!(msg.contains("\"00\""), "message should mention b: {msg}");
     }
 }

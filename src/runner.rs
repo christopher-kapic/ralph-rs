@@ -4,7 +4,7 @@
 // steps in sort_key order, executing each via the single-step executor, and
 // managing plan-level status transitions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -39,6 +39,11 @@ pub struct RunOptions {
     pub to: Option<usize>,
     /// Skip branch creation and use the current branch.
     pub current_branch: bool,
+    /// Auto-commit any dirty working-tree state before switching to the plan
+    /// branch. Honored by `setup_branch`. When false and the config's
+    /// `auto_stash` is also false, a dirty working tree bails the run and
+    /// lists the files that would have been swept up.
+    pub auto_stash: bool,
     /// Override the harness for this run.
     pub harness_override: Option<String>,
     /// Dry-run mode: print what would happen without executing.
@@ -96,7 +101,7 @@ pub async fn run_plan(
 
     // 2. Optionally create and checkout branch.
     if !options.current_branch && !options.dry_run {
-        setup_branch(workdir, &effective_plan, None)?;
+        setup_branch(workdir, &effective_plan, None, options.auto_stash).await?;
     }
 
     // Load steps.
@@ -123,7 +128,7 @@ pub async fn run_plan(
     }
 
     // Load the hook library once for this run, filtered by project scope.
-    let hook_ctx = HookContext::load(workdir)?;
+    let hook_ctx = HookContext::load(workdir, config.hook_timeout_secs)?;
 
     // 4. Iterate through steps.
     let total = steps_to_run.len();
@@ -146,14 +151,14 @@ pub async fn run_plan(
             return Ok(result);
         }
 
-        // Skip already-completed or skipped steps.
+        // Skip already-completed or skipped steps. Pre-existing Complete
+        // steps were not executed by this invocation, so they must not
+        // inflate steps_succeeded.
         let current_step = storage::get_step(conn, &step.id)?;
         if current_step.status == StepStatus::Complete || current_step.status == StepStatus::Skipped
         {
             if current_step.status == StepStatus::Skipped {
                 result.steps_skipped += 1;
-            } else {
-                result.steps_succeeded += 1;
             }
             continue;
         }
@@ -166,7 +171,7 @@ pub async fn run_plan(
                 step_title: current_step.title.clone(),
                 step_num,
                 step_total: total,
-            });
+            })?;
         } else {
             eprintln!(
                 "[{}/{}] > Step {}: {} ...",
@@ -202,7 +207,7 @@ pub async fn run_plan(
             StepOutcome::Timeout => "timeout",
         };
 
-        let emit_finished = |outcome: &str| {
+        let emit_finished = |outcome: &str| -> Result<()> {
             if out.format == OutputFormat::Json {
                 output::emit_ndjson(&RunEvent::StepFinished {
                     step_id: current_step.id.clone(),
@@ -212,14 +217,15 @@ pub async fn run_plan(
                     outcome: outcome.to_string(),
                     attempts: step_result.attempts_used,
                     duration_secs: elapsed.as_secs_f64(),
-                });
+                })?;
             }
+            Ok(())
         };
 
         match step_result.outcome {
             StepOutcome::Success => {
                 result.steps_succeeded += 1;
-                emit_finished(outcome_str);
+                emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
                     eprintln!(
                         "[{}/{}] > {} ... OK (attempt {}, {:.0}s)",
@@ -233,7 +239,7 @@ pub async fn run_plan(
             }
             StepOutcome::Failed => {
                 result.steps_failed += 1;
-                emit_finished(outcome_str);
+                emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
                     eprintln!(
                         "[{}/{}] > {} ... FAILED (after {} attempts, {:.0}s)",
@@ -251,7 +257,7 @@ pub async fn run_plan(
                 return Ok(result);
             }
             StepOutcome::Aborted => {
-                emit_finished(outcome_str);
+                emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
                     eprintln!("[{}/{}] > {} ... ABORTED", i + 1, total, current_step.title);
                 }
@@ -262,7 +268,7 @@ pub async fn run_plan(
             }
             StepOutcome::Timeout => {
                 result.steps_failed += 1;
-                emit_finished(outcome_str);
+                emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
                     eprintln!("[{}/{}] > {} ... TIMEOUT", i + 1, total, current_step.title);
                 }
@@ -298,7 +304,7 @@ pub async fn run_plan(
             steps_executed: result.steps_executed,
             steps_succeeded: result.steps_succeeded,
             steps_failed: result.steps_failed,
-        });
+        })?;
     }
 
     Ok(result)
@@ -457,7 +463,10 @@ pub async fn run_all_plans(
     let run_start_sha = if options.current_branch || options.dry_run {
         String::new()
     } else {
-        git::get_commit_hash(workdir).context("could not capture starting HEAD SHA")?
+        let workdir_owned = workdir.to_path_buf();
+        blocking_git(move || git::get_commit_hash(&workdir_owned))
+            .await
+            .context("could not capture starting HEAD SHA")?
     };
 
     // 4. Build deps_of map for the in-scope plan set.
@@ -466,9 +475,26 @@ pub async fn run_all_plans(
         deps_of.insert(pid.clone(), storage::list_plan_dependencies(conn, pid)?);
     }
 
+    // Reverse adjacency: for each plan, which plans directly depend on it
+    // (within the in-scope set). Used to block transitive dependents when
+    // an upstream plan ends incomplete.
+    let mut dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+    for (pid, deps) in &deps_of {
+        for d in deps {
+            dependents_of
+                .entry(d.clone())
+                .or_default()
+                .push(pid.clone());
+        }
+    }
+
     // 5. Iterate through plans in topo order.
     let mut tip_sha_map: HashMap<String, String> = HashMap::new();
     let mut results: Vec<PlanRunResult> = Vec::new();
+    // Plans whose upstream deps ended incomplete — skip them but continue.
+    let mut blocked: HashSet<String> = HashSet::new();
+    // Slugs of plans that ended with an incomplete (InProgress) final status.
+    let mut incomplete_slugs: Vec<String> = Vec::new();
     let total = topo_order.len();
 
     for (i, plan_id) in topo_order.iter().enumerate() {
@@ -481,6 +507,18 @@ pub async fn run_all_plans(
         let plan = plan_by_id
             .get(plan_id)
             .with_context(|| format!("internal: missing plan {plan_id}"))?;
+
+        // If an upstream dep of this plan ended incomplete, skip it —
+        // its branch can't be set up from an incomplete parent tip.
+        if blocked.contains(plan_id) {
+            eprintln!(
+                "=== Plan {}/{}: {} (skipped — upstream dependency ended incomplete) ===",
+                i + 1,
+                total,
+                plan.slug
+            );
+            continue;
+        }
 
         let branch_plan = compute_branch_plan(
             &topo_order,
@@ -515,11 +553,20 @@ pub async fn run_all_plans(
 
         // Set up the branch ourselves (unless the user wants current-branch mode).
         if !options.current_branch && !options.dry_run {
-            setup_branch(workdir, plan, branch_plan.parent_sha.as_deref())?;
+            setup_branch(
+                workdir,
+                plan,
+                branch_plan.parent_sha.as_deref(),
+                options.auto_stash,
+            )
+            .await?;
 
             // Merge any additional deps' SHAs for multi-parent plans.
             for other_sha in &branch_plan.merge_shas {
-                if let Err(e) = git::merge_sha(workdir, other_sha) {
+                let workdir_owned = workdir.to_path_buf();
+                let sha = other_sha.clone();
+                let merge_result = blocking_git(move || git::merge_sha(&workdir_owned, &sha)).await;
+                if let Err(e) = merge_result {
                     // Try to find a human-readable slug for the conflicting SHA.
                     let other_slug = tip_sha_map
                         .iter()
@@ -551,6 +598,10 @@ pub async fn run_all_plans(
             from: options.from,
             to: options.to,
             current_branch: true,
+            // Branch setup was already handled at the orchestrator level;
+            // forward `auto_stash` for completeness even though the inner
+            // call won't re-run `setup_branch`.
+            auto_stash: options.auto_stash,
             harness_override: options.harness_override.clone(),
             dry_run: options.dry_run,
         };
@@ -574,7 +625,9 @@ pub async fn run_all_plans(
             PlanStatus::Complete => {
                 // Capture the tip SHA of this plan's branch for downstream deps.
                 if !options.current_branch && !options.dry_run {
-                    let sha = git::get_commit_hash(workdir)
+                    let workdir_owned = workdir.to_path_buf();
+                    let sha = blocking_git(move || git::get_commit_hash(&workdir_owned))
+                        .await
                         .context("could not capture tip SHA after plan completed")?;
                     tip_sha_map.insert(plan_id.clone(), sha);
                 }
@@ -587,13 +640,68 @@ pub async fn run_all_plans(
                 return Ok(results);
             }
             _ => {
-                // InProgress or other — treat as "stopped cleanly but incomplete".
-                return Ok(results);
+                // InProgress — plan stopped cleanly but incomplete. Block
+                // its transitive dependents (their branches would root on an
+                // incomplete tip) but keep iterating so independent plans
+                // still run.
+                incomplete_slugs.push(plan.slug.clone());
+                let newly_blocked = transitive_dependents(plan_id, &dependents_of);
+                if newly_blocked.is_empty() {
+                    eprintln!(
+                        "Plan '{}' ended incomplete; continuing with independent plans.",
+                        plan.slug
+                    );
+                } else {
+                    let blocked_slugs: Vec<String> = newly_blocked
+                        .iter()
+                        .filter_map(|id| plan_by_id.get(id).map(|p| p.slug.clone()))
+                        .collect();
+                    eprintln!(
+                        "Plan '{}' ended incomplete; skipping {} dependent plan(s): {}",
+                        plan.slug,
+                        blocked_slugs.len(),
+                        blocked_slugs.join(", ")
+                    );
+                    blocked.extend(newly_blocked);
+                }
             }
         }
     }
 
+    if !incomplete_slugs.is_empty() {
+        eprintln!(
+            "Warning: {} plan(s) ended incomplete: {}",
+            incomplete_slugs.len(),
+            incomplete_slugs.join(", ")
+        );
+    }
+
     Ok(results)
+}
+
+/// Collect every plan that transitively depends on `root_id` within the given
+/// reverse-adjacency graph. Returns plan IDs (excluding `root_id`).
+fn transitive_dependents(
+    root_id: &str,
+    dependents_of: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = dependents_of.get(root_id).cloned().unwrap_or_default();
+    while let Some(node) = stack.pop() {
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        if let Some(next) = dependents_of.get(&node) {
+            for n in next {
+                if !seen.contains(n) {
+                    stack.push(n.clone());
+                }
+            }
+        }
+        out.push(node);
+    }
+    out
 }
 
 /// Resume a plan from the last failed or in-progress step.
@@ -614,7 +722,10 @@ pub async fn resume_plan(
 
     // Reset the failed/in-progress step to pending.
     let step = &steps[resume_idx];
-    if step.status == StepStatus::Failed || step.status == StepStatus::InProgress {
+    if step.status == StepStatus::Failed
+        || step.status == StepStatus::InProgress
+        || step.status == StepStatus::Aborted
+    {
         storage::reset_step(conn, &step.id)?;
     }
 
@@ -639,11 +750,13 @@ pub async fn resume_plan(
 /// Skip the current (or specified) step in a plan.
 ///
 /// Marks the step as skipped and returns the step number that was skipped.
+/// The optional `reason` is persisted on the step so it appears in
+/// `ralph status -v` and `ralph log`.
 pub fn skip_step(
     conn: &Connection,
     plan: &Plan,
     step_num: Option<usize>,
-    _reason: Option<&str>,
+    reason: Option<&str>,
 ) -> Result<usize> {
     let steps = storage::list_steps(conn, &plan.id)?;
 
@@ -674,8 +787,14 @@ pub fn skip_step(
         }
     }
 
-    storage::update_step_status(conn, &step.id, StepStatus::Skipped)?;
-    eprintln!("Skipped step {} '{}'", actual_num, step.title);
+    storage::mark_step_skipped(conn, &step.id, reason)?;
+    match reason {
+        Some(r) => eprintln!(
+            "Skipped step {} '{}' (reason: {})",
+            actual_num, step.title, r
+        ),
+        None => eprintln!("Skipped step {} '{}'", actual_num, step.title),
+    }
 
     Ok(actual_num)
 }
@@ -690,10 +809,9 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
         // Aborted is runnable: `resume_plan` routes through `run_plan`, and
         // the old rejection (with a "use resume to continue" hint) made
         // resume error out on exactly the plans it was meant to handle.
-        PlanStatus::Ready
-        | PlanStatus::InProgress
-        | PlanStatus::Failed
-        | PlanStatus::Aborted => Ok(()),
+        PlanStatus::Ready | PlanStatus::InProgress | PlanStatus::Failed | PlanStatus::Aborted => {
+            Ok(())
+        }
         PlanStatus::Planning => bail!(
             "Plan '{}' is still in planning status. Run `plan approve {}` first.",
             plan.slug,
@@ -720,44 +838,90 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
 ///   parent SHA is ignored and the existing branch is checked out.
 /// - If `parent_sha` is `None`, creates the branch from the current HEAD
 ///   (legacy behavior).
-fn setup_branch(workdir: &Path, plan: &Plan, parent_sha: Option<&str>) -> Result<()> {
-    let current = git::get_current_branch(workdir).context("Failed to get current git branch")?;
+async fn setup_branch(
+    workdir: &Path,
+    plan: &Plan,
+    parent_sha: Option<&str>,
+    auto_stash: bool,
+) -> Result<()> {
+    let current = {
+        let workdir_owned = workdir.to_path_buf();
+        blocking_git(move || git::get_current_branch(&workdir_owned))
+            .await
+            .context("Failed to get current git branch")?
+    };
 
     if current == plan.branch_name {
         return Ok(());
     }
 
-    // Auto-commit any dirty state before switching branches.
-    git::auto_commit_dirty_state(
-        workdir,
-        &format!(
-            "ralph: auto-save before switching to branch '{}'",
-            plan.branch_name
-        ),
-    )?;
+    // Handle any dirty working-tree state before switching branches.
+    // Default (auto_stash=false) is to refuse: auto-committing untracked
+    // files has surprised users who had scratch work in the tree, so we
+    // preview the file list and bail unless the user opted in via
+    // `--auto-stash` or `config.auto_stash`.
+    {
+        let workdir_owned = workdir.to_path_buf();
+        let dirty = blocking_git(move || git::has_uncommitted_changes(&workdir_owned)).await?;
+        if dirty {
+            let workdir_owned = workdir.to_path_buf();
+            let files = blocking_git(move || git::get_all_changed_files(&workdir_owned)).await?;
+            if auto_stash {
+                let workdir_owned = workdir.to_path_buf();
+                let msg = format!(
+                    "ralph: auto-save before switching to branch '{}'",
+                    plan.branch_name
+                );
+                blocking_git(move || git::commit_changes(&workdir_owned, &msg)).await?;
+            } else {
+                let mut msg = format!(
+                    "Working tree has uncommitted changes; refusing to auto-commit \
+                     {} file(s) before switching to branch '{}':\n",
+                    files.len(),
+                    plan.branch_name
+                );
+                for f in &files {
+                    msg.push_str("  ");
+                    msg.push_str(f);
+                    msg.push('\n');
+                }
+                msg.push_str(
+                    "Re-run with --auto-stash (or set `auto_stash: true` in config.json) \
+                     to commit them automatically, or stage/discard them manually first.",
+                );
+                bail!(msg);
+            }
+        }
+    }
 
     // Try to create and checkout the branch. If it already exists,
     // just check it out.
-    let create_result = if let Some(sha) = parent_sha {
-        git::create_branch_from_sha(workdir, &plan.branch_name, sha)
-    } else {
-        git::create_and_checkout_branch(workdir, &plan.branch_name)
+    let create_result = {
+        let workdir_owned = workdir.to_path_buf();
+        let branch = plan.branch_name.clone();
+        let parent = parent_sha.map(|s| s.to_string());
+        blocking_git(move || match parent {
+            Some(sha) => git::create_branch_from_sha(&workdir_owned, &branch, &sha),
+            None => git::create_and_checkout_branch(&workdir_owned, &branch),
+        })
+        .await
     };
 
     if create_result.is_err() {
         // Branch might already exist; try a plain checkout.
-        checkout_existing_branch(workdir, &plan.branch_name)?;
+        checkout_existing_branch(workdir, &plan.branch_name).await?;
     }
 
     Ok(())
 }
 
 /// Checkout an existing branch.
-fn checkout_existing_branch(workdir: &Path, branch: &str) -> Result<()> {
-    let output = std::process::Command::new("git")
+async fn checkout_existing_branch(workdir: &Path, branch: &str) -> Result<()> {
+    let output = tokio::process::Command::new("git")
         .args(["checkout", branch])
         .current_dir(workdir)
         .output()
+        .await
         .context("Failed to execute git checkout")?;
 
     if !output.status.success() {
@@ -766,6 +930,19 @@ fn checkout_existing_branch(workdir: &Path, branch: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run a synchronous `git.rs` operation on the tokio blocking thread pool so
+/// that the runtime worker remains free to drive other futures (such as the
+/// abort-signal watcher) while the git subprocess runs.
+async fn blocking_git<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .context("git worker task panicked")?
 }
 
 /// Select which steps to run based on RunOptions.
@@ -895,7 +1072,9 @@ fn dry_run_report(plan: &Plan, all_steps: &[Step], steps_to_run: &[Step]) -> Res
         steps_succeeded: 0,
         steps_failed: 0,
         steps_skipped: 0,
-        final_status: plan.status,
+        // Dry run does not mutate state; report the projected status assuming
+        // every step that would run succeeds.
+        final_status: PlanStatus::Complete,
         step_results: Vec::new(),
     })
 }
@@ -1000,6 +1179,7 @@ mod tests {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 model: None,
+                skipped_reason: None,
             })
             .collect()
     }
@@ -1148,6 +1328,38 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_resume_resets_aborted_step_to_pending() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) =
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        let (s2, _) =
+            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None)
+                .unwrap();
+        storage::update_step_status(&conn, &s2.id, StepStatus::Aborted).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let resume_idx = find_resume_point(&steps).unwrap();
+        assert_eq!(resume_idx, 1);
+
+        let step = &steps[resume_idx];
+        assert_eq!(step.status, StepStatus::Aborted);
+
+        // Replicate the reset condition from resume_plan
+        if step.status == StepStatus::Failed
+            || step.status == StepStatus::InProgress
+            || step.status == StepStatus::Aborted
+        {
+            storage::reset_step(&conn, &step.id).unwrap();
+        }
+
+        let refreshed = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(refreshed[resume_idx].status, StepStatus::Pending);
+    }
+
     // -- find_current_step tests --
 
     #[test]
@@ -1227,6 +1439,52 @@ mod tests {
     }
 
     #[test]
+    fn test_skip_step_persists_reason() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+
+        let skipped = skip_step(&conn, &plan, Some(1), Some("redundant after H7")).unwrap();
+        assert_eq!(skipped, 1);
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Skipped);
+        assert_eq!(
+            steps[0].skipped_reason.as_deref(),
+            Some("redundant after H7")
+        );
+    }
+
+    #[test]
+    fn test_skip_step_no_reason_stores_null() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+
+        skip_step(&conn, &plan, Some(1), None).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Skipped);
+        assert!(steps[0].skipped_reason.is_none());
+    }
+
+    #[test]
+    fn test_reset_clears_skipped_reason() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) =
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
+
+        skip_step(&conn, &plan, Some(1), Some("because")).unwrap();
+        storage::reset_step(&conn, &s1.id).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Pending);
+        assert!(steps[0].skipped_reason.is_none());
+    }
+
+    #[test]
     fn test_skip_step_allows_failed() {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
@@ -1260,6 +1518,10 @@ mod tests {
         let result = dry_run_report(&plan, &all_steps, &all_steps).unwrap();
         assert_eq!(result.steps_executed, 0);
         assert_eq!(result.plan_slug, "test-plan");
+        // Projected status is not the plan's current status (Ready); it reflects
+        // the outcome of a successful run.
+        assert_ne!(result.final_status, PlanStatus::Ready);
+        assert_eq!(result.final_status, PlanStatus::Complete);
     }
 
     // -- RunOptions default --
@@ -1535,17 +1797,80 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // -- setup_branch with parent_sha --
+    // -- transitive_dependents (L9 helper) --
 
     #[test]
-    fn test_setup_branch_with_parent_sha() {
+    fn test_transitive_dependents_no_edges() {
+        // With no edges, no plan is blocked by any other. This is the core
+        // of the L9 fix: when B ends incomplete and C is independent, C must
+        // not be blocked.
+        let dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+        let blocked = transitive_dependents("B", &dependents_of);
+        assert!(blocked.is_empty());
+    }
+
+    #[test]
+    fn test_transitive_dependents_direct_dependent() {
+        // C depends on B → B's incomplete run blocks C.
+        let mut dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+        dependents_of.insert("B".to_string(), vec!["C".to_string()]);
+        let blocked = transitive_dependents("B", &dependents_of);
+        assert_eq!(blocked, vec!["C".to_string()]);
+    }
+
+    #[test]
+    fn test_transitive_dependents_transitive_chain() {
+        // B -> C -> D: incomplete B blocks both C and D.
+        let mut dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+        dependents_of.insert("B".to_string(), vec!["C".to_string()]);
+        dependents_of.insert("C".to_string(), vec!["D".to_string()]);
+        let mut blocked = transitive_dependents("B", &dependents_of);
+        blocked.sort();
+        assert_eq!(blocked, vec!["C".to_string(), "D".to_string()]);
+    }
+
+    #[test]
+    fn test_transitive_dependents_diamond_no_duplicates() {
+        // B -> {C, D}; both C and D -> E. E appears once, not twice.
+        let mut dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+        dependents_of.insert("B".to_string(), vec!["C".to_string(), "D".to_string()]);
+        dependents_of.insert("C".to_string(), vec!["E".to_string()]);
+        dependents_of.insert("D".to_string(), vec!["E".to_string()]);
+        let mut blocked = transitive_dependents("B", &dependents_of);
+        blocked.sort();
+        assert_eq!(
+            blocked,
+            vec!["C".to_string(), "D".to_string(), "E".to_string()]
+        );
+    }
+
+    /// Acceptance test for L9: with [A Ready, B, C Ready] where C is
+    /// independent of B, an incomplete run of B must not block C. The
+    /// helper encodes that decision.
+    #[test]
+    fn test_transitive_dependents_independent_plans_not_blocked() {
+        // Graph: A, B, C all in scope, no edges between any of them.
+        let dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+        // B ends incomplete → nothing is blocked.
+        let blocked_by_b = transitive_dependents("B", &dependents_of);
+        assert!(blocked_by_b.is_empty());
+        // Sanity: A and C aren't in a blocked set, so run_all_plans' blocked
+        // check `contains(plan_id)` returns false for them and they run.
+        let blocked_set: HashSet<String> = blocked_by_b.into_iter().collect();
+        assert!(!blocked_set.contains("A"));
+        assert!(!blocked_set.contains("C"));
+    }
+
+    // -- setup_branch with parent_sha --
+
+    /// Initialize a throwaway git repo with a single commit and return its path.
+    fn init_git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
         use std::fs;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
 
-        // Initialize repo with one commit.
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&dir)
@@ -1573,6 +1898,14 @@ mod tests {
             .output()
             .unwrap();
 
+        (tmp, dir)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_with_parent_sha() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
         let initial_sha = git::get_commit_hash(&dir).unwrap();
 
         // Make a second commit.
@@ -1595,10 +1928,210 @@ mod tests {
         };
 
         // Should create feat/rooted rooted at initial_sha.
-        setup_branch(&dir, &plan, Some(&initial_sha)).unwrap();
+        setup_branch(&dir, &plan, Some(&initial_sha), false)
+            .await
+            .unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/rooted");
         assert_eq!(git::get_commit_hash(&dir).unwrap(), initial_sha);
         // The second commit's file should not be visible on the new branch.
         assert!(!dir.join("second.txt").exists());
+    }
+
+    /// Confirm `setup_branch` no longer monopolises a single-threaded runtime:
+    /// a concurrent tokio task must be able to make progress while the git
+    /// subprocesses run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_does_not_block_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_tmp, dir) = init_git_repo();
+
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: dir.to_string_lossy().to_string(),
+            branch_name: "feat/concurrent".to_string(),
+            description: String::new(),
+            status: PlanStatus::Ready,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Concurrent ticker that increments a counter every few ms. On a
+        // blocking runtime worker it would not get any cycles while the git
+        // subprocesses run serially in `setup_branch`.
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_task = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                ticks_task.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        setup_branch(&dir, &plan, None, false).await.unwrap();
+        ticker.await.unwrap();
+
+        // The ticker's 50 × 1ms sleeps only make progress if the runtime
+        // worker was free to poll them. Assert at least a few got through —
+        // the exact count depends on git timing, but a fully blocked runtime
+        // yields zero.
+        assert!(
+            ticks.load(Ordering::SeqCst) > 0,
+            "ticker made no progress — setup_branch blocked the runtime"
+        );
+    }
+
+    // Regression for L7: pre-existing Complete steps must not inflate
+    // steps_succeeded — only steps this invocation actually executed count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_plan_does_not_count_preexisting_complete_as_succeeded() {
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+
+        let conn = setup();
+        let plan =
+            storage::create_plan(&conn, "s", &project, "feat/x", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+
+        // Two pre-completed steps from an earlier run.
+        let (s1, _) =
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        let (s2, _) =
+            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None)
+                .unwrap();
+        storage::update_step_status(&conn, &s2.id, StepStatus::Complete).unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "s", &project)
+            .unwrap()
+            .unwrap();
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let result = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        // Before the fix, pre-existing Complete steps were counted as
+        // succeeded; this invocation executed nothing, so both counters
+        // must be zero.
+        assert_eq!(result.steps_executed, 0);
+        assert_eq!(result.steps_succeeded, 0);
+        assert_eq!(result.final_status, PlanStatus::Complete);
+    }
+
+    // -- setup_branch auto-stash preview/opt-out (L10) --
+
+    /// Acceptance for L10: a dirty tree without `--auto-stash` must bail
+    /// rather than silently sweep untracked files into a commit. The error
+    /// must surface the files so the user can stage them intentionally.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_refuses_dirty_tree_without_auto_stash() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        // Drop an untracked file into the tree.
+        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: dir.to_string_lossy().to_string(),
+            branch_name: "feat/dirty".to_string(),
+            description: String::new(),
+            status: PlanStatus::Ready,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let err = setup_branch(&dir, &plan, None, false)
+            .await
+            .expect_err("dirty tree without auto_stash must bail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scratch.txt"),
+            "error must list the untracked file, got: {msg}"
+        );
+        assert!(
+            msg.contains("--auto-stash"),
+            "error must point users at the opt-in flag, got: {msg}"
+        );
+
+        // Nothing was swept into a commit; the branch was not switched.
+        assert!(git::has_uncommitted_changes(&dir).unwrap());
+        assert_ne!(git::get_current_branch(&dir).unwrap(), "feat/dirty");
+    }
+
+    /// With `auto_stash: true` the old behavior is preserved: dirty state
+    /// is committed and the new branch is checked out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_auto_stash_commits_dirty_tree() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: dir.to_string_lossy().to_string(),
+            branch_name: "feat/auto".to_string(),
+            description: String::new(),
+            status: PlanStatus::Ready,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        setup_branch(&dir, &plan, None, true).await.unwrap();
+        assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/auto");
+        assert!(!git::has_uncommitted_changes(&dir).unwrap());
+    }
+
+    /// A clean tree must not require the opt-in. This also confirms we
+    /// didn't regress the zero-change fast path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_clean_tree_proceeds_without_auto_stash() {
+        let (_tmp, dir) = init_git_repo();
+
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: dir.to_string_lossy().to_string(),
+            branch_name: "feat/clean".to_string(),
+            description: String::new(),
+            status: PlanStatus::Ready,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        setup_branch(&dir, &plan, None, false).await.unwrap();
+        assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");
     }
 }

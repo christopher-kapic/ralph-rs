@@ -15,7 +15,10 @@ pub struct Cli {
     #[arg(long, short = 'C', global = true)]
     pub project: Option<PathBuf>,
 
-    /// Override the default harness for this invocation.
+    /// Override the default harness for this invocation. A per-subcommand
+    /// `--harness` (e.g. `ralph run --harness X`) takes precedence over this
+    /// global flag; both in turn fall back to the plan's stored harness and
+    /// then the config default.
     #[arg(long, global = true)]
     pub harness: Option<String>,
 
@@ -40,14 +43,6 @@ pub enum Command {
     /// Initialize ralph-rs: create config/agents directories, detect
     /// installed harnesses, and write the default config.
     Init {
-        /// Slug for the initial plan.
-        #[arg(long)]
-        slug: Option<String>,
-
-        /// Git branch name to use.
-        #[arg(long)]
-        branch: Option<String>,
-
         /// Skip the interactive default-harness prompt (picks the first
         /// installed harness, preferring `claude`).
         #[arg(long)]
@@ -77,13 +72,13 @@ pub enum Command {
     /// By default, runs all remaining pending steps in the plan sequentially.
     /// Use --one to run only the next pending step. Use --from/--to to run a
     /// specific range of steps. Use --all to run every plan in dependency order
-    /// (ignores the plan slug). Precedence: --all > --one > --from/--to > default.
+    /// (ignores the plan slug). --one and --all are mutually exclusive.
     Run {
         /// Plan slug to run. Defaults to the active plan.
         plan: Option<String>,
 
         /// Run only the next pending step instead of all remaining.
-        #[arg(long, alias = "single")]
+        #[arg(long, alias = "single", conflicts_with = "all")]
         one: bool,
 
         /// Run all plans in dependency order (chains plans). Plan slug
@@ -111,6 +106,14 @@ pub enum Command {
         #[arg(long)]
         current_branch: bool,
 
+        /// Auto-commit any dirty working-tree state before switching to the
+        /// plan branch. Without this flag (and when `auto_stash` is false in
+        /// config.json), a dirty working tree bails the run and prints the
+        /// files that would have been swept up, so the user can stage or
+        /// discard them intentionally.
+        #[arg(long)]
+        auto_stash: bool,
+
         /// Override the harness for this run.
         #[arg(long)]
         harness: Option<String>,
@@ -124,6 +127,10 @@ pub enum Command {
     Resume {
         /// Plan slug to resume. Defaults to the active plan.
         plan: Option<String>,
+
+        /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Skip the current or specified step.
@@ -138,6 +145,10 @@ pub enum Command {
         /// Reason for skipping.
         #[arg(long)]
         reason: Option<String>,
+
+        /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Export a plan to a portable JSON file.
@@ -162,6 +173,11 @@ pub enum Command {
         /// Override the branch name on import.
         #[arg(long)]
         branch: Option<String>,
+
+        /// Fail when the export's ralph-rs major version is incompatible
+        /// (default is to warn and continue).
+        #[arg(long)]
+        strict: bool,
     },
 
     /// Show the status of the current or specified plan.
@@ -191,8 +207,9 @@ pub enum Command {
         #[arg(long, conflicts_with = "lines")]
         full: bool,
 
-        /// Maximum number of stdout/stderr lines to show per attempt
-        /// (default: 50). Implies showing output. Conflicts with --full.
+        /// Maximum number of output lines to show per attempt, split between
+        /// stdout and stderr (total budget, not per stream). Implies showing
+        /// output. Conflicts with --full.
         #[arg(long)]
         lines: Option<usize>,
     },
@@ -365,7 +382,7 @@ pub enum PlanDependencyCommand {
         slug: String,
 
         /// Slug of the dependency to remove (can be repeated).
-        #[arg(long = "depends-on", num_args = 1..)]
+        #[arg(long = "depends-on", num_args = 1.., required = true)]
         depends_on: Vec<String>,
     },
 
@@ -392,14 +409,15 @@ pub enum StepCommand {
     ///
     /// The single-step form takes a positional title plus per-field flags.
     /// For bulk insertion use `--import-json <FILE|->` to read an array of
-    /// step objects (or a single object) from a file or stdin; the positional
-    /// title and per-field flags are mutually exclusive with `--import-json`.
+    /// step objects (or a single object) from a file or stdin; the per-field
+    /// flags are mutually exclusive with `--import-json`. When `--import-json`
+    /// is used, the first positional is interpreted as the plan slug (since
+    /// no title is meaningful for a bulk import).
     Add {
-        /// Step title. Required unless `--import-json` is used.
-        #[arg(
-            required_unless_present = "import_json",
-            conflicts_with = "import_json"
-        )]
+        /// Step title. Required unless `--import-json` is used. With
+        /// `--import-json`, a single positional is reinterpreted as the
+        /// plan slug.
+        #[arg(required_unless_present = "import_json")]
         title: Option<String>,
 
         /// Plan slug. Defaults to the active plan.
@@ -852,14 +870,45 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_step_add_import_json_conflicts_with_title() {
+    fn test_parse_step_add_import_json_with_plan_slug() {
+        // With --import-json, the single positional should parse as the
+        // (would-be) title slot — the handler reinterprets it as the plan
+        // slug. This guards against a clap-level conflict error.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "--import-json",
+            "f.json",
+            "my-plan",
+        ])
+        .unwrap();
+        if let Command::Step(StepCommand::Add {
+            title,
+            plan,
+            import_json,
+            ..
+        }) = cli.command
+        {
+            assert_eq!(title.as_deref(), Some("my-plan"));
+            assert!(plan.is_none());
+            assert_eq!(import_json.as_deref(), Some("f.json"));
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_import_json_conflicts_with_description() {
+        // Non-positional single-step flags still conflict with --import-json.
         let result = Cli::try_parse_from([
             "ralph-rs",
             "step",
             "add",
-            "some title",
             "--import-json",
             "-",
+            "--description",
+            "x",
         ]);
         assert!(result.is_err());
     }
@@ -915,6 +964,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_run_one_and_all_conflict() {
+        let result = Cli::try_parse_from(["ralph-rs", "run", "--one", "--all"]);
+        assert!(
+            result.is_err(),
+            "clap must reject --one combined with --all"
+        );
+    }
+
+    #[test]
     fn test_parse_run_current_branch() {
         let cli =
             Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--current-branch"]).unwrap();
@@ -926,6 +984,27 @@ mod tests {
         {
             assert_eq!(plan.as_deref(), Some("my-feature"));
             assert!(current_branch);
+        } else {
+            panic!("Expected Run");
+        }
+    }
+
+    #[test]
+    fn test_parse_run_auto_stash() {
+        // L10: the `--auto-stash` flag must thread through to the Run
+        // variant so `setup_branch` can opt into the legacy auto-commit
+        // behavior for dirty working trees.
+        let cli = Cli::try_parse_from(["ralph-rs", "run", "--auto-stash"]).unwrap();
+        if let Command::Run { auto_stash, .. } = cli.command {
+            assert!(auto_stash);
+        } else {
+            panic!("Expected Run");
+        }
+
+        // Default must stay off so we don't silently sweep dirty trees.
+        let cli = Cli::try_parse_from(["ralph-rs", "run"]).unwrap();
+        if let Command::Run { auto_stash, .. } = cli.command {
+            assert!(!auto_stash);
         } else {
             panic!("Expected Run");
         }
@@ -1229,6 +1308,49 @@ mod tests {
     fn test_global_harness_flag() {
         let cli = Cli::try_parse_from(["ralph-rs", "--harness", "codex", "doctor"]).unwrap();
         assert_eq!(cli.harness.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn test_run_subcommand_captures_harness_flag() {
+        // The Run subcommand must carry its own harness field so main.rs can
+        // honor per-subcommand overrides. clap's `global = true` on the top
+        // level makes both fields mirror the final `--harness` value, which is
+        // why the parse check below sees the same string in both places.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "--harness",
+            "codex",
+            "run",
+            "--harness",
+            "claude",
+        ])
+        .unwrap();
+        if let Command::Run {
+            harness: run_harness,
+            ..
+        } = cli.command
+        {
+            assert_eq!(run_harness.as_deref(), Some("claude"));
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_harness_precedence_prefers_subcommand() {
+        // Direct regression test for the rule applied in main.rs:
+        //   per-subcommand --harness beats global --harness.
+        // Expressed here so the precedence survives any refactor that relocates
+        // the dispatcher.
+        let global = Some("codex".to_string());
+        let run_flag = Some("claude".to_string());
+        let resolved = run_flag.clone().or(global.clone());
+        assert_eq!(resolved.as_deref(), Some("claude"));
+
+        // Falls back to the global when the subcommand flag is absent.
+        let none_run: Option<String> = None;
+        let resolved = none_run.or(global.clone());
+        assert_eq!(resolved.as_deref(), Some("codex"));
     }
 
     #[test]

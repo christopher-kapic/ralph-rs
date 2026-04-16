@@ -7,13 +7,13 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use super::app::{App, InputMode};
 use crate::plan::StepStatus;
 
 /// Render the entire TUI frame.
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     // Top-level vertical split: main content + help bar at bottom.
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -35,7 +35,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 // Step list (left panel)
 // ---------------------------------------------------------------------------
 
-fn draw_step_list(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_step_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = app
         .steps
         .iter()
@@ -72,9 +72,8 @@ fn draw_step_list(frame: &mut Frame, app: &App, area: Rect) {
         )
         .highlight_symbol("> ");
 
-    let mut state = ListState::default();
-    state.select(Some(app.selected_index));
-    frame.render_stateful_widget(list, area, &mut state);
+    app.list_state.select(Some(app.selected_index));
+    frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
 // ---------------------------------------------------------------------------
@@ -133,7 +132,7 @@ fn draw_step_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Attempt counter
-    let max_retries = step.max_retries.unwrap_or(3);
+    let max_retries = step.max_retries.unwrap_or(app.default_max_retries as i32);
     let max_attempts = max_retries + 1;
     lines.push(Line::from(vec![
         Span::styled("Attempts: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -237,6 +236,7 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::plan::{Plan, PlanStatus, Step, StepStatus};
     use chrono::Utc;
 
@@ -271,9 +271,10 @@ mod tests {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 model: None,
+                skipped_reason: None,
             })
             .collect();
-        App::new(plan, steps)
+        App::new(plan, steps, &Config::default())
     }
 
     #[test]
@@ -298,18 +299,18 @@ mod tests {
 
     #[test]
     fn test_draw_does_not_panic_empty_steps() {
-        let app = make_app(0);
+        let mut app = make_app(0);
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     }
 
     #[test]
     fn test_draw_does_not_panic_with_steps() {
-        let app = make_app(5);
+        let mut app = make_app(5);
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     }
 
     #[test]
@@ -319,6 +320,93 @@ mod tests {
         app.input_buffer = "New step".to_string();
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn test_detail_attempt_counter_uses_config_default() {
+        // A step with no explicit max_retries override should fall back to the
+        // configured Config.max_retries_per_step rather than a hardcoded 3.
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: "/tmp".to_string(),
+            branch_name: "b".to_string(),
+            description: "d".to_string(),
+            status: PlanStatus::InProgress,
+            harness: Some("claude".to_string()),
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let steps = vec![Step {
+            id: "s0".to_string(),
+            plan_id: "p1".to_string(),
+            sort_key: "a0".to_string(),
+            title: "Only step".to_string(),
+            description: String::new(),
+            agent: None,
+            harness: None,
+            acceptance_criteria: vec![],
+            status: StepStatus::Pending,
+            attempts: 0,
+            max_retries: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: None,
+            skipped_reason: None,
+        }];
+        let mut config = Config::default();
+        config.max_retries_per_step = 7;
+        let mut app = App::new(plan, steps, &config);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = (0..buffer.area().height)
+            .map(|y| {
+                (0..buffer.area().width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("0/8"),
+            "detail panel should render 0/(max_retries_per_step + 1) = 0/8; got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_list_state_persists_across_frames() {
+        // Render a long list in a small viewport, scroll past the visible window,
+        // and verify the list_state offset is preserved (not reset to 0 each frame).
+        let mut app = make_app(50);
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.list_state.selected(), Some(0));
+
+        // Scroll far enough that the selection must be off-screen on first render.
+        for _ in 0..30 {
+            app.navigate_down();
+        }
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let offset_after_scroll = app.list_state.offset();
+        assert_eq!(app.list_state.selected(), Some(30));
+        assert!(
+            offset_after_scroll > 0,
+            "viewport should have scrolled to follow selection"
+        );
+
+        // A subsequent render with no navigation must not reset the offset.
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.list_state.offset(), offset_after_scroll);
     }
 }

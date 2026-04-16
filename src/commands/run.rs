@@ -109,6 +109,11 @@ pub fn cmd_status(
                 output::colored_status(step.status, out.color),
                 step.attempts,
             );
+            if step.status == StepStatus::Skipped
+                && let Some(reason) = step.skipped_reason.as_deref()
+            {
+                println!("       reason: {reason}");
+            }
         }
     }
 
@@ -147,7 +152,9 @@ pub fn cmd_log(
         match storage::find_active_plan(conn, project, true)? {
             Some(p) => p,
             None => {
-                if out.format != OutputFormat::Json {
+                if out.format == OutputFormat::Json {
+                    println!("null");
+                } else {
                     eprintln!("No plan found. Specify a plan slug as a positional argument.");
                 }
                 return Ok(());
@@ -170,7 +177,7 @@ pub fn cmd_log(
 
         if out.format == OutputFormat::Json {
             for log in &logs {
-                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode));
+                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode))?;
             }
             return Ok(());
         }
@@ -183,6 +190,14 @@ pub fn cmd_log(
         );
         eprintln!();
 
+        if step.status == StepStatus::Skipped {
+            match step.skipped_reason.as_deref() {
+                Some(reason) => println!("  (skipped: {reason})"),
+                None => println!("  (skipped)"),
+            }
+            println!();
+        }
+
         for log in &logs {
             print_log_entry(&step.title, log, output_mode, out.color);
         }
@@ -192,13 +207,43 @@ pub fn cmd_log(
 
         if out.format == OutputFormat::Json {
             for (_, log) in &entries {
-                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode));
+                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode))?;
             }
             return Ok(());
         }
 
-        if entries.is_empty() {
+        // Surface skipped steps' reasons alongside execution logs — skips
+        // don't produce an execution_log row, so they'd otherwise be invisible
+        // in this view.
+        let steps = storage::list_steps(conn, &plan.id)?;
+        let skipped_with_reason: Vec<&crate::plan::Step> = steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Skipped)
+            .collect();
+
+        if entries.is_empty() && skipped_with_reason.is_empty() {
             eprintln!("No execution logs for plan '{}'.", plan.slug);
+            return Ok(());
+        }
+
+        if !skipped_with_reason.is_empty() {
+            eprintln!("Skipped steps for plan '{}':", plan.slug);
+            eprintln!();
+            for step in &skipped_with_reason {
+                let num = steps.iter().position(|s| s.id == step.id).unwrap_or(0) + 1;
+                match step.skipped_reason.as_deref() {
+                    Some(reason) => {
+                        println!("  #{num} {} — skipped ({reason})", step.title);
+                    }
+                    None => {
+                        println!("  #{num} {} — skipped", step.title);
+                    }
+                }
+            }
+            println!();
+        }
+
+        if entries.is_empty() {
             return Ok(());
         }
 
@@ -251,36 +296,43 @@ fn print_log_entry(step_title: &str, log: &ExecutionLog, output_mode: &LogOutput
     }
 
     if !matches!(output_mode, LogOutputMode::Hidden) {
-        let take_n = match output_mode {
-            LogOutputMode::Truncated(n) => Some(*n),
-            _ => None,
+        // --lines N is a *total* budget across both streams. Distribute it
+        // proportionally so --lines 50 never prints more than 50 lines.
+        let (stdout_cap, stderr_cap) = match output_mode {
+            LogOutputMode::Truncated(n) => {
+                let out_n = log
+                    .harness_stdout
+                    .as_deref()
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                let err_n = log
+                    .harness_stderr
+                    .as_deref()
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                let (a, b) = output::split_lines_budget(out_n, err_n, *n);
+                (Some(a), Some(b))
+            }
+            _ => (None, None),
         };
-        if let Some(ref stdout) = log.harness_stdout
-            && !stdout.is_empty()
-        {
-            println!("    --- stdout ---");
-            let lines_iter = stdout.lines();
-            let lines: Box<dyn Iterator<Item = &str>> = match take_n {
-                Some(n) => Box::new(lines_iter.take(n)),
-                None => Box::new(lines_iter),
-            };
-            for line in lines {
-                println!("    {line}");
+        let print_stream = |label: &str, text: &Option<String>, cap: Option<usize>| {
+            if let Some(s) = text.as_deref()
+                && !s.is_empty()
+                && cap != Some(0)
+            {
+                println!("    --- {label} ---");
+                let lines_iter = s.lines();
+                let lines: Box<dyn Iterator<Item = &str>> = match cap {
+                    Some(n) => Box::new(lines_iter.take(n)),
+                    None => Box::new(lines_iter),
+                };
+                for line in lines {
+                    println!("    {line}");
+                }
             }
-        }
-        if let Some(ref stderr) = log.harness_stderr
-            && !stderr.is_empty()
-        {
-            println!("    --- stderr ---");
-            let lines_iter = stderr.lines();
-            let lines: Box<dyn Iterator<Item = &str>> = match take_n {
-                Some(n) => Box::new(lines_iter.take(n)),
-                None => Box::new(lines_iter),
-            };
-            for line in lines {
-                println!("    {line}");
-            }
-        }
+        };
+        print_stream("stdout", &log.harness_stdout, stdout_cap);
+        print_stream("stderr", &log.harness_stderr, stderr_cap);
     }
 
     println!();

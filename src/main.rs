@@ -22,6 +22,7 @@ mod storage;
 mod test_runner;
 #[allow(dead_code)]
 mod tui;
+mod validate;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -45,12 +46,16 @@ fn resolve_plan(
     project: &str,
     include_complete: bool,
 ) -> Result<Plan> {
-    if let Some(s) = slug.filter(|s| !s.is_empty()) {
-        storage::get_plan_by_slug(conn, &s, project)?
-            .with_context(|| format!("Plan not found: {s}"))
-    } else {
-        storage::find_active_plan(conn, project, include_complete)?
-            .context("No active plan found. Specify a plan slug as a positional argument.")
+    match slug {
+        Some(s) if s.is_empty() => {
+            anyhow::bail!(
+                "Plan slug cannot be empty. Specify a non-empty slug or omit the argument to use the active plan."
+            )
+        }
+        Some(s) => storage::get_plan_by_slug(conn, &s, project)?
+            .with_context(|| format!("Plan not found: {s}")),
+        None => storage::find_active_plan(conn, project, include_complete)?
+            .context("No active plan found. Specify a plan slug as a positional argument."),
     }
 }
 
@@ -61,7 +66,7 @@ fn main() -> Result<()> {
     // write config.json before cmd_init runs — otherwise its "does the config
     // already exist?" check would always be true on a fresh install, silently
     // skipping the interactive harness prompt.
-    let _config = if matches!(&cli.command, Command::Init { .. }) {
+    let config = if matches!(&cli.command, Command::Init { .. }) {
         config::Config::default()
     } else {
         config::load_or_create_config()?
@@ -82,7 +87,6 @@ fn main() -> Result<()> {
             non_interactive,
             default_harness,
             force,
-            ..
         } => {
             let opts = commands::InitOptions {
                 non_interactive,
@@ -104,7 +108,10 @@ fn main() -> Result<()> {
                 tests,
                 depends_on,
             } => {
-                let h = cli.harness.as_deref().or(harness.as_deref());
+                // Precedence: per-subcommand --harness overrides the global
+                // --harness, which in turn falls back to the plan/config
+                // default downstream.
+                let h = harness.as_deref().or(cli.harness.as_deref());
                 commands::plan_create(
                     &conn,
                     &slug,
@@ -161,23 +168,32 @@ fn main() -> Result<()> {
                 }
                 PlanHarnessCommand::Show { plan } => {
                     let p = resolve_plan(&conn, plan, &project, true)?;
-                    commands::plan_harness_show(&conn, &p, &_config, &out)
+                    commands::plan_harness_show(&conn, &p, &config, &out)
                 }
                 PlanHarnessCommand::Generate {
                     description,
                     plan,
                     use_harness,
                 } => {
-                    let _ = plan;
+                    // When the user names a plan, resolve it so the harness
+                    // receives a verified existing slug as its target. A
+                    // missing plan is a hard error here rather than a silent
+                    // fallthrough to "create something new" — if the user
+                    // wanted a new plan, they'd omit the slug.
+                    let plan_slug = match plan {
+                        Some(slug) => Some(resolve_plan(&conn, Some(slug), &project, true)?.slug),
+                        None => None,
+                    };
                     let harness_name = use_harness
                         .or(cli.harness)
-                        .unwrap_or_else(|| _config.default_harness.clone());
+                        .unwrap_or_else(|| config.default_harness.clone());
                     let rt = tokio::runtime::Runtime::new()?;
                     let exit_code = rt.block_on(plan_harness::run_plan_harness(
-                        &_config,
+                        &config,
                         &harness_name,
                         &project,
                         description.as_deref(),
+                        plan_slug.as_deref(),
                     ))?;
                     std::process::exit(exit_code);
                 }
@@ -202,11 +218,25 @@ fn main() -> Result<()> {
                 max_retries,
                 import_json,
             } => {
-                let p = resolve_plan(&conn, plan, &project, false)?;
-                let h = cli.harness.as_deref().or(harness.as_deref());
+                // Precedence: per-subcommand --harness overrides the global
+                // --harness, which in turn falls back to the plan/config
+                // default downstream.
+                let h = harness.as_deref().or(cli.harness.as_deref());
                 if let Some(source) = import_json {
+                    // With --import-json, there is no step title; reinterpret
+                    // a single positional as the plan slug. Error if the user
+                    // supplied both positionals.
+                    let plan_slug = match (title, plan) {
+                        (Some(_), Some(_)) => anyhow::bail!(
+                            "--import-json takes at most one positional (the plan slug); no title is accepted"
+                        ),
+                        (Some(t), None) => Some(t),
+                        (None, p) => p,
+                    };
+                    let p = resolve_plan(&conn, plan_slug, &project, false)?;
                     commands::step_add_bulk(&conn, &p.slug, &project, &source, &out)
                 } else {
+                    let p = resolve_plan(&conn, plan, &project, false)?;
                     // clap enforces that `title` is Some when `--import-json`
                     // is absent via `required_unless_present`.
                     let title = title.as_deref().expect("clap guarantees title is present");
@@ -341,18 +371,27 @@ fn main() -> Result<()> {
             dry_run,
             skip_preflight,
             current_branch,
+            auto_stash,
             harness: run_harness,
             force,
         } => {
             let workdir = std::path::Path::new(&project);
-            let harness_override = cli.harness.or(run_harness);
+            // Precedence: `ralph run --harness X` beats `ralph --harness Y run`,
+            // which in turn falls back to the plan's own harness and then the
+            // config default. The per-subcommand flag is the most specific,
+            // so it wins.
+            let harness_override = run_harness.or(cli.harness);
 
+            // The CLI flag is additive over the config default, so turning
+            // on `auto_stash: true` in config.json always works and
+            // `--auto-stash` flips it on for a single run.
             let options = RunOptions {
                 all_plans: all,
                 one,
                 from,
                 to,
                 current_branch,
+                auto_stash: auto_stash || config.auto_stash,
                 harness_override,
                 dry_run,
             };
@@ -364,7 +403,7 @@ fn main() -> Result<()> {
                     );
                 }
                 if plan_slug.is_some() {
-                    eprintln!("Warning: --plan is ignored when --all is set.");
+                    eprintln!("Warning: plan slug argument is ignored when --all is set.");
                 }
 
                 // Acquire the per-project run lock so two concurrent `ralph run`
@@ -394,8 +433,8 @@ fn main() -> Result<()> {
                     let mut any_errors = false;
                     for p in &runnable {
                         eprintln!("Running preflight checks for '{}'...", p.slug);
-                        let results = preflight::run_preflight_checks(p, &_config, workdir)?;
-                        results.print_report();
+                        let results = preflight::run_preflight_checks(p, &config, workdir)?;
+                        results.print_report(&out);
                         if !results.is_ok() {
                             any_errors = true;
                         }
@@ -411,7 +450,7 @@ fn main() -> Result<()> {
                 let results = rt.block_on(async {
                     let abort_rx = signal::install_and_spawn();
                     runner::run_all_plans(
-                        &conn, &project, &_config, workdir, &options, abort_rx, &out,
+                        &conn, &project, &config, workdir, &options, abort_rx, &out,
                     )
                     .await
                 })?;
@@ -458,8 +497,8 @@ fn main() -> Result<()> {
             // Preflight checks
             if !skip_preflight && !dry_run {
                 eprintln!("Running preflight checks...");
-                let preflight_results = preflight::run_preflight_checks(&plan, &_config, workdir)?;
-                preflight_results.print_report();
+                let preflight_results = preflight::run_preflight_checks(&plan, &config, workdir)?;
+                preflight_results.print_report(&out);
 
                 if !preflight_results.is_ok() {
                     anyhow::bail!("Preflight checks failed. Use --skip-preflight to bypass.");
@@ -469,7 +508,7 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             let result = rt.block_on(async {
                 let abort_rx = signal::install_and_spawn();
-                runner::run_plan(&conn, &plan, &_config, workdir, &options, abort_rx, &out).await
+                runner::run_plan(&conn, &plan, &config, workdir, &options, abort_rx, &out).await
             })?;
 
             if result.steps_failed > 0 {
@@ -487,14 +526,22 @@ fn main() -> Result<()> {
         }
 
         // -- Resume --
-        Command::Resume { plan: plan_slug } => {
+        Command::Resume {
+            plan: plan_slug,
+            force,
+        } => {
             let plan = resolve_plan(&conn, plan_slug, &project, false)?;
             let slug = plan.slug.clone();
+
+            // Acquire the same per-project run lock that `ralph run` uses, so
+            // resume can't race a concurrent run or skip.
+            let _run_lock =
+                run_lock::acquire(&conn, &project, Some(&plan.slug), Some(&plan.id), force)?;
 
             let rt = tokio::runtime::Runtime::new()?;
             let result = rt.block_on(async {
                 let abort_rx = signal::install_and_spawn();
-                runner::resume_plan(&conn, &plan, &_config, project.as_ref(), abort_rx, &out).await
+                runner::resume_plan(&conn, &plan, &config, project.as_ref(), abort_rx, &out).await
             })?;
 
             if result.steps_failed > 0 {
@@ -516,8 +563,14 @@ fn main() -> Result<()> {
             plan: plan_slug,
             step: step_num,
             reason,
+            force,
         } => {
             let plan = resolve_plan(&conn, plan_slug, &project, false)?;
+
+            // Acquire the same per-project run lock that `ralph run` uses, so
+            // skip can't race a concurrent run or resume.
+            let _run_lock =
+                run_lock::acquire(&conn, &project, Some(&plan.slug), Some(&plan.id), force)?;
 
             runner::skip_step(&conn, &plan, step_num, reason.as_deref())?;
             Ok(())
@@ -529,7 +582,12 @@ fn main() -> Result<()> {
         }
 
         // -- Import --
-        Command::Import { file, slug, branch } => {
+        Command::Import {
+            file,
+            slug,
+            branch,
+            strict,
+        } => {
             let h = cli.harness.as_deref();
             import::import_plan(
                 &conn,
@@ -538,6 +596,7 @@ fn main() -> Result<()> {
                 slug.as_deref(),
                 branch.as_deref(),
                 h,
+                strict,
             )
         }
 
@@ -610,7 +669,7 @@ fn main() -> Result<()> {
         },
 
         // -- Doctor --
-        Command::Doctor => commands::cmd_doctor(&_config, &out),
+        Command::Doctor => commands::cmd_doctor(&config, &out),
 
         // -- Completions --
         Command::Completions { shell } => {
@@ -618,5 +677,22 @@ fn main() -> Result<()> {
             clap_complete::generate(shell, &mut Cli::command(), "ralph", &mut std::io::stdout());
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_plan_rejects_empty_slug() {
+        let conn = db::open_memory().expect("open in-memory db");
+        let err = resolve_plan(&conn, Some(String::new()), "/tmp/proj", false)
+            .expect_err("empty slug must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("empty"),
+            "error should mention empty slug, got: {msg}"
+        );
     }
 }

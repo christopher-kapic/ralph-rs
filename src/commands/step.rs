@@ -101,19 +101,19 @@ pub fn step_add(
             } else {
                 let first_key = &steps[0].sort_key;
                 if first_key.as_str() > "0" {
-                    frac_index::key_between("0", first_key)
+                    frac_index::key_between("0", first_key)?
                 } else {
                     "00".to_string()
                 }
             }
         } else if after_pos == steps.len() {
             // Append at end
-            frac_index::key_after(&steps[steps.len() - 1].sort_key)
+            frac_index::key_after(&steps[steps.len() - 1].sort_key)?
         } else {
             // Insert between after_pos-1 and after_pos
             let before = &steps[after_pos - 1].sort_key;
             let after_key = &steps[after_pos].sort_key;
-            frac_index::key_between(before, after_key)
+            frac_index::key_between(before, after_key)?
         };
 
         storage::create_step_at(
@@ -468,7 +468,7 @@ pub fn step_move(
             // Use "0" as a synthetic lower bound; it sorts before any key
             // starting with a digit > '0' or a letter.
             if first > "0" {
-                frac_index::key_between("0", first)
+                frac_index::key_between("0", first)?
             } else {
                 // Extremely unlikely: first key is "0". Prepend with shorter key.
                 "00".to_string()
@@ -476,12 +476,12 @@ pub fn step_move(
         }
     } else if target_idx >= other_keys.len() {
         // Move to last position
-        frac_index::key_after(other_keys[other_keys.len() - 1])
+        frac_index::key_after(other_keys[other_keys.len() - 1])?
     } else {
         // Move between two existing steps
         let before = other_keys[target_idx - 1];
         let after_key = other_keys[target_idx];
-        frac_index::key_between(before, after_key)
+        frac_index::key_between(before, after_key)?
     };
 
     storage::update_step_sort_key(conn, &step.id, &new_sort_key)?;
@@ -523,7 +523,7 @@ pub fn cmd_step_set_hook(
     let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
 
     storage::attach_hook_to_step(conn, &plan.id, &step.id, lifecycle.as_str(), hook_name)?;
-    eprintln!("Attached hook '{hook_name}' to step {display_num} of '{plan_slug}' at {lifecycle}");
+    println!("Attached hook '{hook_name}' to step {display_num} of '{plan_slug}' at {lifecycle}");
     Ok(())
 }
 
@@ -553,7 +553,7 @@ pub fn cmd_step_unset_hook(
     if removed == 0 {
         bail!("No hook '{hook_name}' attached to step {display_num} at {lifecycle}");
     }
-    eprintln!("Detached hook '{hook_name}' from step {display_num} of '{plan_slug}'");
+    println!("Detached hook '{hook_name}' from step {display_num} of '{plan_slug}'");
     Ok(())
 }
 

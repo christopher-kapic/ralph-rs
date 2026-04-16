@@ -9,14 +9,77 @@
 // The shutdown flag is communicated via a `tokio::sync::watch` channel that
 // the executor and runner already consume as `abort_rx`.
 
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use tokio::sync::watch;
 
 // ---------------------------------------------------------------------------
+// Forced-exit cleanup registry
+// ---------------------------------------------------------------------------
+
+/// A cleanup closure executed just before `std::process::exit(130)` on a
+/// second Ctrl+C. Since `exit` skips every Drop impl, any RAII guard whose
+/// release is load-bearing (e.g. the per-project run lock) registers itself
+/// here so the row still gets cleaned up on a forced exit.
+type ExitCleanup = Box<dyn FnOnce() + Send>;
+
+static EXIT_CLEANUP: Mutex<Option<ExitCleanup>> = Mutex::new(None);
+
+/// Serializes tests that touch `EXIT_CLEANUP` so parallel test threads in the
+/// same binary don't race on the global slot.
+#[cfg(test)]
+pub(crate) static EXIT_CLEANUP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Register a cleanup to run before `exit(130)` on forced shutdown. Replaces
+/// any previously-registered cleanup.
+pub fn set_exit_cleanup(f: ExitCleanup) {
+    *EXIT_CLEANUP.lock().unwrap() = Some(f);
+}
+
+/// Clear the registered exit cleanup. Called when the guard whose cleanup
+/// this represents was dropped normally, so no forced-exit release is needed.
+pub fn clear_exit_cleanup() {
+    *EXIT_CLEANUP.lock().unwrap() = None;
+}
+
+/// Take and run the registered exit cleanup (if any). Idempotent.
+pub(crate) fn run_exit_cleanup() {
+    let f = EXIT_CLEANUP.lock().unwrap().take();
+    if let Some(f) = f {
+        f();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shutdown controller
 // ---------------------------------------------------------------------------
+
+/// Handle returned from [`ShutdownController::spawn_signal_listener`] that
+/// lets application code trigger a graceful shutdown programmatically — the
+/// same effect as receiving a first Ctrl+C. Cheap to clone.
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    abort_tx: watch::Sender<bool>,
+}
+
+impl ShutdownHandle {
+    /// Request graceful shutdown. Sets the abort flag so the current step
+    /// finishes its lifecycle, then the runner exits. Idempotent.
+    #[allow(dead_code)]
+    pub fn shutdown(&self) {
+        let _ = self.abort_tx.send(true);
+    }
+
+    /// Whether shutdown has already been requested (by signal or by a prior
+    /// [`shutdown`](Self::shutdown) call).
+    #[allow(dead_code)]
+    pub fn is_shutdown_requested(&self) -> bool {
+        *self.abort_tx.borrow()
+    }
+}
 
 /// Manages the two-stage shutdown lifecycle.
 ///
@@ -29,27 +92,23 @@ pub struct ShutdownController {
     abort_tx: watch::Sender<bool>,
     /// Receivers cloned from here are handed to runner/executor.
     abort_rx: watch::Receiver<bool>,
-    /// `true` once the first signal has been received.
-    first_signal_received: &'static AtomicBool,
+    /// `true` once the first signal has been received. Per-instance so
+    /// concurrent tests don't race on a shared global slot.
+    first_signal_received: Arc<AtomicBool>,
 }
-
-/// Global flag so the raw signal handler (sync context) can record the first
-/// signal and the second signal can detect that the grace period is active.
-static FIRST_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 impl ShutdownController {
     /// Create a new shutdown controller.
     ///
-    /// Resets the global signal state so controllers can be created across
-    /// sequential test runs or successive CLI invocations within the same
-    /// process.
+    /// Each controller owns its own first-signal flag, so creating multiple
+    /// controllers in parallel (e.g. across test threads) does not contend on
+    /// shared state.
     pub fn new() -> Self {
-        FIRST_SIGNAL.store(false, Ordering::SeqCst);
         let (abort_tx, abort_rx) = watch::channel(false);
         Self {
             abort_tx,
             abort_rx,
-            first_signal_received: &FIRST_SIGNAL,
+            first_signal_received: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -66,16 +125,22 @@ impl ShutdownController {
     ///   a message, and allows the current step to finish gracefully.
     /// - **Second signal**: prints a force-exit message and calls
     ///   [`std::process::exit(130)`] (128 + SIGINT) to terminate immediately.
-    pub fn spawn_signal_listener(self) -> watch::Receiver<bool> {
+    ///
+    /// Returns a [`ShutdownHandle`] for triggering shutdown programmatically
+    /// and a receiver for the abort flag.
+    pub fn spawn_signal_listener(self) -> (ShutdownHandle, watch::Receiver<bool>) {
         let rx = self.abort_rx.clone();
+        let handle = ShutdownHandle {
+            abort_tx: self.abort_tx.clone(),
+        };
         tokio::spawn(async move {
             Self::listen(self.abort_tx, self.first_signal_received).await;
         });
-        rx
+        (handle, rx)
     }
 
     /// Internal listener loop.
-    async fn listen(abort_tx: watch::Sender<bool>, first_received: &'static AtomicBool) {
+    async fn listen(abort_tx: watch::Sender<bool>, first_received: Arc<AtomicBool>) {
         loop {
             // Wait for the next Ctrl+C.
             if tokio::signal::ctrl_c().await.is_err() {
@@ -94,6 +159,9 @@ impl ShutdownController {
             } else {
                 // --- Second signal (grace period active) ---
                 eprintln!("\nForce-quit — killing harness and exiting.");
+                // exit(130) skips Drop, so give registered guards (e.g. the
+                // run lock) a chance to release before the process dies.
+                run_exit_cleanup();
                 std::process::exit(130);
             }
         }
@@ -129,8 +197,17 @@ pub fn install() -> Result<(ShutdownController, watch::Receiver<bool>)> {
 ///
 /// Must be called from within an active tokio runtime.
 pub fn install_and_spawn() -> watch::Receiver<bool> {
-    let controller = ShutdownController::new();
-    controller.spawn_signal_listener()
+    let (_handle, rx) = install_and_spawn_with_handle();
+    rx
+}
+
+/// Install signal handlers and spawn the listener task, returning both a
+/// [`ShutdownHandle`] (for programmatic shutdown) and the abort receiver.
+///
+/// Must be called from within an active tokio runtime.
+#[allow(dead_code)]
+pub fn install_and_spawn_with_handle() -> (ShutdownHandle, watch::Receiver<bool>) {
+    ShutdownController::new().spawn_signal_listener()
 }
 
 // ---------------------------------------------------------------------------
@@ -149,12 +226,14 @@ mod tests {
     }
 
     #[test]
-    fn test_shutdown_controller_new_resets_global() {
-        // Set the global flag manually.
-        FIRST_SIGNAL.store(true, Ordering::SeqCst);
-        // Creating a new controller should reset it.
-        let _controller = ShutdownController::new();
-        assert!(!FIRST_SIGNAL.load(Ordering::SeqCst));
+    fn test_shutdown_controller_instances_are_independent() {
+        // Each controller owns its own flag; flipping one must not be
+        // visible from another. This is the regression test for L35.
+        let a = ShutdownController::new();
+        let b = ShutdownController::new();
+        a.first_signal_received.store(true, Ordering::SeqCst);
+        assert!(a.first_signal_received.load(Ordering::SeqCst));
+        assert!(!b.first_signal_received.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -201,11 +280,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_signal_listener_returns_rx() {
+    async fn test_spawn_signal_listener_returns_handle_and_rx() {
         let controller = ShutdownController::new();
-        let rx = controller.spawn_signal_listener();
+        let (handle, rx) = controller.spawn_signal_listener();
         // Initially false.
         assert!(!*rx.borrow());
+        assert!(!handle.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_handle_triggers_abort() {
+        // Regression for L36: application code can trigger graceful shutdown
+        // via the handle returned from spawn_signal_listener, even though
+        // spawn_signal_listener itself consumes the controller.
+        let controller = ShutdownController::new();
+        let (handle, mut rx) = controller.spawn_signal_listener();
+        assert!(!*rx.borrow());
+
+        handle.shutdown();
+
+        // Wait for the value to propagate through the watch channel.
+        rx.changed().await.unwrap();
+        assert!(*rx.borrow());
+        assert!(handle.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn test_install_and_spawn_with_handle() {
+        let (handle, rx) = install_and_spawn_with_handle();
+        assert!(!*rx.borrow());
+        assert!(!handle.is_shutdown_requested());
     }
 
     #[tokio::test]
@@ -219,5 +323,40 @@ mod tests {
         let (controller, rx) = install().unwrap();
         assert!(!*rx.borrow());
         assert!(!controller.is_shutdown_requested());
+    }
+
+    #[test]
+    fn test_exit_cleanup_runs_once_and_is_cleared() {
+        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        clear_exit_cleanup();
+
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran_clone = std::sync::Arc::clone(&ran);
+        set_exit_cleanup(Box::new(move || {
+            ran_clone.store(true, Ordering::SeqCst);
+        }));
+
+        run_exit_cleanup();
+        assert!(ran.load(Ordering::SeqCst), "cleanup should have run");
+
+        // A second call is a no-op because the cleanup was taken.
+        ran.store(false, Ordering::SeqCst);
+        run_exit_cleanup();
+        assert!(!ran.load(Ordering::SeqCst), "cleanup should not run twice");
+    }
+
+    #[test]
+    fn test_clear_exit_cleanup_prevents_run() {
+        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        clear_exit_cleanup();
+
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran_clone = std::sync::Arc::clone(&ran);
+        set_exit_cleanup(Box::new(move || {
+            ran_clone.store(true, Ordering::SeqCst);
+        }));
+        clear_exit_cleanup();
+        run_exit_cleanup();
+        assert!(!ran.load(Ordering::SeqCst));
     }
 }

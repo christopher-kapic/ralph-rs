@@ -25,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config;
+use crate::validate::validate_name;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -113,6 +114,7 @@ pub fn hooks_dir() -> Result<PathBuf> {
 }
 
 fn hook_path(name: &str) -> Result<PathBuf> {
+    validate_name(name)?;
     Ok(hooks_dir()?.join(format!("{name}.md")))
 }
 
@@ -145,11 +147,30 @@ pub fn parse_hook(contents: &str, fallback_name: &str) -> Result<Hook> {
         .context("Hook file must start with '---' frontmatter delimiter")?;
     let rest = rest.strip_prefix('\n').unwrap_or(rest);
 
-    let end = rest
-        .find("\n---")
-        .context("Hook file missing closing '---' frontmatter delimiter")?;
+    // Walk line-by-line so the closing `---` only matches when it's exactly
+    // that (optionally with trailing whitespace) at column 0. A substring
+    // search would match `\n--- a/file` inside diff output in the body.
+    let (end, body_start) = {
+        let mut end: Option<usize> = None;
+        let mut body_start: Option<usize> = None;
+        let mut pos = 0usize;
+        for line in rest.split_inclusive('\n') {
+            let stripped = line.strip_suffix('\n').unwrap_or(line);
+            let stripped = stripped.strip_suffix('\r').unwrap_or(stripped);
+            if stripped.trim_end_matches([' ', '\t']) == "---" {
+                end = Some(pos);
+                body_start = Some(pos + line.len());
+                break;
+            }
+            pos += line.len();
+        }
+        (
+            end.context("Hook file missing closing '---' frontmatter delimiter")?,
+            body_start.unwrap(),
+        )
+    };
     let frontmatter_str = &rest[..end];
-    let body = rest[end + 4..].trim_start_matches('\n').trim_end();
+    let body = rest[body_start..].trim_start_matches('\n').trim_end();
 
     let mut name: Option<String> = None;
     let mut description = String::new();
@@ -159,11 +180,7 @@ pub fn parse_hook(contents: &str, fallback_name: &str) -> Result<Hook> {
     let mut in_scope_paths = false;
 
     for raw_line in frontmatter_str.lines() {
-        // Strip comments.
-        let line = match raw_line.find('#') {
-            Some(i) => &raw_line[..i],
-            None => raw_line,
-        };
+        let line = strip_comment(raw_line);
 
         if line.trim().is_empty() {
             continue;
@@ -206,7 +223,7 @@ pub fn parse_hook(contents: &str, fallback_name: &str) -> Result<Hook> {
 
         match key {
             "name" => name = Some(value.to_string()),
-            "description" => description = unquote(value).to_string(),
+            "description" => description = unquote(value),
             "lifecycle" => lifecycle_str = Some(value.to_string()),
             "scope" => {
                 if value.is_empty() {
@@ -247,17 +264,65 @@ pub fn parse_hook(contents: &str, fallback_name: &str) -> Result<Hook> {
     })
 }
 
-/// Strip surrounding single or double quotes from a YAML-ish scalar.
-fn unquote(s: &str) -> &str {
+/// Strip a trailing `#` comment from a frontmatter line, ignoring `#`
+/// characters that appear inside single- or double-quoted strings.
+fn strip_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'#' if !in_single && !in_double => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+/// Strip surrounding single or double quotes from a YAML-ish scalar and
+/// decode common escape sequences inside double-quoted values.
+fn unquote(s: &str) -> String {
     if s.len() >= 2 {
         let bytes = s.as_bytes();
-        if (bytes[0] == b'"' && bytes[s.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[s.len() - 1] == b'\'')
-        {
-            return &s[1..s.len() - 1];
+        if bytes[0] == b'"' && bytes[s.len() - 1] == b'"' {
+            return yaml_unescape(&s[1..s.len() - 1]);
+        }
+        if bytes[0] == b'\'' && bytes[s.len() - 1] == b'\'' {
+            return s[1..s.len() - 1].to_string();
         }
     }
-    s
+    s.to_string()
+}
+
+/// Decode the escape sequences that `yaml_escape` emits inside a
+/// double-quoted scalar: `\\`, `\"`, `\n`, `\r`, `\t`.
+fn yaml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Serialize a Hook back to the file format used by the library.
@@ -290,15 +355,22 @@ pub fn serialize_hook(hook: &Hook) -> String {
 }
 
 /// Minimal escaping for YAML scalars — wraps in double quotes if the string
-/// contains anything that would confuse a YAML parser.
+/// contains anything that would confuse a YAML parser, and escapes control
+/// characters (`\n`, `\r`, `\t`) so the value fits on a single line.
 fn yaml_escape(s: &str) -> String {
-    if s.chars()
-        .any(|c| c == ':' || c == '#' || c == '\n' || c == '"' || c == '\'')
-    {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        s.to_string()
+    let needs_quoting = s
+        .chars()
+        .any(|c| matches!(c, ':' | '#' | '\n' | '\r' | '\t' | '"' | '\'' | '\\'));
+    if !needs_quoting {
+        return s.to_string();
     }
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("\"{escaped}\"")
 }
 
 // ---------------------------------------------------------------------------
@@ -307,14 +379,26 @@ fn yaml_escape(s: &str) -> String {
 
 /// Load every hook in the library. Invalid files are skipped with a warning
 /// on stderr so one bad file doesn't take down the whole library.
+///
+/// Returns `Err` only for directory-level failures (the hooks dir exists but
+/// can't be read — e.g. permission denied). Per-file parse or read errors are
+/// logged as warnings and skipped. Callers should propagate the `Err` rather
+/// than swallowing it, so directory-level failures are not indistinguishable
+/// from "no hooks configured."
 pub fn load_all() -> Result<Vec<Hook>> {
     let dir = hooks_dir()?;
+    load_all_from(&dir)
+}
+
+/// Dir-parameterized core of `load_all` — extracted so tests can exercise
+/// the warning path without touching `XDG_CONFIG_HOME`.
+pub(crate) fn load_all_from(dir: &Path) -> Result<Vec<Hook>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
 
     let mut hooks = Vec::new();
-    let mut entries: Vec<_> = fs::read_dir(&dir)
+    let mut entries: Vec<_> = fs::read_dir(dir)
         .with_context(|| format!("Failed to read hooks directory {}", dir.display()))?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
@@ -365,6 +449,7 @@ pub fn try_load(name: &str) -> Result<Option<Hook>> {
 /// Save a hook to disk. Fails if a hook with the same name already exists
 /// and `force` is false.
 pub fn save(hook: &Hook, force: bool) -> Result<PathBuf> {
+    validate_name(&hook.name)?;
     let dir = hooks_dir()?;
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create hooks directory {}", dir.display()))?;
@@ -574,6 +659,162 @@ mod tests {
         let filtered = filter_by_project(hooks, Path::new("/home/me/js/project"));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "global-one");
+    }
+
+    #[test]
+    fn test_strip_comment_outside_quotes() {
+        assert_eq!(strip_comment("key: value # comment"), "key: value ");
+        assert_eq!(strip_comment("# whole line"), "");
+        assert_eq!(strip_comment("no comment here"), "no comment here");
+    }
+
+    #[test]
+    fn test_strip_comment_inside_quotes() {
+        assert_eq!(
+            strip_comment("description: \"Fix issue #123\""),
+            "description: \"Fix issue #123\""
+        );
+        assert_eq!(
+            strip_comment("description: 'Fix issue #123'"),
+            "description: 'Fix issue #123'"
+        );
+        assert_eq!(
+            strip_comment("description: \"before #inside\" # trailing"),
+            "description: \"before #inside\" "
+        );
+    }
+
+    #[test]
+    fn test_parse_description_preserves_hash_in_double_quotes() {
+        let src = "---\nname: x\ndescription: \"Fix issue #123\"\nlifecycle: post-step\nscope: global\n---\necho hi\n";
+        let hook = parse_hook(src, "x").unwrap();
+        assert_eq!(hook.description, "Fix issue #123");
+    }
+
+    #[test]
+    fn test_parse_description_preserves_hash_in_single_quotes() {
+        let src = "---\nname: x\ndescription: 'Fix issue #123'\nlifecycle: post-step\nscope: global\n---\necho hi\n";
+        let hook = parse_hook(src, "x").unwrap();
+        assert_eq!(hook.description, "Fix issue #123");
+    }
+
+    #[test]
+    fn test_parse_strips_unquoted_trailing_comment() {
+        let src = "---\nname: x\ndescription: hello # a comment\nlifecycle: post-step\nscope: global\n---\necho hi\n";
+        let hook = parse_hook(src, "x").unwrap();
+        assert_eq!(hook.description, "hello");
+    }
+
+    #[test]
+    fn test_roundtrip_description_with_hash() {
+        let hook = Hook {
+            name: "hashy".to_string(),
+            description: "Fix issue #123".to_string(),
+            lifecycle: Lifecycle::PostStep,
+            scope: Scope::Global,
+            command: "echo hi".to_string(),
+        };
+        let serialized = serialize_hook(&hook);
+        let parsed = parse_hook(&serialized, "hashy").unwrap();
+        assert_eq!(parsed.description, "Fix issue #123");
+    }
+
+    #[test]
+    fn test_yaml_escape_newline() {
+        assert_eq!(yaml_escape("line1\nline2"), "\"line1\\nline2\"");
+    }
+
+    #[test]
+    fn test_yaml_escape_tab_and_backslash() {
+        assert_eq!(yaml_escape("a\\b\tc"), "\"a\\\\b\\tc\"");
+    }
+
+    #[test]
+    fn test_roundtrip_description_with_newline() {
+        let hook = Hook {
+            name: "multi".to_string(),
+            description: "line1\nline2\twith tab\rand cr".to_string(),
+            lifecycle: Lifecycle::PreTest,
+            scope: Scope::Global,
+            command: "echo hi".to_string(),
+        };
+        let serialized = serialize_hook(&hook);
+        // The serialized frontmatter's description line must not wrap onto a
+        // second line; otherwise subsequent keys are swallowed into it.
+        assert!(!serialized.contains("line1\nline2"));
+        let parsed = parse_hook(&serialized, "multi").unwrap();
+        assert_eq!(parsed.description, hook.description);
+        assert_eq!(parsed.lifecycle, hook.lifecycle);
+    }
+
+    #[test]
+    fn test_roundtrip_description_with_embedded_backslash() {
+        let hook = Hook {
+            name: "slashy".to_string(),
+            description: "path C:\\Users\\x and quote \" inside".to_string(),
+            lifecycle: Lifecycle::PostStep,
+            scope: Scope::Global,
+            command: "echo hi".to_string(),
+        };
+        let serialized = serialize_hook(&hook);
+        let parsed = parse_hook(&serialized, "slashy").unwrap();
+        assert_eq!(parsed.description, hook.description);
+    }
+
+    #[test]
+    fn test_parse_body_with_diff_markers_does_not_close_frontmatter_early() {
+        let src = "---\nname: diffy\ndescription: body has diff markers\nlifecycle: post-step\nscope: global\n---\ngit diff <<'EOF'\n--- a/old_file\n+++ b/new_file\n@@ -1 +1 @@\n-old\n+new\nEOF\n";
+        let hook = parse_hook(src, "diffy").unwrap();
+        assert_eq!(hook.name, "diffy");
+        assert_eq!(hook.description, "body has diff markers");
+        assert_eq!(hook.lifecycle, Lifecycle::PostStep);
+        assert_eq!(hook.scope, Scope::Global);
+        assert!(
+            hook.command.contains("--- a/old_file"),
+            "body should retain diff marker line, got: {:?}",
+            hook.command
+        );
+        assert!(hook.command.contains("+++ b/new_file"));
+    }
+
+    #[test]
+    fn test_parse_accepts_closing_delimiter_with_trailing_whitespace() {
+        let src = "---\nname: ws\nlifecycle: post-step\nscope: global\n---  \necho hi\n";
+        let hook = parse_hook(src, "ws").unwrap();
+        assert_eq!(hook.name, "ws");
+        assert_eq!(hook.command, "echo hi");
+    }
+
+    #[test]
+    fn test_parse_rejects_indented_closing_delimiter() {
+        // An indented `---` line must NOT close the frontmatter — the closer
+        // must be at column 0.
+        let src = "---\nname: x\nlifecycle: post-step\nscope: global\n  ---\necho hi\n";
+        assert!(parse_hook(src, "x").is_err());
+    }
+
+    #[test]
+    fn test_load_all_skips_corrupt_files_and_loads_valid() {
+        // A corrupt hook file in the directory must not prevent valid hooks
+        // from loading — load_all should return Ok with just the valid hook.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let valid = "---\nname: good\nlifecycle: post-step\nscope: global\n---\necho hi\n";
+        fs::write(tmp.path().join("good.md"), valid).unwrap();
+        // Missing frontmatter — parse_hook will reject this file.
+        fs::write(tmp.path().join("bad.md"), "not a hook\n").unwrap();
+
+        let hooks = load_all_from(tmp.path()).expect("directory-level read should succeed");
+        assert_eq!(hooks.len(), 1, "corrupt file should be skipped, valid kept");
+        assert_eq!(hooks[0].name, "good");
+    }
+
+    #[test]
+    fn test_load_all_returns_empty_when_dir_missing() {
+        // No hooks dir means "no hooks configured" — not an error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let hooks = load_all_from(&missing).unwrap();
+        assert!(hooks.is_empty());
     }
 
     #[test]

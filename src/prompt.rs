@@ -20,6 +20,10 @@ pub struct RetryContext {
 /// Summary of a completed prior step for context injection.
 #[derive(Debug, Clone)]
 pub struct PriorStepSummary {
+    /// 1-based step number within the plan's full step list. Preserved from
+    /// the plan (not the filtered prior-step slice) so skipped/aborted steps
+    /// do not shift the numbering visible to the agent.
+    pub number: usize,
     /// Step title.
     pub title: String,
     /// Step status (should be Complete or Skipped).
@@ -153,16 +157,19 @@ fn format_plan_context(plan: &Plan) -> String {
 fn format_prior_steps(prior_steps: &[PriorStepSummary]) -> String {
     let mut lines = vec!["## Context from Prior Steps".to_string()];
 
-    for (i, step) in prior_steps.iter().enumerate() {
+    for step in prior_steps {
         let status_marker = match step.status {
             StepStatus::Complete => "completed",
             StepStatus::Skipped => "skipped",
-            _ => "other",
+            StepStatus::Failed => "failed",
+            StepStatus::Aborted => "aborted",
+            StepStatus::Pending => "pending",
+            StepStatus::InProgress => "in-progress",
         };
 
         let mut step_line = format!(
             "\n**Step {} ({status_marker}): {title}**",
-            i + 1,
+            step.number,
             title = step.title,
         );
 
@@ -224,15 +231,18 @@ fn format_focus_instruction(step: &Step) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Truncate text to a maximum number of lines, adding a note if truncated.
+/// Truncate text to a maximum number of lines, appending an elision marker
+/// when truncated. Keeps the first `max_lines` because the top of a diff or
+/// test output usually carries the most context — file headers, the first
+/// failing assertion — and losing the tail is the cheaper choice.
 fn truncate_text(text: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= max_lines {
         text.to_string()
     } else {
         let omitted = lines.len() - max_lines;
-        let tail = &lines[lines.len() - max_lines..];
-        format!("... ({omitted} lines omitted) ...\n{}", tail.join("\n"))
+        let head = &lines[..max_lines];
+        format!("{}\n... ({omitted} lines omitted) ...", head.join("\n"))
     }
 }
 
@@ -286,6 +296,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             model: None,
+            skipped_reason: None,
         }
     }
 
@@ -294,6 +305,7 @@ mod tests {
         let plan = make_plan();
         let step = make_step();
         let prior_steps = vec![PriorStepSummary {
+            number: 1,
             title: "Set up project".to_string(),
             status: StepStatus::Complete,
             files_changed: vec!["Cargo.toml".to_string(), "src/main.rs".to_string()],
@@ -459,14 +471,30 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_text_long() {
+    fn test_truncate_text_long_keeps_head() {
         let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
         let text = lines.join("\n");
         let result = truncate_text(&text, 5);
+
         assert!(result.contains("(15 lines omitted)"));
-        assert!(result.contains("line 19"));
-        assert!(result.contains("line 15"));
-        assert!(!result.contains("line 0"));
+        // First five lines preserved in order.
+        for i in 0..5 {
+            assert!(
+                result.contains(&format!("line {i}")),
+                "head line {i} missing from {result}"
+            );
+        }
+        // Lines beyond the head are elided.
+        for i in 5..20 {
+            assert!(
+                !result.contains(&format!("line {i}")),
+                "tail line {i} unexpectedly present in {result}"
+            );
+        }
+        // Elision marker follows the retained head.
+        let head_end = result.find("line 4").unwrap();
+        let marker = result.find("lines omitted").unwrap();
+        assert!(head_end < marker);
     }
 
     #[test]
@@ -506,12 +534,14 @@ mod tests {
     fn test_format_prior_steps_multiple() {
         let steps = vec![
             PriorStepSummary {
+                number: 3,
                 title: "Step A".to_string(),
                 status: StepStatus::Complete,
                 files_changed: vec!["a.rs".to_string()],
                 description: "Did A".to_string(),
             },
             PriorStepSummary {
+                number: 7,
                 title: "Step B".to_string(),
                 status: StepStatus::Skipped,
                 files_changed: vec![],
@@ -520,9 +550,50 @@ mod tests {
         ];
 
         let result = format_prior_steps(&steps);
-        assert!(result.contains("Step 1 (completed): Step A"));
-        assert!(result.contains("Step 2 (skipped): Step B"));
+        // Numbers come from the plan, not the filtered slice.
+        assert!(result.contains("Step 3 (completed): Step A"));
+        assert!(result.contains("Step 7 (skipped): Step B"));
+        assert!(!result.contains("Step 1 (completed)"));
+        assert!(!result.contains("Step 2 (skipped)"));
         assert!(result.contains("a.rs"));
+    }
+
+    #[test]
+    fn test_format_prior_steps_includes_failed_and_aborted() {
+        let steps = vec![
+            PriorStepSummary {
+                number: 1,
+                title: "Worked".to_string(),
+                status: StepStatus::Complete,
+                files_changed: vec!["ok.rs".to_string()],
+                description: "Fine".to_string(),
+            },
+            PriorStepSummary {
+                number: 2,
+                title: "Broke things".to_string(),
+                status: StepStatus::Failed,
+                files_changed: vec!["bad.rs".to_string()],
+                description: "Tests failed after edit".to_string(),
+            },
+            PriorStepSummary {
+                number: 3,
+                title: "User bailed".to_string(),
+                status: StepStatus::Aborted,
+                files_changed: vec![],
+                description: "Ctrl+C mid-run".to_string(),
+            },
+        ];
+
+        let result = format_prior_steps(&steps);
+        // Completed step still labeled
+        assert!(result.contains("Step 1 (completed): Worked"));
+        // Failed step is present and tagged as failed
+        assert!(result.contains("Step 2 (failed): Broke things"));
+        assert!(result.contains("Tests failed after edit"));
+        assert!(result.contains("bad.rs"));
+        // Aborted step is present and tagged as aborted
+        assert!(result.contains("Step 3 (aborted): User bailed"));
+        assert!(result.contains("Ctrl+C mid-run"));
     }
 
     #[test]
@@ -530,6 +601,7 @@ mod tests {
         let plan = make_plan();
         let step = make_step();
         let prior = vec![PriorStepSummary {
+            number: 1,
             title: "Prior".to_string(),
             status: StepStatus::Complete,
             files_changed: vec![],

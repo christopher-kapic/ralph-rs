@@ -1,11 +1,12 @@
 // Storage abstraction: high-level CRUD operations wrapping db.rs
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, params, params_from_iter};
 use uuid::Uuid;
 
 use crate::frac_index;
-use crate::plan::{ExecutionLog, Plan, PlanStatus, Step, StepStatus};
+use crate::plan::{ExecutionLog, PLAN_COLUMNS, Plan, PlanStatus, Step, StepStatus};
 
 // ---------------------------------------------------------------------------
 // Plan operations
@@ -38,10 +39,8 @@ pub fn create_plan(
 
 /// Find a plan by its (slug, project) combination.
 pub fn get_plan_by_slug(conn: &Connection, slug: &str, project: &str) -> Result<Option<Plan>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at
-         FROM plans WHERE slug = ?1 AND project = ?2",
-    )?;
+    let query = format!("SELECT {PLAN_COLUMNS} FROM plans WHERE slug = ?1 AND project = ?2");
+    let mut stmt = conn.prepare(&query)?;
 
     let mut rows = stmt.query_map(params![slug, project], Plan::from_row)?;
     match rows.next() {
@@ -52,12 +51,9 @@ pub fn get_plan_by_slug(conn: &Connection, slug: &str, project: &str) -> Result<
 
 /// Fetch a plan by its primary key.
 fn get_plan_by_id(conn: &Connection, id: &str) -> Result<Plan> {
-    conn.query_row(
-        "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at FROM plans WHERE id = ?1",
-        params![id],
-        Plan::from_row,
-    )
-    .with_context(|| format!("Plan not found: {id}"))
+    let query = format!("SELECT {PLAN_COLUMNS} FROM plans WHERE id = ?1");
+    conn.query_row(&query, params![id], Plan::from_row)
+        .with_context(|| format!("Plan not found: {id}"))
 }
 
 /// Fetch just the slug for a plan by its primary key.
@@ -78,13 +74,37 @@ pub fn find_active_plan(
     project: &str,
     include_complete: bool,
 ) -> Result<Option<Plan>> {
-    let plans = list_plans(conn, project, false)?;
-    Ok(plans.into_iter().find(|p| {
-        matches!(
-            p.status,
-            PlanStatus::InProgress | PlanStatus::Ready | PlanStatus::Failed
-        ) || (include_complete && p.status == PlanStatus::Complete)
-    }))
+    let mut statuses: Vec<&'static str> = vec![
+        PlanStatus::InProgress.as_str(),
+        PlanStatus::Ready.as_str(),
+        PlanStatus::Failed.as_str(),
+    ];
+    if include_complete {
+        statuses.push(PlanStatus::Complete.as_str());
+    }
+
+    let placeholders = (0..statuses.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT {PLAN_COLUMNS} FROM plans \
+         WHERE project = ?1 AND status IN ({placeholders}) \
+         ORDER BY created_at DESC LIMIT 1"
+    );
+
+    let mut params: Vec<Value> = Vec::with_capacity(statuses.len() + 1);
+    params.push(Value::Text(project.to_string()));
+    for s in &statuses {
+        params.push(Value::Text((*s).to_string()));
+    }
+
+    let mut stmt = conn.prepare(&query)?;
+    let mut rows = stmt.query_map(params_from_iter(params.iter()), Plan::from_row)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
 }
 
 /// List plans. If `all` is false, only return plans for `project`.
@@ -92,19 +112,16 @@ pub fn list_plans(conn: &Connection, project: &str, all: bool) -> Result<Vec<Pla
     let mut plans = Vec::new();
 
     if all {
-        let mut stmt = conn.prepare(
-            "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at
-             FROM plans ORDER BY created_at DESC",
-        )?;
+        let query = format!("SELECT {PLAN_COLUMNS} FROM plans ORDER BY created_at DESC");
+        let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map([], Plan::from_row)?;
         for row in rows {
             plans.push(row?);
         }
     } else {
-        let mut stmt = conn.prepare(
-            "SELECT id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, plan_harness, created_at, updated_at
-             FROM plans WHERE project = ?1 ORDER BY created_at DESC",
-        )?;
+        let query =
+            format!("SELECT {PLAN_COLUMNS} FROM plans WHERE project = ?1 ORDER BY created_at DESC");
+        let mut stmt = conn.prepare(&query)?;
         let rows = stmt.query_map(params![project], Plan::from_row)?;
         for row in rows {
             plans.push(row?);
@@ -181,7 +198,7 @@ pub fn create_step(
         .ok();
 
     let sort_key = match last_key {
-        Some(ref k) => frac_index::key_after(k),
+        Some(ref k) => frac_index::key_after(k)?,
         None => frac_index::initial_key(),
     };
 
@@ -205,7 +222,7 @@ pub fn create_step(
 /// List steps for a plan, ordered by sort_key.
 pub fn list_steps(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
          FROM steps WHERE plan_id = ?1 ORDER BY sort_key ASC",
     )?;
 
@@ -220,7 +237,7 @@ pub fn list_steps(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
 /// Fetch a single step by ID.
 pub fn get_step(conn: &Connection, step_id: &str) -> Result<Step> {
     conn.query_row(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
          FROM steps WHERE id = ?1",
         params![step_id],
         Step::from_row,
@@ -235,7 +252,7 @@ pub fn get_step(conn: &Connection, step_id: &str) -> Result<Step> {
 /// a user-supplied `--step-id` flag).
 pub fn get_step_by_id(conn: &Connection, step_id: &str) -> Result<Option<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
          FROM steps WHERE id = ?1",
     )?;
     let mut rows = stmt.query_map(params![step_id], Step::from_row)?;
@@ -245,13 +262,28 @@ pub fn get_step_by_id(conn: &Connection, step_id: &str) -> Result<Option<Step>> 
     }
 }
 
-/// Update a step's status (and bump attempts if transitioning to in_progress).
+/// Update a step's status. Does not modify `attempts`; use [`set_step_attempts`] for that.
 pub fn update_step_status(conn: &Connection, step_id: &str, status: StepStatus) -> Result<()> {
     let affected = conn.execute(
         "UPDATE steps SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
         params![status.as_str(), step_id],
     )?;
 
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
+/// Mark a step as skipped and record the operator-supplied reason (if any).
+///
+/// Writes `status` and `skipped_reason` in a single UPDATE so a concurrent
+/// reader can't observe the skipped status without its reason.
+pub fn mark_step_skipped(conn: &Connection, step_id: &str, reason: Option<&str>) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE steps SET status = ?1, skipped_reason = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
+        params![StepStatus::Skipped.as_str(), reason, step_id],
+    )?;
     if affected == 0 {
         anyhow::bail!("Step not found: {step_id}");
     }
@@ -302,28 +334,6 @@ pub fn create_step_at(
     Ok((get_step(conn, &id)?, position))
 }
 
-/// Update a step's title and/or description.
-pub fn update_step_fields(
-    conn: &Connection,
-    step_id: &str,
-    title: Option<&str>,
-    description: Option<&str>,
-) -> Result<()> {
-    if let Some(t) = title {
-        conn.execute(
-            "UPDATE steps SET title = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![t, step_id],
-        )?;
-    }
-    if let Some(d) = description {
-        conn.execute(
-            "UPDATE steps SET description = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![d, step_id],
-        )?;
-    }
-    Ok(())
-}
-
 /// Extended step update: title, description, agent, harness, criteria, max_retries, model.
 ///
 /// - `agent_update`: `Some(Some("name"))` sets the agent, `Some(None)` clears it
@@ -348,40 +358,66 @@ pub fn update_step_fields_ext(
     retries_update: Option<Option<i32>>,
     model_update: Option<Option<&str>>,
 ) -> Result<()> {
-    // Delegate to the simple updater for title/description.
-    update_step_fields(conn, step_id, title, description)?;
+    // Build a single UPDATE with dynamic SET clauses so all changed fields
+    // share one `updated_at` and a partial failure can't leave the row half
+    // updated.
+    let mut clauses: Vec<&str> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
 
+    let text_or_null = |v: Option<&str>| match v {
+        Some(s) => Value::Text(s.to_string()),
+        None => Value::Null,
+    };
+
+    if let Some(t) = title {
+        clauses.push("title = ?");
+        values.push(Value::Text(t.to_string()));
+    }
+    if let Some(d) = description {
+        clauses.push("description = ?");
+        values.push(Value::Text(d.to_string()));
+    }
     if let Some(agent) = agent_update {
-        conn.execute(
-            "UPDATE steps SET agent = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![agent, step_id],
-        )?;
+        clauses.push("agent = ?");
+        values.push(text_or_null(agent));
     }
     if let Some(harness) = harness_update {
-        conn.execute(
-            "UPDATE steps SET harness = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![harness, step_id],
-        )?;
+        clauses.push("harness = ?");
+        values.push(text_or_null(harness));
     }
     if let Some(criteria) = criteria_update {
         let criteria_json = serde_json::to_string(criteria)?;
-        conn.execute(
-            "UPDATE steps SET acceptance_criteria = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![criteria_json, step_id],
-        )?;
+        clauses.push("acceptance_criteria = ?");
+        values.push(Value::Text(criteria_json));
     }
     if let Some(retries) = retries_update {
-        conn.execute(
-            "UPDATE steps SET max_retries = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![retries, step_id],
-        )?;
+        clauses.push("max_retries = ?");
+        values.push(match retries {
+            Some(n) => Value::Integer(n as i64),
+            None => Value::Null,
+        });
     }
     if let Some(model) = model_update {
-        conn.execute(
-            "UPDATE steps SET model = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![model, step_id],
-        )?;
+        clauses.push("model = ?");
+        values.push(text_or_null(model));
     }
+
+    if clauses.is_empty() {
+        return Ok(());
+    }
+
+    clauses.push("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')");
+    let sql = format!("UPDATE steps SET {} WHERE id = ?", clauses.join(", "));
+    values.push(Value::Text(step_id.to_string()));
+
+    let tx = conn
+        .unchecked_transaction()
+        .context("beginning step update transaction")?;
+    let affected = tx.execute(&sql, params_from_iter(values.iter()))?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    tx.commit().context("committing step update transaction")?;
     Ok(())
 }
 
@@ -397,8 +433,8 @@ pub fn reset_step(conn: &Connection, step_id: &str) -> Result<()> {
         params![step_id],
     )?;
     let affected = conn.execute(
-        "UPDATE steps SET status = 'pending', attempts = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
-        params![step_id],
+        "UPDATE steps SET status = ?1, attempts = 0, skipped_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![StepStatus::Pending.as_str(), step_id],
     )?;
     if affected == 0 {
         anyhow::bail!("Step not found: {step_id}");
@@ -422,11 +458,14 @@ pub fn update_step_sort_key(conn: &Connection, step_id: &str, sort_key: &str) ->
 #[allow(dead_code)]
 pub fn get_next_pending_step(conn: &Connection, plan_id: &str) -> Result<Option<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
-         FROM steps WHERE plan_id = ?1 AND status = 'pending' ORDER BY sort_key ASC LIMIT 1",
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
+         FROM steps WHERE plan_id = ?1 AND status = ?2 ORDER BY sort_key ASC LIMIT 1",
     )?;
 
-    let mut rows = stmt.query_map(params![plan_id], Step::from_row)?;
+    let mut rows = stmt.query_map(
+        params![plan_id, StepStatus::Pending.as_str()],
+        Step::from_row,
+    )?;
     match rows.next() {
         Some(row) => Ok(Some(row?)),
         None => Ok(None),
@@ -488,7 +527,13 @@ pub fn update_execution_log(
     cost_usd: Option<f64>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    session_id: Option<&str>,
 ) -> Result<()> {
+    debug_assert!(
+        !(rolled_back && committed),
+        "execution log cannot be both rolled_back and committed",
+    );
+
     let test_results_json = serde_json::to_string(test_results)?;
 
     let affected = conn.execute(
@@ -503,8 +548,9 @@ pub fn update_execution_log(
             harness_stderr = ?8,
             cost_usd = ?9,
             input_tokens = ?10,
-            output_tokens = ?11
-         WHERE id = ?12",
+            output_tokens = ?11,
+            session_id = COALESCE(?12, session_id)
+         WHERE id = ?13",
         params![
             duration_secs,
             diff,
@@ -517,6 +563,7 @@ pub fn update_execution_log(
             cost_usd,
             input_tokens,
             output_tokens,
+            session_id,
             log_id,
         ],
     )?;
@@ -542,13 +589,22 @@ pub fn list_execution_logs_for_step(conn: &Connection, step_id: &str) -> Result<
     Ok(logs)
 }
 
-/// List all execution logs for a plan (across all steps), ordered by started_at.
+/// List all execution logs for a plan (across all steps), ordered by
+/// started_at descending (most recent first).
+///
+/// When `limit` is `Some(n)`, returns at most `n` rows. When `limit` is
+/// `None`, returns every matching row with no cap.
 pub fn list_execution_logs_for_plan(
     conn: &Connection,
     plan_id: &str,
     limit: Option<usize>,
 ) -> Result<Vec<(String, ExecutionLog)>> {
-    let limit_val = limit.unwrap_or(100) as i64;
+    // SQLite treats a negative LIMIT as "no upper bound", which is how we
+    // implement the unlimited case when the caller passes None.
+    let limit_val: i64 = match limit {
+        Some(n) => n as i64,
+        None => -1,
+    };
     let mut stmt = conn.prepare(
         "SELECT s.title, el.id, el.step_id, el.attempt, el.started_at, el.duration_secs,
                 el.prompt_text, el.diff, el.test_results, el.rolled_back, el.committed,
@@ -817,6 +873,16 @@ pub struct StepHookRow {
     pub hook_name: String,
 }
 
+/// Returns true if `err` is a SQLite UNIQUE constraint violation.
+fn is_unique_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if e.code == rusqlite::ErrorCode::ConstraintViolation
+                && e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+    )
+}
+
 /// Attach a hook to a specific step at a lifecycle event.
 pub fn attach_hook_to_step(
     conn: &Connection,
@@ -829,8 +895,16 @@ pub fn attach_hook_to_step(
         "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, ?2, ?3, ?4)",
         params![plan_id, step_id, lifecycle, hook_name],
     )
-    .with_context(|| {
-        format!("Failed to attach hook '{hook_name}' to step {step_id} at {lifecycle}")
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            anyhow::anyhow!(
+                "hook '{hook_name}' is already attached to step {step_id} at {lifecycle}"
+            )
+        } else {
+            anyhow::Error::new(e).context(format!(
+                "Failed to attach hook '{hook_name}' to step {step_id} at {lifecycle}"
+            ))
+        }
     })?;
     Ok(())
 }
@@ -846,8 +920,16 @@ pub fn attach_hook_to_plan(
         "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, NULL, ?2, ?3)",
         params![plan_id, lifecycle, hook_name],
     )
-    .with_context(|| {
-        format!("Failed to attach plan-wide hook '{hook_name}' to plan {plan_id} at {lifecycle}")
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            anyhow::anyhow!(
+                "hook '{hook_name}' is already attached to plan {plan_id} at {lifecycle}"
+            )
+        } else {
+            anyhow::Error::new(e).context(format!(
+                "Failed to attach plan-wide hook '{hook_name}' to plan {plan_id} at {lifecycle}"
+            ))
+        }
     })?;
     Ok(())
 }
@@ -1002,6 +1084,62 @@ mod tests {
     }
 
     #[test]
+    fn test_find_active_plan_filters_by_status() {
+        let conn = setup();
+
+        // Seed one plan per status, plus a same-status plan in another project.
+        let planning = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let ready = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let in_progress = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        let failed = create_plan(&conn, "p4", "/proj", "b4", "d", None, None, &[]).unwrap();
+        let complete = create_plan(&conn, "p5", "/proj", "b5", "d", None, None, &[]).unwrap();
+        let archived = create_plan(&conn, "p6", "/proj", "b6", "d", None, None, &[]).unwrap();
+        let aborted = create_plan(&conn, "p7", "/proj", "b7", "d", None, None, &[]).unwrap();
+        let other = create_plan(&conn, "p8", "/other", "b8", "d", None, None, &[]).unwrap();
+
+        update_plan_status(&conn, &ready.id, PlanStatus::Ready).unwrap();
+        update_plan_status(&conn, &in_progress.id, PlanStatus::InProgress).unwrap();
+        update_plan_status(&conn, &failed.id, PlanStatus::Failed).unwrap();
+        update_plan_status(&conn, &complete.id, PlanStatus::Complete).unwrap();
+        update_plan_status(&conn, &archived.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &aborted.id, PlanStatus::Aborted).unwrap();
+        update_plan_status(&conn, &other.id, PlanStatus::InProgress).unwrap();
+
+        // Only in_progress / ready / failed in "/proj" count as active.
+        let active_ids: std::collections::HashSet<String> =
+            [ready.id.clone(), in_progress.id.clone(), failed.id.clone()]
+                .into_iter()
+                .collect();
+        let found = find_active_plan(&conn, "/proj", false).unwrap().unwrap();
+        assert!(active_ids.contains(&found.id));
+        assert_eq!(found.project, "/proj");
+
+        // With include_complete, the complete plan becomes eligible too.
+        let active_with_complete: std::collections::HashSet<String> = [
+            ready.id.clone(),
+            in_progress.id.clone(),
+            failed.id.clone(),
+            complete.id.clone(),
+        ]
+        .into_iter()
+        .collect();
+        let found_inc = find_active_plan(&conn, "/proj", true).unwrap().unwrap();
+        assert!(active_with_complete.contains(&found_inc.id));
+
+        // Archive every active row; nothing should match without include_complete.
+        update_plan_status(&conn, &ready.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &in_progress.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &failed.id, PlanStatus::Archived).unwrap();
+        assert!(find_active_plan(&conn, "/proj", false).unwrap().is_none());
+        // include_complete still resolves to the lone complete plan.
+        let found_complete = find_active_plan(&conn, "/proj", true).unwrap().unwrap();
+        assert_eq!(found_complete.id, complete.id);
+
+        // Planning / aborted / archived are never treated as active.
+        let _ = (planning, aborted);
+    }
+
+    #[test]
     fn test_update_plan_status() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
@@ -1132,6 +1270,134 @@ mod tests {
     }
 
     #[test]
+    fn test_update_step_fields_ext_atomic_single_update() {
+        // A single UPDATE carries one `updated_at` for every changed column,
+        // so setting multiple fields in one call leaves no window for a
+        // partial write with inconsistent timestamps.
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+
+        let baseline = get_step(&conn, &step.id).unwrap();
+        // Sleep long enough that strftime('now') advances past the baseline.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        update_step_fields_ext(
+            &conn,
+            &step.id,
+            Some("New Title"),
+            Some("New Desc"),
+            Some(Some("new-agent")),
+            Some(Some("new-harness")),
+            Some(&["criterion".to_string()]),
+            Some(Some(5)),
+            Some(Some("new-model")),
+        )
+        .unwrap();
+
+        let updated = get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.title, "New Title");
+        assert_eq!(updated.description, "New Desc");
+        assert_eq!(updated.agent.as_deref(), Some("new-agent"));
+        assert_eq!(updated.harness.as_deref(), Some("new-harness"));
+        assert_eq!(updated.acceptance_criteria, vec!["criterion".to_string()]);
+        assert_eq!(updated.max_retries, Some(5));
+        assert_eq!(updated.model.as_deref(), Some("new-model"));
+        assert!(updated.updated_at > baseline.updated_at);
+    }
+
+    #[test]
+    fn test_update_step_fields_ext_missing_step_rolls_back() {
+        // When the step doesn't exist the transaction rolls back, leaving
+        // other rows untouched.
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (other, _) = create_step(
+            &conn,
+            &plan.id,
+            "Other",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let other_before = get_step(&conn, &other.id).unwrap();
+
+        let err = update_step_fields_ext(
+            &conn,
+            "nonexistent-id",
+            Some("New Title"),
+            Some("New Desc"),
+            Some(Some("agent")),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Step not found"));
+
+        let other_after = get_step(&conn, &other.id).unwrap();
+        assert_eq!(other_before.title, other_after.title);
+        assert_eq!(other_before.updated_at, other_after.updated_at);
+    }
+
+    #[test]
+    fn test_update_step_fields_ext_clears_nullable_fields() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            Some("agent"),
+            Some("harness"),
+            &[],
+            Some(3),
+            Some("model"),
+        )
+        .unwrap();
+
+        update_step_fields_ext(
+            &conn,
+            &step.id,
+            None,
+            None,
+            Some(None),
+            Some(None),
+            None,
+            Some(None),
+            Some(None),
+        )
+        .unwrap();
+
+        let updated = get_step(&conn, &step.id).unwrap();
+        assert!(updated.agent.is_none());
+        assert!(updated.harness.is_none());
+        assert!(updated.max_retries.is_none());
+        assert!(updated.model.is_none());
+    }
+
+    #[test]
+    fn test_update_step_fields_ext_noop_when_all_none() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+        let before = get_step(&conn, &step.id).unwrap();
+
+        update_step_fields_ext(&conn, &step.id, None, None, None, None, None, None, None).unwrap();
+
+        let after = get_step(&conn, &step.id).unwrap();
+        assert_eq!(before.updated_at, after.updated_at);
+    }
+
+    #[test]
     fn test_delete_step() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
@@ -1256,6 +1522,7 @@ mod tests {
             Some(0.05),
             Some(1000),
             Some(500),
+            Some("session-abc"),
         )
         .unwrap();
 
@@ -1271,6 +1538,69 @@ mod tests {
         assert_eq!(updated.cost_usd, Some(0.05));
         assert_eq!(updated.input_tokens, Some(1000));
         assert_eq!(updated.output_tokens, Some(500));
+        assert_eq!(updated.session_id.as_deref(), Some("session-abc"));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "execution log cannot be both rolled_back and committed")]
+    fn test_update_execution_log_rolled_back_and_committed_panics() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+        let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
+
+        let _ = update_execution_log(
+            &conn,
+            log.id,
+            None,
+            None,
+            &[],
+            true,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+
+    #[test]
+    fn test_update_execution_log_preserves_session_id_when_none() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+        let log = create_execution_log(&conn, &step.id, 1, None, Some("initial-session")).unwrap();
+
+        update_execution_log(
+            &conn,
+            log.id,
+            Some(10.0),
+            None,
+            &[],
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let updated = get_latest_log_for_step(&conn, &step.id).unwrap().unwrap();
+        assert_eq!(
+            updated.session_id.as_deref(),
+            Some("initial-session"),
+            "session_id set at creation should be preserved when update passes None"
+        );
     }
 
     #[test]
@@ -1517,6 +1847,68 @@ mod tests {
         for id in &ids {
             assert!(msg.contains(id), "missing plan id in error: {msg}");
         }
+    }
+
+    // -- step_hooks uniqueness tests --
+
+    #[test]
+    fn test_attach_hook_to_step_rejects_duplicate() {
+        let conn = setup();
+        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "t", "d", None, None, &[], None, None).unwrap();
+
+        attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "h1").unwrap();
+
+        let err = attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "h1").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already attached"), "unexpected error: {msg}");
+
+        // Only one row exists.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM step_hooks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_attach_hook_to_plan_rejects_duplicate() {
+        let conn = setup();
+        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        attach_hook_to_plan(&conn, &plan.id, "post-step", "h1").unwrap();
+
+        let err = attach_hook_to_plan(&conn, &plan.id, "post-step", "h1").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already attached"), "unexpected error: {msg}");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM step_hooks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_attach_hook_allows_distinct_combinations() {
+        let conn = setup();
+        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = create_step(&conn, &plan.id, "t1", "d", None, None, &[], None, None).unwrap();
+        let (s2, _) = create_step(&conn, &plan.id, "t2", "d", None, None, &[], None, None).unwrap();
+
+        // Same hook on different steps: OK.
+        attach_hook_to_step(&conn, &plan.id, &s1.id, "pre-step", "h1").unwrap();
+        attach_hook_to_step(&conn, &plan.id, &s2.id, "pre-step", "h1").unwrap();
+        // Same hook on same step but different lifecycle: OK.
+        attach_hook_to_step(&conn, &plan.id, &s1.id, "post-step", "h1").unwrap();
+        // Different hook name on same step/lifecycle: OK.
+        attach_hook_to_step(&conn, &plan.id, &s1.id, "pre-step", "h2").unwrap();
+        // Plan-wide alongside per-step with the same lifecycle/name: OK.
+        attach_hook_to_plan(&conn, &plan.id, "pre-step", "h1").unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM step_hooks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 5);
     }
 
     #[test]

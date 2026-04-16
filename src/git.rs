@@ -69,36 +69,42 @@ pub fn commit_changes(workdir: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
-/// Auto-commit any dirty state with a descriptive message.
+/// Parse `git status --porcelain` output into a list of file paths.
 ///
-/// If the working tree is clean this is a no-op.
-pub fn auto_commit_dirty_state(workdir: &Path, message: &str) -> Result<()> {
-    if has_uncommitted_changes(workdir)? {
-        commit_changes(workdir, message)?;
+/// Rename/copy entries (`R` or `C` status in either column) are split on
+/// ` -> ` so both the old and new paths are returned as separate entries.
+fn parse_porcelain_status(out: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for line in out.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        // `git status --porcelain` lines look like "XY filename" (3-char prefix).
+        let status = line.get(..2).unwrap_or("");
+        let rest = line.get(3..).unwrap_or(line);
+        let is_rename_or_copy = status.contains('R') || status.contains('C');
+        if is_rename_or_copy {
+            if let Some((old, new)) = rest.split_once(" -> ") {
+                files.push(old.to_string());
+                files.push(new.to_string());
+                continue;
+            }
+        }
+        files.push(rest.to_string());
     }
-    Ok(())
+    files
 }
 
 /// Return a list of all changed files (staged, unstaged, and untracked).
 pub fn get_all_changed_files(workdir: &Path) -> Result<Vec<String>> {
     let out = git(workdir, &["status", "--porcelain"]).context("could not list changed files")?;
-    let files: Vec<String> = out
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            // `git status --porcelain` lines look like "XY filename" (3-char prefix).
-            l.get(3..).unwrap_or(l).to_string()
-        })
-        .collect();
-    Ok(files)
+    Ok(parse_porcelain_status(&out))
 }
 
 /// Return the unified diff of all current (unstaged + staged) changes.
 pub fn get_diff(workdir: &Path) -> Result<String> {
-    // Unstaged changes.
-    let unstaged = git(workdir, &["diff"]).unwrap_or_default();
-    // Staged changes.
-    let staged = git(workdir, &["diff", "--cached"]).unwrap_or_default();
+    let unstaged = git(workdir, &["diff"]).context("could not get unstaged diff")?;
+    let staged = git(workdir, &["diff", "--cached"]).context("could not get staged diff")?;
 
     let mut diff = String::new();
     if !unstaged.is_empty() {
@@ -115,10 +121,10 @@ pub fn get_diff(workdir: &Path) -> Result<String> {
 
 /// Hard-reset the working directory to the last commit state.
 ///
-/// Equivalent to `git checkout -- . && git clean -fd`.
+/// Equivalent to `git restore . && git clean -fd`. Requires git >= 2.23.
 #[allow(dead_code)]
 pub fn rollback_changes(workdir: &Path) -> Result<()> {
-    git(workdir, &["checkout", "--", "."]).context("git checkout -- . failed")?;
+    git(workdir, &["restore", "."]).context("git restore . failed")?;
     git(workdir, &["clean", "-fd"]).context("git clean -fd failed")?;
     Ok(())
 }
@@ -141,8 +147,8 @@ pub fn get_untracked_files(workdir: &Path) -> Result<Vec<String>> {
 pub fn stage_except(workdir: &Path, exclude: &[String]) -> Result<()> {
     git(workdir, &["add", "-A"]).context("git add -A failed")?;
     for file in exclude {
-        // Unstage the file. Ignore errors (file may not have been staged).
-        let _ = git(workdir, &["reset", "HEAD", "--", file]);
+        git(workdir, &["reset", "HEAD", "--", file])
+            .with_context(|| format!("git reset HEAD -- '{file}' failed"))?;
     }
     Ok(())
 }
@@ -155,21 +161,40 @@ pub fn commit_staged(workdir: &Path, message: &str) -> Result<()> {
 
 /// Rollback changes while preserving specified untracked files.
 ///
-/// Restores tracked files via `git checkout -- .`, then selectively removes
-/// only untracked files that are NOT in the `preserve` list.
+/// Restores tracked files via `git restore .`, then selectively removes
+/// only untracked files that are NOT in the `preserve` list. Requires git >= 2.23.
 pub fn rollback_except(workdir: &Path, preserve: &[String]) -> Result<()> {
     // Restore tracked files.
-    git(workdir, &["checkout", "--", "."]).context("git checkout -- . failed")?;
+    git(workdir, &["restore", "."]).context("git restore . failed")?;
 
-    // Get current untracked files and remove only those not in preserve list.
     let untracked = get_untracked_files(workdir)?;
-    for file in &untracked {
-        if !preserve.contains(file) {
-            let path = workdir.join(file);
-            if path.is_dir() {
-                let _ = std::fs::remove_dir_all(&path);
-            } else {
-                let _ = std::fs::remove_file(&path);
+    remove_untracked_except(workdir, preserve, &untracked)
+}
+
+/// Remove each path in `untracked` from `workdir` unless it appears in `preserve`.
+///
+/// Tolerates `NotFound` errors: a file may disappear between listing and
+/// deletion (concurrent process, symlink chain, etc.). Other I/O errors are
+/// propagated with context.
+fn remove_untracked_except(
+    workdir: &Path,
+    preserve: &[String],
+    untracked: &[String],
+) -> Result<()> {
+    for file in untracked {
+        if preserve.contains(file) {
+            continue;
+        }
+        let path = workdir.join(file);
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(err) = result {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err)
+                    .with_context(|| format!("failed to remove untracked path '{file}'"));
             }
         }
     }
@@ -267,26 +292,6 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_commit_dirty_state_noop_when_clean() {
-        let (_tmp, dir) = init_repo();
-        let hash_before = get_commit_hash(&dir).unwrap();
-        auto_commit_dirty_state(&dir, "should not commit").unwrap();
-        let hash_after = get_commit_hash(&dir).unwrap();
-        assert_eq!(hash_before, hash_after);
-    }
-
-    #[test]
-    fn test_auto_commit_dirty_state_commits_when_dirty() {
-        let (_tmp, dir) = init_repo();
-        let hash_before = get_commit_hash(&dir).unwrap();
-        fs::write(dir.join("dirty.txt"), "stuff").unwrap();
-        auto_commit_dirty_state(&dir, "auto save").unwrap();
-        let hash_after = get_commit_hash(&dir).unwrap();
-        assert_ne!(hash_before, hash_after);
-        assert!(!has_uncommitted_changes(&dir).unwrap());
-    }
-
-    #[test]
     fn test_get_all_changed_files() {
         let (_tmp, dir) = init_repo();
         fs::write(dir.join("a.txt"), "a").unwrap();
@@ -298,11 +303,54 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_porcelain_status_rename_and_copy() {
+        // Simulated `git status --porcelain` output covering:
+        //   - plain modifications
+        //   - adds
+        //   - untracked
+        //   - a staged rename (R  old -> new)
+        //   - a staged copy    (C  old -> new)
+        //   - an unstaged rename where worktree column is R ( R old -> new)
+        let lines = [
+            " M modified.txt",
+            "A  added.txt",
+            "?? untracked.txt",
+            "R  old_renamed.txt -> new_renamed.txt",
+            "C  src_copied.txt -> dst_copied.txt",
+            " R wt_old.txt -> wt_new.txt",
+        ];
+        let out = lines.join("\n") + "\n";
+        let files = parse_porcelain_status(&out);
+        assert_eq!(
+            files,
+            vec![
+                "modified.txt".to_string(),
+                "added.txt".to_string(),
+                "untracked.txt".to_string(),
+                "old_renamed.txt".to_string(),
+                "new_renamed.txt".to_string(),
+                "src_copied.txt".to_string(),
+                "dst_copied.txt".to_string(),
+                "wt_old.txt".to_string(),
+                "wt_new.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn test_get_diff() {
         let (_tmp, dir) = init_repo();
         fs::write(dir.join("README.md"), "# changed").unwrap();
         let diff = get_diff(&dir).unwrap();
         assert!(diff.contains("changed"));
+    }
+
+    #[test]
+    fn test_get_diff_errors_when_not_a_repo() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        // Not a git repo — git diff should fail and propagate.
+        assert!(get_diff(&dir).is_err());
     }
 
     #[test]
@@ -383,6 +431,64 @@ mod tests {
         // Both files should now be present.
         assert!(dir.join("a.txt").exists());
         assert!(dir.join("b.txt").exists());
+    }
+
+    #[test]
+    fn test_remove_untracked_except_tolerates_missing() {
+        let (_tmp, dir) = init_repo();
+        // "exists.txt" is on disk; "gone.txt" is only in the list (simulating
+        // a file that disappeared between listing and deletion).
+        fs::write(dir.join("exists.txt"), "data").unwrap();
+        let untracked = vec!["exists.txt".to_string(), "gone.txt".to_string()];
+        remove_untracked_except(&dir, &[], &untracked).unwrap();
+        assert!(!dir.join("exists.txt").exists());
+        assert!(!dir.join("gone.txt").exists());
+    }
+
+    #[test]
+    fn test_remove_untracked_except_preserves_list() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("keep.txt"), "k").unwrap();
+        fs::write(dir.join("drop.txt"), "d").unwrap();
+        let untracked = vec!["keep.txt".to_string(), "drop.txt".to_string()];
+        let preserve = vec!["keep.txt".to_string()];
+        remove_untracked_except(&dir, &preserve, &untracked).unwrap();
+        assert!(dir.join("keep.txt").exists());
+        assert!(!dir.join("drop.txt").exists());
+    }
+
+    #[test]
+    fn test_stage_except_unstages_excluded_files() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("keep.txt"), "k").unwrap();
+        fs::write(dir.join("drop.txt"), "d").unwrap();
+
+        stage_except(&dir, &["drop.txt".to_string()]).unwrap();
+
+        // keep.txt should be staged; drop.txt should remain untracked.
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(status.contains("A  keep.txt"));
+        assert!(status.contains("?? drop.txt"));
+    }
+
+    #[test]
+    fn test_stage_except_tolerates_unstaged_file_in_exclude_list() {
+        // `git reset HEAD -- <path>` is a no-op (exit 0) for paths that are
+        // not currently staged, so excluding a file that was never staged
+        // must not produce an error.
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("file.txt"), "data").unwrap();
+        stage_except(&dir, &["never_staged.txt".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn test_stage_except_propagates_reset_errors() {
+        // When the underlying `git reset` fails (e.g. not a git repo), the
+        // error must surface rather than being swallowed.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let result = stage_except(&dir, &["file.txt".to_string()]);
+        assert!(result.is_err());
     }
 
     #[test]
