@@ -79,18 +79,36 @@ pub fn auto_commit_dirty_state(workdir: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// Parse `git status --porcelain` output into a list of file paths.
+///
+/// Rename/copy entries (`R` or `C` status in either column) are split on
+/// ` -> ` so both the old and new paths are returned as separate entries.
+fn parse_porcelain_status(out: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for line in out.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        // `git status --porcelain` lines look like "XY filename" (3-char prefix).
+        let status = line.get(..2).unwrap_or("");
+        let rest = line.get(3..).unwrap_or(line);
+        let is_rename_or_copy = status.contains('R') || status.contains('C');
+        if is_rename_or_copy {
+            if let Some((old, new)) = rest.split_once(" -> ") {
+                files.push(old.to_string());
+                files.push(new.to_string());
+                continue;
+            }
+        }
+        files.push(rest.to_string());
+    }
+    files
+}
+
 /// Return a list of all changed files (staged, unstaged, and untracked).
 pub fn get_all_changed_files(workdir: &Path) -> Result<Vec<String>> {
     let out = git(workdir, &["status", "--porcelain"]).context("could not list changed files")?;
-    let files: Vec<String> = out
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            // `git status --porcelain` lines look like "XY filename" (3-char prefix).
-            l.get(3..).unwrap_or(l).to_string()
-        })
-        .collect();
-    Ok(files)
+    Ok(parse_porcelain_status(&out))
 }
 
 /// Return the unified diff of all current (unstaged + staged) changes.
@@ -295,6 +313,41 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.contains(&"a.txt".to_string()));
         assert!(files.contains(&"b.txt".to_string()));
+    }
+
+    #[test]
+    fn test_parse_porcelain_status_rename_and_copy() {
+        // Simulated `git status --porcelain` output covering:
+        //   - plain modifications
+        //   - adds
+        //   - untracked
+        //   - a staged rename (R  old -> new)
+        //   - a staged copy    (C  old -> new)
+        //   - an unstaged rename where worktree column is R ( R old -> new)
+        let lines = [
+            " M modified.txt",
+            "A  added.txt",
+            "?? untracked.txt",
+            "R  old_renamed.txt -> new_renamed.txt",
+            "C  src_copied.txt -> dst_copied.txt",
+            " R wt_old.txt -> wt_new.txt",
+        ];
+        let out = lines.join("\n") + "\n";
+        let files = parse_porcelain_status(&out);
+        assert_eq!(
+            files,
+            vec![
+                "modified.txt".to_string(),
+                "added.txt".to_string(),
+                "untracked.txt".to_string(),
+                "old_renamed.txt".to_string(),
+                "new_renamed.txt".to_string(),
+                "src_copied.txt".to_string(),
+                "dst_copied.txt".to_string(),
+                "wt_old.txt".to_string(),
+                "wt_new.txt".to_string(),
+            ]
+        );
     }
 
     #[test]
