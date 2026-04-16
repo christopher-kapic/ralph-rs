@@ -6,6 +6,8 @@
 
 use std::time::Instant;
 
+use ratatui::widgets::ListState;
+
 use crate::plan::{Plan, Step, StepStatus};
 
 // ---------------------------------------------------------------------------
@@ -46,11 +48,16 @@ pub struct App {
 
     /// Start time of the current in-progress step (for the live timer).
     pub step_start_time: Option<Instant>,
+
+    /// Persistent list widget state so the viewport offset survives across frames.
+    pub list_state: ListState,
 }
 
 impl App {
     /// Create a new App with the given plan and steps.
     pub fn new(plan: Plan, steps: Vec<Step>) -> Self {
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
         Self {
             plan,
             steps,
@@ -59,6 +66,7 @@ impl App {
             input_buffer: String::new(),
             should_quit: false,
             step_start_time: None,
+            list_state,
         }
     }
 
