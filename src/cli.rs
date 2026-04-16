@@ -111,6 +111,14 @@ pub enum Command {
         #[arg(long)]
         current_branch: bool,
 
+        /// Auto-commit any dirty working-tree state before switching to the
+        /// plan branch. Without this flag (and when `auto_stash` is false in
+        /// config.json), a dirty working tree bails the run and prints the
+        /// files that would have been swept up, so the user can stage or
+        /// discard them intentionally.
+        #[arg(long)]
+        auto_stash: bool,
+
         /// Override the harness for this run.
         #[arg(long)]
         harness: Option<String>,
@@ -966,6 +974,27 @@ mod tests {
         {
             assert_eq!(plan.as_deref(), Some("my-feature"));
             assert!(current_branch);
+        } else {
+            panic!("Expected Run");
+        }
+    }
+
+    #[test]
+    fn test_parse_run_auto_stash() {
+        // L10: the `--auto-stash` flag must thread through to the Run
+        // variant so `setup_branch` can opt into the legacy auto-commit
+        // behavior for dirty working trees.
+        let cli = Cli::try_parse_from(["ralph-rs", "run", "--auto-stash"]).unwrap();
+        if let Command::Run { auto_stash, .. } = cli.command {
+            assert!(auto_stash);
+        } else {
+            panic!("Expected Run");
+        }
+
+        // Default must stay off so we don't silently sweep dirty trees.
+        let cli = Cli::try_parse_from(["ralph-rs", "run"]).unwrap();
+        if let Command::Run { auto_stash, .. } = cli.command {
+            assert!(!auto_stash);
         } else {
             panic!("Expected Run");
         }

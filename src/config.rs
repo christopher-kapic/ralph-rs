@@ -73,6 +73,13 @@ fn default_hook_timeout_secs() -> u64 {
     120
 }
 
+/// Default for `Config::auto_stash`. Off by default so `ralph run` never
+/// silently sweeps a dirty working tree into a commit — users must opt in
+/// either globally here or per-run via `--auto-stash`.
+fn default_auto_stash() -> bool {
+    false
+}
+
 /// Top-level ralph-rs configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
@@ -86,6 +93,13 @@ pub struct Config {
     /// pre/post-test). `0` disables the timeout. Defaults to 120.
     #[serde(default = "default_hook_timeout_secs")]
     pub hook_timeout_secs: u64,
+    /// When true, `ralph run` auto-commits any dirty working-tree state
+    /// before switching to the plan branch. When false (default), a dirty
+    /// working tree causes the run to bail and print the files that would
+    /// have been swept up, so the user can stage intentionally. The
+    /// `--auto-stash` CLI flag overrides this per-run.
+    #[serde(default = "default_auto_stash")]
+    pub auto_stash: bool,
     /// Available harness definitions keyed by name.
     pub harnesses: HashMap<String, HarnessConfig>,
 }
@@ -349,6 +363,7 @@ impl Default for Config {
             max_retries_per_step: 3,
             timeout_secs: 0,
             hook_timeout_secs: default_hook_timeout_secs(),
+            auto_stash: default_auto_stash(),
             harnesses,
         }
     }
@@ -427,6 +442,9 @@ mod tests {
         assert_eq!(config.default_harness, "claude");
         assert_eq!(config.max_retries_per_step, 3);
         assert_eq!(config.timeout_secs, 0);
+        // L10: auto_stash is opt-in; default config must preserve the safer
+        // "refuse to sweep a dirty tree" behavior.
+        assert!(!config.auto_stash);
 
         let expected_harnesses = ["claude", "codex", "pi", "opencode", "copilot", "goose"];
         for name in &expected_harnesses {
@@ -703,6 +721,22 @@ mod tests {
         Config::default()
             .validate()
             .expect("default config must validate");
+    }
+
+    #[test]
+    fn test_auto_stash_defaults_to_false_when_missing_in_json() {
+        // L10: older configs (written before the key existed) must keep
+        // working and default to the safer opt-in behavior.
+        let json = r#"{
+            "default_harness": "claude",
+            "max_retries_per_step": 3,
+            "timeout_secs": 0,
+            "harnesses": {
+                "claude": {"command": "claude"}
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).expect("deserialize");
+        assert!(!config.auto_stash);
     }
 
     #[test]

@@ -98,6 +98,7 @@ ralph run --all                        # Run every plan in dependency order
 ralph run [<slug>] --from <n> --to <m> # Run a specific step range
 ralph run [<slug>] --dry-run           # Print what would happen without executing
 ralph run [<slug>] --current-branch    # Run on current branch (skip branch creation)
+ralph run [<slug>] --auto-stash        # Auto-commit a dirty tree instead of bailing
 ralph run [<slug>] --harness <h>       # Override harness for this run
 ralph resume [<slug>]                  # Resume from last failed step
 ralph skip [<slug>]                    # Skip failed step, continue
@@ -151,6 +152,14 @@ cd ~/myapp-codex  && ralph run auth-codex  --harness codex  &
 ## Configuration
 
 Config lives at `~/.config/ralph-rs/config.json` (Linux/macOS) with harness definitions, default harness, retry settings, and timeout configuration.
+
+Relevant top-level keys:
+
+- `default_harness` — harness used when none is specified (must match a key under `harnesses`).
+- `max_retries_per_step` — retry budget per step (default: 3).
+- `timeout_secs` — harness invocation timeout (`0` disables; default: 0).
+- `hook_timeout_secs` — lifecycle hook timeout (`0` disables; default: 120).
+- `auto_stash` — when `true`, `ralph run` auto-commits a dirty working tree before switching to the plan branch. When `false` (default) `ralph run` lists the dirty files and bails so you can stage or discard them intentionally; pass `--auto-stash` to override for a single run.
 
 Agent definitions are markdown files in `~/.config/ralph-rs/agents/*.md`.
 

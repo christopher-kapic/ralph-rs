@@ -39,6 +39,11 @@ pub struct RunOptions {
     pub to: Option<usize>,
     /// Skip branch creation and use the current branch.
     pub current_branch: bool,
+    /// Auto-commit any dirty working-tree state before switching to the plan
+    /// branch. Honored by `setup_branch`. When false and the config's
+    /// `auto_stash` is also false, a dirty working tree bails the run and
+    /// lists the files that would have been swept up.
+    pub auto_stash: bool,
     /// Override the harness for this run.
     pub harness_override: Option<String>,
     /// Dry-run mode: print what would happen without executing.
@@ -96,7 +101,7 @@ pub async fn run_plan(
 
     // 2. Optionally create and checkout branch.
     if !options.current_branch && !options.dry_run {
-        setup_branch(workdir, &effective_plan, None).await?;
+        setup_branch(workdir, &effective_plan, None, options.auto_stash).await?;
     }
 
     // Load steps.
@@ -544,7 +549,13 @@ pub async fn run_all_plans(
 
         // Set up the branch ourselves (unless the user wants current-branch mode).
         if !options.current_branch && !options.dry_run {
-            setup_branch(workdir, plan, branch_plan.parent_sha.as_deref()).await?;
+            setup_branch(
+                workdir,
+                plan,
+                branch_plan.parent_sha.as_deref(),
+                options.auto_stash,
+            )
+            .await?;
 
             // Merge any additional deps' SHAs for multi-parent plans.
             for other_sha in &branch_plan.merge_shas {
@@ -584,6 +595,10 @@ pub async fn run_all_plans(
             from: options.from,
             to: options.to,
             current_branch: true,
+            // Branch setup was already handled at the orchestrator level;
+            // forward `auto_stash` for completeness even though the inner
+            // call won't re-run `setup_branch`.
+            auto_stash: options.auto_stash,
             harness_override: options.harness_override.clone(),
             dry_run: options.dry_run,
         };
@@ -821,7 +836,12 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
 ///   parent SHA is ignored and the existing branch is checked out.
 /// - If `parent_sha` is `None`, creates the branch from the current HEAD
 ///   (legacy behavior).
-async fn setup_branch(workdir: &Path, plan: &Plan, parent_sha: Option<&str>) -> Result<()> {
+async fn setup_branch(
+    workdir: &Path,
+    plan: &Plan,
+    parent_sha: Option<&str>,
+    auto_stash: bool,
+) -> Result<()> {
     let current = {
         let workdir_owned = workdir.to_path_buf();
         blocking_git(move || git::get_current_branch(&workdir_owned))
@@ -833,14 +853,44 @@ async fn setup_branch(workdir: &Path, plan: &Plan, parent_sha: Option<&str>) -> 
         return Ok(());
     }
 
-    // Auto-commit any dirty state before switching branches.
+    // Handle any dirty working-tree state before switching branches.
+    // Default (auto_stash=false) is to refuse: auto-committing untracked
+    // files has surprised users who had scratch work in the tree, so we
+    // preview the file list and bail unless the user opted in via
+    // `--auto-stash` or `config.auto_stash`.
     {
         let workdir_owned = workdir.to_path_buf();
-        let msg = format!(
-            "ralph: auto-save before switching to branch '{}'",
-            plan.branch_name
-        );
-        blocking_git(move || git::auto_commit_dirty_state(&workdir_owned, &msg)).await?;
+        let dirty =
+            blocking_git(move || git::has_uncommitted_changes(&workdir_owned)).await?;
+        if dirty {
+            let workdir_owned = workdir.to_path_buf();
+            let files = blocking_git(move || git::get_all_changed_files(&workdir_owned)).await?;
+            if auto_stash {
+                let workdir_owned = workdir.to_path_buf();
+                let msg = format!(
+                    "ralph: auto-save before switching to branch '{}'",
+                    plan.branch_name
+                );
+                blocking_git(move || git::commit_changes(&workdir_owned, &msg)).await?;
+            } else {
+                let mut msg = format!(
+                    "Working tree has uncommitted changes; refusing to auto-commit \
+                     {} file(s) before switching to branch '{}':\n",
+                    files.len(),
+                    plan.branch_name
+                );
+                for f in &files {
+                    msg.push_str("  ");
+                    msg.push_str(f);
+                    msg.push('\n');
+                }
+                msg.push_str(
+                    "Re-run with --auto-stash (or set `auto_stash: true` in config.json) \
+                     to commit them automatically, or stage/discard them manually first.",
+                );
+                bail!(msg);
+            }
+        }
     }
 
     // Try to create and checkout the branch. If it already exists,
@@ -1877,7 +1927,9 @@ mod tests {
         };
 
         // Should create feat/rooted rooted at initial_sha.
-        setup_branch(&dir, &plan, Some(&initial_sha)).await.unwrap();
+        setup_branch(&dir, &plan, Some(&initial_sha), false)
+            .await
+            .unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/rooted");
         assert_eq!(git::get_commit_hash(&dir).unwrap(), initial_sha);
         // The second commit's file should not be visible on the new branch.
@@ -1921,7 +1973,7 @@ mod tests {
             }
         });
 
-        setup_branch(&dir, &plan, None).await.unwrap();
+        setup_branch(&dir, &plan, None, false).await.unwrap();
         ticker.await.unwrap();
 
         // The ticker's 50 × 1ms sleeps only make progress if the runtime
@@ -1980,5 +2032,105 @@ mod tests {
         assert_eq!(result.steps_executed, 0);
         assert_eq!(result.steps_succeeded, 0);
         assert_eq!(result.final_status, PlanStatus::Complete);
+    }
+
+    // -- setup_branch auto-stash preview/opt-out (L10) --
+
+    /// Acceptance for L10: a dirty tree without `--auto-stash` must bail
+    /// rather than silently sweep untracked files into a commit. The error
+    /// must surface the files so the user can stage them intentionally.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_refuses_dirty_tree_without_auto_stash() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        // Drop an untracked file into the tree.
+        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: dir.to_string_lossy().to_string(),
+            branch_name: "feat/dirty".to_string(),
+            description: String::new(),
+            status: PlanStatus::Ready,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let err = setup_branch(&dir, &plan, None, false)
+            .await
+            .expect_err("dirty tree without auto_stash must bail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scratch.txt"),
+            "error must list the untracked file, got: {msg}"
+        );
+        assert!(
+            msg.contains("--auto-stash"),
+            "error must point users at the opt-in flag, got: {msg}"
+        );
+
+        // Nothing was swept into a commit; the branch was not switched.
+        assert!(git::has_uncommitted_changes(&dir).unwrap());
+        assert_ne!(git::get_current_branch(&dir).unwrap(), "feat/dirty");
+    }
+
+    /// With `auto_stash: true` the old behavior is preserved: dirty state
+    /// is committed and the new branch is checked out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_auto_stash_commits_dirty_tree() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: dir.to_string_lossy().to_string(),
+            branch_name: "feat/auto".to_string(),
+            description: String::new(),
+            status: PlanStatus::Ready,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        setup_branch(&dir, &plan, None, true).await.unwrap();
+        assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/auto");
+        assert!(!git::has_uncommitted_changes(&dir).unwrap());
+    }
+
+    /// A clean tree must not require the opt-in. This also confirms we
+    /// didn't regress the zero-change fast path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_clean_tree_proceeds_without_auto_stash() {
+        let (_tmp, dir) = init_git_repo();
+
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: dir.to_string_lossy().to_string(),
+            branch_name: "feat/clean".to_string(),
+            description: String::new(),
+            status: PlanStatus::Ready,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        setup_branch(&dir, &plan, None, false).await.unwrap();
+        assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");
     }
 }

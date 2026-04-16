@@ -69,16 +69,6 @@ pub fn commit_changes(workdir: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
-/// Auto-commit any dirty state with a descriptive message.
-///
-/// If the working tree is clean this is a no-op.
-pub fn auto_commit_dirty_state(workdir: &Path, message: &str) -> Result<()> {
-    if has_uncommitted_changes(workdir)? {
-        commit_changes(workdir, message)?;
-    }
-    Ok(())
-}
-
 /// Parse `git status --porcelain` output into a list of file paths.
 ///
 /// Rename/copy entries (`R` or `C` status in either column) are split on
@@ -279,26 +269,6 @@ mod tests {
         let (_tmp, dir) = init_repo();
         fs::write(dir.join("file.txt"), "content").unwrap();
         commit_changes(&dir, "add file").unwrap();
-        assert!(!has_uncommitted_changes(&dir).unwrap());
-    }
-
-    #[test]
-    fn test_auto_commit_dirty_state_noop_when_clean() {
-        let (_tmp, dir) = init_repo();
-        let hash_before = get_commit_hash(&dir).unwrap();
-        auto_commit_dirty_state(&dir, "should not commit").unwrap();
-        let hash_after = get_commit_hash(&dir).unwrap();
-        assert_eq!(hash_before, hash_after);
-    }
-
-    #[test]
-    fn test_auto_commit_dirty_state_commits_when_dirty() {
-        let (_tmp, dir) = init_repo();
-        let hash_before = get_commit_hash(&dir).unwrap();
-        fs::write(dir.join("dirty.txt"), "stuff").unwrap();
-        auto_commit_dirty_state(&dir, "auto save").unwrap();
-        let hash_after = get_commit_hash(&dir).unwrap();
-        assert_ne!(hash_before, hash_after);
         assert!(!has_uncommitted_changes(&dir).unwrap());
     }
 

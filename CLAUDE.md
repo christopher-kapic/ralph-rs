@@ -102,7 +102,7 @@ ralph step move <num>|--step-id <uuid> --to <n> [<slug>]
 ralph step set-hook <num>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --hook <name>
 ralph step unset-hook <num>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --hook <name>
 
-ralph run [<slug>] [--one/--single] [--all] [--from <n>] [--to <m>] [--dry-run] [--skip-preflight] [--current-branch] [--harness <h>] [--force]
+ralph run [<slug>] [--one/--single] [--all] [--from <n>] [--to <m>] [--dry-run] [--skip-preflight] [--current-branch] [--auto-stash] [--harness <h>] [--force]
 ralph resume [<slug>]
 ralph skip [<slug>] [--step <n>] [--reason <reason>]
 

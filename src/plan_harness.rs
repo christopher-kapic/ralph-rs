@@ -785,6 +785,7 @@ mod tests {
             max_retries_per_step: 0,
             timeout_secs: 0,
             hook_timeout_secs: 120,
+            auto_stash: false,
             harnesses,
         }
     }

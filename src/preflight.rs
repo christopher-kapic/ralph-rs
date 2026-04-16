@@ -520,6 +520,7 @@ mod tests {
             max_retries_per_step: 3,
             timeout_secs: 300,
             hook_timeout_secs: 120,
+            auto_stash: false,
             harnesses: HashMap::new(),
         };
         let checks = run_doctor_checks(&config);

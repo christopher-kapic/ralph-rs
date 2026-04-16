@@ -362,18 +362,23 @@ fn main() -> Result<()> {
             dry_run,
             skip_preflight,
             current_branch,
+            auto_stash,
             harness: run_harness,
             force,
         } => {
             let workdir = std::path::Path::new(&project);
             let harness_override = cli.harness.or(run_harness);
 
+            // The CLI flag is additive over the config default, so turning
+            // on `auto_stash: true` in config.json always works and
+            // `--auto-stash` flips it on for a single run.
             let options = RunOptions {
                 all_plans: all,
                 one,
                 from,
                 to,
                 current_branch,
+                auto_stash: auto_stash || _config.auto_stash,
                 harness_override,
                 dry_run,
             };
