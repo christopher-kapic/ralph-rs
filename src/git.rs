@@ -113,10 +113,8 @@ pub fn get_all_changed_files(workdir: &Path) -> Result<Vec<String>> {
 
 /// Return the unified diff of all current (unstaged + staged) changes.
 pub fn get_diff(workdir: &Path) -> Result<String> {
-    // Unstaged changes.
-    let unstaged = git(workdir, &["diff"]).unwrap_or_default();
-    // Staged changes.
-    let staged = git(workdir, &["diff", "--cached"]).unwrap_or_default();
+    let unstaged = git(workdir, &["diff"]).context("could not get unstaged diff")?;
+    let staged = git(workdir, &["diff", "--cached"]).context("could not get staged diff")?;
 
     let mut diff = String::new();
     if !unstaged.is_empty() {
@@ -356,6 +354,14 @@ mod tests {
         fs::write(dir.join("README.md"), "# changed").unwrap();
         let diff = get_diff(&dir).unwrap();
         assert!(diff.contains("changed"));
+    }
+
+    #[test]
+    fn test_get_diff_errors_when_not_a_repo() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        // Not a git repo — git diff should fail and propagate.
+        assert!(get_diff(&dir).is_err());
     }
 
     #[test]
