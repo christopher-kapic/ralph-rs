@@ -7,11 +7,6 @@ use std::path::PathBuf;
 
 use crate::config;
 
-/// Current schema version. Bump this and add a new migration function
-/// to `MIGRATIONS` whenever the schema changes.
-#[allow(dead_code)]
-const CURRENT_VERSION: u32 = 8;
-
 /// Each migration is a function that receives a connection (already inside a transaction).
 /// Migrations are 1-indexed: MIGRATIONS[0] migrates from version 0 → 1.
 const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
@@ -24,6 +19,11 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v7,
     migrate_v8,
 ];
+
+/// Current schema version — derived from the length of `MIGRATIONS` so that
+/// adding a migration automatically bumps the version.
+#[allow(dead_code)]
+const CURRENT_VERSION: u32 = MIGRATIONS.len() as u32;
 
 /// Returns the path to the SQLite database file.
 pub fn db_path() -> Result<PathBuf> {
