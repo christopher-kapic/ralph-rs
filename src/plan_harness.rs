@@ -690,6 +690,7 @@ mod tests {
             default_harness: "synth".to_string(),
             max_retries_per_step: 0,
             timeout_secs: 0,
+            hook_timeout_secs: 120,
             harnesses,
         }
     }

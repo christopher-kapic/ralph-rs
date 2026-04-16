@@ -511,6 +511,7 @@ mod tests {
             default_harness: "claude".to_string(),
             max_retries_per_step: 3,
             timeout_secs: 300,
+            hook_timeout_secs: 120,
             harnesses: HashMap::new(),
         };
         let checks = run_doctor_checks(&config);

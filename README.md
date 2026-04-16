@@ -168,6 +168,8 @@ ralph hooks import bundle.json
 
 Hooks can be `global` or path-scoped to specific project prefixes. When you run `ralph plan harness generate`, the plan agent is told which hooks are available and can attach them to steps it thinks deserve review.
 
+Each hook runs with a wall-clock budget controlled by `hook_timeout_secs` in `config.json` (default: 120; set to `0` to disable). A hook that exceeds the budget is killed and its step attempt is marked failed.
+
 For the full model (library layout, scope rules, sharing, worked examples for Claude Code / Codex / clippy), see [docs/review-hooks.md](docs/review-hooks.md).
 
 ## License

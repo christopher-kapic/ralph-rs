@@ -67,6 +67,12 @@ pub struct HarnessConfig {
     pub default_model: Option<String>,
 }
 
+/// Default timeout in seconds for a single lifecycle hook invocation.
+/// Applied when `Config::hook_timeout_secs` is missing from a user's config.
+fn default_hook_timeout_secs() -> u64 {
+    120
+}
+
 /// Top-level ralph-rs configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
@@ -76,6 +82,10 @@ pub struct Config {
     pub max_retries_per_step: u32,
     /// Timeout in seconds for a single harness invocation.
     pub timeout_secs: u64,
+    /// Timeout in seconds for a single lifecycle hook (pre/post-step,
+    /// pre/post-test). `0` disables the timeout. Defaults to 120.
+    #[serde(default = "default_hook_timeout_secs")]
+    pub hook_timeout_secs: u64,
     /// Available harness definitions keyed by name.
     pub harnesses: HashMap<String, HarnessConfig>,
 }
@@ -338,6 +348,7 @@ impl Default for Config {
             default_harness: "claude".to_string(),
             max_retries_per_step: 3,
             timeout_secs: 0,
+            hook_timeout_secs: default_hook_timeout_secs(),
             harnesses,
         }
     }

@@ -173,7 +173,7 @@ struct FailureOutput<'a> {
 
 /// Handle a terminal step failure: rollback changes, update the execution log,
 /// set step status, run post-step hook, and return the appropriate [`StepResult`].
-fn finalize_failure(
+async fn finalize_failure(
     ctx: &ExecCtx<'_>,
     exec_log_id: i64,
     duration_secs: f64,
@@ -235,7 +235,8 @@ fn finalize_failure(
         attempt,
         reason.hook_label(),
         ctx.workdir,
-    );
+    )
+    .await;
 
     Ok(StepResult {
         outcome: reason.to_outcome(),
@@ -397,7 +398,7 @@ pub async fn execute_step(
         let started_at = std::time::Instant::now();
 
         // Run pre-step hook.
-        if let Err(e) = hooks::run_pre_step(conn, hook_ctx, plan, step, attempt, workdir) {
+        if let Err(e) = hooks::run_pre_step(conn, hook_ctx, plan, step, attempt, workdir).await {
             eprintln!("Pre-step hook failed: {e}");
             // Treat as a failed attempt — skip harness execution.
             let test_result_strings = vec![format!("pre-step hook failed: {e}")];
@@ -419,7 +420,7 @@ pub async fn execute_step(
             )?;
             if attempt >= max_attempts {
                 storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
-                hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir);
+                hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir).await;
                 return Ok(StepResult {
                     outcome: StepOutcome::Failed,
                     step_id: step.id.clone(),
@@ -428,7 +429,7 @@ pub async fn execute_step(
                 });
             }
             prev_test_output = Some(format!("pre-step hook failed: {e}"));
-            hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir);
+            hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir).await;
             continue;
         }
 
@@ -475,7 +476,7 @@ pub async fn execute_step(
                 {
                     // Pre-test hook.
                     if let Err(e) =
-                        hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir)
+                        hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir).await
                     {
                         eprintln!("Pre-test hook failed: {e}");
                     }
@@ -503,7 +504,8 @@ pub async fn execute_step(
                         attempt,
                         test_results.all_passed,
                         workdir,
-                    );
+                    )
+                    .await;
 
                     (test_results.all_passed, strings, test_results.aborted)
                 } else if has_changes {
@@ -528,7 +530,8 @@ pub async fn execute_step(
                         attempt,
                         FailureReason::Aborted,
                         None,
-                    );
+                    )
+                    .await;
                 }
 
                 if test_passed && has_changes {
@@ -562,7 +565,8 @@ pub async fn execute_step(
                     // Mark step as complete.
                     storage::update_step_status(conn, &step.id, StepStatus::Complete)?;
 
-                    hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir);
+                    hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir)
+                        .await;
 
                     return Ok(StepResult {
                         outcome: StepOutcome::Success,
@@ -589,7 +593,8 @@ pub async fn execute_step(
                         attempt,
                         FailureReason::TestFailed,
                         Some(&fail_output),
-                    );
+                    )
+                    .await;
                 }
 
                 // Retry: rollback, log failure, stash context for next attempt.
@@ -651,7 +656,8 @@ pub async fn execute_step(
                     attempt,
                     FailureReason::Timeout,
                     Some(&fail_output),
-                );
+                )
+                .await;
             }
 
             WaitResult::Aborted => {
@@ -662,7 +668,8 @@ pub async fn execute_step(
                     attempt,
                     FailureReason::Aborted,
                     None,
-                );
+                )
+                .await;
             }
         }
     }
@@ -1147,6 +1154,7 @@ diff --git a/src/lib.rs b/src/lib.rs
         let hook_ctx = HookContext {
             applicable: vec![],
             project_dir: dir.clone(),
+            hook_timeout_secs: 120,
         };
 
         let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)

@@ -123,7 +123,7 @@ pub async fn run_plan(
     }
 
     // Load the hook library once for this run, filtered by project scope.
-    let hook_ctx = HookContext::load(workdir)?;
+    let hook_ctx = HookContext::load(workdir, config.hook_timeout_secs)?;
 
     // 4. Iterate through steps.
     let total = steps_to_run.len();
