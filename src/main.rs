@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     // write config.json before cmd_init runs — otherwise its "does the config
     // already exist?" check would always be true on a fresh install, silently
     // skipping the interactive harness prompt.
-    let _config = if matches!(&cli.command, Command::Init { .. }) {
+    let config = if matches!(&cli.command, Command::Init { .. }) {
         config::Config::default()
     } else {
         config::load_or_create_config()?
@@ -162,7 +162,7 @@ fn main() -> Result<()> {
                 }
                 PlanHarnessCommand::Show { plan } => {
                     let p = resolve_plan(&conn, plan, &project, true)?;
-                    commands::plan_harness_show(&conn, &p, &_config, &out)
+                    commands::plan_harness_show(&conn, &p, &config, &out)
                 }
                 PlanHarnessCommand::Generate {
                     description,
@@ -180,10 +180,10 @@ fn main() -> Result<()> {
                     };
                     let harness_name = use_harness
                         .or(cli.harness)
-                        .unwrap_or_else(|| _config.default_harness.clone());
+                        .unwrap_or_else(|| config.default_harness.clone());
                     let rt = tokio::runtime::Runtime::new()?;
                     let exit_code = rt.block_on(plan_harness::run_plan_harness(
-                        &_config,
+                        &config,
                         &harness_name,
                         &project,
                         description.as_deref(),
@@ -378,7 +378,7 @@ fn main() -> Result<()> {
                 from,
                 to,
                 current_branch,
-                auto_stash: auto_stash || _config.auto_stash,
+                auto_stash: auto_stash || config.auto_stash,
                 harness_override,
                 dry_run,
             };
@@ -420,7 +420,7 @@ fn main() -> Result<()> {
                     let mut any_errors = false;
                     for p in &runnable {
                         eprintln!("Running preflight checks for '{}'...", p.slug);
-                        let results = preflight::run_preflight_checks(p, &_config, workdir)?;
+                        let results = preflight::run_preflight_checks(p, &config, workdir)?;
                         results.print_report(&out);
                         if !results.is_ok() {
                             any_errors = true;
@@ -437,7 +437,7 @@ fn main() -> Result<()> {
                 let results = rt.block_on(async {
                     let abort_rx = signal::install_and_spawn();
                     runner::run_all_plans(
-                        &conn, &project, &_config, workdir, &options, abort_rx, &out,
+                        &conn, &project, &config, workdir, &options, abort_rx, &out,
                     )
                     .await
                 })?;
@@ -484,7 +484,7 @@ fn main() -> Result<()> {
             // Preflight checks
             if !skip_preflight && !dry_run {
                 eprintln!("Running preflight checks...");
-                let preflight_results = preflight::run_preflight_checks(&plan, &_config, workdir)?;
+                let preflight_results = preflight::run_preflight_checks(&plan, &config, workdir)?;
                 preflight_results.print_report(&out);
 
                 if !preflight_results.is_ok() {
@@ -495,7 +495,7 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             let result = rt.block_on(async {
                 let abort_rx = signal::install_and_spawn();
-                runner::run_plan(&conn, &plan, &_config, workdir, &options, abort_rx, &out).await
+                runner::run_plan(&conn, &plan, &config, workdir, &options, abort_rx, &out).await
             })?;
 
             if result.steps_failed > 0 {
@@ -533,7 +533,7 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             let result = rt.block_on(async {
                 let abort_rx = signal::install_and_spawn();
-                runner::resume_plan(&conn, &plan, &_config, project.as_ref(), abort_rx, &out).await
+                runner::resume_plan(&conn, &plan, &config, project.as_ref(), abort_rx, &out).await
             })?;
 
             if result.steps_failed > 0 {
@@ -660,7 +660,7 @@ fn main() -> Result<()> {
         },
 
         // -- Doctor --
-        Command::Doctor => commands::cmd_doctor(&_config, &out),
+        Command::Doctor => commands::cmd_doctor(&config, &out),
 
         // -- Completions --
         Command::Completions { shell } => {
