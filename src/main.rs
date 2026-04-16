@@ -46,12 +46,14 @@ fn resolve_plan(
     project: &str,
     include_complete: bool,
 ) -> Result<Plan> {
-    if let Some(s) = slug.filter(|s| !s.is_empty()) {
-        storage::get_plan_by_slug(conn, &s, project)?
-            .with_context(|| format!("Plan not found: {s}"))
-    } else {
-        storage::find_active_plan(conn, project, include_complete)?
-            .context("No active plan found. Specify a plan slug as a positional argument.")
+    match slug {
+        Some(s) if s.is_empty() => {
+            anyhow::bail!("Plan slug cannot be empty. Specify a non-empty slug or omit the argument to use the active plan.")
+        }
+        Some(s) => storage::get_plan_by_slug(conn, &s, project)?
+            .with_context(|| format!("Plan not found: {s}")),
+        None => storage::find_active_plan(conn, project, include_complete)?
+            .context("No active plan found. Specify a plan slug as a positional argument."),
     }
 }
 
@@ -667,5 +669,22 @@ fn main() -> Result<()> {
             clap_complete::generate(shell, &mut Cli::command(), "ralph", &mut std::io::stdout());
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_plan_rejects_empty_slug() {
+        let conn = db::open_memory().expect("open in-memory db");
+        let err = resolve_plan(&conn, Some(String::new()), "/tmp/proj", false)
+            .expect_err("empty slug must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("empty"),
+            "error should mention empty slug, got: {msg}"
+        );
     }
 }
