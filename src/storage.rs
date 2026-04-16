@@ -262,7 +262,7 @@ pub fn get_step_by_id(conn: &Connection, step_id: &str) -> Result<Option<Step>> 
     }
 }
 
-/// Update a step's status (and bump attempts if transitioning to in_progress).
+/// Update a step's status. Does not modify `attempts`; use [`set_step_attempts`] for that.
 pub fn update_step_status(conn: &Connection, step_id: &str, status: StepStatus) -> Result<()> {
     let affected = conn.execute(
         "UPDATE steps SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
