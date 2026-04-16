@@ -857,7 +857,10 @@ mod tests {
     fn test_log_entry_summary_truncated_respects_total_budget() {
         use crate::commands::LogOutputMode;
 
-        let big = (1..=100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let big = (1..=100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let log = ExecutionLog {
             id: 1,
             step_id: "s1".into(),

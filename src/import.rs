@@ -870,7 +870,10 @@ mod tests {
         };
 
         let result = import_plan_from_data(&conn, &data, &options);
-        assert!(result.is_err(), "import should fail on self-dependency cycle");
+        assert!(
+            result.is_err(),
+            "import should fail on self-dependency cycle"
+        );
 
         let plan = storage::get_plan_by_slug(&conn, "self-dep", "/tmp/rollback").unwrap();
         assert!(plan.is_none(), "plan should not exist after rollback");
@@ -943,13 +946,19 @@ mod tests {
     #[test]
     fn test_check_import_version_future_major_warns_not_strict() {
         // Bump major arbitrarily high; non-strict should warn and succeed.
-        let future = format!("{}.0.0", major_version(env!("CARGO_PKG_VERSION")).unwrap() + 42);
+        let future = format!(
+            "{}.0.0",
+            major_version(env!("CARGO_PKG_VERSION")).unwrap() + 42
+        );
         assert!(check_import_version(&future, false).is_ok());
     }
 
     #[test]
     fn test_check_import_version_future_major_errors_when_strict() {
-        let future = format!("{}.0.0", major_version(env!("CARGO_PKG_VERSION")).unwrap() + 42);
+        let future = format!(
+            "{}.0.0",
+            major_version(env!("CARGO_PKG_VERSION")).unwrap() + 42
+        );
         let err = check_import_version(&future, true).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("major"), "error should mention major: {msg}");

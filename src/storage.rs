@@ -462,7 +462,10 @@ pub fn get_next_pending_step(conn: &Connection, plan_id: &str) -> Result<Option<
          FROM steps WHERE plan_id = ?1 AND status = ?2 ORDER BY sort_key ASC LIMIT 1",
     )?;
 
-    let mut rows = stmt.query_map(params![plan_id, StepStatus::Pending.as_str()], Step::from_row)?;
+    let mut rows = stmt.query_map(
+        params![plan_id, StepStatus::Pending.as_str()],
+        Step::from_row,
+    )?;
     match rows.next() {
         Some(row) => Ok(Some(row?)),
         None => Ok(None),
@@ -1103,13 +1106,10 @@ mod tests {
         update_plan_status(&conn, &other.id, PlanStatus::InProgress).unwrap();
 
         // Only in_progress / ready / failed in "/proj" count as active.
-        let active_ids: std::collections::HashSet<String> = [
-            ready.id.clone(),
-            in_progress.id.clone(),
-            failed.id.clone(),
-        ]
-        .into_iter()
-        .collect();
+        let active_ids: std::collections::HashSet<String> =
+            [ready.id.clone(), in_progress.id.clone(), failed.id.clone()]
+                .into_iter()
+                .collect();
         let found = find_active_plan(&conn, "/proj", false).unwrap().unwrap();
         assert!(active_ids.contains(&found.id));
         assert_eq!(found.project, "/proj");
@@ -1313,8 +1313,18 @@ mod tests {
         // other rows untouched.
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (other, _) =
-            create_step(&conn, &plan.id, "Other", "desc", None, None, &[], None, None).unwrap();
+        let (other, _) = create_step(
+            &conn,
+            &plan.id,
+            "Other",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
         let other_before = get_step(&conn, &other.id).unwrap();
 
         let err = update_step_fields_ext(
@@ -1542,7 +1552,20 @@ mod tests {
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         let _ = update_execution_log(
-            &conn, log.id, None, None, &[], true, true, None, None, None, None, None, None, None,
+            &conn,
+            log.id,
+            None,
+            None,
+            &[],
+            true,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         );
     }
 
@@ -1837,8 +1860,7 @@ mod tests {
 
         attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "h1").unwrap();
 
-        let err =
-            attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "h1").unwrap_err();
+        let err = attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "h1").unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("already attached"), "unexpected error: {msg}");
 
@@ -1870,10 +1892,8 @@ mod tests {
     fn test_attach_hook_allows_distinct_combinations() {
         let conn = setup();
         let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
-        let (s1, _) =
-            create_step(&conn, &plan.id, "t1", "d", None, None, &[], None, None).unwrap();
-        let (s2, _) =
-            create_step(&conn, &plan.id, "t2", "d", None, None, &[], None, None).unwrap();
+        let (s1, _) = create_step(&conn, &plan.id, "t1", "d", None, None, &[], None, None).unwrap();
+        let (s2, _) = create_step(&conn, &plan.id, "t2", "d", None, None, &[], None, None).unwrap();
 
         // Same hook on different steps: OK.
         attach_hook_to_step(&conn, &plan.id, &s1.id, "pre-step", "h1").unwrap();

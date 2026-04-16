@@ -145,8 +145,7 @@ impl Config {
             return Err(anyhow!("config.default_harness must not be empty"));
         }
         if !self.harnesses.contains_key(&self.default_harness) {
-            let mut available: Vec<&str> =
-                self.harnesses.keys().map(String::as_str).collect();
+            let mut available: Vec<&str> = self.harnesses.keys().map(String::as_str).collect();
             available.sort_unstable();
             return Err(anyhow!(
                 "config.default_harness '{}' is not defined in harnesses (available: {})",
@@ -515,8 +514,8 @@ fn load_or_create_config_at(dir: &Path, path: &Path) -> Result<Config> {
 }
 
 fn read_and_validate(path: &Path) -> Result<Config> {
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
     let config: Config = serde_json::from_str(&contents)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
     config
@@ -572,11 +571,7 @@ mod tests {
         assert!(claude.args.contains(&"--permission-mode".to_string()));
         assert!(claude.args.contains(&"bypassPermissions".to_string()));
         assert!(claude.plan_args.contains(&"--permission-mode".to_string()));
-        assert!(
-            claude
-                .plan_args
-                .contains(&"bypassPermissions".to_string())
-        );
+        assert!(claude.plan_args.contains(&"bypassPermissions".to_string()));
         // Claude takes the agent file via --system-prompt-file, not via env.
         // `agent_file_env` is only read when supports_agent_file is false,
         // so setting it on claude would be dead config.
@@ -824,7 +819,9 @@ mod tests {
     fn test_validate_rejects_missing_default_harness() {
         let mut config = Config::default();
         config.default_harness = "nope".to_string();
-        let err = config.validate().expect_err("validate must reject missing harness");
+        let err = config
+            .validate()
+            .expect_err("validate must reject missing harness");
         let msg = format!("{err}");
         assert!(
             msg.contains("nope"),

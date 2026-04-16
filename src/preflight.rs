@@ -243,7 +243,10 @@ fn run_auth_probe(harness_name: &str, harness_config: &HarnessConfig) -> CheckRe
             message: format!(
                 "{harness_name}: auth probe `{}` exited with {}",
                 harness_config.command,
-                status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".to_string())
             ),
         },
         Err(e) => CheckResult {

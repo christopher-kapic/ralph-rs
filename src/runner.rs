@@ -481,7 +481,10 @@ pub async fn run_all_plans(
     let mut dependents_of: HashMap<String, Vec<String>> = HashMap::new();
     for (pid, deps) in &deps_of {
         for d in deps {
-            dependents_of.entry(d.clone()).or_default().push(pid.clone());
+            dependents_of
+                .entry(d.clone())
+                .or_default()
+                .push(pid.clone());
         }
     }
 
@@ -562,8 +565,7 @@ pub async fn run_all_plans(
             for other_sha in &branch_plan.merge_shas {
                 let workdir_owned = workdir.to_path_buf();
                 let sha = other_sha.clone();
-                let merge_result =
-                    blocking_git(move || git::merge_sha(&workdir_owned, &sha)).await;
+                let merge_result = blocking_git(move || git::merge_sha(&workdir_owned, &sha)).await;
                 if let Err(e) = merge_result {
                     // Try to find a human-readable slug for the conflicting SHA.
                     let other_slug = tip_sha_map
@@ -685,10 +687,7 @@ fn transitive_dependents(
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = dependents_of
-        .get(root_id)
-        .cloned()
-        .unwrap_or_default();
+    let mut stack: Vec<String> = dependents_of.get(root_id).cloned().unwrap_or_default();
     while let Some(node) = stack.pop() {
         if !seen.insert(node.clone()) {
             continue;
@@ -790,7 +789,10 @@ pub fn skip_step(
 
     storage::mark_step_skipped(conn, &step.id, reason)?;
     match reason {
-        Some(r) => eprintln!("Skipped step {} '{}' (reason: {})", actual_num, step.title, r),
+        Some(r) => eprintln!(
+            "Skipped step {} '{}' (reason: {})",
+            actual_num, step.title, r
+        ),
         None => eprintln!("Skipped step {} '{}'", actual_num, step.title),
     }
 
@@ -807,10 +809,9 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
         // Aborted is runnable: `resume_plan` routes through `run_plan`, and
         // the old rejection (with a "use resume to continue" hint) made
         // resume error out on exactly the plans it was meant to handle.
-        PlanStatus::Ready
-        | PlanStatus::InProgress
-        | PlanStatus::Failed
-        | PlanStatus::Aborted => Ok(()),
+        PlanStatus::Ready | PlanStatus::InProgress | PlanStatus::Failed | PlanStatus::Aborted => {
+            Ok(())
+        }
         PlanStatus::Planning => bail!(
             "Plan '{}' is still in planning status. Run `plan approve {}` first.",
             plan.slug,
@@ -861,8 +862,7 @@ async fn setup_branch(
     // `--auto-stash` or `config.auto_stash`.
     {
         let workdir_owned = workdir.to_path_buf();
-        let dirty =
-            blocking_git(move || git::has_uncommitted_changes(&workdir_owned)).await?;
+        let dirty = blocking_git(move || git::has_uncommitted_changes(&workdir_owned)).await?;
         if dirty {
             let workdir_owned = workdir.to_path_buf();
             let files = blocking_git(move || git::get_all_changed_files(&workdir_owned)).await?;

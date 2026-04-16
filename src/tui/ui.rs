@@ -132,9 +132,7 @@ fn draw_step_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Attempt counter
-    let max_retries = step
-        .max_retries
-        .unwrap_or(app.default_max_retries as i32);
+    let max_retries = step.max_retries.unwrap_or(app.default_max_retries as i32);
     let max_attempts = max_retries + 1;
     lines.push(Line::from(vec![
         Span::styled("Attempts: ", Style::default().add_modifier(Modifier::BOLD)),

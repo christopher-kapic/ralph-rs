@@ -233,10 +233,7 @@ mod tests {
         let collisions = vec!["a".to_string()];
         let result = finalize_import(0, &collisions, false);
         let err = result.expect_err("all-collided import should error");
-        assert!(
-            err.to_string().contains("No hooks imported"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("No hooks imported"), "got: {err}");
     }
 
     #[test]

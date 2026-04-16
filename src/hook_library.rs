@@ -358,12 +358,9 @@ pub fn serialize_hook(hook: &Hook) -> String {
 /// contains anything that would confuse a YAML parser, and escapes control
 /// characters (`\n`, `\r`, `\t`) so the value fits on a single line.
 fn yaml_escape(s: &str) -> String {
-    let needs_quoting = s.chars().any(|c| {
-        matches!(
-            c,
-            ':' | '#' | '\n' | '\r' | '\t' | '"' | '\'' | '\\'
-        )
-    });
+    let needs_quoting = s
+        .chars()
+        .any(|c| matches!(c, ':' | '#' | '\n' | '\r' | '\t' | '"' | '\'' | '\\'));
     if !needs_quoting {
         return s.to_string();
     }

@@ -10,14 +10,7 @@ use crate::config;
 /// Each migration is a function that receives a connection (already inside a transaction).
 /// Migrations are 1-indexed: MIGRATIONS[0] migrates from version 0 → 1.
 const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
-    migrate_v1,
-    migrate_v2,
-    migrate_v3,
-    migrate_v4,
-    migrate_v5,
-    migrate_v6,
-    migrate_v7,
-    migrate_v8,
+    migrate_v1, migrate_v2, migrate_v3, migrate_v4, migrate_v5, migrate_v6, migrate_v7, migrate_v8,
     migrate_v9,
 ];
 

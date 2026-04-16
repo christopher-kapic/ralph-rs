@@ -342,10 +342,7 @@ mod tests {
         // A second call is a no-op because the cleanup was taken.
         ran.store(false, Ordering::SeqCst);
         run_exit_cleanup();
-        assert!(
-            !ran.load(Ordering::SeqCst),
-            "cleanup should not run twice"
-        );
+        assert!(!ran.load(Ordering::SeqCst), "cleanup should not run twice");
     }
 
     #[test]

@@ -24,7 +24,10 @@ impl fmt::Display for FracIndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FracIndexError::NoKeyBetween { a, b } => {
-                write!(f, "cannot find fractional index key between {a:?} and {b:?}")
+                write!(
+                    f,
+                    "cannot find fractional index key between {a:?} and {b:?}"
+                )
             }
             FracIndexError::InvalidChar(c) => {
                 write!(f, "invalid fractional index character: {c:?}")

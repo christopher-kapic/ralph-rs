@@ -20,9 +20,9 @@ mod runner;
 mod signal;
 mod storage;
 mod test_runner;
-mod validate;
 #[allow(dead_code)]
 mod tui;
+mod validate;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -48,7 +48,9 @@ fn resolve_plan(
 ) -> Result<Plan> {
     match slug {
         Some(s) if s.is_empty() => {
-            anyhow::bail!("Plan slug cannot be empty. Specify a non-empty slug or omit the argument to use the active plan.")
+            anyhow::bail!(
+                "Plan slug cannot be empty. Specify a non-empty slug or omit the argument to use the active plan."
+            )
         }
         Some(s) => storage::get_plan_by_slug(conn, &s, project)?
             .with_context(|| format!("Plan not found: {s}")),
@@ -533,13 +535,8 @@ fn main() -> Result<()> {
 
             // Acquire the same per-project run lock that `ralph run` uses, so
             // resume can't race a concurrent run or skip.
-            let _run_lock = run_lock::acquire(
-                &conn,
-                &project,
-                Some(&plan.slug),
-                Some(&plan.id),
-                force,
-            )?;
+            let _run_lock =
+                run_lock::acquire(&conn, &project, Some(&plan.slug), Some(&plan.id), force)?;
 
             let rt = tokio::runtime::Runtime::new()?;
             let result = rt.block_on(async {
@@ -572,13 +569,8 @@ fn main() -> Result<()> {
 
             // Acquire the same per-project run lock that `ralph run` uses, so
             // skip can't race a concurrent run or resume.
-            let _run_lock = run_lock::acquire(
-                &conn,
-                &project,
-                Some(&plan.slug),
-                Some(&plan.id),
-                force,
-            )?;
+            let _run_lock =
+                run_lock::acquire(&conn, &project, Some(&plan.slug), Some(&plan.id), force)?;
 
             runner::skip_step(&conn, &plan, step_num, reason.as_deref())?;
             Ok(())

@@ -358,10 +358,7 @@ pub async fn run_post_test(
 
 /// Apply the post-lifecycle policy: fatal failures propagate, the rest log
 /// a kind-specific warning and return `Ok`.
-fn handle_post_lifecycle(
-    which: Lifecycle,
-    result: Result<(), HookFailure>,
-) -> Result<()> {
+fn handle_post_lifecycle(which: Lifecycle, result: Result<(), HookFailure>) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
         Err(e) if e.is_fatal() => Err(anyhow!(e)),
@@ -802,8 +799,7 @@ mod tests {
             .expect_err("DB errors must escalate, not be warned about");
         let msg = format!("{err:#}");
         assert!(
-            msg.to_lowercase().contains("database")
-                || msg.to_lowercase().contains("hook bindings"),
+            msg.to_lowercase().contains("database") || msg.to_lowercase().contains("hook bindings"),
             "error should name the DB problem: {msg}"
         );
     }
@@ -826,8 +822,7 @@ mod tests {
             .expect_err("DB errors must escalate, not be warned about");
         let msg = format!("{err:#}");
         assert!(
-            msg.to_lowercase().contains("database")
-                || msg.to_lowercase().contains("hook bindings"),
+            msg.to_lowercase().contains("database") || msg.to_lowercase().contains("hook bindings"),
             "error should name the DB problem: {msg}"
         );
     }

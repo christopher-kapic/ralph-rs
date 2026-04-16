@@ -330,8 +330,7 @@ pub async fn execute_step(
         // that StepResult reports and the abort has a visible audit trail.
         if *abort_rx.borrow() {
             set_step_attempts(conn, &step.id, attempt)?;
-            let exec_log =
-                storage::create_execution_log(conn, &step.id, attempt, None, None)?;
+            let exec_log = storage::create_execution_log(conn, &step.id, attempt, None, None)?;
             storage::update_execution_log(
                 conn,
                 exec_log.id,
@@ -468,50 +467,49 @@ pub async fn execute_step(
                 };
 
                 // Run tests if there are changes and tests are defined.
-                let (test_passed, test_result_strings, test_aborted) = if has_changes
-                    && !plan.deterministic_tests.is_empty()
-                {
-                    // Pre-test hook.
-                    if let Err(e) =
-                        hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir).await
-                    {
-                        eprintln!("Pre-test hook failed: {e}");
-                    }
+                let (test_passed, test_result_strings, test_aborted) =
+                    if has_changes && !plan.deterministic_tests.is_empty() {
+                        // Pre-test hook.
+                        if let Err(e) =
+                            hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir).await
+                        {
+                            eprintln!("Pre-test hook failed: {e}");
+                        }
 
-                    let test_results = test_runner::run_tests(
-                        &plan.deterministic_tests,
-                        workdir,
-                        abort_rx.clone(),
-                    )
-                    .await;
-                    let strings: Vec<String> = test_results
-                        .results
-                        .iter()
-                        .map(|r| {
-                            format!("{}: {}", r.command, if r.passed { "pass" } else { "FAIL" })
-                        })
-                        .collect();
+                        let test_results = test_runner::run_tests(
+                            &plan.deterministic_tests,
+                            workdir,
+                            abort_rx.clone(),
+                        )
+                        .await;
+                        let strings: Vec<String> = test_results
+                            .results
+                            .iter()
+                            .map(|r| {
+                                format!("{}: {}", r.command, if r.passed { "pass" } else { "FAIL" })
+                            })
+                            .collect();
 
-                    // Post-test hook.
-                    hooks::run_post_test(
-                        conn,
-                        hook_ctx,
-                        plan,
-                        step,
-                        attempt,
-                        test_results.all_passed,
-                        workdir,
-                    )
-                    .await?;
+                        // Post-test hook.
+                        hooks::run_post_test(
+                            conn,
+                            hook_ctx,
+                            plan,
+                            step,
+                            attempt,
+                            test_results.all_passed,
+                            workdir,
+                        )
+                        .await?;
 
-                    (test_results.all_passed, strings, test_results.aborted)
-                } else if has_changes {
-                    // No tests defined: treat as passing.
-                    (true, Vec::new(), false)
-                } else {
-                    // No changes at all: harness produced nothing useful.
-                    (false, vec!["no changes detected".to_string()], false)
-                };
+                        (test_results.all_passed, strings, test_results.aborted)
+                    } else if has_changes {
+                        // No tests defined: treat as passing.
+                        (true, Vec::new(), false)
+                    } else {
+                        // No changes at all: harness produced nothing useful.
+                        (false, vec!["no changes detected".to_string()], false)
+                    };
 
                 // If Ctrl+C landed mid-test, the test runner will have killed
                 // its child; surface this as Aborted rather than a retry-worthy
@@ -898,10 +896,7 @@ fn build_prior_step_summaries(
         // they have nothing to report yet.
         if matches!(
             s.status,
-            StepStatus::Complete
-                | StepStatus::Skipped
-                | StepStatus::Failed
-                | StepStatus::Aborted
+            StepStatus::Complete | StepStatus::Skipped | StepStatus::Failed | StepStatus::Aborted
         ) {
             // Try to get changed files from the latest execution log.
             let files_changed = if let Ok(Some(log)) = storage::get_latest_log_for_step(conn, &s.id)
@@ -1096,8 +1091,14 @@ new file mode 100644
         assert_eq!(FailureReason::NoChanges.hook_label(), "no_changes");
 
         assert_eq!(FailureReason::Aborted.to_step_status(), StepStatus::Aborted);
-        assert_eq!(FailureReason::NoChanges.to_step_status(), StepStatus::Failed);
-        assert_eq!(FailureReason::TestFailed.to_step_status(), StepStatus::Failed);
+        assert_eq!(
+            FailureReason::NoChanges.to_step_status(),
+            StepStatus::Failed
+        );
+        assert_eq!(
+            FailureReason::TestFailed.to_step_status(),
+            StepStatus::Failed
+        );
 
         assert_eq!(FailureReason::NoChanges.to_outcome(), StepOutcome::Failed);
         assert_eq!(FailureReason::TestFailed.to_outcome(), StepOutcome::Failed);
@@ -1251,10 +1252,9 @@ new file mode 100644
             &[],
         )
         .unwrap();
-        let (step, _) = storage::create_step(
-            &conn, &plan.id, "Step", "desc", None, None, &[], None, None,
-        )
-        .unwrap();
+        let (step, _) =
+            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None)
+                .unwrap();
         assert_eq!(step.attempts, 0);
 
         let (tx, rx) = watch::channel(false);

@@ -966,7 +966,10 @@ mod tests {
     #[test]
     fn test_parse_run_one_and_all_conflict() {
         let result = Cli::try_parse_from(["ralph-rs", "run", "--one", "--all"]);
-        assert!(result.is_err(), "clap must reject --one combined with --all");
+        assert!(
+            result.is_err(),
+            "clap must reject --one combined with --all"
+        );
     }
 
     #[test]
@@ -1314,7 +1317,12 @@ mod tests {
         // level makes both fields mirror the final `--harness` value, which is
         // why the parse check below sees the same string in both places.
         let cli = Cli::try_parse_from([
-            "ralph-rs", "--harness", "codex", "run", "--harness", "claude",
+            "ralph-rs",
+            "--harness",
+            "codex",
+            "run",
+            "--harness",
+            "claude",
         ])
         .unwrap();
         if let Command::Run {

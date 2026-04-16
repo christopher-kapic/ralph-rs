@@ -393,11 +393,7 @@ mod tests {
         // Regression: `ralph plan harness generate <desc> my-plan` used to
         // discard the slug. The prompt must now name the target plan so the
         // harness updates it instead of touching the active plan.
-        let prompt = build_initial_prompt(
-            "/tmp/project",
-            Some("Wire up the API"),
-            Some("my-plan"),
-        );
+        let prompt = build_initial_prompt("/tmp/project", Some("Wire up the API"), Some("my-plan"));
         assert!(prompt.contains("/tmp/project"));
         assert!(prompt.contains("Wire up the API"));
         assert!(prompt.contains("'my-plan'"));
@@ -670,13 +666,8 @@ mod tests {
         // available ones, not a process abort.
         let config = Config::default();
         let agent_content = test_agent_content();
-        let result = build_plan_harness_args(
-            "does-not-exist",
-            &config,
-            None,
-            &agent_content,
-            "Plan",
-        );
+        let result =
+            build_plan_harness_args("does-not-exist", &config, None, &agent_content, "Plan");
         let err = result.expect_err("expected Err for unknown harness");
         let msg = format!("{err:#}");
         assert!(

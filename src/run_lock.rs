@@ -127,9 +127,7 @@ pub fn acquire(
         let conn = match release_conn_for_signal.lock() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(
-                    "warning: run lock release connection poisoned during forced exit: {e}"
-                );
+                eprintln!("warning: run lock release connection poisoned during forced exit: {e}");
                 return;
             }
         };
@@ -316,7 +314,11 @@ fn process_start_token(pid: i64) -> Option<String> {
         }
         let s = String::from_utf8(output.stdout).ok()?;
         let s = s.trim();
-        if s.is_empty() { None } else { Some(s.to_string()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
     }
     #[cfg(not(unix))]
     {
