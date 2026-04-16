@@ -614,7 +614,10 @@ pub async fn resume_plan(
 
     // Reset the failed/in-progress step to pending.
     let step = &steps[resume_idx];
-    if step.status == StepStatus::Failed || step.status == StepStatus::InProgress {
+    if step.status == StepStatus::Failed
+        || step.status == StepStatus::InProgress
+        || step.status == StepStatus::Aborted
+    {
         storage::reset_step(conn, &step.id)?;
     }
 
@@ -1146,6 +1149,38 @@ mod tests {
         steps[1].status = StepStatus::Complete;
         let result = find_resume_point(&steps);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resume_resets_aborted_step_to_pending() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) =
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        let (s2, _) =
+            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None)
+                .unwrap();
+        storage::update_step_status(&conn, &s2.id, StepStatus::Aborted).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let resume_idx = find_resume_point(&steps).unwrap();
+        assert_eq!(resume_idx, 1);
+
+        let step = &steps[resume_idx];
+        assert_eq!(step.status, StepStatus::Aborted);
+
+        // Replicate the reset condition from resume_plan
+        if step.status == StepStatus::Failed
+            || step.status == StepStatus::InProgress
+            || step.status == StepStatus::Aborted
+        {
+            storage::reset_step(&conn, &step.id).unwrap();
+        }
+
+        let refreshed = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(refreshed[resume_idx].status, StepStatus::Pending);
     }
 
     // -- find_current_step tests --
