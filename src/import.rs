@@ -96,8 +96,32 @@ pub fn import_plan_from_data(
     let branch = options.branch.unwrap_or(&data.plan.branch_name);
     let harness = options.harness.or(data.plan.harness.as_deref());
 
-    // Create the plan with status defaulting to "planning" from DB,
-    // then immediately update to "ready".
+    conn.execute_batch("BEGIN;")
+        .context("Failed to begin import transaction")?;
+
+    let result = import_plan_inner(conn, data, slug, branch, harness, options);
+
+    match &result {
+        Ok(_) => {
+            conn.execute_batch("COMMIT;")
+                .context("Failed to commit import transaction")?;
+        }
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
+    }
+
+    result
+}
+
+fn import_plan_inner(
+    conn: &Connection,
+    data: &ImportedPlan,
+    slug: &str,
+    branch: &str,
+    harness: Option<&str>,
+    options: &ImportOptions<'_>,
+) -> Result<String> {
     let plan = storage::create_plan(
         conn,
         slug,
@@ -110,17 +134,12 @@ pub fn import_plan_from_data(
     )
     .with_context(|| format!("Failed to create imported plan '{slug}'"))?;
 
-    // Set plan status to ready
     storage::update_plan_status(conn, &plan.id, crate::plan::PlanStatus::Ready)?;
 
-    // Set plan-generation harness if present in the import data and not
-    // already set by a CLI override (harness override in ImportOptions
-    // sets the execution-time harness, not plan_harness).
     if data.plan.plan_harness.is_some() {
         storage::set_plan_harness_gen(conn, &plan.id, data.plan.plan_harness.as_deref())?;
     }
 
-    // Create all steps in order (pending, 0 attempts by default from DB schema)
     for step_data in &data.steps {
         storage::create_step(
             conn,
@@ -135,10 +154,6 @@ pub fn import_plan_from_data(
         )?;
     }
 
-    // Attach any plan dependencies declared in the export. Plans that
-    // can't be resolved (e.g. the user imported plans in the wrong order)
-    // are warned about on stderr but do not fail the import. Cycle errors
-    // from the storage layer still propagate.
     for dep_slug in &data.plan.depends_on {
         match storage::get_plan_by_slug(conn, dep_slug, options.project)? {
             Some(dep) => {
@@ -760,6 +775,44 @@ mod tests {
         // No dependency edge should have been created.
         let deps = storage::list_plan_dependencies(&conn, &plan_id).unwrap();
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_import_rolls_back_on_failure() {
+        let conn = setup();
+
+        // Import a plan whose depends_on includes its own slug. The plan
+        // and steps will be created inside the transaction, then
+        // add_plan_dependency will bail on the self-cycle, triggering a
+        // rollback. Afterward, no plan or steps should remain.
+        let json = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {
+                "slug": "self-dep",
+                "branch_name": "branch",
+                "description": "will fail",
+                "depends_on": ["self-dep"]
+            },
+            "steps": [
+                {"title": "Step A", "description": "a"},
+                {"title": "Step B", "description": "b"}
+            ]
+        }"#;
+
+        let data: ImportedPlan = serde_json::from_str(json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/rollback",
+        };
+
+        let result = import_plan_from_data(&conn, &data, &options);
+        assert!(result.is_err(), "import should fail on self-dependency cycle");
+
+        let plan = storage::get_plan_by_slug(&conn, "self-dep", "/tmp/rollback").unwrap();
+        assert!(plan.is_none(), "plan should not exist after rollback");
     }
 
     #[test]
