@@ -147,8 +147,8 @@ pub fn get_untracked_files(workdir: &Path) -> Result<Vec<String>> {
 pub fn stage_except(workdir: &Path, exclude: &[String]) -> Result<()> {
     git(workdir, &["add", "-A"]).context("git add -A failed")?;
     for file in exclude {
-        // Unstage the file. Ignore errors (file may not have been staged).
-        let _ = git(workdir, &["reset", "HEAD", "--", file]);
+        git(workdir, &["reset", "HEAD", "--", file])
+            .with_context(|| format!("git reset HEAD -- '{file}' failed"))?;
     }
     Ok(())
 }
@@ -455,6 +455,40 @@ mod tests {
         remove_untracked_except(&dir, &preserve, &untracked).unwrap();
         assert!(dir.join("keep.txt").exists());
         assert!(!dir.join("drop.txt").exists());
+    }
+
+    #[test]
+    fn test_stage_except_unstages_excluded_files() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("keep.txt"), "k").unwrap();
+        fs::write(dir.join("drop.txt"), "d").unwrap();
+
+        stage_except(&dir, &["drop.txt".to_string()]).unwrap();
+
+        // keep.txt should be staged; drop.txt should remain untracked.
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(status.contains("A  keep.txt"));
+        assert!(status.contains("?? drop.txt"));
+    }
+
+    #[test]
+    fn test_stage_except_tolerates_unstaged_file_in_exclude_list() {
+        // `git reset HEAD -- <path>` is a no-op (exit 0) for paths that are
+        // not currently staged, so excluding a file that was never staged
+        // must not produce an error.
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("file.txt"), "data").unwrap();
+        stage_except(&dir, &["never_staged.txt".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn test_stage_except_propagates_reset_errors() {
+        // When the underlying `git reset` fails (e.g. not a git repo), the
+        // error must surface rather than being swallowed.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let result = stage_except(&dir, &["file.txt".to_string()]);
+        assert!(result.is_err());
     }
 
     #[test]
