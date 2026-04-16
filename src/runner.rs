@@ -4,7 +4,7 @@
 // steps in sort_key order, executing each via the single-step executor, and
 // managing plan-level status transitions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
@@ -469,9 +469,23 @@ pub async fn run_all_plans(
         deps_of.insert(pid.clone(), storage::list_plan_dependencies(conn, pid)?);
     }
 
+    // Reverse adjacency: for each plan, which plans directly depend on it
+    // (within the in-scope set). Used to block transitive dependents when
+    // an upstream plan ends incomplete.
+    let mut dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+    for (pid, deps) in &deps_of {
+        for d in deps {
+            dependents_of.entry(d.clone()).or_default().push(pid.clone());
+        }
+    }
+
     // 5. Iterate through plans in topo order.
     let mut tip_sha_map: HashMap<String, String> = HashMap::new();
     let mut results: Vec<PlanRunResult> = Vec::new();
+    // Plans whose upstream deps ended incomplete — skip them but continue.
+    let mut blocked: HashSet<String> = HashSet::new();
+    // Slugs of plans that ended with an incomplete (InProgress) final status.
+    let mut incomplete_slugs: Vec<String> = Vec::new();
     let total = topo_order.len();
 
     for (i, plan_id) in topo_order.iter().enumerate() {
@@ -484,6 +498,18 @@ pub async fn run_all_plans(
         let plan = plan_by_id
             .get(plan_id)
             .with_context(|| format!("internal: missing plan {plan_id}"))?;
+
+        // If an upstream dep of this plan ended incomplete, skip it —
+        // its branch can't be set up from an incomplete parent tip.
+        if blocked.contains(plan_id) {
+            eprintln!(
+                "=== Plan {}/{}: {} (skipped — upstream dependency ended incomplete) ===",
+                i + 1,
+                total,
+                plan.slug
+            );
+            continue;
+        }
 
         let branch_plan = compute_branch_plan(
             &topo_order,
@@ -596,13 +622,71 @@ pub async fn run_all_plans(
                 return Ok(results);
             }
             _ => {
-                // InProgress or other — treat as "stopped cleanly but incomplete".
-                return Ok(results);
+                // InProgress — plan stopped cleanly but incomplete. Block
+                // its transitive dependents (their branches would root on an
+                // incomplete tip) but keep iterating so independent plans
+                // still run.
+                incomplete_slugs.push(plan.slug.clone());
+                let newly_blocked = transitive_dependents(plan_id, &dependents_of);
+                if newly_blocked.is_empty() {
+                    eprintln!(
+                        "Plan '{}' ended incomplete; continuing with independent plans.",
+                        plan.slug
+                    );
+                } else {
+                    let blocked_slugs: Vec<String> = newly_blocked
+                        .iter()
+                        .filter_map(|id| plan_by_id.get(id).map(|p| p.slug.clone()))
+                        .collect();
+                    eprintln!(
+                        "Plan '{}' ended incomplete; skipping {} dependent plan(s): {}",
+                        plan.slug,
+                        blocked_slugs.len(),
+                        blocked_slugs.join(", ")
+                    );
+                    blocked.extend(newly_blocked);
+                }
             }
         }
     }
 
+    if !incomplete_slugs.is_empty() {
+        eprintln!(
+            "Warning: {} plan(s) ended incomplete: {}",
+            incomplete_slugs.len(),
+            incomplete_slugs.join(", ")
+        );
+    }
+
     Ok(results)
+}
+
+/// Collect every plan that transitively depends on `root_id` within the given
+/// reverse-adjacency graph. Returns plan IDs (excluding `root_id`).
+fn transitive_dependents(
+    root_id: &str,
+    dependents_of: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = dependents_of
+        .get(root_id)
+        .cloned()
+        .unwrap_or_default();
+    while let Some(node) = stack.pop() {
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        if let Some(next) = dependents_of.get(&node) {
+            for n in next {
+                if !seen.contains(n) {
+                    stack.push(n.clone());
+                }
+            }
+        }
+        out.push(node);
+    }
+    out
 }
 
 /// Resume a plan from the last failed or in-progress step.
@@ -1660,6 +1744,70 @@ mod tests {
             .unwrap();
 
         assert!(results.is_empty());
+    }
+
+    // -- transitive_dependents (L9 helper) --
+
+    #[test]
+    fn test_transitive_dependents_no_edges() {
+        // With no edges, no plan is blocked by any other. This is the core
+        // of the L9 fix: when B ends incomplete and C is independent, C must
+        // not be blocked.
+        let dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+        let blocked = transitive_dependents("B", &dependents_of);
+        assert!(blocked.is_empty());
+    }
+
+    #[test]
+    fn test_transitive_dependents_direct_dependent() {
+        // C depends on B → B's incomplete run blocks C.
+        let mut dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+        dependents_of.insert("B".to_string(), vec!["C".to_string()]);
+        let blocked = transitive_dependents("B", &dependents_of);
+        assert_eq!(blocked, vec!["C".to_string()]);
+    }
+
+    #[test]
+    fn test_transitive_dependents_transitive_chain() {
+        // B -> C -> D: incomplete B blocks both C and D.
+        let mut dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+        dependents_of.insert("B".to_string(), vec!["C".to_string()]);
+        dependents_of.insert("C".to_string(), vec!["D".to_string()]);
+        let mut blocked = transitive_dependents("B", &dependents_of);
+        blocked.sort();
+        assert_eq!(blocked, vec!["C".to_string(), "D".to_string()]);
+    }
+
+    #[test]
+    fn test_transitive_dependents_diamond_no_duplicates() {
+        // B -> {C, D}; both C and D -> E. E appears once, not twice.
+        let mut dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+        dependents_of.insert("B".to_string(), vec!["C".to_string(), "D".to_string()]);
+        dependents_of.insert("C".to_string(), vec!["E".to_string()]);
+        dependents_of.insert("D".to_string(), vec!["E".to_string()]);
+        let mut blocked = transitive_dependents("B", &dependents_of);
+        blocked.sort();
+        assert_eq!(
+            blocked,
+            vec!["C".to_string(), "D".to_string(), "E".to_string()]
+        );
+    }
+
+    /// Acceptance test for L9: with [A Ready, B, C Ready] where C is
+    /// independent of B, an incomplete run of B must not block C. The
+    /// helper encodes that decision.
+    #[test]
+    fn test_transitive_dependents_independent_plans_not_blocked() {
+        // Graph: A, B, C all in scope, no edges between any of them.
+        let dependents_of: HashMap<String, Vec<String>> = HashMap::new();
+        // B ends incomplete → nothing is blocked.
+        let blocked_by_b = transitive_dependents("B", &dependents_of);
+        assert!(blocked_by_b.is_empty());
+        // Sanity: A and C aren't in a blocked set, so run_all_plans' blocked
+        // check `contains(plan_id)` returns false for them and they run.
+        let blocked_set: HashSet<String> = blocked_by_b.into_iter().collect();
+        assert!(!blocked_set.contains("A"));
+        assert!(!blocked_set.contains("C"));
     }
 
     // -- setup_branch with parent_sha --
