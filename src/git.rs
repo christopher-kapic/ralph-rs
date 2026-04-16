@@ -167,15 +167,34 @@ pub fn rollback_except(workdir: &Path, preserve: &[String]) -> Result<()> {
     // Restore tracked files.
     git(workdir, &["checkout", "--", "."]).context("git checkout -- . failed")?;
 
-    // Get current untracked files and remove only those not in preserve list.
     let untracked = get_untracked_files(workdir)?;
-    for file in &untracked {
-        if !preserve.contains(file) {
-            let path = workdir.join(file);
-            if path.is_dir() {
-                let _ = std::fs::remove_dir_all(&path);
-            } else {
-                let _ = std::fs::remove_file(&path);
+    remove_untracked_except(workdir, preserve, &untracked)
+}
+
+/// Remove each path in `untracked` from `workdir` unless it appears in `preserve`.
+///
+/// Tolerates `NotFound` errors: a file may disappear between listing and
+/// deletion (concurrent process, symlink chain, etc.). Other I/O errors are
+/// propagated with context.
+fn remove_untracked_except(
+    workdir: &Path,
+    preserve: &[String],
+    untracked: &[String],
+) -> Result<()> {
+    for file in untracked {
+        if preserve.contains(file) {
+            continue;
+        }
+        let path = workdir.join(file);
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        if let Err(err) = result {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err)
+                    .with_context(|| format!("failed to remove untracked path '{file}'"));
             }
         }
     }
@@ -412,6 +431,30 @@ mod tests {
         // Both files should now be present.
         assert!(dir.join("a.txt").exists());
         assert!(dir.join("b.txt").exists());
+    }
+
+    #[test]
+    fn test_remove_untracked_except_tolerates_missing() {
+        let (_tmp, dir) = init_repo();
+        // "exists.txt" is on disk; "gone.txt" is only in the list (simulating
+        // a file that disappeared between listing and deletion).
+        fs::write(dir.join("exists.txt"), "data").unwrap();
+        let untracked = vec!["exists.txt".to_string(), "gone.txt".to_string()];
+        remove_untracked_except(&dir, &[], &untracked).unwrap();
+        assert!(!dir.join("exists.txt").exists());
+        assert!(!dir.join("gone.txt").exists());
+    }
+
+    #[test]
+    fn test_remove_untracked_except_preserves_list() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("keep.txt"), "k").unwrap();
+        fs::write(dir.join("drop.txt"), "d").unwrap();
+        let untracked = vec!["keep.txt".to_string(), "drop.txt".to_string()];
+        let preserve = vec!["keep.txt".to_string()];
+        remove_untracked_except(&dir, &preserve, &untracked).unwrap();
+        assert!(dir.join("keep.txt").exists());
+        assert!(!dir.join("drop.txt").exists());
     }
 
     #[test]
