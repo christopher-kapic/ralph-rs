@@ -580,7 +580,12 @@ fn main() -> Result<()> {
         }
 
         // -- Import --
-        Command::Import { file, slug, branch } => {
+        Command::Import {
+            file,
+            slug,
+            branch,
+            strict,
+        } => {
             let h = cli.harness.as_deref();
             import::import_plan(
                 &conn,
@@ -589,6 +594,7 @@ fn main() -> Result<()> {
                 slug.as_deref(),
                 branch.as_deref(),
                 h,
+                strict,
             )
         }
 

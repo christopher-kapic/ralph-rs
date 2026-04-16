@@ -1,11 +1,52 @@
 // Plan import: deserialize portable JSON and create new plan + steps
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rusqlite::Connection;
 use serde::Deserialize;
 use std::path::Path;
 
 use crate::storage;
+
+/// Parse the leading numeric segment of a version string as the major version.
+///
+/// Returns `None` for empty or non-numeric leading segments.
+fn major_version(v: &str) -> Option<u64> {
+    v.split('.').next()?.parse().ok()
+}
+
+/// Compare the export's ralph-rs version against the running binary's version.
+///
+/// When the majors differ, emit a warning (non-strict) or return an error
+/// (strict). When the exporter version is missing or unparseable, warn and
+/// proceed regardless of strict.
+fn check_import_version(exported_version: &str, strict: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let current_major = major_version(current);
+    let exported_major = major_version(exported_version);
+
+    match (current_major, exported_major) {
+        (Some(c), Some(e)) if c != e => {
+            let msg = format!(
+                "export was produced by ralph-rs {exported_version} (major {e}), \
+                 but this binary is {current} (major {c}); schema may be incompatible"
+            );
+            if strict {
+                Err(anyhow!("{msg}"))
+            } else {
+                eprintln!("warning: {msg}");
+                Ok(())
+            }
+        }
+        (Some(_), None) => {
+            eprintln!(
+                "warning: export's ralph_rs_version '{exported_version}' is unparseable; \
+                 proceeding without version compatibility check"
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Import JSON schema (mirrors export but uses Deserialize)
@@ -14,8 +55,8 @@ use crate::storage;
 /// Top-level imported plan structure.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImportedPlan {
-    /// ralph-rs version that produced this export (informational).
-    #[allow(dead_code)]
+    /// ralph-rs version that produced this export. Checked against the
+    /// running binary's major version on import (see [`check_import_version`]).
     pub ralph_rs_version: String,
     /// When the export was created (informational).
     #[allow(dead_code)]
@@ -72,6 +113,9 @@ pub struct ImportOptions<'a> {
     pub harness: Option<&'a str>,
     /// The project directory to bind the imported plan to.
     pub project: &'a str,
+    /// When true, major-version mismatch in `ralph_rs_version` is a hard
+    /// error; when false, it only warns.
+    pub strict: bool,
 }
 
 /// Read and parse a portable plan JSON file.
@@ -92,6 +136,8 @@ pub fn import_plan_from_data(
     data: &ImportedPlan,
     options: &ImportOptions<'_>,
 ) -> Result<String> {
+    check_import_version(&data.ralph_rs_version, options.strict)?;
+
     let slug = options.slug.unwrap_or(&data.plan.slug);
     let branch = options.branch.unwrap_or(&data.plan.branch_name);
     let harness = options.harness.or(data.plan.harness.as_deref());
@@ -179,6 +225,7 @@ pub fn import_plan(
     slug: Option<&str>,
     branch: Option<&str>,
     harness: Option<&str>,
+    strict: bool,
 ) -> Result<()> {
     let data = read_plan_file(file)?;
 
@@ -187,6 +234,7 @@ pub fn import_plan(
         branch,
         harness,
         project,
+        strict,
     };
 
     let effective_slug = slug.unwrap_or(&data.plan.slug);
@@ -258,6 +306,7 @@ mod tests {
             branch: None,
             harness: None,
             project: "/tmp/proj",
+            strict: false,
         };
 
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
@@ -316,6 +365,7 @@ mod tests {
             branch: None,
             harness: None,
             project: "/tmp/proj",
+            strict: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -352,6 +402,7 @@ mod tests {
             branch: Some("new-branch"),
             harness: None,
             project: "/tmp/proj",
+            strict: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -384,6 +435,7 @@ mod tests {
             branch: None,
             harness: Some("codex"),
             project: "/tmp/proj",
+            strict: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -415,6 +467,7 @@ mod tests {
             branch: None,
             harness: None,
             project: "/home/user/my-project",
+            strict: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -451,6 +504,7 @@ mod tests {
             branch: None,
             harness: None,
             project: "/tmp/proj",
+            strict: false,
         };
         let id1 = import_plan_from_data(&conn, &data, &options1).unwrap();
 
@@ -459,6 +513,7 @@ mod tests {
             branch: None,
             harness: None,
             project: "/tmp/proj",
+            strict: false,
         };
         let id2 = import_plan_from_data(&conn, &data, &options2).unwrap();
 
@@ -495,6 +550,7 @@ mod tests {
             branch: None,
             harness: None,
             project: "/tmp/proj",
+            strict: false,
         };
 
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
@@ -568,6 +624,7 @@ mod tests {
             branch: None,
             harness: None,
             project: "/tmp/imported",
+            strict: false,
         };
 
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
@@ -643,7 +700,7 @@ mod tests {
         let file_path = dir.path().join("plan.json");
         std::fs::write(&file_path, json).unwrap();
 
-        import_plan(&conn, &file_path, "/tmp/proj", None, None, None).unwrap();
+        import_plan(&conn, &file_path, "/tmp/proj", None, None, None, false).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "file-import", "/tmp/proj")
             .unwrap()
@@ -663,6 +720,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(result.is_err());
     }
@@ -736,6 +794,7 @@ mod tests {
             branch: None,
             harness: None,
             project: "/tmp/dst",
+            strict: false,
         };
         let b2_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
 
@@ -767,6 +826,7 @@ mod tests {
             branch: None,
             harness: None,
             project: "/tmp/proj",
+            strict: false,
         };
 
         // Import should succeed despite the missing dependency.
@@ -806,6 +866,7 @@ mod tests {
             branch: None,
             harness: None,
             project: "/tmp/rollback",
+            strict: false,
         };
 
         let result = import_plan_from_data(&conn, &data, &options);
@@ -839,6 +900,7 @@ mod tests {
             branch: None,
             harness: None,
             project: "/tmp/proj",
+            strict: false,
         };
 
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
@@ -857,5 +919,138 @@ mod tests {
         assert!(steps[0].harness.is_none());
         assert!(steps[0].acceptance_criteria.is_empty());
         assert!(steps[0].max_retries.is_none());
+    }
+
+    #[test]
+    fn test_major_version_helper() {
+        assert_eq!(major_version("0.1.10"), Some(0));
+        assert_eq!(major_version("1.2.3"), Some(1));
+        assert_eq!(major_version("42"), Some(42));
+        assert_eq!(major_version(""), None);
+        assert_eq!(major_version("not-a-version"), None);
+        assert_eq!(major_version("1.x"), Some(1));
+    }
+
+    #[test]
+    fn test_check_import_version_same_major_ok() {
+        // Current binary is the pkg version; feed the same major.
+        let current = env!("CARGO_PKG_VERSION");
+        let same_major = major_version(current).unwrap().to_string() + ".999.999";
+        assert!(check_import_version(&same_major, false).is_ok());
+        assert!(check_import_version(&same_major, true).is_ok());
+    }
+
+    #[test]
+    fn test_check_import_version_future_major_warns_not_strict() {
+        // Bump major arbitrarily high; non-strict should warn and succeed.
+        let future = format!("{}.0.0", major_version(env!("CARGO_PKG_VERSION")).unwrap() + 42);
+        assert!(check_import_version(&future, false).is_ok());
+    }
+
+    #[test]
+    fn test_check_import_version_future_major_errors_when_strict() {
+        let future = format!("{}.0.0", major_version(env!("CARGO_PKG_VERSION")).unwrap() + 42);
+        let err = check_import_version(&future, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("major"), "error should mention major: {msg}");
+    }
+
+    #[test]
+    fn test_import_with_future_major_version_succeeds_non_strict() {
+        let conn = setup();
+        // Construct JSON with a far-future major version.
+        let future_major = major_version(env!("CARGO_PKG_VERSION")).unwrap() + 42;
+        let json = format!(
+            r#"{{
+                "ralph_rs_version": "{future_major}.0.0",
+                "exported_at": "2025-01-01T00:00:00Z",
+                "plan": {{
+                    "slug": "future-ver",
+                    "branch_name": "branch",
+                    "description": "desc"
+                }},
+                "steps": []
+            }}"#
+        );
+
+        let data: ImportedPlan = serde_json::from_str(&json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj",
+            strict: false,
+        };
+
+        // Non-strict: should succeed (with a warning printed to stderr).
+        let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "future-ver", "/tmp/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.id, plan_id);
+    }
+
+    #[test]
+    fn test_import_with_future_major_version_errors_strict() {
+        let conn = setup();
+        let future_major = major_version(env!("CARGO_PKG_VERSION")).unwrap() + 42;
+        let json = format!(
+            r#"{{
+                "ralph_rs_version": "{future_major}.0.0",
+                "exported_at": "2025-01-01T00:00:00Z",
+                "plan": {{
+                    "slug": "future-ver-strict",
+                    "branch_name": "branch",
+                    "description": "desc"
+                }},
+                "steps": [
+                    {{"title": "Step", "description": "d"}}
+                ]
+            }}"#
+        );
+
+        let data: ImportedPlan = serde_json::from_str(&json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj",
+            strict: true,
+        };
+
+        let result = import_plan_from_data(&conn, &data, &options);
+        assert!(result.is_err(), "strict import should reject future major");
+
+        // Plan should not have been created.
+        let plan = storage::get_plan_by_slug(&conn, "future-ver-strict", "/tmp/proj").unwrap();
+        assert!(plan.is_none());
+    }
+
+    #[test]
+    fn test_import_with_unparseable_version_proceeds() {
+        let conn = setup();
+        let json = r#"{
+            "ralph_rs_version": "unreleased",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {
+                "slug": "unparseable-ver",
+                "branch_name": "branch",
+                "description": "desc"
+            },
+            "steps": []
+        }"#;
+
+        let data: ImportedPlan = serde_json::from_str(json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj",
+            strict: true,
+        };
+
+        // Even in strict mode, an unparseable version only warns; the
+        // import proceeds because there's nothing concrete to compare.
+        assert!(import_plan_from_data(&conn, &data, &options).is_ok());
     }
 }

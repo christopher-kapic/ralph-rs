@@ -170,6 +170,11 @@ pub enum Command {
         /// Override the branch name on import.
         #[arg(long)]
         branch: Option<String>,
+
+        /// Fail when the export's ralph-rs major version is incompatible
+        /// (default is to warn and continue).
+        #[arg(long)]
+        strict: bool,
     },
 
     /// Show the status of the current or specified plan.
