@@ -10,12 +10,18 @@ use crate::config;
 /// Current schema version. Bump this and add a new migration function
 /// to `MIGRATIONS` whenever the schema changes.
 #[allow(dead_code)]
-const CURRENT_VERSION: u32 = 6;
+const CURRENT_VERSION: u32 = 7;
 
 /// Each migration is a function that receives a connection (already inside a transaction).
 /// Migrations are 1-indexed: MIGRATIONS[0] migrates from version 0 → 1.
 const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
-    migrate_v1, migrate_v2, migrate_v3, migrate_v4, migrate_v5, migrate_v6,
+    migrate_v1,
+    migrate_v2,
+    migrate_v3,
+    migrate_v4,
+    migrate_v5,
+    migrate_v6,
+    migrate_v7,
 ];
 
 /// Returns the path to the SQLite database file.
@@ -253,6 +259,31 @@ fn migrate_v6(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         ALTER TABLE steps ADD COLUMN model TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V7: dedupe step_hooks and enforce uniqueness
+// ---------------------------------------------------------------------------
+
+fn migrate_v7(conn: &Connection) -> Result<()> {
+    // SQLite treats NULLs as distinct in UNIQUE indexes, but plan-wide hooks
+    // use step_id IS NULL and must also be unique per (plan_id, lifecycle,
+    // hook_name). COALESCE(step_id, '') folds NULL into a sentinel for the
+    // index so both per-step and plan-wide rows share a single rule.
+    conn.execute_batch(
+        "
+        DELETE FROM step_hooks
+        WHERE id NOT IN (
+            SELECT MIN(id)
+            FROM step_hooks
+            GROUP BY plan_id, COALESCE(step_id, ''), lifecycle, hook_name
+        );
+
+        CREATE UNIQUE INDEX idx_step_hooks_unique
+            ON step_hooks(plan_id, COALESCE(step_id, ''), lifecycle, hook_name);
         ",
     )?;
     Ok(())
@@ -535,6 +566,119 @@ mod tests {
                 .expect("query");
             assert_eq!(slug, "slug");
         }
+    }
+
+    #[test]
+    fn test_step_hooks_unique_index_enforced() {
+        let conn = open_memory().expect("open_memory");
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["p1", "s1", "pre-step", "h"],
+        )
+        .unwrap();
+
+        // Duplicate per-step attachment is rejected at the DB level.
+        let dup_step = conn.execute(
+            "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["p1", "s1", "pre-step", "h"],
+        );
+        assert!(dup_step.is_err());
+
+        // Plan-wide (step_id NULL) must also be unique per (plan, lifecycle, name).
+        conn.execute(
+            "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, NULL, ?2, ?3)",
+            rusqlite::params!["p1", "post-step", "h"],
+        )
+        .unwrap();
+        let dup_plan = conn.execute(
+            "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, NULL, ?2, ?3)",
+            rusqlite::params!["p1", "post-step", "h"],
+        );
+        assert!(dup_plan.is_err());
+    }
+
+    #[test]
+    fn test_migrate_v7_dedupes_existing_rows() {
+        // Simulate an old database at version 6 with duplicate step_hooks rows,
+        // then finish the migration to v7 and confirm dedup + uniqueness.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..v6 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(6) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+
+        // Three duplicate per-step rows + two duplicate plan-wide rows.
+        for _ in 0..3 {
+            conn.execute(
+                "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params!["p1", "s1", "pre-step", "h"],
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            conn.execute(
+                "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, NULL, ?2, ?3)",
+                rusqlite::params!["p1", "post-step", "h"],
+            )
+            .unwrap();
+        }
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM step_hooks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 5);
+
+        drop(conn);
+
+        // Re-open — v7 now applies and should dedupe before creating the index.
+        let conn = open_at(&path).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM step_hooks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 2, "duplicates should have been collapsed");
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-inserting a duplicate is now rejected.
+        let err = conn.execute(
+            "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["p1", "s1", "pre-step", "h"],
+        );
+        assert!(err.is_err());
     }
 
     #[test]

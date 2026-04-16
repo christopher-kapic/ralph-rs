@@ -812,6 +812,16 @@ pub struct StepHookRow {
     pub hook_name: String,
 }
 
+/// Returns true if `err` is a SQLite UNIQUE constraint violation.
+fn is_unique_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if e.code == rusqlite::ErrorCode::ConstraintViolation
+                && e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+    )
+}
+
 /// Attach a hook to a specific step at a lifecycle event.
 pub fn attach_hook_to_step(
     conn: &Connection,
@@ -824,8 +834,16 @@ pub fn attach_hook_to_step(
         "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, ?2, ?3, ?4)",
         params![plan_id, step_id, lifecycle, hook_name],
     )
-    .with_context(|| {
-        format!("Failed to attach hook '{hook_name}' to step {step_id} at {lifecycle}")
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            anyhow::anyhow!(
+                "hook '{hook_name}' is already attached to step {step_id} at {lifecycle}"
+            )
+        } else {
+            anyhow::Error::new(e).context(format!(
+                "Failed to attach hook '{hook_name}' to step {step_id} at {lifecycle}"
+            ))
+        }
     })?;
     Ok(())
 }
@@ -841,8 +859,16 @@ pub fn attach_hook_to_plan(
         "INSERT INTO step_hooks (plan_id, step_id, lifecycle, hook_name) VALUES (?1, NULL, ?2, ?3)",
         params![plan_id, lifecycle, hook_name],
     )
-    .with_context(|| {
-        format!("Failed to attach plan-wide hook '{hook_name}' to plan {plan_id} at {lifecycle}")
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            anyhow::anyhow!(
+                "hook '{hook_name}' is already attached to plan {plan_id} at {lifecycle}"
+            )
+        } else {
+            anyhow::Error::new(e).context(format!(
+                "Failed to attach plan-wide hook '{hook_name}' to plan {plan_id} at {lifecycle}"
+            ))
+        }
     })?;
     Ok(())
 }
@@ -1548,6 +1574,71 @@ mod tests {
         for id in &ids {
             assert!(msg.contains(id), "missing plan id in error: {msg}");
         }
+    }
+
+    // -- step_hooks uniqueness tests --
+
+    #[test]
+    fn test_attach_hook_to_step_rejects_duplicate() {
+        let conn = setup();
+        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "t", "d", None, None, &[], None, None).unwrap();
+
+        attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "h1").unwrap();
+
+        let err =
+            attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "h1").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already attached"), "unexpected error: {msg}");
+
+        // Only one row exists.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM step_hooks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_attach_hook_to_plan_rejects_duplicate() {
+        let conn = setup();
+        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        attach_hook_to_plan(&conn, &plan.id, "post-step", "h1").unwrap();
+
+        let err = attach_hook_to_plan(&conn, &plan.id, "post-step", "h1").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("already attached"), "unexpected error: {msg}");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM step_hooks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_attach_hook_allows_distinct_combinations() {
+        let conn = setup();
+        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) =
+            create_step(&conn, &plan.id, "t1", "d", None, None, &[], None, None).unwrap();
+        let (s2, _) =
+            create_step(&conn, &plan.id, "t2", "d", None, None, &[], None, None).unwrap();
+
+        // Same hook on different steps: OK.
+        attach_hook_to_step(&conn, &plan.id, &s1.id, "pre-step", "h1").unwrap();
+        attach_hook_to_step(&conn, &plan.id, &s2.id, "pre-step", "h1").unwrap();
+        // Same hook on same step but different lifecycle: OK.
+        attach_hook_to_step(&conn, &plan.id, &s1.id, "post-step", "h1").unwrap();
+        // Different hook name on same step/lifecycle: OK.
+        attach_hook_to_step(&conn, &plan.id, &s1.id, "pre-step", "h2").unwrap();
+        // Plan-wide alongside per-step with the same lifecycle/name: OK.
+        attach_hook_to_plan(&conn, &plan.id, "pre-step", "h1").unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM step_hooks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 5);
     }
 
     #[test]
