@@ -181,33 +181,72 @@ pub fn cmd_hooks_import(file: &Path, force: bool, _out: &OutputContext) -> Resul
     }
 
     let mut imported = 0usize;
-    let mut skipped = 0usize;
+    let mut collisions: Vec<String> = Vec::new();
 
     for hook in &bundle.hooks {
-        // Check for collisions first (default: error).
         let existed = hook_library::try_load(&hook.name)?.is_some();
         if existed && !force {
-            eprintln!(
-                "Error: hook '{}' already exists. Re-run with --force to overwrite.",
-                hook.name
-            );
-            skipped += 1;
+            collisions.push(hook.name.clone());
             continue;
         }
         hook_library::save(hook, true)?;
         imported += 1;
     }
 
-    eprintln!(
-        "Imported {imported} hook(s), skipped {skipped}.{}",
-        if skipped > 0 && !force {
-            " Use --force to overwrite existing hooks."
-        } else {
-            ""
-        }
-    );
+    finalize_import(imported, &collisions, force)
+}
+
+fn finalize_import(imported: usize, collisions: &[String], force: bool) -> Result<()> {
+    let skipped = collisions.len();
+    if skipped > 0 {
+        eprintln!(
+            "Skipped {skipped} hook(s) due to collisions: {}",
+            collisions.join(", ")
+        );
+    }
+    eprintln!("Imported {imported} hook(s), skipped {skipped}.");
+    if imported == 0 && skipped > 0 {
+        bail!("No hooks imported; all {skipped} collided. Use --force to overwrite.");
+    }
     if skipped > 0 && !force {
-        bail!("{skipped} hook(s) skipped due to collisions");
+        eprintln!("Re-run with --force to overwrite existing hooks.");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finalize_import;
+
+    #[test]
+    fn partial_success_returns_ok_and_reports_collisions() {
+        let collisions = vec!["a".to_string(), "b".to_string()];
+        let result = finalize_import(3, &collisions, false);
+        assert!(
+            result.is_ok(),
+            "partial import should exit 0; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn all_collided_returns_err() {
+        let collisions = vec!["a".to_string()];
+        let result = finalize_import(0, &collisions, false);
+        let err = result.expect_err("all-collided import should error");
+        assert!(
+            err.to_string().contains("No hooks imported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn clean_import_returns_ok() {
+        assert!(finalize_import(2, &[], false).is_ok());
+    }
+
+    #[test]
+    fn force_with_overwrites_returns_ok() {
+        let collisions: Vec<String> = Vec::new();
+        assert!(finalize_import(2, &collisions, true).is_ok());
+    }
 }
