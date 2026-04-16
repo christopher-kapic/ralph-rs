@@ -44,8 +44,19 @@ pub fn open() -> Result<Connection> {
 /// Opens a database at the given path and runs migrations.
 /// Useful for testing with a custom path.
 fn open_at<P: AsRef<std::path::Path>>(path: P) -> Result<Connection> {
-    let conn = Connection::open(path.as_ref())
-        .with_context(|| format!("Failed to open database at {}", path.as_ref().display()))?;
+    let path = path.as_ref();
+    let conn = Connection::open(path)
+        .with_context(|| format!("Failed to open database at {}", path.display()))?;
+
+    // Restrict to owner-only on Unix — the DB holds session ids, harness
+    // output, diffs, and cost data that shouldn't be world-readable. Windows
+    // relies on the user-profile directory ACL (per `dirs` crate guidance).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to chmod database at {}", path.display()))?;
+    }
 
     // Enable foreign keys — must happen outside any transaction and on every connection.
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -696,6 +707,29 @@ mod tests {
             rusqlite::params!["p1", "s1", "pre-step", "h"],
         );
         assert!(err.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_db_file_is_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("perms.db");
+        {
+            let _conn = open_at(&path).expect("open_at");
+        }
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "DB should be 0600, got {mode:o}");
+
+        // Re-opening an existing DB must keep (or re-apply) the restrictive mode.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+        {
+            let _conn = open_at(&path).expect("re-open_at");
+        }
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "re-open should restore 0600, got {mode:o}");
     }
 
     #[test]
