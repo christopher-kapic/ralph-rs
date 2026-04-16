@@ -103,6 +103,13 @@ fn handle_add_mode(app: &mut App, key: KeyEvent) -> InputAction {
             InputAction::None
         }
 
+        // Ctrl+C quits even in add mode
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.cancel_input();
+            app.request_quit();
+            InputAction::Quit
+        }
+
         // Character input
         KeyCode::Char(c) => {
             app.input_buffer.push(c);
@@ -297,6 +304,22 @@ mod tests {
 
         let action = handle_key(&mut app, key(KeyCode::Esc));
         assert_eq!(action, InputAction::None);
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_add_mode_ctrl_c_quits() {
+        let mut app = make_app(3);
+        app.enter_add_mode();
+        app.input_buffer = "partial".to_string();
+
+        let action = handle_key(
+            &mut app,
+            key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(action, InputAction::Quit);
+        assert!(app.should_quit);
         assert!(matches!(app.input_mode, InputMode::Normal));
         assert!(app.input_buffer.is_empty());
     }
