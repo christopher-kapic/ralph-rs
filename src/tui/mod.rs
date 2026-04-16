@@ -333,12 +333,12 @@ mod tests {
 
     #[test]
     fn test_status_indicator() {
-        assert_eq!(App::status_indicator(StepStatus::Complete), "  ");
-        assert_eq!(App::status_indicator(StepStatus::InProgress), "  ");
-        assert_eq!(App::status_indicator(StepStatus::Pending), "  ");
-        assert_eq!(App::status_indicator(StepStatus::Failed), "  ");
-        assert_eq!(App::status_indicator(StepStatus::Skipped), "  ");
-        assert_eq!(App::status_indicator(StepStatus::Aborted), "  ");
+        assert_eq!(App::status_indicator(StepStatus::Pending), "○");
+        assert_eq!(App::status_indicator(StepStatus::InProgress), "▶");
+        assert_eq!(App::status_indicator(StepStatus::Complete), "✔");
+        assert_eq!(App::status_indicator(StepStatus::Failed), "✘");
+        assert_eq!(App::status_indicator(StepStatus::Skipped), "⊘");
+        assert_eq!(App::status_indicator(StepStatus::Aborted), "⊘");
     }
 
     #[test]

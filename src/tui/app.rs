@@ -185,12 +185,12 @@ impl App {
     /// Return a status indicator string for a step status.
     pub fn status_indicator(status: StepStatus) -> &'static str {
         match status {
-            StepStatus::Complete => "  ",
-            StepStatus::InProgress => "  ",
-            StepStatus::Pending => "  ",
-            StepStatus::Failed => "  ",
-            StepStatus::Skipped => "  ",
-            StepStatus::Aborted => "  ",
+            StepStatus::Pending => "○",
+            StepStatus::InProgress => "▶",
+            StepStatus::Complete => "✔",
+            StepStatus::Failed => "✘",
+            StepStatus::Skipped => "⊘",
+            StepStatus::Aborted => "⊘",
         }
     }
 }
