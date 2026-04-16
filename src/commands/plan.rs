@@ -196,6 +196,27 @@ pub fn plan_dependency_list(
     Ok(())
 }
 
+/// Decide whether a plan with the given status should appear in the listing,
+/// given the `--status` and `--archived` flags.
+///
+/// - Neither flag: hide archived plans.
+/// - `--status X` only: keep plans whose status is exactly X.
+/// - `--archived` only: keep all plans.
+/// - Both: keep plans whose status is X or Archived. When X itself is
+///   Archived, `--archived` is implied and the rule collapses to `Archived`.
+fn plan_list_matches(
+    plan_status: PlanStatus,
+    status_filter: Option<PlanStatus>,
+    show_archived: bool,
+) -> bool {
+    match (status_filter, show_archived) {
+        (Some(target), true) => plan_status == target || plan_status == PlanStatus::Archived,
+        (Some(target), false) => plan_status == target,
+        (None, true) => true,
+        (None, false) => plan_status != PlanStatus::Archived,
+    }
+}
+
 pub fn plan_list(
     conn: &Connection,
     project: &str,
@@ -205,18 +226,10 @@ pub fn plan_list(
     out: &OutputContext,
 ) -> Result<()> {
     let plans = storage::list_plans(conn, project, all)?;
-
-    // Filter by status if provided, otherwise hide archived unless --archived
-    let plans: Vec<_> = if let Some(target) = status {
-        plans.into_iter().filter(|p| p.status == target).collect()
-    } else if !show_archived {
-        plans
-            .into_iter()
-            .filter(|p| p.status != PlanStatus::Archived)
-            .collect()
-    } else {
-        plans
-    };
+    let plans: Vec<_> = plans
+        .into_iter()
+        .filter(|p| plan_list_matches(p.status, status, show_archived))
+        .collect();
 
     if out.format == OutputFormat::Json {
         let summaries: Vec<output::PlanSummary> =
@@ -540,4 +553,76 @@ pub fn plan_harness_show(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_list_matches_default_hides_archived() {
+        assert!(plan_list_matches(PlanStatus::Ready, None, false));
+        assert!(plan_list_matches(PlanStatus::Complete, None, false));
+        assert!(!plan_list_matches(PlanStatus::Archived, None, false));
+    }
+
+    #[test]
+    fn plan_list_matches_archived_flag_includes_all() {
+        assert!(plan_list_matches(PlanStatus::Ready, None, true));
+        assert!(plan_list_matches(PlanStatus::Archived, None, true));
+    }
+
+    #[test]
+    fn plan_list_matches_status_only_filters_to_exact_status() {
+        assert!(plan_list_matches(
+            PlanStatus::Complete,
+            Some(PlanStatus::Complete),
+            false
+        ));
+        assert!(!plan_list_matches(
+            PlanStatus::Ready,
+            Some(PlanStatus::Complete),
+            false
+        ));
+        assert!(!plan_list_matches(
+            PlanStatus::Archived,
+            Some(PlanStatus::Complete),
+            false
+        ));
+    }
+
+    #[test]
+    fn plan_list_matches_archived_and_status_includes_both() {
+        // --archived --status complete: archived plans and complete plans appear.
+        assert!(plan_list_matches(
+            PlanStatus::Complete,
+            Some(PlanStatus::Complete),
+            true
+        ));
+        assert!(plan_list_matches(
+            PlanStatus::Archived,
+            Some(PlanStatus::Complete),
+            true
+        ));
+        // Unrelated statuses still excluded.
+        assert!(!plan_list_matches(
+            PlanStatus::Ready,
+            Some(PlanStatus::Complete),
+            true
+        ));
+    }
+
+    #[test]
+    fn plan_list_matches_status_archived_with_flag_is_implied() {
+        assert!(plan_list_matches(
+            PlanStatus::Archived,
+            Some(PlanStatus::Archived),
+            true
+        ));
+        assert!(!plan_list_matches(
+            PlanStatus::Complete,
+            Some(PlanStatus::Archived),
+            true
+        ));
+    }
 }
