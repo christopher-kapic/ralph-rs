@@ -173,8 +173,13 @@ fn build_plan_harness_args(
     agent_file_path: Option<&Path>,
     agent_content: &str,
     prompt: &str,
-) -> Vec<String> {
-    let harness_config = &config.harnesses[harness_name];
+) -> Result<Vec<String>> {
+    let harness_config = config.harnesses.get(harness_name).with_context(|| {
+        format!(
+            "Unknown harness '{harness_name}'. Available: {:?}",
+            config.harnesses.keys().collect::<Vec<_>>()
+        )
+    })?;
 
     // Goose-style harnesses load the system prompt from an env var that
     // fully replaces the default, so inlining the agent content into the
@@ -199,7 +204,7 @@ fn build_plan_harness_args(
             args.push(path.to_string_lossy().to_string());
         }
         args.push(effective_prompt);
-        return args;
+        return Ok(args);
     }
 
     // Template path: substitute {prompt} and {agent_file} in place using
@@ -230,7 +235,7 @@ fn build_plan_harness_args(
         *arg = arg.replace("{prompt}", &effective_prompt);
     }
 
-    args
+    Ok(args)
 }
 
 /// Build environment variables for the plan-harness session.
@@ -238,8 +243,13 @@ fn build_plan_harness_env(
     harness_name: &str,
     config: &Config,
     agent_file_path: Option<&Path>,
-) -> Vec<(String, String)> {
-    let harness_config = &config.harnesses[harness_name];
+) -> Result<Vec<(String, String)>> {
+    let harness_config = config.harnesses.get(harness_name).with_context(|| {
+        format!(
+            "Unknown harness '{harness_name}'. Available: {:?}",
+            config.harnesses.keys().collect::<Vec<_>>()
+        )
+    })?;
     let mut env_vars = Vec::new();
 
     // Goose uses an env var for the system prompt file
@@ -250,7 +260,7 @@ fn build_plan_harness_env(
         env_vars.push((env_name.clone(), path.to_string_lossy().to_string()));
     }
 
-    env_vars
+    Ok(env_vars)
 }
 
 /// Run the interactive plan-harness: spawn a harness with the plan agent definition
@@ -293,8 +303,8 @@ pub async fn run_plan_harness(
         Some(agent_file_path),
         &agent_content,
         &prompt,
-    );
-    let env_vars = build_plan_harness_env(harness_name, config, Some(agent_file_path));
+    )?;
+    let env_vars = build_plan_harness_env(harness_name, config, Some(agent_file_path))?;
 
     // Spawn the harness interactively
     let cwd = std::path::Path::new(project);
@@ -417,7 +427,8 @@ mod tests {
             Some(agent_file.path()),
             &agent_content,
             "Create a plan",
-        );
+        )
+        .unwrap();
 
         // Claude should get --system-prompt-file and the prompt as separate args
         assert!(args.contains(&"--system-prompt-file".to_string()));
@@ -452,7 +463,8 @@ mod tests {
             None,
             &agent_content,
             prompt_with_placeholder,
-        );
+        )
+        .unwrap();
         // Claude's plan_args include `--permission-mode bypassPermissions`
         // which must survive unconditionally — and the prompt itself must
         // appear verbatim with its literal `{agent_file}` intact.
@@ -492,7 +504,8 @@ mod tests {
             Some(agent_file.path()),
             &agent_content,
             "Plan this",
-        );
+        )
+        .unwrap();
 
         assert!(
             args.contains(&"-i".to_string()),
@@ -528,7 +541,8 @@ mod tests {
             Some(agent_file.path()),
             &agent_content,
             "Plan",
-        );
+        )
+        .unwrap();
         assert_eq!(claude_args[0], "--system-prompt-file");
         assert_eq!(claude_args[1], agent_file.path().to_string_lossy());
         assert_eq!(claude_args[2], "Plan");
@@ -540,7 +554,8 @@ mod tests {
             Some(agent_file.path()),
             &agent_content,
             "Plan",
-        );
+        )
+        .unwrap();
         assert_eq!(codex_args.len(), 1);
         assert!(codex_args[0].contains("ralph Plan Agent"));
         assert!(codex_args[0].contains("Plan"));
@@ -557,7 +572,8 @@ mod tests {
             Some(agent_file.path()),
             &agent_content,
             "Create a plan",
-        );
+        )
+        .unwrap();
 
         // Codex doesn't support agent files, so agent content should be prepended
         assert!(!args.iter().any(|a| a == "--system-prompt-file"));
@@ -576,7 +592,8 @@ mod tests {
             Some(agent_file.path()),
             &agent_content,
             "Help me plan",
-        );
+        )
+        .unwrap();
 
         assert!(!args.iter().any(|a| a == "--system-prompt-file"));
         assert!(args.iter().any(|a| a.contains("ralph Plan Agent")));
@@ -599,7 +616,8 @@ mod tests {
             Some(agent_file.path()),
             &agent_content,
             "Help me plan",
-        );
+        )
+        .unwrap();
 
         assert!(
             args.iter().any(|a| a.contains("Help me plan")),
@@ -618,7 +636,7 @@ mod tests {
         // as that env var to the subprocess.
         let config = Config::default();
         let agent_file = write_agent_temp_file(&test_agent_content()).unwrap();
-        let env = build_plan_harness_env("goose", &config, Some(agent_file.path()));
+        let env = build_plan_harness_env("goose", &config, Some(agent_file.path())).unwrap();
 
         assert_eq!(env.len(), 1);
         assert_eq!(env[0].0, "GOOSE_SYSTEM_PROMPT_FILE_PATH");
@@ -630,7 +648,7 @@ mod tests {
         // With no agent file, nothing should be exported even if the env
         // var is configured.
         let config = Config::default();
-        let env = build_plan_harness_env("goose", &config, None);
+        let env = build_plan_harness_env("goose", &config, None).unwrap();
         assert!(env.is_empty());
     }
 
@@ -638,10 +656,45 @@ mod tests {
     fn test_build_plan_harness_env_claude_no_env() {
         let config = Config::default();
         let agent_file = write_agent_temp_file(&test_agent_content()).unwrap();
-        let env = build_plan_harness_env("claude", &config, Some(agent_file.path()));
+        let env = build_plan_harness_env("claude", &config, Some(agent_file.path())).unwrap();
 
         // Claude supports agent file natively, so env var should NOT be set
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn test_build_plan_harness_args_unknown_harness_returns_err() {
+        // Regression: indexing into config.harnesses with an unknown key
+        // used to panic. An unknown harness name must surface as a
+        // descriptive Err that names the missing harness and lists the
+        // available ones, not a process abort.
+        let config = Config::default();
+        let agent_content = test_agent_content();
+        let result = build_plan_harness_args(
+            "does-not-exist",
+            &config,
+            None,
+            &agent_content,
+            "Plan",
+        );
+        let err = result.expect_err("expected Err for unknown harness");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does-not-exist"),
+            "error should name the missing harness: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_build_plan_harness_env_unknown_harness_returns_err() {
+        let config = Config::default();
+        let result = build_plan_harness_env("does-not-exist", &config, None);
+        let err = result.expect_err("expected Err for unknown harness");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does-not-exist"),
+            "error should name the missing harness: {msg}"
+        );
     }
 
     #[test]
@@ -751,7 +804,8 @@ mod tests {
             Some(agent_file.path()),
             &agent_content,
             "Create a plan",
-        );
+        )
+        .unwrap();
 
         assert_eq!(args.len(), 1, "expected a single arg, got {args:?}");
         // Because supports_agent_file=false, the agent content is prepended
@@ -784,7 +838,8 @@ mod tests {
             Some(agent_file.path()),
             &agent_content,
             "Create a plan",
-        );
+        )
+        .unwrap();
 
         let path_str = agent_file.path().to_string_lossy().into_owned();
         assert_eq!(args.len(), 2, "expected two args, got {args:?}");
