@@ -291,11 +291,7 @@ pub async fn execute_step(
         );
     }
 
-    let timeout = if config.timeout_secs == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(config.timeout_secs))
-    };
+    let timeout = config.timeout_secs.map(Duration::from_secs);
 
     // Resolve harness once (doesn't change between retries).
     let (harness_name, harness_config) = harness::resolve_harness(step, plan, config)?;

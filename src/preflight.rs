@@ -518,7 +518,7 @@ mod tests {
         let config = Config {
             default_harness: "claude".to_string(),
             max_retries_per_step: 3,
-            timeout_secs: 300,
+            timeout_secs: Some(300),
             hook_timeout_secs: 120,
             auto_stash: false,
             harnesses: HashMap::new(),

@@ -1,11 +1,25 @@
 // Configuration management
 
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+/// Accepts either `null`, a missing field, or `0` as "no timeout" so configs
+/// written before `timeout_secs` became `Option<u64>` keep loading. Positive
+/// integers become `Some(n)`.
+fn deserialize_timeout_secs<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<u64>::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(0) | None => None,
+        Some(n) => Some(n),
+    })
+}
 
 /// Configuration for a single coding agent harness.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -88,8 +102,10 @@ pub struct Config {
     pub default_harness: String,
     /// Maximum number of retries per step before giving up.
     pub max_retries_per_step: u32,
-    /// Timeout in seconds for a single harness invocation.
-    pub timeout_secs: u64,
+    /// Timeout in seconds for a single harness invocation. `None` (or the
+    /// legacy `0` value) disables the timeout.
+    #[serde(default, deserialize_with = "deserialize_timeout_secs")]
+    pub timeout_secs: Option<u64>,
     /// Timeout in seconds for a single lifecycle hook (pre/post-step,
     /// pre/post-test). `0` disables the timeout. Defaults to 120.
     #[serde(default = "default_hook_timeout_secs")]
@@ -362,7 +378,7 @@ impl Default for Config {
         Self {
             default_harness: "claude".to_string(),
             max_retries_per_step: 3,
-            timeout_secs: 0,
+            timeout_secs: None,
             hook_timeout_secs: default_hook_timeout_secs(),
             auto_stash: default_auto_stash(),
             harnesses,
@@ -487,7 +503,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.default_harness, "claude");
         assert_eq!(config.max_retries_per_step, 3);
-        assert_eq!(config.timeout_secs, 0);
+        assert_eq!(config.timeout_secs, None);
         // L10: auto_stash is opt-in; default config must preserve the safer
         // "refuse to sweep a dirty tree" behavior.
         assert!(!config.auto_stash);
@@ -821,6 +837,62 @@ mod tests {
         }"#;
         let config: Config = serde_json::from_str(json).expect("deserialize");
         assert!(!config.auto_stash);
+    }
+
+    #[test]
+    fn test_timeout_secs_deserializes_zero_and_null_as_none() {
+        // L23: legacy configs wrote `"timeout_secs": 0` to disable the
+        // timeout. Keep that working alongside the new `null`/missing forms,
+        // and preserve positive values as-is.
+        let base = r#"{
+            "default_harness": "claude",
+            "max_retries_per_step": 3,
+            "harnesses": {"claude": {"command": "claude"}}
+        }"#;
+
+        // Legacy zero — stays disabled.
+        let legacy_zero = base.replacen(
+            "\"max_retries_per_step\": 3",
+            "\"max_retries_per_step\": 3, \"timeout_secs\": 0",
+            1,
+        );
+        let c: Config = serde_json::from_str(&legacy_zero).expect("legacy zero");
+        assert_eq!(c.timeout_secs, None);
+
+        // Explicit null — disabled.
+        let explicit_null = base.replacen(
+            "\"max_retries_per_step\": 3",
+            "\"max_retries_per_step\": 3, \"timeout_secs\": null",
+            1,
+        );
+        let c: Config = serde_json::from_str(&explicit_null).expect("explicit null");
+        assert_eq!(c.timeout_secs, None);
+
+        // Missing entirely — disabled (serde default).
+        let c: Config = serde_json::from_str(base).expect("missing field");
+        assert_eq!(c.timeout_secs, None);
+
+        // Positive value — preserved.
+        let positive = base.replacen(
+            "\"max_retries_per_step\": 3",
+            "\"max_retries_per_step\": 3, \"timeout_secs\": 600",
+            1,
+        );
+        let c: Config = serde_json::from_str(&positive).expect("positive");
+        assert_eq!(c.timeout_secs, Some(600));
+
+        // Round-trip Some(n) through JSON.
+        let mut cfg = Config::default();
+        cfg.timeout_secs = Some(42);
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.timeout_secs, Some(42));
+
+        // Round-trip None through JSON.
+        cfg.timeout_secs = None;
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.timeout_secs, None);
     }
 
     #[test]

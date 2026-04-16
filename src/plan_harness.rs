@@ -783,7 +783,7 @@ mod tests {
         Config {
             default_harness: "synth".to_string(),
             max_retries_per_step: 0,
-            timeout_secs: 0,
+            timeout_secs: None,
             hook_timeout_secs: 120,
             auto_stash: false,
             harnesses,

@@ -157,7 +157,7 @@ Relevant top-level keys:
 
 - `default_harness` — harness used when none is specified (must match a key under `harnesses`).
 - `max_retries_per_step` — retry budget per step (default: 3).
-- `timeout_secs` — harness invocation timeout (`0` disables; default: 0).
+- `timeout_secs` — harness invocation timeout in seconds. `null`, omitting the field, or the legacy value `0` all disable the timeout (default: disabled).
 - `hook_timeout_secs` — lifecycle hook timeout (`0` disables; default: 120).
 - `auto_stash` — when `true`, `ralph run` auto-commits a dirty working tree before switching to the plan branch. When `false` (default) `ralph run` lists the dirty files and bails so you can stage or discard them intentionally; pass `--auto-stash` to override for a single run.
 
