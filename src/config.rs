@@ -1,6 +1,6 @@
 // Configuration management
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -78,6 +78,35 @@ pub struct Config {
     pub timeout_secs: u64,
     /// Available harness definitions keyed by name.
     pub harnesses: HashMap<String, HarnessConfig>,
+}
+
+impl Config {
+    /// Verifies the loaded config is internally consistent.
+    ///
+    /// Catches misconfigured `default_harness` values (empty or pointing at
+    /// a harness name that isn't defined) at load time rather than at first
+    /// run, so the user sees a clear error instead of a cryptic runtime
+    /// failure deep in harness resolution.
+    pub fn validate(&self) -> Result<()> {
+        if self.default_harness.is_empty() {
+            return Err(anyhow!("config.default_harness must not be empty"));
+        }
+        if !self.harnesses.contains_key(&self.default_harness) {
+            let mut available: Vec<&str> =
+                self.harnesses.keys().map(String::as_str).collect();
+            available.sort_unstable();
+            return Err(anyhow!(
+                "config.default_harness '{}' is not defined in harnesses (available: {})",
+                self.default_harness,
+                if available.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for Config {
@@ -362,6 +391,9 @@ pub fn load_or_create_config() -> Result<Config> {
             .with_context(|| format!("Failed to read {}", path.display()))?;
         let config: Config = serde_json::from_str(&contents)
             .with_context(|| format!("Failed to parse {}", path.display()))?;
+        config
+            .validate()
+            .with_context(|| format!("Invalid config at {}", path.display()))?;
         Ok(config)
     } else {
         let config = Config::default();
@@ -626,6 +658,40 @@ mod tests {
         let contents = std::fs::read_to_string(&config_path).expect("read");
         let loaded: Config = serde_json::from_str(&contents).expect("deserialize");
         assert_eq!(config, loaded);
+    }
+
+    #[test]
+    fn test_validate_rejects_missing_default_harness() {
+        let mut config = Config::default();
+        config.default_harness = "nope".to_string();
+        let err = config.validate().expect_err("validate must reject missing harness");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("nope"),
+            "error should name the offending harness: {msg}"
+        );
+        assert!(
+            msg.contains("default_harness"),
+            "error should reference default_harness: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_default_harness() {
+        let mut config = Config::default();
+        config.default_harness = String::new();
+        let err = config.validate().expect_err("validate must reject empty");
+        assert!(
+            format!("{err}").contains("default_harness"),
+            "error should reference default_harness"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_default_config() {
+        Config::default()
+            .validate()
+            .expect("default config must validate");
     }
 
     #[test]
