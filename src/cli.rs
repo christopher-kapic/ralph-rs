@@ -69,13 +69,13 @@ pub enum Command {
     /// By default, runs all remaining pending steps in the plan sequentially.
     /// Use --one to run only the next pending step. Use --from/--to to run a
     /// specific range of steps. Use --all to run every plan in dependency order
-    /// (ignores the plan slug). Precedence: --all > --one > --from/--to > default.
+    /// (ignores the plan slug). --one and --all are mutually exclusive.
     Run {
         /// Plan slug to run. Defaults to the active plan.
         plan: Option<String>,
 
         /// Run only the next pending step instead of all remaining.
-        #[arg(long, alias = "single")]
+        #[arg(long, alias = "single", conflicts_with = "all")]
         one: bool,
 
         /// Run all plans in dependency order (chains plans). Plan slug
@@ -952,6 +952,12 @@ mod tests {
         } else {
             panic!("Expected Run");
         }
+    }
+
+    #[test]
+    fn test_parse_run_one_and_all_conflict() {
+        let result = Cli::try_parse_from(["ralph-rs", "run", "--one", "--all"]);
+        assert!(result.is_err(), "clap must reject --one combined with --all");
     }
 
     #[test]
