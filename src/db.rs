@@ -391,12 +391,22 @@ mod tests {
             .expect("collect");
 
         let expected = [
+            // V1
             "idx_logs_step_attempt",
             "idx_logs_step_id",
             "idx_plans_project",
             "idx_plans_project_status",
             "idx_steps_plan_id",
             "idx_steps_plan_sort",
+            // V2
+            "idx_plan_deps_dep",
+            "idx_plan_deps_plan",
+            // V3
+            "idx_step_hooks_plan",
+            "idx_step_hooks_plan_lifecycle",
+            "idx_step_hooks_step",
+            // V7
+            "idx_step_hooks_unique",
         ];
         for idx in &expected {
             assert!(indexes.contains(&idx.to_string()), "Missing index: {idx}");
