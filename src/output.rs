@@ -252,8 +252,9 @@ pub fn log_status_icon(committed: bool, rolled_back: bool, color: bool) -> &'sta
 
 /// Prompt the user for a yes/no confirmation on stdin.
 ///
-/// Accepts `y`, `Y`, `yes`, `YES`, `Yes` (and similar) as affirmative.
-/// Returns `false` for everything else (including empty input and EOF).
+/// Accepts any case-insensitive variant of `y` or `yes` (e.g. `y`, `Y`,
+/// `yes`, `Yes`, `YES`, `yEs`) as affirmative. Returns `false` for everything
+/// else (including empty input and EOF).
 pub fn confirm(prompt: &str) -> Result<bool> {
     confirm_with_reader(prompt, &mut io::stdin().lock(), &mut io::stderr())
 }
@@ -273,7 +274,7 @@ fn confirm_with_reader(
         return Ok(false);
     }
     let trimmed = line.trim();
-    Ok(matches!(trimmed, "y" | "Y" | "yes" | "Yes" | "YES"))
+    Ok(trimmed.eq_ignore_ascii_case("y") || trimmed.eq_ignore_ascii_case("yes"))
 }
 
 // ---------------------------------------------------------------------------
@@ -615,10 +616,34 @@ mod tests {
     }
 
     #[test]
+    fn test_confirm_mixed_case_yes() {
+        for variant in ["yEs", "YeS", "yES", "YES", "Yes"] {
+            let mut input = Cursor::new(format!("{variant}\n").into_bytes());
+            let mut output = Vec::new();
+            assert!(
+                confirm_with_reader("Delete?", &mut input, &mut output).unwrap(),
+                "variant {variant} should be affirmative"
+            );
+        }
+    }
+
+    #[test]
     fn test_confirm_n() {
         let mut input = Cursor::new(b"n\n");
         let mut output = Vec::new();
         assert!(!confirm_with_reader("Delete?", &mut input, &mut output).unwrap());
+    }
+
+    #[test]
+    fn test_confirm_no_variants() {
+        for variant in ["no", "No", "NO", "nO", "nope", "n "] {
+            let mut input = Cursor::new(format!("{variant}\n").into_bytes());
+            let mut output = Vec::new();
+            assert!(
+                !confirm_with_reader("Delete?", &mut input, &mut output).unwrap(),
+                "variant {variant:?} should be negative"
+            );
+        }
     }
 
     #[test]
