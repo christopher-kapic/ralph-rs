@@ -937,7 +937,9 @@ fn dry_run_report(plan: &Plan, all_steps: &[Step], steps_to_run: &[Step]) -> Res
         steps_succeeded: 0,
         steps_failed: 0,
         steps_skipped: 0,
-        final_status: plan.status,
+        // Dry run does not mutate state; report the projected status assuming
+        // every step that would run succeeds.
+        final_status: PlanStatus::Complete,
         step_results: Vec::new(),
     })
 }
@@ -1381,6 +1383,10 @@ mod tests {
         let result = dry_run_report(&plan, &all_steps, &all_steps).unwrap();
         assert_eq!(result.steps_executed, 0);
         assert_eq!(result.plan_slug, "test-plan");
+        // Projected status is not the plan's current status (Ready); it reflects
+        // the outcome of a successful run.
+        assert_ne!(result.final_status, PlanStatus::Ready);
+        assert_eq!(result.final_status, PlanStatus::Complete);
     }
 
     // -- RunOptions default --
