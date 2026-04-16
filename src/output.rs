@@ -428,28 +428,6 @@ impl LogEntrySummary {
     }
 }
 
-impl From<&ExecutionLog> for LogEntrySummary {
-    fn from(l: &ExecutionLog) -> Self {
-        Self {
-            id: l.id,
-            step_id: l.step_id.clone(),
-            attempt: l.attempt,
-            started_at: l.started_at,
-            duration_secs: l.duration_secs,
-            test_results: l.test_results.clone(),
-            rolled_back: l.rolled_back,
-            committed: l.committed,
-            commit_hash: l.commit_hash.clone(),
-            cost_usd: l.cost_usd,
-            input_tokens: l.input_tokens,
-            output_tokens: l.output_tokens,
-            session_id: l.session_id.clone(),
-            stdout: None,
-            stderr: None,
-        }
-    }
-}
-
 /// JSON output for the `status` command.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSummary {
