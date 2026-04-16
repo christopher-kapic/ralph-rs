@@ -284,7 +284,7 @@ pub async fn run_plan_harness(
     // Build the plan agent content, injecting the list of hooks applicable
     // to the current project so the harness can reference them by name.
     let project_path = std::path::Path::new(project);
-    let hooks = hook_library::load_all().unwrap_or_default();
+    let hooks = hook_library::load_all()?;
     let applicable = hook_library::filter_by_project(hooks, project_path);
     let agent_content = render_plan_agent(&applicable);
 

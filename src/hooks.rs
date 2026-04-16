@@ -41,7 +41,7 @@ impl HookContext {
     /// Load the library and filter by the given project directory. Safe to
     /// call even if the library is empty or missing.
     pub fn load(project_dir: &Path, hook_timeout_secs: u64) -> Result<Self> {
-        let all = hook_library::load_all().unwrap_or_default();
+        let all = hook_library::load_all()?;
         let applicable = hook_library::filter_by_project(all, project_dir);
         Ok(Self {
             applicable,

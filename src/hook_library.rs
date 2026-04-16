@@ -382,14 +382,26 @@ fn yaml_escape(s: &str) -> String {
 
 /// Load every hook in the library. Invalid files are skipped with a warning
 /// on stderr so one bad file doesn't take down the whole library.
+///
+/// Returns `Err` only for directory-level failures (the hooks dir exists but
+/// can't be read — e.g. permission denied). Per-file parse or read errors are
+/// logged as warnings and skipped. Callers should propagate the `Err` rather
+/// than swallowing it, so directory-level failures are not indistinguishable
+/// from "no hooks configured."
 pub fn load_all() -> Result<Vec<Hook>> {
     let dir = hooks_dir()?;
+    load_all_from(&dir)
+}
+
+/// Dir-parameterized core of `load_all` — extracted so tests can exercise
+/// the warning path without touching `XDG_CONFIG_HOME`.
+pub(crate) fn load_all_from(dir: &Path) -> Result<Vec<Hook>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
 
     let mut hooks = Vec::new();
-    let mut entries: Vec<_> = fs::read_dir(&dir)
+    let mut entries: Vec<_> = fs::read_dir(dir)
         .with_context(|| format!("Failed to read hooks directory {}", dir.display()))?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
@@ -782,6 +794,30 @@ mod tests {
         // must be at column 0.
         let src = "---\nname: x\nlifecycle: post-step\nscope: global\n  ---\necho hi\n";
         assert!(parse_hook(src, "x").is_err());
+    }
+
+    #[test]
+    fn test_load_all_skips_corrupt_files_and_loads_valid() {
+        // A corrupt hook file in the directory must not prevent valid hooks
+        // from loading — load_all should return Ok with just the valid hook.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let valid = "---\nname: good\nlifecycle: post-step\nscope: global\n---\necho hi\n";
+        fs::write(tmp.path().join("good.md"), valid).unwrap();
+        // Missing frontmatter — parse_hook will reject this file.
+        fs::write(tmp.path().join("bad.md"), "not a hook\n").unwrap();
+
+        let hooks = load_all_from(tmp.path()).expect("directory-level read should succeed");
+        assert_eq!(hooks.len(), 1, "corrupt file should be skipped, valid kept");
+        assert_eq!(hooks[0].name, "good");
+    }
+
+    #[test]
+    fn test_load_all_returns_empty_when_dir_missing() {
+        // No hooks dir means "no hooks configured" — not an error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let hooks = load_all_from(&missing).unwrap();
+        assert!(hooks.is_empty());
     }
 
     #[test]
