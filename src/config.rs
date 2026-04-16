@@ -80,6 +80,18 @@ pub struct HarnessConfig {
     /// Users opt in by editing config.json — init leaves this empty.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Environment variables that, when any one is set, signal that the
+    /// harness is authenticated. Consulted by the preflight harness-auth
+    /// check before falling back to [`Self::auth_probe_args`]. Empty means
+    /// "no env-var-based auth check".
+    #[serde(default)]
+    pub auth_env_vars: Vec<String>,
+    /// Argument vector for a non-interactive auth probe. When no
+    /// [`Self::auth_env_vars`] matched, preflight runs
+    /// `<command> <auth_probe_args...>` and treats a zero exit as
+    /// authenticated. Empty means "no probe".
+    #[serde(default)]
+    pub auth_probe_args: Vec<String>,
 }
 
 /// Default timeout in seconds for a single lifecycle hook invocation.
@@ -189,6 +201,8 @@ impl Default for Config {
                 ],
                 model_args: vec!["--model".to_string(), "{model}".to_string()],
                 default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
             },
         );
 
@@ -227,6 +241,8 @@ impl Default for Config {
                 // codex accepts `-m <model>` / `--model <model>`.
                 model_args: vec!["-m".to_string(), "{model}".to_string()],
                 default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
             },
         );
 
@@ -254,6 +270,8 @@ impl Default for Config {
                 // `openai/gpt-4o`, `sonnet:high`).
                 model_args: vec!["--model".to_string(), "{model}".to_string()],
                 default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
             },
         );
 
@@ -282,6 +300,8 @@ impl Default for Config {
                 // (e.g. `anthropic/claude-sonnet-4-20250514`).
                 model_args: vec!["-m".to_string(), "{model}".to_string()],
                 default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
             },
         );
 
@@ -319,6 +339,15 @@ impl Default for Config {
                 // copilot uses `=`-style: `--model=<name>`.
                 model_args: vec!["--model={model}".to_string()],
                 default_model: None,
+                // Standalone Copilot CLI accepts COPILOT_GITHUB_TOKEN,
+                // GH_TOKEN, or GITHUB_TOKEN. Without one of these, `copilot`
+                // requires an interactive `copilot login` device flow.
+                auth_env_vars: vec![
+                    "COPILOT_GITHUB_TOKEN".to_string(),
+                    "GH_TOKEN".to_string(),
+                    "GITHUB_TOKEN".to_string(),
+                ],
+                auth_probe_args: vec![],
             },
         );
 
@@ -372,6 +401,8 @@ impl Default for Config {
                 // the env var ambient.
                 model_args: vec!["--model".to_string(), "{model}".to_string()],
                 default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
             },
         );
 

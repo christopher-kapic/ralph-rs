@@ -778,6 +778,8 @@ mod tests {
                 agent_file_args: vec![],
                 model_args: vec![],
                 default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
             },
         );
         Config {

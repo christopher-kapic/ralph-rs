@@ -169,36 +169,80 @@ fn check_test_binaries(test_commands: &[String]) -> Vec<CheckResult> {
 }
 
 /// Check harness-specific authentication requirements.
-fn check_harness_auth(harness_name: &str, _harness_config: &HarnessConfig) -> CheckResult {
-    // Standalone Copilot CLI accepts COPILOT_GITHUB_TOKEN, GH_TOKEN, or
-    // GITHUB_TOKEN (in that precedence order). Without one of these set,
-    // `copilot` requires an interactive `copilot login` device flow.
-    if harness_name == "copilot" {
-        let has_token = std::env::var("COPILOT_GITHUB_TOKEN").is_ok()
-            || std::env::var("GH_TOKEN").is_ok()
-            || std::env::var("GITHUB_TOKEN").is_ok();
-
-        if has_token {
-            CheckResult {
+///
+/// Driven entirely by the [`HarnessConfig`] entry so custom harnesses can
+/// declare their own auth scheme:
+/// - `auth_env_vars`: any one set → pass.
+/// - `auth_probe_args`: run `<command> <args...>`, zero exit → pass.
+/// - Neither configured → pass with "no special auth required".
+fn check_harness_auth(harness_name: &str, harness_config: &HarnessConfig) -> CheckResult {
+    if !harness_config.auth_env_vars.is_empty() {
+        let has_var = harness_config
+            .auth_env_vars
+            .iter()
+            .any(|v| std::env::var(v).is_ok_and(|s| !s.is_empty()));
+        if has_var {
+            return CheckResult {
                 name: "harness-auth".to_string(),
                 severity: CheckSeverity::Pass,
-                message: format!("{harness_name}: GitHub token found"),
-            }
-        } else {
-            CheckResult {
+                message: format!("{harness_name}: auth env var set"),
+            };
+        }
+        if harness_config.auth_probe_args.is_empty() {
+            return CheckResult {
                 name: "harness-auth".to_string(),
                 severity: CheckSeverity::Warning,
                 message: format!(
-                    "{harness_name}: no token in COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN; run `copilot login` or set a token"
+                    "{harness_name}: none of {} set",
+                    harness_config.auth_env_vars.join(", ")
                 ),
-            }
+            };
         }
-    } else {
-        CheckResult {
+    }
+
+    if !harness_config.auth_probe_args.is_empty() {
+        return run_auth_probe(harness_name, harness_config);
+    }
+
+    CheckResult {
+        name: "harness-auth".to_string(),
+        severity: CheckSeverity::Pass,
+        message: format!("{harness_name}: no special auth required"),
+    }
+}
+
+/// Run `<harness.command> <auth_probe_args...>` and translate the exit
+/// status into a [`CheckResult`]. stdout/stderr are discarded — the probe's
+/// purpose is a boolean signal, not diagnostic output.
+fn run_auth_probe(harness_name: &str, harness_config: &HarnessConfig) -> CheckResult {
+    match std::process::Command::new(&harness_config.command)
+        .args(&harness_config.auth_probe_args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => CheckResult {
             name: "harness-auth".to_string(),
             severity: CheckSeverity::Pass,
-            message: format!("{harness_name}: no special auth required"),
-        }
+            message: format!("{harness_name}: auth probe succeeded"),
+        },
+        Ok(status) => CheckResult {
+            name: "harness-auth".to_string(),
+            severity: CheckSeverity::Warning,
+            message: format!(
+                "{harness_name}: auth probe `{}` exited with {}",
+                harness_config.command,
+                status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".to_string())
+            ),
+        },
+        Err(e) => CheckResult {
+            name: "harness-auth".to_string(),
+            severity: CheckSeverity::Warning,
+            message: format!(
+                "{harness_name}: could not run auth probe `{}`: {e}",
+                harness_config.command
+            ),
+        },
     }
 }
 
@@ -424,6 +468,12 @@ mod tests {
             agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
+            auth_env_vars: vec![
+                "COPILOT_GITHUB_TOKEN".to_string(),
+                "GH_TOKEN".to_string(),
+                "GITHUB_TOKEN".to_string(),
+            ],
+            auth_probe_args: vec![],
         };
         let result = check_harness_auth("copilot", &harness);
         assert_eq!(result.severity, CheckSeverity::Warning);
@@ -455,9 +505,86 @@ mod tests {
             agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
         };
         let result = check_harness_auth("claude", &harness);
         assert_eq!(result.severity, CheckSeverity::Pass);
+    }
+
+    #[test]
+    fn test_check_harness_auth_custom_probe_succeeds() {
+        // A custom harness with an auth probe that exits 0 should be
+        // reported as Pass. `true` is available on every Unix-like system.
+        let harness = crate::config::HarnessConfig {
+            command: "true".to_string(),
+            args: vec![],
+            plan_args: vec![],
+            supports_agent_file: false,
+            supports_json_output: false,
+            json_output_args: vec![],
+            agent_file_env: None,
+            agent_file_args: vec![],
+            model_args: vec![],
+            default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec!["--help".to_string()],
+        };
+        let result = check_harness_auth("custom", &harness);
+        assert_eq!(result.severity, CheckSeverity::Pass);
+        assert!(result.message.contains("auth probe succeeded"));
+    }
+
+    #[test]
+    fn test_check_harness_auth_custom_probe_fails() {
+        // `false` always exits non-zero, so the probe should warn.
+        let harness = crate::config::HarnessConfig {
+            command: "false".to_string(),
+            args: vec![],
+            plan_args: vec![],
+            supports_agent_file: false,
+            supports_json_output: false,
+            json_output_args: vec![],
+            agent_file_env: None,
+            agent_file_args: vec![],
+            model_args: vec![],
+            default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec!["--ignored".to_string()],
+        };
+        let result = check_harness_auth("custom", &harness);
+        assert_eq!(result.severity, CheckSeverity::Warning);
+    }
+
+    #[test]
+    fn test_check_harness_auth_env_var_present_skips_probe() {
+        // When an auth env var is configured and set, the probe should not
+        // run — we pick a command that would fail if executed, then confirm
+        // the result is still Pass.
+        let var = "RALPH_TEST_AUTH_ENV_VAR_L45";
+        unsafe {
+            std::env::set_var(var, "1");
+        }
+        let harness = crate::config::HarnessConfig {
+            command: "definitely_not_a_real_binary_xyz".to_string(),
+            args: vec![],
+            plan_args: vec![],
+            supports_agent_file: false,
+            supports_json_output: false,
+            json_output_args: vec![],
+            agent_file_env: None,
+            agent_file_args: vec![],
+            model_args: vec![],
+            default_model: None,
+            auth_env_vars: vec![var.to_string()],
+            auth_probe_args: vec!["--nope".to_string()],
+        };
+        let result = check_harness_auth("custom", &harness);
+        unsafe {
+            std::env::remove_var(var);
+        }
+        assert_eq!(result.severity, CheckSeverity::Pass);
+        assert!(result.message.contains("env var"));
     }
 
     #[test]

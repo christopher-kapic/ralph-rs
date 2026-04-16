@@ -395,6 +395,8 @@ mod tests {
             agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
         };
 
         let args = build_harness_args("test", &hc, "do the thing", None, None);
@@ -414,6 +416,8 @@ mod tests {
             agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
         };
 
         let args = build_harness_args("codex", &hc, "implement feature", None, None);
@@ -447,6 +451,8 @@ mod tests {
             agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
         };
 
         let args = build_harness_args("fake", &hc, "do stuff", None, None);
@@ -681,6 +687,8 @@ mod tests {
             agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
         };
 
         let agent_path = Path::new("/home/user/.ralph2/agents/default.md");
@@ -703,6 +711,8 @@ mod tests {
             agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
         };
 
         let env = build_harness_env(&hc, None);
@@ -754,6 +764,8 @@ mod tests {
             agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
         };
 
         let args = build_harness_args("test", &hc, "hello world", None, None);
@@ -777,6 +789,8 @@ mod tests {
             agent_file_args: vec![],
             model_args: vec![],
             default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
         };
 
         let agent_path = Path::new("/tmp/agent.md");
