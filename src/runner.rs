@@ -146,14 +146,14 @@ pub async fn run_plan(
             return Ok(result);
         }
 
-        // Skip already-completed or skipped steps.
+        // Skip already-completed or skipped steps. Pre-existing Complete
+        // steps were not executed by this invocation, so they must not
+        // inflate steps_succeeded.
         let current_step = storage::get_step(conn, &step.id)?;
         if current_step.status == StepStatus::Complete || current_step.status == StepStatus::Skipped
         {
             if current_step.status == StepStatus::Skipped {
                 result.steps_skipped += 1;
-            } else {
-                result.steps_succeeded += 1;
             }
             continue;
         }
@@ -1778,5 +1778,53 @@ mod tests {
             ticks.load(Ordering::SeqCst) > 0,
             "ticker made no progress — setup_branch blocked the runtime"
         );
+    }
+
+    // Regression for L7: pre-existing Complete steps must not inflate
+    // steps_succeeded — only steps this invocation actually executed count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_plan_does_not_count_preexisting_complete_as_succeeded() {
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+
+        let conn = setup();
+        let plan =
+            storage::create_plan(&conn, "s", &project, "feat/x", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+
+        // Two pre-completed steps from an earlier run.
+        let (s1, _) =
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        let (s2, _) =
+            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None)
+                .unwrap();
+        storage::update_step_status(&conn, &s2.id, StepStatus::Complete).unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "s", &project)
+            .unwrap()
+            .unwrap();
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let result = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        // Before the fix, pre-existing Complete steps were counted as
+        // succeeded; this invocation executed nothing, so both counters
+        // must be zero.
+        assert_eq!(result.steps_executed, 0);
+        assert_eq!(result.steps_succeeded, 0);
+        assert_eq!(result.final_status, PlanStatus::Complete);
     }
 }
