@@ -64,6 +64,12 @@ fn base_env(plan: &Plan, step: &Step, attempt: i32, workdir: &Path) -> Vec<(&'st
 }
 
 /// Execute a single hook's shell command via `sh -c`. Exit code zero = success.
+///
+/// Ralph's env vars (e.g. `RALPH_PROJECT_DIR`) are passed through `Command::env`
+/// rather than interpolated into the command string. Under POSIX shell rules,
+/// parameter expansion is performed once and its result is not rescanned for
+/// command substitution — so a project path containing `$(...)` is emitted
+/// literally, never executed. See `test_env_var_values_not_reexpanded_by_shell`.
 fn run_one_hook(
     hook: &Hook,
     workdir: &Path,
@@ -452,6 +458,50 @@ mod tests {
 
         let contents = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(contents.trim(), "timeout");
+    }
+
+    #[test]
+    fn test_env_var_values_not_reexpanded_by_shell() {
+        let conn = db::open_memory().unwrap();
+        let plan = make_plan("p1", "my-plan");
+        let step = make_step("s1", "p1", "Step one");
+        insert_plan_and_step(&conn, &plan, &step);
+
+        let tmp = TempDir::new().unwrap();
+        let output_marker = tmp.path().join("output.txt");
+
+        // Build a project directory whose path contains a literal $(...). If
+        // the shell re-scanned RALPH_PROJECT_DIR after parameter expansion,
+        // the command substitution would fire and create pwned.txt inside
+        // this directory.
+        let tricky_dir = tmp.path().join("proj$(touch pwned.txt)");
+        std::fs::create_dir(&tricky_dir).unwrap();
+        let malicious_marker = tricky_dir.join("pwned.txt");
+
+        let hook = Hook {
+            name: "probe".to_string(),
+            description: String::new(),
+            lifecycle: Lifecycle::PreStep,
+            scope: Scope::Global,
+            command: format!("echo \"$RALPH_PROJECT_DIR\" > {}", output_marker.display()),
+        };
+        let ctx = HookContext {
+            applicable: vec![hook],
+            project_dir: tricky_dir.clone(),
+        };
+        storage::attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "probe").unwrap();
+
+        run_pre_step(&conn, &ctx, &plan, &step, 1, &tricky_dir).unwrap();
+
+        assert!(
+            !malicious_marker.exists(),
+            "shell must not execute $(...) substring embedded in RALPH_PROJECT_DIR"
+        );
+        let contents = std::fs::read_to_string(&output_marker).unwrap();
+        assert!(
+            contents.contains("$(touch"),
+            "project dir should be preserved literally, got: {contents}"
+        );
     }
 
     #[test]
