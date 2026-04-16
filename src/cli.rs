@@ -400,14 +400,15 @@ pub enum StepCommand {
     ///
     /// The single-step form takes a positional title plus per-field flags.
     /// For bulk insertion use `--import-json <FILE|->` to read an array of
-    /// step objects (or a single object) from a file or stdin; the positional
-    /// title and per-field flags are mutually exclusive with `--import-json`.
+    /// step objects (or a single object) from a file or stdin; the per-field
+    /// flags are mutually exclusive with `--import-json`. When `--import-json`
+    /// is used, the first positional is interpreted as the plan slug (since
+    /// no title is meaningful for a bulk import).
     Add {
-        /// Step title. Required unless `--import-json` is used.
-        #[arg(
-            required_unless_present = "import_json",
-            conflicts_with = "import_json"
-        )]
+        /// Step title. Required unless `--import-json` is used. With
+        /// `--import-json`, a single positional is reinterpreted as the
+        /// plan slug.
+        #[arg(required_unless_present = "import_json")]
         title: Option<String>,
 
         /// Plan slug. Defaults to the active plan.
@@ -860,14 +861,45 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_step_add_import_json_conflicts_with_title() {
+    fn test_parse_step_add_import_json_with_plan_slug() {
+        // With --import-json, the single positional should parse as the
+        // (would-be) title slot — the handler reinterprets it as the plan
+        // slug. This guards against a clap-level conflict error.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "--import-json",
+            "f.json",
+            "my-plan",
+        ])
+        .unwrap();
+        if let Command::Step(StepCommand::Add {
+            title,
+            plan,
+            import_json,
+            ..
+        }) = cli.command
+        {
+            assert_eq!(title.as_deref(), Some("my-plan"));
+            assert!(plan.is_none());
+            assert_eq!(import_json.as_deref(), Some("f.json"));
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_import_json_conflicts_with_description() {
+        // Non-positional single-step flags still conflict with --import-json.
         let result = Cli::try_parse_from([
             "ralph-rs",
             "step",
             "add",
-            "some title",
             "--import-json",
             "-",
+            "--description",
+            "x",
         ]);
         assert!(result.is_err());
     }

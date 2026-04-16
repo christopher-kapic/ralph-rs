@@ -203,11 +203,22 @@ fn main() -> Result<()> {
                 max_retries,
                 import_json,
             } => {
-                let p = resolve_plan(&conn, plan, &project, false)?;
                 let h = cli.harness.as_deref().or(harness.as_deref());
                 if let Some(source) = import_json {
+                    // With --import-json, there is no step title; reinterpret
+                    // a single positional as the plan slug. Error if the user
+                    // supplied both positionals.
+                    let plan_slug = match (title, plan) {
+                        (Some(_), Some(_)) => anyhow::bail!(
+                            "--import-json takes at most one positional (the plan slug); no title is accepted"
+                        ),
+                        (Some(t), None) => Some(t),
+                        (None, p) => p,
+                    };
+                    let p = resolve_plan(&conn, plan_slug, &project, false)?;
                     commands::step_add_bulk(&conn, &p.slug, &project, &source, &out)
                 } else {
+                    let p = resolve_plan(&conn, plan, &project, false)?;
                     // clap enforces that `title` is Some when `--import-json`
                     // is absent via `required_unless_present`.
                     let title = title.as_deref().expect("clap guarantees title is present");
