@@ -566,13 +566,22 @@ pub fn list_execution_logs_for_step(conn: &Connection, step_id: &str) -> Result<
     Ok(logs)
 }
 
-/// List all execution logs for a plan (across all steps), ordered by started_at.
+/// List all execution logs for a plan (across all steps), ordered by
+/// started_at descending (most recent first).
+///
+/// When `limit` is `Some(n)`, returns at most `n` rows. When `limit` is
+/// `None`, returns every matching row with no cap.
 pub fn list_execution_logs_for_plan(
     conn: &Connection,
     plan_id: &str,
     limit: Option<usize>,
 ) -> Result<Vec<(String, ExecutionLog)>> {
-    let limit_val = limit.unwrap_or(100) as i64;
+    // SQLite treats a negative LIMIT as "no upper bound", which is how we
+    // implement the unlimited case when the caller passes None.
+    let limit_val: i64 = match limit {
+        Some(n) => n as i64,
+        None => -1,
+    };
     let mut stmt = conn.prepare(
         "SELECT s.title, el.id, el.step_id, el.attempt, el.started_at, el.duration_secs,
                 el.prompt_text, el.diff, el.test_results, el.rolled_back, el.committed,
