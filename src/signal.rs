@@ -9,6 +9,7 @@
 // The shutdown flag is communicated via a `tokio::sync::watch` channel that
 // the executor and runner already consume as `abort_rx`.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -67,27 +68,23 @@ pub struct ShutdownController {
     abort_tx: watch::Sender<bool>,
     /// Receivers cloned from here are handed to runner/executor.
     abort_rx: watch::Receiver<bool>,
-    /// `true` once the first signal has been received.
-    first_signal_received: &'static AtomicBool,
+    /// `true` once the first signal has been received. Per-instance so
+    /// concurrent tests don't race on a shared global slot.
+    first_signal_received: Arc<AtomicBool>,
 }
-
-/// Global flag so the raw signal handler (sync context) can record the first
-/// signal and the second signal can detect that the grace period is active.
-static FIRST_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 impl ShutdownController {
     /// Create a new shutdown controller.
     ///
-    /// Resets the global signal state so controllers can be created across
-    /// sequential test runs or successive CLI invocations within the same
-    /// process.
+    /// Each controller owns its own first-signal flag, so creating multiple
+    /// controllers in parallel (e.g. across test threads) does not contend on
+    /// shared state.
     pub fn new() -> Self {
-        FIRST_SIGNAL.store(false, Ordering::SeqCst);
         let (abort_tx, abort_rx) = watch::channel(false);
         Self {
             abort_tx,
             abort_rx,
-            first_signal_received: &FIRST_SIGNAL,
+            first_signal_received: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -113,7 +110,7 @@ impl ShutdownController {
     }
 
     /// Internal listener loop.
-    async fn listen(abort_tx: watch::Sender<bool>, first_received: &'static AtomicBool) {
+    async fn listen(abort_tx: watch::Sender<bool>, first_received: Arc<AtomicBool>) {
         loop {
             // Wait for the next Ctrl+C.
             if tokio::signal::ctrl_c().await.is_err() {
@@ -190,12 +187,14 @@ mod tests {
     }
 
     #[test]
-    fn test_shutdown_controller_new_resets_global() {
-        // Set the global flag manually.
-        FIRST_SIGNAL.store(true, Ordering::SeqCst);
-        // Creating a new controller should reset it.
-        let _controller = ShutdownController::new();
-        assert!(!FIRST_SIGNAL.load(Ordering::SeqCst));
+    fn test_shutdown_controller_instances_are_independent() {
+        // Each controller owns its own flag; flipping one must not be
+        // visible from another. This is the regression test for L35.
+        let a = ShutdownController::new();
+        let b = ShutdownController::new();
+        a.first_signal_received.store(true, Ordering::SeqCst);
+        assert!(a.first_signal_received.load(Ordering::SeqCst));
+        assert!(!b.first_signal_received.load(Ordering::SeqCst));
     }
 
     #[test]
