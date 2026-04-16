@@ -204,7 +204,7 @@ pub fn parse_hook(contents: &str, fallback_name: &str) -> Result<Hook> {
 
         match key {
             "name" => name = Some(value.to_string()),
-            "description" => description = unquote(value).to_string(),
+            "description" => description = unquote(value),
             "lifecycle" => lifecycle_str = Some(value.to_string()),
             "scope" => {
                 if value.is_empty() {
@@ -265,17 +265,45 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-/// Strip surrounding single or double quotes from a YAML-ish scalar.
-fn unquote(s: &str) -> &str {
+/// Strip surrounding single or double quotes from a YAML-ish scalar and
+/// decode common escape sequences inside double-quoted values.
+fn unquote(s: &str) -> String {
     if s.len() >= 2 {
         let bytes = s.as_bytes();
-        if (bytes[0] == b'"' && bytes[s.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[s.len() - 1] == b'\'')
-        {
-            return &s[1..s.len() - 1];
+        if bytes[0] == b'"' && bytes[s.len() - 1] == b'"' {
+            return yaml_unescape(&s[1..s.len() - 1]);
+        }
+        if bytes[0] == b'\'' && bytes[s.len() - 1] == b'\'' {
+            return s[1..s.len() - 1].to_string();
         }
     }
-    s
+    s.to_string()
+}
+
+/// Decode the escape sequences that `yaml_escape` emits inside a
+/// double-quoted scalar: `\\`, `\"`, `\n`, `\r`, `\t`.
+fn yaml_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// Serialize a Hook back to the file format used by the library.
@@ -308,15 +336,25 @@ pub fn serialize_hook(hook: &Hook) -> String {
 }
 
 /// Minimal escaping for YAML scalars — wraps in double quotes if the string
-/// contains anything that would confuse a YAML parser.
+/// contains anything that would confuse a YAML parser, and escapes control
+/// characters (`\n`, `\r`, `\t`) so the value fits on a single line.
 fn yaml_escape(s: &str) -> String {
-    if s.chars()
-        .any(|c| c == ':' || c == '#' || c == '\n' || c == '"' || c == '\'')
-    {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        s.to_string()
+    let needs_quoting = s.chars().any(|c| {
+        matches!(
+            c,
+            ':' | '#' | '\n' | '\r' | '\t' | '"' | '\'' | '\\'
+        )
+    });
+    if !needs_quoting {
+        return s.to_string();
     }
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("\"{escaped}\"")
 }
 
 // ---------------------------------------------------------------------------
@@ -651,6 +689,48 @@ mod tests {
         let serialized = serialize_hook(&hook);
         let parsed = parse_hook(&serialized, "hashy").unwrap();
         assert_eq!(parsed.description, "Fix issue #123");
+    }
+
+    #[test]
+    fn test_yaml_escape_newline() {
+        assert_eq!(yaml_escape("line1\nline2"), "\"line1\\nline2\"");
+    }
+
+    #[test]
+    fn test_yaml_escape_tab_and_backslash() {
+        assert_eq!(yaml_escape("a\\b\tc"), "\"a\\\\b\\tc\"");
+    }
+
+    #[test]
+    fn test_roundtrip_description_with_newline() {
+        let hook = Hook {
+            name: "multi".to_string(),
+            description: "line1\nline2\twith tab\rand cr".to_string(),
+            lifecycle: Lifecycle::PreTest,
+            scope: Scope::Global,
+            command: "echo hi".to_string(),
+        };
+        let serialized = serialize_hook(&hook);
+        // The serialized frontmatter's description line must not wrap onto a
+        // second line; otherwise subsequent keys are swallowed into it.
+        assert!(!serialized.contains("line1\nline2"));
+        let parsed = parse_hook(&serialized, "multi").unwrap();
+        assert_eq!(parsed.description, hook.description);
+        assert_eq!(parsed.lifecycle, hook.lifecycle);
+    }
+
+    #[test]
+    fn test_roundtrip_description_with_embedded_backslash() {
+        let hook = Hook {
+            name: "slashy".to_string(),
+            description: "path C:\\Users\\x and quote \" inside".to_string(),
+            lifecycle: Lifecycle::PostStep,
+            scope: Scope::Global,
+            command: "echo hi".to_string(),
+        };
+        let serialized = serialize_hook(&hook);
+        let parsed = parse_hook(&serialized, "slashy").unwrap();
+        assert_eq!(parsed.description, hook.description);
     }
 
     #[test]
