@@ -296,36 +296,43 @@ fn print_log_entry(step_title: &str, log: &ExecutionLog, output_mode: &LogOutput
     }
 
     if !matches!(output_mode, LogOutputMode::Hidden) {
-        let take_n = match output_mode {
-            LogOutputMode::Truncated(n) => Some(*n),
-            _ => None,
+        // --lines N is a *total* budget across both streams. Distribute it
+        // proportionally so --lines 50 never prints more than 50 lines.
+        let (stdout_cap, stderr_cap) = match output_mode {
+            LogOutputMode::Truncated(n) => {
+                let out_n = log
+                    .harness_stdout
+                    .as_deref()
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                let err_n = log
+                    .harness_stderr
+                    .as_deref()
+                    .map(|s| s.lines().count())
+                    .unwrap_or(0);
+                let (a, b) = output::split_lines_budget(out_n, err_n, *n);
+                (Some(a), Some(b))
+            }
+            _ => (None, None),
         };
-        if let Some(ref stdout) = log.harness_stdout
-            && !stdout.is_empty()
-        {
-            println!("    --- stdout ---");
-            let lines_iter = stdout.lines();
-            let lines: Box<dyn Iterator<Item = &str>> = match take_n {
-                Some(n) => Box::new(lines_iter.take(n)),
-                None => Box::new(lines_iter),
-            };
-            for line in lines {
-                println!("    {line}");
+        let print_stream = |label: &str, text: &Option<String>, cap: Option<usize>| {
+            if let Some(s) = text.as_deref()
+                && !s.is_empty()
+                && cap != Some(0)
+            {
+                println!("    --- {label} ---");
+                let lines_iter = s.lines();
+                let lines: Box<dyn Iterator<Item = &str>> = match cap {
+                    Some(n) => Box::new(lines_iter.take(n)),
+                    None => Box::new(lines_iter),
+                };
+                for line in lines {
+                    println!("    {line}");
+                }
             }
-        }
-        if let Some(ref stderr) = log.harness_stderr
-            && !stderr.is_empty()
-        {
-            println!("    --- stderr ---");
-            let lines_iter = stderr.lines();
-            let lines: Box<dyn Iterator<Item = &str>> = match take_n {
-                Some(n) => Box::new(lines_iter.take(n)),
-                None => Box::new(lines_iter),
-            };
-            for line in lines {
-                println!("    {line}");
-            }
-        }
+        };
+        print_stream("stdout", &log.harness_stdout, stdout_cap);
+        print_stream("stderr", &log.harness_stderr, stderr_cap);
     }
 
     println!();

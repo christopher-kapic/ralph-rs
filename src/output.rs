@@ -389,22 +389,51 @@ pub struct LogEntrySummary {
     pub stderr: Option<String>,
 }
 
+/// Split a total line budget across stdout and stderr.
+///
+/// When one stream fits in its fair share, the other gets the remainder; when
+/// both exceed half, the budget is split evenly (with any odd extra line going
+/// to stdout). The combined output never exceeds `total`.
+pub fn split_lines_budget(
+    stdout_lines: usize,
+    stderr_lines: usize,
+    total: usize,
+) -> (usize, usize) {
+    let half = total / 2;
+    let half_up = total - half;
+    match (stdout_lines <= half, stderr_lines <= half) {
+        (true, true) => (stdout_lines, stderr_lines),
+        (true, false) => (stdout_lines, total - stdout_lines),
+        (false, true) => (total - stderr_lines, stderr_lines),
+        (false, false) => (half_up, half),
+    }
+}
+
 impl LogEntrySummary {
     /// Build a summary, controlling stdout/stderr inclusion via [`LogOutputMode`].
     ///
     /// - `Hidden` → `stdout`/`stderr` are `None` (omitted from JSON).
-    /// - `Truncated(n)` → include up to `n` lines per stream.
+    /// - `Truncated(n)` → include at most `n` lines **combined** across both
+    ///   streams, allocated proportionally (see [`split_lines_budget`]).
     /// - `Full` → include full text, no truncation.
     pub fn new(l: &ExecutionLog, mode: &crate::commands::LogOutputMode) -> Self {
         use crate::commands::LogOutputMode;
 
-        let include = |text: &Option<String>| -> Option<String> {
-            match mode {
-                LogOutputMode::Hidden => None,
-                LogOutputMode::Full => text.clone(),
-                LogOutputMode::Truncated(n) => text
-                    .as_ref()
-                    .map(|s| s.lines().take(*n).collect::<Vec<_>>().join("\n")),
+        let (stdout, stderr) = match mode {
+            LogOutputMode::Hidden => (None, None),
+            LogOutputMode::Full => (l.harness_stdout.clone(), l.harness_stderr.clone()),
+            LogOutputMode::Truncated(n) => {
+                let stdout_lines = l.harness_stdout.as_deref().map(count_lines).unwrap_or(0);
+                let stderr_lines = l.harness_stderr.as_deref().map(count_lines).unwrap_or(0);
+                let (out_cap, err_cap) = split_lines_budget(stdout_lines, stderr_lines, *n);
+                let take_head = |text: &Option<String>, cap: usize| -> Option<String> {
+                    text.as_ref()
+                        .map(|s| s.lines().take(cap).collect::<Vec<_>>().join("\n"))
+                };
+                (
+                    take_head(&l.harness_stdout, out_cap),
+                    take_head(&l.harness_stderr, err_cap),
+                )
             }
         };
 
@@ -422,10 +451,14 @@ impl LogEntrySummary {
             input_tokens: l.input_tokens,
             output_tokens: l.output_tokens,
             session_id: l.session_id.clone(),
-            stdout: include(&l.harness_stdout),
-            stderr: include(&l.harness_stderr),
+            stdout,
+            stderr,
         }
     }
+}
+
+fn count_lines(s: &str) -> usize {
+    s.lines().count()
 }
 
 /// JSON output for the `status` command.
@@ -777,5 +810,82 @@ mod tests {
         assert!(json.contains("\"session_id\""));
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(val["committed"], true);
+    }
+
+    // -- split_lines_budget -------------------------------------------------
+
+    #[test]
+    fn test_split_lines_budget_both_fit() {
+        // Neither stream exceeds half of the budget: return both unchanged.
+        assert_eq!(split_lines_budget(3, 4, 50), (3, 4));
+        assert_eq!(split_lines_budget(0, 0, 50), (0, 0));
+    }
+
+    #[test]
+    fn test_split_lines_budget_one_small_one_large() {
+        // Small stream keeps all of its lines; large stream gets the remainder.
+        assert_eq!(split_lines_budget(3, 100, 50), (3, 47));
+        assert_eq!(split_lines_budget(100, 3, 50), (47, 3));
+    }
+
+    #[test]
+    fn test_split_lines_budget_both_large_even_split() {
+        // Both streams exceed half: split evenly; odd extra goes to stdout.
+        assert_eq!(split_lines_budget(100, 100, 50), (25, 25));
+        assert_eq!(split_lines_budget(100, 100, 51), (26, 25));
+    }
+
+    #[test]
+    fn test_split_lines_budget_total_never_exceeds_budget() {
+        // Exhaustively confirm the contract: out_cap + err_cap <= budget.
+        for out in [0usize, 1, 5, 24, 25, 26, 49, 50, 100] {
+            for err in [0usize, 1, 5, 24, 25, 26, 49, 50, 100] {
+                for budget in [0usize, 1, 2, 49, 50, 51] {
+                    let (a, b) = split_lines_budget(out, err, budget);
+                    assert!(
+                        a + b <= budget,
+                        "budget exceeded: out={out} err={err} budget={budget} got=({a},{b})"
+                    );
+                }
+            }
+        }
+    }
+
+    // -- LogEntrySummary::new truncation ------------------------------------
+
+    #[test]
+    fn test_log_entry_summary_truncated_respects_total_budget() {
+        use crate::commands::LogOutputMode;
+
+        let big = (1..=100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let log = ExecutionLog {
+            id: 1,
+            step_id: "s1".into(),
+            attempt: 1,
+            started_at: Utc::now(),
+            duration_secs: None,
+            prompt_text: None,
+            diff: None,
+            test_results: vec![],
+            rolled_back: false,
+            committed: true,
+            commit_hash: None,
+            harness_stdout: Some(big.clone()),
+            harness_stderr: Some(big),
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            session_id: None,
+        };
+        let s = LogEntrySummary::new(&log, &LogOutputMode::Truncated(50));
+        let out_lines = s.stdout.as_deref().map(|s| s.lines().count()).unwrap_or(0);
+        let err_lines = s.stderr.as_deref().map(|s| s.lines().count()).unwrap_or(0);
+        assert!(
+            out_lines + err_lines <= 50,
+            "expected total <= 50, got stdout={out_lines} stderr={err_lines}"
+        );
+        // With two equally large streams the split is 25/25.
+        assert_eq!(out_lines, 25);
+        assert_eq!(err_lines, 25);
     }
 }

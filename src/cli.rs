@@ -199,8 +199,9 @@ pub enum Command {
         #[arg(long, conflicts_with = "lines")]
         full: bool,
 
-        /// Maximum number of stdout/stderr lines to show per attempt
-        /// (default: 50). Implies showing output. Conflicts with --full.
+        /// Maximum number of output lines to show per attempt, split between
+        /// stdout and stderr (total budget, not per stream). Implies showing
+        /// output. Conflicts with --full.
         #[arg(long)]
         lines: Option<usize>,
     },
