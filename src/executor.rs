@@ -449,7 +449,7 @@ pub async fn execute_step(
                 };
 
                 // Run tests if there are changes and tests are defined.
-                let (test_passed, test_result_strings) = if has_changes
+                let (test_passed, test_result_strings, test_aborted) = if has_changes
                     && !plan.deterministic_tests.is_empty()
                 {
                     // Pre-test hook.
@@ -459,7 +459,12 @@ pub async fn execute_step(
                         eprintln!("Pre-test hook failed: {e}");
                     }
 
-                    let test_results = test_runner::run_tests(&plan.deterministic_tests, workdir);
+                    let test_results = test_runner::run_tests(
+                        &plan.deterministic_tests,
+                        workdir,
+                        abort_rx.clone(),
+                    )
+                    .await;
                     let strings: Vec<String> = test_results
                         .results
                         .iter()
@@ -479,14 +484,31 @@ pub async fn execute_step(
                         workdir,
                     );
 
-                    (test_results.all_passed, strings)
+                    (test_results.all_passed, strings, test_results.aborted)
                 } else if has_changes {
                     // No tests defined: treat as passing.
-                    (true, Vec::new())
+                    (true, Vec::new(), false)
                 } else {
                     // No changes at all: harness produced nothing useful.
-                    (false, vec!["no changes detected".to_string()])
+                    (false, vec!["no changes detected".to_string()], false)
                 };
+
+                // If Ctrl+C landed mid-test, the test runner will have killed
+                // its child; surface this as Aborted rather than a retry-worthy
+                // test failure.
+                if test_aborted {
+                    if has_changes {
+                        git::rollback_except(workdir, &pre_existing_untracked)?;
+                    }
+                    return finalize_failure(
+                        &ctx,
+                        exec_log.id,
+                        duration_secs,
+                        attempt,
+                        FailureReason::Aborted,
+                        None,
+                    );
+                }
 
                 if test_passed && has_changes {
                     // Stage changes, excluding pre-existing untracked files.

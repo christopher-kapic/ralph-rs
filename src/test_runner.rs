@@ -3,7 +3,9 @@
 // Executes deterministic test commands (shell commands) and collects structured results.
 
 use std::path::Path;
-use std::process::Command;
+
+use tokio::process::Command;
+use tokio::sync::watch;
 
 /// Result of a single test command execution.
 #[derive(Debug, Clone)]
@@ -30,34 +32,56 @@ pub struct TestResults {
     pub all_passed: bool,
     /// Index into `results` of the first failing test, if any.
     pub first_failure_index: Option<usize>,
+    /// True if the run was cut short by an abort signal.
+    pub aborted: bool,
 }
 
 /// Maximum number of output lines to retain per test command.
 const TAIL_LINES: usize = 50;
 
 /// Execute each test command sequentially via `sh -c`, short-circuiting on the
-/// first failure.
+/// first failure or on an abort signal.
 ///
 /// # Arguments
 /// * `tests` – slice of shell command strings to run.
 /// * `cwd` – working directory for each command.
+/// * `abort_rx` – watch channel; when it flips to `true`, any running test is
+///   killed and the run is reported as aborted.
 ///
 /// # Returns
 /// A [`TestResults`] summarising the run.
-pub fn run_tests(tests: &[String], cwd: &Path) -> TestResults {
+pub async fn run_tests(
+    tests: &[String],
+    cwd: &Path,
+    abort_rx: watch::Receiver<bool>,
+) -> TestResults {
     let mut results: Vec<TestResult> = Vec::with_capacity(tests.len());
     let mut all_passed = true;
     let mut first_failure_index: Option<usize> = None;
+    let mut aborted = false;
 
     for (i, cmd) in tests.iter().enumerate() {
-        let result = run_single_test(cmd, cwd);
+        if *abort_rx.borrow() {
+            aborted = true;
+            all_passed = false;
+            break;
+        }
+
+        let (result, was_aborted) = run_single_test(cmd, cwd, abort_rx.clone()).await;
         let passed = result.passed;
         results.push(result);
+
+        if was_aborted {
+            aborted = true;
+            all_passed = false;
+            first_failure_index = Some(i);
+            break;
+        }
 
         if !passed {
             all_passed = false;
             first_failure_index = Some(i);
-            break; // short-circuit
+            break;
         }
     }
 
@@ -65,54 +89,134 @@ pub fn run_tests(tests: &[String], cwd: &Path) -> TestResults {
         results,
         all_passed,
         first_failure_index,
+        aborted,
     }
 }
 
-/// Run a single shell command and capture its output.
-fn run_single_test(cmd: &str, cwd: &Path) -> TestResult {
-    let output = Command::new("sh")
+/// Run a single shell command and capture its output, racing against an abort signal.
+async fn run_single_test(
+    cmd: &str,
+    cwd: &Path,
+    mut abort_rx: watch::Receiver<bool>,
+) -> (TestResult, bool) {
+    let spawn_result = Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
-        .output();
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
 
-    match output {
-        Ok(out) => {
-            let exit_code = out.status.code();
-            let passed = out.status.success();
+    let mut child = match spawn_result {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                TestResult {
+                    command: cmd.to_string(),
+                    exit_code: None,
+                    output_tail: format!("failed to execute command: {e}"),
+                    passed: false,
+                },
+                false,
+            );
+        }
+    };
 
-            // Combine stdout and stderr, then keep only the last TAIL_LINES lines.
-            let combined = {
-                let mut buf = String::from_utf8_lossy(&out.stdout).into_owned();
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                if !stderr.is_empty() {
-                    if !buf.is_empty() && !buf.ends_with('\n') {
-                        buf.push('\n');
-                    }
-                    buf.push_str(&stderr);
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    tokio::select! {
+        status = child.wait() => {
+            match status {
+                Ok(exit_status) => {
+                    let exit_code = exit_status.code();
+                    let passed = exit_status.success();
+                    let stdout = read_to_string(stdout_handle).await;
+                    let stderr = read_to_string(stderr_handle).await;
+                    let combined = combine(&stdout, &stderr);
+                    let output_tail = tail_lines(&combined, TAIL_LINES);
+                    (
+                        TestResult {
+                            command: cmd.to_string(),
+                            exit_code,
+                            output_tail,
+                            passed,
+                        },
+                        false,
+                    )
                 }
-                buf
-            };
-
-            let output_tail = tail_lines(&combined, TAIL_LINES);
-
-            TestResult {
-                command: cmd.to_string(),
-                exit_code,
-                output_tail,
-                passed,
+                Err(e) => (
+                    TestResult {
+                        command: cmd.to_string(),
+                        exit_code: None,
+                        output_tail: format!("failed to execute command: {e}"),
+                        passed: false,
+                    },
+                    false,
+                ),
             }
         }
-        Err(e) => {
-            // Could not even spawn the process.
-            TestResult {
-                command: cmd.to_string(),
-                exit_code: None,
-                output_tail: format!("failed to execute command: {e}"),
-                passed: false,
-            }
+        _ = wait_for_abort(&mut abort_rx) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            (
+                TestResult {
+                    command: cmd.to_string(),
+                    exit_code: None,
+                    output_tail: "aborted by signal".to_string(),
+                    passed: false,
+                },
+                true,
+            )
         }
     }
+}
+
+/// Block until the abort watch channel signals `true`.
+async fn wait_for_abort(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    loop {
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+            return;
+        }
+        if *rx.borrow() {
+            return;
+        }
+    }
+}
+
+/// Drain a piped stdout/stderr handle to a String.
+async fn read_to_string<R>(handle: Option<R>) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    match handle {
+        Some(mut h) => {
+            let mut buf = Vec::new();
+            if h.read_to_end(&mut buf).await.is_ok() {
+                String::from_utf8_lossy(&buf).into_owned()
+            } else {
+                String::new()
+            }
+        }
+        None => String::new(),
+    }
+}
+
+/// Combine stdout and stderr into one buffer, separated by a newline if needed.
+fn combine(stdout: &str, stderr: &str) -> String {
+    let mut buf = stdout.to_string();
+    if !stderr.is_empty() {
+        if !buf.is_empty() && !buf.ends_with('\n') {
+            buf.push('\n');
+        }
+        buf.push_str(stderr);
+    }
+    buf
 }
 
 /// Return the last `n` lines of `text` as a single string.
@@ -133,16 +237,27 @@ fn tail_lines(text: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn cwd() -> PathBuf {
         std::env::current_dir().expect("current dir")
     }
 
-    #[test]
-    fn test_all_pass() {
+    fn never_abort() -> watch::Receiver<bool> {
+        // Leak the sender: `wait_for_abort` already handles a closed channel
+        // by pending forever, but a live sender keeps semantics identical to
+        // the real abort channel the runner passes in.
+        let (tx, rx) = watch::channel(false);
+        Box::leak(Box::new(tx));
+        rx
+    }
+
+    #[tokio::test]
+    async fn test_all_pass() {
         let tests = vec!["true".to_string(), "echo hello".to_string()];
-        let res = run_tests(&tests, &cwd());
+        let res = run_tests(&tests, &cwd(), never_abort()).await;
         assert!(res.all_passed);
+        assert!(!res.aborted);
         assert_eq!(res.results.len(), 2);
         assert!(res.first_failure_index.is_none());
         for r in &res.results {
@@ -151,42 +266,41 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_first_failure_short_circuits() {
+    #[tokio::test]
+    async fn test_first_failure_short_circuits() {
         let tests = vec![
             "true".to_string(),
-            "false".to_string(), // fails
+            "false".to_string(),
             "echo should_not_run".to_string(),
         ];
-        let res = run_tests(&tests, &cwd());
+        let res = run_tests(&tests, &cwd(), never_abort()).await;
         assert!(!res.all_passed);
-        // Only first two tests should have run.
         assert_eq!(res.results.len(), 2);
         assert_eq!(res.first_failure_index, Some(1));
         assert!(res.results[0].passed);
         assert!(!res.results[1].passed);
     }
 
-    #[test]
-    fn test_captures_output() {
+    #[tokio::test]
+    async fn test_captures_output() {
         let tests = vec!["echo hello_world".to_string()];
-        let res = run_tests(&tests, &cwd());
+        let res = run_tests(&tests, &cwd(), never_abort()).await;
         assert!(res.all_passed);
         assert!(res.results[0].output_tail.contains("hello_world"));
     }
 
-    #[test]
-    fn test_captures_stderr() {
+    #[tokio::test]
+    async fn test_captures_stderr() {
         let tests = vec!["echo err_output >&2".to_string()];
-        let res = run_tests(&tests, &cwd());
+        let res = run_tests(&tests, &cwd(), never_abort()).await;
         assert!(res.all_passed);
         assert!(res.results[0].output_tail.contains("err_output"));
     }
 
-    #[test]
-    fn test_exit_code_nonzero() {
+    #[tokio::test]
+    async fn test_exit_code_nonzero() {
         let tests = vec!["exit 42".to_string()];
-        let res = run_tests(&tests, &cwd());
+        let res = run_tests(&tests, &cwd(), never_abort()).await;
         assert!(!res.all_passed);
         assert_eq!(res.results[0].exit_code, Some(42));
         assert!(!res.results[0].passed);
@@ -194,7 +308,6 @@ mod tests {
 
     #[test]
     fn test_tail_lines_truncation() {
-        // Generate 100 lines; tail should keep only last 50.
         let many_lines: String = (0..100)
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
@@ -206,26 +319,68 @@ mod tests {
         assert!(lines[49].contains("line99"));
     }
 
-    #[test]
-    fn test_empty_tests() {
+    #[tokio::test]
+    async fn test_empty_tests() {
         let tests: Vec<String> = vec![];
-        let res = run_tests(&tests, &cwd());
+        let res = run_tests(&tests, &cwd(), never_abort()).await;
         assert!(res.all_passed);
         assert!(res.results.is_empty());
         assert!(res.first_failure_index.is_none());
+        assert!(!res.aborted);
     }
 
-    #[test]
-    fn test_respects_cwd() {
+    #[tokio::test]
+    async fn test_respects_cwd() {
         let tests = vec!["pwd".to_string()];
         let dir = std::env::temp_dir();
-        let res = run_tests(&tests, &dir);
+        let res = run_tests(&tests, &dir, never_abort()).await;
         assert!(res.all_passed);
-        // The output should contain the temp dir path (canonicalize to handle symlinks).
         let canonical = dir.canonicalize().unwrap();
         let output_canonical = PathBuf::from(res.results[0].output_tail.trim())
             .canonicalize()
             .unwrap_or_default();
         assert_eq!(output_canonical, canonical);
+    }
+
+    #[tokio::test]
+    async fn test_abort_signal_interrupts_running_test() {
+        // A long-running test that would take 30 seconds to finish normally.
+        let tests = vec!["sleep 30".to_string()];
+        let (tx, rx) = watch::channel(false);
+
+        // Fire the abort after a short delay, while the test is still running.
+        let abort_handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = tx.send(true);
+        });
+
+        let start = std::time::Instant::now();
+        let res = run_tests(&tests, &cwd(), rx).await;
+        let elapsed = start.elapsed();
+
+        abort_handle.await.ok();
+
+        assert!(res.aborted, "run should be marked aborted");
+        assert!(!res.all_passed);
+        assert_eq!(res.results.len(), 1);
+        assert!(!res.results[0].passed);
+        // The sleep should have been killed well before its 30-second end.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "abort took too long: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_abort_before_start() {
+        // Abort already set before run_tests is called: no test should run.
+        let tests = vec!["echo should_not_run".to_string()];
+        let (tx, rx) = watch::channel(false);
+        let _ = tx.send(true);
+
+        let res = run_tests(&tests, &cwd(), rx).await;
+        assert!(res.aborted);
+        assert!(!res.all_passed);
+        assert!(res.results.is_empty());
     }
 }
