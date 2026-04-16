@@ -124,6 +124,10 @@ pub enum Command {
     Resume {
         /// Plan slug to resume. Defaults to the active plan.
         plan: Option<String>,
+
+        /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Skip the current or specified step.
@@ -138,6 +142,10 @@ pub enum Command {
         /// Reason for skipping.
         #[arg(long)]
         reason: Option<String>,
+
+        /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Export a plan to a portable JSON file.

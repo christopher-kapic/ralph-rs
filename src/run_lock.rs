@@ -323,6 +323,50 @@ mod tests {
     }
 
     #[test]
+    fn run_blocks_concurrent_skip_on_same_project() {
+        // Simulates `ralph run` holding the per-project lock while `ralph skip`
+        // tries to mutate step status. In-process both calls see the same pid,
+        // so the liveness check on the second acquire bails with the shared
+        // "Another ralph run is already active" error.
+        let conn = mem_db();
+
+        let _run_guard = acquire_inner(
+            &conn,
+            "/tmp/proj-contend",
+            Some("feat"),
+            Some("p1"),
+            false,
+            noop_release(),
+        )
+        .expect("run acquires first");
+
+        let err = acquire_inner(
+            &conn,
+            "/tmp/proj-contend",
+            Some("feat"),
+            Some("p1"),
+            false,
+            noop_release(),
+        )
+        .expect_err("skip must not be able to acquire while run holds the lock");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Another ralph run is already active"),
+            "unexpected error: {msg}"
+        );
+
+        // Only one row exists — the winner's — so the loser didn't stomp state.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_locks WHERE project = ?1",
+                params!["/tmp/proj-contend"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn pid_is_alive_self() {
         assert!(pid_is_alive(std::process::id() as i64));
     }

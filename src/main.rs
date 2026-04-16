@@ -488,9 +488,22 @@ fn main() -> Result<()> {
         }
 
         // -- Resume --
-        Command::Resume { plan: plan_slug } => {
+        Command::Resume {
+            plan: plan_slug,
+            force,
+        } => {
             let plan = resolve_plan(&conn, plan_slug, &project, false)?;
             let slug = plan.slug.clone();
+
+            // Acquire the same per-project run lock that `ralph run` uses, so
+            // resume can't race a concurrent run or skip.
+            let _run_lock = run_lock::acquire(
+                &conn,
+                &project,
+                Some(&plan.slug),
+                Some(&plan.id),
+                force,
+            )?;
 
             let rt = tokio::runtime::Runtime::new()?;
             let result = rt.block_on(async {
@@ -517,8 +530,19 @@ fn main() -> Result<()> {
             plan: plan_slug,
             step: step_num,
             reason,
+            force,
         } => {
             let plan = resolve_plan(&conn, plan_slug, &project, false)?;
+
+            // Acquire the same per-project run lock that `ralph run` uses, so
+            // skip can't race a concurrent run or resume.
+            let _run_lock = run_lock::acquire(
+                &conn,
+                &project,
+                Some(&plan.slug),
+                Some(&plan.id),
+                force,
+            )?;
 
             runner::skip_step(&conn, &plan, step_num, reason.as_deref())?;
             Ok(())
