@@ -687,7 +687,13 @@ pub fn skip_step(
 /// Validate that the plan is in a runnable status.
 fn validate_plan_status(plan: &Plan) -> Result<()> {
     match plan.status {
-        PlanStatus::Ready | PlanStatus::InProgress | PlanStatus::Failed => Ok(()),
+        // Aborted is runnable: `resume_plan` routes through `run_plan`, and
+        // the old rejection (with a "use resume to continue" hint) made
+        // resume error out on exactly the plans it was meant to handle.
+        PlanStatus::Ready
+        | PlanStatus::InProgress
+        | PlanStatus::Failed
+        | PlanStatus::Aborted => Ok(()),
         PlanStatus::Planning => bail!(
             "Plan '{}' is still in planning status. Run `plan approve {}` first.",
             plan.slug,
@@ -695,10 +701,6 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
         ),
         PlanStatus::Complete => bail!(
             "Plan '{}' is already complete. Reset steps to re-run.",
-            plan.slug
-        ),
-        PlanStatus::Aborted => bail!(
-            "Plan '{}' was aborted. Use `resume` to continue or reset steps.",
             plan.slug
         ),
         PlanStatus::Archived => bail!(
@@ -778,12 +780,15 @@ fn checkout_existing_branch(workdir: &Path, branch: &str) -> Result<()> {
 fn select_steps(all_steps: &[Step], options: &RunOptions) -> Result<Vec<Step>> {
     let total = all_steps.len();
 
-    // --one: only run the next actionable step (first pending/failed/in_progress).
+    // --one: only run the next actionable step. Aborted is included so
+    // that a Ctrl+C'd step is retryable via `--one` without an explicit
+    // reset, mirroring how the default (range) path already handles it.
     if options.one {
         let next = all_steps.iter().find(|s| {
             s.status == StepStatus::Pending
                 || s.status == StepStatus::Failed
                 || s.status == StepStatus::InProgress
+                || s.status == StepStatus::Aborted
         });
         return Ok(next.cloned().into_iter().collect());
     }
@@ -966,11 +971,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_plan_status_aborted_rejected() {
+    fn test_validate_plan_status_aborted_allows_resume() {
+        // Regression: previously this was rejected with a "use `resume`"
+        // hint, but `resume_plan` itself routes through `run_plan` →
+        // `validate_plan_status`, so the rejection made aborted plans
+        // unresumable. Aborted must be a runnable state.
         let mut plan = make_plan(None);
         plan.status = PlanStatus::Aborted;
-        let err = validate_plan_status(&plan).unwrap_err();
-        assert!(err.to_string().contains("aborted"));
+        assert!(validate_plan_status(&plan).is_ok());
     }
 
     // -- select_steps tests --

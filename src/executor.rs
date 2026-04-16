@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use tokio::sync::watch;
 
@@ -272,6 +272,22 @@ pub async fn execute_step(
         .max_retries
         .unwrap_or(config.max_retries_per_step as i32);
     let max_attempts = max_retries + 1; // first attempt + retries
+
+    // Refuse to run a step that has already exhausted its retry budget.
+    // Without this guard, the retry loop would skip its body entirely and
+    // silently return Failed with zero new work — the user wouldn't know
+    // why nothing happened. Require an explicit reset or wider budget.
+    if step.attempts >= max_attempts {
+        bail!(
+            "Step '{}' has already used all {} attempts — run \
+             `ralph step reset --step-id {}` to retry from scratch, \
+             or raise --max-retries",
+            step.title,
+            max_attempts,
+            step.id,
+        );
+    }
+
     let timeout = if config.timeout_secs == 0 {
         None
     } else {
@@ -323,7 +339,7 @@ pub async fn execute_step(
 
         // Mark step as in-progress and bump attempts.
         storage::update_step_status(conn, &step.id, StepStatus::InProgress)?;
-        increment_step_attempts(conn, &step.id, attempt)?;
+        set_step_attempts(conn, &step.id, attempt)?;
 
         // Build retry context if this is not the first attempt.
         let retry_context = if attempt > 1 {
@@ -554,17 +570,39 @@ pub async fn execute_step(
                 prev_files_modified = changed_files;
             }
 
-            WaitResult::Timeout => {
-                // Timeout: don't count as an attempt (revert the increment).
-                attempt -= 1;
-                increment_step_attempts(conn, &step.id, attempt)?;
+            WaitResult::Timeout { stdout, stderr } => {
+                // Timeouts count as a real attempt — consistent with test
+                // failures and hook failures, and avoids reusing an attempt
+                // number whose execution_logs row already exists (which
+                // would trip the UNIQUE(step_id, attempt) constraint on
+                // the next run).
+                //
+                // Capture any partial changes + parsed JSON so the log
+                // row retains diagnostic context (stdout/stderr/diff/
+                // cost) rather than being a blank "timeout" marker.
+                let parsed = parse_harness_json(&stdout);
+                let has_changes = git::has_uncommitted_changes(workdir)?;
+                let diff = if has_changes {
+                    Some(git::get_diff(workdir)?)
+                } else {
+                    None
+                };
+                let timeout_results = vec!["harness timed out".to_string()];
+                let fail_output = FailureOutput {
+                    diff: diff.as_deref(),
+                    test_results: &timeout_results,
+                    stdout: &stdout,
+                    stderr: &stderr,
+                    parsed: &parsed,
+                    has_changes,
+                };
                 return finalize_failure(
                     &ctx,
                     exec_log.id,
                     duration_secs,
                     attempt,
                     FailureReason::Timeout,
-                    None,
+                    Some(&fail_output),
                 );
             }
 
@@ -581,14 +619,10 @@ pub async fn execute_step(
         }
     }
 
-    // Should not be reachable, but handle gracefully.
-    storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
-    Ok(StepResult {
-        outcome: StepOutcome::Failed,
-        step_id: step.id.clone(),
-        attempts_used: attempt,
-        commit_hash: None,
-    })
+    // Unreachable: the budget guard above rejects steps that enter with
+    // `attempts >= max_attempts`, so the while-loop always runs at least
+    // once, and every terminal state returns from inside the loop.
+    unreachable!("retry loop should always return via one of its inner branches")
 }
 
 // ---------------------------------------------------------------------------
@@ -599,8 +633,10 @@ pub async fn execute_step(
 enum WaitResult {
     /// Process completed (may have succeeded or failed).
     Completed(Result<HarnessOutput>),
-    /// Process exceeded timeout and was killed.
-    Timeout,
+    /// Process exceeded timeout and was killed. The partial stdout/stderr
+    /// captured before the kill are surfaced so the execution log retains
+    /// diagnostic context for the failed attempt.
+    Timeout { stdout: String, stderr: String },
     /// Abort signal received.
     Aborted,
 }
@@ -643,7 +679,12 @@ async fn wait_with_timeout_and_abort(
                 }
                 _ = tokio::time::sleep(dur) => {
                     let _ = child.kill().await;
-                    WaitResult::Timeout
+                    // Drain whatever the harness managed to emit before
+                    // the kill — otherwise the user gets zero diagnostic
+                    // output for a timeout, which now costs a real retry.
+                    let stdout = read_stdout(stdout_handle).await;
+                    let stderr = read_stderr(stderr_handle).await;
+                    WaitResult::Timeout { stdout, stderr }
                 }
                 _ = wait_for_abort(&mut abort_rx) => {
                     graceful_shutdown(&mut child).await;
@@ -831,8 +872,8 @@ fn extract_changed_files_from_diff(diff: &str) -> Vec<String> {
     files
 }
 
-/// Set the attempt count for a step directly.
-fn increment_step_attempts(conn: &Connection, step_id: &str, attempts: i32) -> Result<()> {
+/// Set the attempt count for a step to an absolute value.
+fn set_step_attempts(conn: &Connection, step_id: &str, attempts: i32) -> Result<()> {
     conn.execute(
         "UPDATE steps SET attempts = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
         rusqlite::params![attempts, step_id],
@@ -932,7 +973,7 @@ diff --git a/src/lib.rs b/src/lib.rs
     }
 
     #[test]
-    fn test_increment_step_attempts() {
+    fn test_set_step_attempts() {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
@@ -940,7 +981,7 @@ diff --git a/src/lib.rs b/src/lib.rs
                 .unwrap();
         assert_eq!(step.attempts, 0);
 
-        super::increment_step_attempts(&conn, &step.id, 3).unwrap();
+        super::set_step_attempts(&conn, &step.id, 3).unwrap();
         let updated = storage::get_step(&conn, &step.id).unwrap();
         assert_eq!(updated.attempts, 3);
     }

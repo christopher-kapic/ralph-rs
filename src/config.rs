@@ -88,11 +88,20 @@ impl Default for Config {
             "claude".to_string(),
             HarnessConfig {
                 command: "claude".to_string(),
-                args: vec!["-p".to_string()],
+                // `--permission-mode bypassPermissions` is required for
+                // non-interactive runs — without it, claude falls back to
+                // interactive approval prompts and hangs ralph's subprocess.
+                args: vec![
+                    "-p".to_string(),
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                ],
                 // Claude's `--system-prompt-file` natively loads the agent
                 // definition, and the prompt is a positional argument that
                 // keeps the session interactive.
                 plan_args: vec![
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
                     "--system-prompt-file".to_string(),
                     "{agent_file}".to_string(),
                     "{prompt}".to_string(),
@@ -403,6 +412,17 @@ mod tests {
         assert!(claude.supports_agent_file);
         assert!(claude.supports_json_output);
         assert!(!claude.json_output_args.is_empty());
+        // Non-interactive runs must bypass claude's permission prompts —
+        // otherwise the subprocess blocks waiting for approval input.
+        assert!(claude.args.contains(&"-p".to_string()));
+        assert!(claude.args.contains(&"--permission-mode".to_string()));
+        assert!(claude.args.contains(&"bypassPermissions".to_string()));
+        assert!(claude.plan_args.contains(&"--permission-mode".to_string()));
+        assert!(
+            claude
+                .plan_args
+                .contains(&"bypassPermissions".to_string())
+        );
         // Claude takes the agent file via --system-prompt-file, not via env.
         // `agent_file_env` is only read when supports_agent_file is false,
         // so setting it on claude would be dead config.

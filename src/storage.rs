@@ -386,7 +386,16 @@ pub fn update_step_fields_ext(
 }
 
 /// Reset a step's status to pending and zero out attempts.
+///
+/// Also deletes the step's `execution_logs` rows — otherwise the zeroed
+/// attempt counter collides with the `UNIQUE(step_id, attempt)` constraint
+/// when the executor tries to create a fresh attempt=1 log on the next run
+/// (e.g. via `ralph resume` on an in-progress step).
 pub fn reset_step(conn: &Connection, step_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM execution_logs WHERE step_id = ?1",
+        params![step_id],
+    )?;
     let affected = conn.execute(
         "UPDATE steps SET status = 'pending', attempts = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
         params![step_id],
@@ -1135,6 +1144,30 @@ mod tests {
         assert!(list_steps(&conn, &plan.id).unwrap().is_empty());
         // Logs should cascade delete
         assert!(get_latest_log_for_step(&conn, &step.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_reset_step_clears_execution_logs() {
+        // Regression: `ralph resume` on an in-progress step called reset_step,
+        // which zeroed `attempts` but left old execution_logs in place. The
+        // next run then tried to create attempt=1 again and tripped the
+        // UNIQUE(step_id, attempt) constraint.
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+        update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();
+        create_execution_log(&conn, &step.id, 1, Some("first try"), None).unwrap();
+
+        reset_step(&conn, &step.id).unwrap();
+
+        let reset = get_step(&conn, &step.id).unwrap();
+        assert_eq!(reset.status, StepStatus::Pending);
+        assert_eq!(reset.attempts, 0);
+        assert!(get_latest_log_for_step(&conn, &step.id).unwrap().is_none());
+
+        // And we can now create a fresh attempt=1 log without colliding.
+        create_execution_log(&conn, &step.id, 1, Some("retry"), None).unwrap();
     }
 
     #[test]
