@@ -124,6 +124,10 @@ pub fn acquire(
 
 /// Core acquire logic parameterized by the release closure. Called directly by
 /// tests so they can inject a no-op release and avoid touching the real DB.
+///
+/// The entire query → liveness-check → delete → insert sequence runs inside a
+/// `BEGIN IMMEDIATE` transaction so two concurrent acquirers cannot both pass
+/// the liveness check and both insert a row.
 fn acquire_inner(
     conn: &Connection,
     project: &str,
@@ -132,6 +136,43 @@ fn acquire_inner(
     force: bool,
     release: ReleaseFn,
 ) -> Result<RunLock> {
+    // Make concurrent acquirers (separate processes / connections) wait for a
+    // held transaction instead of immediately erroring with SQLITE_BUSY.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .context("beginning run-lock acquisition transaction")?;
+
+    let result = acquire_txn(conn, project, plan_slug, plan_id, force);
+
+    match &result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")
+                .context("committing run-lock acquisition transaction")?;
+        }
+        Err(_) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+        }
+    }
+
+    result?;
+
+    Ok(RunLock {
+        project: project.to_string(),
+        release: Some(release),
+        clears_exit_cleanup: false,
+    })
+}
+
+/// Body of the acquire transaction. Separated so the outer wrapper can funnel
+/// every exit path through COMMIT/ROLLBACK.
+fn acquire_txn(
+    conn: &Connection,
+    project: &str,
+    plan_slug: Option<&str>,
+    plan_id: Option<&str>,
+    force: bool,
+) -> Result<()> {
     let my_pid = std::process::id() as i64;
 
     if force {
@@ -170,11 +211,7 @@ fn acquire_inner(
     )
     .context("inserting run_locks row")?;
 
-    Ok(RunLock {
-        project: project.to_string(),
-        release: Some(release),
-        clears_exit_cleanup: false,
-    })
+    Ok(())
 }
 
 /// Returns true if a process with `pid` is still running. Uses `kill -0`,
@@ -505,5 +542,96 @@ mod tests {
     fn pid_is_alive_zero_or_negative() {
         assert!(!pid_is_alive(0));
         assert!(!pid_is_alive(-1));
+    }
+
+    /// Opens a file-backed connection with just the `run_locks` table so the
+    /// concurrent-acquire test can drive multiple connections against the same
+    /// underlying database. Mirrors migration v4's schema.
+    fn open_file_db(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).expect("open file db");
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS run_locks (
+                project TEXT PRIMARY KEY,
+                pid INTEGER NOT NULL,
+                plan_id TEXT,
+                plan_slug TEXT,
+                started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn concurrent_acquirers_leave_exactly_one_lock_row() {
+        // N threads each open their own connection to the same file DB and
+        // race to acquire the same project lock. Because all threads share
+        // this test process's pid, every loser hits the live-pid branch and
+        // bails with the "Another ralph run is already active" error. The
+        // BEGIN IMMEDIATE wrapping ensures only one winner inserts a row.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stress.db");
+
+        // Initialize schema up front so threads race only the acquire path.
+        drop(open_file_db(&db_path));
+
+        const THREADS: usize = 16;
+        let project = "/tmp/proj-stress";
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let barrier = Arc::clone(&barrier);
+            let path = db_path.clone();
+            let project = project.to_string();
+            handles.push(std::thread::spawn(move || -> Result<()> {
+                let conn = open_file_db(&path);
+                barrier.wait();
+                let _lock = acquire_inner(
+                    &conn,
+                    &project,
+                    Some("feat"),
+                    Some("p1"),
+                    false,
+                    noop_release(),
+                )?;
+                // Hold the guard briefly so other threads observe the row.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(())
+            }));
+        }
+
+        let mut successes = 0;
+        let mut failures = 0;
+        for h in handles {
+            match h.join().expect("thread join") {
+                Ok(()) => successes += 1,
+                Err(e) => {
+                    let msg = format!("{e}");
+                    assert!(
+                        msg.contains("Another ralph run is already active"),
+                        "unexpected failure: {msg}"
+                    );
+                    failures += 1;
+                }
+            }
+        }
+        assert_eq!(successes, 1, "exactly one acquirer should have won");
+        assert_eq!(failures, THREADS - 1, "every other acquirer should bail");
+
+        // The winning guard was released when its thread exited (noop_release
+        // leaves the row in place), so exactly one row remains.
+        let conn = open_file_db(&db_path);
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_locks WHERE project = ?1",
+                params![project],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "race left behind a duplicate lock row");
     }
 }
