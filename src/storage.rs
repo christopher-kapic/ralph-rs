@@ -74,13 +74,37 @@ pub fn find_active_plan(
     project: &str,
     include_complete: bool,
 ) -> Result<Option<Plan>> {
-    let plans = list_plans(conn, project, false)?;
-    Ok(plans.into_iter().find(|p| {
-        matches!(
-            p.status,
-            PlanStatus::InProgress | PlanStatus::Ready | PlanStatus::Failed
-        ) || (include_complete && p.status == PlanStatus::Complete)
-    }))
+    let mut statuses: Vec<&'static str> = vec![
+        PlanStatus::InProgress.as_str(),
+        PlanStatus::Ready.as_str(),
+        PlanStatus::Failed.as_str(),
+    ];
+    if include_complete {
+        statuses.push(PlanStatus::Complete.as_str());
+    }
+
+    let placeholders = (0..statuses.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT {PLAN_COLUMNS} FROM plans \
+         WHERE project = ?1 AND status IN ({placeholders}) \
+         ORDER BY created_at DESC LIMIT 1"
+    );
+
+    let mut params: Vec<Value> = Vec::with_capacity(statuses.len() + 1);
+    params.push(Value::Text(project.to_string()));
+    for s in &statuses {
+        params.push(Value::Text((*s).to_string()));
+    }
+
+    let mut stmt = conn.prepare(&query)?;
+    let mut rows = stmt.query_map(params_from_iter(params.iter()), Plan::from_row)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
 }
 
 /// List plans. If `all` is false, only return plans for `project`.
@@ -1025,6 +1049,65 @@ mod tests {
 
         let all = list_plans(&conn, "/proj-a", true).unwrap();
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_find_active_plan_filters_by_status() {
+        let conn = setup();
+
+        // Seed one plan per status, plus a same-status plan in another project.
+        let planning = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let ready = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let in_progress = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        let failed = create_plan(&conn, "p4", "/proj", "b4", "d", None, None, &[]).unwrap();
+        let complete = create_plan(&conn, "p5", "/proj", "b5", "d", None, None, &[]).unwrap();
+        let archived = create_plan(&conn, "p6", "/proj", "b6", "d", None, None, &[]).unwrap();
+        let aborted = create_plan(&conn, "p7", "/proj", "b7", "d", None, None, &[]).unwrap();
+        let other = create_plan(&conn, "p8", "/other", "b8", "d", None, None, &[]).unwrap();
+
+        update_plan_status(&conn, &ready.id, PlanStatus::Ready).unwrap();
+        update_plan_status(&conn, &in_progress.id, PlanStatus::InProgress).unwrap();
+        update_plan_status(&conn, &failed.id, PlanStatus::Failed).unwrap();
+        update_plan_status(&conn, &complete.id, PlanStatus::Complete).unwrap();
+        update_plan_status(&conn, &archived.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &aborted.id, PlanStatus::Aborted).unwrap();
+        update_plan_status(&conn, &other.id, PlanStatus::InProgress).unwrap();
+
+        // Only in_progress / ready / failed in "/proj" count as active.
+        let active_ids: std::collections::HashSet<String> = [
+            ready.id.clone(),
+            in_progress.id.clone(),
+            failed.id.clone(),
+        ]
+        .into_iter()
+        .collect();
+        let found = find_active_plan(&conn, "/proj", false).unwrap().unwrap();
+        assert!(active_ids.contains(&found.id));
+        assert_eq!(found.project, "/proj");
+
+        // With include_complete, the complete plan becomes eligible too.
+        let active_with_complete: std::collections::HashSet<String> = [
+            ready.id.clone(),
+            in_progress.id.clone(),
+            failed.id.clone(),
+            complete.id.clone(),
+        ]
+        .into_iter()
+        .collect();
+        let found_inc = find_active_plan(&conn, "/proj", true).unwrap().unwrap();
+        assert!(active_with_complete.contains(&found_inc.id));
+
+        // Archive every active row; nothing should match without include_complete.
+        update_plan_status(&conn, &ready.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &in_progress.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &failed.id, PlanStatus::Archived).unwrap();
+        assert!(find_active_plan(&conn, "/proj", false).unwrap().is_none());
+        // include_complete still resolves to the lone complete plan.
+        let found_complete = find_active_plan(&conn, "/proj", true).unwrap().unwrap();
+        assert_eq!(found_complete.id, complete.id);
+
+        // Planning / aborted / archived are never treated as active.
+        let _ = (planning, aborted);
     }
 
     #[test]
