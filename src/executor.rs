@@ -328,8 +328,29 @@ pub async fn execute_step(
     while attempt < max_attempts {
         attempt += 1;
 
-        // Check abort before starting.
+        // Check abort before starting. Persist the bumped attempt count and
+        // drop an execution-log row so the DB reflects the same attempt number
+        // that StepResult reports and the abort has a visible audit trail.
         if *abort_rx.borrow() {
+            set_step_attempts(conn, &step.id, attempt)?;
+            let exec_log =
+                storage::create_execution_log(conn, &step.id, attempt, None, None)?;
+            storage::update_execution_log(
+                conn,
+                exec_log.id,
+                Some(0.0),
+                None,
+                &["aborted before harness started".to_string()],
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
             storage::update_step_status(conn, &step.id, StepStatus::Aborted)?;
             return Ok(StepResult {
                 outcome: StepOutcome::Aborted,
@@ -1061,5 +1082,89 @@ diff --git a/src/lib.rs b/src/lib.rs
         let summaries = build_prior_step_summaries(&conn, &plan, &s3).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].title, "First");
+    }
+
+    /// Regression: aborting at the pre-log boundary must persist the bumped
+    /// attempt count and leave behind an execution_log row so the DB agrees
+    /// with `StepResult.attempts_used`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_abort_before_pre_log_persists_attempts_and_log() {
+        use std::fs;
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        fs::write(dir.join("README.md"), "init").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("claude"),
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Step", "desc", None, None, &[], None, None,
+        )
+        .unwrap();
+        assert_eq!(step.attempts, 0);
+
+        let (tx, rx) = watch::channel(false);
+        tx.send(true).unwrap();
+
+        let config = Config::default();
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+        };
+
+        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Aborted);
+        assert_eq!(result.attempts_used, 1);
+
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Aborted);
+        assert_eq!(
+            updated.attempts, result.attempts_used,
+            "DB attempts must match StepResult.attempts_used"
+        );
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1, "exactly one execution_log row for the abort");
+        assert_eq!(logs[0].attempt, 1);
     }
 }
