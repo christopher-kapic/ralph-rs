@@ -684,6 +684,8 @@ async fn wait_with_timeout_and_abort(
                 }
                 _ = tokio::time::sleep(dur) => {
                     let _ = child.kill().await;
+                    // Reap the child so it doesn't linger as a zombie on Unix.
+                    let _ = child.wait().await;
                     // Drain whatever the harness managed to emit before
                     // the kill — otherwise the user gets zero diagnostic
                     // output for a timeout, which now costs a real retry.
