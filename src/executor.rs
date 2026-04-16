@@ -887,7 +887,7 @@ fn build_prior_step_summaries(
     let all_steps = storage::list_steps(conn, &plan.id)?;
     let mut summaries = Vec::new();
 
-    for s in &all_steps {
+    for (idx, s) in all_steps.iter().enumerate() {
         if s.sort_key >= current_step.sort_key {
             break;
         }
@@ -915,6 +915,10 @@ fn build_prior_step_summaries(
             };
 
             summaries.push(PriorStepSummary {
+                // Real 1-based position in the plan — not the summary slice
+                // index, so skipped/pending steps keep their numbering
+                // stable when some predecessors are filtered out.
+                number: idx + 1,
                 title: s.title.clone(),
                 status: s.status,
                 files_changed,
@@ -1158,6 +1162,42 @@ new file mode 100644
         let summaries = build_prior_step_summaries(&conn, &plan, &s3).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].title, "First");
+        assert_eq!(summaries[0].number, 1);
+    }
+
+    /// Prior-step summaries must carry each step's real 1-based position in
+    /// the plan, not the index in the filtered slice. When a pending step
+    /// sits between two completed steps, the second summary should be
+    /// numbered 3 (its plan position) rather than 2 (its slice index).
+    #[test]
+    fn test_build_prior_step_summaries_preserves_real_numbers_with_gap() {
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+
+        let (s1, _) =
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
+        let (_s2, _) =
+            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None)
+                .unwrap();
+        let (s3, _) =
+            storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None)
+                .unwrap();
+        let (s4, _) =
+            storage::create_step(&conn, &plan.id, "Fourth", "d4", None, None, &[], None, None)
+                .unwrap();
+
+        // s1 and s3 are complete; s2 is pending (the gap).
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        storage::update_step_status(&conn, &s3.id, StepStatus::Complete).unwrap();
+
+        let summaries = build_prior_step_summaries(&conn, &plan, &s4).unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].title, "First");
+        assert_eq!(summaries[0].number, 1);
+        assert_eq!(summaries[1].title, "Third");
+        // Plan position (3), not slice index (2).
+        assert_eq!(summaries[1].number, 3);
     }
 
     /// Regression: aborting at the pre-log boundary must persist the bumped

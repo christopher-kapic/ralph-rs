@@ -20,6 +20,10 @@ pub struct RetryContext {
 /// Summary of a completed prior step for context injection.
 #[derive(Debug, Clone)]
 pub struct PriorStepSummary {
+    /// 1-based step number within the plan's full step list. Preserved from
+    /// the plan (not the filtered prior-step slice) so skipped/aborted steps
+    /// do not shift the numbering visible to the agent.
+    pub number: usize,
     /// Step title.
     pub title: String,
     /// Step status (should be Complete or Skipped).
@@ -153,7 +157,7 @@ fn format_plan_context(plan: &Plan) -> String {
 fn format_prior_steps(prior_steps: &[PriorStepSummary]) -> String {
     let mut lines = vec!["## Context from Prior Steps".to_string()];
 
-    for (i, step) in prior_steps.iter().enumerate() {
+    for step in prior_steps {
         let status_marker = match step.status {
             StepStatus::Complete => "completed",
             StepStatus::Skipped => "skipped",
@@ -165,7 +169,7 @@ fn format_prior_steps(prior_steps: &[PriorStepSummary]) -> String {
 
         let mut step_line = format!(
             "\n**Step {} ({status_marker}): {title}**",
-            i + 1,
+            step.number,
             title = step.title,
         );
 
@@ -301,6 +305,7 @@ mod tests {
         let plan = make_plan();
         let step = make_step();
         let prior_steps = vec![PriorStepSummary {
+            number: 1,
             title: "Set up project".to_string(),
             status: StepStatus::Complete,
             files_changed: vec!["Cargo.toml".to_string(), "src/main.rs".to_string()],
@@ -529,12 +534,14 @@ mod tests {
     fn test_format_prior_steps_multiple() {
         let steps = vec![
             PriorStepSummary {
+                number: 3,
                 title: "Step A".to_string(),
                 status: StepStatus::Complete,
                 files_changed: vec!["a.rs".to_string()],
                 description: "Did A".to_string(),
             },
             PriorStepSummary {
+                number: 7,
                 title: "Step B".to_string(),
                 status: StepStatus::Skipped,
                 files_changed: vec![],
@@ -543,8 +550,11 @@ mod tests {
         ];
 
         let result = format_prior_steps(&steps);
-        assert!(result.contains("Step 1 (completed): Step A"));
-        assert!(result.contains("Step 2 (skipped): Step B"));
+        // Numbers come from the plan, not the filtered slice.
+        assert!(result.contains("Step 3 (completed): Step A"));
+        assert!(result.contains("Step 7 (skipped): Step B"));
+        assert!(!result.contains("Step 1 (completed)"));
+        assert!(!result.contains("Step 2 (skipped)"));
         assert!(result.contains("a.rs"));
     }
 
@@ -552,18 +562,21 @@ mod tests {
     fn test_format_prior_steps_includes_failed_and_aborted() {
         let steps = vec![
             PriorStepSummary {
+                number: 1,
                 title: "Worked".to_string(),
                 status: StepStatus::Complete,
                 files_changed: vec!["ok.rs".to_string()],
                 description: "Fine".to_string(),
             },
             PriorStepSummary {
+                number: 2,
                 title: "Broke things".to_string(),
                 status: StepStatus::Failed,
                 files_changed: vec!["bad.rs".to_string()],
                 description: "Tests failed after edit".to_string(),
             },
             PriorStepSummary {
+                number: 3,
                 title: "User bailed".to_string(),
                 status: StepStatus::Aborted,
                 files_changed: vec![],
@@ -588,6 +601,7 @@ mod tests {
         let plan = make_plan();
         let step = make_step();
         let prior = vec![PriorStepSummary {
+            number: 1,
             title: "Prior".to_string(),
             status: StepStatus::Complete,
             files_changed: vec![],
