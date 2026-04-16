@@ -5,6 +5,7 @@
 // plus a PID liveness check to recover from crashed runs.
 
 use std::process::Command;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -75,13 +76,10 @@ fn sql_escape_single_quotes(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// Delete this process's run_locks row for `project`. Shared by the normal
-/// Drop-path release closure and the forced-exit cleanup so both behave
-/// identically.
-fn release_row_by_project(project: &str) -> Result<()> {
-    let conn = Connection::open(db::db_path()?)
-        .with_context(|| "reopening database to release run lock")?;
-    conn.execute("PRAGMA foreign_keys = ON;", [])?;
+/// Delete this process's run_locks row for `project` using an already-open
+/// connection. Shared by the normal Drop-path release closure and the
+/// forced-exit cleanup so both behave identically and neither reopens the DB.
+fn release_row_with_conn(conn: &Connection, project: &str) -> Result<()> {
     let my_pid = std::process::id() as i64;
     conn.execute(
         "DELETE FROM run_locks WHERE project = ?1 AND pid = ?2",
@@ -101,17 +99,41 @@ pub fn acquire(
     plan_id: Option<&str>,
     force: bool,
 ) -> Result<RunLock> {
-    // Production release: reopen a fresh connection (the caller's `conn` is a
-    // borrow, not an owned value we could stash in the guard) and pid-scope
-    // the DELETE so a racing reclaim of a stale row can't be clobbered.
-    let release: ReleaseFn = Box::new(release_row_by_project);
+    // Open one dedicated connection at acquire time and share it between the
+    // Drop-path release closure and the forced-exit cleanup. Keeping the
+    // connection alive for the guard's lifetime means neither release path
+    // has to reopen the database (which could fail if the file is briefly
+    // unavailable). The caller's `conn` is a borrow we can't stash, so we
+    // open our own here.
+    let release_conn = Connection::open(db::db_path()?)
+        .with_context(|| "opening database for run lock release")?;
+    release_conn.execute("PRAGMA foreign_keys = ON;", [])?;
+    let release_conn = Arc::new(StdMutex::new(release_conn));
+
+    let release_conn_for_drop = Arc::clone(&release_conn);
+    let release: ReleaseFn = Box::new(move |project| {
+        let conn = release_conn_for_drop
+            .lock()
+            .map_err(|e| anyhow::anyhow!("run lock release connection poisoned: {e}"))?;
+        release_row_with_conn(&conn, project)
+    });
     let mut lock = acquire_inner(conn, project, plan_slug, plan_id, force, release)?;
 
     // Register a forced-exit cleanup so a double Ctrl+C (which calls
     // std::process::exit(130) and skips Drop) still releases the lock.
     let project_owned = project.to_string();
+    let release_conn_for_signal = Arc::clone(&release_conn);
     crate::signal::set_exit_cleanup(Box::new(move || {
-        if let Err(e) = release_row_by_project(&project_owned) {
+        let conn = match release_conn_for_signal.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "warning: run lock release connection poisoned during forced exit: {e}"
+                );
+                return;
+            }
+        };
+        if let Err(e) = release_row_with_conn(&conn, &project_owned) {
             eprintln!(
                 "warning: failed to release run lock during forced exit for {}: {}",
                 project_owned, e
@@ -563,6 +585,84 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn release_closure_reuses_shared_connection() {
+        // Mirrors the production pattern: open a dedicated connection at
+        // acquire time, wrap it in Arc<Mutex<_>>, and hand clones into both
+        // the Drop-path release closure and (conceptually) the forced-exit
+        // cleanup. Verifying this here ensures the release path deletes the
+        // row via the shared conn — without opening a new one.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.db");
+
+        // Main working connection (what acquire_inner drives).
+        let conn = open_file_db(&db_path);
+
+        // Dedicated release connection to the same DB file, shared via Arc.
+        let release_conn = Arc::new(StdMutex::new(open_file_db(&db_path)));
+        let release_conn_for_drop = Arc::clone(&release_conn);
+        let release: ReleaseFn = Box::new(move |project| {
+            let c = release_conn_for_drop
+                .lock()
+                .map_err(|e| anyhow::anyhow!("poisoned: {e}"))?;
+            release_row_with_conn(&c, project)
+        });
+
+        {
+            let _lock = acquire_inner(
+                &conn,
+                "/tmp/proj-share",
+                Some("x"),
+                Some("p"),
+                false,
+                release,
+            )
+            .expect("acquire");
+        }
+
+        // Row deleted by the release closure using the shared conn.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_locks WHERE project = ?1",
+                params!["/tmp/proj-share"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "release closure should have deleted the row via the shared connection"
+        );
+
+        // The Arc still holds the release conn (only one ref now, since the
+        // release closure was consumed by Drop). Closing it explicitly is
+        // optional — it drops with the test scope.
+        drop(release_conn);
+    }
+
+    #[test]
+    fn release_row_with_conn_is_pid_scoped() {
+        // A stray row owned by another pid must survive our release call so
+        // concurrent processes don't clobber each other's locks.
+        let conn = mem_db();
+        let other_pid: i64 = 0x7FFF_FFFD;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            params!["/tmp/proj-other", other_pid, "p-other", "slug-other"],
+        )
+        .unwrap();
+
+        release_row_with_conn(&conn, "/tmp/proj-other").expect("release");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_locks WHERE project = ?1",
+                params!["/tmp/proj-other"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "release must only delete rows for our own pid");
     }
 
     #[test]
