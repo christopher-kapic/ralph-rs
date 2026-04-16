@@ -57,6 +57,30 @@ pub(crate) fn run_exit_cleanup() {
 // Shutdown controller
 // ---------------------------------------------------------------------------
 
+/// Handle returned from [`ShutdownController::spawn_signal_listener`] that
+/// lets application code trigger a graceful shutdown programmatically — the
+/// same effect as receiving a first Ctrl+C. Cheap to clone.
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    abort_tx: watch::Sender<bool>,
+}
+
+impl ShutdownHandle {
+    /// Request graceful shutdown. Sets the abort flag so the current step
+    /// finishes its lifecycle, then the runner exits. Idempotent.
+    #[allow(dead_code)]
+    pub fn shutdown(&self) {
+        let _ = self.abort_tx.send(true);
+    }
+
+    /// Whether shutdown has already been requested (by signal or by a prior
+    /// [`shutdown`](Self::shutdown) call).
+    #[allow(dead_code)]
+    pub fn is_shutdown_requested(&self) -> bool {
+        *self.abort_tx.borrow()
+    }
+}
+
 /// Manages the two-stage shutdown lifecycle.
 ///
 /// Create one per run via [`ShutdownController::new`], then call
@@ -101,12 +125,18 @@ impl ShutdownController {
     ///   a message, and allows the current step to finish gracefully.
     /// - **Second signal**: prints a force-exit message and calls
     ///   [`std::process::exit(130)`] (128 + SIGINT) to terminate immediately.
-    pub fn spawn_signal_listener(self) -> watch::Receiver<bool> {
+    ///
+    /// Returns a [`ShutdownHandle`] for triggering shutdown programmatically
+    /// and a receiver for the abort flag.
+    pub fn spawn_signal_listener(self) -> (ShutdownHandle, watch::Receiver<bool>) {
         let rx = self.abort_rx.clone();
+        let handle = ShutdownHandle {
+            abort_tx: self.abort_tx.clone(),
+        };
         tokio::spawn(async move {
             Self::listen(self.abort_tx, self.first_signal_received).await;
         });
-        rx
+        (handle, rx)
     }
 
     /// Internal listener loop.
@@ -167,8 +197,17 @@ pub fn install() -> Result<(ShutdownController, watch::Receiver<bool>)> {
 ///
 /// Must be called from within an active tokio runtime.
 pub fn install_and_spawn() -> watch::Receiver<bool> {
-    let controller = ShutdownController::new();
-    controller.spawn_signal_listener()
+    let (_handle, rx) = install_and_spawn_with_handle();
+    rx
+}
+
+/// Install signal handlers and spawn the listener task, returning both a
+/// [`ShutdownHandle`] (for programmatic shutdown) and the abort receiver.
+///
+/// Must be called from within an active tokio runtime.
+#[allow(dead_code)]
+pub fn install_and_spawn_with_handle() -> (ShutdownHandle, watch::Receiver<bool>) {
+    ShutdownController::new().spawn_signal_listener()
 }
 
 // ---------------------------------------------------------------------------
@@ -241,11 +280,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spawn_signal_listener_returns_rx() {
+    async fn test_spawn_signal_listener_returns_handle_and_rx() {
         let controller = ShutdownController::new();
-        let rx = controller.spawn_signal_listener();
+        let (handle, rx) = controller.spawn_signal_listener();
         // Initially false.
         assert!(!*rx.borrow());
+        assert!(!handle.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_handle_triggers_abort() {
+        // Regression for L36: application code can trigger graceful shutdown
+        // via the handle returned from spawn_signal_listener, even though
+        // spawn_signal_listener itself consumes the controller.
+        let controller = ShutdownController::new();
+        let (handle, mut rx) = controller.spawn_signal_listener();
+        assert!(!*rx.borrow());
+
+        handle.shutdown();
+
+        // Wait for the value to propagate through the watch channel.
+        rx.changed().await.unwrap();
+        assert!(*rx.borrow());
+        assert!(handle.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn test_install_and_spawn_with_handle() {
+        let (handle, rx) = install_and_spawn_with_handle();
+        assert!(!*rx.borrow());
+        assert!(!handle.is_shutdown_requested());
     }
 
     #[tokio::test]
