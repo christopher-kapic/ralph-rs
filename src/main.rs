@@ -390,7 +390,7 @@ fn main() -> Result<()> {
                     );
                 }
                 if plan_slug.is_some() {
-                    eprintln!("Warning: --plan is ignored when --all is set.");
+                    eprintln!("Warning: plan slug argument is ignored when --all is set.");
                 }
 
                 // Acquire the per-project run lock so two concurrent `ralph run`
