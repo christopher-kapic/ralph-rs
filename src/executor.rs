@@ -205,6 +205,7 @@ fn finalize_failure(
             o.parsed.cost_usd,
             o.parsed.input_tokens,
             o.parsed.output_tokens,
+            o.parsed.session_id.as_deref(),
         )?;
     } else {
         storage::update_execution_log(
@@ -215,6 +216,7 @@ fn finalize_failure(
             &[],
             rolled_back,
             false,
+            None,
             None,
             None,
             None,
@@ -392,6 +394,7 @@ pub async fn execute_step(
                 None,
                 None,
                 None,
+                None,
             )?;
             if attempt >= max_attempts {
                 storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
@@ -510,6 +513,7 @@ pub async fn execute_step(
                         parsed.cost_usd,
                         parsed.input_tokens,
                         parsed.output_tokens,
+                        parsed.session_id.as_deref(),
                     )?;
 
                     // Mark step as complete.
@@ -564,6 +568,7 @@ pub async fn execute_step(
                     parsed.cost_usd,
                     parsed.input_tokens,
                     parsed.output_tokens,
+                    parsed.session_id.as_deref(),
                 )?;
                 prev_diff = diff;
                 prev_test_output = Some(test_output_summary);

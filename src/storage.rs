@@ -488,6 +488,7 @@ pub fn update_execution_log(
     cost_usd: Option<f64>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
+    session_id: Option<&str>,
 ) -> Result<()> {
     let test_results_json = serde_json::to_string(test_results)?;
 
@@ -503,8 +504,9 @@ pub fn update_execution_log(
             harness_stderr = ?8,
             cost_usd = ?9,
             input_tokens = ?10,
-            output_tokens = ?11
-         WHERE id = ?12",
+            output_tokens = ?11,
+            session_id = COALESCE(?12, session_id)
+         WHERE id = ?13",
         params![
             duration_secs,
             diff,
@@ -517,6 +519,7 @@ pub fn update_execution_log(
             cost_usd,
             input_tokens,
             output_tokens,
+            session_id,
             log_id,
         ],
     )?;
@@ -1256,6 +1259,7 @@ mod tests {
             Some(0.05),
             Some(1000),
             Some(500),
+            Some("session-abc"),
         )
         .unwrap();
 
@@ -1271,6 +1275,41 @@ mod tests {
         assert_eq!(updated.cost_usd, Some(0.05));
         assert_eq!(updated.input_tokens, Some(1000));
         assert_eq!(updated.output_tokens, Some(500));
+        assert_eq!(updated.session_id.as_deref(), Some("session-abc"));
+    }
+
+    #[test]
+    fn test_update_execution_log_preserves_session_id_when_none() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+        let log = create_execution_log(&conn, &step.id, 1, None, Some("initial-session")).unwrap();
+
+        update_execution_log(
+            &conn,
+            log.id,
+            Some(10.0),
+            None,
+            &[],
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let updated = get_latest_log_for_step(&conn, &step.id).unwrap().unwrap();
+        assert_eq!(
+            updated.session_id.as_deref(),
+            Some("initial-session"),
+            "session_id set at creation should be preserved when update passes None"
+        );
     }
 
     #[test]
