@@ -523,7 +523,7 @@ pub fn cmd_step_set_hook(
     let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
 
     storage::attach_hook_to_step(conn, &plan.id, &step.id, lifecycle.as_str(), hook_name)?;
-    eprintln!("Attached hook '{hook_name}' to step {display_num} of '{plan_slug}' at {lifecycle}");
+    println!("Attached hook '{hook_name}' to step {display_num} of '{plan_slug}' at {lifecycle}");
     Ok(())
 }
 
@@ -553,7 +553,7 @@ pub fn cmd_step_unset_hook(
     if removed == 0 {
         bail!("No hook '{hook_name}' attached to step {display_num} at {lifecycle}");
     }
-    eprintln!("Detached hook '{hook_name}' from step {display_num} of '{plan_slug}'");
+    println!("Detached hook '{hook_name}' from step {display_num} of '{plan_slug}'");
     Ok(())
 }
 

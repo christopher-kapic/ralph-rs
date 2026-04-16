@@ -440,7 +440,7 @@ pub fn cmd_plan_set_hook(
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
     storage::attach_hook_to_plan(conn, &plan.id, lifecycle.as_str(), hook_name)?;
-    eprintln!("Attached plan-wide hook '{hook_name}' to '{plan_slug}' at {lifecycle}");
+    println!("Attached plan-wide hook '{hook_name}' to '{plan_slug}' at {lifecycle}");
     Ok(())
 }
 
@@ -458,7 +458,7 @@ pub fn cmd_plan_unset_hook(
     if removed == 0 {
         bail!("No plan-wide hook '{hook_name}' attached to '{plan_slug}' at {lifecycle}");
     }
-    eprintln!("Detached plan-wide hook '{hook_name}' from '{plan_slug}'");
+    println!("Detached plan-wide hook '{hook_name}' from '{plan_slug}'");
     Ok(())
 }
 
@@ -473,7 +473,7 @@ pub fn cmd_plan_hooks(
     let rows = storage::list_all_hooks_for_plan(conn, &plan.id)?;
 
     if rows.is_empty() {
-        eprintln!("No hooks attached to plan '{plan_slug}'.");
+        println!("No hooks attached to plan '{plan_slug}'.");
         return Ok(());
     }
 
@@ -481,7 +481,7 @@ pub fn cmd_plan_hooks(
     let step_num =
         |sid: &str| -> Option<usize> { steps.iter().position(|s| s.id == sid).map(|i| i + 1) };
 
-    eprintln!("Hooks attached to plan '{plan_slug}':");
+    println!("Hooks attached to plan '{plan_slug}':");
     for row in &rows {
         let target = match &row.step_id {
             None => "plan-wide".to_string(),
