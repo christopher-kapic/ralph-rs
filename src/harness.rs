@@ -66,7 +66,24 @@ pub fn build_harness_args(
 ) -> Vec<String> {
     let mut args = harness_config.args.clone();
 
-    // Replace {prompt} placeholders or append prompt at end
+    // Resolve `{agent_file}` placeholders BEFORE substituting `{prompt}`.
+    // Otherwise, a prompt whose text contains the literal string
+    // `{agent_file}` (e.g. a step description discussing the placeholder
+    // system) would be scanned by `remove_agent_file_args` after
+    // substitution, causing the prompt arg AND its preceding flag
+    // (typically `-p`) to be stripped entirely.
+    if let Some(agent_path) = agent_file {
+        let agent_path_str = agent_path.to_string_lossy().to_string();
+        inject_agent_file(harness_name, harness_config, &mut args, &agent_path_str);
+    } else {
+        // No agent file: strip any `{agent_file}` placeholder tokens and
+        // the preceding flag they go with.
+        remove_agent_file_args(&mut args);
+    }
+
+    // Replace {prompt} placeholders or append prompt at end. This must
+    // happen AFTER agent-file resolution so the prompt text is opaque
+    // to both passes.
     let has_prompt_placeholder = args.iter().any(|a| a.contains(PROMPT_PLACEHOLDER));
     if has_prompt_placeholder {
         args = args
@@ -76,17 +93,6 @@ pub fn build_harness_args(
     } else {
         // For most harnesses, the prompt is appended as the last arg
         args.push(prompt.to_string());
-    }
-
-    // Handle agent file injection based on harness type
-    if let Some(agent_path) = agent_file {
-        let agent_path_str = agent_path.to_string_lossy().to_string();
-        inject_agent_file(harness_name, harness_config, &mut args, &agent_path_str);
-    }
-
-    // Remove {agent_file} placeholder and its surrounding flag if no agent file
-    if agent_file.is_none() {
-        remove_agent_file_args(&mut args);
     }
 
     // Forward an optional model selection via the harness's model_args
@@ -588,6 +594,77 @@ mod tests {
         let mut args = vec!["-p".to_string(), "prompt".to_string()];
         remove_agent_file_args(&mut args);
         assert_eq!(args, vec!["-p", "prompt"]);
+    }
+
+    #[test]
+    fn test_build_harness_args_prompt_containing_agent_file_token_no_agent() {
+        // Regression test for the `{agent_file}` / `{prompt}` collision:
+        // if a prompt text happens to contain the literal string
+        // `{agent_file}` (e.g. a step description discussing the
+        // placeholder system itself), the prompt substitution must run
+        // AFTER `remove_agent_file_args` so the removal pass does not
+        // see the placeholder inside the substituted prompt and strip
+        // the preceding `-p` flag along with it.
+        let config = Config::default();
+        let hc = &config.harnesses["claude"];
+
+        let prompt_with_placeholder =
+            "Fix the bug where {agent_file} collides with prompt substitution.";
+
+        // No agent file — this is the path that invokes remove_agent_file_args.
+        let args = build_harness_args("claude", hc, prompt_with_placeholder, None, None);
+
+        // The `-p` flag and its surrounding default args must survive.
+        assert!(
+            args.iter().any(|a| a == "-p"),
+            "-p flag was stripped; got args: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--permission-mode"),
+            "--permission-mode flag was stripped; got args: {args:?}"
+        );
+        // The prompt text must appear verbatim as an arg (including the
+        // literal `{agent_file}` token — it is opaque user content, not
+        // a placeholder for this harness to interpret).
+        assert!(
+            args.iter().any(|a| a == prompt_with_placeholder),
+            "prompt was stripped or mangled; got args: {args:?}"
+        );
+    }
+
+    #[test]
+    fn test_build_harness_args_prompt_containing_agent_file_token_with_agent() {
+        // Companion case: when an agent file IS provided, the prompt's
+        // literal `{agent_file}` token must likewise be preserved — it's
+        // not a placeholder for the prompt text to be interpolated into.
+        let config = Config::default();
+        let hc = &config.harnesses["claude"];
+
+        let prompt_with_placeholder = "Step talks about {agent_file} placeholder.";
+        let agent_path = Path::new("/tmp/agent.md");
+
+        let args = build_harness_args(
+            "claude",
+            hc,
+            prompt_with_placeholder,
+            Some(agent_path),
+            None,
+        );
+
+        // Agent file flag was injected…
+        assert!(
+            args.iter().any(|a| a == "--system-prompt-file"),
+            "agent file flag missing; got args: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "/tmp/agent.md"),
+            "agent path missing; got args: {args:?}"
+        );
+        // …and the prompt is present verbatim (with `{agent_file}` intact).
+        assert!(
+            args.iter().any(|a| a == prompt_with_placeholder),
+            "prompt was mangled; got args: {args:?}"
+        );
     }
 
     #[test]

@@ -189,11 +189,13 @@ fn build_plan_harness_args(
     // Template path: substitute {prompt} and {agent_file} in place using
     // substring replacement so tokens like "--prompt={prompt}" and
     // "--agent-file={agent_file}" work, matching build_harness_args semantics.
-    let mut args: Vec<String> = harness_config
-        .plan_args
-        .iter()
-        .map(|tok| tok.replace("{prompt}", &effective_prompt))
-        .collect();
+    //
+    // Resolve `{agent_file}` BEFORE `{prompt}` so a prompt that happens
+    // to contain the literal string `{agent_file}` (e.g. a plan
+    // description discussing the placeholder system) cannot collide
+    // with the no-agent removal pass — see harness::build_harness_args
+    // for the matching fix.
+    let mut args: Vec<String> = harness_config.plan_args.clone();
 
     if let Some(path) = agent_file_path {
         let agent_file_str = path.to_string_lossy();
@@ -204,6 +206,12 @@ fn build_plan_harness_args(
         // Mirror build_harness_args's no-agent-file behavior: strip any
         // `{agent_file}` placeholder tokens and the preceding flag they go with.
         harness::remove_agent_file_args(&mut args);
+    }
+
+    // Now that `{agent_file}` is resolved, substitute `{prompt}` into
+    // every arg position.
+    for arg in args.iter_mut() {
+        *arg = arg.replace("{prompt}", &effective_prompt);
     }
 
     args
@@ -379,6 +387,54 @@ mod tests {
         let path_str = agent_file.path().to_string_lossy().into_owned();
         assert!(args.contains(&path_str));
         assert!(!args.iter().any(|a| a.contains("{agent_file}")));
+    }
+
+    #[test]
+    fn test_build_plan_harness_args_prompt_containing_agent_file_token() {
+        // Regression test mirroring harness::build_harness_args: if the
+        // prompt text contains the literal string `{agent_file}` (e.g. a
+        // plan description discussing the placeholder system itself), the
+        // no-agent removal pass must run BEFORE prompt substitution so
+        // the preceding flag (here, claude's `--system-prompt-file` or a
+        // harness's `-p` / `--prompt`) is not stripped along with the
+        // prompt arg.
+        let config = Config::default();
+        let agent_content = test_agent_content();
+        let prompt_with_placeholder =
+            "Plan that discusses the {agent_file} placeholder collision bug.";
+
+        // No agent file: hits the remove_agent_file_args branch for
+        // any harness whose plan_args contain a `{agent_file}` token.
+        let claude_args = build_plan_harness_args(
+            "claude",
+            &config,
+            None,
+            &agent_content,
+            prompt_with_placeholder,
+        );
+        // Claude's plan_args include `--permission-mode bypassPermissions`
+        // which must survive unconditionally — and the prompt itself must
+        // appear verbatim with its literal `{agent_file}` intact.
+        assert!(
+            claude_args.iter().any(|a| a == "--permission-mode"),
+            "--permission-mode was stripped; got args: {claude_args:?}"
+        );
+        assert!(
+            claude_args.iter().any(|a| a == "bypassPermissions"),
+            "bypassPermissions was stripped; got args: {claude_args:?}"
+        );
+        assert!(
+            claude_args.iter().any(|a| a == prompt_with_placeholder),
+            "prompt was stripped or mangled; got args: {claude_args:?}"
+        );
+        // No residual `{agent_file}` token in args (outside the prompt).
+        // Every arg equal to just "{agent_file}" on its own would indicate
+        // a failed removal; the prompt-as-a-whole containing the substring
+        // is fine and expected.
+        assert!(
+            !claude_args.iter().any(|a| a == "{agent_file}"),
+            "raw {{agent_file}} token leaked through; got args: {claude_args:?}"
+        );
     }
 
     #[test]
