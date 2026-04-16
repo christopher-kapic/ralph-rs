@@ -219,14 +219,19 @@ fn combine(stdout: &str, stderr: &str) -> String {
     buf
 }
 
-/// Return the last `n` lines of `text` as a single string.
+/// Return the last `n` lines of `text` as a single string, preserving the
+/// input's trailing newline (present or absent) in both the fits-within-limit
+/// and truncated paths.
 fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= n {
-        text.to_string()
-    } else {
-        lines[lines.len() - n..].join("\n")
+        return text.to_string();
     }
+    let mut result = lines[lines.len() - n..].join("\n");
+    if text.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +322,17 @@ mod tests {
         assert_eq!(lines.len(), 50);
         assert!(lines[0].contains("line50"));
         assert!(lines[49].contains("line99"));
+    }
+
+    #[test]
+    fn test_tail_lines_preserves_trailing_newline() {
+        // Both paths — fits-within-limit and truncated — should match the
+        // input's trailing-newline state.
+        assert_eq!(tail_lines("a\nb\nc\n", 10), "a\nb\nc\n");
+        assert_eq!(tail_lines("a\nb\nc", 10), "a\nb\nc");
+        assert_eq!(tail_lines("a\nb\nc\n", 2), "b\nc\n");
+        assert_eq!(tail_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(tail_lines("", 5), "");
     }
 
     #[tokio::test]
