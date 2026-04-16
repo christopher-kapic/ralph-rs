@@ -526,6 +526,11 @@ pub fn update_execution_log(
     output_tokens: Option<i64>,
     session_id: Option<&str>,
 ) -> Result<()> {
+    debug_assert!(
+        !(rolled_back && committed),
+        "execution log cannot be both rolled_back and committed",
+    );
+
     let test_results_json = serde_json::to_string(test_results)?;
 
     let affected = conn.execute(
@@ -1524,6 +1529,21 @@ mod tests {
         assert_eq!(updated.input_tokens, Some(1000));
         assert_eq!(updated.output_tokens, Some(500));
         assert_eq!(updated.session_id.as_deref(), Some("session-abc"));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "execution log cannot be both rolled_back and committed")]
+    fn test_update_execution_log_rolled_back_and_committed_panics() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+        let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
+
+        let _ = update_execution_log(
+            &conn, log.id, None, None, &[], true, true, None, None, None, None, None, None, None,
+        );
     }
 
     #[test]
