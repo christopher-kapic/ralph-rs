@@ -9,10 +9,48 @@
 // The shutdown flag is communicated via a `tokio::sync::watch` channel that
 // the executor and runner already consume as `abort_rx`.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use tokio::sync::watch;
+
+// ---------------------------------------------------------------------------
+// Forced-exit cleanup registry
+// ---------------------------------------------------------------------------
+
+/// A cleanup closure executed just before `std::process::exit(130)` on a
+/// second Ctrl+C. Since `exit` skips every Drop impl, any RAII guard whose
+/// release is load-bearing (e.g. the per-project run lock) registers itself
+/// here so the row still gets cleaned up on a forced exit.
+type ExitCleanup = Box<dyn FnOnce() + Send>;
+
+static EXIT_CLEANUP: Mutex<Option<ExitCleanup>> = Mutex::new(None);
+
+/// Serializes tests that touch `EXIT_CLEANUP` so parallel test threads in the
+/// same binary don't race on the global slot.
+#[cfg(test)]
+pub(crate) static EXIT_CLEANUP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Register a cleanup to run before `exit(130)` on forced shutdown. Replaces
+/// any previously-registered cleanup.
+pub fn set_exit_cleanup(f: ExitCleanup) {
+    *EXIT_CLEANUP.lock().unwrap() = Some(f);
+}
+
+/// Clear the registered exit cleanup. Called when the guard whose cleanup
+/// this represents was dropped normally, so no forced-exit release is needed.
+pub fn clear_exit_cleanup() {
+    *EXIT_CLEANUP.lock().unwrap() = None;
+}
+
+/// Take and run the registered exit cleanup (if any). Idempotent.
+pub(crate) fn run_exit_cleanup() {
+    let f = EXIT_CLEANUP.lock().unwrap().take();
+    if let Some(f) = f {
+        f();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shutdown controller
@@ -94,6 +132,9 @@ impl ShutdownController {
             } else {
                 // --- Second signal (grace period active) ---
                 eprintln!("\nForce-quit — killing harness and exiting.");
+                // exit(130) skips Drop, so give registered guards (e.g. the
+                // run lock) a chance to release before the process dies.
+                run_exit_cleanup();
                 std::process::exit(130);
             }
         }
@@ -219,5 +260,43 @@ mod tests {
         let (controller, rx) = install().unwrap();
         assert!(!*rx.borrow());
         assert!(!controller.is_shutdown_requested());
+    }
+
+    #[test]
+    fn test_exit_cleanup_runs_once_and_is_cleared() {
+        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        clear_exit_cleanup();
+
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran_clone = std::sync::Arc::clone(&ran);
+        set_exit_cleanup(Box::new(move || {
+            ran_clone.store(true, Ordering::SeqCst);
+        }));
+
+        run_exit_cleanup();
+        assert!(ran.load(Ordering::SeqCst), "cleanup should have run");
+
+        // A second call is a no-op because the cleanup was taken.
+        ran.store(false, Ordering::SeqCst);
+        run_exit_cleanup();
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "cleanup should not run twice"
+        );
+    }
+
+    #[test]
+    fn test_clear_exit_cleanup_prevents_run() {
+        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        clear_exit_cleanup();
+
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran_clone = std::sync::Arc::clone(&ran);
+        set_exit_cleanup(Box::new(move || {
+            ran_clone.store(true, Ordering::SeqCst);
+        }));
+        clear_exit_cleanup();
+        run_exit_cleanup();
+        assert!(!ran.load(Ordering::SeqCst));
     }
 }

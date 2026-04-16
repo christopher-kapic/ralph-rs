@@ -19,6 +19,11 @@ type ReleaseFn = Box<dyn FnOnce(&str) -> Result<()> + Send>;
 pub struct RunLock {
     project: String,
     release: Option<ReleaseFn>,
+    /// Whether normal Drop should also clear the forced-exit cleanup slot in
+    /// `signal`. Only the production [`acquire`] registers that cleanup, so
+    /// tests using [`acquire_inner`] leave it false to avoid disturbing any
+    /// cleanup another parallel test has registered.
+    clears_exit_cleanup: bool,
 }
 
 impl std::fmt::Debug for RunLock {
@@ -36,6 +41,9 @@ impl RunLock {
     /// swallows errors.
     #[allow(dead_code)]
     pub fn release(mut self) -> Result<()> {
+        if self.clears_exit_cleanup {
+            crate::signal::clear_exit_cleanup();
+        }
         if let Some(release) = self.release.take() {
             release(&self.project)
         } else {
@@ -53,8 +61,27 @@ impl Drop for RunLock {
                     self.project, e
                 );
             }
+            if self.clears_exit_cleanup {
+                crate::signal::clear_exit_cleanup();
+            }
         }
     }
+}
+
+/// Delete this process's run_locks row for `project`. Shared by the normal
+/// Drop-path release closure and the forced-exit cleanup so both behave
+/// identically.
+fn release_row_by_project(project: &str) -> Result<()> {
+    let conn = Connection::open(db::db_path()?)
+        .with_context(|| "reopening database to release run lock")?;
+    conn.execute("PRAGMA foreign_keys = ON;", [])?;
+    let my_pid = std::process::id() as i64;
+    conn.execute(
+        "DELETE FROM run_locks WHERE project = ?1 AND pid = ?2",
+        params![project, my_pid],
+    )
+    .context("deleting run_locks row")?;
+    Ok(())
 }
 
 /// Attempt to acquire the run lock for `project`. Returns an error if another
@@ -70,19 +97,22 @@ pub fn acquire(
     // Production release: reopen a fresh connection (the caller's `conn` is a
     // borrow, not an owned value we could stash in the guard) and pid-scope
     // the DELETE so a racing reclaim of a stale row can't be clobbered.
-    let release: ReleaseFn = Box::new(|project: &str| {
-        let conn = Connection::open(db::db_path()?)
-            .with_context(|| "reopening database to release run lock")?;
-        conn.execute("PRAGMA foreign_keys = ON;", [])?;
-        let my_pid = std::process::id() as i64;
-        conn.execute(
-            "DELETE FROM run_locks WHERE project = ?1 AND pid = ?2",
-            params![project, my_pid],
-        )
-        .context("deleting run_locks row")?;
-        Ok(())
-    });
-    acquire_inner(conn, project, plan_slug, plan_id, force, release)
+    let release: ReleaseFn = Box::new(release_row_by_project);
+    let mut lock = acquire_inner(conn, project, plan_slug, plan_id, force, release)?;
+
+    // Register a forced-exit cleanup so a double Ctrl+C (which calls
+    // std::process::exit(130) and skips Drop) still releases the lock.
+    let project_owned = project.to_string();
+    crate::signal::set_exit_cleanup(Box::new(move || {
+        if let Err(e) = release_row_by_project(&project_owned) {
+            eprintln!(
+                "warning: failed to release run lock during forced exit for {}: {}",
+                project_owned, e
+            );
+        }
+    }));
+    lock.clears_exit_cleanup = true;
+    Ok(lock)
 }
 
 /// Core acquire logic parameterized by the release closure. Called directly by
@@ -135,6 +165,7 @@ fn acquire_inner(
     Ok(RunLock {
         project: project.to_string(),
         release: Some(release),
+        clears_exit_cleanup: false,
     })
 }
 
@@ -364,6 +395,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn double_signal_cleanup_clears_run_lock_row() {
+        use std::sync::Mutex as StdMutex;
+
+        let _guard = crate::signal::EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        crate::signal::clear_exit_cleanup();
+
+        let conn = mem_db();
+        let project = "/tmp/proj-m10";
+        let my_pid = std::process::id() as i64;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            params![project, my_pid, "p-m10", "slug-m10"],
+        )
+        .unwrap();
+
+        let count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM run_locks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_before, 1);
+
+        // Share the in-memory conn with the cleanup closure. We can't use the
+        // production path (it reopens db::db_path()), so we inject an
+        // equivalent DELETE targeting the same row.
+        let shared = Arc::new(StdMutex::new(conn));
+        let shared_for_cleanup = Arc::clone(&shared);
+        let project_owned = project.to_string();
+        crate::signal::set_exit_cleanup(Box::new(move || {
+            let conn = shared_for_cleanup.lock().unwrap();
+            conn.execute(
+                "DELETE FROM run_locks WHERE project = ?1",
+                params![project_owned],
+            )
+            .unwrap();
+        }));
+
+        // Simulate the second-Ctrl+C path: the signal listener runs the
+        // registered cleanup right before std::process::exit(130).
+        crate::signal::run_exit_cleanup();
+
+        let count_after: i64 = shared
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM run_locks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count_after, 0,
+            "run lock row should have been released by the forced-exit cleanup"
+        );
     }
 
     #[test]
