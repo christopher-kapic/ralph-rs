@@ -16,6 +16,8 @@ pub enum FracIndexError {
     /// Triggered when `b` is `a` followed by one or more `'0'` characters
     /// (or other inputs that leave no room for a midpoint to be synthesized).
     NoKeyBetween { a: String, b: String },
+    /// A sort key contained a character outside the base-62 alphabet.
+    InvalidChar(char),
 }
 
 impl fmt::Display for FracIndexError {
@@ -24,6 +26,9 @@ impl fmt::Display for FracIndexError {
             FracIndexError::NoKeyBetween { a, b } => {
                 write!(f, "cannot find fractional index key between {a:?} and {b:?}")
             }
+            FracIndexError::InvalidChar(c) => {
+                write!(f, "invalid fractional index character: {c:?}")
+            }
         }
     }
 }
@@ -31,12 +36,12 @@ impl fmt::Display for FracIndexError {
 impl std::error::Error for FracIndexError {}
 
 /// Returns the index of a character in the base-62 alphabet.
-fn char_index(c: u8) -> usize {
+fn char_index(c: u8) -> Result<usize, FracIndexError> {
     match c {
-        b'0'..=b'9' => (c - b'0') as usize,
-        b'A'..=b'Z' => (c - b'A') as usize + 10,
-        b'a'..=b'z' => (c - b'a') as usize + 36,
-        _ => panic!("Invalid fractional index character: {}", c as char),
+        b'0'..=b'9' => Ok((c - b'0') as usize),
+        b'A'..=b'Z' => Ok((c - b'A') as usize + 10),
+        b'a'..=b'z' => Ok((c - b'a') as usize + 36),
+        _ => Err(FracIndexError::InvalidChar(c as char)),
     }
 }
 
@@ -48,10 +53,14 @@ pub fn initial_key() -> String {
 /// Returns a key that sorts after the given key.
 ///
 /// Increments the last character. If it overflows, appends a '0'.
-pub fn key_after(key: &str) -> String {
+///
+/// # Errors
+/// Returns [`FracIndexError::InvalidChar`] if the last character of `key` is
+/// outside the base-62 alphabet.
+pub fn key_after(key: &str) -> Result<String, FracIndexError> {
     let bytes = key.as_bytes();
     let last = bytes[bytes.len() - 1];
-    let idx = char_index(last);
+    let idx = char_index(last)?;
 
     if idx + 1 < ALPHABET.len() {
         // Increment last character
@@ -61,10 +70,10 @@ pub fn key_after(key: &str) -> String {
         unsafe {
             result.as_bytes_mut()[len - 1] = ALPHABET[idx + 1];
         }
-        result
+        Ok(result)
     } else {
         // Last char is 'z', append '0' to go after
-        format!("{key}0")
+        Ok(format!("{key}0"))
     }
 }
 
@@ -91,8 +100,8 @@ pub fn key_between(a: &str, b: &str) -> Result<String, FracIndexError> {
     };
 
     for i in 0..min_len {
-        let ai = char_index(a_bytes[i]);
-        let bi = char_index(b_bytes[i]);
+        let ai = char_index(a_bytes[i])?;
+        let bi = char_index(b_bytes[i])?;
 
         if ai == bi {
             continue;
@@ -139,7 +148,7 @@ fn suffix_between(a: &str, b: Option<&str>) -> Result<String, FracIndexError> {
                 return Ok(String::from(ALPHABET[31] as char)); // 'V'
             }
             let a_bytes = a.as_bytes();
-            let first_idx = char_index(a_bytes[0]);
+            let first_idx = char_index(a_bytes[0])?;
             if first_idx + 1 < ALPHABET.len() {
                 let mid = first_idx + (ALPHABET.len() - first_idx) / 2;
                 return Ok(String::from(ALPHABET[mid] as char));
@@ -159,7 +168,7 @@ fn suffix_between(a: &str, b: Option<&str>) -> Result<String, FracIndexError> {
                 });
             }
             let b_bytes = b_str.as_bytes();
-            let bi = char_index(b_bytes[0]);
+            let bi = char_index(b_bytes[0])?;
 
             if a.is_empty() {
                 if bi > 1 {
@@ -174,7 +183,7 @@ fn suffix_between(a: &str, b: Option<&str>) -> Result<String, FracIndexError> {
             }
 
             let a_bytes = a.as_bytes();
-            let ai = char_index(a_bytes[0]);
+            let ai = char_index(a_bytes[0])?;
 
             if ai == bi {
                 let mut result = String::from(ALPHABET[ai] as char);
@@ -214,12 +223,12 @@ mod tests {
 
     #[test]
     fn test_key_after() {
-        assert_eq!(key_after("a0"), "a1");
-        assert_eq!(key_after("a9"), "aA");
-        assert_eq!(key_after("aZ"), "aa");
-        assert_eq!(key_after("ay"), "az");
+        assert_eq!(key_after("a0").unwrap(), "a1");
+        assert_eq!(key_after("a9").unwrap(), "aA");
+        assert_eq!(key_after("aZ").unwrap(), "aa");
+        assert_eq!(key_after("ay").unwrap(), "az");
         // Overflow: 'z' wraps by appending
-        assert_eq!(key_after("az"), "az0");
+        assert_eq!(key_after("az").unwrap(), "az0");
     }
 
     #[test]
@@ -259,7 +268,7 @@ mod tests {
         // Insert 10 keys after each previous one
         for _ in 0..10 {
             let last = keys.last().unwrap();
-            keys.push(key_after(last));
+            keys.push(key_after(last).unwrap());
         }
 
         for i in 0..keys.len() - 1 {
@@ -303,20 +312,51 @@ mod tests {
     #[test]
     fn test_char_index_roundtrip() {
         for (i, &ch) in ALPHABET.iter().enumerate() {
-            assert_eq!(char_index(ch), i, "char_index failed for {}", ch as char);
+            assert_eq!(
+                char_index(ch).unwrap(),
+                i,
+                "char_index failed for {}",
+                ch as char
+            );
         }
+    }
+
+    #[test]
+    fn test_char_index_invalid_returns_err() {
+        for &c in &[b'!', b'-', b'.', b'/', b'@', b'[', b'`', b'{', 0u8, 0xFFu8] {
+            let result = char_index(c);
+            assert_eq!(
+                result,
+                Err(FracIndexError::InvalidChar(c as char)),
+                "expected Err for byte {c:#x}, got {result:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_key_after_invalid_char_returns_err() {
+        // Last byte '!' is outside the base-62 alphabet.
+        let result = key_after("a!");
+        assert_eq!(result, Err(FracIndexError::InvalidChar('!')));
+    }
+
+    #[test]
+    fn test_key_between_invalid_char_returns_err() {
+        // First byte '!' is outside the alphabet; should surface as InvalidChar.
+        let result = key_between("!0", "!1");
+        assert_eq!(result, Err(FracIndexError::InvalidChar('!')));
     }
 
     #[test]
     #[should_panic(expected = "key_between requires a < b")]
     fn test_key_between_panics_when_a_ge_b() {
-        key_between("a1", "a0");
+        let _ = key_between("a1", "a0");
     }
 
     #[test]
     #[should_panic(expected = "key_between requires a < b")]
     fn test_key_between_panics_when_equal() {
-        key_between("a0", "a0");
+        let _ = key_between("a0", "a0");
     }
 
     #[test]

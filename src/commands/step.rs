@@ -108,7 +108,7 @@ pub fn step_add(
             }
         } else if after_pos == steps.len() {
             // Append at end
-            frac_index::key_after(&steps[steps.len() - 1].sort_key)
+            frac_index::key_after(&steps[steps.len() - 1].sort_key)?
         } else {
             // Insert between after_pos-1 and after_pos
             let before = &steps[after_pos - 1].sort_key;
@@ -476,7 +476,7 @@ pub fn step_move(
         }
     } else if target_idx >= other_keys.len() {
         // Move to last position
-        frac_index::key_after(other_keys[other_keys.len() - 1])
+        frac_index::key_after(other_keys[other_keys.len() - 1])?
     } else {
         // Move between two existing steps
         let before = other_keys[target_idx - 1];

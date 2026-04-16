@@ -198,7 +198,7 @@ pub fn create_step(
         .ok();
 
     let sort_key = match last_key {
-        Some(ref k) => frac_index::key_after(k),
+        Some(ref k) => frac_index::key_after(k)?,
         None => frac_index::initial_key(),
     };
 
