@@ -302,16 +302,22 @@ pub fn update_step_fields(
     description: Option<&str>,
 ) -> Result<()> {
     if let Some(t) = title {
-        conn.execute(
+        let affected = conn.execute(
             "UPDATE steps SET title = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
             params![t, step_id],
         )?;
+        if affected == 0 {
+            anyhow::bail!("Step not found: {step_id}");
+        }
     }
     if let Some(d) = description {
-        conn.execute(
+        let affected = conn.execute(
             "UPDATE steps SET description = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
             params![d, step_id],
         )?;
+        if affected == 0 {
+            anyhow::bail!("Step not found: {step_id}");
+        }
     }
     Ok(())
 }
@@ -1150,6 +1156,17 @@ mod tests {
 
         let updated = get_step(&conn, &step.id).unwrap();
         assert_eq!(updated.status, StepStatus::Complete);
+    }
+
+    #[test]
+    fn test_update_step_fields_missing_step_errors() {
+        let conn = setup();
+        let err =
+            update_step_fields(&conn, "nonexistent-id", Some("new title"), None).unwrap_err();
+        assert!(err.to_string().contains("Step not found"));
+
+        let err = update_step_fields(&conn, "nonexistent-id", None, Some("new desc")).unwrap_err();
+        assert!(err.to_string().contains("Step not found"));
     }
 
     #[test]
