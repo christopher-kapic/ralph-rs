@@ -68,6 +68,13 @@ impl Drop for RunLock {
     }
 }
 
+/// Escape a SQLite single-quoted string literal by doubling embedded quotes.
+/// Used only to build a copy-pasteable recovery command in the error message;
+/// all real queries use bound parameters.
+fn sql_escape_single_quotes(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// Delete this process's run_locks row for `project`. Shared by the normal
 /// Drop-path release closure and the forced-exit cleanup so both behave
 /// identically.
@@ -145,10 +152,11 @@ fn acquire_inner(
                 let plan_label = existing_slug.as_deref().unwrap_or("<all plans>");
                 let db_path = db::db_path()?;
                 let db_path_display = db_path.display();
+                let project_sql = sql_escape_single_quotes(project);
                 bail!(
                     "Another ralph run is already active in this project (pid {pid}, plan {plan_label}, started {started_at}).\n\
                      If the previous run crashed, re-run with --force to reclaim the lock, or\n\
-                     manually remove the row: sqlite3 {db_path_display} \"DELETE FROM run_locks WHERE project = '{project}';\""
+                     manually remove the row: sqlite3 {db_path_display} \"DELETE FROM run_locks WHERE project = '{project_sql}';\""
                 );
             }
             conn.execute("DELETE FROM run_locks WHERE project = ?1", params![project])
@@ -446,6 +454,46 @@ mod tests {
             count_after, 0,
             "run lock row should have been released by the forced-exit cleanup"
         );
+    }
+
+    #[test]
+    fn error_message_escapes_apostrophe_in_project_path() {
+        // Pre-seed a row under our own pid so the second acquire takes the
+        // "live pid" branch that formats the recovery SQL.
+        let conn = mem_db();
+        let project = "/tmp/bob's proj";
+        let my_pid = std::process::id() as i64;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            params![project, my_pid, "p1", "feat"],
+        )
+        .unwrap();
+
+        let err = acquire_inner(
+            &conn,
+            project,
+            Some("feat"),
+            Some("p1"),
+            false,
+            noop_release(),
+        )
+        .expect_err("should bail because pid is live");
+        let msg = format!("{err}");
+
+        // The SQL literal in the suggestion must double-quote the embedded
+        // apostrophe so a copy-paste doesn't break or become destructive.
+        assert!(
+            msg.contains("project = '/tmp/bob''s proj';"),
+            "expected escaped project literal in suggestion, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn sql_escape_single_quotes_doubles_apostrophes() {
+        assert_eq!(sql_escape_single_quotes("no-quotes"), "no-quotes");
+        assert_eq!(sql_escape_single_quotes("bob's"), "bob''s");
+        assert_eq!(sql_escape_single_quotes("''"), "''''");
+        assert_eq!(sql_escape_single_quotes(""), "");
     }
 
     #[test]
