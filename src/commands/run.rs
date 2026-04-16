@@ -177,7 +177,7 @@ pub fn cmd_log(
 
         if out.format == OutputFormat::Json {
             for log in &logs {
-                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode));
+                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode))?;
             }
             return Ok(());
         }
@@ -207,7 +207,7 @@ pub fn cmd_log(
 
         if out.format == OutputFormat::Json {
             for (_, log) in &entries {
-                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode));
+                output::emit_ndjson(&output::LogEntrySummary::new(log, output_mode))?;
             }
             return Ok(());
         }

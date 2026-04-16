@@ -171,7 +171,7 @@ pub async fn run_plan(
                 step_title: current_step.title.clone(),
                 step_num,
                 step_total: total,
-            });
+            })?;
         } else {
             eprintln!(
                 "[{}/{}] > Step {}: {} ...",
@@ -207,7 +207,7 @@ pub async fn run_plan(
             StepOutcome::Timeout => "timeout",
         };
 
-        let emit_finished = |outcome: &str| {
+        let emit_finished = |outcome: &str| -> Result<()> {
             if out.format == OutputFormat::Json {
                 output::emit_ndjson(&RunEvent::StepFinished {
                     step_id: current_step.id.clone(),
@@ -217,14 +217,15 @@ pub async fn run_plan(
                     outcome: outcome.to_string(),
                     attempts: step_result.attempts_used,
                     duration_secs: elapsed.as_secs_f64(),
-                });
+                })?;
             }
+            Ok(())
         };
 
         match step_result.outcome {
             StepOutcome::Success => {
                 result.steps_succeeded += 1;
-                emit_finished(outcome_str);
+                emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
                     eprintln!(
                         "[{}/{}] > {} ... OK (attempt {}, {:.0}s)",
@@ -238,7 +239,7 @@ pub async fn run_plan(
             }
             StepOutcome::Failed => {
                 result.steps_failed += 1;
-                emit_finished(outcome_str);
+                emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
                     eprintln!(
                         "[{}/{}] > {} ... FAILED (after {} attempts, {:.0}s)",
@@ -256,7 +257,7 @@ pub async fn run_plan(
                 return Ok(result);
             }
             StepOutcome::Aborted => {
-                emit_finished(outcome_str);
+                emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
                     eprintln!("[{}/{}] > {} ... ABORTED", i + 1, total, current_step.title);
                 }
@@ -267,7 +268,7 @@ pub async fn run_plan(
             }
             StepOutcome::Timeout => {
                 result.steps_failed += 1;
-                emit_finished(outcome_str);
+                emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
                     eprintln!("[{}/{}] > {} ... TIMEOUT", i + 1, total, current_step.title);
                 }
@@ -303,7 +304,7 @@ pub async fn run_plan(
             steps_executed: result.steps_executed,
             steps_succeeded: result.steps_succeeded,
             steps_failed: result.steps_failed,
-        });
+        })?;
     }
 
     Ok(result)

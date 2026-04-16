@@ -42,12 +42,19 @@ pub enum RunEvent {
 /// Write a single NDJSON record to stdout and flush immediately.
 ///
 /// This is the **only** path that writes to stdout in JSON/run mode.
-pub fn emit_ndjson<T: Serialize>(value: &T) {
-    // Ignore write errors (broken pipe, etc.) — same behavior as println!.
+/// Serialization and write errors are propagated: silently swallowing them
+/// would produce corrupt machine-readable output.
+pub fn emit_ndjson<T: Serialize>(value: &T) -> Result<()> {
     let mut out = io::stdout().lock();
-    let _ = serde_json::to_writer(&mut out, value);
-    let _ = out.write_all(b"\n");
-    let _ = out.flush();
+    emit_ndjson_to(&mut out, value)
+}
+
+/// Testable variant of [`emit_ndjson`] that writes to an arbitrary writer.
+fn emit_ndjson_to<W: Write, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {
+    serde_json::to_writer(&mut *writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +510,39 @@ pub struct HookInfo {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    // -- emit_ndjson --------------------------------------------------------
+
+    #[test]
+    fn test_emit_ndjson_serialization_error_propagates() {
+        // A value whose Serialize impl always fails should produce an Err from
+        // emit_ndjson_to — not silently swallow the error and emit a blank
+        // line into the NDJSON stream.
+        struct FailSerialize;
+        impl Serialize for FailSerialize {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                _serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("forced failure"))
+            }
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        let result = emit_ndjson_to(&mut buf, &FailSerialize);
+        assert!(result.is_err(), "serialization error must propagate");
+    }
+
+    #[test]
+    fn test_emit_ndjson_ok_writes_newline_terminated_json() {
+        #[derive(Serialize)]
+        struct Payload {
+            x: i32,
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        emit_ndjson_to(&mut buf, &Payload { x: 42 }).unwrap();
+        assert_eq!(buf, b"{\"x\":42}\n");
+    }
 
     // -- should_use_color ---------------------------------------------------
 
