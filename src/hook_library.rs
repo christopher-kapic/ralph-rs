@@ -161,11 +161,7 @@ pub fn parse_hook(contents: &str, fallback_name: &str) -> Result<Hook> {
     let mut in_scope_paths = false;
 
     for raw_line in frontmatter_str.lines() {
-        // Strip comments.
-        let line = match raw_line.find('#') {
-            Some(i) => &raw_line[..i],
-            None => raw_line,
-        };
+        let line = strip_comment(raw_line);
 
         if line.trim().is_empty() {
             continue;
@@ -247,6 +243,26 @@ pub fn parse_hook(contents: &str, fallback_name: &str) -> Result<Hook> {
         scope,
         command: body.to_string(),
     })
+}
+
+/// Strip a trailing `#` comment from a frontmatter line, ignoring `#`
+/// characters that appear inside single- or double-quoted strings.
+fn strip_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'#' if !in_single && !in_double => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
 }
 
 /// Strip surrounding single or double quotes from a YAML-ish scalar.
@@ -577,6 +593,64 @@ mod tests {
         let filtered = filter_by_project(hooks, Path::new("/home/me/js/project"));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "global-one");
+    }
+
+    #[test]
+    fn test_strip_comment_outside_quotes() {
+        assert_eq!(strip_comment("key: value # comment"), "key: value ");
+        assert_eq!(strip_comment("# whole line"), "");
+        assert_eq!(strip_comment("no comment here"), "no comment here");
+    }
+
+    #[test]
+    fn test_strip_comment_inside_quotes() {
+        assert_eq!(
+            strip_comment("description: \"Fix issue #123\""),
+            "description: \"Fix issue #123\""
+        );
+        assert_eq!(
+            strip_comment("description: 'Fix issue #123'"),
+            "description: 'Fix issue #123'"
+        );
+        assert_eq!(
+            strip_comment("description: \"before #inside\" # trailing"),
+            "description: \"before #inside\" "
+        );
+    }
+
+    #[test]
+    fn test_parse_description_preserves_hash_in_double_quotes() {
+        let src = "---\nname: x\ndescription: \"Fix issue #123\"\nlifecycle: post-step\nscope: global\n---\necho hi\n";
+        let hook = parse_hook(src, "x").unwrap();
+        assert_eq!(hook.description, "Fix issue #123");
+    }
+
+    #[test]
+    fn test_parse_description_preserves_hash_in_single_quotes() {
+        let src = "---\nname: x\ndescription: 'Fix issue #123'\nlifecycle: post-step\nscope: global\n---\necho hi\n";
+        let hook = parse_hook(src, "x").unwrap();
+        assert_eq!(hook.description, "Fix issue #123");
+    }
+
+    #[test]
+    fn test_parse_strips_unquoted_trailing_comment() {
+        let src = "---\nname: x\ndescription: hello # a comment\nlifecycle: post-step\nscope: global\n---\necho hi\n";
+        let hook = parse_hook(src, "x").unwrap();
+        assert_eq!(hook.description, "hello");
+    }
+
+    #[test]
+    fn test_roundtrip_description_with_hash() {
+        let hook = Hook {
+            name: "hashy".to_string(),
+            description: "Fix issue #123".to_string(),
+            lifecycle: Lifecycle::PostStep,
+            scope: Scope::Global,
+            command: "echo hi".to_string(),
+        };
+        let serialized = serialize_hook(&hook);
+        let parsed = parse_hook(&serialized, "hashy").unwrap();
+        assert_eq!(parsed.description, "Fix issue #123");
     }
 
     #[test]
