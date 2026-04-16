@@ -1,7 +1,8 @@
 // Storage abstraction: high-level CRUD operations wrapping db.rs
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::types::Value;
+use rusqlite::{Connection, params, params_from_iter};
 use uuid::Uuid;
 
 use crate::frac_index;
@@ -294,34 +295,6 @@ pub fn create_step_at(
     Ok((get_step(conn, &id)?, position))
 }
 
-/// Update a step's title and/or description.
-pub fn update_step_fields(
-    conn: &Connection,
-    step_id: &str,
-    title: Option<&str>,
-    description: Option<&str>,
-) -> Result<()> {
-    if let Some(t) = title {
-        let affected = conn.execute(
-            "UPDATE steps SET title = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![t, step_id],
-        )?;
-        if affected == 0 {
-            anyhow::bail!("Step not found: {step_id}");
-        }
-    }
-    if let Some(d) = description {
-        let affected = conn.execute(
-            "UPDATE steps SET description = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![d, step_id],
-        )?;
-        if affected == 0 {
-            anyhow::bail!("Step not found: {step_id}");
-        }
-    }
-    Ok(())
-}
-
 /// Extended step update: title, description, agent, harness, criteria, max_retries, model.
 ///
 /// - `agent_update`: `Some(Some("name"))` sets the agent, `Some(None)` clears it
@@ -346,40 +319,66 @@ pub fn update_step_fields_ext(
     retries_update: Option<Option<i32>>,
     model_update: Option<Option<&str>>,
 ) -> Result<()> {
-    // Delegate to the simple updater for title/description.
-    update_step_fields(conn, step_id, title, description)?;
+    // Build a single UPDATE with dynamic SET clauses so all changed fields
+    // share one `updated_at` and a partial failure can't leave the row half
+    // updated.
+    let mut clauses: Vec<&str> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
 
+    let text_or_null = |v: Option<&str>| match v {
+        Some(s) => Value::Text(s.to_string()),
+        None => Value::Null,
+    };
+
+    if let Some(t) = title {
+        clauses.push("title = ?");
+        values.push(Value::Text(t.to_string()));
+    }
+    if let Some(d) = description {
+        clauses.push("description = ?");
+        values.push(Value::Text(d.to_string()));
+    }
     if let Some(agent) = agent_update {
-        conn.execute(
-            "UPDATE steps SET agent = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![agent, step_id],
-        )?;
+        clauses.push("agent = ?");
+        values.push(text_or_null(agent));
     }
     if let Some(harness) = harness_update {
-        conn.execute(
-            "UPDATE steps SET harness = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![harness, step_id],
-        )?;
+        clauses.push("harness = ?");
+        values.push(text_or_null(harness));
     }
     if let Some(criteria) = criteria_update {
         let criteria_json = serde_json::to_string(criteria)?;
-        conn.execute(
-            "UPDATE steps SET acceptance_criteria = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![criteria_json, step_id],
-        )?;
+        clauses.push("acceptance_criteria = ?");
+        values.push(Value::Text(criteria_json));
     }
     if let Some(retries) = retries_update {
-        conn.execute(
-            "UPDATE steps SET max_retries = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![retries, step_id],
-        )?;
+        clauses.push("max_retries = ?");
+        values.push(match retries {
+            Some(n) => Value::Integer(n as i64),
+            None => Value::Null,
+        });
     }
     if let Some(model) = model_update {
-        conn.execute(
-            "UPDATE steps SET model = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-            params![model, step_id],
-        )?;
+        clauses.push("model = ?");
+        values.push(text_or_null(model));
     }
+
+    if clauses.is_empty() {
+        return Ok(());
+    }
+
+    clauses.push("updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')");
+    let sql = format!("UPDATE steps SET {} WHERE id = ?", clauses.join(", "));
+    values.push(Value::Text(step_id.to_string()));
+
+    let tx = conn
+        .unchecked_transaction()
+        .context("beginning step update transaction")?;
+    let affected = tx.execute(&sql, params_from_iter(values.iter()))?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    tx.commit().context("committing step update transaction")?;
     Ok(())
 }
 
@@ -1159,14 +1158,121 @@ mod tests {
     }
 
     #[test]
-    fn test_update_step_fields_missing_step_errors() {
+    fn test_update_step_fields_ext_atomic_single_update() {
+        // A single UPDATE carries one `updated_at` for every changed column,
+        // so setting multiple fields in one call leaves no window for a
+        // partial write with inconsistent timestamps.
         let conn = setup();
-        let err =
-            update_step_fields(&conn, "nonexistent-id", Some("new title"), None).unwrap_err();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+
+        let baseline = get_step(&conn, &step.id).unwrap();
+        // Sleep long enough that strftime('now') advances past the baseline.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        update_step_fields_ext(
+            &conn,
+            &step.id,
+            Some("New Title"),
+            Some("New Desc"),
+            Some(Some("new-agent")),
+            Some(Some("new-harness")),
+            Some(&["criterion".to_string()]),
+            Some(Some(5)),
+            Some(Some("new-model")),
+        )
+        .unwrap();
+
+        let updated = get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.title, "New Title");
+        assert_eq!(updated.description, "New Desc");
+        assert_eq!(updated.agent.as_deref(), Some("new-agent"));
+        assert_eq!(updated.harness.as_deref(), Some("new-harness"));
+        assert_eq!(updated.acceptance_criteria, vec!["criterion".to_string()]);
+        assert_eq!(updated.max_retries, Some(5));
+        assert_eq!(updated.model.as_deref(), Some("new-model"));
+        assert!(updated.updated_at > baseline.updated_at);
+    }
+
+    #[test]
+    fn test_update_step_fields_ext_missing_step_rolls_back() {
+        // When the step doesn't exist the transaction rolls back, leaving
+        // other rows untouched.
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (other, _) =
+            create_step(&conn, &plan.id, "Other", "desc", None, None, &[], None, None).unwrap();
+        let other_before = get_step(&conn, &other.id).unwrap();
+
+        let err = update_step_fields_ext(
+            &conn,
+            "nonexistent-id",
+            Some("New Title"),
+            Some("New Desc"),
+            Some(Some("agent")),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("Step not found"));
 
-        let err = update_step_fields(&conn, "nonexistent-id", None, Some("new desc")).unwrap_err();
-        assert!(err.to_string().contains("Step not found"));
+        let other_after = get_step(&conn, &other.id).unwrap();
+        assert_eq!(other_before.title, other_after.title);
+        assert_eq!(other_before.updated_at, other_after.updated_at);
+    }
+
+    #[test]
+    fn test_update_step_fields_ext_clears_nullable_fields() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            Some("agent"),
+            Some("harness"),
+            &[],
+            Some(3),
+            Some("model"),
+        )
+        .unwrap();
+
+        update_step_fields_ext(
+            &conn,
+            &step.id,
+            None,
+            None,
+            Some(None),
+            Some(None),
+            None,
+            Some(None),
+            Some(None),
+        )
+        .unwrap();
+
+        let updated = get_step(&conn, &step.id).unwrap();
+        assert!(updated.agent.is_none());
+        assert!(updated.harness.is_none());
+        assert!(updated.max_retries.is_none());
+        assert!(updated.model.is_none());
+    }
+
+    #[test]
+    fn test_update_step_fields_ext_noop_when_all_none() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+        let before = get_step(&conn, &step.id).unwrap();
+
+        update_step_fields_ext(&conn, &step.id, None, None, None, None, None, None, None).unwrap();
+
+        let after = get_step(&conn, &step.id).unwrap();
+        assert_eq!(before.updated_at, after.updated_at);
     }
 
     #[test]
