@@ -921,16 +921,26 @@ fn build_prior_step_summaries(
 }
 
 /// Extract file paths from a unified diff.
+///
+/// Captures additions and modifications (`+++ b/`), deletions (`--- a/` paired
+/// with `+++ /dev/null`), and both sides of renames (`rename from`/`rename to`,
+/// or the `--- a/` and `+++ b/` pair when rename detection emits a diff body).
 fn extract_changed_files_from_diff(diff: &str) -> Vec<String> {
     let mut files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for line in diff.lines() {
-        if let Some(path) = line.strip_prefix("+++ b/")
+        let path = line
+            .strip_prefix("+++ b/")
+            .or_else(|| line.strip_prefix("--- a/"))
+            .or_else(|| line.strip_prefix("rename from "))
+            .or_else(|| line.strip_prefix("rename to "));
+        if let Some(path) = path
             && path != "/dev/null"
+            && seen.insert(path.to_string())
         {
             files.push(path.to_string());
         }
     }
-    files.dedup();
     files
 }
 
@@ -1018,6 +1028,39 @@ diff --git a/src/lib.rs b/src/lib.rs
     fn test_extract_changed_files_from_diff_empty() {
         let files = extract_changed_files_from_diff("");
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_extract_changed_files_from_diff_delete_rename_add() {
+        let diff = "\
+diff --git a/deleted.txt b/deleted.txt
+deleted file mode 100644
+--- a/deleted.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-gone
+diff --git a/old_name.rs b/new_name.rs
+similarity index 80%
+rename from old_name.rs
+rename to new_name.rs
+--- a/old_name.rs
++++ b/new_name.rs
+@@ -1,2 +1,2 @@
+-fn old() {}
++fn new() {}
+diff --git a/added.rs b/added.rs
+new file mode 100644
+--- /dev/null
++++ b/added.rs
+@@ -0,0 +1 @@
++pub fn x() {}
+";
+        let files = extract_changed_files_from_diff(diff);
+        assert!(files.contains(&"deleted.txt".to_string()));
+        assert!(files.contains(&"old_name.rs".to_string()));
+        assert!(files.contains(&"new_name.rs".to_string()));
+        assert!(files.contains(&"added.rs".to_string()));
+        assert_eq!(files.len(), 4);
     }
 
     #[test]
