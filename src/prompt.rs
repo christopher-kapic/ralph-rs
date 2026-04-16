@@ -227,15 +227,18 @@ fn format_focus_instruction(step: &Step) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Truncate text to a maximum number of lines, adding a note if truncated.
+/// Truncate text to a maximum number of lines, appending an elision marker
+/// when truncated. Keeps the first `max_lines` because the top of a diff or
+/// test output usually carries the most context — file headers, the first
+/// failing assertion — and losing the tail is the cheaper choice.
 fn truncate_text(text: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= max_lines {
         text.to_string()
     } else {
         let omitted = lines.len() - max_lines;
-        let tail = &lines[lines.len() - max_lines..];
-        format!("... ({omitted} lines omitted) ...\n{}", tail.join("\n"))
+        let head = &lines[..max_lines];
+        format!("{}\n... ({omitted} lines omitted) ...", head.join("\n"))
     }
 }
 
@@ -463,14 +466,30 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_text_long() {
+    fn test_truncate_text_long_keeps_head() {
         let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
         let text = lines.join("\n");
         let result = truncate_text(&text, 5);
+
         assert!(result.contains("(15 lines omitted)"));
-        assert!(result.contains("line 19"));
-        assert!(result.contains("line 15"));
-        assert!(!result.contains("line 0"));
+        // First five lines preserved in order.
+        for i in 0..5 {
+            assert!(
+                result.contains(&format!("line {i}")),
+                "head line {i} missing from {result}"
+            );
+        }
+        // Lines beyond the head are elided.
+        for i in 5..20 {
+            assert!(
+                !result.contains(&format!("line {i}")),
+                "tail line {i} unexpectedly present in {result}"
+            );
+        }
+        // Elision marker follows the retained head.
+        let head_end = result.find("line 4").unwrap();
+        let marker = result.find("lines omitted").unwrap();
+        assert!(head_end < marker);
     }
 
     #[test]
