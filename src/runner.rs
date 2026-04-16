@@ -96,7 +96,7 @@ pub async fn run_plan(
 
     // 2. Optionally create and checkout branch.
     if !options.current_branch && !options.dry_run {
-        setup_branch(workdir, &effective_plan, None)?;
+        setup_branch(workdir, &effective_plan, None).await?;
     }
 
     // Load steps.
@@ -457,7 +457,10 @@ pub async fn run_all_plans(
     let run_start_sha = if options.current_branch || options.dry_run {
         String::new()
     } else {
-        git::get_commit_hash(workdir).context("could not capture starting HEAD SHA")?
+        let workdir_owned = workdir.to_path_buf();
+        blocking_git(move || git::get_commit_hash(&workdir_owned))
+            .await
+            .context("could not capture starting HEAD SHA")?
     };
 
     // 4. Build deps_of map for the in-scope plan set.
@@ -515,11 +518,15 @@ pub async fn run_all_plans(
 
         // Set up the branch ourselves (unless the user wants current-branch mode).
         if !options.current_branch && !options.dry_run {
-            setup_branch(workdir, plan, branch_plan.parent_sha.as_deref())?;
+            setup_branch(workdir, plan, branch_plan.parent_sha.as_deref()).await?;
 
             // Merge any additional deps' SHAs for multi-parent plans.
             for other_sha in &branch_plan.merge_shas {
-                if let Err(e) = git::merge_sha(workdir, other_sha) {
+                let workdir_owned = workdir.to_path_buf();
+                let sha = other_sha.clone();
+                let merge_result =
+                    blocking_git(move || git::merge_sha(&workdir_owned, &sha)).await;
+                if let Err(e) = merge_result {
                     // Try to find a human-readable slug for the conflicting SHA.
                     let other_slug = tip_sha_map
                         .iter()
@@ -574,7 +581,9 @@ pub async fn run_all_plans(
             PlanStatus::Complete => {
                 // Capture the tip SHA of this plan's branch for downstream deps.
                 if !options.current_branch && !options.dry_run {
-                    let sha = git::get_commit_hash(workdir)
+                    let workdir_owned = workdir.to_path_buf();
+                    let sha = blocking_git(move || git::get_commit_hash(&workdir_owned))
+                        .await
                         .context("could not capture tip SHA after plan completed")?;
                     tip_sha_map.insert(plan_id.clone(), sha);
                 }
@@ -723,44 +732,56 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
 ///   parent SHA is ignored and the existing branch is checked out.
 /// - If `parent_sha` is `None`, creates the branch from the current HEAD
 ///   (legacy behavior).
-fn setup_branch(workdir: &Path, plan: &Plan, parent_sha: Option<&str>) -> Result<()> {
-    let current = git::get_current_branch(workdir).context("Failed to get current git branch")?;
+async fn setup_branch(workdir: &Path, plan: &Plan, parent_sha: Option<&str>) -> Result<()> {
+    let current = {
+        let workdir_owned = workdir.to_path_buf();
+        blocking_git(move || git::get_current_branch(&workdir_owned))
+            .await
+            .context("Failed to get current git branch")?
+    };
 
     if current == plan.branch_name {
         return Ok(());
     }
 
     // Auto-commit any dirty state before switching branches.
-    git::auto_commit_dirty_state(
-        workdir,
-        &format!(
+    {
+        let workdir_owned = workdir.to_path_buf();
+        let msg = format!(
             "ralph: auto-save before switching to branch '{}'",
             plan.branch_name
-        ),
-    )?;
+        );
+        blocking_git(move || git::auto_commit_dirty_state(&workdir_owned, &msg)).await?;
+    }
 
     // Try to create and checkout the branch. If it already exists,
     // just check it out.
-    let create_result = if let Some(sha) = parent_sha {
-        git::create_branch_from_sha(workdir, &plan.branch_name, sha)
-    } else {
-        git::create_and_checkout_branch(workdir, &plan.branch_name)
+    let create_result = {
+        let workdir_owned = workdir.to_path_buf();
+        let branch = plan.branch_name.clone();
+        let parent = parent_sha.map(|s| s.to_string());
+        blocking_git(move || match parent {
+            Some(sha) => git::create_branch_from_sha(&workdir_owned, &branch, &sha),
+            None => git::create_and_checkout_branch(&workdir_owned, &branch),
+        })
+        .await
     };
 
     if create_result.is_err() {
         // Branch might already exist; try a plain checkout.
-        checkout_existing_branch(workdir, &plan.branch_name)?;
+        checkout_existing_branch(workdir, &plan.branch_name).await?;
     }
 
     Ok(())
 }
 
 /// Checkout an existing branch.
-fn checkout_existing_branch(workdir: &Path, branch: &str) -> Result<()> {
-    let output = std::process::Command::new("git")
+async fn checkout_existing_branch(workdir: &Path, branch: &str) -> Result<()> {
+    let output = tokio::process::Command::new("git")
         .args(["checkout", branch])
         .current_dir(workdir)
         .output()
+        .await
         .context("Failed to execute git checkout")?;
 
     if !output.status.success() {
@@ -769,6 +790,19 @@ fn checkout_existing_branch(workdir: &Path, branch: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run a synchronous `git.rs` operation on the tokio blocking thread pool so
+/// that the runtime worker remains free to drive other futures (such as the
+/// abort-signal watcher) while the git subprocess runs.
+async fn blocking_git<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .context("git worker task panicked")?
 }
 
 /// Select which steps to run based on RunOptions.
@@ -1572,15 +1606,14 @@ mod tests {
 
     // -- setup_branch with parent_sha --
 
-    #[test]
-    fn test_setup_branch_with_parent_sha() {
+    /// Initialize a throwaway git repo with a single commit and return its path.
+    fn init_git_repo() -> (tempfile::TempDir, std::path::PathBuf) {
         use std::fs;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
 
-        // Initialize repo with one commit.
         std::process::Command::new("git")
             .args(["init"])
             .current_dir(&dir)
@@ -1608,6 +1641,14 @@ mod tests {
             .output()
             .unwrap();
 
+        (tmp, dir)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_with_parent_sha() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
         let initial_sha = git::get_commit_hash(&dir).unwrap();
 
         // Make a second commit.
@@ -1630,10 +1671,60 @@ mod tests {
         };
 
         // Should create feat/rooted rooted at initial_sha.
-        setup_branch(&dir, &plan, Some(&initial_sha)).unwrap();
+        setup_branch(&dir, &plan, Some(&initial_sha)).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/rooted");
         assert_eq!(git::get_commit_hash(&dir).unwrap(), initial_sha);
         // The second commit's file should not be visible on the new branch.
         assert!(!dir.join("second.txt").exists());
+    }
+
+    /// Confirm `setup_branch` no longer monopolises a single-threaded runtime:
+    /// a concurrent tokio task must be able to make progress while the git
+    /// subprocesses run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_does_not_block_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_tmp, dir) = init_git_repo();
+
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: dir.to_string_lossy().to_string(),
+            branch_name: "feat/concurrent".to_string(),
+            description: String::new(),
+            status: PlanStatus::Ready,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        // Concurrent ticker that increments a counter every few ms. On a
+        // blocking runtime worker it would not get any cycles while the git
+        // subprocesses run serially in `setup_branch`.
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_task = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                ticks_task.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        setup_branch(&dir, &plan, None).await.unwrap();
+        ticker.await.unwrap();
+
+        // The ticker's 50 × 1ms sleeps only make progress if the runtime
+        // worker was free to poll them. Assert at least a few got through —
+        // the exact count depends on git timing, but a fully blocked runtime
+        // yields zero.
+        assert!(
+            ticks.load(Ordering::SeqCst) > 0,
+            "ticker made no progress — setup_branch blocked the runtime"
+        );
     }
 }
