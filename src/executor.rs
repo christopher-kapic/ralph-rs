@@ -119,10 +119,9 @@ enum FailureReason {
     Timeout,
     /// Execution was aborted via signal.
     Aborted,
-    /// Tests failed (or no changes) after exhausting all attempts.
+    /// Tests failed after exhausting all attempts.
     TestFailed,
-    /// Harness produced no changes (reserved for future use).
-    #[allow(dead_code)]
+    /// Harness produced no changes after exhausting all attempts.
     NoChanges,
 }
 
@@ -146,7 +145,8 @@ impl FailureReason {
         match self {
             Self::Timeout => "timeout",
             Self::Aborted => "aborted",
-            _ => "failed",
+            Self::NoChanges => "no_changes",
+            Self::TestFailed => "failed",
         }
     }
 }
@@ -586,12 +586,17 @@ pub async fn execute_step(
                         parsed: &parsed,
                         has_changes,
                     };
+                    let reason = if has_changes {
+                        FailureReason::TestFailed
+                    } else {
+                        FailureReason::NoChanges
+                    };
                     return finalize_failure(
                         &ctx,
                         exec_log.id,
                         duration_secs,
                         attempt,
-                        FailureReason::TestFailed,
+                        reason,
                         Some(&fail_output),
                     )
                     .await;
@@ -1027,6 +1032,21 @@ diff --git a/src/lib.rs b/src/lib.rs
         assert_eq!(outcomes.len(), 4);
         assert_eq!(StepOutcome::Success, StepOutcome::Success);
         assert_ne!(StepOutcome::Success, StepOutcome::Failed);
+    }
+
+    #[test]
+    fn test_failure_reason_mappings() {
+        assert_eq!(FailureReason::Timeout.hook_label(), "timeout");
+        assert_eq!(FailureReason::Aborted.hook_label(), "aborted");
+        assert_eq!(FailureReason::TestFailed.hook_label(), "failed");
+        assert_eq!(FailureReason::NoChanges.hook_label(), "no_changes");
+
+        assert_eq!(FailureReason::Aborted.to_step_status(), StepStatus::Aborted);
+        assert_eq!(FailureReason::NoChanges.to_step_status(), StepStatus::Failed);
+        assert_eq!(FailureReason::TestFailed.to_step_status(), StepStatus::Failed);
+
+        assert_eq!(FailureReason::NoChanges.to_outcome(), StepOutcome::Failed);
+        assert_eq!(FailureReason::TestFailed.to_outcome(), StepOutcome::Failed);
     }
 
     #[test]
