@@ -895,7 +895,17 @@ fn build_prior_step_summaries(
         if s.sort_key >= current_step.sort_key {
             break;
         }
-        if s.status == StepStatus::Complete || s.status == StepStatus::Skipped {
+        // Include any step that has produced an outcome — success, skip, or
+        // failure. Failed/Aborted steps give the agent useful "here's what
+        // did not work" context. Pending/InProgress are excluded because
+        // they have nothing to report yet.
+        if matches!(
+            s.status,
+            StepStatus::Complete
+                | StepStatus::Skipped
+                | StepStatus::Failed
+                | StepStatus::Aborted
+        ) {
             // Try to get changed files from the latest execution log.
             let files_changed = if let Ok(Some(log)) = storage::get_latest_log_for_step(conn, &s.id)
             {

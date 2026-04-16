@@ -157,7 +157,10 @@ fn format_prior_steps(prior_steps: &[PriorStepSummary]) -> String {
         let status_marker = match step.status {
             StepStatus::Complete => "completed",
             StepStatus::Skipped => "skipped",
-            _ => "other",
+            StepStatus::Failed => "failed",
+            StepStatus::Aborted => "aborted",
+            StepStatus::Pending => "pending",
+            StepStatus::InProgress => "in-progress",
         };
 
         let mut step_line = format!(
@@ -523,6 +526,41 @@ mod tests {
         assert!(result.contains("Step 1 (completed): Step A"));
         assert!(result.contains("Step 2 (skipped): Step B"));
         assert!(result.contains("a.rs"));
+    }
+
+    #[test]
+    fn test_format_prior_steps_includes_failed_and_aborted() {
+        let steps = vec![
+            PriorStepSummary {
+                title: "Worked".to_string(),
+                status: StepStatus::Complete,
+                files_changed: vec!["ok.rs".to_string()],
+                description: "Fine".to_string(),
+            },
+            PriorStepSummary {
+                title: "Broke things".to_string(),
+                status: StepStatus::Failed,
+                files_changed: vec!["bad.rs".to_string()],
+                description: "Tests failed after edit".to_string(),
+            },
+            PriorStepSummary {
+                title: "User bailed".to_string(),
+                status: StepStatus::Aborted,
+                files_changed: vec![],
+                description: "Ctrl+C mid-run".to_string(),
+            },
+        ];
+
+        let result = format_prior_steps(&steps);
+        // Completed step still labeled
+        assert!(result.contains("Step 1 (completed): Worked"));
+        // Failed step is present and tagged as failed
+        assert!(result.contains("Step 2 (failed): Broke things"));
+        assert!(result.contains("Tests failed after edit"));
+        assert!(result.contains("bad.rs"));
+        // Aborted step is present and tagged as aborted
+        assert!(result.contains("Step 3 (aborted): User bailed"));
+        assert!(result.contains("Ctrl+C mid-run"));
     }
 
     #[test]
