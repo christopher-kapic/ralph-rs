@@ -14,13 +14,89 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, anyhow};
 use rusqlite::Connection;
 use tokio::process::Command;
 
 use crate::hook_library::{self, Hook, Lifecycle};
 use crate::plan::{Plan, Step};
 use crate::storage;
+
+/// Categorized hook failure. The post-step / post-test entry points use the
+/// variant to choose between a soft warning and a hard failure: only `Db` is
+/// fatal, since DB problems indicate the run can't reliably continue.
+#[derive(Debug)]
+enum HookFailure {
+    /// Failed to query the `step_hooks` table for bindings on this lifecycle.
+    /// Treated as fatal — the database is the source of truth for what runs.
+    Db(anyhow::Error),
+    /// Could not spawn or wait on the hook subprocess (typically a missing
+    /// shell, EACCES on the workdir, or another `std::io::Error` from
+    /// `tokio::process::Command`).
+    Spawn {
+        hook_name: String,
+        source: std::io::Error,
+    },
+    /// Hook exceeded the configured `hook_timeout_secs` and was killed.
+    Timeout { hook_name: String, secs: u64 },
+    /// Hook ran to completion but exited with a non-zero status (or signal).
+    Exit {
+        hook_name: String,
+        code: Option<i32>,
+        stderr: String,
+    },
+}
+
+impl HookFailure {
+    /// True for failures the post-step / post-test entry points must escalate
+    /// rather than swallow as a warning. Today only `Db` qualifies.
+    fn is_fatal(&self) -> bool {
+        matches!(self, HookFailure::Db(_))
+    }
+}
+
+impl std::fmt::Display for HookFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HookFailure::Db(e) => {
+                write!(f, "database error reading hook bindings: {e:#}")
+            }
+            HookFailure::Spawn { hook_name, source } => write!(
+                f,
+                "could not spawn hook '{hook_name}' ({:?}): {source}",
+                source.kind()
+            ),
+            HookFailure::Timeout { hook_name, secs } => {
+                write!(f, "hook '{hook_name}' timed out after {secs}s")
+            }
+            HookFailure::Exit {
+                hook_name,
+                code,
+                stderr,
+            } => {
+                let code_s = code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "<signal>".to_string());
+                write!(
+                    f,
+                    "hook '{hook_name}' exited with status {code_s}: {}",
+                    stderr.trim()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for HookFailure {}
+
+/// Build the warning text emitted when a post-lifecycle hook fails non-fatally.
+/// Kept separate from emission so it can be unit-tested without capturing
+/// stderr. The `Db` variant is intentionally handled here too even though the
+/// caller escalates it — keeping the formatter total makes it easier to reuse
+/// if escalation policy changes later.
+fn warning_message(which: Lifecycle, failure: &HookFailure) -> String {
+    format!("Warning: {} {}", which.as_str(), failure)
+}
 
 /// A cache of the user's hook library + project path, populated once per
 /// plan run. Passed through to each hook invocation so we don't re-read the
@@ -84,7 +160,7 @@ async fn run_one_hook(
     env: &[(&'static str, String)],
     extra_env: &[(&'static str, String)],
     timeout_secs: u64,
-) -> Result<()> {
+) -> Result<(), HookFailure> {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(&hook.command)
@@ -100,23 +176,31 @@ async fn run_one_hook(
 
     let run = cmd.output();
     let output = if timeout_secs == 0 {
-        run.await
-            .with_context(|| format!("Failed to execute hook '{}'", hook.name))?
+        run.await.map_err(|source| HookFailure::Spawn {
+            hook_name: hook.name.clone(),
+            source,
+        })?
     } else {
         match tokio::time::timeout(Duration::from_secs(timeout_secs), run).await {
-            Ok(r) => r.with_context(|| format!("Failed to execute hook '{}'", hook.name))?,
-            Err(_) => bail!("Hook '{}' timed out after {}s", hook.name, timeout_secs),
+            Ok(r) => r.map_err(|source| HookFailure::Spawn {
+                hook_name: hook.name.clone(),
+                source,
+            })?,
+            Err(_) => {
+                return Err(HookFailure::Timeout {
+                    hook_name: hook.name.clone(),
+                    secs: timeout_secs,
+                });
+            }
         }
     };
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "Hook '{}' failed (exit {}): {}",
-            hook.name,
-            output.status,
-            stderr.trim()
-        );
+        return Err(HookFailure::Exit {
+            hook_name: hook.name.clone(),
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
     }
 
     Ok(())
@@ -135,8 +219,9 @@ async fn run_lifecycle(
     lifecycle: Lifecycle,
     workdir: &Path,
     extra_env: &[(&'static str, String)],
-) -> Result<()> {
-    let rows = storage::list_hooks_for_step(conn, &plan.id, &step.id, lifecycle.as_str())?;
+) -> Result<(), HookFailure> {
+    let rows = storage::list_hooks_for_step(conn, &plan.id, &step.id, lifecycle.as_str())
+        .map_err(HookFailure::Db)?;
     if rows.is_empty() {
         return Ok(());
     }
@@ -164,8 +249,8 @@ async fn run_lifecycle(
 // Public lifecycle entry points
 // ---------------------------------------------------------------------------
 
-/// Run pre-step hooks. Returns `Err` if any hook exits non-zero (caller
-/// should treat this as a failed attempt).
+/// Run pre-step hooks. Returns `Err` for any failure (DB lookup, spawn,
+/// timeout, or non-zero exit) — callers treat this as a failed attempt.
 pub async fn run_pre_step(
     conn: &Connection,
     ctx: &HookContext,
@@ -185,9 +270,13 @@ pub async fn run_pre_step(
         &[],
     )
     .await
+    .map_err(|e| anyhow!(e))
 }
 
-/// Run post-step hooks. Failures are logged as warnings but do not propagate.
+/// Run post-step hooks. Hook-execution failures (spawn / timeout / non-zero
+/// exit) are logged as kind-specific warnings; DB lookup failures escalate
+/// to a hard error since the run can't reliably continue without trusting
+/// the hook bindings table.
 pub async fn run_post_step(
     conn: &Connection,
     ctx: &HookContext,
@@ -196,25 +285,25 @@ pub async fn run_post_step(
     attempt: i32,
     status: &str,
     workdir: &Path,
-) {
+) -> Result<()> {
     let extra = vec![("RALPH_STEP_STATUS", status.to_string())];
-    if let Err(e) = run_lifecycle(
-        conn,
-        ctx,
-        plan,
-        step,
-        attempt,
+    handle_post_lifecycle(
         Lifecycle::PostStep,
-        workdir,
-        &extra,
+        run_lifecycle(
+            conn,
+            ctx,
+            plan,
+            step,
+            attempt,
+            Lifecycle::PostStep,
+            workdir,
+            &extra,
+        )
+        .await,
     )
-    .await
-    {
-        eprintln!("Warning: post-step hook failed: {e}");
-    }
 }
 
-/// Run pre-test hooks. Returns `Err` if any hook exits non-zero.
+/// Run pre-test hooks. Returns `Err` for any failure.
 pub async fn run_pre_test(
     conn: &Connection,
     ctx: &HookContext,
@@ -234,9 +323,10 @@ pub async fn run_pre_test(
         &[],
     )
     .await
+    .map_err(|e| anyhow!(e))
 }
 
-/// Run post-test hooks. Failures are logged as warnings but do not propagate.
+/// Run post-test hooks. Same error policy as `run_post_step`.
 pub async fn run_post_test(
     conn: &Connection,
     ctx: &HookContext,
@@ -245,24 +335,40 @@ pub async fn run_post_test(
     attempt: i32,
     test_passed: bool,
     workdir: &Path,
-) {
+) -> Result<()> {
     let extra = vec![(
         "RALPH_TEST_PASSED",
         if test_passed { "true" } else { "false" }.to_string(),
     )];
-    if let Err(e) = run_lifecycle(
-        conn,
-        ctx,
-        plan,
-        step,
-        attempt,
+    handle_post_lifecycle(
         Lifecycle::PostTest,
-        workdir,
-        &extra,
+        run_lifecycle(
+            conn,
+            ctx,
+            plan,
+            step,
+            attempt,
+            Lifecycle::PostTest,
+            workdir,
+            &extra,
+        )
+        .await,
     )
-    .await
-    {
-        eprintln!("Warning: post-test hook failed: {e}");
+}
+
+/// Apply the post-lifecycle policy: fatal failures propagate, the rest log
+/// a kind-specific warning and return `Ok`.
+fn handle_post_lifecycle(
+    which: Lifecycle,
+    result: Result<(), HookFailure>,
+) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if e.is_fatal() => Err(anyhow!(e)),
+        Err(e) => {
+            eprintln!("{}", warning_message(which, &e));
+            Ok(())
+        }
     }
 }
 
@@ -385,7 +491,9 @@ mod tests {
         storage::attach_hook_to_plan(&conn, &plan.id, "post-step", "plan-wide").unwrap();
         storage::attach_hook_to_step(&conn, &plan.id, &step.id, "post-step", "per-step").unwrap();
 
-        run_post_step(&conn, &ctx, &plan, &step, 1, "complete", tmp.path()).await;
+        run_post_step(&conn, &ctx, &plan, &step, 1, "complete", tmp.path())
+            .await
+            .unwrap();
 
         let contents = std::fs::read_to_string(&marker).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
@@ -462,8 +570,10 @@ mod tests {
 
         storage::attach_hook_to_step(&conn, &plan.id, &step.id, "post-step", "fail").unwrap();
 
-        // post-step failure is just a warning — no panic, no error return.
-        run_post_step(&conn, &ctx, &plan, &step, 1, "complete", tmp.path()).await;
+        // post-step exit failure is a warning, not a hard error.
+        run_post_step(&conn, &ctx, &plan, &step, 1, "complete", tmp.path())
+            .await
+            .expect("non-zero hook exit must surface as warning, not Err");
     }
 
     #[tokio::test]
@@ -485,7 +595,9 @@ mod tests {
         let ctx = ctx_for(vec![capture], tmp.path().to_path_buf());
         storage::attach_hook_to_step(&conn, &plan.id, &step.id, "post-step", "capture").unwrap();
 
-        run_post_step(&conn, &ctx, &plan, &step, 1, "timeout", tmp.path()).await;
+        run_post_step(&conn, &ctx, &plan, &step, 1, "timeout", tmp.path())
+            .await
+            .unwrap();
 
         let contents = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(contents.trim(), "timeout");
@@ -553,7 +665,9 @@ mod tests {
         let ctx = ctx_for(vec![capture], tmp.path().to_path_buf());
         storage::attach_hook_to_step(&conn, &plan.id, &step.id, "post-test", "capture").unwrap();
 
-        run_post_test(&conn, &ctx, &plan, &step, 1, false, tmp.path()).await;
+        run_post_test(&conn, &ctx, &plan, &step, 1, false, tmp.path())
+            .await
+            .unwrap();
 
         let contents = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(contents.trim(), "false");
@@ -603,6 +717,118 @@ mod tests {
         assert!(
             msg.contains("slow") && msg.contains("timed out"),
             "error should name the hook and mention the timeout: {msg}"
+        );
+    }
+
+    /// Each `HookFailure` variant must produce a distinct, kind-specific
+    /// message — that is the whole point of the typed enum.
+    #[test]
+    fn test_warning_message_is_distinct_per_failure_kind() {
+        let db = warning_message(
+            Lifecycle::PostStep,
+            &HookFailure::Db(anyhow!("connection closed")),
+        );
+        let spawn = warning_message(
+            Lifecycle::PostStep,
+            &HookFailure::Spawn {
+                hook_name: "myhook".into(),
+                source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            },
+        );
+        let timeout = warning_message(
+            Lifecycle::PostStep,
+            &HookFailure::Timeout {
+                hook_name: "myhook".into(),
+                secs: 5,
+            },
+        );
+        let exit = warning_message(
+            Lifecycle::PostStep,
+            &HookFailure::Exit {
+                hook_name: "myhook".into(),
+                code: Some(2),
+                stderr: "boom".into(),
+            },
+        );
+
+        let all = [&db, &spawn, &timeout, &exit];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "messages must differ between variants");
+                }
+            }
+        }
+
+        // Each message carries kind-specific text so a reader can tell
+        // them apart at a glance.
+        assert!(db.to_lowercase().contains("database"), "db: {db}");
+        assert!(spawn.contains("spawn"), "spawn: {spawn}");
+        assert!(spawn.contains("PermissionDenied"), "spawn kind: {spawn}");
+        assert!(timeout.contains("timed out"), "timeout: {timeout}");
+        assert!(exit.contains("exited"), "exit: {exit}");
+
+        // Lifecycle name is included so post-step vs post-test failures
+        // are distinguishable in logs.
+        assert!(db.contains("post-step"));
+        let pt = warning_message(
+            Lifecycle::PostTest,
+            &HookFailure::Exit {
+                hook_name: "h".into(),
+                code: Some(1),
+                stderr: String::new(),
+            },
+        );
+        assert!(pt.contains("post-test"));
+    }
+
+    /// A DB lookup failure during a post-step hook escalates to a hard error
+    /// rather than being silently warned about. We provoke it by dropping
+    /// the table that `list_hooks_for_step` queries.
+    #[tokio::test]
+    async fn test_post_step_db_error_escalates_to_hard_failure() {
+        let conn = db::open_memory().unwrap();
+        let plan = make_plan("p1", "my-plan");
+        let step = make_step("s1", "p1", "Step one");
+        insert_plan_and_step(&conn, &plan, &step);
+
+        let tmp = TempDir::new().unwrap();
+        let ctx = ctx_for(vec![], tmp.path().to_path_buf());
+
+        conn.execute("DROP TABLE step_hooks", []).unwrap();
+
+        let err = run_post_step(&conn, &ctx, &plan, &step, 1, "complete", tmp.path())
+            .await
+            .expect_err("DB errors must escalate, not be warned about");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("database")
+                || msg.to_lowercase().contains("hook bindings"),
+            "error should name the DB problem: {msg}"
+        );
+    }
+
+    /// Same policy applies to post-test hooks.
+    #[tokio::test]
+    async fn test_post_test_db_error_escalates_to_hard_failure() {
+        let conn = db::open_memory().unwrap();
+        let plan = make_plan("p1", "my-plan");
+        let step = make_step("s1", "p1", "Step one");
+        insert_plan_and_step(&conn, &plan, &step);
+
+        let tmp = TempDir::new().unwrap();
+        let ctx = ctx_for(vec![], tmp.path().to_path_buf());
+
+        conn.execute("DROP TABLE step_hooks", []).unwrap();
+
+        let err = run_post_test(&conn, &ctx, &plan, &step, 1, true, tmp.path())
+            .await
+            .expect_err("DB errors must escalate, not be warned about");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("database")
+                || msg.to_lowercase().contains("hook bindings"),
+            "error should name the DB problem: {msg}"
         );
     }
 

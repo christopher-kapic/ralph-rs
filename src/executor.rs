@@ -236,7 +236,7 @@ async fn finalize_failure(
         reason.hook_label(),
         ctx.workdir,
     )
-    .await;
+    .await?;
 
     Ok(StepResult {
         outcome: reason.to_outcome(),
@@ -416,7 +416,8 @@ pub async fn execute_step(
             )?;
             if attempt >= max_attempts {
                 storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
-                hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir).await;
+                hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir)
+                    .await?;
                 return Ok(StepResult {
                     outcome: StepOutcome::Failed,
                     step_id: step.id.clone(),
@@ -425,7 +426,7 @@ pub async fn execute_step(
                 });
             }
             prev_test_output = Some(format!("pre-step hook failed: {e}"));
-            hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir).await;
+            hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir).await?;
             continue;
         }
 
@@ -501,7 +502,7 @@ pub async fn execute_step(
                         test_results.all_passed,
                         workdir,
                     )
-                    .await;
+                    .await?;
 
                     (test_results.all_passed, strings, test_results.aborted)
                 } else if has_changes {
@@ -562,7 +563,7 @@ pub async fn execute_step(
                     storage::update_step_status(conn, &step.id, StepStatus::Complete)?;
 
                     hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir)
-                        .await;
+                        .await?;
 
                     return Ok(StepResult {
                         outcome: StepOutcome::Success,
