@@ -14,6 +14,8 @@ A deterministic orchestrator for coding agent harnesses. Takes step-based plans 
 
 ## Install
 
+**Requirements:** git >= 2.23 (uses `git restore`).
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/christopher-kapic/ralph-rs/master/scripts/install.sh | bash
 ```

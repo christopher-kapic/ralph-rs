@@ -121,10 +121,10 @@ pub fn get_diff(workdir: &Path) -> Result<String> {
 
 /// Hard-reset the working directory to the last commit state.
 ///
-/// Equivalent to `git checkout -- . && git clean -fd`.
+/// Equivalent to `git restore . && git clean -fd`. Requires git >= 2.23.
 #[allow(dead_code)]
 pub fn rollback_changes(workdir: &Path) -> Result<()> {
-    git(workdir, &["checkout", "--", "."]).context("git checkout -- . failed")?;
+    git(workdir, &["restore", "."]).context("git restore . failed")?;
     git(workdir, &["clean", "-fd"]).context("git clean -fd failed")?;
     Ok(())
 }
@@ -161,11 +161,11 @@ pub fn commit_staged(workdir: &Path, message: &str) -> Result<()> {
 
 /// Rollback changes while preserving specified untracked files.
 ///
-/// Restores tracked files via `git checkout -- .`, then selectively removes
-/// only untracked files that are NOT in the `preserve` list.
+/// Restores tracked files via `git restore .`, then selectively removes
+/// only untracked files that are NOT in the `preserve` list. Requires git >= 2.23.
 pub fn rollback_except(workdir: &Path, preserve: &[String]) -> Result<()> {
     // Restore tracked files.
-    git(workdir, &["checkout", "--", "."]).context("git checkout -- . failed")?;
+    git(workdir, &["restore", "."]).context("git restore . failed")?;
 
     let untracked = get_untracked_files(workdir)?;
     remove_untracked_except(workdir, preserve, &untracked)
