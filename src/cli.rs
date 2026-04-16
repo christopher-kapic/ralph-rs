@@ -40,14 +40,6 @@ pub enum Command {
     /// Initialize ralph-rs: create config/agents directories, detect
     /// installed harnesses, and write the default config.
     Init {
-        /// Slug for the initial plan.
-        #[arg(long)]
-        slug: Option<String>,
-
-        /// Git branch name to use.
-        #[arg(long)]
-        branch: Option<String>,
-
         /// Skip the interactive default-harness prompt (picks the first
         /// installed harness, preferring `claude`).
         #[arg(long)]

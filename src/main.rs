@@ -83,7 +83,6 @@ fn main() -> Result<()> {
             non_interactive,
             default_harness,
             force,
-            ..
         } => {
             let opts = commands::InitOptions {
                 non_interactive,
