@@ -101,7 +101,7 @@ pub fn step_add(
             } else {
                 let first_key = &steps[0].sort_key;
                 if first_key.as_str() > "0" {
-                    frac_index::key_between("0", first_key)
+                    frac_index::key_between("0", first_key)?
                 } else {
                     "00".to_string()
                 }
@@ -113,7 +113,7 @@ pub fn step_add(
             // Insert between after_pos-1 and after_pos
             let before = &steps[after_pos - 1].sort_key;
             let after_key = &steps[after_pos].sort_key;
-            frac_index::key_between(before, after_key)
+            frac_index::key_between(before, after_key)?
         };
 
         storage::create_step_at(
@@ -468,7 +468,7 @@ pub fn step_move(
             // Use "0" as a synthetic lower bound; it sorts before any key
             // starting with a digit > '0' or a letter.
             if first > "0" {
-                frac_index::key_between("0", first)
+                frac_index::key_between("0", first)?
             } else {
                 // Extremely unlikely: first key is "0". Prepend with shorter key.
                 "00".to_string()
@@ -481,7 +481,7 @@ pub fn step_move(
         // Move between two existing steps
         let before = other_keys[target_idx - 1];
         let after_key = other_keys[target_idx];
-        frac_index::key_between(before, after_key)
+        frac_index::key_between(before, after_key)?
     };
 
     storage::update_step_sort_key(conn, &step.id, &new_sort_key)?;
