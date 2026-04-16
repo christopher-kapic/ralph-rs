@@ -222,7 +222,7 @@ pub fn create_step(
 /// List steps for a plan, ordered by sort_key.
 pub fn list_steps(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
          FROM steps WHERE plan_id = ?1 ORDER BY sort_key ASC",
     )?;
 
@@ -237,7 +237,7 @@ pub fn list_steps(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
 /// Fetch a single step by ID.
 pub fn get_step(conn: &Connection, step_id: &str) -> Result<Step> {
     conn.query_row(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
          FROM steps WHERE id = ?1",
         params![step_id],
         Step::from_row,
@@ -252,7 +252,7 @@ pub fn get_step(conn: &Connection, step_id: &str) -> Result<Step> {
 /// a user-supplied `--step-id` flag).
 pub fn get_step_by_id(conn: &Connection, step_id: &str) -> Result<Option<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
          FROM steps WHERE id = ?1",
     )?;
     let mut rows = stmt.query_map(params![step_id], Step::from_row)?;
@@ -269,6 +269,21 @@ pub fn update_step_status(conn: &Connection, step_id: &str, status: StepStatus) 
         params![status.as_str(), step_id],
     )?;
 
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
+/// Mark a step as skipped and record the operator-supplied reason (if any).
+///
+/// Writes `status` and `skipped_reason` in a single UPDATE so a concurrent
+/// reader can't observe the skipped status without its reason.
+pub fn mark_step_skipped(conn: &Connection, step_id: &str, reason: Option<&str>) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE steps SET status = ?1, skipped_reason = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
+        params![StepStatus::Skipped.as_str(), reason, step_id],
+    )?;
     if affected == 0 {
         anyhow::bail!("Step not found: {step_id}");
     }
@@ -418,7 +433,7 @@ pub fn reset_step(conn: &Connection, step_id: &str) -> Result<()> {
         params![step_id],
     )?;
     let affected = conn.execute(
-        "UPDATE steps SET status = ?1, attempts = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        "UPDATE steps SET status = ?1, attempts = 0, skipped_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
         params![StepStatus::Pending.as_str(), step_id],
     )?;
     if affected == 0 {
@@ -443,7 +458,7 @@ pub fn update_step_sort_key(conn: &Connection, step_id: &str, sort_key: &str) ->
 #[allow(dead_code)]
 pub fn get_next_pending_step(conn: &Connection, plan_id: &str) -> Result<Option<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
          FROM steps WHERE plan_id = ?1 AND status = ?2 ORDER BY sort_key ASC LIMIT 1",
     )?;
 

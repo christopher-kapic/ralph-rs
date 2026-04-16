@@ -223,6 +223,11 @@ pub struct Step {
     /// (or omit the model flag entirely if that's also None)".
     #[serde(default)]
     pub model: Option<String>,
+    /// Operator-supplied reason recorded when the step was skipped via
+    /// `ralph skip --reason <r>`. `None` for non-skipped steps or skips
+    /// that omitted the flag.
+    #[serde(default)]
+    pub skipped_reason: Option<String>,
 }
 
 impl Step {
@@ -231,7 +236,7 @@ impl Step {
     /// Expected column order:
     /// id, plan_id, sort_key, title, description, agent, harness,
     /// acceptance_criteria, status, attempts, max_retries, created_at,
-    /// updated_at, model
+    /// updated_at, model, skipped_reason
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let criteria_json: String = row.get(7)?;
         let acceptance_criteria: Vec<String> =
@@ -273,6 +278,7 @@ impl Step {
             created_at,
             updated_at,
             model: row.get(13)?,
+            skipped_reason: row.get(14)?,
         })
     }
 }
@@ -541,7 +547,7 @@ mod tests {
 
         let step = conn
             .query_row(
-                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model FROM steps WHERE id = ?1",
+                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason FROM steps WHERE id = ?1",
                 ["s1"],
                 Step::from_row,
             )

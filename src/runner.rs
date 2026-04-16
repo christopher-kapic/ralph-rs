@@ -651,11 +651,13 @@ pub async fn resume_plan(
 /// Skip the current (or specified) step in a plan.
 ///
 /// Marks the step as skipped and returns the step number that was skipped.
+/// The optional `reason` is persisted on the step so it appears in
+/// `ralph status -v` and `ralph log`.
 pub fn skip_step(
     conn: &Connection,
     plan: &Plan,
     step_num: Option<usize>,
-    _reason: Option<&str>,
+    reason: Option<&str>,
 ) -> Result<usize> {
     let steps = storage::list_steps(conn, &plan.id)?;
 
@@ -686,8 +688,11 @@ pub fn skip_step(
         }
     }
 
-    storage::update_step_status(conn, &step.id, StepStatus::Skipped)?;
-    eprintln!("Skipped step {} '{}'", actual_num, step.title);
+    storage::mark_step_skipped(conn, &step.id, reason)?;
+    match reason {
+        Some(r) => eprintln!("Skipped step {} '{}' (reason: {})", actual_num, step.title, r),
+        None => eprintln!("Skipped step {} '{}'", actual_num, step.title),
+    }
 
     Ok(actual_num)
 }
@@ -1037,6 +1042,7 @@ mod tests {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 model: None,
+                skipped_reason: None,
             })
             .collect()
     }
@@ -1293,6 +1299,52 @@ mod tests {
 
         let result = skip_step(&conn, &plan, Some(5), None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_skip_step_persists_reason() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+
+        let skipped = skip_step(&conn, &plan, Some(1), Some("redundant after H7")).unwrap();
+        assert_eq!(skipped, 1);
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Skipped);
+        assert_eq!(
+            steps[0].skipped_reason.as_deref(),
+            Some("redundant after H7")
+        );
+    }
+
+    #[test]
+    fn test_skip_step_no_reason_stores_null() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+
+        skip_step(&conn, &plan, Some(1), None).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Skipped);
+        assert!(steps[0].skipped_reason.is_none());
+    }
+
+    #[test]
+    fn test_reset_clears_skipped_reason() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) =
+            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None)
+                .unwrap();
+
+        skip_step(&conn, &plan, Some(1), Some("because")).unwrap();
+        storage::reset_step(&conn, &s1.id).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Pending);
+        assert!(steps[0].skipped_reason.is_none());
     }
 
     #[test]

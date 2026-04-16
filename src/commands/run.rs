@@ -109,6 +109,11 @@ pub fn cmd_status(
                 output::colored_status(step.status, out.color),
                 step.attempts,
             );
+            if step.status == StepStatus::Skipped
+                && let Some(reason) = step.skipped_reason.as_deref()
+            {
+                println!("       reason: {reason}");
+            }
         }
     }
 
@@ -183,6 +188,14 @@ pub fn cmd_log(
         );
         eprintln!();
 
+        if step.status == StepStatus::Skipped {
+            match step.skipped_reason.as_deref() {
+                Some(reason) => println!("  (skipped: {reason})"),
+                None => println!("  (skipped)"),
+            }
+            println!();
+        }
+
         for log in &logs {
             print_log_entry(&step.title, log, output_mode, out.color);
         }
@@ -197,8 +210,38 @@ pub fn cmd_log(
             return Ok(());
         }
 
-        if entries.is_empty() {
+        // Surface skipped steps' reasons alongside execution logs — skips
+        // don't produce an execution_log row, so they'd otherwise be invisible
+        // in this view.
+        let steps = storage::list_steps(conn, &plan.id)?;
+        let skipped_with_reason: Vec<&crate::plan::Step> = steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Skipped)
+            .collect();
+
+        if entries.is_empty() && skipped_with_reason.is_empty() {
             eprintln!("No execution logs for plan '{}'.", plan.slug);
+            return Ok(());
+        }
+
+        if !skipped_with_reason.is_empty() {
+            eprintln!("Skipped steps for plan '{}':", plan.slug);
+            eprintln!();
+            for step in &skipped_with_reason {
+                let num = steps.iter().position(|s| s.id == step.id).unwrap_or(0) + 1;
+                match step.skipped_reason.as_deref() {
+                    Some(reason) => {
+                        println!("  #{num} {} — skipped ({reason})", step.title);
+                    }
+                    None => {
+                        println!("  #{num} {} — skipped", step.title);
+                    }
+                }
+            }
+            println!();
+        }
+
+        if entries.is_empty() {
             return Ok(());
         }
 

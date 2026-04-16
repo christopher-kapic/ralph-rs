@@ -10,7 +10,7 @@ use crate::config;
 /// Current schema version. Bump this and add a new migration function
 /// to `MIGRATIONS` whenever the schema changes.
 #[allow(dead_code)]
-const CURRENT_VERSION: u32 = 7;
+const CURRENT_VERSION: u32 = 8;
 
 /// Each migration is a function that receives a connection (already inside a transaction).
 /// Migrations are 1-indexed: MIGRATIONS[0] migrates from version 0 → 1.
@@ -22,6 +22,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v5,
     migrate_v6,
     migrate_v7,
+    migrate_v8,
 ];
 
 /// Returns the path to the SQLite database file.
@@ -284,6 +285,22 @@ fn migrate_v7(conn: &Connection) -> Result<()> {
 
         CREATE UNIQUE INDEX idx_step_hooks_unique
             ON step_hooks(plan_id, COALESCE(step_id, ''), lifecycle, hook_name);
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V8: skipped_reason column on steps
+// ---------------------------------------------------------------------------
+
+fn migrate_v8(conn: &Connection) -> Result<()> {
+    // Nullable: only populated when `ralph skip --reason <r>` records why a
+    // step was intentionally bypassed. Surfaced in `ralph status -v` and
+    // `ralph log` so the operator's rationale isn't lost.
+    conn.execute_batch(
+        "
+        ALTER TABLE steps ADD COLUMN skipped_reason TEXT;
         ",
     )?;
     Ok(())
