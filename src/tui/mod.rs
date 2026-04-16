@@ -12,6 +12,7 @@ pub mod ui;
 #[cfg(test)]
 mod tests {
     use super::app::{App, InputMode};
+    use crate::config::Config;
     use crate::plan::{Plan, PlanStatus, Step, StepStatus};
     use chrono::Utc;
 
@@ -64,7 +65,7 @@ mod tests {
     fn test_app_creation() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let app = App::new(plan.clone(), steps.clone());
+        let app = App::new(plan.clone(), steps.clone(), &Config::default());
 
         assert_eq!(app.plan.slug, "test-plan");
         assert_eq!(app.steps.len(), 3);
@@ -77,7 +78,7 @@ mod tests {
     fn test_navigate_down() {
         let plan = make_plan();
         let steps = make_steps(5);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         assert_eq!(app.selected_index, 0);
         app.navigate_down();
@@ -90,7 +91,7 @@ mod tests {
     fn test_navigate_down_wraps() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         app.selected_index = 2;
         app.navigate_down();
@@ -101,7 +102,7 @@ mod tests {
     fn test_navigate_up() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         app.selected_index = 2;
         app.navigate_up();
@@ -114,7 +115,7 @@ mod tests {
     fn test_navigate_up_wraps() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         assert_eq!(app.selected_index, 0);
         app.navigate_up();
@@ -124,7 +125,7 @@ mod tests {
     #[test]
     fn test_navigate_empty_steps() {
         let plan = make_plan();
-        let mut app = App::new(plan, vec![]);
+        let mut app = App::new(plan, vec![], &Config::default());
 
         app.navigate_down();
         assert_eq!(app.selected_index, 0);
@@ -136,7 +137,7 @@ mod tests {
     fn test_enter_add_mode() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         app.enter_add_mode();
         assert!(matches!(app.input_mode, InputMode::AddStep));
@@ -147,7 +148,7 @@ mod tests {
     fn test_confirm_add_step() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         // Select step 1 (in_progress) then add
         app.selected_index = 1;
@@ -165,7 +166,7 @@ mod tests {
     fn test_confirm_add_step_empty_title() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         app.enter_add_mode();
         app.input_buffer = "   ".to_string();
@@ -178,7 +179,7 @@ mod tests {
     fn test_cancel_add_step() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         app.enter_add_mode();
         app.input_buffer = "Some text".to_string();
@@ -191,7 +192,7 @@ mod tests {
     fn test_skip_current_step() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         // Select the in_progress step
         app.selected_index = 1;
@@ -204,7 +205,7 @@ mod tests {
     fn test_skip_complete_step_rejected() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         // Select the complete step
         app.selected_index = 0;
@@ -216,7 +217,7 @@ mod tests {
     fn test_quit() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         assert!(!app.should_quit);
         app.request_quit();
@@ -227,7 +228,7 @@ mod tests {
     fn test_update_step_status() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         app.update_step_status("s2", StepStatus::InProgress, 1);
         assert_eq!(app.steps[2].status, StepStatus::InProgress);
@@ -238,7 +239,7 @@ mod tests {
     fn test_update_step_status_unknown_id() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         // Should be a no-op
         app.update_step_status("unknown", StepStatus::Complete, 1);
@@ -250,7 +251,7 @@ mod tests {
     fn test_current_in_progress_step() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let app = App::new(plan, steps);
+        let app = App::new(plan, steps, &Config::default());
 
         let current = app.current_in_progress_step();
         assert!(current.is_some());
@@ -264,7 +265,7 @@ mod tests {
         let plan = make_plan();
         let mut steps = make_steps(3);
         steps[1].status = StepStatus::Pending;
-        let app = App::new(plan, steps);
+        let app = App::new(plan, steps, &Config::default());
 
         let current = app.current_in_progress_step();
         assert!(current.is_none());
@@ -274,7 +275,7 @@ mod tests {
     fn test_insert_step_at_position() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         let new_step = Step {
             id: "s_new".to_string(),
@@ -311,7 +312,7 @@ mod tests {
     fn test_execution_timer() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let mut app = App::new(plan, steps);
+        let mut app = App::new(plan, steps, &Config::default());
 
         assert!(app.step_start_time.is_none());
         app.start_step_timer();
@@ -328,7 +329,7 @@ mod tests {
     fn test_elapsed_secs_no_timer() {
         let plan = make_plan();
         let steps = make_steps(3);
-        let app = App::new(plan, steps);
+        let app = App::new(plan, steps, &Config::default());
 
         assert_eq!(app.elapsed_secs(), 0.0);
     }

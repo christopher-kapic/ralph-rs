@@ -123,6 +123,7 @@ fn handle_add_mode(app: &mut App, key: KeyEvent) -> InputAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::plan::{Plan, PlanStatus, Step, StepStatus};
     use chrono::Utc;
 
@@ -164,7 +165,7 @@ mod tests {
                 skipped_reason: None,
             })
             .collect();
-        App::new(plan, steps)
+        App::new(plan, steps, &Config::default())
     }
 
     fn key(code: KeyCode) -> KeyEvent {

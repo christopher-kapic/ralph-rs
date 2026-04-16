@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use ratatui::widgets::ListState;
 
+use crate::config::Config;
 use crate::plan::{Plan, Step, StepStatus};
 
 // ---------------------------------------------------------------------------
@@ -51,11 +52,15 @@ pub struct App {
 
     /// Persistent list widget state so the viewport offset survives across frames.
     pub list_state: ListState,
+
+    /// Default retry budget per step, sourced from `Config.max_retries_per_step`,
+    /// used when a step has no explicit `max_retries` override.
+    pub default_max_retries: u32,
 }
 
 impl App {
     /// Create a new App with the given plan and steps.
-    pub fn new(plan: Plan, steps: Vec<Step>) -> Self {
+    pub fn new(plan: Plan, steps: Vec<Step>, config: &Config) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         Self {
@@ -67,6 +72,7 @@ impl App {
             should_quit: false,
             step_start_time: None,
             list_state,
+            default_max_retries: config.max_retries_per_step,
         }
     }
 

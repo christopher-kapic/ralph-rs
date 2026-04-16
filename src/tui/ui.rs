@@ -132,7 +132,9 @@ fn draw_step_detail(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     // Attempt counter
-    let max_retries = step.max_retries.unwrap_or(3);
+    let max_retries = step
+        .max_retries
+        .unwrap_or(app.default_max_retries as i32);
     let max_attempts = max_retries + 1;
     lines.push(Line::from(vec![
         Span::styled("Attempts: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -236,6 +238,7 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::plan::{Plan, PlanStatus, Step, StepStatus};
     use chrono::Utc;
 
@@ -273,7 +276,7 @@ mod tests {
                 skipped_reason: None,
             })
             .collect();
-        App::new(plan, steps)
+        App::new(plan, steps, &Config::default())
     }
 
     #[test]
@@ -320,6 +323,65 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn test_detail_attempt_counter_uses_config_default() {
+        // A step with no explicit max_retries override should fall back to the
+        // configured Config.max_retries_per_step rather than a hardcoded 3.
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: "/tmp".to_string(),
+            branch_name: "b".to_string(),
+            description: "d".to_string(),
+            status: PlanStatus::InProgress,
+            harness: Some("claude".to_string()),
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let steps = vec![Step {
+            id: "s0".to_string(),
+            plan_id: "p1".to_string(),
+            sort_key: "a0".to_string(),
+            title: "Only step".to_string(),
+            description: String::new(),
+            agent: None,
+            harness: None,
+            acceptance_criteria: vec![],
+            status: StepStatus::Pending,
+            attempts: 0,
+            max_retries: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: None,
+            skipped_reason: None,
+        }];
+        let mut config = Config::default();
+        config.max_retries_per_step = 7;
+        let mut app = App::new(plan, steps, &config);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let rendered: String = (0..buffer.area().height)
+            .map(|y| {
+                (0..buffer.area().width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("0/8"),
+            "detail panel should render 0/(max_retries_per_step + 1) = 0/8; got:\n{rendered}"
+        );
     }
 
     #[test]
