@@ -106,7 +106,10 @@ fn main() -> Result<()> {
                 tests,
                 depends_on,
             } => {
-                let h = cli.harness.as_deref().or(harness.as_deref());
+                // Precedence: per-subcommand --harness overrides the global
+                // --harness, which in turn falls back to the plan/config
+                // default downstream.
+                let h = harness.as_deref().or(cli.harness.as_deref());
                 commands::plan_create(
                     &conn,
                     &slug,
@@ -213,7 +216,10 @@ fn main() -> Result<()> {
                 max_retries,
                 import_json,
             } => {
-                let h = cli.harness.as_deref().or(harness.as_deref());
+                // Precedence: per-subcommand --harness overrides the global
+                // --harness, which in turn falls back to the plan/config
+                // default downstream.
+                let h = harness.as_deref().or(cli.harness.as_deref());
                 if let Some(source) = import_json {
                     // With --import-json, there is no step title; reinterpret
                     // a single positional as the plan slug. Error if the user
@@ -368,7 +374,11 @@ fn main() -> Result<()> {
             force,
         } => {
             let workdir = std::path::Path::new(&project);
-            let harness_override = cli.harness.or(run_harness);
+            // Precedence: `ralph run --harness X` beats `ralph --harness Y run`,
+            // which in turn falls back to the plan's own harness and then the
+            // config default. The per-subcommand flag is the most specific,
+            // so it wins.
+            let harness_override = run_harness.or(cli.harness);
 
             // The CLI flag is additive over the config default, so turning
             // on `auto_stash: true` in config.json always works and

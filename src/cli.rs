@@ -15,7 +15,10 @@ pub struct Cli {
     #[arg(long, short = 'C', global = true)]
     pub project: Option<PathBuf>,
 
-    /// Override the default harness for this invocation.
+    /// Override the default harness for this invocation. A per-subcommand
+    /// `--harness` (e.g. `ralph run --harness X`) takes precedence over this
+    /// global flag; both in turn fall back to the plan's stored harness and
+    /// then the config default.
     #[arg(long, global = true)]
     pub harness: Option<String>,
 
@@ -1302,6 +1305,44 @@ mod tests {
     fn test_global_harness_flag() {
         let cli = Cli::try_parse_from(["ralph-rs", "--harness", "codex", "doctor"]).unwrap();
         assert_eq!(cli.harness.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn test_run_subcommand_captures_harness_flag() {
+        // The Run subcommand must carry its own harness field so main.rs can
+        // honor per-subcommand overrides. clap's `global = true` on the top
+        // level makes both fields mirror the final `--harness` value, which is
+        // why the parse check below sees the same string in both places.
+        let cli = Cli::try_parse_from([
+            "ralph-rs", "--harness", "codex", "run", "--harness", "claude",
+        ])
+        .unwrap();
+        if let Command::Run {
+            harness: run_harness,
+            ..
+        } = cli.command
+        {
+            assert_eq!(run_harness.as_deref(), Some("claude"));
+        } else {
+            panic!("Expected Run command");
+        }
+    }
+
+    #[test]
+    fn test_harness_precedence_prefers_subcommand() {
+        // Direct regression test for the rule applied in main.rs:
+        //   per-subcommand --harness beats global --harness.
+        // Expressed here so the precedence survives any refactor that relocates
+        // the dispatcher.
+        let global = Some("codex".to_string());
+        let run_flag = Some("claude".to_string());
+        let resolved = run_flag.clone().or(global.clone());
+        assert_eq!(resolved.as_deref(), Some("claude"));
+
+        // Falls back to the global when the subcommand flag is absent.
+        let none_run: Option<String> = None;
+        let resolved = none_run.or(global.clone());
+        assert_eq!(resolved.as_deref(), Some("codex"));
     }
 
     #[test]

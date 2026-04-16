@@ -101,7 +101,7 @@ ralph run [<slug>] --from <n> --to <m> # Run a specific step range
 ralph run [<slug>] --dry-run           # Print what would happen without executing
 ralph run [<slug>] --current-branch    # Run on current branch (skip branch creation)
 ralph run [<slug>] --auto-stash        # Auto-commit a dirty tree instead of bailing
-ralph run [<slug>] --harness <h>       # Override harness for this run
+ralph run [<slug>] --harness <h>       # Override harness for this run (beats the global --harness)
 ralph resume [<slug>]                  # Resume from last failed step
 ralph skip [<slug>]                    # Skip failed step, continue
 ```
