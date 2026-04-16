@@ -389,8 +389,8 @@ pub fn reset_step(conn: &Connection, step_id: &str) -> Result<()> {
         params![step_id],
     )?;
     let affected = conn.execute(
-        "UPDATE steps SET status = 'pending', attempts = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
-        params![step_id],
+        "UPDATE steps SET status = ?1, attempts = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![StepStatus::Pending.as_str(), step_id],
     )?;
     if affected == 0 {
         anyhow::bail!("Step not found: {step_id}");
@@ -415,10 +415,10 @@ pub fn update_step_sort_key(conn: &Connection, step_id: &str, sort_key: &str) ->
 pub fn get_next_pending_step(conn: &Connection, plan_id: &str) -> Result<Option<Step>> {
     let mut stmt = conn.prepare(
         "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model
-         FROM steps WHERE plan_id = ?1 AND status = 'pending' ORDER BY sort_key ASC LIMIT 1",
+         FROM steps WHERE plan_id = ?1 AND status = ?2 ORDER BY sort_key ASC LIMIT 1",
     )?;
 
-    let mut rows = stmt.query_map(params![plan_id], Step::from_row)?;
+    let mut rows = stmt.query_map(params![plan_id, StepStatus::Pending.as_str()], Step::from_row)?;
     match rows.next() {
         Some(row) => Ok(Some(row?)),
         None => Ok(None),
