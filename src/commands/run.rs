@@ -152,7 +152,9 @@ pub fn cmd_log(
         match storage::find_active_plan(conn, project, true)? {
             Some(p) => p,
             None => {
-                if out.format != OutputFormat::Json {
+                if out.format == OutputFormat::Json {
+                    println!("null");
+                } else {
                     eprintln!("No plan found. Specify a plan slug as a positional argument.");
                 }
                 return Ok(());
