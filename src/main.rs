@@ -396,7 +396,7 @@ fn main() -> Result<()> {
                     for p in &runnable {
                         eprintln!("Running preflight checks for '{}'...", p.slug);
                         let results = preflight::run_preflight_checks(p, &_config, workdir)?;
-                        results.print_report();
+                        results.print_report(&out);
                         if !results.is_ok() {
                             any_errors = true;
                         }
@@ -460,7 +460,7 @@ fn main() -> Result<()> {
             if !skip_preflight && !dry_run {
                 eprintln!("Running preflight checks...");
                 let preflight_results = preflight::run_preflight_checks(&plan, &_config, workdir)?;
-                preflight_results.print_report();
+                preflight_results.print_report(&out);
 
                 if !preflight_results.is_ok() {
                     anyhow::bail!("Preflight checks failed. Use --skip-preflight to bypass.");

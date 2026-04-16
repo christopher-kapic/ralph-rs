@@ -6,12 +6,14 @@
 // - Harness authentication: check GH_TOKEN for copilot
 // - Git dirty state: auto-commit with a descriptive message
 
+use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::Result;
 
 use crate::config::{Config, HarnessConfig};
 use crate::git;
+use crate::output::OutputContext;
 use crate::plan::Plan;
 
 // ---------------------------------------------------------------------------
@@ -58,15 +60,21 @@ impl PreflightResults {
     }
 
     /// Print all check results to stderr.
-    pub fn print_report(&self) {
+    pub fn print_report(&self, ctx: &OutputContext) {
+        let _ = self.write_report(ctx, &mut io::stderr());
+    }
+
+    /// Write the report to an arbitrary writer (testable seam).
+    fn write_report(&self, ctx: &OutputContext, writer: &mut dyn Write) -> io::Result<()> {
         for check in &self.checks {
             let icon = match check.severity {
-                CheckSeverity::Pass => "\x1b[32m\u{2714}\x1b[0m", // green check
-                CheckSeverity::Warning => "\x1b[33m\u{26a0}\x1b[0m", // yellow warning
-                CheckSeverity::Error => "\x1b[31m\u{2718}\x1b[0m", // red X
+                CheckSeverity::Pass => crate::output::severity_icon("pass", ctx.color),
+                CheckSeverity::Warning => crate::output::severity_icon("warning", ctx.color),
+                CheckSeverity::Error => crate::output::severity_icon("error", ctx.color),
             };
-            eprintln!("  {} {}: {}", icon, check.name, check.message);
+            writeln!(writer, "  {} {}: {}", icon, check.name, check.message)?;
         }
+        Ok(())
     }
 }
 
@@ -521,6 +529,64 @@ mod tests {
         // Config should always pass
         let config_check = checks.iter().find(|c| c.name == "config").unwrap();
         assert_eq!(config_check.severity, CheckSeverity::Pass);
+    }
+
+    #[test]
+    fn test_print_report_no_color_omits_ansi() {
+        let results = PreflightResults {
+            checks: vec![
+                CheckResult {
+                    name: "a".to_string(),
+                    severity: CheckSeverity::Pass,
+                    message: "ok".to_string(),
+                },
+                CheckResult {
+                    name: "b".to_string(),
+                    severity: CheckSeverity::Warning,
+                    message: "warn".to_string(),
+                },
+                CheckResult {
+                    name: "c".to_string(),
+                    severity: CheckSeverity::Error,
+                    message: "bad".to_string(),
+                },
+            ],
+        };
+        let ctx = OutputContext {
+            format: crate::output::OutputFormat::Plain,
+            quiet: false,
+            color: false,
+        };
+        let mut buf = Vec::new();
+        results.write_report(&ctx, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            !text.contains('\x1b'),
+            "expected no ANSI escapes with color=false, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_print_report_with_color_emits_ansi() {
+        let results = PreflightResults {
+            checks: vec![CheckResult {
+                name: "a".to_string(),
+                severity: CheckSeverity::Pass,
+                message: "ok".to_string(),
+            }],
+        };
+        let ctx = OutputContext {
+            format: crate::output::OutputFormat::Plain,
+            quiet: false,
+            color: true,
+        };
+        let mut buf = Vec::new();
+        results.write_report(&ctx, &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(
+            text.contains('\x1b'),
+            "expected ANSI escapes with color=true, got: {text:?}"
+        );
     }
 
     #[test]
