@@ -34,6 +34,59 @@ pub struct PriorStepSummary {
     pub description: String,
 }
 
+/// A single prefix/suffix pair contributed by one scope (global, project, or
+/// plan). Fields are borrowed from their source of truth — config, DB row, or
+/// plan column — so building a [`PromptWraps`] is allocation-free.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PromptWrap<'a> {
+    pub prefix: Option<&'a str>,
+    pub suffix: Option<&'a str>,
+}
+
+impl<'a> PromptWrap<'a> {
+    /// Convenience constructor taking `Option<&String>` views, which is how
+    /// `Plan` / `Config` / `ProjectSettings` expose their owned strings.
+    pub fn from_opts(prefix: Option<&'a String>, suffix: Option<&'a String>) -> Self {
+        Self {
+            prefix: prefix.map(String::as_str),
+            suffix: suffix.map(String::as_str),
+        }
+    }
+}
+
+/// All three wrap layers, outermost to innermost. Prefixes stack global →
+/// project → plan at the top of the prompt; suffixes stack plan → project →
+/// global at the bottom. Empty strings are treated as `None` so a scope can
+/// be "set but blank" without contaminating the prompt.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PromptWraps<'a> {
+    pub global: PromptWrap<'a>,
+    pub project: PromptWrap<'a>,
+    pub plan: PromptWrap<'a>,
+}
+
+impl<'a> PromptWraps<'a> {
+    /// Iterator over prefix strings in the order they should appear at the
+    /// top of the assembled prompt (outermost first).
+    fn prefix_sections(&self) -> impl Iterator<Item = &'a str> {
+        [self.global.prefix, self.project.prefix, self.plan.prefix]
+            .into_iter()
+            .filter_map(non_empty)
+    }
+
+    /// Iterator over suffix strings in the order they should appear at the
+    /// bottom of the assembled prompt (innermost first, so global ends last).
+    fn suffix_sections(&self) -> impl Iterator<Item = &'a str> {
+        [self.plan.suffix, self.project.suffix, self.global.suffix]
+            .into_iter()
+            .filter_map(non_empty)
+    }
+}
+
+fn non_empty(s: Option<&str>) -> Option<&str> {
+    s.filter(|v| !v.is_empty())
+}
+
 /// Build the full prompt for a step execution.
 ///
 /// The prompt is assembled from 8 parts:
@@ -45,6 +98,10 @@ pub struct PriorStepSummary {
 /// 6. Acceptance criteria (specific criteria the step must meet)
 /// 7. Deterministic tests (test commands that must pass)
 /// 8. Focus instruction (reminder to stay focused on just this step)
+///
+/// Then the global/project/plan prompt prefix/suffix layers are wrapped
+/// around the joined sections: prefixes stack outermost→innermost at the
+/// top, suffixes stack innermost→outermost at the bottom.
 pub fn build_step_prompt(
     plan: &Plan,
     step: &Step,
@@ -52,6 +109,7 @@ pub fn build_step_prompt(
     agent_name: Option<&str>,
     retry_context: Option<&RetryContext>,
     harness_supports_agent_file: bool,
+    wraps: &PromptWraps<'_>,
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
 
@@ -94,7 +152,15 @@ pub fn build_step_prompt(
     // 8. Focus instruction
     sections.push(format_focus_instruction(step));
 
-    sections.join("\n\n")
+    // Layer prefix/suffix wraps around the joined sections. Each wrap layer
+    // is inserted as its own `\n\n`-separated section, matching the rest of
+    // the prompt's delimiter so nothing looks glued on.
+    let mut all = Vec::with_capacity(sections.len() + 6);
+    all.extend(wraps.prefix_sections().map(str::to_string));
+    all.extend(sections);
+    all.extend(wraps.suffix_sections().map(str::to_string));
+
+    all.join("\n\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +340,8 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
         }
     }
 
@@ -319,6 +387,7 @@ mod tests {
             None,
             None,
             true, // harness supports agent file natively
+            &PromptWraps::default(),
         );
 
         // Should contain plan context
@@ -361,6 +430,7 @@ mod tests {
             Some("senior-engineer"),
             None,
             false, // harness does NOT support agent file natively
+            &PromptWraps::default(),
         );
 
         // A short pointer should be prepended telling the agent to run
@@ -381,6 +451,7 @@ mod tests {
             Some("senior-engineer"),
             None,
             true, // harness supports agent file natively
+            &PromptWraps::default(),
         );
 
         // Pointer section should NOT be in the prompt — the harness gets
@@ -401,6 +472,7 @@ mod tests {
             None,
             None,
             false, // non-native, but no agent assigned
+            &PromptWraps::default(),
         );
 
         assert!(!prompt.contains("# Agent Profile"));
@@ -418,7 +490,15 @@ mod tests {
             files_modified: vec!["src/harness.rs".to_string(), "src/main.rs".to_string()],
         };
 
-        let prompt = build_step_prompt(&plan, &step, &[], None, Some(&retry), true);
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &[],
+            None,
+            Some(&retry),
+            true,
+            &PromptWraps::default(),
+        );
 
         assert!(prompt.contains("# Retry Context"));
         assert!(prompt.contains("attempt 2 of 3"));
@@ -435,7 +515,8 @@ mod tests {
         let plan = make_plan();
         let step = make_step();
 
-        let prompt = build_step_prompt(&plan, &step, &[], None, None, true);
+        let prompt =
+            build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
 
         // Should not contain prior steps section
         assert!(!prompt.contains("Context from Prior Steps"));
@@ -447,7 +528,8 @@ mod tests {
         let mut step = make_step();
         step.acceptance_criteria = vec![];
 
-        let prompt = build_step_prompt(&plan, &step, &[], None, None, true);
+        let prompt =
+            build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
 
         assert!(!prompt.contains("Acceptance Criteria"));
     }
@@ -458,7 +540,8 @@ mod tests {
         plan.deterministic_tests = vec![];
         let step = make_step();
 
-        let prompt = build_step_prompt(&plan, &step, &[], None, None, true);
+        let prompt =
+            build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
 
         assert!(!prompt.contains("Deterministic Tests"));
     }
@@ -622,6 +705,7 @@ mod tests {
             Some("senior-engineer"),
             Some(&retry),
             false,
+            &PromptWraps::default(),
         );
 
         // Verify ordering: agent -> retry -> plan -> prior -> step -> criteria -> tests -> focus
@@ -641,5 +725,75 @@ mod tests {
         assert!(step_pos < criteria_pos);
         assert!(criteria_pos < tests_pos);
         assert!(tests_pos < focus_pos);
+    }
+
+    #[test]
+    fn test_wraps_layer_global_project_plan_order() {
+        let plan = make_plan();
+        let step = make_step();
+        let global_pre = "GLOBAL-PRE".to_string();
+        let global_suf = "GLOBAL-SUF".to_string();
+        let project_pre = "PROJECT-PRE".to_string();
+        let project_suf = "PROJECT-SUF".to_string();
+        let plan_pre = "PLAN-PRE".to_string();
+        let plan_suf = "PLAN-SUF".to_string();
+        let wraps = PromptWraps {
+            global: PromptWrap::from_opts(Some(&global_pre), Some(&global_suf)),
+            project: PromptWrap::from_opts(Some(&project_pre), Some(&project_suf)),
+            plan: PromptWrap::from_opts(Some(&plan_pre), Some(&plan_suf)),
+        };
+
+        let prompt = build_step_prompt(&plan, &step, &[], None, None, true, &wraps);
+
+        // Prefixes stack outermost → innermost at the top.
+        let g_pre = prompt.find("GLOBAL-PRE").unwrap();
+        let p_pre = prompt.find("PROJECT-PRE").unwrap();
+        let pl_pre = prompt.find("PLAN-PRE").unwrap();
+        let plan_section = prompt.find("# Plan: test-plan").unwrap();
+        assert!(g_pre < p_pre);
+        assert!(p_pre < pl_pre);
+        assert!(pl_pre < plan_section);
+
+        // Suffixes stack innermost → outermost at the bottom.
+        let focus = prompt.find("Only modify files").unwrap();
+        let pl_suf = prompt.find("PLAN-SUF").unwrap();
+        let p_suf = prompt.find("PROJECT-SUF").unwrap();
+        let g_suf = prompt.find("GLOBAL-SUF").unwrap();
+        assert!(focus < pl_suf);
+        assert!(pl_suf < p_suf);
+        assert!(p_suf < g_suf);
+
+        // Global prefix is the very start; global suffix is the very end.
+        assert!(prompt.starts_with("GLOBAL-PRE"));
+        assert!(prompt.trim_end().ends_with("GLOBAL-SUF"));
+    }
+
+    #[test]
+    fn test_wraps_skip_empty_and_none() {
+        let plan = make_plan();
+        let step = make_step();
+        let blank = String::new();
+        let plan_pre = "PLAN-PRE".to_string();
+        let wraps = PromptWraps {
+            // Empty strings are treated identically to None — they do not
+            // contribute a section (no stray double-newline gap).
+            global: PromptWrap::from_opts(Some(&blank), Some(&blank)),
+            project: PromptWrap::default(),
+            plan: PromptWrap::from_opts(Some(&plan_pre), None),
+        };
+
+        let prompt = build_step_prompt(&plan, &step, &[], None, None, true, &wraps);
+
+        assert!(prompt.starts_with("PLAN-PRE"));
+        assert!(
+            !prompt.contains("\n\n\n"),
+            "should not produce blank sections"
+        );
+        // No suffix contribution at all — focus instruction is the tail.
+        assert!(
+            prompt
+                .trim_end()
+                .ends_with(&format!("Focus on: {}", step.title))
+        );
     }
 }

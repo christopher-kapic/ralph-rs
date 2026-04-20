@@ -107,6 +107,11 @@ fn default_auto_stash() -> bool {
     false
 }
 
+/// Default global prompt prefix seeded by `ralph init`. Points agents at the
+/// ralph CLI so they can look up plan details themselves, and flags
+/// AGENTS.md/CLAUDE.md as the place for plan-specific conventions.
+pub const DEFAULT_GLOBAL_PROMPT_PREFIX: &str = "You are running as part of a `ralph` plan. Run `ralph status` to see the active plan, or `ralph plan show <slug>` for full details. Plan-specific conventions may be defined in AGENTS.md or CLAUDE.md.";
+
 /// Top-level ralph-rs configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
@@ -129,6 +134,17 @@ pub struct Config {
     /// `--auto-stash` CLI flag overrides this per-run.
     #[serde(default = "default_auto_stash")]
     pub auto_stash: bool,
+    /// Global prompt prefix prepended to every step prompt, outside any
+    /// project- or plan-level prefix. Seeded by `ralph init` with a pointer
+    /// to the ralph CLI; editable via `ralph prompt set --scope global`.
+    /// `None` means no global prefix contribution.
+    #[serde(default)]
+    pub prompt_prefix: Option<String>,
+    /// Global prompt suffix appended to every step prompt, outside any
+    /// project- or plan-level suffix. `None` means no global suffix
+    /// contribution.
+    #[serde(default)]
+    pub prompt_suffix: Option<String>,
     /// Available harness definitions keyed by name.
     pub harnesses: HashMap<String, HarnessConfig>,
 }
@@ -411,6 +427,8 @@ impl Default for Config {
             timeout_secs: None,
             hook_timeout_secs: default_hook_timeout_secs(),
             auto_stash: default_auto_stash(),
+            prompt_prefix: Some(DEFAULT_GLOBAL_PROMPT_PREFIX.to_string()),
+            prompt_suffix: None,
             harnesses,
         }
     }

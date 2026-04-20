@@ -6,6 +6,7 @@
 mod agents;
 mod hooks;
 mod plan;
+mod prompt;
 mod run;
 mod step;
 
@@ -13,6 +14,7 @@ mod step;
 pub use agents::*;
 pub use hooks::*;
 pub use plan::*;
+pub use prompt::*;
 pub use run::*;
 pub use step::*;
 

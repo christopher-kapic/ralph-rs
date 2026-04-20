@@ -131,11 +131,11 @@ impl std::str::FromStr for StepStatus {
 /// Canonical column list for `SELECT` queries against the `plans` table.
 ///
 /// Matches the physical table layout after all migrations: V1 defined every
-/// column through `updated_at`, and V5 appended `plan_harness` via
-/// `ALTER TABLE ... ADD COLUMN`, which places it last. Every `Plan`-returning
-/// query MUST use this list so [`Plan::from_row`]'s indices line up — a raw
-/// `SELECT *` would otherwise swap `plan_harness` into the `created_at` slot.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness";
+/// column through `updated_at`, V5 appended `plan_harness`, and V10 appended
+/// `prompt_prefix` and `prompt_suffix` via `ALTER TABLE ... ADD COLUMN`.
+/// Every `Plan`-returning query MUST use this list so [`Plan::from_row`]'s
+/// indices line up — a raw `SELECT *` would otherwise swap columns.
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, prompt_prefix, prompt_suffix";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,14 +152,19 @@ pub struct Plan {
     pub plan_harness: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub prompt_prefix: Option<String>,
+    #[serde(default)]
+    pub prompt_suffix: Option<String>,
 }
 
 impl Plan {
     /// Read a Plan from a SQLite row.
     ///
     /// Expected column order matches [`PLAN_COLUMNS`]:
-    /// id, slug, project, branch_name, description, status,
-    /// harness, agent, deterministic_tests, created_at, updated_at, plan_harness
+    /// id, slug, project, branch_name, description, status, harness, agent,
+    /// deterministic_tests, created_at, updated_at, plan_harness,
+    /// prompt_prefix, prompt_suffix
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -194,6 +199,8 @@ impl Plan {
             plan_harness: row.get(11)?,
             created_at,
             updated_at,
+            prompt_prefix: row.get(12)?,
+            prompt_suffix: row.get(13)?,
         })
     }
 }

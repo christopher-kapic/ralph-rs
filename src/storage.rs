@@ -165,6 +165,104 @@ pub fn set_plan_harness_gen(conn: &Connection, plan_id: &str, harness: Option<&s
     Ok(())
 }
 
+/// Set the plan-scope prompt prefix. Pass `None` to clear.
+pub fn set_plan_prompt_prefix(
+    conn: &Connection,
+    plan_id: &str,
+    prefix: Option<&str>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET prompt_prefix = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![prefix, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// Set the plan-scope prompt suffix. Pass `None` to clear.
+pub fn set_plan_prompt_suffix(
+    conn: &Connection,
+    plan_id: &str,
+    suffix: Option<&str>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET prompt_suffix = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![suffix, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Project settings (prompt prefix/suffix at project scope)
+// ---------------------------------------------------------------------------
+
+/// Prefix and suffix pair loaded from the `project_settings` table. Both
+/// fields `None` represents "no project-scope wrap configured".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectSettings {
+    pub prompt_prefix: Option<String>,
+    pub prompt_suffix: Option<String>,
+}
+
+/// Read project-scope settings for `project`. Returns a zero-value struct
+/// when no row exists — callers treat missing rows identically to NULLs.
+pub fn get_project_settings(conn: &Connection, project: &str) -> Result<ProjectSettings> {
+    let mut stmt = conn
+        .prepare("SELECT prompt_prefix, prompt_suffix FROM project_settings WHERE project = ?1")?;
+    let mut rows = stmt.query_map(params![project], |row| {
+        Ok(ProjectSettings {
+            prompt_prefix: row.get(0)?,
+            prompt_suffix: row.get(1)?,
+        })
+    })?;
+    match rows.next() {
+        Some(row) => Ok(row?),
+        None => Ok(ProjectSettings::default()),
+    }
+}
+
+/// Upsert the project-scope prompt prefix. Pass `None` to clear the column.
+pub fn set_project_prompt_prefix(
+    conn: &Connection,
+    project: &str,
+    prefix: Option<&str>,
+) -> Result<()> {
+    // ON CONFLICT … DO UPDATE keeps the sibling suffix untouched so a
+    // standalone "set prefix" call never silently wipes a previously-set
+    // suffix on the same project row.
+    conn.execute(
+        "INSERT INTO project_settings (project, prompt_prefix)
+         VALUES (?1, ?2)
+         ON CONFLICT(project) DO UPDATE SET
+             prompt_prefix = excluded.prompt_prefix,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        params![project, prefix],
+    )?;
+    Ok(())
+}
+
+/// Upsert the project-scope prompt suffix. Pass `None` to clear the column.
+pub fn set_project_prompt_suffix(
+    conn: &Connection,
+    project: &str,
+    suffix: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO project_settings (project, prompt_suffix)
+         VALUES (?1, ?2)
+         ON CONFLICT(project) DO UPDATE SET
+             prompt_suffix = excluded.prompt_suffix,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        params![project, suffix],
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Step operations
 // ---------------------------------------------------------------------------
