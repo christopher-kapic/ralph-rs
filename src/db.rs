@@ -11,7 +11,7 @@ use crate::config;
 /// Migrations are 1-indexed: MIGRATIONS[0] migrates from version 0 → 1.
 const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v1, migrate_v2, migrate_v3, migrate_v4, migrate_v5, migrate_v6, migrate_v7, migrate_v8,
-    migrate_v9,
+    migrate_v9, migrate_v10,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -327,6 +327,32 @@ fn migrate_v9(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         ALTER TABLE run_locks ADD COLUMN pid_start_token TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V10: prompt prefix/suffix at project and plan scope
+// ---------------------------------------------------------------------------
+
+fn migrate_v10(conn: &Connection) -> Result<()> {
+    // `project_settings` holds one row per project path with optional prompt
+    // prefix/suffix. Layered outside the plan-scope wrap at execution time.
+    //
+    // `plans` gains matching columns so plan-scope wraps sit alongside the rest
+    // of the plan's configuration rather than in a sibling table.
+    conn.execute_batch(
+        "
+        CREATE TABLE project_settings (
+            project TEXT PRIMARY KEY,
+            prompt_prefix TEXT,
+            prompt_suffix TEXT,
+            updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
+
+        ALTER TABLE plans ADD COLUMN prompt_prefix TEXT;
+        ALTER TABLE plans ADD COLUMN prompt_suffix TEXT;
         ",
     )?;
     Ok(())

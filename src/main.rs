@@ -29,7 +29,7 @@ use clap::Parser;
 
 use crate::cli::{
     AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
-    PlanHarnessCommand, StepCommand,
+    PlanHarnessCommand, PromptCommand, StepCommand,
 };
 
 use crate::commands::resolve_project;
@@ -667,6 +667,56 @@ fn main() -> Result<()> {
             }
             HooksCommand::Import { file, force } => commands::cmd_hooks_import(&file, force, &out),
         },
+
+        // -- Prompt --
+        Command::Prompt(subcmd) => {
+            let config_path = config::config_dir()?.join("config.json");
+            match subcmd {
+                PromptCommand::Show {
+                    plan,
+                    scope,
+                    resolved,
+                } => commands::cmd_prompt_show(
+                    &conn,
+                    &config,
+                    &project,
+                    plan.as_deref(),
+                    scope,
+                    resolved,
+                    &out,
+                ),
+                PromptCommand::Set {
+                    scope,
+                    prefix,
+                    suffix,
+                    plan,
+                } => commands::cmd_prompt_set(
+                    &conn,
+                    &config_path,
+                    &project,
+                    scope,
+                    plan.as_deref(),
+                    prefix.as_deref(),
+                    suffix.as_deref(),
+                    &out,
+                ),
+                PromptCommand::Clear {
+                    scope,
+                    prefix,
+                    suffix,
+                    plan,
+                } => commands::cmd_prompt_clear(
+                    &conn,
+                    &config_path,
+                    &project,
+                    scope,
+                    plan.as_deref(),
+                    prefix,
+                    suffix,
+                    &out,
+                ),
+            }
+        }
 
         // -- Doctor --
         Command::Doctor => commands::cmd_doctor(&config, &out),

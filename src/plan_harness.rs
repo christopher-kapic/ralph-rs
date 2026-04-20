@@ -779,6 +779,8 @@ mod tests {
             timeout_secs: None,
             hook_timeout_secs: 120,
             auto_stash: false,
+            prompt_prefix: None,
+            prompt_suffix: None,
             harnesses,
         }
     }

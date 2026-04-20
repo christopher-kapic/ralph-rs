@@ -303,6 +303,10 @@ pub struct PlanSummary {
     pub plan_harness: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_suffix: Option<String>,
 }
 
 impl From<&Plan> for PlanSummary {
@@ -320,6 +324,8 @@ impl From<&Plan> for PlanSummary {
             plan_harness: p.plan_harness.clone(),
             created_at: p.created_at,
             updated_at: p.updated_at,
+            prompt_prefix: p.prompt_prefix.clone(),
+            prompt_suffix: p.prompt_suffix.clone(),
         }
     }
 }
@@ -738,6 +744,8 @@ mod tests {
             plan_harness: Some("goose".into()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
         };
         let json = serde_json::to_string(&summary).unwrap();
         // Verify snake_case keys

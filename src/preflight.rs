@@ -628,6 +628,8 @@ mod tests {
             timeout_secs: Some(300),
             hook_timeout_secs: 120,
             auto_stash: false,
+            prompt_prefix: None,
+            prompt_suffix: None,
             harnesses,
         };
         let now = chrono::Utc::now();
@@ -644,6 +646,8 @@ mod tests {
             plan_harness: None,
             created_at: now,
             updated_at: now,
+            prompt_prefix: None,
+            prompt_suffix: None,
         };
         let results = run_preflight_checks(&plan, &config, tmp.path()).unwrap();
         let auth = results
@@ -726,6 +730,8 @@ mod tests {
             timeout_secs: Some(300),
             hook_timeout_secs: 120,
             auto_stash: false,
+            prompt_prefix: None,
+            prompt_suffix: None,
             harnesses: HashMap::new(),
         };
         let checks = run_doctor_checks(&config);

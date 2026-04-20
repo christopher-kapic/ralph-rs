@@ -1107,6 +1107,8 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
         }
     }
 
@@ -1925,6 +1927,8 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -1960,6 +1964,8 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -2061,6 +2067,8 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
         };
 
         let err = setup_branch(&dir, &plan, None, false)
@@ -2103,6 +2111,8 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
         };
 
         setup_branch(&dir, &plan, None, true).await.unwrap();
@@ -2129,6 +2139,8 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
         };
 
         setup_branch(&dir, &plan, None, false).await.unwrap();

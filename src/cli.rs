@@ -222,6 +222,14 @@ pub enum Command {
     #[command(subcommand)]
     Hooks(HooksCommand),
 
+    /// Configure prompt prefixes/suffixes at global, project, or plan scope.
+    ///
+    /// Each scope's prefix is prepended and suffix appended to every step
+    /// prompt; prefixes stack outermost (global) to innermost (plan) at the
+    /// top, suffixes stack innermost to outermost at the bottom.
+    #[command(subcommand)]
+    Prompt(PromptCommand),
+
     /// Run preflight checks to verify the environment is ready.
     Doctor,
 
@@ -768,6 +776,86 @@ pub enum HooksCommand {
         /// Overwrite existing hooks on name collision.
         #[arg(long)]
         force: bool,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Prompt subcommands
+// ---------------------------------------------------------------------------
+
+/// Which scope a prompt prefix/suffix command targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum PromptScope {
+    /// Global wrap stored in `~/.config/ralph-rs/config.json`.
+    Global,
+    /// Project wrap stored in SQLite keyed on the current project path.
+    Project,
+    /// Plan wrap stored on a single plan row (requires `--plan <slug>`,
+    /// defaults to the active plan).
+    Plan,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PromptCommand {
+    /// Show the prompt prefix/suffix configured for one or all scopes.
+    ///
+    /// With no `--scope`, displays global, project, and plan entries for the
+    /// current (or specified) plan. Use `--resolved` to print the fully
+    /// layered wrap exactly as it would appear around a step prompt.
+    Show {
+        /// Plan slug for plan-scope entries. Defaults to the active plan.
+        plan: Option<String>,
+
+        /// Limit output to a single scope.
+        #[arg(long)]
+        scope: Option<PromptScope>,
+
+        /// Show the final composed prefix/suffix (global + project + plan)
+        /// rather than each scope's individual contribution.
+        #[arg(long)]
+        resolved: bool,
+    },
+
+    /// Set a prompt prefix and/or suffix at the given scope. At least one of
+    /// `--prefix` / `--suffix` must be provided; omitted values leave the
+    /// sibling field untouched. Pass an empty string to blank a value.
+    Set {
+        /// Target scope. Plan scope uses `<plan>` or the active plan.
+        #[arg(long)]
+        scope: PromptScope,
+
+        /// New prefix text. Omit to leave the stored prefix unchanged.
+        #[arg(long)]
+        prefix: Option<String>,
+
+        /// New suffix text. Omit to leave the stored suffix unchanged.
+        #[arg(long)]
+        suffix: Option<String>,
+
+        /// Plan slug (only used with `--scope plan`). Defaults to the
+        /// active plan.
+        plan: Option<String>,
+    },
+
+    /// Clear a prompt prefix and/or suffix at the given scope. Pass at least
+    /// one of `--prefix` / `--suffix` to specify which fields to clear.
+    Clear {
+        /// Target scope.
+        #[arg(long)]
+        scope: PromptScope,
+
+        /// Clear the prefix for this scope.
+        #[arg(long)]
+        prefix: bool,
+
+        /// Clear the suffix for this scope.
+        #[arg(long)]
+        suffix: bool,
+
+        /// Plan slug (only used with `--scope plan`). Defaults to the
+        /// active plan.
+        plan: Option<String>,
     },
 }
 

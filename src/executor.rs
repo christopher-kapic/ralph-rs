@@ -15,7 +15,7 @@ use crate::git;
 use crate::harness::{self, HarnessOutput};
 use crate::hooks::{self, HookContext};
 use crate::plan::{Plan, Step, StepStatus};
-use crate::prompt::{self, PriorStepSummary, RetryContext};
+use crate::prompt::{self, PriorStepSummary, PromptWrap, PromptWraps, RetryContext};
 use crate::storage;
 use crate::test_runner;
 
@@ -377,6 +377,24 @@ pub async fn execute_step(
         // prompts when the harness can't take an agent file directly).
         let agent_name = step.agent.as_deref().or(plan.agent.as_deref());
 
+        // Collect prompt prefix/suffix layers. Project-scope settings are
+        // looked up by project path; a missing row is treated as "no wrap".
+        let project_settings = storage::get_project_settings(conn, &plan.project)?;
+        let wraps = PromptWraps {
+            global: PromptWrap::from_opts(
+                config.prompt_prefix.as_ref(),
+                config.prompt_suffix.as_ref(),
+            ),
+            project: PromptWrap::from_opts(
+                project_settings.prompt_prefix.as_ref(),
+                project_settings.prompt_suffix.as_ref(),
+            ),
+            plan: PromptWrap::from_opts(
+                plan.prompt_prefix.as_ref(),
+                plan.prompt_suffix.as_ref(),
+            ),
+        };
+
         // Build prompt.
         let prompt_text = prompt::build_step_prompt(
             plan,
@@ -385,6 +403,7 @@ pub async fn execute_step(
             agent_name,
             retry_context.as_ref(),
             harness_config.supports_agent_file,
+            &wraps,
         );
 
         // Create execution log entry.

@@ -141,6 +141,8 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
