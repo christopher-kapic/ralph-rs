@@ -212,9 +212,8 @@ pub struct ProjectSettings {
 /// Read project-scope settings for `project`. Returns a zero-value struct
 /// when no row exists — callers treat missing rows identically to NULLs.
 pub fn get_project_settings(conn: &Connection, project: &str) -> Result<ProjectSettings> {
-    let mut stmt = conn.prepare(
-        "SELECT prompt_prefix, prompt_suffix FROM project_settings WHERE project = ?1",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT prompt_prefix, prompt_suffix FROM project_settings WHERE project = ?1")?;
     let mut rows = stmt.query_map(params![project], |row| {
         Ok(ProjectSettings {
             prompt_prefix: row.get(0)?,

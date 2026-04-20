@@ -389,10 +389,7 @@ pub async fn execute_step(
                 project_settings.prompt_prefix.as_ref(),
                 project_settings.prompt_suffix.as_ref(),
             ),
-            plan: PromptWrap::from_opts(
-                plan.prompt_prefix.as_ref(),
-                plan.prompt_suffix.as_ref(),
-            ),
+            plan: PromptWrap::from_opts(plan.prompt_prefix.as_ref(), plan.prompt_suffix.as_ref()),
         };
 
         // Build prompt.

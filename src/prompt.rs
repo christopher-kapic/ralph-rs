@@ -515,15 +515,8 @@ mod tests {
         let plan = make_plan();
         let step = make_step();
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &[],
-            None,
-            None,
-            true,
-            &PromptWraps::default(),
-        );
+        let prompt =
+            build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
 
         // Should not contain prior steps section
         assert!(!prompt.contains("Context from Prior Steps"));
@@ -535,15 +528,8 @@ mod tests {
         let mut step = make_step();
         step.acceptance_criteria = vec![];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &[],
-            None,
-            None,
-            true,
-            &PromptWraps::default(),
-        );
+        let prompt =
+            build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
 
         assert!(!prompt.contains("Acceptance Criteria"));
     }
@@ -554,15 +540,8 @@ mod tests {
         plan.deterministic_tests = vec![];
         let step = make_step();
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &[],
-            None,
-            None,
-            true,
-            &PromptWraps::default(),
-        );
+        let prompt =
+            build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
 
         assert!(!prompt.contains("Deterministic Tests"));
     }
@@ -764,8 +743,7 @@ mod tests {
             plan: PromptWrap::from_opts(Some(&plan_pre), Some(&plan_suf)),
         };
 
-        let prompt =
-            build_step_prompt(&plan, &step, &[], None, None, true, &wraps);
+        let prompt = build_step_prompt(&plan, &step, &[], None, None, true, &wraps);
 
         // Prefixes stack outermost → innermost at the top.
         let g_pre = prompt.find("GLOBAL-PRE").unwrap();
@@ -804,11 +782,13 @@ mod tests {
             plan: PromptWrap::from_opts(Some(&plan_pre), None),
         };
 
-        let prompt =
-            build_step_prompt(&plan, &step, &[], None, None, true, &wraps);
+        let prompt = build_step_prompt(&plan, &step, &[], None, None, true, &wraps);
 
         assert!(prompt.starts_with("PLAN-PRE"));
-        assert!(!prompt.contains("\n\n\n"), "should not produce blank sections");
+        assert!(
+            !prompt.contains("\n\n\n"),
+            "should not produce blank sections"
+        );
         // No suffix contribution at all — focus instruction is the tail.
         assert!(
             prompt
