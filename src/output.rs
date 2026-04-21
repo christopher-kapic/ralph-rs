@@ -1077,10 +1077,7 @@ mod tests {
             attempt: Some(2),
             max_attempts: Some(4),
             phase: Some(Phase::Tests),
-            phase_started_at: Some(started.to_rfc3339_opts(
-                chrono::SecondsFormat::Millis,
-                true,
-            )),
+            phase_started_at: Some(started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             current_command: Some("pnpm turbo test --filter=rne".into()),
             execution_log_id: Some(99),
             child_pid: Some(54321),

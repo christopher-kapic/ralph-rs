@@ -188,7 +188,10 @@ fn render_live_block(lv: &output::LiveRunDisplay, steps: &[crate::plan::Step]) -
     // live row's step_id resolves there.
     if let Some(num) = lv.step_num {
         let title = lv.step_id.as_deref().and_then(|id| {
-            steps.iter().find(|st| st.id == id).map(|st| st.title.as_str())
+            steps
+                .iter()
+                .find(|st| st.id == id)
+                .map(|st| st.title.as_str())
         });
         match title {
             Some(t) => {
@@ -416,8 +419,7 @@ fn print_log_entry(step_title: &str, log: &ExecutionLog, output_mode: &LogOutput
         .iter()
         .any(|r| r.contains("change_policy=optional"))
         || (log.commit_hash.is_none()
-            && log.termination_reason
-                == Some(crate::plan::TerminationReason::Success));
+            && log.termination_reason == Some(crate::plan::TerminationReason::Success));
     if optional_no_change {
         println!("    (no changes — change_policy=optional)");
     }
@@ -558,9 +560,7 @@ fn cmd_cancel_unix(
         && live.plan_slug.as_deref() != Some(requested)
     {
         let live_label = live.plan_slug.as_deref().unwrap_or("<none>");
-        anyhow::bail!(
-            "Live run is for plan {live_label}, not {requested}. Refusing to cancel."
-        );
+        anyhow::bail!("Live run is for plan {live_label}, not {requested}. Refusing to cancel.");
     }
 
     // 3. Verify the pid is the same process we think it is. If the token
@@ -603,7 +603,9 @@ fn cmd_cancel_unix(
         if released {
             // Runner handled it gracefully. Its Drop-path release already
             // deleted the run_locks row; just emit summary.
-            emit_summary(out, &live, /*forced=*/ false, /*already_dead=*/ false)?;
+            emit_summary(
+                out, &live, /*forced=*/ false, /*already_dead=*/ false,
+            )?;
             return Ok(());
         }
         // Escalate.
@@ -705,12 +707,7 @@ fn finalize_stale_run(
     // and is left alone. Errors from the UPDATE propagate so the operator
     // doesn't see a "cancelled successfully" summary after a DB failure.
     if let Some(step_id) = live.step_id.as_deref() {
-        storage::update_step_status_if(
-            conn,
-            step_id,
-            StepStatus::InProgress,
-            StepStatus::Aborted,
-        )?;
+        storage::update_step_status_if(conn, step_id, StepStatus::InProgress, StepStatus::Aborted)?;
     }
 
     // Delete the run_locks row scoped by pid + start token so a new ralph run
@@ -778,8 +775,7 @@ fn kill_force(live: &LiveRun) -> Result<()> {
 fn send_signal(pid: i64, signo: i32) -> Result<()> {
     // Clamp pid into i32 since libc::kill takes `pid_t` which is i32 on Linux
     // and every other unix we care about.
-    let pid_i32 = i32::try_from(pid)
-        .with_context(|| format!("pid {pid} does not fit in i32"))?;
+    let pid_i32 = i32::try_from(pid).with_context(|| format!("pid {pid} does not fit in i32"))?;
     let rc = unsafe { libc::kill(pid_i32, signo) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
@@ -891,17 +887,12 @@ mod cancel_tests {
     /// alive, and `/proc/<pid>/stat` returns nothing.
     const DEAD_PID: i64 = 0x7FFF_FFFE;
 
-    fn seed_plan_and_step(
-        conn: &Connection,
-        slug: &str,
-        project: &str,
-    ) -> (String, String) {
+    fn seed_plan_and_step(conn: &Connection, slug: &str, project: &str) -> (String, String) {
         let plan =
             storage::create_plan(conn, slug, project, "br", "desc", None, None, &[]).unwrap();
-        let (step, _) = storage::create_step(
-            conn, &plan.id, "t", "d", None, None, &[], None, None, None,
-        )
-        .unwrap();
+        let (step, _) =
+            storage::create_step(conn, &plan.id, "t", "d", None, None, &[], None, None, None)
+                .unwrap();
         (plan.id, step.id)
     }
 
@@ -1185,8 +1176,7 @@ mod cancel_tests {
         let child_pid = child.id() as i64;
         // Give the shell a beat to start so /proc/<pid>/stat is populated.
         std::thread::sleep(Duration::from_millis(50));
-        let token =
-            run_lock::process_start_token(child_pid).expect("child start token");
+        let token = run_lock::process_start_token(child_pid).expect("child start token");
 
         conn.execute(
             "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug)
@@ -1244,17 +1234,12 @@ mod status_live_view_tests {
     use crate::plan::{Phase, TerminationReason, TestStatus};
     use rusqlite::params;
 
-    fn seed_plan_and_step(
-        conn: &Connection,
-        slug: &str,
-        project: &str,
-    ) -> (String, String) {
+    fn seed_plan_and_step(conn: &Connection, slug: &str, project: &str) -> (String, String) {
         let plan =
             storage::create_plan(conn, slug, project, "br", "desc", None, None, &[]).unwrap();
-        let (step, _) = storage::create_step(
-            conn, &plan.id, "t", "d", None, None, &[], None, None, None,
-        )
-        .unwrap();
+        let (step, _) =
+            storage::create_step(conn, &plan.id, "t", "d", None, None, &[], None, None, None)
+                .unwrap();
         (plan.id, step.id)
     }
 
@@ -1292,7 +1277,10 @@ mod status_live_view_tests {
             .unwrap();
         let (summary, _steps) = build_status_summary(&conn, project, &plan).unwrap();
 
-        let live = summary.live.clone().expect("live field should be populated");
+        let live = summary
+            .live
+            .clone()
+            .expect("live field should be populated");
         assert_eq!(live.pid, 12345);
         assert_eq!(live.phase, Some(Phase::Tests));
         assert_eq!(live.attempt, Some(2));
@@ -1416,8 +1404,7 @@ mod status_live_view_tests {
         // the JSON payload.
         let logs = storage::list_execution_logs_for_step(&conn, &step_id).unwrap();
         assert_eq!(logs.len(), 1);
-        let summary =
-            output::LogEntrySummary::new(&logs[0], &LogOutputMode::Hidden);
+        let summary = output::LogEntrySummary::new(&logs[0], &LogOutputMode::Hidden);
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"termination_reason\":\"user_interrupted\""));
         assert!(json.contains("\"test_status\":\"passed\""));
@@ -1438,9 +1425,7 @@ mod status_live_view_tests {
             attempt: Some(2),
             max_attempts: Some(4),
             phase: Some(Phase::Tests),
-            phase_started_at: Some(
-                started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            ),
+            phase_started_at: Some(started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             phase_elapsed_secs: Some(12.0),
             current_command: Some("cargo test".into()),
             child_pid: Some(54321),
@@ -1530,7 +1515,10 @@ mod status_live_view_tests {
             .unwrap();
         let (summary, _steps) = build_status_summary(&conn, project, &plan).unwrap();
 
-        let live = summary.live.clone().expect("live field should be populated");
+        let live = summary
+            .live
+            .clone()
+            .expect("live field should be populated");
         assert_eq!(
             live.child_pid, None,
             "child_pid must be cleared once the harness phase ends",

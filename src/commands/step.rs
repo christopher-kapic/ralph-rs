@@ -79,9 +79,8 @@ pub fn step_list(
 /// step has been attempted (or failed/aborted/etc.) or the user explicitly
 /// bound `max_retries`, the tag renders.
 pub(crate) fn render_budget_tag(step: &Step, config: &Config) -> String {
-    let show = step.attempts > 0
-        || step.status != StepStatus::Pending
-        || step.max_retries.is_some();
+    let show =
+        step.attempts > 0 || step.status != StepStatus::Pending || step.max_retries.is_some();
     if !show {
         return String::new();
     }

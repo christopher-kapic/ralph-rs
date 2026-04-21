@@ -140,9 +140,7 @@ impl std::str::FromStr for StepStatus {
 /// A third `forbidden` variant is reserved for future work but intentionally
 /// not implemented here — the enum stays extensible via the non-exhaustive
 /// matches each caller performs.
-#[derive(
-    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum,
-)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "kebab-case")]
 pub enum ChangePolicy {
@@ -519,11 +517,7 @@ impl Step {
 
         let change_policy_str: String = row.get(15)?;
         let change_policy: ChangePolicy = change_policy_str.parse().map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                15,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
         Ok(Step {
@@ -1021,10 +1015,7 @@ mod tests {
     #[test]
     fn test_termination_reason_display() {
         assert_eq!(TerminationReason::Success.to_string(), "success");
-        assert_eq!(
-            TerminationReason::CommitFailed.to_string(),
-            "commit_failed"
-        );
+        assert_eq!(TerminationReason::CommitFailed.to_string(), "commit_failed");
     }
 
     #[test]

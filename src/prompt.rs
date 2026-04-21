@@ -296,7 +296,9 @@ fn format_deterministic_tests(tests: &[String]) -> String {
     lines.push(
         "ralph will re-run them regardless, so a passing run inside your session".to_string(),
     );
-    lines.push("doesn't skip ralph's check. Prefer using the time to complete the work.".to_string());
+    lines.push(
+        "doesn't skip ralph's check. Prefer using the time to complete the work.".to_string(),
+    );
     lines.join("\n")
 }
 

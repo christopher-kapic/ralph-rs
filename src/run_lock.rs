@@ -1026,10 +1026,7 @@ mod tests {
         assert_eq!(live.execution_log_id, Some(17));
         assert_eq!(live.child_pid, Some(99_999));
         assert_eq!(live.child_start_token.as_deref(), Some("child-token"));
-        assert_eq!(
-            live.updated_at.as_deref(),
-            Some("2026-04-21T00:02:00.000Z")
-        );
+        assert_eq!(live.updated_at.as_deref(), Some("2026-04-21T00:02:00.000Z"));
     }
 
     #[test]

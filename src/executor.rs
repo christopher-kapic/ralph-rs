@@ -763,104 +763,103 @@ pub async fn execute_step(
                 // no-diff exit — a review step may configure `cargo test` to
                 // confirm the tree's invariants even when nothing changed.
                 let tests_configured = !plan.deterministic_tests.is_empty();
-                let policy_allows_no_change_success =
-                    step.change_policy == ChangePolicy::Optional;
+                let policy_allows_no_change_success = step.change_policy == ChangePolicy::Optional;
                 let should_run_tests =
                     (has_changes || policy_allows_no_change_success) && tests_configured;
 
                 let (test_passed, test_result_strings, test_aborted) = if should_run_tests {
-                        // Pre-test hook. Harness phase is over — clear the
-                        // child columns so `ralph status` stops advertising
-                        // the dead harness pid.
-                        write_phase(
-                            conn,
-                            plan,
-                            &step.id,
-                            step_num,
-                            attempt,
-                            max_attempts,
-                            Some(exec_log.id),
-                            Phase::PreTestHook,
-                            None,
-                            ChildUpdate::Clear,
-                        )?;
-                        if let Err(e) =
-                            hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir).await
-                        {
-                            eprintln!("Pre-test hook failed: {e}");
-                        }
+                    // Pre-test hook. Harness phase is over — clear the
+                    // child columns so `ralph status` stops advertising
+                    // the dead harness pid.
+                    write_phase(
+                        conn,
+                        plan,
+                        &step.id,
+                        step_num,
+                        attempt,
+                        max_attempts,
+                        Some(exec_log.id),
+                        Phase::PreTestHook,
+                        None,
+                        ChildUpdate::Clear,
+                    )?;
+                    if let Err(e) =
+                        hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir).await
+                    {
+                        eprintln!("Pre-test hook failed: {e}");
+                    }
 
-                        // Aggregate tests phase. Per-command updates would
-                        // require plumbing callbacks into run_tests.
-                        write_phase(
-                            conn,
-                            plan,
-                            &step.id,
-                            step_num,
-                            attempt,
-                            max_attempts,
-                            Some(exec_log.id),
-                            Phase::Tests,
-                            None,
-                            ChildUpdate::Clear,
-                        )?;
-                        let test_results = test_runner::run_tests(
-                            &plan.deterministic_tests,
-                            workdir,
-                            abort_rx.clone(),
-                        )
-                        .await;
-                        let strings: Vec<String> = test_results
-                            .results
-                            .iter()
-                            .map(|r| {
-                                format!("{}: {}", r.command, if r.passed { "pass" } else { "FAIL" })
-                            })
-                            .collect();
+                    // Aggregate tests phase. Per-command updates would
+                    // require plumbing callbacks into run_tests.
+                    write_phase(
+                        conn,
+                        plan,
+                        &step.id,
+                        step_num,
+                        attempt,
+                        max_attempts,
+                        Some(exec_log.id),
+                        Phase::Tests,
+                        None,
+                        ChildUpdate::Clear,
+                    )?;
+                    let test_results = test_runner::run_tests(
+                        &plan.deterministic_tests,
+                        workdir,
+                        abort_rx.clone(),
+                    )
+                    .await;
+                    let strings: Vec<String> = test_results
+                        .results
+                        .iter()
+                        .map(|r| {
+                            format!("{}: {}", r.command, if r.passed { "pass" } else { "FAIL" })
+                        })
+                        .collect();
 
-                        // Post-test hook.
-                        write_phase(
-                            conn,
-                            plan,
-                            &step.id,
-                            step_num,
-                            attempt,
-                            max_attempts,
-                            Some(exec_log.id),
-                            Phase::PostTestHook,
-                            None,
-                            ChildUpdate::Clear,
-                        )?;
-                        hooks::run_post_test(
-                            conn,
-                            hook_ctx,
-                            plan,
-                            step,
-                            attempt,
-                            test_results.all_passed,
-                            workdir,
-                        )
-                        .await?;
+                    // Post-test hook.
+                    write_phase(
+                        conn,
+                        plan,
+                        &step.id,
+                        step_num,
+                        attempt,
+                        max_attempts,
+                        Some(exec_log.id),
+                        Phase::PostTestHook,
+                        None,
+                        ChildUpdate::Clear,
+                    )?;
+                    hooks::run_post_test(
+                        conn,
+                        hook_ctx,
+                        plan,
+                        step,
+                        attempt,
+                        test_results.all_passed,
+                        workdir,
+                    )
+                    .await?;
 
-                        (test_results.all_passed, strings, test_results.aborted)
-                    } else if has_changes {
-                        // Changes produced, no tests configured: treat as passing.
-                        (true, Vec::new(), false)
-                    } else if policy_allows_no_change_success {
-                        // Optional policy + no changes + no tests configured:
-                        // the step is done. The sentinel string below is
-                        // surfaced by `ralph log` so a reader doesn't see a
-                        // blank-looking successful row and wonder what
-                        // happened.
-                        (
-                            true,
-                            vec!["no changes (change_policy=optional)".to_string()],
-                            false,
-                        )
-                    } else {
-                        // Required policy, no changes: harness produced nothing useful.
-                        (false, vec!["no changes detected".to_string()], false)
-                    };
+                    (test_results.all_passed, strings, test_results.aborted)
+                } else if has_changes {
+                    // Changes produced, no tests configured: treat as passing.
+                    (true, Vec::new(), false)
+                } else if policy_allows_no_change_success {
+                    // Optional policy + no changes + no tests configured:
+                    // the step is done. The sentinel string below is
+                    // surfaced by `ralph log` so a reader doesn't see a
+                    // blank-looking successful row and wonder what
+                    // happened.
+                    (
+                        true,
+                        vec!["no changes (change_policy=optional)".to_string()],
+                        false,
+                    )
+                } else {
+                    // Required policy, no changes: harness produced nothing useful.
+                    (false, vec!["no changes detected".to_string()], false)
+                };
 
                 // If Ctrl+C landed mid-test, the test runner will have killed
                 // its child; surface this as Aborted rather than a retry-worthy
@@ -1238,10 +1237,8 @@ async fn wait_with_timeout_and_abort(
     // *immediately*: a child that writes more than the pipe buffer
     // (~64 KiB) would otherwise block on write(2) while we block on wait(),
     // deadlocking. Draining concurrently keeps the pipe flowing.
-    let stdout_task =
-        io_util::drain_bounded(child.stdout.take(), HARNESS_OUTPUT_TAIL_BYTES);
-    let stderr_task =
-        io_util::drain_bounded(child.stderr.take(), HARNESS_OUTPUT_TAIL_BYTES);
+    let stdout_task = io_util::drain_bounded(child.stdout.take(), HARNESS_OUTPUT_TAIL_BYTES);
+    let stderr_task = io_util::drain_bounded(child.stderr.take(), HARNESS_OUTPUT_TAIL_BYTES);
 
     match timeout {
         Some(dur) => {
@@ -1715,9 +1712,19 @@ new file mode 100644
     fn test_set_step_attempts() {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None)
-                .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(step.attempts, 0);
 
         super::set_step_attempts(&conn, &step.id, 3).unwrap();
@@ -1730,15 +1737,45 @@ new file mode 100644
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let (s1, _) =
-            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None, None)
-                .unwrap();
-        let (s2, _) =
-            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None, None)
-                .unwrap();
-        let (s3, _) =
-            storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None, None)
-                .unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (s2, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Second",
+            "d2",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (s3, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Third",
+            "d3",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Mark first two as complete.
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -1755,15 +1792,45 @@ new file mode 100644
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let (s1, _) =
-            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None, None)
-                .unwrap();
-        let (_s2, _) =
-            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None, None)
-                .unwrap();
-        let (s3, _) =
-            storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None, None)
-                .unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (_s2, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Second",
+            "d2",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (s3, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Third",
+            "d3",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Only first is complete; second is pending.
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -1783,18 +1850,58 @@ new file mode 100644
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let (s1, _) =
-            storage::create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None, None)
-                .unwrap();
-        let (_s2, _) =
-            storage::create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None, None)
-                .unwrap();
-        let (s3, _) =
-            storage::create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None, None)
-                .unwrap();
-        let (s4, _) =
-            storage::create_step(&conn, &plan.id, "Fourth", "d4", None, None, &[], None, None, None)
-                .unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (_s2, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Second",
+            "d2",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (s3, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Third",
+            "d3",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (s4, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Fourth",
+            "d4",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // s1 and s3 are complete; s2 is pending (the gap).
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -1863,9 +1970,19 @@ new file mode 100644
         // abort branch bails before any `write_phase` call, but downstream
         // observers still expect the row to exist.
         seed_run_lock_row(&conn, &dir.to_string_lossy());
-        let (step, _) =
-            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None)
-                .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(step.attempts, 0);
 
         let (tx, rx) = watch::channel(false);
@@ -2174,9 +2291,7 @@ new file mode 100644
         } else {
             String::new()
         };
-        let script = format!(
-            "#!/bin/sh\nyes | head -c {bytes}\n{touch}exit 0\n",
-        );
+        let script = format!("#!/bin/sh\nyes | head -c {bytes}\n{touch}exit 0\n",);
         let path = outside_dir.join("large-output-harness.sh");
         fs::write(&path, script).unwrap();
         let mut perms = fs::metadata(&path).unwrap().permissions();
@@ -2201,8 +2316,7 @@ new file mode 100644
         init_git_repo(&dir);
 
         let harness_tmp = TempDir::new().unwrap();
-        let harness_path =
-            write_large_output_harness(harness_tmp.path(), &dir, 500_000, true);
+        let harness_path = write_large_output_harness(harness_tmp.path(), &dir, 500_000, true);
 
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
@@ -2304,8 +2418,7 @@ new file mode 100644
         // 5 MiB, safely over the 4 MiB cap.
         let bytes = 5 * 1024 * 1024;
         let harness_tmp = TempDir::new().unwrap();
-        let harness_path =
-            write_large_output_harness(harness_tmp.path(), &dir, bytes, false);
+        let harness_path = write_large_output_harness(harness_tmp.path(), &dir, bytes, false);
 
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
@@ -2984,10 +3097,7 @@ new file mode 100644
             !logs[0].committed,
             "no-change success must not record a commit"
         );
-        assert_eq!(
-            logs[0].termination_reason,
-            Some(TerminationReason::Success)
-        );
+        assert_eq!(logs[0].termination_reason, Some(TerminationReason::Success));
         assert_eq!(logs[0].test_status, Some(TestStatus::NotConfigured));
 
         let fresh_step = storage::get_step(&conn, &step.id).unwrap();
@@ -3055,10 +3165,7 @@ new file mode 100644
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
         assert_eq!(logs.len(), 1);
         assert!(!logs[0].committed);
-        assert_eq!(
-            logs[0].termination_reason,
-            Some(TerminationReason::Success)
-        );
+        assert_eq!(logs[0].termination_reason, Some(TerminationReason::Success));
         assert_eq!(logs[0].test_status, Some(TestStatus::Passed));
     }
 
@@ -3194,10 +3301,7 @@ new file mode 100644
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
         assert_eq!(logs.len(), 1);
         assert!(logs[0].committed);
-        assert_eq!(
-            logs[0].termination_reason,
-            Some(TerminationReason::Success)
-        );
+        assert_eq!(logs[0].termination_reason, Some(TerminationReason::Success));
         assert_eq!(logs[0].test_status, Some(TestStatus::Passed));
     }
 
@@ -3270,9 +3374,10 @@ new file mode 100644
         .unwrap();
 
         let mut config = Config::default();
-        config
-            .harnesses
-            .insert("exit1".to_string(), harness_config_for_script(&harness_path));
+        config.harnesses.insert(
+            "exit1".to_string(),
+            harness_config_for_script(&harness_path),
+        );
 
         let hook_ctx = HookContext {
             applicable: vec![],
@@ -3343,9 +3448,10 @@ new file mode 100644
         .unwrap();
 
         let mut config = Config::default();
-        config
-            .harnesses
-            .insert("exit1".to_string(), harness_config_for_script(&harness_path));
+        config.harnesses.insert(
+            "exit1".to_string(),
+            harness_config_for_script(&harness_path),
+        );
 
         let hook_ctx = HookContext {
             applicable: vec![],
@@ -3417,9 +3523,10 @@ new file mode 100644
         .unwrap();
 
         let mut config = Config::default();
-        config
-            .harnesses
-            .insert("exit1".to_string(), harness_config_for_script(&harness_path));
+        config.harnesses.insert(
+            "exit1".to_string(),
+            harness_config_for_script(&harness_path),
+        );
 
         let hook_ctx = HookContext {
             applicable: vec![],
@@ -3493,9 +3600,10 @@ new file mode 100644
         .unwrap();
 
         let mut config = Config::default();
-        config
-            .harnesses
-            .insert("exit1".to_string(), harness_config_for_script(&harness_path));
+        config.harnesses.insert(
+            "exit1".to_string(),
+            harness_config_for_script(&harness_path),
+        );
 
         let hook_ctx = HookContext {
             applicable: vec![],

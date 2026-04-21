@@ -795,15 +795,13 @@ pub fn list_execution_logs_for_plan(
         // Shift columns by 1 for the ExecutionLog fields.
         let termination_reason_str: Option<String> = row.get(18)?;
         let termination_reason = match termination_reason_str {
-            Some(s) => Some(
-                s.parse::<crate::plan::TerminationReason>().map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        18,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
-            ),
+            Some(s) => Some(s.parse::<crate::plan::TerminationReason>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    18,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?),
             None => None,
         };
         let test_status_str: Option<String> = row.get(19)?;
@@ -1288,6 +1286,43 @@ pub fn get_live_run(conn: &Connection, project: &str) -> Result<Option<LiveRun>>
     }
 }
 
+/// Bind the live run-lock row to the plan currently being executed.
+///
+/// `ralph run --all` acquires a project-wide lock before it knows which plan is
+/// active. As the orchestrator advances from one plan to the next, bind the row
+/// to that plan and clear step/phase fields from the previous plan. The next
+/// executor phase write will populate the concrete step and attempt.
+pub fn bind_live_run_to_plan(
+    conn: &Connection,
+    project: &str,
+    plan_id: &str,
+    plan_slug: &str,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE run_locks SET
+            plan_id = ?1,
+            plan_slug = ?2,
+            step_id = NULL,
+            step_num = NULL,
+            attempt = NULL,
+            max_attempts = NULL,
+            phase = ?3,
+            phase_started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            current_command = NULL,
+            execution_log_id = NULL,
+            child_pid = NULL,
+            child_start_token = NULL,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE project = ?4",
+        params![plan_id, plan_slug, Phase::Idle.as_str(), project],
+    )?;
+
+    if affected == 0 {
+        anyhow::bail!("No run_locks row for project: {project}");
+    }
+    Ok(())
+}
+
 /// How a phase write should treat the `child_pid` / `child_start_token`
 /// columns on the `run_locks` row.
 ///
@@ -1556,8 +1591,19 @@ mod tests {
     fn test_delete_plan_cascades() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         delete_plan(&conn, &plan.id).unwrap();
@@ -1584,12 +1630,45 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let (s1, _) =
-            create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None, None).unwrap();
-        let (s2, _) =
-            create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None, None).unwrap();
-        let (s3, _) =
-            create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None, None).unwrap();
+        let (s1, _) = create_step(
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (s2, _) = create_step(
+            &conn,
+            &plan.id,
+            "Second",
+            "d2",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (s3, _) = create_step(
+            &conn,
+            &plan.id,
+            "Third",
+            "d3",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Sort keys should be monotonically increasing
         assert!(
@@ -1614,9 +1693,45 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        create_step(&conn, &plan.id, "First", "d", None, None, &[], None, None, None).unwrap();
-        create_step(&conn, &plan.id, "Second", "d", None, None, &[], None, None, None).unwrap();
-        create_step(&conn, &plan.id, "Third", "d", None, None, &[], None, None, None).unwrap();
+        create_step(
+            &conn,
+            &plan.id,
+            "First",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        create_step(
+            &conn,
+            &plan.id,
+            "Second",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        create_step(
+            &conn,
+            &plan.id,
+            "Third",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let steps = list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps.len(), 3);
@@ -1660,8 +1775,19 @@ mod tests {
     fn test_update_step_status() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         update_step_status(&conn, &step.id, StepStatus::Complete).unwrap();
 
@@ -1676,8 +1802,19 @@ mod tests {
         // partial write with inconsistent timestamps.
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let baseline = get_step(&conn, &step.id).unwrap();
         // Sleep long enough that strftime('now') advances past the baseline.
@@ -1793,12 +1930,25 @@ mod tests {
     fn test_update_step_fields_ext_noop_when_all_none() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let before = get_step(&conn, &step.id).unwrap();
 
-        update_step_fields_ext(&conn, &step.id, None, None, None, None, None, None, None, None)
-            .unwrap();
+        update_step_fields_ext(
+            &conn, &step.id, None, None, None, None, None, None, None, None,
+        )
+        .unwrap();
 
         let after = get_step(&conn, &step.id).unwrap();
         assert_eq!(before.updated_at, after.updated_at);
@@ -1808,8 +1958,19 @@ mod tests {
     fn test_delete_step() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         delete_step(&conn, &step.id).unwrap();
@@ -1827,8 +1988,19 @@ mod tests {
         // UNIQUE(step_id, attempt) constraint.
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();
         create_execution_log(&conn, &step.id, 1, Some("first try"), None).unwrap();
 
@@ -1848,10 +2020,32 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        let (s1, _) =
-            create_step(&conn, &plan.id, "First", "d", None, None, &[], None, None, None).unwrap();
-        let (s2, _) =
-            create_step(&conn, &plan.id, "Second", "d", None, None, &[], None, None, None).unwrap();
+        let (s1, _) = create_step(
+            &conn,
+            &plan.id,
+            "First",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (s2, _) = create_step(
+            &conn,
+            &plan.id,
+            "Second",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Both pending — should return first by sort_key
         let next = get_next_pending_step(&conn, &plan.id).unwrap().unwrap();
@@ -1876,8 +2070,19 @@ mod tests {
     fn test_create_and_get_execution_log() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let log =
             create_execution_log(&conn, &step.id, 1, Some("do the thing"), Some("sess-1")).unwrap();
@@ -1895,8 +2100,19 @@ mod tests {
     fn test_get_latest_log_for_step() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         create_execution_log(&conn, &step.id, 1, Some("first"), None).unwrap();
         create_execution_log(&conn, &step.id, 2, Some("second"), None).unwrap();
@@ -1910,8 +2126,19 @@ mod tests {
     fn test_update_execution_log() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         let test_results = vec!["test1: pass".to_string(), "test2: fail".to_string()];
@@ -1957,8 +2184,19 @@ mod tests {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         update_execution_log(
@@ -1997,8 +2235,19 @@ mod tests {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         // First write: set both fields.
@@ -2062,8 +2311,19 @@ mod tests {
     fn test_update_execution_log_rolled_back_and_committed_panics() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         let _ = update_execution_log(
@@ -2090,8 +2350,19 @@ mod tests {
     fn test_update_execution_log_preserves_session_id_when_none() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, Some("initial-session")).unwrap();
 
         update_execution_log(
@@ -2162,8 +2433,19 @@ mod tests {
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         assert!(plan.deterministic_tests.is_empty());
 
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(step.acceptance_criteria.is_empty());
     }
 
@@ -2411,8 +2693,32 @@ mod tests {
     fn test_attach_hook_allows_distinct_combinations() {
         let conn = setup();
         let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
-        let (s1, _) = create_step(&conn, &plan.id, "t1", "d", None, None, &[], None, None, None).unwrap();
-        let (s2, _) = create_step(&conn, &plan.id, "t2", "d", None, None, &[], None, None, None).unwrap();
+        let (s1, _) = create_step(
+            &conn,
+            &plan.id,
+            "t1",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (s2, _) = create_step(
+            &conn,
+            &plan.id,
+            "t2",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Same hook on different steps: OK.
         attach_hook_to_step(&conn, &plan.id, &s1.id, "pre-step", "h1").unwrap();
@@ -2436,8 +2742,19 @@ mod tests {
         let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
 
         // None argument → Required default.
-        let (s_default, _) =
-            create_step(&conn, &plan.id, "def", "d", None, None, &[], None, None, None).unwrap();
+        let (s_default, _) = create_step(
+            &conn,
+            &plan.id,
+            "def",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(s_default.change_policy, ChangePolicy::Required);
 
         let read = get_step(&conn, &s_default.id).unwrap();
@@ -2703,10 +3020,7 @@ mod tests {
         .unwrap();
 
         let after = get_live_run(&conn, "/proj-clear").unwrap().unwrap();
-        assert_eq!(
-            after.child_pid, None,
-            "Clear must null out child_pid"
-        );
+        assert_eq!(after.child_pid, None, "Clear must null out child_pid");
         assert_eq!(
             after.child_start_token, None,
             "Clear must null out child_start_token"
@@ -2787,6 +3101,50 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[test]
+    fn test_bind_live_run_to_plan_sets_plan_and_clears_stale_step_state() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug, step_id, step_num,
+                                    attempt, max_attempts, phase, current_command,
+                                    execution_log_id, child_pid, child_start_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                "/proj-bind",
+                1i64,
+                "old-plan",
+                "old-slug",
+                "old-step",
+                7i32,
+                2i32,
+                4i32,
+                Phase::Harness.as_str(),
+                "claude-code",
+                99i64,
+                12345i64,
+                "child-token",
+            ],
+        )
+        .unwrap();
+
+        bind_live_run_to_plan(&conn, "/proj-bind", "new-plan", "new-slug").unwrap();
+
+        let live = get_live_run(&conn, "/proj-bind").unwrap().unwrap();
+        assert_eq!(live.plan_id.as_deref(), Some("new-plan"));
+        assert_eq!(live.plan_slug.as_deref(), Some("new-slug"));
+        assert_eq!(live.phase, Some(Phase::Idle));
+        assert_eq!(live.step_id, None);
+        assert_eq!(live.step_num, None);
+        assert_eq!(live.attempt, None);
+        assert_eq!(live.max_attempts, None);
+        assert_eq!(live.current_command, None);
+        assert_eq!(live.execution_log_id, None);
+        assert_eq!(live.child_pid, None);
+        assert_eq!(live.child_start_token, None);
+        assert!(live.phase_started_at.is_some());
+        assert!(live.updated_at.is_some());
+    }
+
     // -- finalize_execution_log_as_interrupted_if_exists tests --
 
     #[test]
@@ -2794,8 +3152,19 @@ mod tests {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         // Simulate the runner having written diff/stdout before dying.
@@ -2840,8 +3209,19 @@ mod tests {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         // Runner already finalized as Success before cancel raced in.
@@ -2876,8 +3256,7 @@ mod tests {
     #[test]
     fn test_finalize_execution_log_as_interrupted_missing_row_is_benign() {
         let conn = setup();
-        let updated_row =
-            finalize_execution_log_as_interrupted_if_exists(&conn, 99_999).unwrap();
+        let updated_row = finalize_execution_log_as_interrupted_if_exists(&conn, 99_999).unwrap();
         assert!(
             !updated_row,
             "expected no row to match for nonexistent log id"
@@ -2895,7 +3274,8 @@ mod tests {
         )
         .unwrap();
 
-        let affected = delete_run_lock_row_unscoped(&conn, "/proj-del", 4242, Some("tok-A")).unwrap();
+        let affected =
+            delete_run_lock_row_unscoped(&conn, "/proj-del", 4242, Some("tok-A")).unwrap();
         assert_eq!(affected, 1);
 
         let count: i64 = conn
@@ -2920,7 +3300,10 @@ mod tests {
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM run_locks", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 1, "row owned by a different start token must survive");
+        assert_eq!(
+            count, 1,
+            "row owned by a different start token must survive"
+        );
     }
 
     #[test]

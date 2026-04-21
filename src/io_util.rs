@@ -148,8 +148,7 @@ mod tests {
     /// A `None` reader produces an empty buffer without spawning any work.
     #[tokio::test]
     async fn test_drain_bounded_none_reader() {
-        let handle: JoinHandle<Vec<u8>> =
-            drain_bounded(None::<tokio::io::DuplexStream>, 1024);
+        let handle: JoinHandle<Vec<u8>> = drain_bounded(None::<tokio::io::DuplexStream>, 1024);
         let out = join_drain(handle).await;
         assert!(out.is_empty());
     }
@@ -158,11 +157,17 @@ mod tests {
     /// back to bytes otherwise.
     #[test]
     fn test_truncation_marker_format() {
-        assert_eq!(truncation_marker(1024 * 1024), "\n[output truncated to last 1 MiB]\n");
+        assert_eq!(
+            truncation_marker(1024 * 1024),
+            "\n[output truncated to last 1 MiB]\n"
+        );
         assert_eq!(
             truncation_marker(4 * 1024 * 1024),
             "\n[output truncated to last 4 MiB]\n"
         );
-        assert_eq!(truncation_marker(500), "\n[output truncated to last 500 bytes]\n");
+        assert_eq!(
+            truncation_marker(500),
+            "\n[output truncated to last 500 bytes]\n"
+        );
     }
 }

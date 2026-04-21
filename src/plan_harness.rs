@@ -916,7 +916,10 @@ mod tests {
         // Observability: pid and plan slug should surface so the user can
         // identify the blocking run.
         assert!(msg.contains("4242"), "pid missing from message: {msg}");
-        assert!(msg.contains("my-plan"), "plan slug missing from message: {msg}");
+        assert!(
+            msg.contains("my-plan"),
+            "plan slug missing from message: {msg}"
+        );
         // The escape hatches must be named.
         assert!(
             msg.contains("ralph cancel"),
@@ -931,7 +934,10 @@ mod tests {
         // the preflight function is the unit under test.
         let conn = setup_conn();
         let res = preflight_no_live_run(&conn, "/proj-empty");
-        assert!(res.is_ok(), "expected Ok when no run_locks row present, got: {res:?}");
+        assert!(
+            res.is_ok(),
+            "expected Ok when no run_locks row present, got: {res:?}"
+        );
     }
 
     #[test]
@@ -949,7 +955,10 @@ mod tests {
         let err = preflight_no_live_run(&conn, "/proj-all")
             .expect_err("expected Err when a run lock row exists");
         let msg = format!("{err:#}");
-        assert!(msg.contains("<all plans>"), "missing all-plans label: {msg}");
+        assert!(
+            msg.contains("<all plans>"),
+            "missing all-plans label: {msg}"
+        );
         assert!(msg.contains("7777"), "missing pid: {msg}");
     }
 }
