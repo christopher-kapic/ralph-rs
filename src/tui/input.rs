@@ -165,6 +165,7 @@ mod tests {
                 updated_at: Utc::now(),
                 model: None,
                 skipped_reason: None,
+                change_policy: crate::plan::ChangePolicy::Required,
             })
             .collect();
         App::new(plan, steps, &Config::default())

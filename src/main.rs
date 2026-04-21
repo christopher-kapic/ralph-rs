@@ -10,6 +10,7 @@ mod harness;
 mod hook_library;
 mod hooks;
 mod import;
+mod io_util;
 mod output;
 mod plan;
 mod plan_harness;
@@ -175,6 +176,12 @@ fn main() -> Result<()> {
                     plan,
                     use_harness,
                 } => {
+                    // Refuse to start the planner if a `ralph run` is live
+                    // on this project. Concurrent planner + run corrupts plan
+                    // state (the planner can reorder/delete steps the
+                    // executor is about to run).
+                    plan_harness::preflight_no_live_run(&conn, &project)?;
+
                     // When the user names a plan, resolve it so the harness
                     // receives a verified existing slug as its target. A
                     // missing plan is a hard error here rather than a silent
@@ -204,7 +211,7 @@ fn main() -> Result<()> {
         Command::Step(subcmd) => match subcmd {
             StepCommand::List { plan } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::step_list(&conn, &p.slug, &project, &out)
+                commands::step_list(&conn, &p.slug, &project, &config, &out)
             }
             StepCommand::Add {
                 title,
@@ -216,6 +223,7 @@ fn main() -> Result<()> {
                 model,
                 criteria,
                 max_retries,
+                change_policy,
                 import_json,
             } => {
                 // Precedence: per-subcommand --harness overrides the global
@@ -252,6 +260,7 @@ fn main() -> Result<()> {
                         model.as_deref(),
                         &criteria,
                         max_retries,
+                        change_policy,
                         &out,
                     )
                 }
@@ -285,6 +294,7 @@ fn main() -> Result<()> {
                 criteria,
                 max_retries,
                 clear_max_retries,
+                change_policy,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::step_edit(
@@ -301,6 +311,7 @@ fn main() -> Result<()> {
                     &criteria,
                     max_retries,
                     clear_max_retries,
+                    change_policy,
                     &out,
                 )
             }
@@ -557,6 +568,20 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+
+        // -- Cancel --
+        Command::Cancel {
+            plan: plan_slug,
+            force,
+            timeout,
+        } => commands::cmd_cancel(
+            &conn,
+            &project,
+            plan_slug.as_deref(),
+            force,
+            std::time::Duration::from_secs(timeout),
+            &out,
+        ),
 
         // -- Skip --
         Command::Skip {

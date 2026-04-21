@@ -1,6 +1,10 @@
 // Output formatting — centralized helpers for display and JSON serialization.
 
-use crate::plan::{ExecutionLog, Plan, PlanStatus, Step, StepStatus};
+use crate::plan::{
+    ChangePolicy, ExecutionLog, Phase, Plan, PlanStatus, Step, StepStatus, TerminationReason,
+    TestStatus,
+};
+use crate::run_lock::LiveRun;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -187,6 +191,46 @@ pub fn plan_status_icon(status: PlanStatus, color: bool) -> &'static str {
     }
 }
 
+/// Return the termination-reason string wrapped in ANSI color codes.
+///
+/// When `color` is false the plain string is returned. Green for Success,
+/// yellow for NoChanges (benign optional-policy no-op), gray for Unknown,
+/// red for every terminal-error variant.
+pub fn colored_termination_reason(reason: TerminationReason, color: bool) -> String {
+    if !color {
+        return reason.as_str().to_string();
+    }
+    let code = match reason {
+        TerminationReason::Success => "\x1b[32m",
+        TerminationReason::UserInterrupted
+        | TerminationReason::Timeout
+        | TerminationReason::TestFailed
+        | TerminationReason::HookFailed
+        | TerminationReason::HarnessFailed
+        | TerminationReason::CommitFailed
+        | TerminationReason::RollbackFailed => "\x1b[31m",
+        TerminationReason::NoChanges => "\x1b[33m",
+        TerminationReason::Unknown => "\x1b[90m",
+    };
+    format!("{code}{}\x1b[0m", reason.as_str())
+}
+
+/// Return the test-status string wrapped in ANSI color codes.
+///
+/// When `color` is false the plain string is returned. Green for Passed,
+/// red for Failed/Aborted/TimedOut, gray for NotConfigured/NotRun.
+pub fn colored_test_status(status: TestStatus, color: bool) -> String {
+    if !color {
+        return status.as_str().to_string();
+    }
+    let code = match status {
+        TestStatus::Passed => "\x1b[32m",
+        TestStatus::Failed | TestStatus::Aborted | TestStatus::TimedOut => "\x1b[31m",
+        TestStatus::NotConfigured | TestStatus::NotRun => "\x1b[90m",
+    };
+    format!("{code}{}\x1b[0m", status.as_str())
+}
+
 /// Return the plan status string wrapped in ANSI color codes.
 ///
 /// When `color` is false the plain status string is returned.
@@ -348,6 +392,10 @@ pub struct StepSummary {
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Always serialized (no skip_serializing_if) so JSON consumers see the
+    /// policy explicitly rather than having to infer a default. Matches the
+    /// `ExportedStep` emission policy.
+    pub change_policy: ChangePolicy,
 }
 
 impl From<&Step> for StepSummary {
@@ -367,6 +415,7 @@ impl From<&Step> for StepSummary {
             created_at: s.created_at,
             updated_at: s.updated_at,
             model: s.model.clone(),
+            change_policy: s.change_policy,
         }
     }
 }
@@ -393,6 +442,16 @@ pub struct LogEntrySummary {
     /// Included when `--full` or `--lines` is specified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stderr: Option<String>,
+    /// Why the attempt terminated. Populated from the V11 `termination_reason`
+    /// column on `execution_logs`; absent only for in-progress rows that
+    /// haven't yet written a terminal outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub termination_reason: Option<TerminationReason>,
+    /// Outcome of the test phase. Separate from `termination_reason` because
+    /// tests can be "not configured" or "not run" without the attempt itself
+    /// terminating abnormally.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_status: Option<TestStatus>,
 }
 
 /// Split a total line budget across stdout and stderr.
@@ -459,6 +518,8 @@ impl LogEntrySummary {
             session_id: l.session_id.clone(),
             stdout,
             stderr,
+            termination_reason: l.termination_reason,
+            test_status: l.test_status,
         }
     }
 }
@@ -474,6 +535,72 @@ pub struct StatusSummary {
     pub status: PlanStatus,
     pub branch_name: String,
     pub steps: StepCounts,
+    /// Live-run snapshot: present when a `ralph run` is currently active for
+    /// this project and its recorded plan matches (or is unbound and covers
+    /// the project broadly). Absent when no live row exists, or the live row
+    /// is for a different plan than the one being queried.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live: Option<LiveRunDisplay>,
+}
+
+/// Serializable projection of a [`LiveRun`] for the `status` command.
+///
+/// Timestamps are kept as raw strings so the struct mirrors the on-disk row;
+/// `phase_elapsed_secs` is a computed field populated at construction time
+/// when `phase_started_at` parses as a chrono timestamp.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveRunDisplay {
+    pub pid: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_slug: Option<String>,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_num: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<Phase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_elapsed_secs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_pid: Option<i64>,
+}
+
+impl LiveRunDisplay {
+    /// Project a [`LiveRun`] into its display form, computing
+    /// `phase_elapsed_secs = now() - phase_started_at`. Parse failures on the
+    /// timestamp leave `phase_elapsed_secs` as `None` rather than erroring —
+    /// the point is to surface best-effort observability, not to refuse
+    /// output when the server clock wrote an unparseable string.
+    pub fn from_live_run(lr: &LiveRun) -> Self {
+        let phase_elapsed_secs = lr.phase_started_at.as_deref().and_then(|s| {
+            s.parse::<DateTime<Utc>>()
+                .ok()
+                .map(|started| (Utc::now() - started).num_milliseconds() as f64 / 1000.0)
+        });
+        LiveRunDisplay {
+            pid: lr.pid,
+            plan_slug: lr.plan_slug.clone(),
+            started_at: lr.started_at.clone(),
+            step_id: lr.step_id.clone(),
+            step_num: lr.step_num,
+            attempt: lr.attempt,
+            max_attempts: lr.max_attempts,
+            phase: lr.phase,
+            phase_started_at: lr.phase_started_at.clone(),
+            phase_elapsed_secs,
+            current_command: lr.current_command.clone(),
+            child_pid: lr.child_pid,
+        }
+    }
 }
 
 /// Step count breakdown for the status command.
@@ -485,6 +612,33 @@ pub struct StepCounts {
     pub skipped: usize,
     pub pending: usize,
     pub in_progress: usize,
+}
+
+/// JSON output for the `cancel` command.
+#[derive(Debug, Clone, Serialize)]
+pub struct CancelSummary {
+    /// Whether cancel actually had a live run to signal. `false` means no
+    /// active row was found — cancel was a no-op.
+    pub cancelled: bool,
+    /// Whether the graceful SIGTERM was bypassed (`--force`) or the target
+    /// failed to release in time and was escalated to SIGKILL.
+    pub forced: bool,
+    /// Plan slug of the cancelled run, if the live row recorded one.
+    pub plan_slug: Option<String>,
+    /// 1-based step number in the plan, if the live row had progressed into a
+    /// step.
+    pub step_num: Option<i32>,
+    /// Phase the runner was in when cancel fired.
+    pub phase: Option<String>,
+    /// Attempt number at the time of cancel.
+    pub attempt: Option<i32>,
+    /// Configured max attempts for the step.
+    pub max_attempts: Option<i32>,
+    /// Pid of the runner that was signalled.
+    pub pid: Option<i64>,
+    /// `true` when the target process was already dead (pid missing or start
+    /// token mismatch); cancel only cleaned up bookkeeping in that case.
+    pub already_dead: bool,
 }
 
 /// JSON output for the `plan dependency list` command.
@@ -776,6 +930,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             model: None,
+            change_policy: ChangePolicy::Required,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"plan_id\""));
@@ -804,6 +959,8 @@ mod tests {
             session_id: None,
             stdout: None,
             stderr: None,
+            termination_reason: None,
+            test_status: None,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"step_id\""));
@@ -887,6 +1044,8 @@ mod tests {
             input_tokens: None,
             output_tokens: None,
             session_id: None,
+            termination_reason: None,
+            test_status: None,
         };
         let s = LogEntrySummary::new(&log, &LogOutputMode::Truncated(50));
         let out_lines = s.stdout.as_deref().map(|s| s.lines().count()).unwrap_or(0);
@@ -898,5 +1057,197 @@ mod tests {
         // With two equally large streams the split is 25/25.
         assert_eq!(out_lines, 25);
         assert_eq!(err_lines, 25);
+    }
+
+    // -- LiveRunDisplay / StatusSummary / termination-reason ---------------
+
+    /// Build a LiveRun with a phase_started_at a few seconds in the past so
+    /// from_live_run can compute a positive elapsed duration.
+    fn sample_live_run() -> LiveRun {
+        let started = Utc::now() - chrono::Duration::seconds(12);
+        LiveRun {
+            project: "/tmp/proj-roundtrip".into(),
+            pid: 12345,
+            pid_start_token: Some("tok".into()),
+            plan_id: Some("plan-uuid".into()),
+            plan_slug: Some("my-slug".into()),
+            started_at: "2026-04-21T17:23:10.000Z".into(),
+            step_id: Some("step-uuid".into()),
+            step_num: Some(3),
+            attempt: Some(2),
+            max_attempts: Some(4),
+            phase: Some(Phase::Tests),
+            phase_started_at: Some(started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            current_command: Some("pnpm turbo test --filter=rne".into()),
+            execution_log_id: Some(99),
+            child_pid: Some(54321),
+            child_start_token: Some("child-tok".into()),
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn test_live_run_display_json_includes_phase_elapsed_secs() {
+        let live = sample_live_run();
+        let disp = LiveRunDisplay::from_live_run(&live);
+        assert!(disp.phase_elapsed_secs.is_some());
+        let elapsed = disp.phase_elapsed_secs.unwrap();
+        assert!(
+            (11.0..120.0).contains(&elapsed),
+            "expected ~12s elapsed, got {elapsed}"
+        );
+        let json = serde_json::to_string(&disp).unwrap();
+        assert!(json.contains("\"phase\":\"tests\""));
+        assert!(json.contains("\"phase_elapsed_secs\""));
+        assert!(json.contains("\"attempt\":2"));
+        assert!(json.contains("\"max_attempts\":4"));
+        assert!(json.contains("\"current_command\":\"pnpm turbo test --filter=rne\""));
+        assert!(json.contains("\"pid\":12345"));
+    }
+
+    #[test]
+    fn test_live_run_display_malformed_phase_started_at_yields_none() {
+        let mut live = sample_live_run();
+        live.phase_started_at = Some("not-a-timestamp".into());
+        let disp = LiveRunDisplay::from_live_run(&live);
+        assert!(disp.phase_elapsed_secs.is_none());
+    }
+
+    #[test]
+    fn test_status_summary_omits_live_when_none() {
+        let summary = StatusSummary {
+            slug: "my-plan".into(),
+            status: PlanStatus::InProgress,
+            branch_name: "feat/x".into(),
+            steps: StepCounts {
+                total: 3,
+                complete: 1,
+                failed: 0,
+                skipped: 0,
+                pending: 2,
+                in_progress: 0,
+            },
+            live: None,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(
+            !json.contains("\"live\""),
+            "live should be omitted when None, got {json}"
+        );
+    }
+
+    #[test]
+    fn test_status_summary_includes_live_when_populated() {
+        let summary = StatusSummary {
+            slug: "my-plan".into(),
+            status: PlanStatus::InProgress,
+            branch_name: "feat/x".into(),
+            steps: StepCounts {
+                total: 3,
+                complete: 1,
+                failed: 0,
+                skipped: 0,
+                pending: 2,
+                in_progress: 1,
+            },
+            live: Some(LiveRunDisplay::from_live_run(&sample_live_run())),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"live\":{"));
+        assert!(json.contains("\"phase\":\"tests\""));
+    }
+
+    #[test]
+    fn test_log_entry_summary_includes_termination_reason_and_test_status() {
+        let summary = LogEntrySummary {
+            id: 1,
+            step_id: "s1".into(),
+            attempt: 2,
+            started_at: Utc::now(),
+            duration_secs: Some(5.0),
+            test_results: vec![],
+            rolled_back: false,
+            committed: false,
+            commit_hash: None,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            session_id: None,
+            stdout: None,
+            stderr: None,
+            termination_reason: Some(TerminationReason::UserInterrupted),
+            test_status: Some(TestStatus::Passed),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(json.contains("\"termination_reason\":\"user_interrupted\""));
+        assert!(json.contains("\"test_status\":\"passed\""));
+    }
+
+    #[test]
+    fn test_log_entry_summary_omits_termination_and_test_status_when_none() {
+        let summary = LogEntrySummary {
+            id: 1,
+            step_id: "s1".into(),
+            attempt: 1,
+            started_at: Utc::now(),
+            duration_secs: None,
+            test_results: vec![],
+            rolled_back: false,
+            committed: false,
+            commit_hash: None,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            session_id: None,
+            stdout: None,
+            stderr: None,
+            termination_reason: None,
+            test_status: None,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("\"termination_reason\""));
+        assert!(!json.contains("\"test_status\""));
+    }
+
+    #[test]
+    fn test_colored_termination_reason_color_off() {
+        assert_eq!(
+            colored_termination_reason(TerminationReason::UserInterrupted, false),
+            "user_interrupted"
+        );
+        assert_eq!(
+            colored_termination_reason(TerminationReason::Success, false),
+            "success"
+        );
+    }
+
+    #[test]
+    fn test_colored_termination_reason_color_on() {
+        let s = colored_termination_reason(TerminationReason::Success, true);
+        assert!(s.contains('\x1b'));
+        assert!(s.contains("success"));
+        assert!(s.contains("\x1b[32m")); // green
+        let s = colored_termination_reason(TerminationReason::UserInterrupted, true);
+        assert!(s.contains("\x1b[31m")); // red
+        let s = colored_termination_reason(TerminationReason::NoChanges, true);
+        assert!(s.contains("\x1b[33m")); // yellow
+        let s = colored_termination_reason(TerminationReason::Unknown, true);
+        assert!(s.contains("\x1b[90m")); // gray
+    }
+
+    #[test]
+    fn test_colored_test_status_color_off() {
+        assert_eq!(colored_test_status(TestStatus::Passed, false), "passed");
+        assert_eq!(colored_test_status(TestStatus::Failed, false), "failed");
+    }
+
+    #[test]
+    fn test_colored_test_status_color_on() {
+        let s = colored_test_status(TestStatus::Passed, true);
+        assert!(s.contains("\x1b[32m"));
+        let s = colored_test_status(TestStatus::Failed, true);
+        assert!(s.contains("\x1b[31m"));
+        let s = colored_test_status(TestStatus::NotConfigured, true);
+        assert!(s.contains("\x1b[90m"));
     }
 }

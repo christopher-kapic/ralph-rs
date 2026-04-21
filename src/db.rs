@@ -20,6 +20,8 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v8,
     migrate_v9,
     migrate_v10,
+    migrate_v11,
+    migrate_v12,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -361,6 +363,85 @@ fn migrate_v10(conn: &Connection) -> Result<()> {
 
         ALTER TABLE plans ADD COLUMN prompt_prefix TEXT;
         ALTER TABLE plans ADD COLUMN prompt_suffix TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V11: observability/control columns on run_locks + execution_logs
+// ---------------------------------------------------------------------------
+
+fn migrate_v11(conn: &Connection) -> Result<()> {
+    // `run_locks` gains a set of nullable observability columns so the
+    // executor can record which phase of a step is currently running (and,
+    // if it's a hook or test, which subprocess owns that phase). Every
+    // column is nullable because SQLite's `ADD COLUMN` can't introduce a
+    // NOT NULL column without a default, and more importantly because the
+    // lock row is created before any of this state is known.
+    //
+    // `execution_logs` gains `termination_reason` and `test_status` so
+    // terminal outcome is explicit rather than inferred from the
+    // committed/rolled_back/test_results tuple. Existing rows are backfilled:
+    // `termination_reason` becomes `'unknown'` (we genuinely can't tell), and
+    // `test_status` is inferred from the existing shape where possible.
+    conn.execute_batch(
+        "
+        ALTER TABLE run_locks ADD COLUMN step_id TEXT;
+        ALTER TABLE run_locks ADD COLUMN step_num INTEGER;
+        ALTER TABLE run_locks ADD COLUMN attempt INTEGER;
+        ALTER TABLE run_locks ADD COLUMN max_attempts INTEGER;
+        ALTER TABLE run_locks ADD COLUMN phase TEXT;
+        ALTER TABLE run_locks ADD COLUMN phase_started_at TEXT;
+        ALTER TABLE run_locks ADD COLUMN current_command TEXT;
+        ALTER TABLE run_locks ADD COLUMN execution_log_id INTEGER;
+        ALTER TABLE run_locks ADD COLUMN child_pid INTEGER;
+        ALTER TABLE run_locks ADD COLUMN child_start_token TEXT;
+        ALTER TABLE run_locks ADD COLUMN updated_at TEXT;
+
+        ALTER TABLE execution_logs ADD COLUMN termination_reason TEXT;
+        ALTER TABLE execution_logs ADD COLUMN test_status TEXT;
+
+        -- Backfill termination_reason: we can't tell after the fact, so mark
+        -- every existing row 'unknown'. Fresh rows will get populated properly.
+        UPDATE execution_logs SET termination_reason = 'unknown';
+
+        -- Backfill test_status from the (committed, rolled_back, test_results)
+        -- tuple. The four cases below are all we can infer; anything else
+        -- (e.g. rows stuck mid-run) stays NULL.
+        UPDATE execution_logs
+           SET test_status = 'passed'
+         WHERE committed = 1 AND test_results != '[]';
+        UPDATE execution_logs
+           SET test_status = 'not_configured'
+         WHERE committed = 1 AND test_results = '[]';
+        UPDATE execution_logs
+           SET test_status = 'failed'
+         WHERE rolled_back = 1 AND test_results != '[]';
+        UPDATE execution_logs
+           SET test_status = 'not_run'
+         WHERE rolled_back = 1 AND test_results = '[]';
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V12: per-step change_policy column
+// ---------------------------------------------------------------------------
+
+fn migrate_v12(conn: &Connection) -> Result<()> {
+    // `change_policy` governs whether a step must produce file changes to
+    // succeed. `'required'` (default) preserves existing behavior — a harness
+    // that exits cleanly with no diff is treated as a failure. `'optional'`
+    // lets review/audit steps succeed on a clean no-diff harness exit.
+    //
+    // SQLite permits NOT NULL DEFAULT on `ALTER TABLE ADD COLUMN`, so every
+    // pre-V12 row is backfilled to `'required'` and the invariant is
+    // preserved going forward.
+    conn.execute_batch(
+        "
+        ALTER TABLE steps ADD COLUMN change_policy TEXT NOT NULL DEFAULT 'required';
         ",
     )?;
     Ok(())
@@ -789,6 +870,266 @@ mod tests {
         }
         let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "re-open should restore 0600, got {mode:o}");
+    }
+
+    #[test]
+    fn test_migrate_v11_backfills_execution_logs() {
+        // Seed a pre-V11 database, populate rows covering each backfill case,
+        // then let V11 apply and verify termination_reason + test_status.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v10.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v10 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(10) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+
+        // Case A: committed + non-empty test_results -> test_status = 'passed'
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, test_results, rolled_back, committed)
+             VALUES (?1, ?2, ?3, 0, 1)",
+            rusqlite::params!["s1", 1, r#"["cargo test: pass"]"#],
+        )
+        .unwrap();
+
+        // Case B: committed + empty test_results -> 'not_configured'
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, test_results, rolled_back, committed)
+             VALUES (?1, ?2, '[]', 0, 1)",
+            rusqlite::params!["s1", 2],
+        )
+        .unwrap();
+
+        // Case C: rolled_back + non-empty test_results -> 'failed'
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, test_results, rolled_back, committed)
+             VALUES (?1, ?2, ?3, 1, 0)",
+            rusqlite::params!["s1", 3, r#"["cargo test: fail"]"#],
+        )
+        .unwrap();
+
+        // Case D: rolled_back + empty test_results -> 'not_run'
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, test_results, rolled_back, committed)
+             VALUES (?1, ?2, '[]', 1, 0)",
+            rusqlite::params!["s1", 4],
+        )
+        .unwrap();
+
+        // Case E: neither committed nor rolled_back (e.g. interrupted mid-run)
+        // -> test_status stays NULL.
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, test_results, rolled_back, committed)
+             VALUES (?1, ?2, '[]', 0, 0)",
+            rusqlite::params!["s1", 5],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V11 applies and backfills.
+        let conn = open_at(&path).unwrap();
+
+        // Every row should have termination_reason = 'unknown'.
+        let unknown_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM execution_logs WHERE termination_reason = 'unknown'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unknown_count, 5);
+
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM execution_logs WHERE termination_reason IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 0, "no row should have NULL termination_reason");
+
+        // Inspect test_status per case.
+        let ts = |attempt: i32| -> Option<String> {
+            conn.query_row(
+                "SELECT test_status FROM execution_logs WHERE attempt = ?1",
+                rusqlite::params![attempt],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(ts(1).as_deref(), Some("passed"));
+        assert_eq!(ts(2).as_deref(), Some("not_configured"));
+        assert_eq!(ts(3).as_deref(), Some("failed"));
+        assert_eq!(ts(4).as_deref(), Some("not_run"));
+        assert_eq!(ts(5), None, "unresolved rows should keep NULL test_status");
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migrate_v11_idempotent() {
+        // Opening the DB twice should not reapply V11 (which would fail on
+        // the duplicate ALTER TABLE ADD COLUMN).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("idem_v11.db");
+        {
+            let _conn = open_at(&path).expect("first open runs all migrations");
+        }
+        // A second open is the actual idempotence check — if V11 re-ran it
+        // would fail on "duplicate column name".
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migrate_v11_adds_run_lock_columns() {
+        // Every new run_locks column should be queryable and accept NULL.
+        let conn = open_memory().expect("open_memory");
+
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, step_id, step_num, attempt, max_attempts,
+                                    phase, phase_started_at, current_command, execution_log_id,
+                                    child_pid, child_start_token, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                "/proj",
+                1234,
+                "s1",
+                3,
+                1,
+                5,
+                "harness",
+                "2026-04-21T00:00:00.000Z",
+                "cargo test",
+                42,
+                99999,
+                "token",
+                "2026-04-21T00:00:01.000Z",
+            ],
+        )
+        .expect("insert with all v11 columns");
+
+        // All columns readable.
+        let (phase, cmd, updated): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT phase, current_command, updated_at FROM run_locks WHERE project = ?1",
+                ["/proj"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("query");
+        assert_eq!(phase.as_deref(), Some("harness"));
+        assert_eq!(cmd.as_deref(), Some("cargo test"));
+        assert_eq!(updated.as_deref(), Some("2026-04-21T00:00:01.000Z"));
+
+        // Null values also permitted (all columns nullable).
+        conn.execute(
+            "INSERT INTO run_locks (project, pid) VALUES (?1, ?2)",
+            rusqlite::params!["/proj2", 1],
+        )
+        .expect("insert with only required columns");
+    }
+
+    #[test]
+    fn test_migrate_v12_backfills_change_policy() {
+        // Seed a pre-V12 database, populate some steps, then let V12 apply
+        // and verify every existing row got change_policy = 'required'.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v11.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v11 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(11) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step A", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s2", "p1", "a1", "Step B", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V12 applies and backfills every row to 'required'.
+        let conn = open_at(&path).unwrap();
+
+        let required_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM steps WHERE change_policy = 'required'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(required_count, 2, "both pre-V12 rows should be 'required'");
+
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM steps WHERE change_policy IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_count, 0, "NOT NULL DEFAULT must leave no NULLs");
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migrate_v12_idempotent() {
+        // Opening the DB twice must not re-apply V12 (which would fail with
+        // "duplicate column name" on the second ALTER TABLE ADD COLUMN).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("idem_v12.db");
+        {
+            let _conn = open_at(&path).expect("first open runs all migrations");
+        }
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
     }
 
     #[test]

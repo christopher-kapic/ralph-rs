@@ -274,6 +274,7 @@ mod tests {
                 updated_at: Utc::now(),
                 model: None,
                 skipped_reason: None,
+                change_policy: crate::plan::ChangePolicy::Required,
             })
             .collect();
         App::new(plan, steps, &Config::default())
@@ -361,9 +362,12 @@ mod tests {
             updated_at: Utc::now(),
             model: None,
             skipped_reason: None,
+            change_policy: crate::plan::ChangePolicy::Required,
         }];
-        let mut config = Config::default();
-        config.max_retries_per_step = 7;
+        let config = Config {
+            max_retries_per_step: 7,
+            ..Default::default()
+        };
         let mut app = App::new(plan, steps, &config);
 
         let backend = ratatui::backend::TestBackend::new(80, 24);
