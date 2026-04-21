@@ -6,7 +6,10 @@ use rusqlite::{Connection, params, params_from_iter};
 use uuid::Uuid;
 
 use crate::frac_index;
-use crate::plan::{ExecutionLog, PLAN_COLUMNS, Plan, PlanStatus, Step, StepStatus};
+use crate::plan::{
+    ChangePolicy, ExecutionLog, PLAN_COLUMNS, Phase, Plan, PlanStatus, Step, StepStatus,
+};
+use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 
 // ---------------------------------------------------------------------------
 // Plan operations
@@ -271,6 +274,11 @@ pub fn set_project_prompt_suffix(
 ///
 /// Automatically generates a sort_key after the last existing step.
 /// Returns the new step and its 1-based position in the plan.
+///
+/// `change_policy`: pass `None` to default to [`ChangePolicy::Required`]
+/// (the pre-V12 behavior). `Some(policy)` records the caller's explicit
+/// choice. Kept as an Option to avoid churning every existing callsite — the
+/// default behavior is what most callers want.
 #[allow(clippy::too_many_arguments)]
 pub fn create_step(
     conn: &Connection,
@@ -282,9 +290,11 @@ pub fn create_step(
     acceptance_criteria: &[String],
     max_retries: Option<i32>,
     model: Option<&str>,
+    change_policy: Option<ChangePolicy>,
 ) -> Result<(Step, usize)> {
     let id = Uuid::new_v4().to_string();
     let criteria_json = serde_json::to_string(acceptance_criteria)?;
+    let change_policy = change_policy.unwrap_or_default();
 
     // Determine sort_key: after the last existing step, or initial_key if none.
     let last_key: Option<String> = conn
@@ -301,9 +311,9 @@ pub fn create_step(
     };
 
     conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model],
+        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str()],
     )
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
@@ -320,7 +330,7 @@ pub fn create_step(
 /// List steps for a plan, ordered by sort_key.
 pub fn list_steps(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy
          FROM steps WHERE plan_id = ?1 ORDER BY sort_key ASC",
     )?;
 
@@ -335,7 +345,7 @@ pub fn list_steps(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
 /// Fetch a single step by ID.
 pub fn get_step(conn: &Connection, step_id: &str) -> Result<Step> {
     conn.query_row(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy
          FROM steps WHERE id = ?1",
         params![step_id],
         Step::from_row,
@@ -350,7 +360,7 @@ pub fn get_step(conn: &Connection, step_id: &str) -> Result<Step> {
 /// a user-supplied `--step-id` flag).
 pub fn get_step_by_id(conn: &Connection, step_id: &str) -> Result<Option<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy
          FROM steps WHERE id = ?1",
     )?;
     let mut rows = stmt.query_map(params![step_id], Step::from_row)?;
@@ -371,6 +381,32 @@ pub fn update_step_status(conn: &Connection, step_id: &str, status: StepStatus) 
         anyhow::bail!("Step not found: {step_id}");
     }
     Ok(())
+}
+
+/// Atomically transition a step's status from `expected` to `new_status`.
+///
+/// Unlike [`update_step_status`], this variant is a no-op (returns `Ok(false)`)
+/// when the row is missing or its current status doesn't equal `expected`.
+/// The read+check+write is collapsed into a single `UPDATE ... WHERE status = ?`
+/// so there's no TOCTOU gap between observing the current status and writing
+/// the new one.
+///
+/// Returns `Ok(true)` if a row was updated, `Ok(false)` if none matched.
+/// Used by `ralph cancel`'s stale-run finalization to flip `InProgress`
+/// to `Aborted` only when the runner hasn't already moved it to a terminal
+/// status during its own cleanup.
+pub fn update_step_status_if(
+    conn: &Connection,
+    step_id: &str,
+    expected: StepStatus,
+    new_status: StepStatus,
+) -> Result<bool> {
+    let affected = conn.execute(
+        "UPDATE steps SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ?2 AND status = ?3",
+        params![new_status.as_str(), step_id, expected.as_str()],
+    )?;
+    Ok(affected > 0)
 }
 
 /// Mark a step as skipped and record the operator-supplied reason (if any).
@@ -399,6 +435,9 @@ pub fn delete_step(conn: &Connection, step_id: &str) -> Result<()> {
 
 /// Create a new step inserted at a specific sort_key position.
 /// Returns the new step and its 1-based position in the plan.
+///
+/// `change_policy`: see [`create_step`] — `None` defaults to
+/// [`ChangePolicy::Required`].
 #[allow(clippy::too_many_arguments)]
 pub fn create_step_at(
     conn: &Connection,
@@ -411,14 +450,16 @@ pub fn create_step_at(
     acceptance_criteria: &[String],
     max_retries: Option<i32>,
     model: Option<&str>,
+    change_policy: Option<ChangePolicy>,
 ) -> Result<(Step, usize)> {
     let id = Uuid::new_v4().to_string();
     let criteria_json = serde_json::to_string(acceptance_criteria)?;
+    let change_policy = change_policy.unwrap_or_default();
 
     conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model],
+        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str()],
     )
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
@@ -432,7 +473,7 @@ pub fn create_step_at(
     Ok((get_step(conn, &id)?, position))
 }
 
-/// Extended step update: title, description, agent, harness, criteria, max_retries, model.
+/// Extended step update: title, description, agent, harness, criteria, max_retries, model, change_policy.
 ///
 /// - `agent_update`: `Some(Some("name"))` sets the agent, `Some(None)` clears it
 ///   (sets to NULL), `None` means don't change.
@@ -444,6 +485,10 @@ pub fn create_step_at(
 ///   `None` means don't change.
 /// - `model_update`: same pattern as agent — `Some(Some("name"))` sets the
 ///   per-step model override, `Some(None)` clears it, `None` means don't change.
+/// - `change_policy_update`: `Some(policy)` replaces the stored policy,
+///   `None` means don't change. `change_policy` is NOT NULL at the DB level
+///   so there's no "clear" form — you always substitute one valid policy
+///   for another.
 #[allow(clippy::too_many_arguments)]
 pub fn update_step_fields_ext(
     conn: &Connection,
@@ -455,6 +500,7 @@ pub fn update_step_fields_ext(
     criteria_update: Option<&[String]>,
     retries_update: Option<Option<i32>>,
     model_update: Option<Option<&str>>,
+    change_policy_update: Option<ChangePolicy>,
 ) -> Result<()> {
     // Build a single UPDATE with dynamic SET clauses so all changed fields
     // share one `updated_at` and a partial failure can't leave the row half
@@ -498,6 +544,10 @@ pub fn update_step_fields_ext(
     if let Some(model) = model_update {
         clauses.push("model = ?");
         values.push(text_or_null(model));
+    }
+    if let Some(policy) = change_policy_update {
+        clauses.push("change_policy = ?");
+        values.push(Value::Text(policy.as_str().to_string()));
     }
 
     if clauses.is_empty() {
@@ -556,7 +606,7 @@ pub fn update_step_sort_key(conn: &Connection, step_id: &str, sort_key: &str) ->
 #[allow(dead_code)]
 pub fn get_next_pending_step(conn: &Connection, plan_id: &str) -> Result<Option<Step>> {
     let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason
+        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy
          FROM steps WHERE plan_id = ?1 AND status = ?2 ORDER BY sort_key ASC LIMIT 1",
     )?;
 
@@ -598,7 +648,7 @@ pub fn create_execution_log(
 /// Get the latest (highest attempt) execution log for a step.
 pub fn get_latest_log_for_step(conn: &Connection, step_id: &str) -> Result<Option<ExecutionLog>> {
     let mut stmt = conn.prepare(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id
+        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status
          FROM execution_logs WHERE step_id = ?1 ORDER BY attempt DESC LIMIT 1",
     )?;
 
@@ -610,6 +660,22 @@ pub fn get_latest_log_for_step(conn: &Connection, step_id: &str) -> Result<Optio
 }
 
 /// Update fields on an execution log (typically after the attempt completes).
+///
+/// `termination_reason` records *why* this attempt stopped (success, timeout,
+/// test failure, hook failure, user interrupt, etc.). `test_status` records
+/// the outcome of the test phase specifically — separate because tests can be
+/// `NotConfigured` or `NotRun` without the attempt itself failing.
+///
+/// ## COALESCE semantics
+///
+/// `session_id`, `termination_reason`, and `test_status` are all written with
+/// `COALESCE(?n, <column>)`: passing `None` preserves whatever is already in
+/// the row, passing `Some(...)` overwrites. This lets non-terminal writers
+/// (intermediate progress updates within a retry loop) leave those columns
+/// alone while terminal writers stomp them with the authoritative final
+/// values. At every *terminal* callsite in the executor, callers MUST pass
+/// `Some(...)` for `termination_reason`; `test_status` should be
+/// `Some(TestStatus::NotRun)` for rows that never reached the test phase.
 #[allow(clippy::too_many_arguments)]
 pub fn update_execution_log(
     conn: &Connection,
@@ -626,6 +692,8 @@ pub fn update_execution_log(
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     session_id: Option<&str>,
+    termination_reason: Option<crate::plan::TerminationReason>,
+    test_status: Option<crate::plan::TestStatus>,
 ) -> Result<()> {
     debug_assert!(
         !(rolled_back && committed),
@@ -633,6 +701,8 @@ pub fn update_execution_log(
     );
 
     let test_results_json = serde_json::to_string(test_results)?;
+    let termination_reason_str: Option<&str> = termination_reason.as_ref().map(|r| r.as_str());
+    let test_status_str: Option<&str> = test_status.as_ref().map(|s| s.as_str());
 
     let affected = conn.execute(
         "UPDATE execution_logs SET
@@ -647,8 +717,10 @@ pub fn update_execution_log(
             cost_usd = ?9,
             input_tokens = ?10,
             output_tokens = ?11,
-            session_id = COALESCE(?12, session_id)
-         WHERE id = ?13",
+            session_id = COALESCE(?12, session_id),
+            termination_reason = COALESCE(?13, termination_reason),
+            test_status = COALESCE(?14, test_status)
+         WHERE id = ?15",
         params![
             duration_secs,
             diff,
@@ -662,6 +734,8 @@ pub fn update_execution_log(
             input_tokens,
             output_tokens,
             session_id,
+            termination_reason_str,
+            test_status_str,
             log_id,
         ],
     )?;
@@ -675,7 +749,7 @@ pub fn update_execution_log(
 /// List execution logs for a step, ordered by attempt.
 pub fn list_execution_logs_for_step(conn: &Connection, step_id: &str) -> Result<Vec<ExecutionLog>> {
     let mut stmt = conn.prepare(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id
+        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status
          FROM execution_logs WHERE step_id = ?1 ORDER BY attempt ASC",
     )?;
 
@@ -707,7 +781,8 @@ pub fn list_execution_logs_for_plan(
         "SELECT s.title, el.id, el.step_id, el.attempt, el.started_at, el.duration_secs,
                 el.prompt_text, el.diff, el.test_results, el.rolled_back, el.committed,
                 el.commit_hash, el.harness_stdout, el.harness_stderr, el.cost_usd,
-                el.input_tokens, el.output_tokens, el.session_id
+                el.input_tokens, el.output_tokens, el.session_id,
+                el.termination_reason, el.test_status
          FROM execution_logs el
          JOIN steps s ON s.id = el.step_id
          WHERE s.plan_id = ?1
@@ -718,6 +793,30 @@ pub fn list_execution_logs_for_plan(
     let rows = stmt.query_map(params![plan_id, limit_val], |row| {
         let step_title: String = row.get(0)?;
         // Shift columns by 1 for the ExecutionLog fields.
+        let termination_reason_str: Option<String> = row.get(18)?;
+        let termination_reason = match termination_reason_str {
+            Some(s) => Some(
+                s.parse::<crate::plan::TerminationReason>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        18,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+            ),
+            None => None,
+        };
+        let test_status_str: Option<String> = row.get(19)?;
+        let test_status = match test_status_str {
+            Some(s) => Some(s.parse::<crate::plan::TestStatus>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    19,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?),
+            None => None,
+        };
         let log = ExecutionLog {
             id: row.get(1)?,
             step_id: row.get(2)?,
@@ -760,6 +859,8 @@ pub fn list_execution_logs_for_plan(
             input_tokens: row.get(15)?,
             output_tokens: row.get(16)?,
             session_id: row.get(17)?,
+            termination_reason,
+            test_status,
         };
         Ok((step_title, log))
     })?;
@@ -772,14 +873,72 @@ pub fn list_execution_logs_for_plan(
 }
 
 /// Fetch an execution log by its primary key.
-fn get_execution_log_by_id(conn: &Connection, id: i64) -> Result<ExecutionLog> {
+pub(crate) fn get_execution_log_by_id(conn: &Connection, id: i64) -> Result<ExecutionLog> {
     conn.query_row(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id
+        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status
          FROM execution_logs WHERE id = ?1",
         params![id],
         ExecutionLog::from_row,
     )
     .with_context(|| format!("Execution log not found: {id}"))
+}
+
+/// Mark the live execution log row as interrupted by the user without
+/// clobbering any observability fields the target runner may have already
+/// written (diff, stdout/stderr, commit_hash, etc.).
+///
+/// Used by `ralph cancel`: the regular `update_execution_log` path takes every
+/// observability column as an `Option` but unconditionally overwrites most of
+/// them, so calling it with `None`s would wipe whatever the runner persisted
+/// before it died. This narrow helper only touches `termination_reason` and
+/// `test_status`, both via COALESCE semantics — if the runner already recorded
+/// a terminal reason (e.g. the attempt succeeded before cancel raced it), we
+/// leave it alone.
+///
+/// Returns `Ok(true)` if a matching row was updated (the COALESCE means the
+/// update may have been a no-op at the column level if the runner already
+/// recorded a terminal reason, but the row still matched). Returns `Ok(false)`
+/// if no such row exists — for `ralph cancel`'s stale-run path that's benign
+/// (the runner may have deleted its own execution_log during cleanup).
+pub fn finalize_execution_log_as_interrupted_if_exists(
+    conn: &Connection,
+    log_id: i64,
+) -> Result<bool> {
+    let affected = conn.execute(
+        "UPDATE execution_logs SET
+            termination_reason = COALESCE(termination_reason, ?1),
+            test_status = COALESCE(test_status, ?2)
+         WHERE id = ?3",
+        params![
+            crate::plan::TerminationReason::UserInterrupted.as_str(),
+            crate::plan::TestStatus::NotRun.as_str(),
+            log_id,
+        ],
+    )?;
+    Ok(affected > 0)
+}
+
+/// Delete a run_locks row without requiring that the calling process owns it.
+///
+/// Unlike [`crate::run_lock::acquire`]'s normal Drop-path release, this is used
+/// by `ralph cancel` from a *sibling* process that never held the lock. The
+/// query is scoped by `(project, pid, pid_start_token)` so a racing new
+/// `ralph run` that already inserted its own row (different pid, or same pid
+/// with a different start token) is untouched.
+pub fn delete_run_lock_row_unscoped(
+    conn: &Connection,
+    project: &str,
+    pid: i64,
+    pid_start_token: Option<&str>,
+) -> Result<usize> {
+    let affected = conn.execute(
+        "DELETE FROM run_locks
+         WHERE project = ?1
+           AND pid = ?2
+           AND COALESCE(pid_start_token, '') = COALESCE(?3, '')",
+        params![project, pid, pid_start_token],
+    )?;
+    Ok(affected)
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,6 +1268,148 @@ pub fn list_all_hooks_for_plan(conn: &Connection, plan_id: &str) -> Result<Vec<S
 }
 
 // ---------------------------------------------------------------------------
+// Live-run observability (run_locks V11 columns)
+// ---------------------------------------------------------------------------
+
+/// Read the live-run snapshot for `project`, including every observability
+/// column added in V11. Returns `Ok(None)` when no lock row exists.
+///
+/// Production callers are `ralph cancel` and `ralph status`. Tests exercise it
+/// to verify phase writes, so the `#[allow(dead_code)]` marks the binary
+/// surface area, not the function itself.
+#[allow(dead_code)]
+pub fn get_live_run(conn: &Connection, project: &str) -> Result<Option<LiveRun>> {
+    let query = format!("SELECT {LIVE_RUN_COLUMNS} FROM run_locks WHERE project = ?1");
+    let mut stmt = conn.prepare(&query)?;
+    let mut rows = stmt.query_map(params![project], LiveRun::from_row)?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+/// How a phase write should treat the `child_pid` / `child_start_token`
+/// columns on the `run_locks` row.
+///
+/// These two columns move together — we only ever write a matching (pid,
+/// token) pair or clear both — so they share a single enum rather than two
+/// independent args. Post-harness phases must explicitly `Clear` instead of
+/// using COALESCE, otherwise a dead harness pid lingers on the row through
+/// the Tests / PostTestHook / Commit / Rollback / PostStepHook phases,
+/// confusing observers that read `ralph status` mid-cleanup.
+#[derive(Debug, Clone)]
+pub enum ChildUpdate<'a> {
+    /// Preserve whatever (pid, token) is already on the row (COALESCE).
+    Keep,
+    /// Overwrite with these concrete values. `start_token` may be `None` on
+    /// platforms that can't derive one (still writes NULL to that column).
+    Set {
+        pid: i64,
+        start_token: Option<&'a str>,
+    },
+    /// Overwrite both columns with NULL. Use after the harness phase ends
+    /// (Tests onward) so the row no longer advertises a dead pid.
+    Clear,
+}
+
+/// Record a phase transition onto the `run_locks` row for `project`.
+///
+/// Semantics:
+///
+/// - `phase`, `phase_started_at`, and `updated_at` are **always** written.
+///   `phase_started_at` and `updated_at` are set to `strftime('now')`.
+/// - `step_id`, `step_num`, `attempt`, `max_attempts`, `execution_log_id`:
+///   **COALESCE** semantics. Passing `None` leaves the existing column value
+///   untouched. This lets callers set these fields once (e.g. at the start
+///   of a step) without having to re-pass them on every phase write inside
+///   the same step.
+/// - `current_command`: **always overwrites**. Phases that don't have a
+///   current command (e.g. `PostTestHook`) should pass `None` and the column
+///   will be cleared back to NULL. Using COALESCE here would leave a stale
+///   command (like `"cargo test"`) sitting on a phase that isn't running any
+///   command.
+/// - `child`: explicit [`ChildUpdate`] to disambiguate "preserve", "set",
+///   and "clear" for `child_pid` / `child_start_token`. COALESCE here would
+///   leave a dead harness pid visible through post-harness phases.
+///
+/// Errors when no row exists for `project` — the run_locks row is created by
+/// [`crate::run_lock::acquire`] before the executor starts, so a missing row
+/// indicates a programming error (likely a test forgot to seed the row).
+#[allow(clippy::too_many_arguments)]
+pub fn update_live_phase(
+    conn: &Connection,
+    project: &str,
+    phase: Phase,
+    step_id: Option<&str>,
+    step_num: Option<i32>,
+    attempt: Option<i32>,
+    max_attempts: Option<i32>,
+    execution_log_id: Option<i64>,
+    current_command: Option<&str>,
+    child: ChildUpdate<'_>,
+) -> Result<()> {
+    // Build the child-column fragment + bound params depending on the mode.
+    // Keep uses COALESCE so Nones don't clobber; Set writes the values
+    // directly; Clear overwrites both to NULL.
+    let (child_sql, child_pid_param, child_token_param): (&str, Option<i64>, Option<&str>) =
+        match child {
+            ChildUpdate::Keep => (
+                "child_pid = COALESCE(?8, child_pid),
+                 child_start_token = COALESCE(?9, child_start_token),",
+                None,
+                None,
+            ),
+            ChildUpdate::Set { pid, start_token } => (
+                "child_pid = ?8,
+                 child_start_token = ?9,",
+                Some(pid),
+                start_token,
+            ),
+            ChildUpdate::Clear => (
+                "child_pid = NULL,
+                 child_start_token = NULL,",
+                None,
+                None,
+            ),
+        };
+
+    let sql = format!(
+        "UPDATE run_locks SET
+            phase = ?1,
+            phase_started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            step_id = COALESCE(?2, step_id),
+            step_num = COALESCE(?3, step_num),
+            attempt = COALESCE(?4, attempt),
+            max_attempts = COALESCE(?5, max_attempts),
+            execution_log_id = COALESCE(?6, execution_log_id),
+            current_command = ?7,
+            {child_sql}
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE project = ?10",
+    );
+    let affected = conn.execute(
+        &sql,
+        params![
+            phase.as_str(),
+            step_id,
+            step_num,
+            attempt,
+            max_attempts,
+            execution_log_id,
+            current_command,
+            child_pid_param,
+            child_token_param,
+            project,
+        ],
+    )?;
+
+    if affected == 0 {
+        anyhow::bail!("No run_locks row for project: {project}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1256,7 +1557,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "step", "desc", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "step", "desc", None, None, &[], None, None, None).unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         delete_plan(&conn, &plan.id).unwrap();
@@ -1284,11 +1585,11 @@ mod tests {
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
         let (s1, _) =
-            create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "First", "d1", None, None, &[], None, None, None).unwrap();
         let (s2, _) =
-            create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Second", "d2", None, None, &[], None, None, None).unwrap();
         let (s3, _) =
-            create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Third", "d3", None, None, &[], None, None, None).unwrap();
 
         // Sort keys should be monotonically increasing
         assert!(
@@ -1313,9 +1614,9 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
-        create_step(&conn, &plan.id, "First", "d", None, None, &[], None, None).unwrap();
-        create_step(&conn, &plan.id, "Second", "d", None, None, &[], None, None).unwrap();
-        create_step(&conn, &plan.id, "Third", "d", None, None, &[], None, None).unwrap();
+        create_step(&conn, &plan.id, "First", "d", None, None, &[], None, None, None).unwrap();
+        create_step(&conn, &plan.id, "Second", "d", None, None, &[], None, None, None).unwrap();
+        create_step(&conn, &plan.id, "Third", "d", None, None, &[], None, None, None).unwrap();
 
         let steps = list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps.len(), 3);
@@ -1345,6 +1646,7 @@ mod tests {
             &criteria,
             Some(3),
             None,
+            None,
         )
         .unwrap();
 
@@ -1359,7 +1661,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
 
         update_step_status(&conn, &step.id, StepStatus::Complete).unwrap();
 
@@ -1375,7 +1677,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
 
         let baseline = get_step(&conn, &step.id).unwrap();
         // Sleep long enough that strftime('now') advances past the baseline.
@@ -1391,6 +1693,7 @@ mod tests {
             Some(&["criterion".to_string()]),
             Some(Some(5)),
             Some(Some("new-model")),
+            Some(ChangePolicy::Optional),
         )
         .unwrap();
 
@@ -1402,6 +1705,7 @@ mod tests {
         assert_eq!(updated.acceptance_criteria, vec!["criterion".to_string()]);
         assert_eq!(updated.max_retries, Some(5));
         assert_eq!(updated.model.as_deref(), Some("new-model"));
+        assert_eq!(updated.change_policy, ChangePolicy::Optional);
         assert!(updated.updated_at > baseline.updated_at);
     }
 
@@ -1421,6 +1725,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .unwrap();
         let other_before = get_step(&conn, &other.id).unwrap();
@@ -1431,6 +1736,7 @@ mod tests {
             Some("New Title"),
             Some("New Desc"),
             Some(Some("agent")),
+            None,
             None,
             None,
             None,
@@ -1458,6 +1764,7 @@ mod tests {
             &[],
             Some(3),
             Some("model"),
+            None,
         )
         .unwrap();
 
@@ -1471,6 +1778,7 @@ mod tests {
             None,
             Some(None),
             Some(None),
+            None,
         )
         .unwrap();
 
@@ -1486,10 +1794,11 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
         let before = get_step(&conn, &step.id).unwrap();
 
-        update_step_fields_ext(&conn, &step.id, None, None, None, None, None, None, None).unwrap();
+        update_step_fields_ext(&conn, &step.id, None, None, None, None, None, None, None, None)
+            .unwrap();
 
         let after = get_step(&conn, &step.id).unwrap();
         assert_eq!(before.updated_at, after.updated_at);
@@ -1500,7 +1809,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         delete_step(&conn, &step.id).unwrap();
@@ -1519,7 +1828,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
         update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();
         create_execution_log(&conn, &step.id, 1, Some("first try"), None).unwrap();
 
@@ -1540,9 +1849,9 @@ mod tests {
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
 
         let (s1, _) =
-            create_step(&conn, &plan.id, "First", "d", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "First", "d", None, None, &[], None, None, None).unwrap();
         let (s2, _) =
-            create_step(&conn, &plan.id, "Second", "d", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Second", "d", None, None, &[], None, None, None).unwrap();
 
         // Both pending — should return first by sort_key
         let next = get_next_pending_step(&conn, &plan.id).unwrap().unwrap();
@@ -1568,7 +1877,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
 
         let log =
             create_execution_log(&conn, &step.id, 1, Some("do the thing"), Some("sess-1")).unwrap();
@@ -1587,7 +1896,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
 
         create_execution_log(&conn, &step.id, 1, Some("first"), None).unwrap();
         create_execution_log(&conn, &step.id, 2, Some("second"), None).unwrap();
@@ -1602,7 +1911,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         let test_results = vec!["test1: pass".to_string(), "test2: fail".to_string()];
@@ -1621,6 +1930,8 @@ mod tests {
             Some(1000),
             Some(500),
             Some("session-abc"),
+            None,
+            None,
         )
         .unwrap();
 
@@ -1637,6 +1948,112 @@ mod tests {
         assert_eq!(updated.input_tokens, Some(1000));
         assert_eq!(updated.output_tokens, Some(500));
         assert_eq!(updated.session_id.as_deref(), Some("session-abc"));
+        assert!(updated.termination_reason.is_none());
+        assert!(updated.test_status.is_none());
+    }
+
+    #[test]
+    fn test_update_execution_log_persists_termination_and_test_status() {
+        use crate::plan::{TerminationReason, TestStatus};
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
+
+        update_execution_log(
+            &conn,
+            log.id,
+            Some(1.0),
+            None,
+            &[],
+            false,
+            true,
+            Some("abc"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(TerminationReason::Success),
+            Some(TestStatus::Passed),
+        )
+        .unwrap();
+
+        let updated = get_latest_log_for_step(&conn, &step.id).unwrap().unwrap();
+        assert_eq!(updated.termination_reason, Some(TerminationReason::Success));
+        assert_eq!(updated.test_status, Some(TestStatus::Passed));
+
+        // Round-trip via list_execution_logs_for_step too.
+        let logs = list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].termination_reason, Some(TerminationReason::Success));
+        assert_eq!(logs[0].test_status, Some(TestStatus::Passed));
+    }
+
+    #[test]
+    fn test_update_execution_log_coalesces_termination_and_test_status() {
+        use crate::plan::{TerminationReason, TestStatus};
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
+
+        // First write: set both fields.
+        update_execution_log(
+            &conn,
+            log.id,
+            Some(1.0),
+            None,
+            &[],
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(TerminationReason::TestFailed),
+            Some(TestStatus::Failed),
+        )
+        .unwrap();
+
+        // Second write: pass None for both — should preserve the first values.
+        update_execution_log(
+            &conn,
+            log.id,
+            Some(2.0),
+            None,
+            &[],
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let updated = get_latest_log_for_step(&conn, &step.id).unwrap().unwrap();
+        assert_eq!(
+            updated.termination_reason,
+            Some(TerminationReason::TestFailed),
+            "None should preserve existing termination_reason via COALESCE"
+        );
+        assert_eq!(
+            updated.test_status,
+            Some(TestStatus::Failed),
+            "None should preserve existing test_status via COALESCE"
+        );
     }
 
     #[test]
@@ -1646,7 +2063,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
 
         let _ = update_execution_log(
@@ -1664,6 +2081,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
     }
 
@@ -1672,7 +2091,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, Some("initial-session")).unwrap();
 
         update_execution_log(
@@ -1683,6 +2102,8 @@ mod tests {
             &[],
             false,
             true,
+            None,
+            None,
             None,
             None,
             None,
@@ -1727,7 +2148,7 @@ mod tests {
             "Code coverage > 80%".to_string(),
         ];
         let (step, _) = create_step(
-            &conn, &plan.id, "Step", "d", None, None, &criteria, None, None,
+            &conn, &plan.id, "Step", "d", None, None, &criteria, None, None, None,
         )
         .unwrap();
 
@@ -1742,7 +2163,7 @@ mod tests {
         assert!(plan.deterministic_tests.is_empty());
 
         let (step, _) =
-            create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "Step", "d", None, None, &[], None, None, None).unwrap();
         assert!(step.acceptance_criteria.is_empty());
     }
 
@@ -1954,7 +2375,7 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
         let (step, _) =
-            create_step(&conn, &plan.id, "t", "d", None, None, &[], None, None).unwrap();
+            create_step(&conn, &plan.id, "t", "d", None, None, &[], None, None, None).unwrap();
 
         attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "h1").unwrap();
 
@@ -1990,8 +2411,8 @@ mod tests {
     fn test_attach_hook_allows_distinct_combinations() {
         let conn = setup();
         let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
-        let (s1, _) = create_step(&conn, &plan.id, "t1", "d", None, None, &[], None, None).unwrap();
-        let (s2, _) = create_step(&conn, &plan.id, "t2", "d", None, None, &[], None, None).unwrap();
+        let (s1, _) = create_step(&conn, &plan.id, "t1", "d", None, None, &[], None, None, None).unwrap();
+        let (s2, _) = create_step(&conn, &plan.id, "t2", "d", None, None, &[], None, None, None).unwrap();
 
         // Same hook on different steps: OK.
         attach_hook_to_step(&conn, &plan.id, &s1.id, "pre-step", "h1").unwrap();
@@ -2010,6 +2431,71 @@ mod tests {
     }
 
     #[test]
+    fn test_create_step_persists_change_policy_required_by_default() {
+        let conn = setup();
+        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        // None argument → Required default.
+        let (s_default, _) =
+            create_step(&conn, &plan.id, "def", "d", None, None, &[], None, None, None).unwrap();
+        assert_eq!(s_default.change_policy, ChangePolicy::Required);
+
+        let read = get_step(&conn, &s_default.id).unwrap();
+        assert_eq!(read.change_policy, ChangePolicy::Required);
+    }
+
+    #[test]
+    fn test_create_step_persists_change_policy_optional() {
+        let conn = setup();
+        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        let (s_opt, _) = create_step(
+            &conn,
+            &plan.id,
+            "review",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some(ChangePolicy::Optional),
+        )
+        .unwrap();
+        assert_eq!(s_opt.change_policy, ChangePolicy::Optional);
+
+        let read = get_step(&conn, &s_opt.id).unwrap();
+        assert_eq!(read.change_policy, ChangePolicy::Optional);
+
+        // list_steps must also carry the new column through.
+        let listed = list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].change_policy, ChangePolicy::Optional);
+    }
+
+    #[test]
+    fn test_create_step_at_persists_change_policy() {
+        let conn = setup();
+        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        let (s, _) = create_step_at(
+            &conn,
+            &plan.id,
+            "m5",
+            "mid",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some(ChangePolicy::Optional),
+        )
+        .unwrap();
+        assert_eq!(s.change_policy, ChangePolicy::Optional);
+    }
+
+    #[test]
     fn test_topo_sort_ignores_edges_outside_input() {
         let conn = setup();
         let ids = make_plans(&conn, 3);
@@ -2023,5 +2509,431 @@ mod tests {
         let input = vec![ids[0].clone(), ids[1].clone()];
         let sorted = topo_sort_plans(&conn, &input).unwrap();
         assert_eq!(sorted, vec![ids[1].clone(), ids[0].clone()]);
+    }
+
+    // -- Live-run (run_locks V11) tests --
+
+    /// Seed a minimal run_locks row for `project` so `update_live_phase`
+    /// has something to update. Mirrors what `run_lock::acquire` does at the
+    /// start of a real run.
+    fn seed_run_lock(conn: &Connection, project: &str) {
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            params![project, 1i64, "p1", "slug"],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_update_live_phase_sets_row() {
+        let conn = setup();
+        seed_run_lock(&conn, "/proj-lp1");
+
+        update_live_phase(
+            &conn,
+            "/proj-lp1",
+            Phase::Harness,
+            Some("step-uuid"),
+            Some(2),
+            Some(1),
+            Some(3),
+            Some(42),
+            Some("claude-code"),
+            ChildUpdate::Set {
+                pid: 99_999,
+                start_token: Some("token-abc"),
+            },
+        )
+        .unwrap();
+
+        let live = get_live_run(&conn, "/proj-lp1").unwrap().unwrap();
+        assert_eq!(live.project, "/proj-lp1");
+        assert_eq!(live.pid, 1);
+        assert_eq!(live.phase, Some(Phase::Harness));
+        assert_eq!(live.step_id.as_deref(), Some("step-uuid"));
+        assert_eq!(live.step_num, Some(2));
+        assert_eq!(live.attempt, Some(1));
+        assert_eq!(live.max_attempts, Some(3));
+        assert_eq!(live.execution_log_id, Some(42));
+        assert_eq!(live.current_command.as_deref(), Some("claude-code"));
+        assert_eq!(live.child_pid, Some(99_999));
+        assert_eq!(live.child_start_token.as_deref(), Some("token-abc"));
+        assert!(live.phase_started_at.is_some());
+        assert!(live.updated_at.is_some());
+    }
+
+    #[test]
+    fn test_update_live_phase_coalesces_optional_fields() {
+        let conn = setup();
+        seed_run_lock(&conn, "/proj-lp2");
+
+        // First write: populate step_id, max_attempts, child_pid.
+        update_live_phase(
+            &conn,
+            "/proj-lp2",
+            Phase::Harness,
+            Some("step-1"),
+            Some(1),
+            Some(1),
+            Some(3),
+            Some(7),
+            None,
+            ChildUpdate::Set {
+                pid: 12345,
+                start_token: Some("tok-initial"),
+            },
+        )
+        .unwrap();
+
+        // Second write: pass None for everything except phase, and Keep for
+        // the child. COALESCE should preserve the earlier values.
+        update_live_phase(
+            &conn,
+            "/proj-lp2",
+            Phase::Tests,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChildUpdate::Keep,
+        )
+        .unwrap();
+
+        let live = get_live_run(&conn, "/proj-lp2").unwrap().unwrap();
+        assert_eq!(live.phase, Some(Phase::Tests));
+        assert_eq!(live.step_id.as_deref(), Some("step-1"));
+        assert_eq!(live.step_num, Some(1));
+        assert_eq!(live.attempt, Some(1));
+        assert_eq!(live.max_attempts, Some(3));
+        assert_eq!(live.execution_log_id, Some(7));
+        assert_eq!(live.child_pid, Some(12345));
+        assert_eq!(
+            live.child_start_token.as_deref(),
+            Some("tok-initial"),
+            "child_start_token must be preserved when Keep is passed"
+        );
+    }
+
+    #[test]
+    fn test_update_live_phase_keep_preserves_child() {
+        // Sanity check on the Keep variant: after a Set, a Keep must not
+        // disturb either child column.
+        let conn = setup();
+        seed_run_lock(&conn, "/proj-keep");
+
+        update_live_phase(
+            &conn,
+            "/proj-keep",
+            Phase::Harness,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChildUpdate::Set {
+                pid: 42,
+                start_token: Some("tok"),
+            },
+        )
+        .unwrap();
+
+        update_live_phase(
+            &conn,
+            "/proj-keep",
+            Phase::PreTestHook,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChildUpdate::Keep,
+        )
+        .unwrap();
+
+        let live = get_live_run(&conn, "/proj-keep").unwrap().unwrap();
+        assert_eq!(live.child_pid, Some(42));
+        assert_eq!(live.child_start_token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn test_update_live_phase_clear_child_sets_columns_null() {
+        // After the harness phase ends, subsequent writes pass Clear so the
+        // row stops advertising a dead pid.
+        let conn = setup();
+        seed_run_lock(&conn, "/proj-clear");
+
+        // Set child fields.
+        update_live_phase(
+            &conn,
+            "/proj-clear",
+            Phase::Harness,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChildUpdate::Set {
+                pid: 7777,
+                start_token: Some("tok-set"),
+            },
+        )
+        .unwrap();
+        let before = get_live_run(&conn, "/proj-clear").unwrap().unwrap();
+        assert_eq!(before.child_pid, Some(7777));
+        assert_eq!(before.child_start_token.as_deref(), Some("tok-set"));
+
+        // Clear them on the next phase write.
+        update_live_phase(
+            &conn,
+            "/proj-clear",
+            Phase::Tests,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChildUpdate::Clear,
+        )
+        .unwrap();
+
+        let after = get_live_run(&conn, "/proj-clear").unwrap().unwrap();
+        assert_eq!(
+            after.child_pid, None,
+            "Clear must null out child_pid"
+        );
+        assert_eq!(
+            after.child_start_token, None,
+            "Clear must null out child_start_token"
+        );
+    }
+
+    #[test]
+    fn test_update_live_phase_overwrites_current_command() {
+        let conn = setup();
+        seed_run_lock(&conn, "/proj-lp3");
+
+        // Set current_command = "cargo test".
+        update_live_phase(
+            &conn,
+            "/proj-lp3",
+            Phase::Tests,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("cargo test"),
+            ChildUpdate::Keep,
+        )
+        .unwrap();
+        let before = get_live_run(&conn, "/proj-lp3").unwrap().unwrap();
+        assert_eq!(before.current_command.as_deref(), Some("cargo test"));
+
+        // Now move to PostTestHook with current_command = None; the column
+        // should be cleared, NOT preserved.
+        update_live_phase(
+            &conn,
+            "/proj-lp3",
+            Phase::PostTestHook,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChildUpdate::Keep,
+        )
+        .unwrap();
+        let after = get_live_run(&conn, "/proj-lp3").unwrap().unwrap();
+        assert_eq!(
+            after.current_command, None,
+            "current_command must overwrite to NULL when None is passed"
+        );
+    }
+
+    #[test]
+    fn test_update_live_phase_errors_when_no_row() {
+        let conn = setup();
+        // Deliberately don't seed a row.
+        let err = update_live_phase(
+            &conn,
+            "/proj-missing",
+            Phase::Harness,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChildUpdate::Keep,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("No run_locks row for project"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_get_live_run_missing_returns_none() {
+        let conn = setup();
+        let result = get_live_run(&conn, "/nope").unwrap();
+        assert!(result.is_none());
+    }
+
+    // -- finalize_execution_log_as_interrupted_if_exists tests --
+
+    #[test]
+    fn test_finalize_execution_log_as_interrupted_sets_fields() {
+        use crate::plan::{TerminationReason, TestStatus};
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
+
+        // Simulate the runner having written diff/stdout before dying.
+        update_execution_log(
+            &conn,
+            log.id,
+            Some(3.0),
+            Some("+some diff"),
+            &["unit: pass".to_string()],
+            false,
+            false,
+            None,
+            Some("hello stdout"),
+            Some("warn stderr"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let updated_row = finalize_execution_log_as_interrupted_if_exists(&conn, log.id).unwrap();
+        assert!(updated_row, "expected row to match");
+
+        let updated = get_execution_log_by_id(&conn, log.id).unwrap();
+        assert_eq!(
+            updated.termination_reason,
+            Some(TerminationReason::UserInterrupted)
+        );
+        assert_eq!(updated.test_status, Some(TestStatus::NotRun));
+        // Observability fields the runner wrote must survive.
+        assert_eq!(updated.diff.as_deref(), Some("+some diff"));
+        assert_eq!(updated.harness_stdout.as_deref(), Some("hello stdout"));
+        assert_eq!(updated.harness_stderr.as_deref(), Some("warn stderr"));
+        assert_eq!(updated.test_results, vec!["unit: pass".to_string()]);
+    }
+
+    #[test]
+    fn test_finalize_execution_log_as_interrupted_preserves_existing_terminal() {
+        use crate::plan::{TerminationReason, TestStatus};
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
+        let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
+
+        // Runner already finalized as Success before cancel raced in.
+        update_execution_log(
+            &conn,
+            log.id,
+            Some(1.0),
+            None,
+            &[],
+            false,
+            true,
+            Some("abc"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(TerminationReason::Success),
+            Some(TestStatus::Passed),
+        )
+        .unwrap();
+
+        let updated_row = finalize_execution_log_as_interrupted_if_exists(&conn, log.id).unwrap();
+        assert!(updated_row, "expected row to match");
+
+        let updated = get_execution_log_by_id(&conn, log.id).unwrap();
+        assert_eq!(updated.termination_reason, Some(TerminationReason::Success));
+        assert_eq!(updated.test_status, Some(TestStatus::Passed));
+    }
+
+    #[test]
+    fn test_finalize_execution_log_as_interrupted_missing_row_is_benign() {
+        let conn = setup();
+        let updated_row =
+            finalize_execution_log_as_interrupted_if_exists(&conn, 99_999).unwrap();
+        assert!(
+            !updated_row,
+            "expected no row to match for nonexistent log id"
+        );
+    }
+
+    // -- delete_run_lock_row_unscoped tests --
+
+    #[test]
+    fn test_delete_run_lock_row_unscoped_matches_pid_and_token() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["/proj-del", 4242i64, "tok-A", "pid1", "slug"],
+        )
+        .unwrap();
+
+        let affected = delete_run_lock_row_unscoped(&conn, "/proj-del", 4242, Some("tok-A")).unwrap();
+        assert_eq!(affected, 1);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM run_locks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_delete_run_lock_row_unscoped_mismatched_token_leaves_row() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["/proj-del2", 4242i64, "tok-A", "pid1", "slug"],
+        )
+        .unwrap();
+
+        let affected =
+            delete_run_lock_row_unscoped(&conn, "/proj-del2", 4242, Some("tok-OTHER")).unwrap();
+        assert_eq!(affected, 0);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM run_locks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "row owned by a different start token must survive");
+    }
+
+    #[test]
+    fn test_delete_run_lock_row_unscoped_null_token_both_sides() {
+        let conn = setup();
+        // A pre-v9 row without a start token.
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            params!["/proj-del3", 4242i64, "pid1", "slug"],
+        )
+        .unwrap();
+
+        let affected = delete_run_lock_row_unscoped(&conn, "/proj-del3", 4242, None).unwrap();
+        assert_eq!(affected, 1);
     }
 }

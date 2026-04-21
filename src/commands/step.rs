@@ -4,10 +4,12 @@ use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use std::io::Read;
 
+use crate::config::Config;
 use crate::frac_index;
 use crate::hook_library::{self, Lifecycle};
 use crate::import::ImportedStep;
 use crate::output::{self, OutputContext, OutputFormat};
+use crate::plan::{ChangePolicy, Step, StepStatus};
 use crate::storage;
 
 use super::resolve_step;
@@ -20,6 +22,7 @@ pub fn step_list(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
+    config: &Config,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
@@ -45,22 +48,49 @@ pub fn step_list(
         steps.len()
     );
     for (i, step) in steps.iter().enumerate() {
+        let policy_tag = if step.change_policy == ChangePolicy::Optional {
+            " [optional]"
+        } else {
+            ""
+        };
+        let budget_tag = render_budget_tag(step, config);
         println!(
-            "  {:>3}. {} {}  [{}]",
+            "  {:>3}. {} {}{}  [{}]{}",
             i + 1,
             output::status_icon(step.status, out.color),
             output::bold(&step.title, out.color),
+            policy_tag,
             output::colored_status(step.status, out.color),
+            budget_tag,
         );
         if !step.description.is_empty() {
             println!("       {}", step.description);
         }
-        if step.attempts > 0 {
-            println!("       attempts: {}", step.attempts);
-        }
     }
 
     Ok(())
+}
+
+/// Render the `(attempts: N/M)` tag shown at end of a step-list line.
+///
+/// Returns an empty string for the "noisy for the common case" rule:
+/// a step that is still Pending with zero attempts and no custom
+/// `max_retries` doesn't need the budget cluttering every row. As soon as the
+/// step has been attempted (or failed/aborted/etc.) or the user explicitly
+/// bound `max_retries`, the tag renders.
+pub(crate) fn render_budget_tag(step: &Step, config: &Config) -> String {
+    let show = step.attempts > 0
+        || step.status != StepStatus::Pending
+        || step.max_retries.is_some();
+    if !show {
+        return String::new();
+    }
+    // Match executor.rs: max_attempts = max_retries.unwrap_or(default) + 1.
+    let max_retries = step
+        .max_retries
+        .unwrap_or(config.max_retries_per_step as i32);
+    let max_attempts = max_retries + 1;
+    format!(" (attempts: {}/{})", step.attempts, max_attempts)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -76,6 +106,7 @@ pub fn step_add(
     model: Option<&str>,
     criteria: &[String],
     max_retries: Option<i32>,
+    change_policy: Option<ChangePolicy>,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
@@ -127,6 +158,7 @@ pub fn step_add(
             criteria,
             max_retries,
             model,
+            change_policy,
         )?
     } else {
         // Append at the end (default)
@@ -140,6 +172,7 @@ pub fn step_add(
             criteria,
             max_retries,
             model,
+            change_policy,
         )?
     };
 
@@ -227,6 +260,7 @@ pub fn step_add_bulk(
                 &s.acceptance_criteria,
                 s.max_retries,
                 s.model.as_deref(),
+                Some(s.change_policy),
             )?;
             inserted.push((step, pos));
         }
@@ -309,6 +343,7 @@ pub fn step_edit(
     criteria: &[String],
     max_retries: Option<i32>,
     clear_max_retries: bool,
+    change_policy: Option<ChangePolicy>,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
@@ -324,9 +359,10 @@ pub fn step_edit(
         && criteria.is_empty()
         && max_retries.is_none()
         && !clear_max_retries
+        && change_policy.is_none()
     {
         bail!(
-            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --max-retries, or --clear-max-retries"
+            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --max-retries, --clear-max-retries, or --change-policy"
         );
     }
 
@@ -362,6 +398,7 @@ pub fn step_edit(
         },
         retries_update,
         model_update,
+        change_policy,
     )?;
 
     eprintln!(
@@ -719,5 +756,118 @@ mod tests {
             .unwrap();
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert!(steps.is_empty(), "no steps should have been inserted");
+    }
+
+    // -- step-list attempt budget ------------------------------------------
+
+    fn default_config() -> Config {
+        Config {
+            max_retries_per_step: 3, // explicit default budget for the test
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn test_step_list_shows_attempts_budget_when_relevant() {
+        let (conn, project) = setup_with_plan();
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "With custom retries",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            Some(3),
+            None,
+            &test_out(),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        // Simulate attempts=2 on that step.
+        conn.execute(
+            "UPDATE steps SET attempts = 2 WHERE id = ?1",
+            rusqlite::params![steps[0].id],
+        )
+        .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+
+        // Inspect the budget tag directly — no need to capture stdout for a
+        // format contract that's fully rendered by render_budget_tag.
+        let tag = render_budget_tag(&steps[0], &default_config());
+        assert_eq!(tag, " (attempts: 2/4)", "tag was: {tag:?}");
+    }
+
+    #[test]
+    fn test_step_list_omits_budget_for_pending_default_steps() {
+        let (conn, project) = setup_with_plan();
+        // No max_retries override, no attempts yet, Pending.
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "Plain pending",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &test_out(),
+        )
+        .unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let tag = render_budget_tag(&steps[0], &default_config());
+        assert_eq!(
+            tag, "",
+            "pending default-retry step should not render the budget tag; got {tag:?}"
+        );
+    }
+
+    #[test]
+    fn test_step_list_shows_budget_after_attempts_even_without_override() {
+        let (conn, project) = setup_with_plan();
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "No override",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None, // no max_retries override — falls back to config default.
+            None,
+            &test_out(),
+        )
+        .unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        conn.execute(
+            "UPDATE steps SET attempts = 1 WHERE id = ?1",
+            rusqlite::params![steps[0].id],
+        )
+        .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+
+        let tag = render_budget_tag(&steps[0], &default_config());
+        // Default config has max_retries_per_step=3 → max_attempts=4.
+        assert_eq!(tag, " (attempts: 1/4)");
     }
 }

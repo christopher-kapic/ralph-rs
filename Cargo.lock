@@ -704,6 +704,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "dirs",
+ "libc",
  "ratatui",
  "rusqlite",
  "serde",

@@ -142,17 +142,18 @@ impl ShutdownController {
     /// Internal listener loop.
     async fn listen(abort_tx: watch::Sender<bool>, first_received: Arc<AtomicBool>) {
         loop {
-            // Wait for the next Ctrl+C.
-            if tokio::signal::ctrl_c().await.is_err() {
-                // Signal registration failed — nothing we can do.
-                return;
-            }
+            // Wait for either SIGINT (Ctrl+C) or SIGTERM (`ralph cancel`
+            // delivers the latter, and external process supervisors often
+            // prefer it over SIGINT). Both route through the same two-stage
+            // logic so the UX is consistent regardless of how shutdown was
+            // requested.
+            let signal_name = next_signal().await;
 
             if !first_received.swap(true, Ordering::SeqCst) {
                 // --- First signal ---
                 eprintln!(
-                    "\nInterrupt received — finishing current step. \
-                     Press Ctrl+C again to force-quit."
+                    "\n{signal_name} received — finishing current step. \
+                     Send again to force-quit."
                 );
                 // Tell the executor to abort after the current lifecycle phase.
                 let _ = abort_tx.send(true);
@@ -172,6 +173,52 @@ impl ShutdownController {
     pub fn is_shutdown_requested(&self) -> bool {
         *self.abort_rx.borrow()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-signal listener
+// ---------------------------------------------------------------------------
+
+/// Wait for the next shutdown-class signal and return its human-readable name.
+///
+/// On unix, races SIGINT against SIGTERM; either one resolves and drives the
+/// two-stage shutdown. On non-unix only Ctrl+C is available.
+///
+/// SIGTERM registration happens on the very first call inside the listener
+/// task — before that call returns, any SIGTERM delivered to the process
+/// would take the default action (terminate). That's fine for ralph: signals
+/// arriving during startup (before the runner is in place) have nothing
+/// useful to interrupt anyway, and callers install this listener before the
+/// run loop begins.
+#[cfg(unix)]
+async fn next_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => {
+            // Registration failed — fall back to ctrl_c only.
+            let _ = tokio::signal::ctrl_c().await;
+            return "SIGINT";
+        }
+    };
+    tokio::select! {
+        res = tokio::signal::ctrl_c() => {
+            if res.is_err() {
+                // ctrl_c failed but sigterm is live — wait on it.
+                let _ = sigterm.recv().await;
+                "SIGTERM"
+            } else {
+                "SIGINT"
+            }
+        }
+        _ = sigterm.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn next_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "SIGINT"
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +390,46 @@ mod tests {
         ran.store(false, Ordering::SeqCst);
         run_exit_cleanup();
         assert!(!ran.load(Ordering::SeqCst), "cleanup should not run twice");
+    }
+
+    /// Regression: a SIGTERM delivered to the process (which is how
+    /// `ralph cancel` signals its sibling) must flip the abort flag via
+    /// the same two-stage path that Ctrl+C uses.
+    ///
+    /// Holds `EXIT_CLEANUP_TEST_LOCK` to serialize with other tests that
+    /// mutate process-wide state (signal handlers, exit cleanup slot), so
+    /// parallel cargo test threads can't race on the SIGTERM disposition.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_sigterm_triggers_graceful_shutdown() {
+        // Holding the std::Mutex guard across .await is intentional here:
+        // the whole point is to serialize the full SIGTERM-delivery window
+        // (listener setup + raise + flag check) against other tests that
+        // mutate process-wide state. The test runs on a current_thread
+        // runtime, so there's no risk of cross-thread guard transfer.
+        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let controller = ShutdownController::new();
+        let (_handle, mut rx) = controller.spawn_signal_listener();
+        assert!(!*rx.borrow());
+
+        // Give the listener a moment to register its SIGTERM handler
+        // before we deliver the signal. Without this wait, we'd race the
+        // default disposition and the test process would terminate.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // SAFETY: raise is async-signal-safe and just posts a signal to
+        // the current process.
+        let rc = unsafe { libc::raise(libc::SIGTERM) };
+        assert_eq!(rc, 0, "libc::raise(SIGTERM) failed");
+
+        // The watch channel must flip to true within a short window.
+        tokio::time::timeout(std::time::Duration::from_millis(500), rx.changed())
+            .await
+            .expect("abort flag never flipped after SIGTERM")
+            .expect("watch sender dropped");
+        assert!(*rx.borrow(), "abort flag should be true after SIGTERM");
     }
 
     #[test]

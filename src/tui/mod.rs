@@ -59,6 +59,7 @@ mod tests {
                 updated_at: Utc::now(),
                 model: None,
                 skipped_reason: None,
+                change_policy: crate::plan::ChangePolicy::Required,
             })
             .collect()
     }
@@ -295,6 +296,7 @@ mod tests {
             updated_at: Utc::now(),
             model: None,
             skipped_reason: None,
+            change_policy: crate::plan::ChangePolicy::Required,
         };
 
         app.insert_step(new_step);

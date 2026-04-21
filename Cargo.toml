@@ -17,6 +17,7 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 crossterm = "0.28"
 dirs = "6"
+libc = "0.2"
 ratatui = "0.29"
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

@@ -97,6 +97,11 @@ pub struct ImportedStep {
     pub max_retries: Option<i32>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional per-step change policy. Missing field defaults to
+    /// [`crate::plan::ChangePolicy::Required`] via serde(default), preserving
+    /// backward compatibility with plan JSON written before V12.
+    #[serde(default)]
+    pub change_policy: crate::plan::ChangePolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +202,7 @@ fn import_plan_inner(
             &step_data.acceptance_criteria,
             step_data.max_retries,
             step_data.model.as_deref(),
+            Some(step_data.change_policy),
         )?;
     }
 
@@ -592,6 +598,7 @@ mod tests {
             &["setup done".to_string()],
             Some(2),
             None,
+            None,
         )
         .unwrap();
 
@@ -603,6 +610,7 @@ mod tests {
             None,
             Some("codex"),
             &["code written".to_string(), "tests pass".to_string()],
+            None,
             None,
             None,
         )
@@ -1033,6 +1041,111 @@ mod tests {
         // Plan should not have been created.
         let plan = storage::get_plan_by_slug(&conn, "future-ver-strict", "/tmp/proj").unwrap();
         assert!(plan.is_none());
+    }
+
+    #[test]
+    fn test_import_defaults_change_policy_to_required_when_missing() {
+        let conn = setup();
+        // Old-style plan JSON with no change_policy on any step.
+        let json = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {
+                "slug": "old-plan",
+                "branch_name": "branch",
+                "description": "legacy"
+            },
+            "steps": [
+                {"title": "Implement", "description": "d"}
+            ]
+        }"#;
+
+        let data: ImportedPlan = serde_json::from_str(json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj",
+            strict: false,
+        };
+
+        let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
+        let steps = storage::list_steps(&conn, &plan_id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].change_policy, crate::plan::ChangePolicy::Required);
+    }
+
+    #[test]
+    fn test_roundtrip_preserves_mixed_change_policies() {
+        let conn = setup();
+
+        // Build a source plan with one Required step and one Optional step.
+        let original = storage::create_plan(
+            &conn,
+            "mix-policy",
+            "/tmp/src",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::create_step(
+            &conn,
+            &original.id,
+            "Implement",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some(crate::plan::ChangePolicy::Required),
+        )
+        .unwrap();
+        storage::create_step(
+            &conn,
+            &original.id,
+            "Review",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some(crate::plan::ChangePolicy::Optional),
+        )
+        .unwrap();
+
+        // Export through the real export pipeline.
+        let steps = storage::list_steps(&conn, &original.id).unwrap();
+        let exported = export::build_exported_plan(&original, &steps, Vec::new());
+        let json = serde_json::to_string_pretty(&exported).unwrap();
+        // The exported JSON must mention both policy values literally.
+        assert!(json.contains("\"required\""));
+        assert!(json.contains("\"optional\""));
+
+        // Import into a fresh project.
+        let imported_data: ImportedPlan = serde_json::from_str(&json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: false,
+        };
+        let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
+        let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
+        assert_eq!(imported_steps.len(), 2);
+        assert_eq!(
+            imported_steps[0].change_policy,
+            crate::plan::ChangePolicy::Required
+        );
+        assert_eq!(
+            imported_steps[1].change_policy,
+            crate::plan::ChangePolicy::Optional
+        );
     }
 
     #[test]

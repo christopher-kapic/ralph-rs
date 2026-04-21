@@ -125,6 +125,248 @@ impl std::str::FromStr for StepStatus {
 }
 
 // ---------------------------------------------------------------------------
+// ChangePolicy enum
+// ---------------------------------------------------------------------------
+
+/// Whether a step must produce file changes after the harness runs.
+///
+/// - [`ChangePolicy::Required`] (default): a clean harness exit with no diff
+///   is treated as failure. Appropriate for implementation steps where the
+///   absence of changes means the harness did nothing useful.
+/// - [`ChangePolicy::Optional`]: a clean harness exit with no diff is a valid
+///   success (tests still run if configured). Appropriate for review, audit,
+///   or check steps whose prompts direct the harness not to modify code.
+///
+/// A third `forbidden` variant is reserved for future work but intentionally
+/// not implemented here — the enum stays extensible via the non-exhaustive
+/// matches each caller performs.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "kebab-case")]
+pub enum ChangePolicy {
+    #[default]
+    Required,
+    Optional,
+}
+
+impl ChangePolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Optional => "optional",
+        }
+    }
+}
+
+impl std::fmt::Display for ChangePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ChangePolicy {
+    type Err = ParseStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "required" => Ok(Self::Required),
+            "optional" => Ok(Self::Optional),
+            other => Err(ParseStatusError(other.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase enum
+// ---------------------------------------------------------------------------
+
+/// Which sub-stage of a step's execution is currently active.
+///
+/// Recorded on `run_locks` so an external observer can tell whether a step
+/// is mid-harness, mid-test, mid-commit, etc. `Idle` means no step is
+/// running — the lock exists but the runner is between steps.
+///
+/// The executor writes a new phase value to the `run_locks` row at every
+/// lifecycle boundary inside [`crate::executor::execute_step`]; `ralph cancel`
+/// and `ralph status` read those values back. `Idle` is never written by the
+/// executor today — it's reserved for a future "lock held, no step running"
+/// state (the runner between steps).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {
+    Idle,
+    PreStepHook,
+    Harness,
+    PreTestHook,
+    Tests,
+    PostTestHook,
+    Commit,
+    Rollback,
+    PostStepHook,
+}
+
+impl Phase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::PreStepHook => "pre_step_hook",
+            Self::Harness => "harness",
+            Self::PreTestHook => "pre_test_hook",
+            Self::Tests => "tests",
+            Self::PostTestHook => "post_test_hook",
+            Self::Commit => "commit",
+            Self::Rollback => "rollback",
+            Self::PostStepHook => "post_step_hook",
+        }
+    }
+}
+
+impl std::fmt::Display for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Phase {
+    type Err = ParseStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "idle" => Ok(Self::Idle),
+            "pre_step_hook" => Ok(Self::PreStepHook),
+            "harness" => Ok(Self::Harness),
+            "pre_test_hook" => Ok(Self::PreTestHook),
+            "tests" => Ok(Self::Tests),
+            "post_test_hook" => Ok(Self::PostTestHook),
+            "commit" => Ok(Self::Commit),
+            "rollback" => Ok(Self::Rollback),
+            "post_step_hook" => Ok(Self::PostStepHook),
+            other => Err(ParseStatusError(other.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TerminationReason enum
+// ---------------------------------------------------------------------------
+
+/// Why an execution-log attempt terminated. Stored on `execution_logs` so the
+/// terminal outcome is explicit rather than inferred from the
+/// `(committed, rolled_back, test_results)` tuple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminationReason {
+    Success,
+    UserInterrupted,
+    Timeout,
+    TestFailed,
+    NoChanges,
+    HookFailed,
+    HarnessFailed,
+    CommitFailed,
+    RollbackFailed,
+    Unknown,
+}
+
+impl TerminationReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::UserInterrupted => "user_interrupted",
+            Self::Timeout => "timeout",
+            Self::TestFailed => "test_failed",
+            Self::NoChanges => "no_changes",
+            Self::HookFailed => "hook_failed",
+            Self::HarnessFailed => "harness_failed",
+            Self::CommitFailed => "commit_failed",
+            Self::RollbackFailed => "rollback_failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for TerminationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TerminationReason {
+    type Err = ParseStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "success" => Ok(Self::Success),
+            "user_interrupted" => Ok(Self::UserInterrupted),
+            "timeout" => Ok(Self::Timeout),
+            "test_failed" => Ok(Self::TestFailed),
+            "no_changes" => Ok(Self::NoChanges),
+            "hook_failed" => Ok(Self::HookFailed),
+            "harness_failed" => Ok(Self::HarnessFailed),
+            "commit_failed" => Ok(Self::CommitFailed),
+            "rollback_failed" => Ok(Self::RollbackFailed),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(ParseStatusError(other.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TestStatus enum
+// ---------------------------------------------------------------------------
+
+/// Outcome of the test phase for an execution-log attempt. Separate from
+/// `TerminationReason` because tests can be "not configured" or "not run"
+/// without the attempt itself terminating abnormally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestStatus {
+    NotConfigured,
+    NotRun,
+    Passed,
+    Failed,
+    Aborted,
+    TimedOut,
+}
+
+impl TestStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::NotRun => "not_run",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Aborted => "aborted",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+impl std::fmt::Display for TestStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TestStatus {
+    type Err = ParseStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "not_configured" => Ok(Self::NotConfigured),
+            "not_run" => Ok(Self::NotRun),
+            "passed" => Ok(Self::Passed),
+            "failed" => Ok(Self::Failed),
+            "aborted" => Ok(Self::Aborted),
+            "timed_out" => Ok(Self::TimedOut),
+            other => Err(ParseStatusError(other.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Plan struct
 // ---------------------------------------------------------------------------
 
@@ -235,6 +477,11 @@ pub struct Step {
     /// that omitted the flag.
     #[serde(default)]
     pub skipped_reason: Option<String>,
+    /// Whether this step must produce file changes to succeed. Defaults to
+    /// [`ChangePolicy::Required`] so old exported plan JSON (and any caller
+    /// that forgets the field) keeps the pre-V12 behavior.
+    #[serde(default)]
+    pub change_policy: ChangePolicy,
 }
 
 impl Step {
@@ -243,7 +490,7 @@ impl Step {
     /// Expected column order:
     /// id, plan_id, sort_key, title, description, agent, harness,
     /// acceptance_criteria, status, attempts, max_retries, created_at,
-    /// updated_at, model, skipped_reason
+    /// updated_at, model, skipped_reason, change_policy
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let criteria_json: String = row.get(7)?;
         let acceptance_criteria: Vec<String> =
@@ -270,6 +517,15 @@ impl Step {
             rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
+        let change_policy_str: String = row.get(15)?;
+        let change_policy: ChangePolicy = change_policy_str.parse().map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                15,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })?;
+
         Ok(Step {
             id: row.get(0)?,
             plan_id: row.get(1)?,
@@ -286,6 +542,7 @@ impl Step {
             updated_at,
             model: row.get(13)?,
             skipped_reason: row.get(14)?,
+            change_policy,
         })
     }
 }
@@ -314,6 +571,10 @@ pub struct ExecutionLog {
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub termination_reason: Option<TerminationReason>,
+    #[serde(default)]
+    pub test_status: Option<TestStatus>,
 }
 
 impl ExecutionLog {
@@ -322,7 +583,8 @@ impl ExecutionLog {
     /// Expected column order:
     /// id, step_id, attempt, started_at, duration_secs, prompt_text, diff,
     /// test_results, rolled_back, committed, commit_hash,
-    /// harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id
+    /// harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens,
+    /// session_id, termination_reason, test_status
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let started_str: String = row.get(3)?;
         let started_at = parse_datetime(&started_str).map_err(|e| {
@@ -336,6 +598,30 @@ impl ExecutionLog {
 
         let rolled_back_int: i32 = row.get(8)?;
         let committed_int: i32 = row.get(9)?;
+
+        let termination_reason_str: Option<String> = row.get(17)?;
+        let termination_reason = match termination_reason_str {
+            Some(s) => Some(s.parse::<TerminationReason>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    17,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?),
+            None => None,
+        };
+
+        let test_status_str: Option<String> = row.get(18)?;
+        let test_status = match test_status_str {
+            Some(s) => Some(s.parse::<TestStatus>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    18,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?),
+            None => None,
+        };
 
         Ok(ExecutionLog {
             id: row.get(0)?,
@@ -355,6 +641,8 @@ impl ExecutionLog {
             input_tokens: row.get(14)?,
             output_tokens: row.get(15)?,
             session_id: row.get(16)?,
+            termination_reason,
+            test_status,
         })
     }
 }
@@ -555,7 +843,7 @@ mod tests {
 
         let step = conn
             .query_row(
-                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason FROM steps WHERE id = ?1",
+                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy FROM steps WHERE id = ?1",
                 ["s1"],
                 Step::from_row,
             )
@@ -612,7 +900,7 @@ mod tests {
 
         let log = conn
             .query_row(
-                "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id FROM execution_logs WHERE step_id = ?1",
+                "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status FROM execution_logs WHERE step_id = ?1",
                 ["s1"],
                 ExecutionLog::from_row,
             )
@@ -655,5 +943,219 @@ mod tests {
     fn test_invalid_step_status() {
         let result: Result<StepStatus, _> = "invalid".parse();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_phase_roundtrip() {
+        let phases = [
+            Phase::Idle,
+            Phase::PreStepHook,
+            Phase::Harness,
+            Phase::PreTestHook,
+            Phase::Tests,
+            Phase::PostTestHook,
+            Phase::Commit,
+            Phase::Rollback,
+            Phase::PostStepHook,
+        ];
+        for phase in &phases {
+            let s = phase.as_str();
+            let parsed: Phase = s.parse().unwrap();
+            assert_eq!(*phase, parsed);
+        }
+    }
+
+    #[test]
+    fn test_phase_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&Phase::PreStepHook).unwrap(),
+            r#""pre_step_hook""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&Phase::PostStepHook).unwrap(),
+            r#""post_step_hook""#,
+        );
+    }
+
+    #[test]
+    fn test_phase_display() {
+        assert_eq!(Phase::Harness.to_string(), "harness");
+        assert_eq!(Phase::PreTestHook.to_string(), "pre_test_hook");
+    }
+
+    #[test]
+    fn test_invalid_phase() {
+        let result: Result<Phase, _> = "bogus".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_termination_reason_roundtrip() {
+        let reasons = [
+            TerminationReason::Success,
+            TerminationReason::UserInterrupted,
+            TerminationReason::Timeout,
+            TerminationReason::TestFailed,
+            TerminationReason::NoChanges,
+            TerminationReason::HookFailed,
+            TerminationReason::HarnessFailed,
+            TerminationReason::CommitFailed,
+            TerminationReason::RollbackFailed,
+            TerminationReason::Unknown,
+        ];
+        for r in &reasons {
+            let s = r.as_str();
+            let parsed: TerminationReason = s.parse().unwrap();
+            assert_eq!(*r, parsed);
+        }
+    }
+
+    #[test]
+    fn test_termination_reason_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TerminationReason::UserInterrupted).unwrap(),
+            r#""user_interrupted""#,
+        );
+    }
+
+    #[test]
+    fn test_termination_reason_display() {
+        assert_eq!(TerminationReason::Success.to_string(), "success");
+        assert_eq!(
+            TerminationReason::CommitFailed.to_string(),
+            "commit_failed"
+        );
+    }
+
+    #[test]
+    fn test_invalid_termination_reason() {
+        let result: Result<TerminationReason, _> = "nope".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_test_status_roundtrip() {
+        let statuses = [
+            TestStatus::NotConfigured,
+            TestStatus::NotRun,
+            TestStatus::Passed,
+            TestStatus::Failed,
+            TestStatus::Aborted,
+            TestStatus::TimedOut,
+        ];
+        for status in &statuses {
+            let s = status.as_str();
+            let parsed: TestStatus = s.parse().unwrap();
+            assert_eq!(*status, parsed);
+        }
+    }
+
+    #[test]
+    fn test_test_status_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&TestStatus::NotConfigured).unwrap(),
+            r#""not_configured""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&TestStatus::TimedOut).unwrap(),
+            r#""timed_out""#,
+        );
+    }
+
+    #[test]
+    fn test_test_status_display() {
+        assert_eq!(TestStatus::Passed.to_string(), "passed");
+        assert_eq!(TestStatus::TimedOut.to_string(), "timed_out");
+    }
+
+    #[test]
+    fn test_invalid_test_status() {
+        let result: Result<TestStatus, _> = "invalid".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_change_policy_roundtrip() {
+        let policies = [ChangePolicy::Required, ChangePolicy::Optional];
+        for p in &policies {
+            let s = p.as_str();
+            let parsed: ChangePolicy = s.parse().unwrap();
+            assert_eq!(*p, parsed);
+        }
+    }
+
+    #[test]
+    fn test_change_policy_default_is_required() {
+        assert_eq!(ChangePolicy::default(), ChangePolicy::Required);
+    }
+
+    #[test]
+    fn test_change_policy_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ChangePolicy::Required).unwrap(),
+            r#""required""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&ChangePolicy::Optional).unwrap(),
+            r#""optional""#,
+        );
+    }
+
+    #[test]
+    fn test_change_policy_display() {
+        assert_eq!(ChangePolicy::Required.to_string(), "required");
+        assert_eq!(ChangePolicy::Optional.to_string(), "optional");
+    }
+
+    #[test]
+    fn test_invalid_change_policy() {
+        let result: Result<ChangePolicy, _> = "forbidden".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_step_serde_defaults_change_policy_when_missing() {
+        // Old exported plan JSON lacks `change_policy`. The serde(default)
+        // attribute must backfill it to Required so round-tripping through
+        // serde doesn't lose or change the effective policy.
+        let json = r#"{
+            "id": "s1",
+            "plan_id": "p1",
+            "sort_key": "a0",
+            "title": "T",
+            "description": "",
+            "agent": null,
+            "harness": null,
+            "acceptance_criteria": [],
+            "status": "pending",
+            "attempts": 0,
+            "max_retries": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let step: Step = serde_json::from_str(json).unwrap();
+        assert_eq!(step.change_policy, ChangePolicy::Required);
+    }
+
+    #[test]
+    fn test_step_serde_preserves_optional_change_policy() {
+        let json = r#"{
+            "id": "s1",
+            "plan_id": "p1",
+            "sort_key": "a0",
+            "title": "Review",
+            "description": "",
+            "agent": null,
+            "harness": null,
+            "acceptance_criteria": [],
+            "status": "pending",
+            "attempts": 0,
+            "max_retries": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "change_policy": "optional"
+        }"#;
+        let step: Step = serde_json::from_str(json).unwrap();
+        assert_eq!(step.change_policy, ChangePolicy::Optional);
     }
 }

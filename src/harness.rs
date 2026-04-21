@@ -198,6 +198,20 @@ pub fn build_harness_env(
 /// Spawn a harness process in non-interactive mode with piped stdout/stderr.
 ///
 /// Returns a handle to the child process.
+///
+/// On unix, the child is placed in a new process group with itself as leader
+/// (`setpgid(0, 0)` via `Command::process_group(0)`). This lets ralph kill the
+/// *entire* descendant tree on shutdown by signalling the negative pgid — so
+/// grandchildren like `pnpm -> turbo -> next` don't survive as orphans when
+/// the top-level harness exits. The tradeoff: a child in its own process
+/// group no longer receives terminal-driven SIGINT automatically, so ralph
+/// must forward it explicitly. `graceful_shutdown` in `executor.rs` already
+/// does this (it sends SIGTERM to the process group) so the two pieces are
+/// designed to work together.
+///
+/// Note the asymmetry with `spawn_harness_interactive` below: the planner
+/// inherits stdio and expects terminal-driven Ctrl+C to pass straight to the
+/// child, so it is intentionally left in ralph's own process group.
 pub async fn spawn_harness(
     harness_config: &HarnessConfig,
     args: &[String],
@@ -214,6 +228,14 @@ pub async fn spawn_harness(
         cmd.env(key, value);
     }
 
+    // Put the child into its own process group so we can fan signals out to
+    // grandchildren on shutdown. See the doc comment above for the full
+    // rationale and the implication for SIGINT forwarding.
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+
     let child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn harness '{}'", harness_config.command))?;
@@ -224,6 +246,12 @@ pub async fn spawn_harness(
 /// Spawn a harness process in interactive mode with inherited stdio.
 ///
 /// Used for `plan:harness` mode where the user interacts directly with the harness.
+///
+/// Unlike [`spawn_harness`], this deliberately does **not** move the child
+/// into its own process group: the planner inherits stdio and relies on the
+/// controlling terminal to forward SIGINT directly (Ctrl+C during planning
+/// should behave like Ctrl+C in any other terminal program). Placing it in a
+/// separate group would intercept that UX.
 pub async fn spawn_harness_interactive(
     harness_config: &HarnessConfig,
     args: &[String],
@@ -274,7 +302,6 @@ pub async fn wait_for_harness(child: tokio::process::Child) -> Result<HarnessOut
 
 /// Output captured from a harness invocation.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct HarnessOutput {
     pub stdout: String,
     pub stderr: String,
@@ -329,6 +356,7 @@ mod tests {
             updated_at: Utc::now(),
             model: None,
             skipped_reason: None,
+            change_policy: crate::plan::ChangePolicy::Required,
         }
     }
 

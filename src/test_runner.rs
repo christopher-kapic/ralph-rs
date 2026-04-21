@@ -7,6 +7,16 @@ use std::path::Path;
 use tokio::process::Command;
 use tokio::sync::watch;
 
+use crate::io_util;
+
+/// Per-stream cap for concurrent test-command pipe drainers. Tests are usually
+/// chattier than harness invocations but shorter-lived, so 1 MiB per stream is
+/// sufficient to keep structured failure output without letting a runaway
+/// test balloon memory. Mirrors the deadlock fix in `executor.rs`:
+/// draining *concurrently* with `child.wait()` keeps the pipe flowing past
+/// the ~64 KiB kernel buffer.
+const TEST_OUTPUT_TAIL_BYTES: usize = 1024 * 1024;
+
 /// Result of a single test command execution.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -99,13 +109,23 @@ async fn run_single_test(
     cwd: &Path,
     mut abort_rx: watch::Receiver<bool>,
 ) -> (TestResult, bool) {
-    let spawn_result = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
+        .stderr(std::process::Stdio::piped());
+
+    // Put the child into its own process group so SIGKILL on abort fans out
+    // to grandchildren (e.g. `cargo test` workers, `pnpm -> turbo -> next`).
+    // Same rationale as `harness::spawn_harness`.
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+
+    let spawn_result = command.spawn();
 
     let mut child = match spawn_result {
         Ok(c) => c,
@@ -122,8 +142,12 @@ async fn run_single_test(
         }
     };
 
-    let stdout_handle = child.stdout.take();
-    let stderr_handle = child.stderr.take();
+    // Spawn concurrent drain tasks for stdout and stderr *before* waiting
+    // on the child. A test that emits more than the kernel pipe buffer
+    // (~64 KiB) would otherwise block on write(2) while we block on wait(),
+    // deadlocking. See `io_util::drain_bounded` for the full rationale.
+    let stdout_task = io_util::drain_bounded(child.stdout.take(), TEST_OUTPUT_TAIL_BYTES);
+    let stderr_task = io_util::drain_bounded(child.stderr.take(), TEST_OUTPUT_TAIL_BYTES);
 
     tokio::select! {
         status = child.wait() => {
@@ -131,8 +155,10 @@ async fn run_single_test(
                 Ok(exit_status) => {
                     let exit_code = exit_status.code();
                     let passed = exit_status.success();
-                    let stdout = read_to_string(stdout_handle).await;
-                    let stderr = read_to_string(stderr_handle).await;
+                    // Child has exited; pipes will EOF and the drain tasks
+                    // will finish on their own.
+                    let stdout = io_util::join_drain_string(stdout_task).await;
+                    let stderr = io_util::join_drain_string(stderr_task).await;
                     let combined = combine(&stdout, &stderr);
                     let output_tail = tail_lines(&combined, TAIL_LINES);
                     (
@@ -145,20 +171,47 @@ async fn run_single_test(
                         false,
                     )
                 }
-                Err(e) => (
-                    TestResult {
-                        command: cmd.to_string(),
-                        exit_code: None,
-                        output_tail: format!("failed to execute command: {e}"),
-                        passed: false,
-                    },
-                    false,
-                ),
+                Err(e) => {
+                    // Reap the drain tasks even on wait() error so their
+                    // handles don't linger.
+                    let _ = io_util::join_drain(stdout_task).await;
+                    let _ = io_util::join_drain(stderr_task).await;
+                    (
+                        TestResult {
+                            command: cmd.to_string(),
+                            exit_code: None,
+                            output_tail: format!("failed to execute command: {e}"),
+                            passed: false,
+                        },
+                        false,
+                    )
+                }
             }
         }
         _ = wait_for_abort(&mut abort_rx) => {
-            let _ = child.kill().await;
+            // SIGKILL the entire process group so grandchildren (test-runner
+            // workers, etc.) die with the shell. Without this, orphans would
+            // keep holding the stdout/stderr pipes open past the abort, and
+            // the drain tasks below would block on `read` until those
+            // orphans exited on their own. See `executor::signal_process_group`
+            // for the `-pid` convention.
+            #[cfg(unix)]
+            {
+                if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
+                    crate::executor::signal_process_group(pid, libc::SIGKILL);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill().await;
+            }
             let _ = child.wait().await;
+            // With the whole pgroup killed, the pipes EOF promptly, so we
+            // can await the drain tasks normally. The output isn't used on
+            // the abort path (it's hardcoded to "aborted by signal"), but
+            // awaiting keeps the task handles tidy.
+            let _ = io_util::join_drain(stdout_task).await;
+            let _ = io_util::join_drain(stderr_task).await;
             (
                 TestResult {
                     command: cmd.to_string(),
@@ -185,25 +238,6 @@ async fn wait_for_abort(rx: &mut watch::Receiver<bool>) {
         if *rx.borrow() {
             return;
         }
-    }
-}
-
-/// Drain a piped stdout/stderr handle to a String.
-async fn read_to_string<R>(handle: Option<R>) -> String
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-    match handle {
-        Some(mut h) => {
-            let mut buf = Vec::new();
-            if h.read_to_end(&mut buf).await.is_ok() {
-                String::from_utf8_lossy(&buf).into_owned()
-            } else {
-                String::new()
-            }
-        }
-        None => String::new(),
     }
 }
 
@@ -398,5 +432,43 @@ mod tests {
         assert!(res.aborted);
         assert!(!res.all_passed);
         assert!(res.results.is_empty());
+    }
+
+    /// Regression: a test command that writes more than the kernel pipe
+    /// buffer (~64 KiB) would deadlock before the concurrent-drain fix,
+    /// because the child would block on write(2) while the parent blocks
+    /// on wait(). 500 KB is well above the pipe buffer but well below the
+    /// 1 MiB tail cap — the test should complete promptly with the final
+    /// tail lines visible.
+    #[tokio::test]
+    async fn test_large_output_does_not_deadlock() {
+        // `yes` emits "y\n" pairs; head -c cuts at 500000 bytes. The child
+        // will try to write all 500 KB, which dwarfs the pipe buffer.
+        let tests = vec!["yes | head -c 500000".to_string()];
+
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_tests(&tests, &cwd(), never_abort()),
+        )
+        .await
+        .expect("test_runner should not deadlock on large output");
+        let elapsed = start.elapsed();
+
+        assert!(res.all_passed, "500 KB of stdout should pass: {res:?}");
+        assert_eq!(res.results.len(), 1);
+        assert!(res.results[0].passed);
+        // Tail lines logic keeps the last N lines; they should contain
+        // the expected 'y' chars.
+        assert!(
+            res.results[0].output_tail.contains('y'),
+            "output tail should contain 'y' content"
+        );
+        // Sanity: 500 KB piped to head should finish in well under the
+        // 30s test timeout.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "500 KB output took too long: {elapsed:?}"
+        );
     }
 }

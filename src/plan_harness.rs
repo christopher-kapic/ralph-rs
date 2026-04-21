@@ -3,11 +3,13 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::harness;
 use crate::hook_library::{self, Hook, Scope};
+use crate::storage;
 
 /// Base agent definition for the harness-plan agent.
 ///
@@ -261,6 +263,41 @@ fn build_plan_harness_env(
     }
 
     Ok(env_vars)
+}
+
+/// Refuse to start the planner when a `ralph run` is in progress on this
+/// project.
+///
+/// The planner mutates plan/step rows the executor is about to read, so
+/// running them concurrently can corrupt plan state (steps reordered or
+/// deleted out from under the executor). The check is strict by default:
+/// if a `run_locks` row exists for `project`, we bail — even if the
+/// recorded pid is no longer alive. Liveness probing lives in
+/// `ralph run --force` (reclaim path) and `ralph cancel` (clears dead
+/// locks); duplicating that heuristic here would invite split-brain
+/// behavior where the planner and executor disagree about whether a run
+/// is live.
+///
+/// The bail message names the escape hatches so a user who hits a stale
+/// row knows exactly how to recover.
+pub fn preflight_no_live_run(conn: &Connection, project: &str) -> Result<()> {
+    let live = storage::get_live_run(conn, project)?;
+    if let Some(lr) = live {
+        let plan_label = lr
+            .plan_slug
+            .as_deref()
+            .map(|s| format!("plan {s}"))
+            .unwrap_or_else(|| "<all plans>".to_string());
+        bail!(
+            "`ralph run` is active in this project (pid {pid}, {plan_label}, started {started_at}).\n\
+             Refusing to start the planner while a run is in progress.\n\n\
+             Cancel the run with `ralph cancel` first, or wait for it to finish.",
+            pid = lr.pid,
+            plan_label = plan_label,
+            started_at = lr.started_at,
+        );
+    }
+    Ok(())
 }
 
 /// Run the interactive plan-harness: spawn a harness with the plan agent definition
@@ -849,5 +886,70 @@ mod tests {
             "literal {{agent_file}} leaked into argv: {args:?}"
         );
         assert_eq!(args[1], "Create a plan");
+    }
+
+    // -- preflight_no_live_run tests --
+
+    fn setup_conn() -> Connection {
+        crate::db::open_memory().expect("open_memory")
+    }
+
+    #[test]
+    fn test_planner_refuses_when_run_lock_present() {
+        // A live `ralph run` row for this project must block the planner.
+        // The bail message should explain the situation in terms the user
+        // can act on.
+        let conn = setup_conn();
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["/proj-live", 4242i64, "plan-id-x", "my-plan"],
+        )
+        .unwrap();
+
+        let err = preflight_no_live_run(&conn, "/proj-live")
+            .expect_err("expected Err when a run lock row exists");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("active") || msg.contains("Refusing"),
+            "bail message should signal the run is active; got: {msg}"
+        );
+        // Observability: pid and plan slug should surface so the user can
+        // identify the blocking run.
+        assert!(msg.contains("4242"), "pid missing from message: {msg}");
+        assert!(msg.contains("my-plan"), "plan slug missing from message: {msg}");
+        // The escape hatches must be named.
+        assert!(
+            msg.contains("ralph cancel"),
+            "escape-hatch hint missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_planner_proceeds_when_no_run_lock() {
+        // No row → preflight returns Ok, so the caller proceeds to spawn
+        // the planner harness. We don't drive the full planner path here;
+        // the preflight function is the unit under test.
+        let conn = setup_conn();
+        let res = preflight_no_live_run(&conn, "/proj-empty");
+        assert!(res.is_ok(), "expected Ok when no run_locks row present, got: {res:?}");
+    }
+
+    #[test]
+    fn test_planner_refuses_even_when_plan_slug_is_null() {
+        // A run row without a plan_slug (e.g. `ralph run --all`) still
+        // blocks the planner. The bail message should fall back to the
+        // "<all plans>" label instead of omitting the plan field entirely.
+        let conn = setup_conn();
+        conn.execute(
+            "INSERT INTO run_locks (project, pid) VALUES (?1, ?2)",
+            rusqlite::params!["/proj-all", 7777i64],
+        )
+        .unwrap();
+
+        let err = preflight_no_live_run(&conn, "/proj-all")
+            .expect_err("expected Err when a run lock row exists");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("<all plans>"), "missing all-plans label: {msg}");
+        assert!(msg.contains("7777"), "missing pid: {msg}");
     }
 }

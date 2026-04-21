@@ -274,14 +274,29 @@ fn format_acceptance_criteria(criteria: &[String]) -> String {
 }
 
 fn format_deterministic_tests(tests: &[String]) -> String {
+    // Framing matters here: the harness should treat these as ralph-owned
+    // post-harness validation, not as an imperative checklist to run eagerly
+    // inside the session. Older wording ("All must pass") pushed agents into
+    // test-loops that burned context before finishing the work — ralph
+    // already re-runs the tests after the harness returns, so an in-session
+    // pass doesn't substitute for ralph's check.
     let mut lines = vec![
-        "## Deterministic Tests".to_string(),
+        "## Post-harness validation".to_string(),
         String::new(),
-        "The following commands will be run after your changes. All must pass:".to_string(),
+        "After you return, ralph will run these commands as validation — you don't".to_string(),
+        "need to run them yourself:".to_string(),
     ];
     for test in tests {
         lines.push(format!("\n```\n{test}\n```"));
     }
+    lines.push(String::new());
+    lines.push(
+        "If you want to sanity-check your changes before returning, feel free — but".to_string(),
+    );
+    lines.push(
+        "ralph will re-run them regardless, so a passing run inside your session".to_string(),
+    );
+    lines.push("doesn't skip ralph's check. Prefer using the time to complete the work.".to_string());
     lines.join("\n")
 }
 
@@ -365,6 +380,7 @@ mod tests {
             updated_at: Utc::now(),
             model: None,
             skipped_reason: None,
+            change_policy: crate::plan::ChangePolicy::Required,
         }
     }
 
@@ -408,8 +424,10 @@ mod tests {
         assert!(prompt.contains("Acceptance Criteria"));
         assert!(prompt.contains("spawn_harness()"));
 
-        // Should contain deterministic tests
-        assert!(prompt.contains("Deterministic Tests"));
+        // Should contain deterministic tests (framed as ralph-owned
+        // post-harness validation, NOT as an imperative checklist).
+        assert!(prompt.contains("Post-harness validation"));
+        assert!(prompt.contains("ralph will run these"));
         assert!(prompt.contains("cargo build"));
         assert!(prompt.contains("cargo test"));
         assert!(prompt.contains("cargo clippy"));
@@ -543,7 +561,28 @@ mod tests {
         let prompt =
             build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
 
-        assert!(!prompt.contains("Deterministic Tests"));
+        assert!(!prompt.contains("Post-harness validation"));
+    }
+
+    #[test]
+    fn test_deterministic_tests_framing_no_imperative() {
+        // Belt-and-braces regression: the section must not revert to the
+        // old imperative phrasing ("All must pass") which pushed harnesses
+        // into test-loops inside the session. If a future edit drifts back
+        // toward imperative language, this catches it.
+        let plan = make_plan();
+        let step = make_step();
+        let prompt =
+            build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
+        assert!(
+            !prompt.contains("All must pass"),
+            "imperative wording re-introduced: prompt should frame tests as ralph-owned \
+             post-harness validation, not a checklist the agent must run"
+        );
+        assert!(
+            !prompt.contains("Deterministic Tests"),
+            "old section heading re-introduced; expected `Post-harness validation`"
+        );
     }
 
     #[test]
@@ -715,7 +754,7 @@ mod tests {
         let prior_pos = prompt.find("Context from Prior Steps").unwrap();
         let step_pos = prompt.find("# Step:").unwrap();
         let criteria_pos = prompt.find("Acceptance Criteria").unwrap();
-        let tests_pos = prompt.find("Deterministic Tests").unwrap();
+        let tests_pos = prompt.find("Post-harness validation").unwrap();
         let focus_pos = prompt.find("Only modify files").unwrap();
 
         assert!(agent_pos < retry_pos);

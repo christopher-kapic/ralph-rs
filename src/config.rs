@@ -835,8 +835,10 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_missing_default_harness() {
-        let mut config = Config::default();
-        config.default_harness = "nope".to_string();
+        let config = Config {
+            default_harness: "nope".to_string(),
+            ..Default::default()
+        };
         let err = config
             .validate()
             .expect_err("validate must reject missing harness");
@@ -853,8 +855,10 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_empty_default_harness() {
-        let mut config = Config::default();
-        config.default_harness = String::new();
+        let config = Config {
+            default_harness: String::new(),
+            ..Default::default()
+        };
         let err = config.validate().expect_err("validate must reject empty");
         assert!(
             format!("{err}").contains("default_harness"),
@@ -928,8 +932,10 @@ mod tests {
         assert_eq!(c.timeout_secs, Some(600));
 
         // Round-trip Some(n) through JSON.
-        let mut cfg = Config::default();
-        cfg.timeout_secs = Some(42);
+        let mut cfg = Config {
+            timeout_secs: Some(42),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&cfg).expect("serialize");
         let back: Config = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.timeout_secs, Some(42));

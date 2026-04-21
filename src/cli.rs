@@ -5,7 +5,7 @@ use clap_complete::Shell;
 use std::path::PathBuf;
 
 use crate::hook_library::Lifecycle;
-use crate::plan::PlanStatus;
+use crate::plan::{ChangePolicy, PlanStatus};
 
 /// ralph-rs: a deterministic orchestrator for coding agent harnesses.
 #[derive(Debug, Parser)]
@@ -131,6 +131,30 @@ pub enum Command {
         /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
         #[arg(long)]
         force: bool,
+    },
+
+    /// Cancel the live `ralph run` for this project.
+    ///
+    /// Sends SIGTERM to the active runner so it can finish its current phase,
+    /// tear down the harness process group, and release the project run lock.
+    /// Falls through to SIGKILL if the runner doesn't release the lock within
+    /// --timeout. Idempotent: a no-op if no run is active.
+    Cancel {
+        /// Restrict cancellation to a specific plan slug. If the live run is
+        /// for a different plan, cancel refuses (exit 1).
+        plan: Option<String>,
+
+        /// Skip the graceful SIGTERM + grace period. Goes straight to SIGKILL
+        /// on the runner AND its harness process group, then writes a
+        /// `user_interrupted` row to the live execution_log so the history
+        /// isn't left ambiguous.
+        #[arg(long)]
+        force: bool,
+
+        /// How long to wait for the runner to release the lock after SIGTERM,
+        /// in seconds. Ignored when --force is set.
+        #[arg(long, default_value = "15")]
+        timeout: u64,
     },
 
     /// Skip the current or specified step.
@@ -461,6 +485,14 @@ pub enum StepCommand {
         #[arg(long, conflicts_with = "import_json")]
         max_retries: Option<i32>,
 
+        /// Whether this step must produce file changes. `required` (default)
+        /// fails when the harness exits with an empty diff — appropriate for
+        /// implementation steps. `optional` allows a clean harness exit with
+        /// no diff — appropriate for review, audit, or check steps where the
+        /// prompt directs the harness not to modify code.
+        #[arg(long, value_name = "POLICY", conflicts_with = "import_json")]
+        change_policy: Option<ChangePolicy>,
+
         /// Bulk-insert steps from a JSON file or stdin (use `-` for stdin).
         /// Accepts a JSON array of step objects, or a single object. Each
         /// object requires `title`; `description`, `acceptance_criteria`,
@@ -539,6 +571,11 @@ pub enum StepCommand {
         /// Explicitly clear the max-retries override (sets to NULL/plan default).
         #[arg(long)]
         clear_max_retries: bool,
+
+        /// Update the step's change policy (`required` or `optional`). Omit
+        /// to leave the existing policy unchanged.
+        #[arg(long, value_name = "POLICY")]
+        change_policy: Option<ChangePolicy>,
     },
 
     /// Reset a step's status back to pending.
@@ -1211,6 +1248,60 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cancel_defaults() {
+        let cli = Cli::try_parse_from(["ralph-rs", "cancel"]).unwrap();
+        if let Command::Cancel {
+            plan,
+            force,
+            timeout,
+        } = cli.command
+        {
+            assert!(plan.is_none());
+            assert!(!force);
+            assert_eq!(timeout, 15);
+        } else {
+            panic!("Expected Cancel");
+        }
+    }
+
+    #[test]
+    fn test_parse_cancel_with_plan() {
+        let cli = Cli::try_parse_from(["ralph-rs", "cancel", "myplan"]).unwrap();
+        if let Command::Cancel {
+            plan,
+            force,
+            timeout,
+        } = cli.command
+        {
+            assert_eq!(plan.as_deref(), Some("myplan"));
+            assert!(!force);
+            assert_eq!(timeout, 15);
+        } else {
+            panic!("Expected Cancel");
+        }
+    }
+
+    #[test]
+    fn test_parse_cancel_force() {
+        let cli = Cli::try_parse_from(["ralph-rs", "cancel", "--force"]).unwrap();
+        if let Command::Cancel { force, .. } = cli.command {
+            assert!(force);
+        } else {
+            panic!("Expected Cancel");
+        }
+    }
+
+    #[test]
+    fn test_parse_cancel_timeout() {
+        let cli = Cli::try_parse_from(["ralph-rs", "cancel", "--timeout", "30"]).unwrap();
+        if let Command::Cancel { timeout, .. } = cli.command {
+            assert_eq!(timeout, 30);
+        } else {
+            panic!("Expected Cancel");
+        }
+    }
+
+    #[test]
     fn test_parse_export() {
         let cli = Cli::try_parse_from(["ralph-rs", "export", "my-plan", "--output", "plan.json"])
             .unwrap();
@@ -1594,6 +1685,67 @@ mod tests {
             "my-hook",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_step_add_change_policy_optional() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "Review",
+            "--change-policy",
+            "optional",
+        ])
+        .unwrap();
+        if let Command::Step(StepCommand::Add { change_policy, .. }) = cli.command {
+            assert_eq!(change_policy, Some(crate::plan::ChangePolicy::Optional));
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_change_policy_default_none() {
+        // Without the flag, the parsed value is None (the handler treats this
+        // as "use default" = Required).
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "add", "Implement"]).unwrap();
+        if let Command::Step(StepCommand::Add { change_policy, .. }) = cli.command {
+            assert!(change_policy.is_none());
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_change_policy_invalid_rejected() {
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "Review",
+            "--change-policy",
+            "forbidden",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_step_edit_change_policy() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "edit",
+            "1",
+            "--change-policy",
+            "required",
+        ])
+        .unwrap();
+        if let Command::Step(StepCommand::Edit { change_policy, .. }) = cli.command {
+            assert_eq!(change_policy, Some(crate::plan::ChangePolicy::Required));
+        } else {
+            panic!("Expected Step Edit");
+        }
     }
 
     #[test]

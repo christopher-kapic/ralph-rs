@@ -8,9 +8,92 @@ use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::db;
+use crate::plan::Phase;
+
+/// Canonical `SELECT` list for hydrating a [`LiveRun`] from the `run_locks`
+/// table. Defines the authoritative column order so [`LiveRun::from_row`]'s
+/// positional `row.get(N)` calls line up. Mirrors the `PLAN_COLUMNS` pattern
+/// in `plan.rs`.
+///
+/// Read by `ralph cancel` and `ralph status` live view.
+#[allow(dead_code)]
+pub const LIVE_RUN_COLUMNS: &str = "project, pid, pid_start_token, plan_id, plan_slug, started_at, \
+     step_id, step_num, attempt, max_attempts, phase, phase_started_at, current_command, \
+     execution_log_id, child_pid, child_start_token, updated_at";
+
+/// Snapshot of the currently-held run lock for a project, including every
+/// observability column added in migration V11. Timestamps are kept as raw
+/// strings so this struct is a thin mirror of the on-disk row; callers that
+/// render times (status, cancel, the TUI) can parse them as they see fit.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct LiveRun {
+    pub project: String,
+    pub pid: i64,
+    pub pid_start_token: Option<String>,
+    pub plan_id: Option<String>,
+    pub plan_slug: Option<String>,
+    pub started_at: String,
+    pub step_id: Option<String>,
+    pub step_num: Option<i32>,
+    pub attempt: Option<i32>,
+    pub max_attempts: Option<i32>,
+    pub phase: Option<Phase>,
+    pub phase_started_at: Option<String>,
+    pub current_command: Option<String>,
+    pub execution_log_id: Option<i64>,
+    pub child_pid: Option<i64>,
+    pub child_start_token: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+impl LiveRun {
+    /// Read a `LiveRun` from a SQLite row.
+    ///
+    /// Expected column order matches [`LIVE_RUN_COLUMNS`]. Phase parsing
+    /// converts `FromStr` failures to
+    /// [`rusqlite::Error::FromSqlConversionFailure`] so a malformed `phase`
+    /// value surfaces as a type-conversion error rather than a silent
+    /// default — this mirrors how `ExecutionLog::from_row` validates its
+    /// `termination_reason` and `test_status` columns.
+    #[allow(dead_code)]
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        let phase_str: Option<String> = row.get(10)?;
+        let phase = match phase_str {
+            Some(s) => Some(s.parse::<Phase>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?),
+            None => None,
+        };
+
+        Ok(LiveRun {
+            project: row.get(0)?,
+            pid: row.get(1)?,
+            pid_start_token: row.get(2)?,
+            plan_id: row.get(3)?,
+            plan_slug: row.get(4)?,
+            started_at: row.get(5)?,
+            step_id: row.get(6)?,
+            step_num: row.get(7)?,
+            attempt: row.get(8)?,
+            max_attempts: row.get(9)?,
+            phase,
+            phase_started_at: row.get(11)?,
+            current_command: row.get(12)?,
+            execution_log_id: row.get(13)?,
+            child_pid: row.get(14)?,
+            child_start_token: row.get(15)?,
+            updated_at: row.get(16)?,
+        })
+    }
+}
 
 type ReleaseFn = Box<dyn FnOnce(&str) -> Result<()> + Send>;
 
@@ -286,9 +369,14 @@ fn is_same_live_process(pid: i64, stored_start_token: Option<&str>) -> bool {
 /// Returns a stable identifier for the process `pid`'s lifetime — distinct
 /// across every `pid` reuse. On Linux reads field 22 (starttime in clock
 /// ticks since boot) from `/proc/<pid>/stat`. On other Unix falls back to
-/// `ps -o lstart=`. Returns `None` when we can't determine a token, in which
-/// case callers should fall back to liveness-only checking.
-fn process_start_token(pid: i64) -> Option<String> {
+/// `ps -o lstart=`. On non-Unix platforms returns `None`. Callers that get
+/// `None` should fall back to liveness-only checking (and, for child
+/// processes, record the token as `NULL` in the run_locks row).
+///
+/// Exposed to `executor.rs` so it can compute the token for a freshly-spawned
+/// harness child. The format is platform-specific and opaque — compare tokens
+/// for equality, don't parse them.
+pub(crate) fn process_start_token(pid: i64) -> Option<String> {
     if pid <= 0 {
         return None;
     }
@@ -878,5 +966,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "race left behind a duplicate lock row");
+    }
+
+    #[test]
+    fn live_run_from_row_hydrates_every_column() {
+        let conn = mem_db();
+        // Insert a row with every V11 column populated so from_row exercises
+        // each positional getter.
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug,
+                                    started_at, step_id, step_num, attempt, max_attempts,
+                                    phase, phase_started_at, current_command, execution_log_id,
+                                    child_pid, child_start_token, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                     ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                "/proj-roundtrip",
+                4242i64,
+                "parent-token",
+                "plan-uuid",
+                "my-slug",
+                "2026-04-21T00:00:00.000Z",
+                "step-uuid",
+                5i32,
+                2i32,
+                3i32,
+                "commit",
+                "2026-04-21T00:01:00.000Z",
+                "git commit -m ...",
+                17i64,
+                99_999i64,
+                "child-token",
+                "2026-04-21T00:02:00.000Z",
+            ],
+        )
+        .unwrap();
+
+        let query = format!("SELECT {LIVE_RUN_COLUMNS} FROM run_locks WHERE project = ?1");
+        let live = conn
+            .query_row(&query, params!["/proj-roundtrip"], LiveRun::from_row)
+            .expect("from_row");
+
+        assert_eq!(live.project, "/proj-roundtrip");
+        assert_eq!(live.pid, 4242);
+        assert_eq!(live.pid_start_token.as_deref(), Some("parent-token"));
+        assert_eq!(live.plan_id.as_deref(), Some("plan-uuid"));
+        assert_eq!(live.plan_slug.as_deref(), Some("my-slug"));
+        assert_eq!(live.started_at, "2026-04-21T00:00:00.000Z");
+        assert_eq!(live.step_id.as_deref(), Some("step-uuid"));
+        assert_eq!(live.step_num, Some(5));
+        assert_eq!(live.attempt, Some(2));
+        assert_eq!(live.max_attempts, Some(3));
+        assert_eq!(live.phase, Some(Phase::Commit));
+        assert_eq!(
+            live.phase_started_at.as_deref(),
+            Some("2026-04-21T00:01:00.000Z")
+        );
+        assert_eq!(live.current_command.as_deref(), Some("git commit -m ..."));
+        assert_eq!(live.execution_log_id, Some(17));
+        assert_eq!(live.child_pid, Some(99_999));
+        assert_eq!(live.child_start_token.as_deref(), Some("child-token"));
+        assert_eq!(
+            live.updated_at.as_deref(),
+            Some("2026-04-21T00:02:00.000Z")
+        );
+    }
+
+    #[test]
+    fn live_run_from_row_rejects_malformed_phase() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, phase) VALUES (?1, ?2, ?3)",
+            params!["/proj-bad-phase", 1i64, "not-a-phase"],
+        )
+        .unwrap();
+
+        let query = format!("SELECT {LIVE_RUN_COLUMNS} FROM run_locks WHERE project = ?1");
+        let err = conn
+            .query_row(&query, params!["/proj-bad-phase"], LiveRun::from_row)
+            .expect_err("malformed phase should surface as a type-conversion error");
+        assert!(
+            matches!(err, rusqlite::Error::FromSqlConversionFailure(_, _, _)),
+            "expected FromSqlConversionFailure, got {err:?}"
+        );
     }
 }

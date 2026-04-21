@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::path::Path;
 
-use crate::plan::{Plan, Step};
+use crate::plan::{ChangePolicy, Plan, Step};
 use crate::storage;
 
 // ---------------------------------------------------------------------------
@@ -54,6 +54,10 @@ pub struct ExportedStep {
     pub max_retries: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Always emitted (including for the `Required` default) so consumers of
+    /// the JSON see the policy explicitly rather than having to assume the
+    /// serde default.
+    pub change_policy: ChangePolicy,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +97,7 @@ pub fn build_exported_plan(
             acceptance_criteria: s.acceptance_criteria.clone(),
             max_retries: s.max_retries,
             model: s.model.clone(),
+            change_policy: s.change_policy,
         })
         .collect();
 
@@ -185,6 +190,7 @@ mod tests {
             &["tests pass".to_string()],
             Some(3),
             None,
+            None,
         )
         .unwrap();
 
@@ -196,6 +202,7 @@ mod tests {
             None,
             Some("codex"),
             &[],
+            None,
             None,
             None,
         )
@@ -250,7 +257,7 @@ mod tests {
         )
         .unwrap();
 
-        storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+        storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         let exported = build_exported_plan(&plan, &steps, Vec::new());
@@ -299,6 +306,7 @@ mod tests {
             &["criterion".to_string()],
             Some(2),
             None,
+            None,
         )
         .unwrap();
 
@@ -329,7 +337,7 @@ mod tests {
         )
         .unwrap();
 
-        storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None).unwrap();
+        storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("exported.json");
@@ -364,9 +372,9 @@ mod tests {
         .unwrap();
 
         // Steps are created in order and have ascending sort_keys
-        storage::create_step(&conn, &plan.id, "Alpha", "d", None, None, &[], None, None).unwrap();
-        storage::create_step(&conn, &plan.id, "Beta", "d", None, None, &[], None, None).unwrap();
-        storage::create_step(&conn, &plan.id, "Gamma", "d", None, None, &[], None, None).unwrap();
+        storage::create_step(&conn, &plan.id, "Alpha", "d", None, None, &[], None, None, None).unwrap();
+        storage::create_step(&conn, &plan.id, "Beta", "d", None, None, &[], None, None, None).unwrap();
+        storage::create_step(&conn, &plan.id, "Gamma", "d", None, None, &[], None, None, None).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         let exported = build_exported_plan(&plan, &steps, Vec::new());
@@ -392,7 +400,7 @@ mod tests {
         .unwrap();
 
         let (step, _) =
-            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None)
+            storage::create_step(&conn, &plan.id, "Step", "desc", None, None, &[], None, None, None)
                 .unwrap();
 
         // Mark step as complete
