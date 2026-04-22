@@ -46,8 +46,7 @@ pub fn config_show(out: &OutputContext) -> Result<()> {
     println!("  hook_timeout_secs:   {}", config.hook_timeout_secs);
     println!("  auto_stash:          {}", config.auto_stash);
     println!("  min_free_disk_mb:    {}", config.min_free_disk_mb);
-    let mut harness_names: Vec<&str> =
-        config.harnesses.keys().map(String::as_str).collect();
+    let mut harness_names: Vec<&str> = config.harnesses.keys().map(String::as_str).collect();
     harness_names.sort_unstable();
     println!("  harnesses:           {}", harness_names.join(", "));
 
@@ -134,8 +133,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _guard = set_xdg(tmp.path());
 
-        let err = config_set_timezone("Not/A_Real_Zone")
-            .expect_err("must reject invalid IANA name");
+        let err =
+            config_set_timezone("Not/A_Real_Zone").expect_err("must reject invalid IANA name");
         let msg = format!("{err}");
         assert!(msg.contains("Not/A_Real_Zone"), "{msg}");
         assert!(msg.contains("IANA"), "{msg}");

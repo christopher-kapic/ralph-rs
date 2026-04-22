@@ -332,11 +332,7 @@ fn prompt_for_default(installed: &[&str]) -> Result<String> {
 // Doctor command
 // ---------------------------------------------------------------------------
 
-pub fn cmd_doctor(
-    config: &config::Config,
-    workdir: &Path,
-    out: &OutputContext,
-) -> Result<()> {
+pub fn cmd_doctor(config: &config::Config, workdir: &Path, out: &OutputContext) -> Result<()> {
     println!("ralph doctor");
     println!();
 

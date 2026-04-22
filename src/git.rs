@@ -292,13 +292,7 @@ pub fn stash_push_with_untracked(workdir: &Path, message: &str) -> Result<Option
     let before = stash_list_shas(workdir)?;
 
     let output = Command::new("git")
-        .args([
-            "stash",
-            "push",
-            "--include-untracked",
-            "-m",
-            message,
-        ])
+        .args(["stash", "push", "--include-untracked", "-m", message])
         .current_dir(workdir)
         .output()
         .with_context(|| format!("failed to execute git stash push -m '{message}'"))?;
@@ -738,8 +732,7 @@ mod tests {
     #[test]
     fn test_stash_push_clean_tree_returns_none() {
         let (_tmp, dir) = init_repo();
-        let result =
-            stash_push_with_untracked(&dir, "ralph: test stash on clean tree").unwrap();
+        let result = stash_push_with_untracked(&dir, "ralph: test stash on clean tree").unwrap();
         assert!(
             result.is_none(),
             "clean tree should produce no stash, got {result:?}"
@@ -780,13 +773,19 @@ mod tests {
 
         // Tree is clean post-stash, and original tracked file is reverted.
         assert!(!has_uncommitted_changes(&dir).unwrap());
-        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "# hello");
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
         assert!(!dir.join("scratch.txt").exists());
 
         // Pop restores both.
         let outcome = stash_pop(&dir, &stash).unwrap();
         assert_eq!(outcome, StashPopOutcome::Clean);
-        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "# modified");
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# modified"
+        );
         assert_eq!(fs::read_to_string(dir.join("scratch.txt")).unwrap(), "wip");
 
         // Stash is gone from the stack.
@@ -830,8 +829,7 @@ mod tests {
         let found = find_stash_by_message(&dir, msg).unwrap().expect("found");
         assert_eq!(found, stash);
 
-        let missing =
-            find_stash_by_message(&dir, "ralph: no-such-marker").unwrap();
+        let missing = find_stash_by_message(&dir, "ralph: no-such-marker").unwrap();
         assert!(missing.is_none());
     }
 

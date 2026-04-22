@@ -1226,20 +1226,17 @@ mod tests {
         let conn = open_at(&path).unwrap();
 
         let tags: String = conn
-            .query_row(
-                "SELECT tags FROM steps WHERE id = ?1",
-                ["s1"],
-                |r| r.get(0),
-            )
+            .query_row("SELECT tags FROM steps WHERE id = ?1", ["s1"], |r| r.get(0))
             .unwrap();
-        assert_eq!(tags, "[]", "pre-V13 rows should backfill to empty JSON array");
+        assert_eq!(
+            tags, "[]",
+            "pre-V13 rows should backfill to empty JSON array"
+        );
 
         let null_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM steps WHERE tags IS NULL",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM steps WHERE tags IS NULL", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(null_count, 0, "NOT NULL DEFAULT must leave no NULLs");
 

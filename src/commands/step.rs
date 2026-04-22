@@ -1174,7 +1174,12 @@ mod tests {
         let (conn, project) = setup_with_plan();
         add_with_tags(&conn, &project, "A", &["FIX".to_string()]);
         add_with_tags(&conn, &project, "B", &["REVIEW".to_string()]);
-        add_with_tags(&conn, &project, "C", &["FIX".to_string(), "URGENT".to_string()]);
+        add_with_tags(
+            &conn,
+            &project,
+            "C",
+            &["FIX".to_string(), "URGENT".to_string()],
+        );
 
         let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
             .unwrap()
@@ -1200,7 +1205,12 @@ mod tests {
     fn test_step_list_filter_requires_all_tags() {
         let (conn, project) = setup_with_plan();
         add_with_tags(&conn, &project, "A", &["FIX".to_string()]);
-        add_with_tags(&conn, &project, "B", &["FIX".to_string(), "URGENT".to_string()]);
+        add_with_tags(
+            &conn,
+            &project,
+            "B",
+            &["FIX".to_string(), "URGENT".to_string()],
+        );
 
         let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
             .unwrap()

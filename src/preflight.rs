@@ -797,7 +797,7 @@ mod tests {
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
                 prompt_input: crate::config::PromptInputMode::Stdin,
-            color: None,
+                color: None,
             },
         );
         let config = Config {
@@ -1102,9 +1102,6 @@ mod tests {
             total_bytes: 10 * 1_073_741_824,
         };
         let gb = ds.available_gb();
-        assert!(
-            (gb - 1.0).abs() < 1e-9,
-            "expected ~1.0 GB, got {gb}"
-        );
+        assert!((gb - 1.0).abs() < 1e-9, "expected ~1.0 GB, got {gb}");
     }
 }

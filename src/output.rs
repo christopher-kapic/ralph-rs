@@ -378,9 +378,7 @@ pub fn format_harness_label_with_override(
     if !color_enabled {
         return name.to_string();
     }
-    if let Some(ratatui::style::Color::Rgb(r, g, b)) =
-        resolved_harness_color(name, override_hex)
-    {
+    if let Some(ratatui::style::Color::Rgb(r, g, b)) = resolved_harness_color(name, override_hex) {
         return format!("\x1b[1;38;2;{r};{g};{b}m{name}\x1b[0m");
     }
     // Unknown harness: bold without color.
@@ -402,7 +400,9 @@ pub fn format_now_in_tz(tz: &chrono_tz::Tz) -> String {
 
 /// Testable variant of [`format_now_in_tz`] that formats a specific instant.
 pub fn format_instant_in_tz(utc: DateTime<Utc>, tz: &chrono_tz::Tz) -> String {
-    utc.with_timezone(tz).format("%Y-%m-%d %H:%M:%S %Z").to_string()
+    utc.with_timezone(tz)
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
 }
 
 /// A green checkmark icon, colored when `color` is true.

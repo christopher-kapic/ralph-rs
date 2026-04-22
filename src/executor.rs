@@ -1665,7 +1665,11 @@ fn render_prompt_preview_to<W: std::io::Write>(
     };
     let shown_chars = shown.chars().count();
 
-    writeln!(writer, "  Prompt ({} of {} chars):", shown_chars, total_chars)?;
+    writeln!(
+        writer,
+        "  Prompt ({} of {} chars):",
+        shown_chars, total_chars
+    )?;
     for raw in shown.lines() {
         // Drop trailing whitespace per line for visual cleanliness; empty
         // lines are preserved so paragraph breaks survive the indent.
@@ -1957,9 +1961,18 @@ mod tests {
             hook_timeout_secs: 120,
         };
 
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.outcome, StepOutcome::Aborted);
         assert_eq!(result.attempts_used, 1);
@@ -2126,9 +2139,18 @@ mod tests {
         let (_tx, rx) = watch::channel(false);
 
         let config = Config::default();
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.outcome, StepOutcome::Failed);
 
@@ -2214,9 +2236,18 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(false);
 
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.outcome, StepOutcome::Failed);
 
@@ -2344,7 +2375,16 @@ mod tests {
         // stalling the suite forever.
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default()),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
         )
         .await
         .expect("execute_step deadlocked on large harness output")
@@ -2450,7 +2490,16 @@ mod tests {
 
         let _result = tokio::time::timeout(
             Duration::from_secs(60),
-            execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default()),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
         )
         .await
         .expect("execute_step deadlocked on >4 MiB harness output")
@@ -2555,7 +2604,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default()),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
         )
         .await
         .expect("execute_step timed out")
@@ -2709,7 +2767,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default()),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
         )
         .await
         .expect("execute_step did not return within 10s on abort")
@@ -2864,7 +2931,16 @@ mod tests {
         // quick failure rather than a stalled suite.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default()),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
         )
         .await
         .expect("execute_step did not return within 10s on abort")
@@ -2918,7 +2994,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: crate::config::PromptInputMode::Stdin,
-                color: None,
+            color: None,
         }
     }
 
@@ -3004,9 +3080,18 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
 
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
@@ -3070,9 +3155,18 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Success);
         assert!(result.commit_hash.is_none());
 
@@ -3142,9 +3236,18 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Success);
         assert!(result.commit_hash.is_none());
 
@@ -3209,9 +3312,18 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
 
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
@@ -3277,9 +3389,18 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Success);
         assert!(
             result.commit_hash.is_some(),
@@ -3374,9 +3495,18 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
         assert_eq!(result.attempts_used, 1);
 
@@ -3449,9 +3579,18 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result.outcome,
             StepOutcome::Failed,
@@ -3525,9 +3664,18 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
         assert!(result.commit_hash.is_none());
 
@@ -3603,9 +3751,18 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx, ExecuteOptions::default())
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
         assert_eq!(result.attempts_used, 3);
 

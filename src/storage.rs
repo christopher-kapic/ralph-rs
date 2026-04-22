@@ -362,9 +362,7 @@ pub fn create_step(
 
 /// List steps for a plan, ordered by sort_key.
 pub fn list_steps(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
-    let sql = format!(
-        "SELECT {STEP_COLUMNS} FROM steps WHERE plan_id = ?1 ORDER BY sort_key ASC",
-    );
+    let sql = format!("SELECT {STEP_COLUMNS} FROM steps WHERE plan_id = ?1 ORDER BY sort_key ASC",);
     let mut stmt = conn.prepare(&sql)?;
 
     let rows = stmt.query_map(params![plan_id], Step::from_row)?;
@@ -2158,8 +2156,7 @@ mod tests {
         let before = get_step(&conn, &step.id).unwrap();
 
         update_step_fields_ext(
-            &conn, &step.id, None, None, None, None, None, None, None, None,
-            None,
+            &conn, &step.id, None, None, None, None, None, None, None, None, None,
         )
         .unwrap();
 
@@ -2643,8 +2640,7 @@ mod tests {
             "Code coverage > 80%".to_string(),
         ];
         let (step, _) = create_step(
-            &conn, &plan.id, "Step", "d", None, None, &criteria, None, None, None,
-            None,
+            &conn, &plan.id, "Step", "d", None, None, &criteria, None, None, None, None,
         )
         .unwrap();
 
@@ -2882,10 +2878,20 @@ mod tests {
     fn test_attach_hook_to_step_rejects_duplicate() {
         let conn = setup();
         let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "t", "d", None, None, &[], None, None, None,
-            None
-).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "t",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "h1").unwrap();
 

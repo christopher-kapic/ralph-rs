@@ -1267,6 +1267,9 @@ mod tests {
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
         assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].tags, vec!["FIX".to_string(), "REGRESSION".to_string()]);
+        assert_eq!(
+            steps[0].tags,
+            vec!["FIX".to_string(), "REGRESSION".to_string()]
+        );
     }
 }

@@ -123,8 +123,7 @@ pub async fn run_plan(
                 .await
                 .context("Failed to get current git branch")?
         };
-        let stash_ref =
-            stash_if_dirty(workdir, &effective_plan.slug, options.auto_stash).await?;
+        let stash_ref = stash_if_dirty(workdir, &effective_plan.slug, options.auto_stash).await?;
         // Record source_branch + stash_sha on the run_lock row so resume /
         // diagnostics can see what we'll try to restore. Best-effort — if
         // the row isn't there (tests), swallow the error.
@@ -175,18 +174,14 @@ pub async fn run_plan(
         match &outcome {
             Ok(_) => {
                 // Don't mask a teardown error with a success.
-                restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref())
-                    .await?;
+                restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref()).await?;
             }
             Err(_) => {
                 // Run already failed; log teardown errors but don't mask
                 // the original failure.
-                if let Err(te) = restore_working_tree(
-                    &td.workdir,
-                    &td.source_branch,
-                    td.stash_ref.as_ref(),
-                )
-                .await
+                if let Err(te) =
+                    restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref())
+                        .await
                 {
                     eprintln!("Warning: teardown after failed run: {te}");
                 }
@@ -278,8 +273,7 @@ async fn run_plan_inner(
         step_results: Vec::new(),
     };
 
-    let mut known_step_ids: HashSet<String> =
-        initial_steps.iter().map(|s| s.id.clone()).collect();
+    let mut known_step_ids: HashSet<String> = initial_steps.iter().map(|s| s.id.clone()).collect();
     let mut executed_step_ids: HashSet<String> = HashSet::new();
 
     // For `--one`, we need to stop after the first step actually executed;
@@ -353,8 +347,7 @@ async fn run_plan_inner(
         // Skip already-completed or skipped steps that happen to fall in
         // the window but weren't filtered out above (defensive: the
         // is_actionable filter already excludes these).
-        if current_step.status == StepStatus::Complete
-            || current_step.status == StepStatus::Skipped
+        if current_step.status == StepStatus::Complete || current_step.status == StepStatus::Skipped
         {
             if current_step.status == StepStatus::Skipped {
                 result.steps_skipped += 1;
@@ -736,16 +729,12 @@ pub async fn run_all_plans(
     if let Some(td) = teardown {
         match &inner {
             Ok(_) => {
-                restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref())
-                    .await?;
+                restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref()).await?;
             }
             Err(_) => {
-                if let Err(te) = restore_working_tree(
-                    &td.workdir,
-                    &td.source_branch,
-                    td.stash_ref.as_ref(),
-                )
-                .await
+                if let Err(te) =
+                    restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref())
+                        .await
                 {
                     eprintln!("Warning: teardown after failed --all run: {te}");
                 }
@@ -769,7 +758,6 @@ async fn run_all_plans_inner(
     plan_by_id: HashMap<String, Plan>,
     run_start_sha: String,
 ) -> Result<Vec<PlanRunResult>> {
-
     // 4. Build deps_of map for the in-scope plan set.
     let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
     for pid in &topo_order {
@@ -1235,8 +1223,7 @@ async fn restore_working_tree(
     if let Some(stash) = stash_ref {
         let workdir_owned = workdir.to_path_buf();
         let stash_owned = stash.clone();
-        let outcome =
-            blocking_git(move || git::stash_pop(&workdir_owned, &stash_owned)).await?;
+        let outcome = blocking_git(move || git::stash_pop(&workdir_owned, &stash_owned)).await?;
         match outcome {
             StashPopOutcome::Clean => {
                 eprintln!("Restored your uncommitted changes.");
@@ -1275,11 +1262,7 @@ async fn restore_working_tree(
 ///   parent SHA is ignored and the existing branch is checked out.
 /// - If `parent_sha` is `None`, creates the branch from the current HEAD
 ///   (legacy behavior).
-async fn setup_branch(
-    workdir: &Path,
-    plan: &Plan,
-    parent_sha: Option<&str>,
-) -> Result<()> {
+async fn setup_branch(workdir: &Path, plan: &Plan, parent_sha: Option<&str>) -> Result<()> {
     let current = {
         let workdir_owned = workdir.to_path_buf();
         blocking_git(move || git::get_current_branch(&workdir_owned))
@@ -1445,10 +1428,7 @@ fn find_resume_point(steps: &[Step]) -> Result<usize> {
 fn is_actionable(status: StepStatus) -> bool {
     matches!(
         status,
-        StepStatus::Pending
-            | StepStatus::Failed
-            | StepStatus::InProgress
-            | StepStatus::Aborted
+        StepStatus::Pending | StepStatus::Failed | StepStatus::InProgress | StepStatus::Aborted
     )
 }
 
@@ -1504,20 +1484,12 @@ fn resolve_window(all_steps: &[Step], options: &RunOptions) -> Result<RunWindow>
     if let Some(to) = options.to
         && (to == 0 || to > total)
     {
-        bail!(
-            "End step {} is out of range (plan has {} steps)",
-            to,
-            total
-        );
+        bail!("End step {} is out of range (plan has {} steps)", to, total);
     }
     if let (Some(from), Some(to)) = (options.from, options.to)
         && from > to
     {
-        bail!(
-            "Start step {} is greater than end step {}",
-            from,
-            to
-        );
+        bail!("Start step {} is greater than end step {}", from, to);
     }
 
     let from_key = options.from.map(|n| all_steps[n - 1].sort_key.clone());
@@ -1589,13 +1561,7 @@ fn report_plan_grew(new_inserts: &[Step], all_steps: &[Step], out: &OutputContex
 fn format_step_list(steps: &[Step], all_steps: &[Step]) -> String {
     steps
         .iter()
-        .map(|s| {
-            format!(
-                "#{} '{}'",
-                step_number_in_plan(all_steps, s),
-                s.title
-            )
-        })
+        .map(|s| format!("#{} '{}'", step_number_in_plan(all_steps, s), s.title))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -2673,9 +2639,7 @@ mod tests {
         };
 
         // Should create feat/rooted rooted at initial_sha.
-        setup_branch(&dir, &plan, Some(&initial_sha))
-            .await
-            .unwrap();
+        setup_branch(&dir, &plan, Some(&initial_sha)).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/rooted");
         assert_eq!(git::get_commit_hash(&dir).unwrap(), initial_sha);
         // The second commit's file should not be visible on the new branch.
@@ -2877,7 +2841,10 @@ mod tests {
             context_prepend: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
-        assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/stash-roundtrip");
+        assert_eq!(
+            git::get_current_branch(&dir).unwrap(),
+            "feat/stash-roundtrip"
+        );
 
         // Teardown: back to source_branch + pop stash.
         restore_working_tree(&dir, &source_branch, Some(&stash))
@@ -2928,7 +2895,9 @@ mod tests {
         let source_branch = git::get_current_branch(&dir).unwrap();
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");
-        restore_working_tree(&dir, &source_branch, None).await.unwrap();
+        restore_working_tree(&dir, &source_branch, None)
+            .await
+            .unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), source_branch);
     }
 
@@ -3059,9 +3028,17 @@ mod tests {
         // create_and_checkout_branch will fail — exercising the
         // post-stash-pre-teardown failure window.
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "bad", &project, "feat/bad..branch", "d", None, None, &[])
-                .unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "bad",
+            &project,
+            "feat/bad..branch",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
         let plan = storage::get_plan_by_slug(&conn, "bad", &project)
             .unwrap()
@@ -3142,12 +3119,30 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None,
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
             None,
         )
         .unwrap();
         let (s2, _) = storage::create_step(
-            &conn, &plan.id, "Second", "d2", None, None, &[], None, None, None,
+            &conn,
+            &plan.id,
+            "Second",
+            "d2",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -3173,12 +3168,30 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None,
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
             None,
         )
         .unwrap();
         let (s2, _) = storage::create_step(
-            &conn, &plan.id, "Second", "d2", None, None, &[], None, None, None,
+            &conn,
+            &plan.id,
+            "Second",
+            "d2",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -3202,7 +3215,16 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None,
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -3351,12 +3373,30 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None,
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
             None,
         )
         .unwrap();
         let (s2, _) = storage::create_step(
-            &conn, &plan.id, "Second", "d2", None, None, &[], None, None, None,
+            &conn,
+            &plan.id,
+            "Second",
+            "d2",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
             None,
         )
         .unwrap();

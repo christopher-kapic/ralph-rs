@@ -897,11 +897,20 @@ mod cancel_tests {
     fn seed_plan_and_step(conn: &Connection, slug: &str, project: &str) -> (String, String) {
         let plan =
             storage::create_plan(conn, slug, project, "br", "desc", None, None, &[]).unwrap();
-        let (step, _) =
-            storage::create_step(conn, &plan.id, "t", "d", None, None, &[], None, None, None,
-            None
-)
-                .unwrap();
+        let (step, _) = storage::create_step(
+            conn,
+            &plan.id,
+            "t",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         (plan.id, step.id)
     }
 
@@ -1246,11 +1255,20 @@ mod status_live_view_tests {
     fn seed_plan_and_step(conn: &Connection, slug: &str, project: &str) -> (String, String) {
         let plan =
             storage::create_plan(conn, slug, project, "br", "desc", None, None, &[]).unwrap();
-        let (step, _) =
-            storage::create_step(conn, &plan.id, "t", "d", None, None, &[], None, None, None,
-            None
-)
-                .unwrap();
+        let (step, _) = storage::create_step(
+            conn,
+            &plan.id,
+            "t",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         (plan.id, step.id)
     }
 

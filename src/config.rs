@@ -254,9 +254,8 @@ impl Config {
         // a silent fallback to the hardcoded map at render time.
         for (name, hc) in &self.harnesses {
             if let Some(hex) = &hc.color {
-                crate::output::parse_hex_color(hex).map_err(|e| {
-                    anyhow!("config.harnesses.{name}.color: {e}")
-                })?;
+                crate::output::parse_hex_color(hex)
+                    .map_err(|e| anyhow!("config.harnesses.{name}.color: {e}"))?;
             }
         }
         Ok(())
@@ -1216,7 +1215,9 @@ mod tests {
             display_timezone: "America/New_York".to_string(),
             ..Default::default()
         };
-        config.validate().expect("America/New_York is a valid IANA name");
+        config
+            .validate()
+            .expect("America/New_York is a valid IANA name");
     }
 
     // -- harness color override --------------------------------------------
@@ -1225,20 +1226,12 @@ mod tests {
     fn test_harness_color_override_hex_parsed() {
         // Valid hex override passes validation.
         let mut config = Config::default();
-        config
-            .harnesses
-            .get_mut("claude")
-            .unwrap()
-            .color = Some("#abcdef".to_string());
+        config.harnesses.get_mut("claude").unwrap().color = Some("#abcdef".to_string());
         config.validate().expect("valid hex override must pass");
 
         // Invalid hex override fails validation with a clear error.
         let mut config = Config::default();
-        config
-            .harnesses
-            .get_mut("claude")
-            .unwrap()
-            .color = Some("not-hex".to_string());
+        config.harnesses.get_mut("claude").unwrap().color = Some("not-hex".to_string());
         let err = config
             .validate()
             .expect_err("invalid hex must fail validation");
@@ -1250,17 +1243,10 @@ mod tests {
     #[test]
     fn test_harness_color_json_roundtrip() {
         let mut config = Config::default();
-        config
-            .harnesses
-            .get_mut("claude")
-            .unwrap()
-            .color = Some("#112233".to_string());
+        config.harnesses.get_mut("claude").unwrap().color = Some("#112233".to_string());
         let json = serde_json::to_string(&config).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            back.harnesses["claude"].color.as_deref(),
-            Some("#112233")
-        );
+        assert_eq!(back.harnesses["claude"].color.as_deref(), Some("#112233"));
     }
 
     // -- save() round trip -------------------------------------------------

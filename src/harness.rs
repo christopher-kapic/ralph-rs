@@ -460,7 +460,7 @@ pub async fn spawn_harness_with_delivery(
             && e.kind() != std::io::ErrorKind::BrokenPipe
         {
             return Err(
-                anyhow::Error::new(e).context("failed to close child stdin after writing prompt"),
+                anyhow::Error::new(e).context("failed to close child stdin after writing prompt")
             );
         }
         drop(stdin);
@@ -1230,10 +1230,9 @@ mod tests {
         let delivery = PromptDelivery::Stdin(prompt_bytes.clone());
 
         let cwd = std::env::temp_dir();
-        let (child, _tmp) =
-            spawn_harness_with_delivery(&hc, &hc.args, &[], &cwd, delivery)
-                .await
-                .unwrap();
+        let (child, _tmp) = spawn_harness_with_delivery(&hc, &hc.args, &[], &cwd, delivery)
+            .await
+            .unwrap();
 
         let output = child.wait_with_output().await.unwrap();
         assert!(

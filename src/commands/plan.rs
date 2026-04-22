@@ -766,8 +766,11 @@ mod tests {
         // easily capture stdout here, but we can validate the resolved
         // string via `effective_context_prepend` and a parallel check that
         // `DEFAULT_CONTEXT_PREPEND` is what `default=true` returns.
-        let effective_when_default =
-            if true { crate::prompt::DEFAULT_CONTEXT_PREPEND } else { "" };
+        let effective_when_default = if true {
+            crate::prompt::DEFAULT_CONTEXT_PREPEND
+        } else {
+            ""
+        };
         assert!(effective_when_default.contains("# Ralph context"));
         assert!(effective_when_default.contains("## Introspecting the plan"));
 

@@ -1109,8 +1109,7 @@ mod tests {
     #[test]
     fn record_source_branch_and_stash_errors_when_no_row() {
         let conn = mem_db();
-        let err = record_source_branch_and_stash(&conn, "/proj-none", "master", None)
-            .unwrap_err();
+        let err = record_source_branch_and_stash(&conn, "/proj-none", "master", None).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("No run_locks row for project"),
