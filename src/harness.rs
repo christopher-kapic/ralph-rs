@@ -1,11 +1,14 @@
 // Harness subprocess management
 
+use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use tempfile::NamedTempFile;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::config::{Config, HarnessConfig};
+use crate::config::{Config, HarnessConfig, PromptInputMode};
 use crate::plan::{Plan, Step};
 
 /// Placeholder token in harness args that gets replaced with the actual prompt.
@@ -16,6 +19,35 @@ const AGENT_FILE_PLACEHOLDER: &str = "{agent_file}";
 
 /// Placeholder token in `model_args` for the selected model identifier.
 const MODEL_PLACEHOLDER: &str = "{model}";
+
+/// Size at which `PromptInputMode::Argv` silently promotes to `TempFile`.
+///
+/// Linux caps a single argv string at `MAX_ARG_STRLEN` = 128 KB and
+/// `execve` returns `E2BIG` past that. Half the kernel limit leaves
+/// headroom for the other argv elements (flags, paths, model args) that
+/// share the argv block, and for a few KB of env that gets counted against
+/// the same limit on some kernels. Any prompt above this threshold spills
+/// to a tempfile with a warning — the user's step still runs, it just
+/// hands the harness a file path instead of the raw text.
+pub(crate) const ARGV_SPILL_THRESHOLD_BYTES: usize = 64 * 1024;
+
+/// How the prompt will actually be delivered to a specific invocation.
+///
+/// Returned by [`resolve_prompt_delivery`] so the spawn path knows whether
+/// to attach a stdin pipe, keep a tempfile alive for the child's lifetime,
+/// or do nothing (prompt is already baked into argv).
+#[derive(Debug)]
+pub enum PromptDelivery {
+    /// Prompt already lives in `args` — nothing extra to do at spawn time.
+    Argv,
+    /// Prompt is piped to the child's stdin after spawn. The bytes are the
+    /// prompt text; the spawn path must write them and close stdin.
+    Stdin(Vec<u8>),
+    /// Prompt has been written to a temp file whose path is already
+    /// substituted into `args`. The `NamedTempFile` must be held alive
+    /// until the child exits (drop triggers cleanup).
+    TempFile(NamedTempFile),
+}
 
 /// Resolve which harness name to use, following the precedence chain:
 /// step.harness -> plan.harness -> config.default_harness
@@ -57,6 +89,12 @@ pub fn resolve_harness<'a>(
 /// Model precedence: `model_override` (e.g. from `Step.model`) takes
 /// priority over `harness_config.default_model`. If both are `None` the
 /// harness is invoked without any model flag.
+///
+/// Note: this always inlines the prompt into argv and is preserved for
+/// tests that expect that behavior. Production code should prefer
+/// [`prepare_harness_invocation`], which honors
+/// [`HarnessConfig::prompt_input`] and picks the safe delivery mode.
+#[allow(dead_code)]
 pub fn build_harness_args(
     harness_name: &str,
     harness_config: &HarnessConfig,
@@ -95,6 +133,18 @@ pub fn build_harness_args(
         args.push(prompt.to_string());
     }
 
+    append_model_and_json_args(&mut args, harness_config, model_override);
+    args
+}
+
+/// Append the optional model flag and JSON-output flags to an already-
+/// assembled args vec. Factored out so both the legacy argv path and the
+/// new [`prepare_harness_invocation`] resolver share the same tail logic.
+fn append_model_and_json_args(
+    args: &mut Vec<String>,
+    harness_config: &HarnessConfig,
+    model_override: Option<&str>,
+) {
     // Forward an optional model selection via the harness's model_args
     // template. Precedence: explicit override (e.g. `Step.model`) first,
     // then the harness's config-level `default_model`. If both are None,
@@ -113,8 +163,116 @@ pub fn build_harness_args(
     if harness_config.supports_json_output {
         args.extend(harness_config.json_output_args.clone());
     }
+}
 
-    args
+/// Prepare a harness invocation, honoring [`HarnessConfig::prompt_input`].
+///
+/// Returns the argv the spawn path should hand to `Command::args` plus a
+/// [`PromptDelivery`] describing what side-channel (stdin pipe or temp
+/// file) the spawn path must set up.
+///
+/// Behavior by mode:
+/// - [`PromptInputMode::Stdin`]: the `{prompt}` placeholder is stripped
+///   from `args` (and any preceding flag that looks dangling is *not*
+///   removed — the harness's config is responsible for ensuring its
+///   stdin-mode args are self-consistent, e.g. `claude -p -`). The
+///   prompt bytes are returned in [`PromptDelivery::Stdin`] for the
+///   spawn path to write to the child's stdin.
+/// - [`PromptInputMode::TempFile`]: the prompt is written to a named
+///   temp file; the file's path is substituted for `{prompt}` in
+///   `args`. The tempfile handle is returned to hold it alive until
+///   the child exits.
+/// - [`PromptInputMode::Argv`]: same as [`build_harness_args`] unless
+///   the prompt exceeds [`ARGV_SPILL_THRESHOLD_BYTES`], in which case
+///   the invocation is transparently promoted to TempFile mode and a
+///   `warn!`-style line is emitted on stderr.
+pub fn prepare_harness_invocation(
+    harness_name: &str,
+    harness_config: &HarnessConfig,
+    prompt: &str,
+    agent_file: Option<&Path>,
+    model_override: Option<&str>,
+) -> Result<(Vec<String>, PromptDelivery)> {
+    // Start with the raw args template and resolve agent-file placeholders
+    // first — same ordering rationale as build_harness_args (so a prompt
+    // whose text contains `{agent_file}` doesn't confuse the removal pass).
+    let mut args = harness_config.args.clone();
+    if let Some(agent_path) = agent_file {
+        let agent_path_str = agent_path.to_string_lossy().to_string();
+        inject_agent_file(harness_name, harness_config, &mut args, &agent_path_str);
+    } else {
+        remove_agent_file_args(&mut args);
+    }
+
+    // Decide the effective delivery mode. Argv auto-spills to TempFile
+    // past the threshold so a retry-context-bloated prompt doesn't trip
+    // E2BIG on the kernel.
+    let mode = match harness_config.prompt_input {
+        PromptInputMode::Argv if prompt.len() > ARGV_SPILL_THRESHOLD_BYTES => {
+            eprintln!(
+                "ralph: warning: prompt is {} bytes (>{} KB threshold); \
+                 spilling to temp file to avoid E2BIG on argv-mode harness '{}'.",
+                prompt.len(),
+                ARGV_SPILL_THRESHOLD_BYTES / 1024,
+                harness_name,
+            );
+            PromptInputMode::TempFile
+        }
+        other => other,
+    };
+
+    let delivery = match mode {
+        PromptInputMode::Stdin => {
+            // Strip any `{prompt}` placeholder tokens from args — in stdin
+            // mode the harness reads its prompt from its stdin pipe and
+            // the placeholder is dead config. If no placeholder is
+            // present we leave args alone (the harness template already
+            // assumes stdin, e.g. opencode `run` with no positional).
+            args.retain(|a| !a.contains(PROMPT_PLACEHOLDER));
+            PromptDelivery::Stdin(prompt.as_bytes().to_vec())
+        }
+        PromptInputMode::TempFile => {
+            // Materialize the prompt to a NamedTempFile, then substitute
+            // its path into args. If no `{prompt}` placeholder is
+            // present, append the path as the trailing positional
+            // (same convention as argv mode's append-when-no-placeholder
+            // behavior).
+            let mut tmp = NamedTempFile::new().context("failed to create prompt temp file")?;
+            tmp.write_all(prompt.as_bytes())
+                .context("failed to write prompt to temp file")?;
+            tmp.flush().context("failed to flush prompt temp file")?;
+            let path_str = tmp.path().to_string_lossy().to_string();
+            let has_placeholder = args.iter().any(|a| a.contains(PROMPT_PLACEHOLDER));
+            if has_placeholder {
+                for a in args.iter_mut() {
+                    if a.contains(PROMPT_PLACEHOLDER) {
+                        *a = a.replace(PROMPT_PLACEHOLDER, &path_str);
+                    }
+                }
+            } else {
+                args.push(path_str);
+            }
+            PromptDelivery::TempFile(tmp)
+        }
+        PromptInputMode::Argv => {
+            // Classic inline-into-argv path — unchanged semantics.
+            let has_prompt_placeholder = args.iter().any(|a| a.contains(PROMPT_PLACEHOLDER));
+            if has_prompt_placeholder {
+                for a in args.iter_mut() {
+                    if a.contains(PROMPT_PLACEHOLDER) {
+                        *a = a.replace(PROMPT_PLACEHOLDER, prompt);
+                    }
+                }
+            } else {
+                args.push(prompt.to_string());
+            }
+            PromptDelivery::Argv
+        }
+    };
+
+    append_model_and_json_args(&mut args, harness_config, model_override);
+
+    Ok((args, delivery))
 }
 
 /// Inject the agent file path into the args based on harness type.
@@ -212,17 +370,53 @@ pub fn build_harness_env(
 /// Note the asymmetry with `spawn_harness_interactive` below: the planner
 /// inherits stdio and expects terminal-driven Ctrl+C to pass straight to the
 /// child, so it is intentionally left in ralph's own process group.
+#[allow(dead_code)]
 pub async fn spawn_harness(
     harness_config: &HarnessConfig,
     args: &[String],
     env_vars: &[(String, String)],
     cwd: &Path,
 ) -> Result<tokio::process::Child> {
+    let (child, _tempfile) =
+        spawn_harness_with_delivery(harness_config, args, env_vars, cwd, PromptDelivery::Argv)
+            .await?;
+    Ok(child)
+}
+
+/// Spawn a harness with an explicit [`PromptDelivery`] side-channel.
+///
+/// - [`PromptDelivery::Argv`]: stdin is `null`, nothing extra to do.
+/// - [`PromptDelivery::Stdin`]: stdin is piped; after spawn we write the
+///   prompt bytes and drop the stdin handle (which sends EOF to the
+///   child). Failure to take stdin is surfaced as a hard error.
+/// - [`PromptDelivery::TempFile`]: stdin is `null` — the prompt is in a
+///   file whose path is already in `args`. The `NamedTempFile` is
+///   returned to the caller, who must keep it alive until the child
+///   exits (drop removes the file). Callers that don't care can let it
+///   drop immediately by binding `_`.
+pub async fn spawn_harness_with_delivery(
+    harness_config: &HarnessConfig,
+    args: &[String],
+    env_vars: &[(String, String)],
+    cwd: &Path,
+    delivery: PromptDelivery,
+) -> Result<(tokio::process::Child, Option<NamedTempFile>)> {
     let mut cmd = Command::new(&harness_config.command);
     cmd.args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    // Attach a stdin pipe only when we have prompt bytes to send;
+    // otherwise close it so the child doesn't block on an empty TTY read.
+    match &delivery {
+        PromptDelivery::Stdin(_) => {
+            cmd.stdin(std::process::Stdio::piped());
+        }
+        PromptDelivery::Argv | PromptDelivery::TempFile(_) => {
+            cmd.stdin(std::process::Stdio::null());
+        }
+    }
 
     for (key, value) in env_vars {
         cmd.env(key, value);
@@ -236,11 +430,43 @@ pub async fn spawn_harness(
         cmd.process_group(0);
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn harness '{}'", harness_config.command))?;
 
-    Ok(child)
+    let (stdin_bytes, tempfile) = match delivery {
+        PromptDelivery::Stdin(bytes) => (Some(bytes), None),
+        PromptDelivery::TempFile(tmp) => (None, Some(tmp)),
+        PromptDelivery::Argv => (None, None),
+    };
+
+    if let Some(bytes) = stdin_bytes {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("child process did not expose a stdin handle")?;
+        // Tolerate BrokenPipe: harnesses that don't actually read stdin
+        // (or exit early) close the pipe before we finish writing. Those
+        // are legitimate scenarios — the child got enough to start work
+        // (or intentionally ignored us) and must not be turned into a
+        // step failure here. Any other IO error is a real problem (e.g.
+        // ENOSPC) and bubbles up.
+        if let Err(e) = stdin.write_all(&bytes).await
+            && e.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(anyhow::Error::new(e).context("failed to write prompt to child stdin"));
+        }
+        if let Err(e) = stdin.shutdown().await
+            && e.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(
+                anyhow::Error::new(e).context("failed to close child stdin after writing prompt")
+            );
+        }
+        drop(stdin);
+    }
+
+    Ok((child, tempfile))
 }
 
 /// Spawn a harness process in interactive mode with inherited stdio.
@@ -336,6 +562,7 @@ mod tests {
             updated_at: Utc::now(),
             prompt_prefix: None,
             prompt_suffix: None,
+            context_prepend: None,
         }
     }
 
@@ -357,6 +584,7 @@ mod tests {
             model: None,
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
+            tags: vec![],
         }
     }
 
@@ -427,6 +655,8 @@ mod tests {
             default_model: None,
             auth_env_vars: vec![],
             auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
 
         let args = build_harness_args("test", &hc, "do the thing", None, None);
@@ -448,6 +678,8 @@ mod tests {
             default_model: None,
             auth_env_vars: vec![],
             auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
 
         let args = build_harness_args("codex", &hc, "implement feature", None, None);
@@ -483,6 +715,8 @@ mod tests {
             default_model: None,
             auth_env_vars: vec![],
             auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
 
         let args = build_harness_args("fake", &hc, "do stuff", None, None);
@@ -719,6 +953,8 @@ mod tests {
             default_model: None,
             auth_env_vars: vec![],
             auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
 
         let agent_path = Path::new("/home/user/.ralph2/agents/default.md");
@@ -743,6 +979,8 @@ mod tests {
             default_model: None,
             auth_env_vars: vec![],
             auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
 
         let env = build_harness_env(&hc, None);
@@ -796,6 +1034,8 @@ mod tests {
             default_model: None,
             auth_env_vars: vec![],
             auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
 
         let args = build_harness_args("test", &hc, "hello world", None, None);
@@ -821,11 +1061,189 @@ mod tests {
             default_model: None,
             auth_env_vars: vec![],
             auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
 
         let agent_path = Path::new("/tmp/agent.md");
         let args = build_harness_args("claude", &hc, "do stuff", Some(agent_path), None);
         assert!(args.contains(&"/tmp/agent.md".to_string()));
         assert!(!args.iter().any(|a| a.contains("{agent_file}")));
+    }
+
+    // -----------------------------------------------------------------
+    // PromptInputMode / prepare_harness_invocation
+    // -----------------------------------------------------------------
+
+    fn hc_with_mode(mode: PromptInputMode, args: Vec<&str>) -> HarnessConfig {
+        HarnessConfig {
+            command: "test".to_string(),
+            args: args.into_iter().map(String::from).collect(),
+            plan_args: vec![],
+            supports_agent_file: false,
+            supports_json_output: false,
+            json_output_args: vec![],
+            agent_file_env: None,
+            agent_file_args: vec![],
+            model_args: vec![],
+            default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
+            prompt_input: mode,
+            color: None,
+        }
+    }
+
+    #[test]
+    fn test_prompt_input_mode_default_is_stdin() {
+        // The `#[serde(default)]` annotation on HarnessConfig::prompt_input
+        // must land on Stdin so older configs (which predate the field)
+        // keep the safe, E2BIG-proof behavior by default.
+        let mode = PromptInputMode::default();
+        assert_eq!(mode, PromptInputMode::Stdin);
+
+        // Also verify the field itself defaults to Stdin when a
+        // HarnessConfig is deserialized without the key.
+        let json = r#"{"command": "test"}"#;
+        let hc: HarnessConfig = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(hc.prompt_input, PromptInputMode::Stdin);
+    }
+
+    #[test]
+    fn test_stdin_mode_strips_prompt_placeholder_and_returns_bytes() {
+        // Stdin mode should NOT leave the prompt text in argv — it strips
+        // the `{prompt}` placeholder and ships the bytes via the returned
+        // PromptDelivery for the spawn path to pipe in.
+        let hc = hc_with_mode(PromptInputMode::Stdin, vec!["-p", "-", "{prompt}"]);
+        let (args, delivery) =
+            prepare_harness_invocation("test", &hc, "hello world", None, None).unwrap();
+        // placeholder gone
+        assert!(!args.iter().any(|a| a.contains("{prompt}")));
+        // raw prompt text NOT in argv
+        assert!(!args.iter().any(|a| a == "hello world"));
+        // surrounding flags preserved
+        assert_eq!(args, vec!["-p".to_string(), "-".to_string()]);
+        match delivery {
+            PromptDelivery::Stdin(bytes) => assert_eq!(bytes, b"hello world"),
+            other => panic!("expected Stdin delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_argv_mode_under_threshold_uses_argv() {
+        // Small prompts on an Argv-mode harness should stay inlined.
+        let hc = hc_with_mode(PromptInputMode::Argv, vec!["-p", "{prompt}"]);
+        let (args, delivery) =
+            prepare_harness_invocation("test", &hc, "short prompt", None, None).unwrap();
+        assert_eq!(args, vec!["-p".to_string(), "short prompt".to_string()]);
+        assert!(matches!(delivery, PromptDelivery::Argv));
+    }
+
+    #[test]
+    fn test_argv_mode_auto_spills_to_tempfile_above_threshold() {
+        // A 100 KB prompt exceeds ARGV_SPILL_THRESHOLD_BYTES (64 KB), so
+        // the invocation must silently promote to TempFile: the `{prompt}`
+        // placeholder gets substituted with a file path (NOT the prompt
+        // text) and a NamedTempFile is returned to be held alive.
+        let hc = hc_with_mode(PromptInputMode::Argv, vec!["-p", "{prompt}"]);
+        let big_prompt = "x".repeat(100 * 1024);
+        let (args, delivery) =
+            prepare_harness_invocation("test", &hc, &big_prompt, None, None).unwrap();
+
+        // The huge prompt text must NOT appear in argv.
+        assert!(
+            !args.iter().any(|a| a.len() > ARGV_SPILL_THRESHOLD_BYTES),
+            "large prompt leaked into argv: {args:?}"
+        );
+        // Argv should now hold a temp file path in the position that
+        // used to carry `{prompt}`.
+        let tmp = match delivery {
+            PromptDelivery::TempFile(t) => t,
+            other => panic!("expected spill to TempFile delivery, got {other:?}"),
+        };
+        let tmp_path_str = tmp.path().to_string_lossy().to_string();
+        assert_eq!(args, vec!["-p".to_string(), tmp_path_str.clone()]);
+
+        // Temp file contents must match the original prompt byte-for-byte.
+        let contents = std::fs::read_to_string(tmp.path()).expect("read tempfile");
+        assert_eq!(contents.len(), big_prompt.len());
+        assert_eq!(contents, big_prompt);
+    }
+
+    #[test]
+    fn test_tempfile_mode_writes_and_passes_path() {
+        // Explicit TempFile mode (e.g. copilot) should behave the same
+        // as the Argv spill path: `{prompt}` is replaced by the temp
+        // file path and the contents match.
+        let hc = hc_with_mode(
+            PromptInputMode::TempFile,
+            vec!["-p", "{prompt}", "--silent"],
+        );
+        let prompt = "prompt body for copilot";
+        let (args, delivery) =
+            prepare_harness_invocation("copilot", &hc, prompt, None, None).unwrap();
+
+        assert!(!args.iter().any(|a| a.contains("{prompt}")));
+        assert!(!args.iter().any(|a| a == prompt));
+        assert_eq!(args[0], "-p");
+        assert_eq!(args[2], "--silent");
+
+        let tmp = match delivery {
+            PromptDelivery::TempFile(t) => t,
+            other => panic!("expected TempFile delivery, got {other:?}"),
+        };
+        assert_eq!(args[1], tmp.path().to_string_lossy());
+
+        let contents = std::fs::read_to_string(tmp.path()).expect("read tempfile");
+        assert_eq!(contents, prompt);
+    }
+
+    #[tokio::test]
+    async fn test_stdin_mode_writes_prompt_to_stdin_and_closes() {
+        // End-to-end: spawn `sh -c 'cat > $OUT'` with Stdin delivery and
+        // verify the prompt lands in the target file byte-for-byte. Proves
+        // both (a) stdin piping works and (b) closing stdin after the write
+        // gets the child to see EOF and exit.
+        let tmp_out = tempfile::NamedTempFile::new().unwrap();
+        let out_path = tmp_out.path().to_path_buf();
+        // Close the file handle so the child can freely overwrite it;
+        // the NamedTempFile will clean up on drop via path.
+        drop(tmp_out);
+
+        let hc = HarnessConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), format!("cat > {}", out_path.display())],
+            plan_args: vec![],
+            supports_agent_file: false,
+            supports_json_output: false,
+            json_output_args: vec![],
+            agent_file_env: None,
+            agent_file_args: vec![],
+            model_args: vec![],
+            default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
+            prompt_input: PromptInputMode::Stdin,
+            color: None,
+        };
+        let prompt_bytes = b"line one\nline two\n".to_vec();
+        let delivery = PromptDelivery::Stdin(prompt_bytes.clone());
+
+        let cwd = std::env::temp_dir();
+        let (child, _tmp) = spawn_harness_with_delivery(&hc, &hc.args, &[], &cwd, delivery)
+            .await
+            .unwrap();
+
+        let output = child.wait_with_output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "sh exited non-zero: stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let written = std::fs::read(&out_path).expect("read output");
+        assert_eq!(written, prompt_bytes);
+        // Best-effort cleanup — ignore if the child already removed it.
+        let _ = std::fs::remove_file(&out_path);
     }
 }

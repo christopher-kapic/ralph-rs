@@ -21,6 +21,26 @@ where
     })
 }
 
+/// How the step prompt is delivered to the harness subprocess.
+///
+/// Linux caps a single argv string at `MAX_ARG_STRLEN` (128 KB) and
+/// `execve` returns `E2BIG` when that limit is exceeded. For large prompts
+/// (retry context accumulating, long plan contexts) ralph must avoid
+/// passing the prompt as an argv element. Most harnesses accept prompts
+/// on stdin; a few require a file path instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptInputMode {
+    /// Pipe prompt to stdin. Most harnesses support this.
+    #[default]
+    Stdin,
+    /// Pass prompt as an argv element. Only for harnesses without stdin support.
+    /// WARNING: subject to 128 KB E2BIG limit; ralph auto-spills to temp file beyond that.
+    Argv,
+    /// Write prompt to a temp file, pass the file path as an argv element.
+    TempFile,
+}
+
 /// Configuration for a single coding agent harness.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HarnessConfig {
@@ -92,6 +112,21 @@ pub struct HarnessConfig {
     /// authenticated. Empty means "no probe".
     #[serde(default)]
     pub auth_probe_args: Vec<String>,
+    /// How the step prompt is delivered to the subprocess. Defaults to
+    /// [`PromptInputMode::Stdin`] so large prompts don't trip `E2BIG` on
+    /// Linux (128 KB argv cap). In `Stdin` mode the `{prompt}` placeholder
+    /// is stripped from `args` at spawn time and the prompt text is piped
+    /// to the child's stdin instead. In `TempFile` mode the placeholder is
+    /// replaced with a temp file path. In `Argv` mode the prompt is passed
+    /// inline — with an automatic spill to `TempFile` when the prompt
+    /// exceeds 64 KB (half the kernel limit, for safety margin).
+    #[serde(default)]
+    pub prompt_input: PromptInputMode,
+    /// Optional per-harness color override as `#RRGGBB` hex. Takes
+    /// precedence over the hardcoded color map in `output::harness_color`.
+    /// Validated at config load time; malformed values cause a hard error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
 }
 
 /// Default timeout in seconds for a single lifecycle hook invocation.
@@ -100,17 +135,34 @@ fn default_hook_timeout_secs() -> u64 {
     120
 }
 
-/// Default for `Config::auto_stash`. Off by default so `ralph run` never
-/// silently sweeps a dirty working tree into a commit — users must opt in
-/// either globally here or per-run via `--auto-stash`.
+/// Default for `Config::auto_stash`. On by default so `ralph run` preserves
+/// a dirty working tree via `git stash push --include-untracked` before
+/// switching branches and pops it back at run end. Users who want to manage
+/// their own stashing can set this to `false` (or pass `--no-auto-stash`
+/// per-run).
 fn default_auto_stash() -> bool {
-    false
+    true
+}
+
+/// Default for `Config::min_free_disk_mb`. 1 GB is enough headroom for a
+/// handful of Cargo artifacts before the next hook gets a chance to run and
+/// prune; tuned low enough not to fire on small projects, high enough to
+/// catch "disk is actually about to fill" before SQLite wedges.
+fn default_min_free_disk_mb() -> u64 {
+    1024
 }
 
 /// Default global prompt prefix seeded by `ralph init`. Points agents at the
 /// ralph CLI so they can look up plan details themselves, and flags
 /// AGENTS.md/CLAUDE.md as the place for plan-specific conventions.
 pub const DEFAULT_GLOBAL_PROMPT_PREFIX: &str = "You are running as part of a `ralph` plan. Run `ralph status` to see the active plan, or `ralph plan show <slug>` for full details. Plan-specific conventions may be defined in AGENTS.md or CLAUDE.md.";
+
+/// Default IANA timezone name used by the progress-header "started at"
+/// stamp. UTC is safe on any platform and doesn't change semantics at DST
+/// boundaries. Users opt in to a local zone via `ralph config set-timezone`.
+pub fn default_display_timezone() -> String {
+    "UTC".to_string()
+}
 
 /// Top-level ralph-rs configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -127,11 +179,11 @@ pub struct Config {
     /// pre/post-test). `0` disables the timeout. Defaults to 120.
     #[serde(default = "default_hook_timeout_secs")]
     pub hook_timeout_secs: u64,
-    /// When true, `ralph run` auto-commits any dirty working-tree state
-    /// before switching to the plan branch. When false (default), a dirty
-    /// working tree causes the run to bail and print the files that would
-    /// have been swept up, so the user can stage intentionally. The
-    /// `--auto-stash` CLI flag overrides this per-run.
+    /// When true (default), `ralph run` stashes any dirty working-tree
+    /// state (tracked + untracked) before switching to the plan branch and
+    /// pops the stash back at run end. When false, a dirty tree causes
+    /// the run to bail so the user can manage it manually. The
+    /// `--no-auto-stash` CLI flag forces this off for a single run.
     #[serde(default = "default_auto_stash")]
     pub auto_stash: bool,
     /// Global prompt prefix prepended to every step prompt, outside any
@@ -145,6 +197,19 @@ pub struct Config {
     /// contribution.
     #[serde(default)]
     pub prompt_suffix: Option<String>,
+    /// Minimum free disk space (in MB) required before running a step.
+    /// Default 1024 (1 GB). Set to 0 to disable the check.
+    ///
+    /// Gates `executor::execute_step` so a nearly-full filesystem terminates
+    /// the attempt with a clear reason instead of letting SQLite hit
+    /// SQLITE_FULL mid-write and corrupt ralph's own state.
+    #[serde(default = "default_min_free_disk_mb")]
+    pub min_free_disk_mb: u64,
+    /// IANA timezone name used to format the "started at" stamp in the
+    /// progress header. Defaults to `UTC`. Validated at load time via
+    /// `chrono_tz::Tz::from_str` so typos fail loudly.
+    #[serde(default = "default_display_timezone")]
+    pub display_timezone: String,
     /// Available harness definitions keyed by name.
     pub harnesses: HashMap<String, HarnessConfig>,
 }
@@ -173,8 +238,84 @@ impl Config {
                 }
             ));
         }
+
+        // Validate display_timezone against chrono-tz's known-name list. We
+        // reject empty / unparseable IANA names at load time rather than
+        // letting format_now_in_tz panic mid-run.
+        use std::str::FromStr;
+        chrono_tz::Tz::from_str(&self.display_timezone).map_err(|e| {
+            anyhow!(
+                "config.display_timezone '{}' is not a valid IANA timezone name: {e}",
+                self.display_timezone
+            )
+        })?;
+
+        // Validate per-harness color overrides. Failing loudly here beats
+        // a silent fallback to the hardcoded map at render time.
+        for (name, hc) in &self.harnesses {
+            if let Some(hex) = &hc.color {
+                crate::output::parse_hex_color(hex)
+                    .map_err(|e| anyhow!("config.harnesses.{name}.color: {e}"))?;
+            }
+        }
         Ok(())
     }
+
+    /// Write this config as pretty-printed JSON to the canonical config
+    /// path (`<config_dir>/config.json`), atomically via tmp-file + rename.
+    ///
+    /// Used by `ralph config set-timezone` and any future mutator paths.
+    /// Validates before writing so we never persist a broken config.
+    pub fn save(&self) -> Result<()> {
+        self.validate()?;
+        let dir = config_dir()?;
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("Failed to create config directory {}", dir.display()))?;
+        let path = dir.join("config.json");
+        write_config_atomic(&dir, &path, self)
+    }
+}
+
+/// Write `config` as pretty-printed JSON to `path` atomically: write to a
+/// uniquely-named tmp file in `dir`, fsync it, then rename over `path`.
+/// Rename is atomic on every supported filesystem, so observers either
+/// see the old file or the new file — never a half-written one.
+fn write_config_atomic(dir: &Path, path: &Path, config: &Config) -> Result<()> {
+    let json = serde_json::to_string_pretty(config)?;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        "config.json.tmp-{}-{}-{:x}",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        nanos,
+    ));
+
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("Failed to create tmp file {}", tmp.display()))?;
+    let write_result = f
+        .write_all(json.as_bytes())
+        .and_then(|_| f.sync_all())
+        .with_context(|| format!("Failed to write tmp file {}", tmp.display()));
+    drop(f);
+
+    let result = write_result.and_then(|_| {
+        fs::rename(&tmp, path)
+            .with_context(|| format!("Failed to rename tmp into {}", path.display()))
+    });
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 impl Default for Config {
@@ -188,8 +329,15 @@ impl Default for Config {
                 // `--permission-mode bypassPermissions` is required for
                 // non-interactive runs — without it, claude falls back to
                 // interactive approval prompts and hangs ralph's subprocess.
+                //
+                // `-p -` tells claude to read the prompt from stdin (the
+                // trailing `-` is the positional PROMPT argument, a Unix
+                // convention for "read from stdin"). In `Stdin` mode the
+                // `{prompt}` placeholder is stripped at spawn time and the
+                // prompt text is piped in instead.
                 args: vec![
                     "-p".to_string(),
+                    "-".to_string(),
                     "--permission-mode".to_string(),
                     "bypassPermissions".to_string(),
                 ],
@@ -218,6 +366,10 @@ impl Default for Config {
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                // Claude accepts prompts on stdin via `-p -` (see args
+                // above). Stdin mode bypasses the 128 KB argv cap.
+                prompt_input: PromptInputMode::Stdin,
+                color: None,
             },
         );
 
@@ -232,6 +384,11 @@ impl Default for Config {
                 // from blocking on approval prompts and avoid persisting
                 // session files that ralph-rs doesn't need.
                 command: "codex".to_string(),
+                // `codex exec` reads the prompt from stdin when no positional
+                // prompt argument is provided. In Stdin mode ralph strips the
+                // `{prompt}` placeholder before spawn and pipes the prompt
+                // text to the child's stdin instead, avoiding the 128 KB
+                // argv cap.
                 args: vec![
                     "exec".to_string(),
                     "{prompt}".to_string(),
@@ -258,6 +415,11 @@ impl Default for Config {
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                // codex exec reads from stdin when no positional prompt is
+                // present; the `{prompt}` placeholder is stripped in Stdin
+                // mode and the prompt is piped in.
+                prompt_input: PromptInputMode::Stdin,
+                color: None,
             },
         );
 
@@ -287,6 +449,12 @@ impl Default for Config {
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                // Pi takes the prompt as a positional argv element. Uses
+                // the auto-spill guard in harness.rs to promote to a
+                // TempFile when the prompt exceeds 64 KB — no verified
+                // stdin support at this time.
+                prompt_input: PromptInputMode::Argv,
+                color: None,
             },
         );
 
@@ -317,6 +485,11 @@ impl Default for Config {
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                // opencode's `run` subcommand reads from stdin when no
+                // positional prompt is supplied; Stdin mode strips the
+                // `{prompt}` placeholder and pipes the prompt in.
+                prompt_input: PromptInputMode::Stdin,
+                color: None,
             },
         );
 
@@ -363,6 +536,12 @@ impl Default for Config {
                     "GITHUB_TOKEN".to_string(),
                 ],
                 auth_probe_args: vec![],
+                // copilot's CLI doesn't accept prompts on stdin, so ralph
+                // materializes the prompt to a temp file and substitutes
+                // the path into the `{prompt}` placeholder. The tempfile
+                // is held alive until the child exits.
+                prompt_input: PromptInputMode::TempFile,
+                color: None,
             },
         );
 
@@ -418,6 +597,11 @@ impl Default for Config {
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                // goose's `-t` flag takes the prompt as an argv element.
+                // The auto-spill guard in harness.rs promotes to TempFile
+                // when the prompt exceeds 64 KB.
+                prompt_input: PromptInputMode::Argv,
+                color: None,
             },
         );
 
@@ -429,6 +613,8 @@ impl Default for Config {
             auto_stash: default_auto_stash(),
             prompt_prefix: Some(DEFAULT_GLOBAL_PROMPT_PREFIX.to_string()),
             prompt_suffix: None,
+            min_free_disk_mb: default_min_free_disk_mb(),
+            display_timezone: default_display_timezone(),
             harnesses,
         }
     }
@@ -552,9 +738,10 @@ mod tests {
         assert_eq!(config.default_harness, "claude");
         assert_eq!(config.max_retries_per_step, 3);
         assert_eq!(config.timeout_secs, None);
-        // L10: auto_stash is opt-in; default config must preserve the safer
-        // "refuse to sweep a dirty tree" behavior.
-        assert!(!config.auto_stash);
+        // Auto-stash is default-on (real git stash + pop, not commit) so
+        // `ralph run` preserves dirty working trees without the user needing
+        // to opt in.
+        assert!(config.auto_stash);
 
         let expected_harnesses = ["claude", "codex", "pi", "opencode", "copilot", "goose"];
         for name in &expected_harnesses {
@@ -874,9 +1061,10 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_stash_defaults_to_false_when_missing_in_json() {
-        // L10: older configs (written before the key existed) must keep
-        // working and default to the safer opt-in behavior.
+    fn test_auto_stash_defaults_to_true_when_missing_in_json() {
+        // Configs written before the key existed must keep working and
+        // default to the new stash-and-pop behavior (opt-out via
+        // --no-auto-stash or `auto_stash: false`).
         let json = r#"{
             "default_harness": "claude",
             "max_retries_per_step": 3,
@@ -886,7 +1074,7 @@ mod tests {
             }
         }"#;
         let config: Config = serde_json::from_str(json).expect("deserialize");
-        assert!(!config.auto_stash);
+        assert!(config.auto_stash);
     }
 
     #[test]
@@ -948,6 +1136,33 @@ mod tests {
     }
 
     #[test]
+    fn test_min_free_disk_mb_default_is_1024() {
+        // Default should guard against SQLITE_FULL crashes at 1 GB.
+        let config = Config::default();
+        assert_eq!(config.min_free_disk_mb, 1024);
+
+        // Missing from JSON should also default to 1024.
+        let json = r#"{
+            "default_harness": "claude",
+            "max_retries_per_step": 3,
+            "harnesses": {"claude": {"command": "claude"}}
+        }"#;
+        let loaded: Config = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(loaded.min_free_disk_mb, 1024);
+    }
+
+    #[test]
+    fn test_min_free_disk_mb_round_trips() {
+        let config = Config {
+            min_free_disk_mb: 2048,
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.min_free_disk_mb, 2048);
+    }
+
+    #[test]
     fn test_harness_config_default_fields() {
         // Verify serde defaults work when fields are omitted
         let json = r#"{"command": "test"}"#;
@@ -958,5 +1173,101 @@ mod tests {
         assert!(!harness.supports_json_output);
         assert!(harness.json_output_args.is_empty());
         assert!(harness.agent_file_env.is_none());
+        assert!(harness.color.is_none());
+    }
+
+    // -- display_timezone ---------------------------------------------------
+
+    #[test]
+    fn test_default_timezone_is_utc() {
+        let config = Config::default();
+        assert_eq!(config.display_timezone, "UTC");
+    }
+
+    #[test]
+    fn test_display_timezone_missing_in_json_defaults_to_utc() {
+        let json = r#"{
+            "default_harness": "claude",
+            "max_retries_per_step": 3,
+            "harnesses": {"claude": {"command": "claude"}}
+        }"#;
+        let c: Config = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(c.display_timezone, "UTC");
+    }
+
+    #[test]
+    fn test_invalid_timezone_fails_to_load() {
+        let config = Config {
+            display_timezone: "Not/A_Real_Zone".to_string(),
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("validate must reject invalid IANA timezone");
+        let msg = format!("{err}");
+        assert!(msg.contains("display_timezone"), "{msg}");
+        assert!(msg.contains("Not/A_Real_Zone"), "{msg}");
+    }
+
+    #[test]
+    fn test_valid_custom_timezone_passes() {
+        let config = Config {
+            display_timezone: "America/New_York".to_string(),
+            ..Default::default()
+        };
+        config
+            .validate()
+            .expect("America/New_York is a valid IANA name");
+    }
+
+    // -- harness color override --------------------------------------------
+
+    #[test]
+    fn test_harness_color_override_hex_parsed() {
+        // Valid hex override passes validation.
+        let mut config = Config::default();
+        config.harnesses.get_mut("claude").unwrap().color = Some("#abcdef".to_string());
+        config.validate().expect("valid hex override must pass");
+
+        // Invalid hex override fails validation with a clear error.
+        let mut config = Config::default();
+        config.harnesses.get_mut("claude").unwrap().color = Some("not-hex".to_string());
+        let err = config
+            .validate()
+            .expect_err("invalid hex must fail validation");
+        let msg = format!("{err}");
+        assert!(msg.contains("claude"), "{msg}");
+        assert!(msg.contains("color"), "{msg}");
+    }
+
+    #[test]
+    fn test_harness_color_json_roundtrip() {
+        let mut config = Config::default();
+        config.harnesses.get_mut("claude").unwrap().color = Some("#112233".to_string());
+        let json = serde_json::to_string(&config).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.harnesses["claude"].color.as_deref(), Some("#112233"));
+    }
+
+    // -- save() round trip -------------------------------------------------
+
+    #[test]
+    fn test_save_round_trip() {
+        // Exercise the atomic writer directly (not Config::save, which
+        // uses the user's real config dir) — write a config to a tmp dir,
+        // read it back, and verify equality.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+        let path = dir.join("config.json");
+
+        let config = Config {
+            display_timezone: "America/New_York".to_string(),
+            ..Config::default()
+        };
+        write_config_atomic(&dir, &path, &config).expect("write_config_atomic");
+
+        let loaded = read_and_validate(&path).expect("read_and_validate");
+        assert_eq!(loaded, config);
+        assert_eq!(loaded.display_timezone, "America/New_York");
     }
 }

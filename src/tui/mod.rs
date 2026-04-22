@@ -32,6 +32,7 @@ mod tests {
             updated_at: Utc::now(),
             prompt_prefix: None,
             prompt_suffix: None,
+            context_prepend: None,
         }
     }
 
@@ -60,6 +61,7 @@ mod tests {
                 model: None,
                 skipped_reason: None,
                 change_policy: crate::plan::ChangePolicy::Required,
+                tags: vec![],
             })
             .collect()
     }
@@ -297,6 +299,7 @@ mod tests {
             model: None,
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
+            tags: vec![],
         };
 
         app.insert_step(new_step);

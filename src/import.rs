@@ -82,6 +82,12 @@ pub struct ImportedPlanMeta {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub plan_harness: Option<String>,
+    /// Per-plan context-prepend override. `None` (missing field) means "use
+    /// the system default at prompt-build time"; `Some(s)` is stored
+    /// verbatim, preserving round-trip fidelity for both overridden and
+    /// empty-string escape-hatch values.
+    #[serde(default)]
+    pub context_prepend: Option<String>,
 }
 
 /// Step from the portable JSON.
@@ -102,6 +108,11 @@ pub struct ImportedStep {
     /// backward compatibility with plan JSON written before V12.
     #[serde(default)]
     pub change_policy: crate::plan::ChangePolicy,
+    /// Free-form string tags attached to the step. Missing field defaults to
+    /// an empty list via serde(default), preserving backward compatibility
+    /// with plan JSON written before V13.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +202,20 @@ fn import_plan_inner(
         storage::set_plan_harness_gen(conn, &plan.id, data.plan.plan_harness.as_deref())?;
     }
 
+    if data.plan.context_prepend.is_some() {
+        // Distinct from "missing field": a `None` import means the export
+        // didn't carry a context_prepend override, so we leave the new plan
+        // at its freshly-created NULL (system-default) state. `Some("")`
+        // imports as an explicit no-prepend escape hatch and must survive.
+        storage::set_plan_context_prepend(conn, &plan.id, data.plan.context_prepend.as_deref())?;
+    }
+
     for step_data in &data.steps {
+        let tags_arg: Option<&[String]> = if step_data.tags.is_empty() {
+            None
+        } else {
+            Some(&step_data.tags)
+        };
         storage::create_step(
             conn,
             &plan.id,
@@ -203,6 +227,7 @@ fn import_plan_inner(
             step_data.max_retries,
             step_data.model.as_deref(),
             Some(step_data.change_policy),
+            tags_arg,
         )?;
     }
 
@@ -599,6 +624,7 @@ mod tests {
             Some(2),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -610,6 +636,7 @@ mod tests {
             None,
             Some("codex"),
             &["code written".to_string(), "tests pass".to_string()],
+            None,
             None,
             None,
             None,
@@ -1102,6 +1129,7 @@ mod tests {
             None,
             None,
             Some(crate::plan::ChangePolicy::Required),
+            None,
         )
         .unwrap();
         storage::create_step(
@@ -1115,6 +1143,7 @@ mod tests {
             None,
             None,
             Some(crate::plan::ChangePolicy::Optional),
+            None,
         )
         .unwrap();
 
@@ -1174,5 +1203,73 @@ mod tests {
         // Even in strict mode, an unparseable version only warns; the
         // import proceeds because there's nothing concrete to compare.
         assert!(import_plan_from_data(&conn, &data, &options).is_ok());
+    }
+
+    #[test]
+    fn test_import_missing_tags_defaults_to_empty() {
+        // Pre-V13 export JSON doesn't include a `tags` field. The import path
+        // must fall back to an empty list via serde(default) and not reject
+        // the payload.
+        let conn = setup();
+        let json = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {
+                "slug": "no-tags",
+                "branch_name": "b",
+                "description": "legacy export"
+            },
+            "steps": [
+                {"title": "legacy step", "description": "d"}
+            ]
+        }"#;
+
+        let data: ImportedPlan = serde_json::from_str(json).unwrap();
+        assert!(data.steps[0].tags.is_empty());
+
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj",
+            strict: false,
+        };
+        let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
+        let steps = storage::list_steps(&conn, &plan_id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert!(steps[0].tags.is_empty());
+    }
+
+    #[test]
+    fn test_import_preserves_explicit_tags() {
+        let conn = setup();
+        let json = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {
+                "slug": "tagged-import",
+                "branch_name": "b",
+                "description": "desc"
+            },
+            "steps": [
+                {"title": "Tagged", "description": "d", "tags": ["FIX", "REGRESSION"]}
+            ]
+        }"#;
+
+        let data: ImportedPlan = serde_json::from_str(json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj",
+            strict: false,
+        };
+        let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
+        let steps = storage::list_steps(&conn, &plan_id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].tags,
+            vec!["FIX".to_string(), "REGRESSION".to_string()]
+        );
     }
 }

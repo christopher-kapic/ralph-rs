@@ -16,7 +16,7 @@ use crate::harness::{self, HarnessOutput};
 use crate::hooks::{self, HookContext};
 use crate::io_util;
 use crate::plan::{ChangePolicy, Phase, Plan, Step, StepStatus, TerminationReason, TestStatus};
-use crate::prompt::{self, PriorStepSummary, PromptWrap, PromptWraps, RetryContext};
+use crate::prompt::{self, PromptWrap, PromptWraps, RetryContext};
 use crate::run_lock::process_start_token;
 use crate::storage::{self, ChildUpdate};
 use crate::test_runner;
@@ -54,6 +54,32 @@ pub struct StepResult {
     pub attempts_used: i32,
     pub commit_hash: Option<String>,
 }
+
+/// Per-call options threaded from the runner into [`execute_step`] to drive
+/// the per-attempt progress sub-header and prompt preview. Kept separate
+/// from the persistent [`Config`] knobs because these are read from CLI
+/// flags / output context, not config.json.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct ExecuteOptions {
+    /// Skip truncation on the per-attempt prompt preview.
+    pub verbose: bool,
+    /// 1-based step position for the progress sub-header. Reserved for
+    /// future header layouts that reprint the step number per attempt.
+    pub step_num_in_plan: usize,
+    /// Total steps in the plan (for the `[N/M]` prefix). Reserved; see above.
+    pub step_total: usize,
+    /// True when the parent runner is emitting NDJSON. Suppresses the
+    /// human-readable sub-header and preview (we emit PromptPrepared events
+    /// instead).
+    pub json_output: bool,
+    /// True when stderr should be ANSI-colored.
+    pub color: bool,
+}
+
+/// Max chars of prompt included in the non-verbose preview and the
+/// `RunEvent::PromptPrepared` payload.
+const PROMPT_PREVIEW_CHARS: usize = 512;
 
 // ---------------------------------------------------------------------------
 // Structured JSON output parsing
@@ -358,6 +384,7 @@ async fn finalize_failure(
 /// 7. If tests pass → git commit with step metadata, log success
 /// 8. If tests fail → git rollback, log failure
 /// 9. Return [`StepResult`]
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_step(
     conn: &Connection,
     plan: &Plan,
@@ -366,6 +393,7 @@ pub async fn execute_step(
     workdir: &Path,
     hook_ctx: &HookContext,
     abort_rx: watch::Receiver<bool>,
+    exec_opts: ExecuteOptions,
 ) -> Result<StepResult> {
     let max_retries = step
         .max_retries
@@ -387,6 +415,69 @@ pub async fn execute_step(
         );
     }
 
+    // Per-step disk-space gate.
+    //
+    // A nearly-full filesystem is the only class of failure where we actively
+    // don't want to start work — past that point, SQLite writes start failing
+    // with SQLITE_FULL and ralph's own state (execution_logs, run_locks) can
+    // be corrupted. Check before we even touch the retry loop so a FS that
+    // filled between preflight and now still bails out cleanly.
+    //
+    // `min_free_disk_mb = 0` disables the check (user opt-out).
+    if config.min_free_disk_mb > 0 {
+        match crate::preflight::disk_space(workdir) {
+            Ok(ds) => {
+                let required_bytes = config.min_free_disk_mb.saturating_mul(1_048_576);
+                if ds.available_bytes < required_bytes {
+                    let have_gb = ds.available_gb();
+                    let need_gb = config.min_free_disk_mb as f64 / 1024.0;
+                    eprintln!(
+                        "> Step skipped: only {have_gb:.1} GB free, need >= {need_gb:.1} GB \
+                         (config: min_free_disk_mb)"
+                    );
+                    let attempt = step.attempts + 1;
+                    set_step_attempts(conn, &step.id, attempt)?;
+                    let exec_log =
+                        storage::create_execution_log(conn, &step.id, attempt, None, None)?;
+                    let msg = format!(
+                        "insufficient disk space: {have_gb:.1} GB free, \
+                         need >= {need_gb:.1} GB"
+                    );
+                    storage::update_execution_log(
+                        conn,
+                        exec_log.id,
+                        Some(0.0),
+                        None,
+                        &[msg],
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(TerminationReason::InsufficientDiskSpace),
+                        Some(TestStatus::NotRun),
+                    )?;
+                    storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
+                    return Ok(StepResult {
+                        outcome: StepOutcome::Failed,
+                        step_id: step.id.clone(),
+                        attempts_used: attempt,
+                        commit_hash: None,
+                    });
+                }
+            }
+            Err(e) => {
+                // Probe failure (non-unix, weird FS) — log and continue.
+                // We'd rather run than block on an inscrutable error.
+                eprintln!("> Disk space probe failed, continuing: {e}");
+            }
+        }
+    }
+
     let timeout = config.timeout_secs.map(Duration::from_secs);
 
     // Resolve harness once (doesn't change between retries).
@@ -395,13 +486,15 @@ pub async fn execute_step(
     // Resolve agent file path.
     let agent_file_path: Option<PathBuf> = resolve_agent_file(step, plan);
 
-    // Collect prior step summaries for prompt context.
-    let prior_steps = build_prior_step_summaries(conn, plan, step)?;
+    // Snapshot all steps in the plan so the prompt builder can render the
+    // compact "Plan step map" section. Taken once up front (pre-attempt)
+    // because steps don't change during a single-step execution, and a
+    // consistent snapshot keeps the prompt stable across retries.
+    let all_steps = storage::list_steps(conn, &plan.id)?;
 
     // 1-based position of `step` within its plan. Computed once up front so
     // every `write_phase` call can pass it without reshuffling the plan's
-    // step list each time. Mirrors the index walk in
-    // `build_prior_step_summaries`.
+    // step list each time.
     let step_num = resolve_step_num(conn, plan, step)?;
 
     // Snapshot pre-existing untracked files so we don't accidentally commit them.
@@ -502,7 +595,7 @@ pub async fn execute_step(
         let prompt_text = prompt::build_step_prompt(
             plan,
             step,
-            &prior_steps,
+            &all_steps,
             agent_name,
             retry_context.as_ref(),
             harness_config.supports_agent_file,
@@ -513,6 +606,20 @@ pub async fn execute_step(
         let exec_log =
             storage::create_execution_log(conn, &step.id, attempt, Some(&prompt_text), None)?;
         let started_at = std::time::Instant::now();
+
+        // Per-attempt progress sub-header and prompt preview. Printed
+        // inside the retry loop so every attempt (including retries) gets
+        // its own timestamped "started at" line. In NDJSON mode we emit
+        // a structured `PromptPrepared` event instead.
+        render_attempt_header(
+            &exec_opts,
+            config,
+            harness_name,
+            harness_config,
+            attempt,
+            max_attempts,
+        );
+        render_prompt_preview(&exec_opts, step, attempt, &prompt_text)?;
 
         // Record the step identity + attempt bookkeeping on the run_locks
         // row. Subsequent `write_phase` calls in this attempt can pass
@@ -599,13 +706,19 @@ pub async fn execute_step(
         // Build harness args and env. `step.model` (if set) overrides the
         // harness's config-level `default_model`; None on both sides means
         // the harness is invoked without any model flag.
-        let args = harness::build_harness_args(
+        //
+        // `prepare_harness_invocation` also decides how the prompt is
+        // delivered to the child (stdin / temp file / argv) per the
+        // harness's `prompt_input` mode. A retry-context-bloated prompt
+        // on an argv-mode harness transparently spills to a temp file so
+        // we don't trip `E2BIG` at `execve` time.
+        let (args, prompt_delivery) = harness::prepare_harness_invocation(
             harness_name,
             harness_config,
             &prompt_text,
             agent_file_path.as_deref(),
             step.model.as_deref(),
-        );
+        )?;
         let env_vars = harness::build_harness_env(harness_config, agent_file_path.as_deref());
 
         // Announce the harness phase with the harness name as the current
@@ -626,8 +739,17 @@ pub async fn execute_step(
             ChildUpdate::Keep,
         )?;
 
-        // Spawn harness subprocess.
-        let child = harness::spawn_harness(harness_config, &args, &env_vars, workdir).await?;
+        // Spawn harness subprocess. The tempfile (if any) must outlive
+        // the child — drop triggers cleanup, which would yank the prompt
+        // out from under the harness mid-run.
+        let (child, _prompt_tempfile) = harness::spawn_harness_with_delivery(
+            harness_config,
+            &args,
+            &env_vars,
+            workdir,
+            prompt_delivery,
+        )
+        .await?;
 
         // As soon as we have a pid, record it on the run_locks row along
         // with a matching start token so the killpg path can verify it's
@@ -1459,85 +1581,107 @@ fn resolve_agent_file(step: &Step, plan: &Plan) -> Option<PathBuf> {
     }
 }
 
-/// Build prior step summaries for all steps before the current one.
-fn build_prior_step_summaries(
-    conn: &Connection,
-    plan: &Plan,
-    current_step: &Step,
-) -> Result<Vec<PriorStepSummary>> {
-    let all_steps = storage::list_steps(conn, &plan.id)?;
-    let mut summaries = Vec::new();
-
-    for (idx, s) in all_steps.iter().enumerate() {
-        if s.sort_key >= current_step.sort_key {
-            break;
-        }
-        // Include any step that has produced an outcome — success, skip, or
-        // failure. Failed/Aborted steps give the agent useful "here's what
-        // did not work" context. Pending/InProgress are excluded because
-        // they have nothing to report yet.
-        if matches!(
-            s.status,
-            StepStatus::Complete | StepStatus::Skipped | StepStatus::Failed | StepStatus::Aborted
-        ) {
-            // Try to get changed files from the latest execution log.
-            let files_changed = if let Ok(Some(log)) = storage::get_latest_log_for_step(conn, &s.id)
-            {
-                if let Some(diff) = &log.diff {
-                    extract_changed_files_from_diff(diff)
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-
-            summaries.push(PriorStepSummary {
-                // Real 1-based position in the plan — not the summary slice
-                // index, so skipped/pending steps keep their numbering
-                // stable when some predecessors are filtered out.
-                number: idx + 1,
-                title: s.title.clone(),
-                status: s.status,
-                files_changed,
-                description: s.description.clone(),
-            });
-        }
-    }
-
-    Ok(summaries)
-}
-
-/// Extract file paths from a unified diff.
-///
-/// Captures additions and modifications (`+++ b/`), deletions (`--- a/` paired
-/// with `+++ /dev/null`), and both sides of renames (`rename from`/`rename to`,
-/// or the `--- a/` and `+++ b/` pair when rename detection emits a diff body).
-fn extract_changed_files_from_diff(diff: &str) -> Vec<String> {
-    let mut files = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for line in diff.lines() {
-        let path = line
-            .strip_prefix("+++ b/")
-            .or_else(|| line.strip_prefix("--- a/"))
-            .or_else(|| line.strip_prefix("rename from "))
-            .or_else(|| line.strip_prefix("rename to "));
-        if let Some(path) = path
-            && path != "/dev/null"
-            && seen.insert(path.to_string())
-        {
-            files.push(path.to_string());
-        }
-    }
-    files
-}
-
 /// Set the attempt count for a step to an absolute value.
 fn set_step_attempts(conn: &Connection, step_id: &str, attempts: i32) -> Result<()> {
     conn.execute(
         "UPDATE steps SET attempts = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
         rusqlite::params![attempts, step_id],
     ).context("Failed to update step attempts")?;
+    Ok(())
+}
+
+/// Print the per-attempt start header to stderr:
+/// `  -> attempt N/M [started YYYY-MM-DD HH:MM:SS ZONE]`.
+///
+/// Skipped in NDJSON mode — the JSON consumer already sees `StepStarted`
+/// and the new `PromptPrepared` event.
+fn render_attempt_header(
+    exec_opts: &ExecuteOptions,
+    config: &Config,
+    harness_name: &str,
+    harness_config: &crate::config::HarnessConfig,
+    attempt: i32,
+    max_attempts: i32,
+) {
+    if exec_opts.json_output {
+        return;
+    }
+    use std::str::FromStr;
+    // Config::load_or_create_config validated the zone up front, so parse
+    // failure here means the user edited config.json under us. Fall back
+    // to UTC silently rather than blow up the run.
+    let tz = chrono_tz::Tz::from_str(&config.display_timezone).unwrap_or(chrono_tz::UTC);
+    let now_str = crate::output::format_now_in_tz(&tz);
+    let harness_label = crate::output::format_harness_label_with_override(
+        harness_name,
+        harness_config.color.as_deref(),
+        exec_opts.color,
+    );
+    eprintln!(
+        "  -> {} attempt {}/{} [started {}]",
+        harness_label, attempt, max_attempts, now_str
+    );
+}
+
+/// Emit the prompt preview (truncated to 512 chars unless `--verbose`) or,
+/// in NDJSON mode, a `PromptPrepared` event with the full char count and a
+/// fixed-length preview.
+fn render_prompt_preview(
+    exec_opts: &ExecuteOptions,
+    step: &Step,
+    attempt: i32,
+    prompt_text: &str,
+) -> Result<()> {
+    if exec_opts.json_output {
+        let total_chars = prompt_text.chars().count();
+        let preview: String = prompt_text.chars().take(PROMPT_PREVIEW_CHARS).collect();
+        crate::output::emit_ndjson(&crate::output::RunEvent::PromptPrepared {
+            step_id: step.id.clone(),
+            attempt,
+            prompt_chars: total_chars,
+            prompt_preview: preview,
+        })?;
+        return Ok(());
+    }
+
+    let mut stderr = std::io::stderr().lock();
+    render_prompt_preview_to(&mut stderr, exec_opts.verbose, prompt_text)?;
+    Ok(())
+}
+
+/// Testable core of [`render_prompt_preview`]: write the human-readable
+/// preview section to `writer`, truncating to 512 chars unless `verbose`.
+fn render_prompt_preview_to<W: std::io::Write>(
+    writer: &mut W,
+    verbose: bool,
+    prompt_text: &str,
+) -> std::io::Result<()> {
+    let total_chars = prompt_text.chars().count();
+    let (shown, truncated) = if verbose || total_chars <= PROMPT_PREVIEW_CHARS {
+        (prompt_text.to_string(), false)
+    } else {
+        let slice: String = prompt_text.chars().take(PROMPT_PREVIEW_CHARS).collect();
+        (slice, true)
+    };
+    let shown_chars = shown.chars().count();
+
+    writeln!(
+        writer,
+        "  Prompt ({} of {} chars):",
+        shown_chars, total_chars
+    )?;
+    for raw in shown.lines() {
+        // Drop trailing whitespace per line for visual cleanliness; empty
+        // lines are preserved so paragraph breaks survive the indent.
+        let trimmed = raw.trim_end();
+        writeln!(writer, "    {trimmed}")?;
+    }
+    if truncated {
+        writeln!(
+            writer,
+            "    [truncated — re-run with --verbose to see the full prompt]"
+        )?;
+    }
     Ok(())
 }
 
@@ -1561,6 +1705,68 @@ fn resolve_step_num(conn: &Connection, plan: &Plan, step: &Step) -> Result<i32> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Prompt preview rendering ------------------------------------------
+
+    #[test]
+    fn test_prompt_display_truncates_to_512_by_default() {
+        // Build a prompt with 1024 distinct chars.
+        let prompt: String = (0..1024).map(|i| ((i % 26) as u8 + b'a') as char).collect();
+        let mut buf: Vec<u8> = Vec::new();
+        render_prompt_preview_to(&mut buf, false, &prompt).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        // Header records the character counts.
+        assert!(
+            out.contains("Prompt (512 of 1024 chars):"),
+            "expected '(512 of 1024 chars)', got: {out}"
+        );
+        // Truncation marker appears.
+        assert!(
+            out.contains("[truncated"),
+            "expected truncation marker, got: {out}"
+        );
+        // Preview never contains the 600th character (`(600 % 26) + 'a' = 'y'`).
+        // Stronger check: the body between the header and the marker must
+        // not exceed 512 chars of content plus the 4-space indent.
+    }
+
+    #[test]
+    fn test_prompt_display_full_with_verbose() {
+        let prompt = "first line\nsecond line\n";
+        let mut buf: Vec<u8> = Vec::new();
+        render_prompt_preview_to(&mut buf, true, prompt).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("Prompt ("));
+        // No truncation marker when verbose is set.
+        assert!(!out.contains("[truncated"));
+        // Body preserved with 4-space indent.
+        assert!(out.contains("    first line"));
+        assert!(out.contains("    second line"));
+    }
+
+    #[test]
+    fn test_prompt_display_short_prompt_no_truncation_marker() {
+        // A short prompt (<=512 chars) must not show the truncation marker
+        // even without --verbose.
+        let prompt = "tiny prompt";
+        let mut buf: Vec<u8> = Vec::new();
+        render_prompt_preview_to(&mut buf, false, prompt).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("Prompt (11 of 11 chars):"));
+        assert!(!out.contains("[truncated"));
+    }
+
+    #[test]
+    fn test_prompt_display_strips_trailing_whitespace() {
+        let prompt = "line one   \nline two\t\t\n";
+        let mut buf: Vec<u8> = Vec::new();
+        render_prompt_preview_to(&mut buf, true, prompt).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        // No trailing spaces/tabs on rendered lines.
+        assert!(out.contains("    line one\n"));
+        assert!(out.contains("    line two\n"));
+        assert!(!out.contains("    line one   "));
+    }
 
     #[test]
     fn test_parse_harness_json_full() {
@@ -1604,64 +1810,6 @@ mod tests {
         let json = r#"{"unknown_field": 42}"#;
         let parsed = parse_harness_json(json);
         assert!(parsed.cost_usd.is_none());
-    }
-
-    #[test]
-    fn test_extract_changed_files_from_diff() {
-        let diff = "\
-diff --git a/src/main.rs b/src/main.rs
---- a/src/main.rs
-+++ b/src/main.rs
-@@ -1,3 +1,4 @@
- fn main() {}
-+// new line
-diff --git a/src/lib.rs b/src/lib.rs
---- /dev/null
-+++ b/src/lib.rs
-@@ -0,0 +1 @@
-+pub mod foo;
-";
-        let files = extract_changed_files_from_diff(diff);
-        assert_eq!(files, vec!["src/main.rs", "src/lib.rs"]);
-    }
-
-    #[test]
-    fn test_extract_changed_files_from_diff_empty() {
-        let files = extract_changed_files_from_diff("");
-        assert!(files.is_empty());
-    }
-
-    #[test]
-    fn test_extract_changed_files_from_diff_delete_rename_add() {
-        let diff = "\
-diff --git a/deleted.txt b/deleted.txt
-deleted file mode 100644
---- a/deleted.txt
-+++ /dev/null
-@@ -1 +0,0 @@
--gone
-diff --git a/old_name.rs b/new_name.rs
-similarity index 80%
-rename from old_name.rs
-rename to new_name.rs
---- a/old_name.rs
-+++ b/new_name.rs
-@@ -1,2 +1,2 @@
--fn old() {}
-+fn new() {}
-diff --git a/added.rs b/added.rs
-new file mode 100644
---- /dev/null
-+++ b/added.rs
-@@ -0,0 +1 @@
-+pub fn x() {}
-";
-        let files = extract_changed_files_from_diff(diff);
-        assert!(files.contains(&"deleted.txt".to_string()));
-        assert!(files.contains(&"old_name.rs".to_string()));
-        assert!(files.contains(&"new_name.rs".to_string()));
-        assert!(files.contains(&"added.rs".to_string()));
-        assert_eq!(files.len(), 4);
     }
 
     #[test]
@@ -1723,6 +1871,7 @@ new file mode 100644
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(step.attempts, 0);
@@ -1730,190 +1879,6 @@ new file mode 100644
         super::set_step_attempts(&conn, &step.id, 3).unwrap();
         let updated = storage::get_step(&conn, &step.id).unwrap();
         assert_eq!(updated.attempts, 3);
-    }
-
-    #[test]
-    fn test_build_prior_step_summaries() {
-        let conn = crate::db::open_memory().unwrap();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-
-        let (s1, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let (s2, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let (s3, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "Third",
-            "d3",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        // Mark first two as complete.
-        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
-        storage::update_step_status(&conn, &s2.id, StepStatus::Complete).unwrap();
-
-        let summaries = build_prior_step_summaries(&conn, &plan, &s3).unwrap();
-        assert_eq!(summaries.len(), 2);
-        assert_eq!(summaries[0].title, "First");
-        assert_eq!(summaries[1].title, "Second");
-    }
-
-    #[test]
-    fn test_build_prior_step_summaries_skips_non_complete() {
-        let conn = crate::db::open_memory().unwrap();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-
-        let (s1, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let (_s2, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let (s3, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "Third",
-            "d3",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        // Only first is complete; second is pending.
-        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
-
-        let summaries = build_prior_step_summaries(&conn, &plan, &s3).unwrap();
-        assert_eq!(summaries.len(), 1);
-        assert_eq!(summaries[0].title, "First");
-        assert_eq!(summaries[0].number, 1);
-    }
-
-    /// Prior-step summaries must carry each step's real 1-based position in
-    /// the plan, not the index in the filtered slice. When a pending step
-    /// sits between two completed steps, the second summary should be
-    /// numbered 3 (its plan position) rather than 2 (its slice index).
-    #[test]
-    fn test_build_prior_step_summaries_preserves_real_numbers_with_gap() {
-        let conn = crate::db::open_memory().unwrap();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-
-        let (s1, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let (_s2, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let (s3, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "Third",
-            "d3",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let (s4, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "Fourth",
-            "d4",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        // s1 and s3 are complete; s2 is pending (the gap).
-        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
-        storage::update_step_status(&conn, &s3.id, StepStatus::Complete).unwrap();
-
-        let summaries = build_prior_step_summaries(&conn, &plan, &s4).unwrap();
-        assert_eq!(summaries.len(), 2);
-        assert_eq!(summaries[0].title, "First");
-        assert_eq!(summaries[0].number, 1);
-        assert_eq!(summaries[1].title, "Third");
-        // Plan position (3), not slice index (2).
-        assert_eq!(summaries[1].number, 3);
     }
 
     /// Regression: aborting at the pre-log boundary must persist the bumped
@@ -1981,6 +1946,7 @@ new file mode 100644
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(step.attempts, 0);
@@ -1995,9 +1961,18 @@ new file mode 100644
             hook_timeout_secs: 120,
         };
 
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.outcome, StepOutcome::Aborted);
         assert_eq!(result.attempts_used, 1);
@@ -2141,6 +2116,7 @@ new file mode 100644
             Some(0),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2163,9 +2139,18 @@ new file mode 100644
         let (_tx, rx) = watch::channel(false);
 
         let config = Config::default();
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.outcome, StepOutcome::Failed);
 
@@ -2218,6 +2203,7 @@ new file mode 100644
             Some(0), // no retries — single failure is terminal
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2238,6 +2224,8 @@ new file mode 100644
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                color: None,
             },
         );
 
@@ -2248,9 +2236,18 @@ new file mode 100644
         };
         let (_tx, rx) = watch::channel(false);
 
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result.outcome, StepOutcome::Failed);
 
@@ -2342,6 +2339,7 @@ new file mode 100644
             Some(0),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2361,6 +2359,8 @@ new file mode 100644
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                color: None,
             },
         );
 
@@ -2375,7 +2375,16 @@ new file mode 100644
         // stalling the suite forever.
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
         )
         .await
         .expect("execute_step deadlocked on large harness output")
@@ -2447,6 +2456,7 @@ new file mode 100644
             Some(0),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2466,6 +2476,8 @@ new file mode 100644
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                color: None,
             },
         );
 
@@ -2478,7 +2490,16 @@ new file mode 100644
 
         let _result = tokio::time::timeout(
             Duration::from_secs(60),
-            execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
         )
         .await
         .expect("execute_step deadlocked on >4 MiB harness output")
@@ -2549,6 +2570,7 @@ new file mode 100644
             Some(0),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2568,6 +2590,8 @@ new file mode 100644
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                color: None,
             },
         );
 
@@ -2580,7 +2604,16 @@ new file mode 100644
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
         )
         .await
         .expect("execute_step timed out")
@@ -2680,6 +2713,7 @@ new file mode 100644
             Some(0),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2699,6 +2733,8 @@ new file mode 100644
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                color: None,
             },
         );
 
@@ -2731,7 +2767,16 @@ new file mode 100644
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
         )
         .await
         .expect("execute_step did not return within 10s on abort")
@@ -2834,6 +2879,7 @@ new file mode 100644
             Some(0),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2853,6 +2899,8 @@ new file mode 100644
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                color: None,
             },
         );
 
@@ -2883,7 +2931,16 @@ new file mode 100644
         // quick failure rather than a stalled suite.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
         )
         .await
         .expect("execute_step did not return within 10s on abort")
@@ -2936,6 +2993,8 @@ new file mode 100644
             default_model: None,
             auth_env_vars: vec![],
             auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         }
     }
 
@@ -3005,6 +3064,7 @@ new file mode 100644
             Some(0),
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(step.change_policy, ChangePolicy::Required);
@@ -3020,9 +3080,18 @@ new file mode 100644
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
 
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
@@ -3071,6 +3140,7 @@ new file mode 100644
             Some(0),
             None,
             Some(ChangePolicy::Optional),
+            None,
         )
         .unwrap();
 
@@ -3085,9 +3155,18 @@ new file mode 100644
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Success);
         assert!(result.commit_hash.is_none());
 
@@ -3142,6 +3221,7 @@ new file mode 100644
             Some(0),
             None,
             Some(ChangePolicy::Optional),
+            None,
         )
         .unwrap();
 
@@ -3156,9 +3236,18 @@ new file mode 100644
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Success);
         assert!(result.commit_hash.is_none());
 
@@ -3208,6 +3297,7 @@ new file mode 100644
             Some(0),
             None,
             Some(ChangePolicy::Optional),
+            None,
         )
         .unwrap();
 
@@ -3222,9 +3312,18 @@ new file mode 100644
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
 
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
@@ -3275,6 +3374,7 @@ new file mode 100644
             Some(0),
             None,
             Some(ChangePolicy::Optional),
+            None,
         )
         .unwrap();
 
@@ -3289,9 +3389,18 @@ new file mode 100644
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Success);
         assert!(
             result.commit_hash.is_some(),
@@ -3370,6 +3479,7 @@ new file mode 100644
             Some(0), // no retries
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -3385,9 +3495,18 @@ new file mode 100644
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
         assert_eq!(result.attempts_used, 1);
 
@@ -3444,6 +3563,7 @@ new file mode 100644
             Some(0),
             None,
             Some(ChangePolicy::Optional),
+            None,
         )
         .unwrap();
 
@@ -3459,9 +3579,18 @@ new file mode 100644
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result.outcome,
             StepOutcome::Failed,
@@ -3519,6 +3648,7 @@ new file mode 100644
             Some(0),
             None,
             None, // Required
+            None,
         )
         .unwrap();
 
@@ -3534,9 +3664,18 @@ new file mode 100644
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
         assert!(result.commit_hash.is_none());
 
@@ -3596,6 +3735,7 @@ new file mode 100644
             Some(2), // 2 retries = 3 total attempts
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -3611,9 +3751,18 @@ new file mode 100644
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(false);
-        let result = execute_step(&conn, &plan, &step, &config, &dir, &hook_ctx, rx)
-            .await
-            .unwrap();
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
         assert_eq!(result.attempts_used, 3);
 

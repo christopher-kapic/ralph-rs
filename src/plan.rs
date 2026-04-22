@@ -265,6 +265,11 @@ pub enum TerminationReason {
     HarnessFailed,
     CommitFailed,
     RollbackFailed,
+    /// Step aborted because free disk space dropped below
+    /// `Config::min_free_disk_mb`. Distinct from `HarnessFailed` so the user
+    /// can tell the difference between "the agent crashed" and "we never
+    /// even started it because the FS was about to fill".
+    InsufficientDiskSpace,
     Unknown,
 }
 
@@ -280,6 +285,7 @@ impl TerminationReason {
             Self::HarnessFailed => "harness_failed",
             Self::CommitFailed => "commit_failed",
             Self::RollbackFailed => "rollback_failed",
+            Self::InsufficientDiskSpace => "insufficient_disk_space",
             Self::Unknown => "unknown",
         }
     }
@@ -305,6 +311,7 @@ impl std::str::FromStr for TerminationReason {
             "harness_failed" => Ok(Self::HarnessFailed),
             "commit_failed" => Ok(Self::CommitFailed),
             "rollback_failed" => Ok(Self::RollbackFailed),
+            "insufficient_disk_space" => Ok(Self::InsufficientDiskSpace),
             "unknown" => Ok(Self::Unknown),
             other => Err(ParseStatusError(other.to_string())),
         }
@@ -371,11 +378,12 @@ impl std::str::FromStr for TestStatus {
 /// Canonical column list for `SELECT` queries against the `plans` table.
 ///
 /// Matches the physical table layout after all migrations: V1 defined every
-/// column through `updated_at`, V5 appended `plan_harness`, and V10 appended
-/// `prompt_prefix` and `prompt_suffix` via `ALTER TABLE ... ADD COLUMN`.
-/// Every `Plan`-returning query MUST use this list so [`Plan::from_row`]'s
-/// indices line up — a raw `SELECT *` would otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, prompt_prefix, prompt_suffix";
+/// column through `updated_at`, V5 appended `plan_harness`, V10 appended
+/// `prompt_prefix` and `prompt_suffix`, and V14 appended `context_prepend`
+/// via `ALTER TABLE ... ADD COLUMN`. Every `Plan`-returning query MUST use
+/// this list so [`Plan::from_row`]'s indices line up — a raw `SELECT *`
+/// would otherwise swap columns.
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, prompt_prefix, prompt_suffix, context_prepend";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +404,12 @@ pub struct Plan {
     pub prompt_prefix: Option<String>,
     #[serde(default)]
     pub prompt_suffix: Option<String>,
+    /// Per-plan override for the default "how to introspect this plan"
+    /// prepend text injected at the top of every step's prompt. `None`
+    /// means "use [`crate::prompt::DEFAULT_CONTEXT_PREPEND`]". `Some("")`
+    /// is an explicit escape hatch meaning "no prepend at all".
+    #[serde(default)]
+    pub context_prepend: Option<String>,
 }
 
 impl Plan {
@@ -404,7 +418,7 @@ impl Plan {
     /// Expected column order matches [`PLAN_COLUMNS`]:
     /// id, slug, project, branch_name, description, status, harness, agent,
     /// deterministic_tests, created_at, updated_at, plan_harness,
-    /// prompt_prefix, prompt_suffix
+    /// prompt_prefix, prompt_suffix, context_prepend
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -441,6 +455,7 @@ impl Plan {
             updated_at,
             prompt_prefix: row.get(12)?,
             prompt_suffix: row.get(13)?,
+            context_prepend: row.get(14)?,
         })
     }
 }
@@ -480,6 +495,12 @@ pub struct Step {
     /// that forgets the field) keeps the pre-V12 behavior.
     #[serde(default)]
     pub change_policy: ChangePolicy,
+    /// Free-form string tags attached to this step. Storage + CRUD only;
+    /// no execution-model semantics today. Stored on the DB row as a JSON
+    /// array of strings. Defaults to empty for pre-V13 rows and old
+    /// exported plan JSON that lacks the field.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 impl Step {
@@ -488,7 +509,7 @@ impl Step {
     /// Expected column order:
     /// id, plan_id, sort_key, title, description, agent, harness,
     /// acceptance_criteria, status, attempts, max_retries, created_at,
-    /// updated_at, model, skipped_reason, change_policy
+    /// updated_at, model, skipped_reason, change_policy, tags
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let criteria_json: String = row.get(7)?;
         let acceptance_criteria: Vec<String> =
@@ -520,6 +541,23 @@ impl Step {
             rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
+        // Tags are stored as a JSON array on column 16. SELECTs that predate
+        // V13 won't include the column (handled by callers using the
+        // canonical column list); for callers that do include it, a NULL or
+        // empty string is defensively treated as an empty list so raw rows
+        // from legacy inserts keep round-tripping.
+        let tags_raw: Option<String> = row.get(16).ok();
+        let tags: Vec<String> = match tags_raw.as_deref() {
+            None | Some("") => Vec::new(),
+            Some(json) => serde_json::from_str(json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    16,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+        };
+
         Ok(Step {
             id: row.get(0)?,
             plan_id: row.get(1)?,
@@ -537,6 +575,7 @@ impl Step {
             model: row.get(13)?,
             skipped_reason: row.get(14)?,
             change_policy,
+            tags,
         })
     }
 }
@@ -837,7 +876,7 @@ mod tests {
 
         let step = conn
             .query_row(
-                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy FROM steps WHERE id = ?1",
+                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags FROM steps WHERE id = ?1",
                 ["s1"],
                 Step::from_row,
             )
@@ -995,6 +1034,7 @@ mod tests {
             TerminationReason::HarnessFailed,
             TerminationReason::CommitFailed,
             TerminationReason::RollbackFailed,
+            TerminationReason::InsufficientDiskSpace,
             TerminationReason::Unknown,
         ];
         for r in &reasons {

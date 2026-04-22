@@ -808,6 +808,8 @@ mod tests {
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                color: None,
             },
         );
         Config {
@@ -815,9 +817,11 @@ mod tests {
             max_retries_per_step: 0,
             timeout_secs: None,
             hook_timeout_secs: 120,
-            auto_stash: false,
+            auto_stash: true,
             prompt_prefix: None,
             prompt_suffix: None,
+            min_free_disk_mb: 1024,
+            display_timezone: "UTC".to_string(),
             harnesses,
         }
     }

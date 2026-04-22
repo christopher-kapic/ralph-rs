@@ -11,6 +11,14 @@ use crate::plan::{
 };
 use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 
+/// Canonical column list for `SELECT` queries against the `steps` table.
+///
+/// Matches the physical table layout after all migrations so [`Step::from_row`]
+/// can index by column position. Kept as a single shared constant so adding a
+/// new column (V13+ tags etc.) only requires editing one place instead of the
+/// dozen scattered SELECTs.
+const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags";
+
 // ---------------------------------------------------------------------------
 // Plan operations
 // ---------------------------------------------------------------------------
@@ -200,6 +208,25 @@ pub fn set_plan_prompt_suffix(
     Ok(())
 }
 
+/// Set the plan-scope context prepend override. Pass `None` to fall back to
+/// [`crate::prompt::DEFAULT_CONTEXT_PREPEND`]. An empty-string argument is
+/// stored verbatim and means "no prepend at all" for this plan — see
+/// [`crate::plan::Plan::context_prepend`] for the precedence rules.
+pub fn set_plan_context_prepend(
+    conn: &Connection,
+    plan_id: &str,
+    prepend: Option<&str>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET context_prepend = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![prepend, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Project settings (prompt prefix/suffix at project scope)
 // ---------------------------------------------------------------------------
@@ -279,6 +306,10 @@ pub fn set_project_prompt_suffix(
 /// (the pre-V12 behavior). `Some(policy)` records the caller's explicit
 /// choice. Kept as an Option to avoid churning every existing callsite — the
 /// default behavior is what most callers want.
+///
+/// `tags`: optional per-step free-form string tags. Pass `None` to default
+/// to an empty list (the pre-V13 behavior). Callers that already care about
+/// tags can pass `Some(&tags)` to seed them at creation time.
 #[allow(clippy::too_many_arguments)]
 pub fn create_step(
     conn: &Connection,
@@ -291,10 +322,12 @@ pub fn create_step(
     max_retries: Option<i32>,
     model: Option<&str>,
     change_policy: Option<ChangePolicy>,
+    tags: Option<&[String]>,
 ) -> Result<(Step, usize)> {
     let id = Uuid::new_v4().to_string();
     let criteria_json = serde_json::to_string(acceptance_criteria)?;
     let change_policy = change_policy.unwrap_or_default();
+    let tags_json = serde_json::to_string(tags.unwrap_or(&[]))?;
 
     // Determine sort_key: after the last existing step, or initial_key if none.
     let last_key: Option<String> = conn
@@ -311,9 +344,9 @@ pub fn create_step(
     };
 
     conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str()],
+        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json],
     )
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
@@ -329,10 +362,8 @@ pub fn create_step(
 
 /// List steps for a plan, ordered by sort_key.
 pub fn list_steps(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy
-         FROM steps WHERE plan_id = ?1 ORDER BY sort_key ASC",
-    )?;
+    let sql = format!("SELECT {STEP_COLUMNS} FROM steps WHERE plan_id = ?1 ORDER BY sort_key ASC",);
+    let mut stmt = conn.prepare(&sql)?;
 
     let rows = stmt.query_map(params![plan_id], Step::from_row)?;
     let mut steps = Vec::new();
@@ -344,13 +375,9 @@ pub fn list_steps(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
 
 /// Fetch a single step by ID.
 pub fn get_step(conn: &Connection, step_id: &str) -> Result<Step> {
-    conn.query_row(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy
-         FROM steps WHERE id = ?1",
-        params![step_id],
-        Step::from_row,
-    )
-    .with_context(|| format!("Step not found: {step_id}"))
+    let sql = format!("SELECT {STEP_COLUMNS} FROM steps WHERE id = ?1");
+    conn.query_row(&sql, params![step_id], Step::from_row)
+        .with_context(|| format!("Step not found: {step_id}"))
 }
 
 /// Fetch a single step by ID, returning `None` if no row matches.
@@ -359,10 +386,8 @@ pub fn get_step(conn: &Connection, step_id: &str) -> Result<Step> {
 /// the caller wants to handle the "not found" case explicitly (e.g. validating
 /// a user-supplied `--step-id` flag).
 pub fn get_step_by_id(conn: &Connection, step_id: &str) -> Result<Option<Step>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy
-         FROM steps WHERE id = ?1",
-    )?;
+    let sql = format!("SELECT {STEP_COLUMNS} FROM steps WHERE id = ?1");
+    let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query_map(params![step_id], Step::from_row)?;
     match rows.next() {
         Some(row) => Ok(Some(row?)),
@@ -438,6 +463,7 @@ pub fn delete_step(conn: &Connection, step_id: &str) -> Result<()> {
 ///
 /// `change_policy`: see [`create_step`] — `None` defaults to
 /// [`ChangePolicy::Required`].
+/// `tags`: see [`create_step`] — `None` defaults to an empty list.
 #[allow(clippy::too_many_arguments)]
 pub fn create_step_at(
     conn: &Connection,
@@ -451,15 +477,17 @@ pub fn create_step_at(
     max_retries: Option<i32>,
     model: Option<&str>,
     change_policy: Option<ChangePolicy>,
+    tags: Option<&[String]>,
 ) -> Result<(Step, usize)> {
     let id = Uuid::new_v4().to_string();
     let criteria_json = serde_json::to_string(acceptance_criteria)?;
     let change_policy = change_policy.unwrap_or_default();
+    let tags_json = serde_json::to_string(tags.unwrap_or(&[]))?;
 
     conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str()],
+        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json],
     )
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
@@ -473,7 +501,7 @@ pub fn create_step_at(
     Ok((get_step(conn, &id)?, position))
 }
 
-/// Extended step update: title, description, agent, harness, criteria, max_retries, model, change_policy.
+/// Extended step update: title, description, agent, harness, criteria, max_retries, model, change_policy, tags.
 ///
 /// - `agent_update`: `Some(Some("name"))` sets the agent, `Some(None)` clears it
 ///   (sets to NULL), `None` means don't change.
@@ -489,6 +517,8 @@ pub fn create_step_at(
 ///   `None` means don't change. `change_policy` is NOT NULL at the DB level
 ///   so there's no "clear" form — you always substitute one valid policy
 ///   for another.
+/// - `tags_update`: `Some(slice)` replaces the entire tag list (pass an
+///   empty slice to clear all tags), `None` means don't change.
 #[allow(clippy::too_many_arguments)]
 pub fn update_step_fields_ext(
     conn: &Connection,
@@ -501,6 +531,7 @@ pub fn update_step_fields_ext(
     retries_update: Option<Option<i32>>,
     model_update: Option<Option<&str>>,
     change_policy_update: Option<ChangePolicy>,
+    tags_update: Option<&[String]>,
 ) -> Result<()> {
     // Build a single UPDATE with dynamic SET clauses so all changed fields
     // share one `updated_at` and a partial failure can't leave the row half
@@ -549,6 +580,11 @@ pub fn update_step_fields_ext(
         clauses.push("change_policy = ?");
         values.push(Value::Text(policy.as_str().to_string()));
     }
+    if let Some(tags) = tags_update {
+        let tags_json = serde_json::to_string(tags)?;
+        clauses.push("tags = ?");
+        values.push(Value::Text(tags_json));
+    }
 
     if clauses.is_empty() {
         return Ok(());
@@ -590,6 +626,41 @@ pub fn reset_step(conn: &Connection, step_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Flip every InProgress step for a plan to Aborted and return the affected rows.
+///
+/// Called at the start of `run_plan` / `resume_plan` to clean up orphaned
+/// InProgress rows left behind by a crashed runner (OOM, disk full, hard kill).
+/// The run lock is held by the caller, so any InProgress row observed here
+/// cannot belong to a live run — it is definitively stale.
+///
+/// Uses `RETURNING` (bundled rusqlite supports it) so the pre-update row
+/// snapshot is atomic with the flip: no TOCTOU window where a concurrent reader
+/// sees the Aborted row but the caller's return slice reflects the pre-update
+/// state.
+pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
+    let sql = format!(
+        "UPDATE steps SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE plan_id = ?2 AND status = ?3
+         RETURNING {STEP_COLUMNS}",
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![
+            StepStatus::Aborted.as_str(),
+            plan_id,
+            StepStatus::InProgress.as_str(),
+        ],
+        Step::from_row,
+    )?;
+    let mut swept = Vec::new();
+    for row in rows {
+        swept.push(row?);
+    }
+    // Sort by sort_key so callers can report them in plan order.
+    swept.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+    Ok(swept)
+}
+
 /// Update a step's sort_key (used for reordering).
 pub fn update_step_sort_key(conn: &Connection, step_id: &str, sort_key: &str) -> Result<()> {
     let affected = conn.execute(
@@ -605,10 +676,10 @@ pub fn update_step_sort_key(conn: &Connection, step_id: &str, sort_key: &str) ->
 /// Get the next pending step for a plan (first by sort_key order).
 #[allow(dead_code)]
 pub fn get_next_pending_step(conn: &Connection, plan_id: &str) -> Result<Option<Step>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy
-         FROM steps WHERE plan_id = ?1 AND status = ?2 ORDER BY sort_key ASC LIMIT 1",
-    )?;
+    let sql = format!(
+        "SELECT {STEP_COLUMNS} FROM steps WHERE plan_id = ?1 AND status = ?2 ORDER BY sort_key ASC LIMIT 1",
+    );
+    let mut stmt = conn.prepare(&sql)?;
 
     let mut rows = stmt.query_map(
         params![plan_id, StepStatus::Pending.as_str()],
@@ -646,6 +717,11 @@ pub fn create_execution_log(
 }
 
 /// Get the latest (highest attempt) execution log for a step.
+///
+/// Currently only referenced from tests — kept in the public API because it
+/// was previously used by the prior-step-summaries builder and is still a
+/// natural helper for anyone adding log-replay or post-mortem features.
+#[allow(dead_code)]
 pub fn get_latest_log_for_step(conn: &Connection, step_id: &str) -> Result<Option<ExecutionLog>> {
     let mut stmt = conn.prepare(
         "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status
@@ -1602,6 +1678,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -1641,6 +1718,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let (s2, _) = create_step(
@@ -1654,6 +1732,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let (s3, _) = create_step(
@@ -1664,6 +1743,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1704,6 +1784,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         create_step(
@@ -1717,6 +1798,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         create_step(
@@ -1727,6 +1809,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1762,6 +1845,7 @@ mod tests {
             Some(3),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1769,6 +1853,124 @@ mod tests {
         assert_eq!(step.max_retries, Some(3));
         assert_eq!(step.status, StepStatus::Pending);
         assert_eq!(step.attempts, 0);
+    }
+
+    #[test]
+    fn test_create_step_stores_tags() {
+        let conn = setup();
+        let plan = create_plan(&conn, "tagged", "/p", "b", "d", None, None, &[]).unwrap();
+
+        let tags = vec!["FIX".to_string(), "REGRESSION".to_string()];
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "Fix bug",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            Some(&tags),
+        )
+        .unwrap();
+
+        // Round-trip: the step returned from create_step should carry the tags
+        // and a fresh SELECT should return the same list in the same order.
+        assert_eq!(step.tags, tags);
+
+        let fetched = get_step(&conn, &step.id).unwrap();
+        assert_eq!(fetched.tags, tags);
+    }
+
+    #[test]
+    fn test_tags_default_to_empty_for_legacy_rows() {
+        // Insert a step via raw SQL so the JSON `tags` column picks up its
+        // NOT NULL DEFAULT '[]' (mirrors the state of pre-V13 rows that V13
+        // backfilled). Reading through Step::from_row must yield an empty
+        // Vec without panicking.
+        let conn = setup();
+        let plan = create_plan(&conn, "legacy", "/p", "b", "d", None, None, &[]).unwrap();
+
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["legacy-s1", &plan.id, "a0", "Legacy step", "desc"],
+        )
+        .unwrap();
+
+        let step = get_step(&conn, "legacy-s1").unwrap();
+        assert!(step.tags.is_empty());
+
+        // An explicit empty string in the tags column (shouldn't happen in
+        // practice because DEFAULT is '[]', but defensively handled in
+        // Step::from_row) also deserializes as an empty vec.
+        conn.execute(
+            "UPDATE steps SET tags = '' WHERE id = ?1",
+            params!["legacy-s1"],
+        )
+        .unwrap();
+        let step_empty = get_step(&conn, "legacy-s1").unwrap();
+        assert!(step_empty.tags.is_empty());
+    }
+
+    #[test]
+    fn test_update_step_fields_ext_replaces_tags() {
+        let conn = setup();
+        let plan = create_plan(&conn, "p", "/p", "b", "d", None, None, &[]).unwrap();
+
+        let initial = vec!["FIX".to_string()];
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "T",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            Some(&initial),
+        )
+        .unwrap();
+
+        // Replace with a fresh set.
+        let replacement = vec!["REVIEW".to_string(), "DOCS".to_string()];
+        update_step_fields_ext(
+            &conn,
+            &step.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&replacement),
+        )
+        .unwrap();
+        let updated = get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.tags, replacement);
+
+        // An empty slice clears the list.
+        update_step_fields_ext(
+            &conn,
+            &step.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[]),
+        )
+        .unwrap();
+        let cleared = get_step(&conn, &step.id).unwrap();
+        assert!(cleared.tags.is_empty());
     }
 
     #[test]
@@ -1783,6 +1985,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1813,6 +2016,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1831,6 +2035,7 @@ mod tests {
             Some(Some(5)),
             Some(Some("new-model")),
             Some(ChangePolicy::Optional),
+            None,
         )
         .unwrap();
 
@@ -1863,6 +2068,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let other_before = get_step(&conn, &other.id).unwrap();
@@ -1873,6 +2079,7 @@ mod tests {
             Some("New Title"),
             Some("New Desc"),
             Some(Some("agent")),
+            None,
             None,
             None,
             None,
@@ -1902,6 +2109,7 @@ mod tests {
             Some(3),
             Some("model"),
             None,
+            None,
         )
         .unwrap();
 
@@ -1915,6 +2123,7 @@ mod tests {
             None,
             Some(None),
             Some(None),
+            None,
             None,
         )
         .unwrap();
@@ -1941,12 +2150,13 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let before = get_step(&conn, &step.id).unwrap();
 
         update_step_fields_ext(
-            &conn, &step.id, None, None, None, None, None, None, None, None,
+            &conn, &step.id, None, None, None, None, None, None, None, None, None,
         )
         .unwrap();
 
@@ -1966,6 +2176,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1996,6 +2207,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -2031,6 +2243,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let (s2, _) = create_step(
@@ -2041,6 +2254,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -2081,6 +2295,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2111,6 +2326,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2134,6 +2350,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -2195,6 +2412,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -2243,6 +2461,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -2322,6 +2541,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -2358,6 +2578,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -2419,7 +2640,7 @@ mod tests {
             "Code coverage > 80%".to_string(),
         ];
         let (step, _) = create_step(
-            &conn, &plan.id, "Step", "d", None, None, &criteria, None, None, None,
+            &conn, &plan.id, "Step", "d", None, None, &criteria, None, None, None, None,
         )
         .unwrap();
 
@@ -2441,6 +2662,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -2656,8 +2878,20 @@ mod tests {
     fn test_attach_hook_to_step_rejects_duplicate() {
         let conn = setup();
         let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "t", "d", None, None, &[], None, None, None).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "t",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "h1").unwrap();
 
@@ -2704,6 +2938,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let (s2, _) = create_step(
@@ -2714,6 +2949,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -2753,6 +2989,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(s_default.change_policy, ChangePolicy::Required);
@@ -2777,6 +3014,7 @@ mod tests {
             None,
             None,
             Some(ChangePolicy::Optional),
+            None,
         )
         .unwrap();
         assert_eq!(s_opt.change_policy, ChangePolicy::Optional);
@@ -2807,6 +3045,7 @@ mod tests {
             None,
             None,
             Some(ChangePolicy::Optional),
+            None,
         )
         .unwrap();
         assert_eq!(s.change_policy, ChangePolicy::Optional);
@@ -3163,6 +3402,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -3217,6 +3457,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -3318,5 +3559,35 @@ mod tests {
 
         let affected = delete_run_lock_row_unscoped(&conn, "/proj-del3", 4242, None).unwrap();
         assert_eq!(affected, 1);
+    }
+
+    #[test]
+    fn test_plan_context_prepend_round_trip() {
+        let conn = setup();
+        let plan = create_plan(&conn, "ctx", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        // Newly-created plans have `None` context_prepend — callers fall back
+        // to the system default via `prompt::effective_context_prepend`.
+        assert_eq!(plan.context_prepend, None);
+
+        // Set to Some("custom"), read back.
+        set_plan_context_prepend(&conn, &plan.id, Some("custom")).unwrap();
+        let reloaded = get_plan_by_slug(&conn, "ctx", "/proj").unwrap().unwrap();
+        assert_eq!(reloaded.context_prepend.as_deref(), Some("custom"));
+
+        // Empty string is a real value — power-user escape hatch for "no
+        // prepend at all". Must survive the round trip distinct from None.
+        set_plan_context_prepend(&conn, &plan.id, Some("")).unwrap();
+        let reloaded = get_plan_by_slug(&conn, "ctx", "/proj").unwrap().unwrap();
+        assert_eq!(
+            reloaded.context_prepend.as_deref(),
+            Some(""),
+            "empty string override must round-trip as Some(\"\"), not None"
+        );
+
+        // Clear back to None.
+        set_plan_context_prepend(&conn, &plan.id, None).unwrap();
+        let reloaded = get_plan_by_slug(&conn, "ctx", "/proj").unwrap().unwrap();
+        assert_eq!(reloaded.context_prepend, None);
     }
 }

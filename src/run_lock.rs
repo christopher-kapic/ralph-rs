@@ -22,7 +22,7 @@ use crate::plan::Phase;
 #[allow(dead_code)]
 pub const LIVE_RUN_COLUMNS: &str = "project, pid, pid_start_token, plan_id, plan_slug, started_at, \
      step_id, step_num, attempt, max_attempts, phase, phase_started_at, current_command, \
-     execution_log_id, child_pid, child_start_token, updated_at";
+     execution_log_id, child_pid, child_start_token, updated_at, source_branch, stash_sha";
 
 /// Snapshot of the currently-held run lock for a project, including every
 /// observability column added in migration V11. Timestamps are kept as raw
@@ -48,6 +48,14 @@ pub struct LiveRun {
     pub child_pid: Option<i64>,
     pub child_start_token: Option<String>,
     pub updated_at: Option<String>,
+    /// Branch the user was on at run start. Used during teardown to
+    /// switch back before popping the ralph-owned stash. NULL for runs
+    /// started before the auto-stash rewrite or where `--current-branch`
+    /// was set.
+    pub source_branch: Option<String>,
+    /// Commit SHA of the ralph-owned stash created at run start (NULL
+    /// when the tree was clean or auto-stash was disabled).
+    pub stash_sha: Option<String>,
 }
 
 impl LiveRun {
@@ -91,8 +99,37 @@ impl LiveRun {
             child_pid: row.get(14)?,
             child_start_token: row.get(15)?,
             updated_at: row.get(16)?,
+            source_branch: row.get(17)?,
+            stash_sha: row.get(18)?,
         })
     }
+}
+
+/// Record the source branch + optional stash SHA on the current project's
+/// run-lock row. Called by the runner after stashing (or confirming the tree
+/// was clean) so `resume` and diagnostic tools can see what the runner will
+/// try to restore during teardown.
+///
+/// Errors if no `run_locks` row exists for `project` — the lock is acquired
+/// before this runs, so a missing row signals a caller bug.
+pub fn record_source_branch_and_stash(
+    conn: &Connection,
+    project: &str,
+    source_branch: &str,
+    stash_sha: Option<&str>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE run_locks
+            SET source_branch = ?1,
+                stash_sha = ?2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE project = ?3",
+        params![source_branch, stash_sha, project],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("No run_locks row for project: {project}");
+    }
+    Ok(())
 }
 
 type ReleaseFn = Box<dyn FnOnce(&str) -> Result<()> + Send>;
@@ -977,9 +1014,10 @@ mod tests {
             "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug,
                                     started_at, step_id, step_num, attempt, max_attempts,
                                     phase, phase_started_at, current_command, execution_log_id,
-                                    child_pid, child_start_token, updated_at)
+                                    child_pid, child_start_token, updated_at,
+                                    source_branch, stash_sha)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                     ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 "/proj-roundtrip",
                 4242i64,
@@ -998,6 +1036,8 @@ mod tests {
                 99_999i64,
                 "child-token",
                 "2026-04-21T00:02:00.000Z",
+                "master",
+                "deadbeefcafe",
             ],
         )
         .unwrap();
@@ -1027,6 +1067,54 @@ mod tests {
         assert_eq!(live.child_pid, Some(99_999));
         assert_eq!(live.child_start_token.as_deref(), Some("child-token"));
         assert_eq!(live.updated_at.as_deref(), Some("2026-04-21T00:02:00.000Z"));
+        assert_eq!(live.source_branch.as_deref(), Some("master"));
+        assert_eq!(live.stash_sha.as_deref(), Some("deadbeefcafe"));
+    }
+
+    #[test]
+    fn record_source_branch_and_stash_writes_both_columns() {
+        let conn = mem_db();
+        let project = "/proj-record";
+        conn.execute(
+            "INSERT INTO run_locks (project, pid) VALUES (?1, ?2)",
+            params![project, 1i64],
+        )
+        .unwrap();
+
+        record_source_branch_and_stash(&conn, project, "master", Some("abc123")).unwrap();
+        let (src, sha): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT source_branch, stash_sha FROM run_locks WHERE project = ?1",
+                params![project],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(src.as_deref(), Some("master"));
+        assert_eq!(sha.as_deref(), Some("abc123"));
+
+        // A None stash_sha overwrites the existing value (caller owns the
+        // truth).
+        record_source_branch_and_stash(&conn, project, "main", None).unwrap();
+        let (src, sha): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT source_branch, stash_sha FROM run_locks WHERE project = ?1",
+                params![project],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(src.as_deref(), Some("main"));
+        assert_eq!(sha, None);
+    }
+
+    #[test]
+    fn record_source_branch_and_stash_errors_when_no_row() {
+        let conn = mem_db();
+        let err = record_source_branch_and_stash(&conn, "/proj-none", "master", None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No run_locks row for project"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

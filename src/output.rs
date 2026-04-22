@@ -41,6 +41,31 @@ pub enum RunEvent {
         steps_succeeded: usize,
         steps_failed: usize,
     },
+    /// Emitted at run start when orphaned InProgress step rows are flipped to
+    /// Aborted. See `storage::sweep_stale_in_progress`.
+    StaleStepsSwept { steps: Vec<StaleStep> },
+    /// Emitted mid-run when the step list grows (steps inserted by the
+    /// running agent via `ralph step add`) between iterations of the runner
+    /// loop.
+    PlanGrew { steps: Vec<StaleStep> },
+    /// Emitted immediately before the harness is spawned for a given
+    /// attempt. `prompt_preview` is always the first 512 chars of the
+    /// prompt (regardless of `--verbose`) so JSON consumers see a stable
+    /// bounded payload; the full prompt lives in `execution_log`.
+    PromptPrepared {
+        step_id: String,
+        attempt: i32,
+        prompt_chars: usize,
+        prompt_preview: String,
+    },
+}
+
+/// Compact reference to a step for NDJSON payloads.
+#[derive(Debug, Clone, Serialize)]
+pub struct StaleStep {
+    pub step_id: String,
+    pub step_num: usize,
+    pub title: String,
 }
 
 /// Write a single NDJSON record to stdout and flush immediately.
@@ -208,7 +233,8 @@ pub fn colored_termination_reason(reason: TerminationReason, color: bool) -> Str
         | TerminationReason::HookFailed
         | TerminationReason::HarnessFailed
         | TerminationReason::CommitFailed
-        | TerminationReason::RollbackFailed => "\x1b[31m",
+        | TerminationReason::RollbackFailed
+        | TerminationReason::InsufficientDiskSpace => "\x1b[31m",
         TerminationReason::NoChanges => "\x1b[33m",
         TerminationReason::Unknown => "\x1b[90m",
     };
@@ -261,6 +287,122 @@ pub fn bold(text: &str, color: bool) -> String {
     } else {
         text.to_string()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Harness color map
+// ---------------------------------------------------------------------------
+
+/// Return the brand/accent color for a known harness name, or `None` for
+/// unknown harnesses.
+///
+/// The colors here are the "canonical" per-harness hues used by the progress
+/// header and any TUI widgets that want a consistent per-harness highlight.
+/// Users can override per-harness via `HarnessConfig.color` in config.json.
+pub fn harness_color(name: &str) -> Option<ratatui::style::Color> {
+    use ratatui::style::Color;
+    match name {
+        "claude" => Some(Color::Rgb(0xcc, 0x8b, 0x89)),
+        "codex" => Some(Color::Rgb(0x7a, 0xa8, 0xc1)),
+        "opencode" => Some(Color::Rgb(0xf3, 0xb2, 0x6d)),
+        "copilot" => Some(Color::Rgb(0xac, 0x4d, 0xb6)),
+        _ => None,
+    }
+}
+
+/// Parse a lenient `#RRGGBB` hex string into an `(r, g, b)` triple.
+///
+/// Returns `Err` on any of: missing leading `#`, wrong length, or any
+/// non-hex digit. Callers (primarily `Config::load`) use the error message
+/// verbatim in validation diagnostics.
+pub fn parse_hex_color(s: &str) -> Result<(u8, u8, u8), String> {
+    let trimmed = s.trim();
+    let hex = match trimmed.strip_prefix('#') {
+        Some(rest) => rest,
+        None => return Err(format!("color '{trimmed}' must start with '#'")),
+    };
+    if hex.len() != 6 {
+        return Err(format!(
+            "color '{trimmed}' must be #RRGGBB (got {} hex digits)",
+            hex.len()
+        ));
+    }
+    let parse = |slice: &str, name: &str| -> Result<u8, String> {
+        u8::from_str_radix(slice, 16)
+            .map_err(|_| format!("color '{trimmed}' has invalid {name} component '{slice}'"))
+    };
+    let r = parse(&hex[0..2], "red")?;
+    let g = parse(&hex[2..4], "green")?;
+    let b = parse(&hex[4..6], "blue")?;
+    Ok((r, g, b))
+}
+
+/// Resolve the effective harness color, preferring a per-harness config
+/// override over the hardcoded [`harness_color`] map.
+///
+/// `override_hex` is the optional `color` field on [`crate::config::HarnessConfig`].
+/// Invalid hex strings fall back to the hardcoded map; `Config::load` is
+/// expected to reject malformed values up front, so this branch only
+/// matters if a hex value snuck past validation.
+pub fn resolved_harness_color(
+    name: &str,
+    override_hex: Option<&str>,
+) -> Option<ratatui::style::Color> {
+    use ratatui::style::Color;
+    if let Some(hex) = override_hex
+        && let Ok((r, g, b)) = parse_hex_color(hex)
+    {
+        return Some(Color::Rgb(r, g, b));
+    }
+    harness_color(name)
+}
+
+/// Format a harness name for human-readable stderr output.
+///
+/// When `color_enabled` is false, returns the name as-is. When true, wraps
+/// the name in ANSI bold + 24-bit foreground color if the harness has a
+/// known color (from [`harness_color`]); otherwise still bolds but emits
+/// no color escape.
+#[allow(dead_code)]
+pub fn format_harness_label(name: &str, color_enabled: bool) -> String {
+    format_harness_label_with_override(name, None, color_enabled)
+}
+
+/// Variant of [`format_harness_label`] that consults a per-harness config
+/// override (hex `#RRGGBB`) before falling back to the hardcoded map.
+pub fn format_harness_label_with_override(
+    name: &str,
+    override_hex: Option<&str>,
+    color_enabled: bool,
+) -> String {
+    if !color_enabled {
+        return name.to_string();
+    }
+    if let Some(ratatui::style::Color::Rgb(r, g, b)) = resolved_harness_color(name, override_hex) {
+        return format!("\x1b[1;38;2;{r};{g};{b}m{name}\x1b[0m");
+    }
+    // Unknown harness: bold without color.
+    format!("\x1b[1m{name}\x1b[0m")
+}
+
+// ---------------------------------------------------------------------------
+// Timezone-aware "now" formatting
+// ---------------------------------------------------------------------------
+
+/// Format the current instant in the supplied IANA timezone.
+///
+/// Output shape: `YYYY-MM-DD HH:MM:SS TZABBR` — e.g. `2026-04-22 14:32:07 EDT`.
+/// Used by the progress-header "started at" stamp so users see a local time
+/// matching their `display_timezone` config instead of UTC.
+pub fn format_now_in_tz(tz: &chrono_tz::Tz) -> String {
+    format_instant_in_tz(chrono::Utc::now(), tz)
+}
+
+/// Testable variant of [`format_now_in_tz`] that formats a specific instant.
+pub fn format_instant_in_tz(utc: DateTime<Utc>, tz: &chrono_tz::Tz) -> String {
+    utc.with_timezone(tz)
+        .format("%Y-%m-%d %H:%M:%S %Z")
+        .to_string()
 }
 
 /// A green checkmark icon, colored when `color` is true.
@@ -396,6 +538,10 @@ pub struct StepSummary {
     /// policy explicitly rather than having to infer a default. Matches the
     /// `ExportedStep` emission policy.
     pub change_policy: ChangePolicy,
+    /// Free-form string tags. Always serialized (even when empty) so JSON
+    /// consumers know the field is present and default-empty rather than
+    /// unsupported.
+    pub tags: Vec<String>,
 }
 
 impl From<&Step> for StepSummary {
@@ -416,6 +562,7 @@ impl From<&Step> for StepSummary {
             updated_at: s.updated_at,
             model: s.model.clone(),
             change_policy: s.change_policy,
+            tags: s.tags.clone(),
         }
     }
 }
@@ -931,6 +1078,7 @@ mod tests {
             updated_at: Utc::now(),
             model: None,
             change_policy: ChangePolicy::Required,
+            tags: vec![],
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"plan_id\""));
@@ -1083,6 +1231,8 @@ mod tests {
             child_pid: Some(54321),
             child_start_token: Some("child-tok".into()),
             updated_at: None,
+            source_branch: None,
+            stash_sha: None,
         }
     }
 
@@ -1249,5 +1399,91 @@ mod tests {
         assert!(s.contains("\x1b[31m"));
         let s = colored_test_status(TestStatus::NotConfigured, true);
         assert!(s.contains("\x1b[90m"));
+    }
+
+    // -- harness colors / labels -------------------------------------------
+
+    #[test]
+    fn test_harness_color_known() {
+        use ratatui::style::Color;
+        assert_eq!(harness_color("claude"), Some(Color::Rgb(0xcc, 0x8b, 0x89)));
+        assert_eq!(harness_color("codex"), Some(Color::Rgb(0x7a, 0xa8, 0xc1)));
+        assert_eq!(
+            harness_color("opencode"),
+            Some(Color::Rgb(0xf3, 0xb2, 0x6d))
+        );
+        assert_eq!(harness_color("copilot"), Some(Color::Rgb(0xac, 0x4d, 0xb6)));
+    }
+
+    #[test]
+    fn test_harness_color_unknown_returns_none() {
+        assert_eq!(harness_color("goose"), None);
+        assert_eq!(harness_color("pi"), None);
+        assert_eq!(harness_color(""), None);
+        assert_eq!(harness_color("does-not-exist"), None);
+    }
+
+    #[test]
+    fn test_parse_hex_color_valid() {
+        assert_eq!(parse_hex_color("#cc8b89"), Ok((0xcc, 0x8b, 0x89)));
+        assert_eq!(parse_hex_color("#FFFFFF"), Ok((0xff, 0xff, 0xff)));
+        assert_eq!(parse_hex_color("#000000"), Ok((0, 0, 0)));
+    }
+
+    #[test]
+    fn test_parse_hex_color_invalid() {
+        assert!(parse_hex_color("cc8b89").is_err()); // missing #
+        assert!(parse_hex_color("#cc8b8").is_err()); // too short
+        assert!(parse_hex_color("#cc8b8901").is_err()); // too long
+        assert!(parse_hex_color("#ggggggg").is_err()); // non-hex digits
+    }
+
+    #[test]
+    fn test_format_harness_label_color_off() {
+        assert_eq!(format_harness_label("claude", false), "claude");
+        assert_eq!(format_harness_label("unknown", false), "unknown");
+    }
+
+    #[test]
+    fn test_format_harness_label_color_on_known() {
+        let out = format_harness_label("claude", true);
+        assert!(out.contains("\x1b[1;38;2;204;139;137m"));
+        assert!(out.contains("claude"));
+        assert!(out.ends_with("\x1b[0m"));
+    }
+
+    #[test]
+    fn test_format_harness_label_color_on_unknown_is_bold_no_color() {
+        let out = format_harness_label("goose", true);
+        assert!(out.contains("\x1b[1m"));
+        assert!(out.contains("goose"));
+        assert!(!out.contains("38;2;"));
+    }
+
+    #[test]
+    fn test_format_harness_label_override_takes_precedence() {
+        let out = format_harness_label_with_override("claude", Some("#010203"), true);
+        assert!(out.contains("\x1b[1;38;2;1;2;3m"));
+    }
+
+    // -- format_now_in_tz / format_instant_in_tz ---------------------------
+
+    #[test]
+    fn test_format_now_in_tz_known_timezone() {
+        // Fixed instant: 2026-04-22T18:32:07Z. In UTC this formats as the
+        // same date and time with the "UTC" abbreviation.
+        let utc: DateTime<Utc> = "2026-04-22T18:32:07Z".parse().unwrap();
+        let s = format_instant_in_tz(utc, &chrono_tz::UTC);
+        assert_eq!(s, "2026-04-22 18:32:07 UTC");
+    }
+
+    #[test]
+    fn test_format_now_in_tz_smoke_live_call() {
+        // Live call: just verify the string has the expected shape and the
+        // timezone abbreviation is present.
+        let s = format_now_in_tz(&chrono_tz::UTC);
+        assert!(s.ends_with(" UTC"));
+        // YYYY-MM-DD HH:MM:SS is 19 chars.
+        assert!(s.len() >= 19 + 1 + 3);
     }
 }

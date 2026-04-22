@@ -155,10 +155,17 @@ fn render_status_plain(
             } else {
                 ""
             };
+            let tags_inline = crate::commands::step::render_tags_inline(step);
+            let tags_prefix = if tags_inline.is_empty() {
+                String::new()
+            } else {
+                format!("{tags_inline} ")
+            };
             println!(
-                "  {:>3}. {} {}{} [{}] (attempts: {})",
+                "  {:>3}. {} {}{}{} [{}] (attempts: {})",
                 i + 1,
                 output::status_icon(step.status, out.color),
+                tags_prefix,
                 step.title,
                 policy_tag,
                 output::colored_status(step.status, out.color),
@@ -890,9 +897,20 @@ mod cancel_tests {
     fn seed_plan_and_step(conn: &Connection, slug: &str, project: &str) -> (String, String) {
         let plan =
             storage::create_plan(conn, slug, project, "br", "desc", None, None, &[]).unwrap();
-        let (step, _) =
-            storage::create_step(conn, &plan.id, "t", "d", None, None, &[], None, None, None)
-                .unwrap();
+        let (step, _) = storage::create_step(
+            conn,
+            &plan.id,
+            "t",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         (plan.id, step.id)
     }
 
@@ -1237,9 +1255,20 @@ mod status_live_view_tests {
     fn seed_plan_and_step(conn: &Connection, slug: &str, project: &str) -> (String, String) {
         let plan =
             storage::create_plan(conn, slug, project, "br", "desc", None, None, &[]).unwrap();
-        let (step, _) =
-            storage::create_step(conn, &plan.id, "t", "d", None, None, &[], None, None, None)
-                .unwrap();
+        let (step, _) = storage::create_step(
+            conn,
+            &plan.id,
+            "t",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         (plan.id, step.id)
     }
 
@@ -1449,6 +1478,7 @@ mod status_live_view_tests {
             model: None,
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
+            tags: vec![],
         };
         let rendered = render_live_block(&live, std::slice::from_ref(&fake_step));
         assert!(rendered.contains("Current:"));
