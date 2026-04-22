@@ -106,13 +106,19 @@ pub enum Command {
         #[arg(long)]
         current_branch: bool,
 
-        /// Auto-commit any dirty working-tree state before switching to the
-        /// plan branch. Without this flag (and when `auto_stash` is false in
-        /// config.json), a dirty working tree bails the run and prints the
-        /// files that would have been swept up, so the user can stage or
-        /// discard them intentionally.
-        #[arg(long)]
-        auto_stash: bool,
+        /// Disable the default auto-stash behavior.
+        ///
+        /// By default, `ralph run` stashes a dirty working tree (tracked +
+        /// untracked) with `git stash push --include-untracked -m "ralph:
+        /// auto-stash for plan '<slug>' at <timestamp>"` before switching
+        /// branches, then pops it back at run end. Pass this flag to make
+        /// ralph bail on a dirty tree instead — useful when you want to
+        /// manage the stash yourself, or are paranoid about pop conflicts.
+        ///
+        /// The `auto_stash` key in `config.json` can be set to `false` to
+        /// make this the default for every run in that config.
+        #[arg(long = "no-auto-stash")]
+        no_auto_stash: bool,
 
         /// Override the harness for this run.
         #[arg(long)]
@@ -121,6 +127,11 @@ pub enum Command {
         /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
         #[arg(long)]
         force: bool,
+
+        /// Print the full per-attempt prompt to stderr instead of the
+        /// truncated 512-char preview.
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
 
     /// Resume a plan from the last failed or in-progress step.
@@ -257,10 +268,34 @@ pub enum Command {
     /// Run preflight checks to verify the environment is ready.
     Doctor,
 
+    /// View or mutate the global config file (`~/.config/ralph-rs/config.json`).
+    #[command(subcommand)]
+    Config(ConfigCommand),
+
     /// Generate shell completions for bash, zsh, fish, elvish, or powershell.
     Completions {
         /// Shell to generate completions for.
         shell: Shell,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Config subcommands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the canonical config path and the current effective values.
+    Show,
+
+    /// Set the IANA timezone used to format progress-header timestamps.
+    ///
+    /// Value must be a recognized IANA name (e.g. `America/New_York`,
+    /// `Europe/London`, `Asia/Tokyo`, `UTC`). Rejected with a clear error
+    /// if the name is unknown, so typos fail fast.
+    SetTimezone {
+        /// IANA timezone name.
+        tz: String,
     },
 }
 
@@ -390,6 +425,11 @@ pub enum PlanCommand {
     /// Manage the plan-generation harness.
     #[command(subcommand)]
     Harness(PlanHarnessCommand),
+
+    /// Manage the plan's context-prepend override (the block injected at the
+    /// top of every step's prompt).
+    #[command(subcommand)]
+    Prepend(PlanPrependCommand),
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +475,12 @@ pub enum StepCommand {
     List {
         /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
+
+        /// Filter to steps that have this tag (repeatable). When passed
+        /// multiple times the filter is AND: a step must carry every tag
+        /// to appear in the output. Matching is case-sensitive.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
     },
 
     /// Add a new step to a plan.
@@ -492,6 +538,14 @@ pub enum StepCommand {
         /// prompt directs the harness not to modify code.
         #[arg(long, value_name = "POLICY", conflicts_with = "import_json")]
         change_policy: Option<ChangePolicy>,
+
+        /// Attach a free-form tag to the new step (repeatable). Tags are
+        /// user-defined labels for filtering with `ralph step list --tag`;
+        /// they carry no execution-model semantics today. Empty/whitespace
+        /// values and exact-duplicate values within a single invocation
+        /// are rejected.
+        #[arg(long = "tag", value_name = "TAG", conflicts_with = "import_json")]
+        tags: Vec<String>,
 
         /// Bulk-insert steps from a JSON file or stdin (use `-` for stdin).
         /// Accepts a JSON array of step objects, or a single object. Each
@@ -576,6 +630,18 @@ pub enum StepCommand {
         /// to leave the existing policy unchanged.
         #[arg(long, value_name = "POLICY")]
         change_policy: Option<ChangePolicy>,
+
+        /// Replace the step's tag list with these values (repeatable). Omit
+        /// to leave existing tags unchanged; pass at least once to overwrite.
+        /// Exact-duplicate values within the same invocation are rejected.
+        /// See also `--clear-tags` for an explicit empty-list clear.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
+
+        /// Explicitly clear all tags on the step (mirrors
+        /// `--clear-max-retries`).
+        #[arg(long, conflicts_with = "tags")]
+        clear_tags: bool,
     },
 
     /// Reset a step's status back to pending.
@@ -699,6 +765,57 @@ pub enum PlanHarnessCommand {
         /// Override the harness to use for planning.
         #[arg(long)]
         use_harness: Option<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Plan prepend subcommands (nested under `plan prepend`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum PlanPrependCommand {
+    /// Set the plan's context-prepend override.
+    ///
+    /// Exactly one of `--text`, `--file`, or `--stdin` is required. The
+    /// stored string replaces the built-in default for this plan — it is not
+    /// concatenated with it. An empty string (e.g. `--text ""`) is valid and
+    /// means "no prepend at all" for this plan.
+    Set {
+        /// Plan slug. Defaults to the active plan.
+        plan: Option<String>,
+
+        /// Literal text to store as the prepend override.
+        #[arg(long, conflicts_with_all = ["file", "stdin"])]
+        text: Option<String>,
+
+        /// Path to a file whose contents will be stored verbatim.
+        #[arg(long, conflicts_with_all = ["text", "stdin"])]
+        file: Option<PathBuf>,
+
+        /// Read the prepend text from standard input.
+        #[arg(long, conflicts_with_all = ["text", "file"])]
+        stdin: bool,
+    },
+
+    /// Show the effective context-prepend text for a plan.
+    ///
+    /// Without `--default`, prints the plan's override if set or the system
+    /// default otherwise. With `--default`, always prints the built-in
+    /// default regardless of the plan's setting.
+    Show {
+        /// Plan slug. Defaults to the active plan.
+        plan: Option<String>,
+
+        /// Print the system default, ignoring any plan override.
+        #[arg(long)]
+        default: bool,
+    },
+
+    /// Clear the plan's context-prepend override (fall back to the system
+    /// default).
+    Clear {
+        /// Plan slug. Defaults to the active plan.
+        plan: Option<String>,
     },
 }
 
@@ -1115,21 +1232,21 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_run_auto_stash() {
-        // L10: the `--auto-stash` flag must thread through to the Run
-        // variant so `setup_branch` can opt into the legacy auto-commit
-        // behavior for dirty working trees.
-        let cli = Cli::try_parse_from(["ralph-rs", "run", "--auto-stash"]).unwrap();
-        if let Command::Run { auto_stash, .. } = cli.command {
-            assert!(auto_stash);
+    fn test_parse_run_no_auto_stash() {
+        // The `--no-auto-stash` flag flips the default-on behavior off for
+        // a single run. Default is "opt-out" now (the old flag was
+        // `--auto-stash` and defaulted off).
+        let cli = Cli::try_parse_from(["ralph-rs", "run", "--no-auto-stash"]).unwrap();
+        if let Command::Run { no_auto_stash, .. } = cli.command {
+            assert!(no_auto_stash);
         } else {
             panic!("Expected Run");
         }
 
-        // Default must stay off so we don't silently sweep dirty trees.
+        // Default must leave `no_auto_stash` false (i.e. auto-stash is on).
         let cli = Cli::try_parse_from(["ralph-rs", "run"]).unwrap();
-        if let Command::Run { auto_stash, .. } = cli.command {
-            assert!(!auto_stash);
+        if let Command::Run { no_auto_stash, .. } = cli.command {
+            assert!(!no_auto_stash);
         } else {
             panic!("Expected Run");
         }

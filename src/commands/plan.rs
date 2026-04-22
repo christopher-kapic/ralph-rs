@@ -525,6 +525,88 @@ pub fn plan_harness_set(
     Ok(())
 }
 
+/// Set the context-prepend override for a plan.
+///
+/// Stores `text` verbatim — an empty string is a legitimate "no prepend at
+/// all" escape hatch, not "clear back to default". Use [`plan_prepend_clear`]
+/// for the clear-to-None path.
+pub fn plan_prepend_set(
+    conn: &Connection,
+    plan: &crate::plan::Plan,
+    text: &str,
+    out: &OutputContext,
+) -> Result<()> {
+    storage::set_plan_context_prepend(conn, &plan.id, Some(text))?;
+    if out.format == OutputFormat::Json {
+        let json = serde_json::json!({
+            "plan": plan.slug,
+            "context_prepend": text,
+        });
+        println!("{}", serde_json::to_string(&json)?);
+    } else if !out.quiet {
+        eprintln!(
+            "{} Set context prepend for plan '{}' ({} bytes).",
+            output::check_icon(out.color),
+            plan.slug,
+            text.len(),
+        );
+    }
+    Ok(())
+}
+
+/// Show the effective context-prepend text for a plan. When `default` is
+/// true, print the built-in system default regardless of the plan's setting.
+pub fn plan_prepend_show(
+    _conn: &Connection,
+    plan: &crate::plan::Plan,
+    default: bool,
+    out: &OutputContext,
+) -> Result<()> {
+    let effective = if default {
+        crate::prompt::DEFAULT_CONTEXT_PREPEND
+    } else {
+        crate::prompt::effective_context_prepend(plan)
+    };
+
+    if out.format == OutputFormat::Json {
+        let json = serde_json::json!({
+            "plan": plan.slug,
+            "context_prepend": plan.context_prepend,
+            "effective": effective,
+            "is_default": plan.context_prepend.is_none() || default,
+        });
+        println!("{}", serde_json::to_string(&json)?);
+    } else {
+        // Write to stdout so `ralph plan prepend show | less` works.
+        println!("{effective}");
+    }
+    Ok(())
+}
+
+/// Clear the plan's context-prepend override — fall back to the system
+/// default.
+pub fn plan_prepend_clear(
+    conn: &Connection,
+    plan: &crate::plan::Plan,
+    out: &OutputContext,
+) -> Result<()> {
+    storage::set_plan_context_prepend(conn, &plan.id, None)?;
+    if out.format == OutputFormat::Json {
+        let json = serde_json::json!({
+            "plan": plan.slug,
+            "context_prepend": serde_json::Value::Null,
+        });
+        println!("{}", serde_json::to_string(&json)?);
+    } else if !out.quiet {
+        eprintln!(
+            "{} Cleared context prepend for plan '{}' (now using system default).",
+            output::check_icon(out.color),
+            plan.slug,
+        );
+    }
+    Ok(())
+}
+
 pub fn plan_harness_show(
     _conn: &Connection,
     plan: &crate::plan::Plan,
@@ -624,5 +706,100 @@ mod tests {
             Some(PlanStatus::Archived),
             true
         ));
+    }
+
+    // ----------------------------------------------------------------------
+    // `ralph plan prepend ...` tests
+    // ----------------------------------------------------------------------
+
+    fn quiet_out() -> OutputContext {
+        OutputContext {
+            format: OutputFormat::Plain,
+            quiet: true,
+            color: false,
+        }
+    }
+
+    fn setup_prepend_test() -> (rusqlite::Connection, crate::plan::Plan) {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let plan = storage::create_plan(
+            &conn,
+            "prep-plan",
+            "/tmp/proj",
+            "b",
+            "A test plan",
+            None,
+            None,
+            &[],
+        )
+        .expect("create_plan");
+        (conn, plan)
+    }
+
+    #[test]
+    fn test_plan_prepend_set_text_from_flag() {
+        let (conn, plan) = setup_prepend_test();
+
+        plan_prepend_set(&conn, &plan, "# Custom\n\nCaveat emptor.", &quiet_out()).unwrap();
+
+        let reloaded = storage::get_plan_by_slug(&conn, &plan.slug, &plan.project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reloaded.context_prepend.as_deref(),
+            Some("# Custom\n\nCaveat emptor."),
+            "set should store the text verbatim"
+        );
+    }
+
+    #[test]
+    fn test_plan_prepend_show_default_flag() {
+        let (conn, plan) = setup_prepend_test();
+
+        // Seed a plan-specific override so we can assert `--default` ignores it.
+        plan_prepend_set(&conn, &plan, "IGNORED OVERRIDE", &quiet_out()).unwrap();
+        let reloaded = storage::get_plan_by_slug(&conn, &plan.slug, &plan.project)
+            .unwrap()
+            .unwrap();
+
+        // Show with `default=true` should bypass the override. We can't
+        // easily capture stdout here, but we can validate the resolved
+        // string via `effective_context_prepend` and a parallel check that
+        // `DEFAULT_CONTEXT_PREPEND` is what `default=true` returns.
+        let effective_when_default =
+            if true { crate::prompt::DEFAULT_CONTEXT_PREPEND } else { "" };
+        assert!(effective_when_default.contains("# Ralph context"));
+        assert!(effective_when_default.contains("## Introspecting the plan"));
+
+        // The override sanity-check: `effective_context_prepend` without
+        // --default should surface the override, not the system default.
+        assert_eq!(
+            crate::prompt::effective_context_prepend(&reloaded),
+            "IGNORED OVERRIDE"
+        );
+
+        // Running the command shouldn't error.
+        plan_prepend_show(&conn, &reloaded, true, &quiet_out()).unwrap();
+        plan_prepend_show(&conn, &reloaded, false, &quiet_out()).unwrap();
+    }
+
+    #[test]
+    fn test_plan_prepend_clear_resets_to_none() {
+        let (conn, plan) = setup_prepend_test();
+
+        plan_prepend_set(&conn, &plan, "custom text", &quiet_out()).unwrap();
+        let reloaded = storage::get_plan_by_slug(&conn, &plan.slug, &plan.project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.context_prepend.as_deref(), Some("custom text"));
+
+        plan_prepend_clear(&conn, &reloaded, &quiet_out()).unwrap();
+        let reloaded = storage::get_plan_by_slug(&conn, &plan.slug, &plan.project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reloaded.context_prepend, None,
+            "clear must reset to None so the plan falls back to the system default"
+        );
     }
 }

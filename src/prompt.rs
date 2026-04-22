@@ -2,6 +2,40 @@
 
 use crate::plan::{Plan, Step, StepStatus};
 
+/// Default "how to introspect this plan" block prepended to every step's
+/// prompt. Plans can override it via [`Plan::context_prepend`]; a `None`
+/// override means "use this default verbatim", `Some(s)` means "use `s`
+/// verbatim (no concatenation with this default)", and `Some("")` is an
+/// explicit escape hatch meaning "no prepend at all".
+///
+/// This string is a user-facing contract — case, punctuation, and line
+/// breaks are load-bearing and should not drift without a conscious bump.
+pub const DEFAULT_CONTEXT_PREPEND: &str = "\
+# Ralph context
+
+You are executing one step of a multi-step plan managed by `ralph`, a
+deterministic execution planner. Your step's title, description, and
+acceptance criteria are below.
+
+## Introspecting the plan
+
+- `ralph status` — current plan state and progress
+- `ralph step list` — all steps with status
+- `ralph step show <num>` — full description of a specific step
+- `ralph log --step <num>` — execution history (prompts sent, outputs)
+
+## Adding follow-up steps
+
+- `ralph step add --next \"title\" -d \"...\"` — insert immediately after current
+- `ralph step add \"title\"` — append at end of plan
+
+Do NOT use `--after <N>` during a run — positions shift as steps are added,
+and inserting before the current step is a no-op for this execution.
+
+---
+
+";
+
 /// Context from a previous failed attempt, used when retrying a step.
 #[derive(Debug, Clone)]
 pub struct RetryContext {
@@ -15,23 +49,6 @@ pub struct RetryContext {
     pub previous_test_output: Option<String>,
     /// Files that were modified in the previous attempt.
     pub files_modified: Vec<String>,
-}
-
-/// Summary of a completed prior step for context injection.
-#[derive(Debug, Clone)]
-pub struct PriorStepSummary {
-    /// 1-based step number within the plan's full step list. Preserved from
-    /// the plan (not the filtered prior-step slice) so skipped/aborted steps
-    /// do not shift the numbering visible to the agent.
-    pub number: usize,
-    /// Step title.
-    pub title: String,
-    /// Step status (should be Complete or Skipped).
-    pub status: StepStatus,
-    /// Files changed in this step (if available).
-    pub files_changed: Vec<String>,
-    /// Brief description of what was done.
-    pub description: String,
 }
 
 /// A single prefix/suffix pair contributed by one scope (global, project, or
@@ -87,25 +104,45 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
     s.filter(|v| !v.is_empty())
 }
 
+/// Resolve the effective context-prepend text for a plan.
+///
+/// `None` -> [`DEFAULT_CONTEXT_PREPEND`]. `Some("")` -> `""` (power-user
+/// escape hatch). `Some(s)` -> `s` verbatim, not concatenated with the
+/// default. Callers that want to print the effective prepend (for example
+/// `ralph plan prepend show`) should route through this helper so the
+/// precedence stays in one place.
+pub fn effective_context_prepend(plan: &Plan) -> &str {
+    match plan.context_prepend.as_deref() {
+        Some(s) => s,
+        None => DEFAULT_CONTEXT_PREPEND,
+    }
+}
+
 /// Build the full prompt for a step execution.
 ///
-/// The prompt is assembled from 8 parts:
-/// 1. Agent pointer (instructs the harness to fetch the agent profile itself)
-/// 2. Retry context (if this is a retry attempt)
-/// 3. Plan context (plan description and overall goal)
-/// 4. Prior steps summary (what has been done so far)
+/// The prompt is assembled from these parts, in order:
+/// 1. Context prepend — per-plan override or [`DEFAULT_CONTEXT_PREPEND`]
+/// 2. Agent pointer (instructs the harness to fetch the agent profile itself)
+/// 3. Retry context (if this is a retry attempt)
+/// 4. Plan context (plan description and overall goal)
 /// 5. Step details (title and description of current step)
 /// 6. Acceptance criteria (specific criteria the step must meet)
-/// 7. Deterministic tests (test commands that must pass)
-/// 8. Focus instruction (reminder to stay focused on just this step)
+/// 7. Plan step map — a compact titles-only list of ALL steps in the plan
+///    with their current status, so the agent can see where it is in the
+///    sequence without us paying O(n²) bytes for full prior descriptions
+/// 8. Deterministic tests (test commands that will be run after)
+/// 9. Focus instruction (reminder to stay focused on just this step)
 ///
 /// Then the global/project/plan prompt prefix/suffix layers are wrapped
 /// around the joined sections: prefixes stack outermost→innermost at the
 /// top, suffixes stack innermost→outermost at the bottom.
+///
+/// `all_steps` is the full ordered list of steps in the plan (as returned by
+/// `storage::list_steps`). `step` must be one of them — matched by `id`.
 pub fn build_step_prompt(
     plan: &Plan,
     step: &Step,
-    prior_steps: &[PriorStepSummary],
+    all_steps: &[Step],
     agent_name: Option<&str>,
     retry_context: Option<&RetryContext>,
     harness_supports_agent_file: bool,
@@ -113,7 +150,18 @@ pub fn build_step_prompt(
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
 
-    // 1. Agent pointer
+    // 1. Context prepend — plan override or system default. An empty override
+    // is the explicit "no prepend" signal and contributes nothing.
+    let prepend = effective_context_prepend(plan);
+    if !prepend.is_empty() {
+        // The constant includes a trailing `\n\n---\n\n` separator, but the
+        // outer `sections.join("\n\n")` will also add one between sections.
+        // Push the prepend with its trailing whitespace trimmed so we don't
+        // end up with three blank lines between it and the next section.
+        sections.push(prepend.trim_end().to_string());
+    }
+
+    // 2. Agent pointer
     // For harnesses without native agent-file support, point the agent at
     // `ralph agents show <name>` rather than inlining the full file — the
     // agent can fetch it on demand and we save tokens in every prompt.
@@ -123,33 +171,40 @@ pub fn build_step_prompt(
         sections.push(format_agent_pointer(name));
     }
 
-    // 2. Retry context
+    // 3. Retry context
     if let Some(retry) = retry_context {
         sections.push(format_retry_context(retry));
     }
 
-    // 3. Plan context
+    // 4. Plan context
     sections.push(format_plan_context(plan));
 
-    // 4. Prior steps summary
-    if !prior_steps.is_empty() {
-        sections.push(format_prior_steps(prior_steps));
-    }
-
-    // 5. Step details
-    sections.push(format_step_details(step));
+    // 5. Step details (with 1-based position in the plan)
+    let step_num = all_steps
+        .iter()
+        .position(|s| s.id == step.id)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    sections.push(format_step_details(step, step_num, all_steps.len()));
 
     // 6. Acceptance criteria
     if !step.acceptance_criteria.is_empty() {
         sections.push(format_acceptance_criteria(&step.acceptance_criteria));
     }
 
-    // 7. Deterministic tests
+    // 7. Plan step map — titles-only listing of every step in the plan.
+    // Strictly linear in plan size (~80 bytes/step) vs the old quadratic
+    // prior-step descriptions dump.
+    if !all_steps.is_empty() {
+        sections.push(format_plan_step_map(all_steps, &step.id));
+    }
+
+    // 8. Deterministic tests
     if !plan.deterministic_tests.is_empty() {
         sections.push(format_deterministic_tests(&plan.deterministic_tests));
     }
 
-    // 8. Focus instruction
+    // 9. Focus instruction
     sections.push(format_focus_instruction(step));
 
     // Layer prefix/suffix wraps around the joined sections. Each wrap layer
@@ -220,45 +275,9 @@ fn format_plan_context(plan: &Plan) -> String {
     )
 }
 
-fn format_prior_steps(prior_steps: &[PriorStepSummary]) -> String {
-    let mut lines = vec!["## Context from Prior Steps".to_string()];
-
-    for step in prior_steps {
-        let status_marker = match step.status {
-            StepStatus::Complete => "completed",
-            StepStatus::Skipped => "skipped",
-            StepStatus::Failed => "failed",
-            StepStatus::Aborted => "aborted",
-            StepStatus::Pending => "pending",
-            StepStatus::InProgress => "in-progress",
-        };
-
-        let mut step_line = format!(
-            "\n**Step {} ({status_marker}): {title}**",
-            step.number,
-            title = step.title,
-        );
-
-        if !step.description.is_empty() {
-            step_line.push_str(&format!("\n{}", step.description));
-        }
-
-        if !step.files_changed.is_empty() {
-            step_line.push_str(&format!(
-                "\n- Files changed: {}",
-                step.files_changed.join(", ")
-            ));
-        }
-
-        lines.push(step_line);
-    }
-
-    lines.join("\n")
-}
-
-fn format_step_details(step: &Step) -> String {
+fn format_step_details(step: &Step, step_num: usize, total: usize) -> String {
     format!(
-        "# Step: {title}\n\n\
+        "## Your step (#{step_num} of {total}): {title}\n\n\
          {description}",
         title = step.title,
         description = step.description,
@@ -266,11 +285,41 @@ fn format_step_details(step: &Step) -> String {
 }
 
 fn format_acceptance_criteria(criteria: &[String]) -> String {
-    let mut lines = vec!["## Acceptance Criteria".to_string()];
+    let mut lines = vec!["### Acceptance criteria".to_string()];
     for criterion in criteria {
         lines.push(format!("- {criterion}"));
     }
     lines.join("\n")
+}
+
+/// Render the compact plan step map: every step as `#N. [STATUS] title`,
+/// with the current step prefixed by `→` so the agent can locate itself.
+/// Status labels are uppercase (COMPLETE, SKIPPED, PENDING, IN_PROGRESS,
+/// FAILED, ABORTED) to stay visually consistent regardless of theme.
+fn format_plan_step_map(all_steps: &[Step], current_step_id: &str) -> String {
+    let mut lines = vec!["## Plan step map".to_string(), String::new()];
+    for (idx, s) in all_steps.iter().enumerate() {
+        let num = idx + 1;
+        let status = status_label(s.status);
+        let line = if s.id == current_step_id {
+            format!("→ #{num}. [{status}] {title}", title = s.title)
+        } else {
+            format!("#{num}. [{status}] {title}", title = s.title)
+        };
+        lines.push(line);
+    }
+    lines.join("\n")
+}
+
+fn status_label(status: StepStatus) -> &'static str {
+    match status {
+        StepStatus::Complete => "COMPLETE",
+        StepStatus::Skipped => "SKIPPED",
+        StepStatus::Pending => "PENDING",
+        StepStatus::InProgress => "IN_PROGRESS",
+        StepStatus::Failed => "FAILED",
+        StepStatus::Aborted => "ABORTED",
+    }
 }
 
 fn format_deterministic_tests(tests: &[String]) -> String {
@@ -336,7 +385,7 @@ fn truncate_text(text: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{Plan, PlanStatus};
+    use crate::plan::{ChangePolicy, Plan, PlanStatus};
     use chrono::Utc;
 
     fn make_plan() -> Plan {
@@ -359,6 +408,29 @@ mod tests {
             updated_at: Utc::now(),
             prompt_prefix: None,
             prompt_suffix: None,
+            context_prepend: None,
+        }
+    }
+
+    fn make_step_with(id: &str, title: &str, status: StepStatus) -> Step {
+        Step {
+            id: id.to_string(),
+            plan_id: "p1".to_string(),
+            sort_key: id.to_string(),
+            title: title.to_string(),
+            description: format!("description for {title}"),
+            agent: None,
+            harness: None,
+            acceptance_criteria: vec![],
+            status,
+            attempts: 0,
+            max_retries: Some(3),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: None,
+            skipped_reason: None,
+            change_policy: ChangePolicy::Required,
+            tags: vec![],
         }
     }
 
@@ -375,14 +447,15 @@ mod tests {
                 "spawn_harness() works correctly".to_string(),
                 "Tests pass".to_string(),
             ],
-            status: StepStatus::Pending,
+            status: StepStatus::InProgress,
             attempts: 0,
             max_retries: Some(3),
             created_at: Utc::now(),
             updated_at: Utc::now(),
             model: None,
             skipped_reason: None,
-            change_policy: crate::plan::ChangePolicy::Required,
+            change_policy: ChangePolicy::Required,
+            tags: vec![],
         }
     }
 
@@ -390,18 +463,12 @@ mod tests {
     fn test_build_step_prompt_all_sections() {
         let plan = make_plan();
         let step = make_step();
-        let prior_steps = vec![PriorStepSummary {
-            number: 1,
-            title: "Set up project".to_string(),
-            status: StepStatus::Complete,
-            files_changed: vec!["Cargo.toml".to_string(), "src/main.rs".to_string()],
-            description: "Initial project scaffolding".to_string(),
-        }];
+        let all_steps = vec![step.clone()];
 
         let prompt = build_step_prompt(
             &plan,
             &step,
-            &prior_steps,
+            &all_steps,
             None,
             None,
             true, // harness supports agent file natively
@@ -413,18 +480,17 @@ mod tests {
         assert!(prompt.contains("Build a new feature"));
         assert!(prompt.contains("feat/test"));
 
-        // Should contain prior steps
-        assert!(prompt.contains("Context from Prior Steps"));
-        assert!(prompt.contains("Set up project"));
-        assert!(prompt.contains("Cargo.toml"));
-
-        // Should contain step details
-        assert!(prompt.contains("# Step: Implement harness spawning"));
+        // Should contain step details with numbered heading
+        assert!(prompt.contains("## Your step (#1 of 1): Implement harness spawning"));
         assert!(prompt.contains("harness.rs"));
 
         // Should contain acceptance criteria
-        assert!(prompt.contains("Acceptance Criteria"));
+        assert!(prompt.contains("Acceptance criteria"));
         assert!(prompt.contains("spawn_harness()"));
+
+        // Should contain plan step map, NOT the old "Context from Prior Steps"
+        assert!(prompt.contains("## Plan step map"));
+        assert!(!prompt.contains("Context from Prior Steps"));
 
         // Should contain deterministic tests (framed as ralph-owned
         // post-harness validation, NOT as an imperative checklist).
@@ -439,23 +505,175 @@ mod tests {
     }
 
     #[test]
-    fn test_build_step_prompt_emits_pointer_for_non_native_harness() {
-        let plan = make_plan();
+    fn test_default_prepend_is_used_when_plan_override_is_none() {
+        let plan = make_plan(); // context_prepend: None
         let step = make_step();
+        let all_steps = vec![step.clone()];
 
         let prompt = build_step_prompt(
             &plan,
             &step,
-            &[],
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+        );
+
+        // The DEFAULT_CONTEXT_PREPEND starts with "# Ralph context" and lists
+        // introspection commands. Spot-check a few load-bearing markers.
+        assert!(prompt.contains("# Ralph context"));
+        assert!(prompt.contains("## Introspecting the plan"));
+        assert!(prompt.contains("`ralph status`"));
+        assert!(prompt.contains("Do NOT use `--after <N>` during a run"));
+    }
+
+    #[test]
+    fn test_plan_override_replaces_default() {
+        let mut plan = make_plan();
+        plan.context_prepend = Some("# Custom prepend\n\nBe concise.".to_string());
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+        );
+
+        // Custom text IS present …
+        assert!(prompt.contains("# Custom prepend"));
+        assert!(prompt.contains("Be concise."));
+        // … and the default is NOT concatenated with it.
+        assert!(
+            !prompt.contains("# Ralph context"),
+            "plan override must REPLACE the default, not append to it"
+        );
+        assert!(!prompt.contains("## Introspecting the plan"));
+    }
+
+    #[test]
+    fn test_empty_string_override_yields_no_prepend() {
+        let mut plan = make_plan();
+        plan.context_prepend = Some(String::new());
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+        );
+
+        // Neither the default nor any custom prepend is present.
+        assert!(!prompt.contains("# Ralph context"));
+        assert!(!prompt.contains("## Introspecting the plan"));
+        // The prompt should start with the plan context, not a blank line.
+        assert!(
+            prompt.starts_with("# Plan:"),
+            "empty override should leave plan context as the first section, got start: {:?}",
+            &prompt[..prompt.len().min(80)]
+        );
+    }
+
+    #[test]
+    fn test_prompt_includes_step_titles_list_not_descriptions() {
+        let plan = make_plan();
+        // Three steps, all with non-empty descriptions; the second is the
+        // current step.
+        let s1 = make_step_with("s1", "Done thing", StepStatus::Complete);
+        let s2 = make_step_with("s2", "Current thing", StepStatus::InProgress);
+        let s3 = make_step_with("s3", "Future thing", StepStatus::Pending);
+        let all_steps = vec![s1.clone(), s2.clone(), s3.clone()];
+
+        let prompt = build_step_prompt(
+            &plan,
+            &s2,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+        );
+
+        // Titles ARE present in the step map.
+        assert!(prompt.contains("Done thing"));
+        assert!(prompt.contains("Current thing"));
+        assert!(prompt.contains("Future thing"));
+
+        // Descriptions of OTHER steps are NOT present — only the current
+        // step's description is allowed (via format_step_details). The step
+        // description for s2 IS "description for Current thing" and should
+        // appear, but s1's and s3's descriptions must not leak.
+        assert!(
+            !prompt.contains("description for Done thing"),
+            "prior step description leaked into the prompt"
+        );
+        assert!(
+            !prompt.contains("description for Future thing"),
+            "future step description leaked into the prompt"
+        );
+        // Current step's own description is expected.
+        assert!(prompt.contains("description for Current thing"));
+
+        // Explicitly assert the removed section heading does not come back.
+        assert!(!prompt.contains("Context from Prior Steps"));
+    }
+
+    #[test]
+    fn test_current_step_marked_with_arrow() {
+        let plan = make_plan();
+        let s1 = make_step_with("s1", "Alpha", StepStatus::Complete);
+        let s2 = make_step_with("s2", "Beta", StepStatus::InProgress);
+        let s3 = make_step_with("s3", "Gamma", StepStatus::Pending);
+        let all_steps = vec![s1.clone(), s2.clone(), s3.clone()];
+
+        let prompt = build_step_prompt(
+            &plan,
+            &s2,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+        );
+
+        // Only the current step line has the arrow prefix.
+        assert!(prompt.contains("→ #2. [IN_PROGRESS] Beta"));
+        // Other lines do NOT have the arrow.
+        assert!(prompt.contains("#1. [COMPLETE] Alpha"));
+        assert!(prompt.contains("#3. [PENDING] Gamma"));
+        assert!(!prompt.contains("→ #1."));
+        assert!(!prompt.contains("→ #3."));
+    }
+
+    #[test]
+    fn test_build_step_prompt_emits_pointer_for_non_native_harness() {
+        let plan = make_plan();
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
             Some("senior-engineer"),
             None,
             false, // harness does NOT support agent file natively
             &PromptWraps::default(),
         );
 
-        // A short pointer should be prepended telling the agent to run
+        // Pointer section should be present telling the agent to run
         // `ralph agents show <name>` rather than inlining the full file.
-        assert!(prompt.starts_with("# Agent Profile"));
+        assert!(prompt.contains("# Agent Profile"));
         assert!(prompt.contains("ralph agents show senior-engineer"));
     }
 
@@ -463,11 +681,12 @@ mod tests {
     fn test_build_step_prompt_no_agent_pointer_when_native() {
         let plan = make_plan();
         let step = make_step();
+        let all_steps = vec![step.clone()];
 
         let prompt = build_step_prompt(
             &plan,
             &step,
-            &[],
+            &all_steps,
             Some("senior-engineer"),
             None,
             true, // harness supports agent file natively
@@ -484,11 +703,12 @@ mod tests {
     fn test_build_step_prompt_no_agent_pointer_when_no_agent() {
         let plan = make_plan();
         let step = make_step();
+        let all_steps = vec![step.clone()];
 
         let prompt = build_step_prompt(
             &plan,
             &step,
-            &[],
+            &all_steps,
             None,
             None,
             false, // non-native, but no agent assigned
@@ -502,6 +722,7 @@ mod tests {
     fn test_build_step_prompt_with_retry_context() {
         let plan = make_plan();
         let step = make_step();
+        let all_steps = vec![step.clone()];
         let retry = RetryContext {
             attempt: 2,
             max_attempts: 3,
@@ -513,7 +734,7 @@ mod tests {
         let prompt = build_step_prompt(
             &plan,
             &step,
-            &[],
+            &all_steps,
             None,
             Some(&retry),
             true,
@@ -531,27 +752,23 @@ mod tests {
     }
 
     #[test]
-    fn test_build_step_prompt_no_prior_steps() {
-        let plan = make_plan();
-        let step = make_step();
-
-        let prompt =
-            build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
-
-        // Should not contain prior steps section
-        assert!(!prompt.contains("Context from Prior Steps"));
-    }
-
-    #[test]
     fn test_build_step_prompt_no_acceptance_criteria() {
         let plan = make_plan();
         let mut step = make_step();
         step.acceptance_criteria = vec![];
+        let all_steps = vec![step.clone()];
 
-        let prompt =
-            build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+        );
 
-        assert!(!prompt.contains("Acceptance Criteria"));
+        assert!(!prompt.contains("Acceptance criteria"));
     }
 
     #[test]
@@ -559,9 +776,17 @@ mod tests {
         let mut plan = make_plan();
         plan.deterministic_tests = vec![];
         let step = make_step();
+        let all_steps = vec![step.clone()];
 
-        let prompt =
-            build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+        );
 
         assert!(!prompt.contains("Post-harness validation"));
     }
@@ -574,8 +799,16 @@ mod tests {
         // toward imperative language, this catches it.
         let plan = make_plan();
         let step = make_step();
-        let prompt =
-            build_step_prompt(&plan, &step, &[], None, None, true, &PromptWraps::default());
+        let all_steps = vec![step.clone()];
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+        );
         assert!(
             !prompt.contains("All must pass"),
             "imperative wording re-introduced: prompt should frame tests as ralph-owned \
@@ -655,82 +888,11 @@ mod tests {
     }
 
     #[test]
-    fn test_format_prior_steps_multiple() {
-        let steps = vec![
-            PriorStepSummary {
-                number: 3,
-                title: "Step A".to_string(),
-                status: StepStatus::Complete,
-                files_changed: vec!["a.rs".to_string()],
-                description: "Did A".to_string(),
-            },
-            PriorStepSummary {
-                number: 7,
-                title: "Step B".to_string(),
-                status: StepStatus::Skipped,
-                files_changed: vec![],
-                description: "Skipped B".to_string(),
-            },
-        ];
-
-        let result = format_prior_steps(&steps);
-        // Numbers come from the plan, not the filtered slice.
-        assert!(result.contains("Step 3 (completed): Step A"));
-        assert!(result.contains("Step 7 (skipped): Step B"));
-        assert!(!result.contains("Step 1 (completed)"));
-        assert!(!result.contains("Step 2 (skipped)"));
-        assert!(result.contains("a.rs"));
-    }
-
-    #[test]
-    fn test_format_prior_steps_includes_failed_and_aborted() {
-        let steps = vec![
-            PriorStepSummary {
-                number: 1,
-                title: "Worked".to_string(),
-                status: StepStatus::Complete,
-                files_changed: vec!["ok.rs".to_string()],
-                description: "Fine".to_string(),
-            },
-            PriorStepSummary {
-                number: 2,
-                title: "Broke things".to_string(),
-                status: StepStatus::Failed,
-                files_changed: vec!["bad.rs".to_string()],
-                description: "Tests failed after edit".to_string(),
-            },
-            PriorStepSummary {
-                number: 3,
-                title: "User bailed".to_string(),
-                status: StepStatus::Aborted,
-                files_changed: vec![],
-                description: "Ctrl+C mid-run".to_string(),
-            },
-        ];
-
-        let result = format_prior_steps(&steps);
-        // Completed step still labeled
-        assert!(result.contains("Step 1 (completed): Worked"));
-        // Failed step is present and tagged as failed
-        assert!(result.contains("Step 2 (failed): Broke things"));
-        assert!(result.contains("Tests failed after edit"));
-        assert!(result.contains("bad.rs"));
-        // Aborted step is present and tagged as aborted
-        assert!(result.contains("Step 3 (aborted): User bailed"));
-        assert!(result.contains("Ctrl+C mid-run"));
-    }
-
-    #[test]
     fn test_prompt_section_order() {
         let plan = make_plan();
-        let step = make_step();
-        let prior = vec![PriorStepSummary {
-            number: 1,
-            title: "Prior".to_string(),
-            status: StepStatus::Complete,
-            files_changed: vec![],
-            description: "Done".to_string(),
-        }];
+        let s1 = make_step_with("s1", "Prior", StepStatus::Complete);
+        let s2 = make_step();
+        let all_steps = vec![s1, s2.clone()];
         let retry = RetryContext {
             attempt: 2,
             max_attempts: 3,
@@ -741,30 +903,33 @@ mod tests {
 
         let prompt = build_step_prompt(
             &plan,
-            &step,
-            &prior,
+            &s2,
+            &all_steps,
             Some("senior-engineer"),
             Some(&retry),
             false,
             &PromptWraps::default(),
         );
 
-        // Verify ordering: agent -> retry -> plan -> prior -> step -> criteria -> tests -> focus
+        // Verify ordering:
+        // prepend -> agent -> retry -> plan -> step -> criteria -> step map -> tests -> focus
+        let prepend_pos = prompt.find("# Ralph context").unwrap();
         let agent_pos = prompt.find("# Agent Profile").unwrap();
         let retry_pos = prompt.find("# Retry Context").unwrap();
         let plan_pos = prompt.find("# Plan:").unwrap();
-        let prior_pos = prompt.find("Context from Prior Steps").unwrap();
-        let step_pos = prompt.find("# Step:").unwrap();
-        let criteria_pos = prompt.find("Acceptance Criteria").unwrap();
+        let step_pos = prompt.find("## Your step").unwrap();
+        let criteria_pos = prompt.find("Acceptance criteria").unwrap();
+        let map_pos = prompt.find("## Plan step map").unwrap();
         let tests_pos = prompt.find("Post-harness validation").unwrap();
         let focus_pos = prompt.find("Only modify files").unwrap();
 
+        assert!(prepend_pos < agent_pos);
         assert!(agent_pos < retry_pos);
         assert!(retry_pos < plan_pos);
-        assert!(plan_pos < prior_pos);
-        assert!(prior_pos < step_pos);
+        assert!(plan_pos < step_pos);
         assert!(step_pos < criteria_pos);
-        assert!(criteria_pos < tests_pos);
+        assert!(criteria_pos < map_pos);
+        assert!(map_pos < tests_pos);
         assert!(tests_pos < focus_pos);
     }
 
@@ -772,6 +937,7 @@ mod tests {
     fn test_wraps_layer_global_project_plan_order() {
         let plan = make_plan();
         let step = make_step();
+        let all_steps = vec![step.clone()];
         let global_pre = "GLOBAL-PRE".to_string();
         let global_suf = "GLOBAL-SUF".to_string();
         let project_pre = "PROJECT-PRE".to_string();
@@ -784,16 +950,17 @@ mod tests {
             plan: PromptWrap::from_opts(Some(&plan_pre), Some(&plan_suf)),
         };
 
-        let prompt = build_step_prompt(&plan, &step, &[], None, None, true, &wraps);
+        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &wraps);
 
-        // Prefixes stack outermost → innermost at the top.
+        // Prefixes stack outermost → innermost at the top, ahead of the
+        // prepend section.
         let g_pre = prompt.find("GLOBAL-PRE").unwrap();
         let p_pre = prompt.find("PROJECT-PRE").unwrap();
         let pl_pre = prompt.find("PLAN-PRE").unwrap();
-        let plan_section = prompt.find("# Plan: test-plan").unwrap();
+        let prepend_pos = prompt.find("# Ralph context").unwrap();
         assert!(g_pre < p_pre);
         assert!(p_pre < pl_pre);
-        assert!(pl_pre < plan_section);
+        assert!(pl_pre < prepend_pos);
 
         // Suffixes stack innermost → outermost at the bottom.
         let focus = prompt.find("Only modify files").unwrap();
@@ -813,6 +980,7 @@ mod tests {
     fn test_wraps_skip_empty_and_none() {
         let plan = make_plan();
         let step = make_step();
+        let all_steps = vec![step.clone()];
         let blank = String::new();
         let plan_pre = "PLAN-PRE".to_string();
         let wraps = PromptWraps {
@@ -823,7 +991,7 @@ mod tests {
             plan: PromptWrap::from_opts(Some(&plan_pre), None),
         };
 
-        let prompt = build_step_prompt(&plan, &step, &[], None, None, true, &wraps);
+        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &wraps);
 
         assert!(prompt.starts_with("PLAN-PRE"));
         assert!(
@@ -836,5 +1004,25 @@ mod tests {
                 .trim_end()
                 .ends_with(&format!("Focus on: {}", step.title))
         );
+    }
+
+    #[test]
+    fn test_effective_context_prepend_returns_default_when_none() {
+        let plan = make_plan();
+        assert_eq!(effective_context_prepend(&plan), DEFAULT_CONTEXT_PREPEND);
+    }
+
+    #[test]
+    fn test_effective_context_prepend_returns_override() {
+        let mut plan = make_plan();
+        plan.context_prepend = Some("custom".to_string());
+        assert_eq!(effective_context_prepend(&plan), "custom");
+    }
+
+    #[test]
+    fn test_effective_context_prepend_returns_empty_for_empty_override() {
+        let mut plan = make_plan();
+        plan.context_prepend = Some(String::new());
+        assert_eq!(effective_context_prepend(&plan), "");
     }
 }

@@ -18,17 +18,66 @@ use super::resolve_step;
 // Step commands
 // ---------------------------------------------------------------------------
 
+/// Normalize user-supplied tags from a single CLI invocation.
+///
+/// Trims whitespace from each value, rejects empty/whitespace-only entries,
+/// and rejects exact duplicates within the same invocation. Case is preserved
+/// as the user typed it. Returns the normalized list ready to store.
+pub(crate) fn normalize_tag_inputs(raw: &[String]) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for t in raw {
+        let trimmed = t.trim();
+        if trimmed.is_empty() {
+            bail!("Tag values cannot be empty or whitespace-only");
+        }
+        if out.iter().any(|existing| existing == trimmed) {
+            bail!("Duplicate tag '{trimmed}' in this invocation");
+        }
+        out.push(trimmed.to_string());
+    }
+    Ok(out)
+}
+
+/// Render a step's tags for plain-text output (e.g. `[FIX][REGRESSION]`).
+///
+/// Returns an empty string when the step has no tags so list rendering stays
+/// unchanged for pre-V13 data and steps that never opted in.
+pub(crate) fn render_tags_inline(step: &Step) -> String {
+    if step.tags.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    for t in &step.tags {
+        s.push('[');
+        s.push_str(t);
+        s.push(']');
+    }
+    s
+}
+
 pub fn step_list(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
     config: &Config,
+    filter_tags: &[String],
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
-    let steps = storage::list_steps(conn, &plan.id)?;
+    let all_steps = storage::list_steps(conn, &plan.id)?;
+
+    // AND-filter: step must carry every requested tag (case-sensitive exact
+    // match). No tags requested → no filtering, preserving the legacy shape.
+    let steps: Vec<Step> = if filter_tags.is_empty() {
+        all_steps
+    } else {
+        all_steps
+            .into_iter()
+            .filter(|s| filter_tags.iter().all(|t| s.tags.iter().any(|st| st == t)))
+            .collect()
+    };
 
     if out.format == OutputFormat::Json {
         let summaries: Vec<output::StepSummary> =
@@ -38,7 +87,14 @@ pub fn step_list(
     }
 
     if steps.is_empty() {
-        eprintln!("No steps in plan '{}'.", plan_slug);
+        if filter_tags.is_empty() {
+            eprintln!("No steps in plan '{}'.", plan_slug);
+        } else {
+            eprintln!(
+                "No steps in plan '{}' matching tags {:?}.",
+                plan_slug, filter_tags
+            );
+        }
         return Ok(());
     }
 
@@ -53,11 +109,18 @@ pub fn step_list(
         } else {
             ""
         };
+        let tags_inline = render_tags_inline(step);
+        let tags_prefix = if tags_inline.is_empty() {
+            String::new()
+        } else {
+            format!("{tags_inline} ")
+        };
         let budget_tag = render_budget_tag(step, config);
         println!(
-            "  {:>3}. {} {}{}  [{}]{}",
+            "  {:>3}. {} {}{}{}  [{}]{}",
             i + 1,
             output::status_icon(step.status, out.color),
+            tags_prefix,
             output::bold(&step.title, out.color),
             policy_tag,
             output::colored_status(step.status, out.color),
@@ -106,12 +169,19 @@ pub fn step_add(
     criteria: &[String],
     max_retries: Option<i32>,
     change_policy: Option<ChangePolicy>,
+    tags: &[String],
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
     let desc = description.unwrap_or("");
+    let normalized_tags = normalize_tag_inputs(tags)?;
+    let tags_arg: Option<&[String]> = if normalized_tags.is_empty() {
+        None
+    } else {
+        Some(&normalized_tags)
+    };
 
     let (step, pos) = if let Some(after_pos) = after {
         // Insert after a specific position using fractional indexing
@@ -158,6 +228,7 @@ pub fn step_add(
             max_retries,
             model,
             change_policy,
+            tags_arg,
         )?
     } else {
         // Append at the end (default)
@@ -172,6 +243,7 @@ pub fn step_add(
             max_retries,
             model,
             change_policy,
+            tags_arg,
         )?
     };
 
@@ -249,6 +321,11 @@ pub fn step_add_bulk(
     let mut inserted: Vec<(crate::plan::Step, usize)> = Vec::with_capacity(steps.len());
     let insert_result: Result<()> = (|| {
         for s in &steps {
+            let tags_arg: Option<&[String]> = if s.tags.is_empty() {
+                None
+            } else {
+                Some(&s.tags)
+            };
             let (step, pos) = storage::create_step(
                 conn,
                 &plan.id,
@@ -260,6 +337,7 @@ pub fn step_add_bulk(
                 s.max_retries,
                 s.model.as_deref(),
                 Some(s.change_policy),
+                tags_arg,
             )?;
             inserted.push((step, pos));
         }
@@ -343,6 +421,8 @@ pub fn step_edit(
     max_retries: Option<i32>,
     clear_max_retries: bool,
     change_policy: Option<ChangePolicy>,
+    tags: &[String],
+    clear_tags: bool,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
@@ -359,9 +439,11 @@ pub fn step_edit(
         && max_retries.is_none()
         && !clear_max_retries
         && change_policy.is_none()
+        && tags.is_empty()
+        && !clear_tags
     {
         bail!(
-            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --max-retries, --clear-max-retries, or --change-policy"
+            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --max-retries, --clear-max-retries, --change-policy, --tag, or --clear-tags"
         );
     }
 
@@ -383,6 +465,22 @@ pub fn step_edit(
         max_retries.map(Some) // Set to specific value
     };
 
+    // Tags: `--clear-tags` substitutes an empty list, any `--tag` invocation
+    // replaces the existing list wholesale after normalization, otherwise
+    // don't change the stored tags.
+    let normalized_tags = if tags.is_empty() {
+        Vec::new()
+    } else {
+        normalize_tag_inputs(tags)?
+    };
+    let tags_update: Option<&[String]> = if clear_tags {
+        Some(&[])
+    } else if !tags.is_empty() {
+        Some(&normalized_tags)
+    } else {
+        None
+    };
+
     storage::update_step_fields_ext(
         conn,
         &step.id,
@@ -398,6 +496,7 @@ pub fn step_edit(
         retries_update,
         model_update,
         change_policy,
+        tags_update,
     )?;
 
     eprintln!(
@@ -782,6 +881,7 @@ mod tests {
             &[],
             Some(3),
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -821,6 +921,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -851,6 +952,7 @@ mod tests {
             &[],
             None, // no max_retries override — falls back to config default.
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -868,5 +970,270 @@ mod tests {
         let tag = render_budget_tag(&steps[0], &default_config());
         // Default config has max_retries_per_step=3 → max_attempts=4.
         assert_eq!(tag, " (attempts: 1/4)");
+    }
+
+    // -- Tag tests ---------------------------------------------------------
+
+    /// Helper: invoke `step_add` with a minimum set of args plus user-provided tags.
+    fn add_with_tags(conn: &Connection, project: &str, title: &str, tags: &[String]) {
+        step_add(
+            conn,
+            "bulk-plan",
+            project,
+            title,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            tags,
+            &test_out(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_step_add_with_tags() {
+        let (conn, project) = setup_with_plan();
+        let tags = vec!["FIX".to_string(), "REGRESSION".to_string()];
+        add_with_tags(&conn, &project, "tagged", &tags);
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].tags, tags);
+    }
+
+    #[test]
+    fn test_step_add_rejects_empty_tag() {
+        let (conn, project) = setup_with_plan();
+        let tags = vec!["FIX".to_string(), "  ".to_string()];
+        let err = step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "t",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &tags,
+            &test_out(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_step_add_rejects_duplicate_tag_in_same_invocation() {
+        let (conn, project) = setup_with_plan();
+        let tags = vec!["FIX".to_string(), "FIX".to_string()];
+        let err = step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "t",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            &tags,
+            &test_out(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("duplicate"));
+    }
+
+    #[test]
+    fn test_step_edit_replaces_tags() {
+        let (conn, project) = setup_with_plan();
+        add_with_tags(
+            &conn,
+            &project,
+            "t",
+            &["INITIAL".to_string(), "OTHER".to_string()],
+        );
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+
+        // Replace with a brand-new set.
+        let new_tags = vec!["REVIEW".to_string()];
+        step_edit(
+            &conn,
+            "bulk-plan",
+            &project,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+            &new_tags,
+            false,
+            &test_out(),
+        )
+        .unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].tags, new_tags);
+    }
+
+    #[test]
+    fn test_step_edit_clear_tags() {
+        let (conn, project) = setup_with_plan();
+        add_with_tags(&conn, &project, "t", &["FIX".to_string()]);
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+
+        step_edit(
+            &conn,
+            "bulk-plan",
+            &project,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+            &[],
+            true, // clear_tags
+            &test_out(),
+        )
+        .unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert!(steps[0].tags.is_empty());
+    }
+
+    #[test]
+    fn test_step_edit_no_tag_flag_leaves_tags_unchanged() {
+        let (conn, project) = setup_with_plan();
+        let original = vec!["KEEP".to_string()];
+        add_with_tags(&conn, &project, "t", &original);
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+
+        // Edit just the title — tags should be unchanged.
+        step_edit(
+            &conn,
+            "bulk-plan",
+            &project,
+            Some(1),
+            None,
+            Some("new title"),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            false,
+            None,
+            &[],
+            false,
+            &test_out(),
+        )
+        .unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].title, "new title");
+        assert_eq!(steps[0].tags, original);
+    }
+
+    #[test]
+    fn test_step_list_filter_by_tag() {
+        let (conn, project) = setup_with_plan();
+        add_with_tags(&conn, &project, "A", &["FIX".to_string()]);
+        add_with_tags(&conn, &project, "B", &["REVIEW".to_string()]);
+        add_with_tags(&conn, &project, "C", &["FIX".to_string(), "URGENT".to_string()]);
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+
+        // No filter -> all three.
+        let all = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Single-tag filter picks the two steps that carry FIX.
+        let filter = ["FIX".to_string()];
+        let filtered: Vec<&Step> = all
+            .iter()
+            .filter(|s| filter.iter().all(|t| s.tags.iter().any(|st| st == t)))
+            .collect();
+        assert_eq!(filtered.len(), 2);
+        let titles: Vec<&str> = filtered.iter().map(|s| s.title.as_str()).collect();
+        assert!(titles.contains(&"A"));
+        assert!(titles.contains(&"C"));
+    }
+
+    #[test]
+    fn test_step_list_filter_requires_all_tags() {
+        let (conn, project) = setup_with_plan();
+        add_with_tags(&conn, &project, "A", &["FIX".to_string()]);
+        add_with_tags(&conn, &project, "B", &["FIX".to_string(), "URGENT".to_string()]);
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+
+        // Demand BOTH `FIX` and `URGENT` -> only B matches.
+        let filter = ["FIX".to_string(), "URGENT".to_string()];
+        let all = storage::list_steps(&conn, &plan.id).unwrap();
+        let filtered: Vec<&Step> = all
+            .iter()
+            .filter(|s| filter.iter().all(|t| s.tags.iter().any(|st| st == t)))
+            .collect();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].title, "B");
+    }
+
+    #[test]
+    fn test_render_tags_inline() {
+        let (conn, project) = setup_with_plan();
+        add_with_tags(
+            &conn,
+            &project,
+            "tagged",
+            &["FIX".to_string(), "REGRESSION".to_string()],
+        );
+        add_with_tags(&conn, &project, "untagged", &[]);
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+
+        assert_eq!(render_tags_inline(&steps[0]), "[FIX][REGRESSION]");
+        assert_eq!(render_tags_inline(&steps[1]), "");
     }
 }

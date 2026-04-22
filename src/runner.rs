@@ -14,10 +14,12 @@ use tokio::sync::watch;
 
 use crate::config::Config;
 use crate::executor::{self, StepOutcome, StepResult};
-use crate::git;
+use crate::git::{self, StashPopOutcome, StashRef};
+use crate::harness;
 use crate::hooks::HookContext;
 use crate::output::{self, OutputContext, OutputFormat, RunEvent};
 use crate::plan::{Plan, PlanStatus, Step, StepStatus};
+use crate::run_lock;
 use crate::storage;
 
 // ---------------------------------------------------------------------------
@@ -39,15 +41,19 @@ pub struct RunOptions {
     pub to: Option<usize>,
     /// Skip branch creation and use the current branch.
     pub current_branch: bool,
-    /// Auto-commit any dirty working-tree state before switching to the plan
-    /// branch. Honored by `setup_branch`. When false and the config's
-    /// `auto_stash` is also false, a dirty working tree bails the run and
-    /// lists the files that would have been swept up.
+    /// Stash any dirty working-tree state (tracked + untracked) before
+    /// switching to the plan branch via `git stash push
+    /// --include-untracked`, and pop it back at run end. Default-on;
+    /// `--no-auto-stash` forces it off, in which case a dirty tree causes
+    /// the run to bail with a clear error.
     pub auto_stash: bool,
     /// Override the harness for this run.
     pub harness_override: Option<String>,
     /// Dry-run mode: print what would happen without executing.
     pub dry_run: bool,
+    /// Print the full per-attempt prompt to stderr instead of the
+    /// 512-char preview. Threaded into [`executor::execute_step`].
+    pub verbose: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -99,27 +105,154 @@ pub async fn run_plan(
         effective_plan.harness = Some(h.clone());
     }
 
-    // 2. Optionally create and checkout branch.
-    if !options.current_branch && !options.dry_run {
-        setup_branch(workdir, &effective_plan, None, options.auto_stash).await?;
+    // Sweep stale in_progress step rows left behind by a crashed prior run.
+    // The caller holds the per-project run lock, so any InProgress row we see
+    // here is definitively orphaned. Skip in dry-run mode (it mutates state).
+    if !options.dry_run {
+        sweep_and_log_stale_in_progress(conn, &effective_plan, out)?;
     }
 
-    // Load steps.
-    let all_steps = storage::list_steps(conn, &effective_plan.id)?;
-    if all_steps.is_empty() {
+    // 2. Stash dirty tree + create branch. The orchestrator
+    // (`run_all_plans`) handles stash/setup itself and forces
+    // `current_branch: true` on the inner `run_plan` call, so only
+    // top-level single-plan runs take this path.
+    let teardown = if !options.current_branch && !options.dry_run {
+        let source_branch = {
+            let workdir_owned = workdir.to_path_buf();
+            blocking_git(move || git::get_current_branch(&workdir_owned))
+                .await
+                .context("Failed to get current git branch")?
+        };
+        let stash_ref =
+            stash_if_dirty(workdir, &effective_plan.slug, options.auto_stash).await?;
+        // Record source_branch + stash_sha on the run_lock row so resume /
+        // diagnostics can see what we'll try to restore. Best-effort — if
+        // the row isn't there (tests), swallow the error.
+        let _ = run_lock::record_source_branch_and_stash(
+            conn,
+            workdir.to_string_lossy().as_ref(),
+            &source_branch,
+            stash_ref.as_ref().map(|s| s.as_str()),
+        );
+        // Construct teardown state BEFORE setup_branch so that a failure in
+        // branch creation/checkout still triggers stash restoration. Without
+        // this, a bad branch name or checkout conflict would leave the user's
+        // uncommitted work stranded on the stash stack.
+        let td = TeardownState {
+            workdir: workdir.to_path_buf(),
+            source_branch,
+            stash_ref,
+        };
+        if let Err(setup_err) = setup_branch(workdir, &effective_plan, None).await {
+            if let Err(te) =
+                restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref()).await
+            {
+                eprintln!("Warning: teardown after failed branch setup: {te}");
+            }
+            return Err(setup_err);
+        }
+        Some(td)
+    } else {
+        None
+    };
+
+    // Execute the plan body. On any exit path (success, error, abort),
+    // restore_working_tree must fire. We use a manual `finalize` pattern
+    // rather than Drop because `stash pop` can fail and we need to
+    // surface that to the caller.
+    let outcome = run_plan_inner(
+        conn,
+        &effective_plan,
+        config,
+        workdir,
+        options,
+        abort_rx,
+        out,
+    )
+    .await;
+
+    if let Some(td) = teardown {
+        match &outcome {
+            Ok(_) => {
+                // Don't mask a teardown error with a success.
+                restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref())
+                    .await?;
+            }
+            Err(_) => {
+                // Run already failed; log teardown errors but don't mask
+                // the original failure.
+                if let Err(te) = restore_working_tree(
+                    &td.workdir,
+                    &td.source_branch,
+                    td.stash_ref.as_ref(),
+                )
+                .await
+                {
+                    eprintln!("Warning: teardown after failed run: {te}");
+                }
+            }
+        }
+    }
+
+    outcome
+}
+
+/// State captured by the top-level `run_plan` before the plan body runs.
+/// Handed to `restore_working_tree` during teardown.
+struct TeardownState {
+    workdir: std::path::PathBuf,
+    source_branch: String,
+    stash_ref: Option<StashRef>,
+}
+
+async fn run_plan_inner(
+    conn: &Connection,
+    effective_plan: &Plan,
+    config: &Config,
+    workdir: &Path,
+    options: &RunOptions,
+    abort_rx: watch::Receiver<bool>,
+    out: &OutputContext,
+) -> Result<PlanRunResult> {
+    let effective_plan = effective_plan.clone();
+
+    // Load steps (post-sweep snapshot used to resolve --from/--to and for the
+    // initial "known step IDs" baseline).
+    let initial_steps = storage::list_steps(conn, &effective_plan.id)?;
+    if initial_steps.is_empty() {
         bail!("Plan '{}' has no steps", effective_plan.slug);
     }
 
-    // Determine which steps to run.
-    let steps_to_run = select_steps(&all_steps, options)?;
+    // Resolve the run window to sort_key bounds ONCE. Positions shift if new
+    // steps are inserted mid-run, but sort_keys are stable. We still accept
+    // `--from`/`--to` as 1-based step numbers for the CLI, but we immediately
+    // translate them to sort_key bounds so later filtering tolerates inserts.
+    let window = resolve_window(&initial_steps, options)?;
 
-    if steps_to_run.is_empty() {
+    // Snapshot of currently-actionable steps in the window. Used to capture
+    // the `--one` target (earliest actionable step) before we start mutating
+    // state. If the window contains NO steps at all (e.g. a bogus
+    // `--from`/`--to` range), bail — but if the window contains steps that
+    // just happen to all be Complete/Skipped, fall through and let the final
+    // status computation report Complete. That mirrors the pre-fix behavior
+    // of a user re-running an already-finished plan.
+    let window_steps: Vec<&Step> = initial_steps
+        .iter()
+        .filter(|s| window.contains_key(&s.sort_key))
+        .collect();
+    if window_steps.is_empty() {
         bail!("No pending steps to run in plan '{}'", effective_plan.slug);
     }
+    let initial_actionable: Vec<Step> = window_steps
+        .iter()
+        .filter(|s| is_actionable(s.status))
+        .map(|s| (*s).clone())
+        .collect();
 
     // Dry-run mode: just print what would happen.
     if options.dry_run {
-        return dry_run_report(&effective_plan, &all_steps, &steps_to_run);
+        let steps_to_run: Vec<Step> = window_steps.iter().map(|s| (*s).clone()).collect();
+        return dry_run_report(&effective_plan, &initial_steps, &steps_to_run);
     }
 
     // 3. Mark plan as in_progress.
@@ -130,8 +263,11 @@ pub async fn run_plan(
     // Load the hook library once for this run, filtered by project scope.
     let hook_ctx = HookContext::load(workdir, config.hook_timeout_secs)?;
 
-    // 4. Iterate through steps.
-    let total = steps_to_run.len();
+    // 4. Iterate through steps. Each iteration re-queries the step list so
+    //    steps inserted mid-run by the running agent (via `ralph step add`)
+    //    are picked up. `known_step_ids` tracks steps observed at or before
+    //    this iteration so we can report any that appeared since the last
+    //    loop pass.
     let mut result = PlanRunResult {
         plan_slug: effective_plan.slug.clone(),
         steps_executed: 0,
@@ -142,24 +278,88 @@ pub async fn run_plan(
         step_results: Vec::new(),
     };
 
-    for (i, step) in steps_to_run.iter().enumerate() {
+    let mut known_step_ids: HashSet<String> =
+        initial_steps.iter().map(|s| s.id.clone()).collect();
+    let mut executed_step_ids: HashSet<String> = HashSet::new();
+
+    // For `--one`, we need to stop after the first step actually executed;
+    // capture its ID at the start (the earliest actionable step in the
+    // window) and exit after it completes. Positions can shift due to
+    // inserts, but the ID is stable. If `--one` is requested but nothing
+    // is actionable, bail — mirrors the pre-fix behavior of `select_steps`
+    // returning an empty slice in that case.
+    let one_target_id: Option<String> = if options.one {
+        match initial_actionable.first() {
+            Some(s) => Some(s.id.clone()),
+            None => bail!("No pending steps to run in plan '{}'", effective_plan.slug),
+        }
+    } else {
+        None
+    };
+
+    loop {
         // Check abort signal between steps.
         if *abort_rx.borrow() {
-            eprintln!("[{}/{}] Aborted", i + 1, total);
+            eprintln!("Aborted");
             storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
             result.final_status = PlanStatus::Aborted;
             return Ok(result);
         }
 
-        // Skip already-completed or skipped steps. Pre-existing Complete
-        // steps were not executed by this invocation, so they must not
-        // inflate steps_succeeded.
-        let current_step = storage::get_step(conn, &step.id)?;
-        if current_step.status == StepStatus::Complete || current_step.status == StepStatus::Skipped
+        // Re-fetch the step list. This is the core of the mid-run-insert fix.
+        let all_steps = storage::list_steps(conn, &effective_plan.id)?;
+
+        // Detect and report new inserts.
+        let new_inserts: Vec<Step> = all_steps
+            .iter()
+            .filter(|s| !known_step_ids.contains(&s.id))
+            .filter(|s| window.contains_key(&s.sort_key))
+            .cloned()
+            .collect();
+        if !new_inserts.is_empty() {
+            report_plan_grew(&new_inserts, &all_steps, out)?;
+        }
+        for s in &all_steps {
+            known_step_ids.insert(s.id.clone());
+        }
+
+        let total_now = all_steps.len();
+
+        // Find the next step to execute in the window: first actionable step
+        // whose ID we haven't already executed in this invocation.
+        let next = all_steps
+            .iter()
+            .find(|s| {
+                window.contains_key(&s.sort_key)
+                    && is_actionable(s.status)
+                    && !executed_step_ids.contains(&s.id)
+            })
+            .cloned();
+
+        let current_step = match next {
+            Some(s) => s,
+            None => break, // no more actionable steps in the window
+        };
+
+        // `--one`: once we've executed the captured target, stop. We also
+        // refuse to pivot to a later step if the original target has moved
+        // out of the actionable set (e.g. it was skipped out-of-band).
+        if let Some(ref target) = one_target_id
+            && current_step.id != *target
+        {
+            break;
+        }
+
+        // Skip already-completed or skipped steps that happen to fall in
+        // the window but weren't filtered out above (defensive: the
+        // is_actionable filter already excludes these).
+        if current_step.status == StepStatus::Complete
+            || current_step.status == StepStatus::Skipped
         {
             if current_step.status == StepStatus::Skipped {
                 result.steps_skipped += 1;
             }
+            executed_step_ids.insert(current_step.id.clone());
             continue;
         }
 
@@ -170,15 +370,22 @@ pub async fn run_plan(
                 step_id: current_step.id.clone(),
                 step_title: current_step.title.clone(),
                 step_num,
-                step_total: total,
+                step_total: total_now,
             })?;
         } else {
+            // Resolve the step-level harness label (hooks into the executor's
+            // per-attempt sub-header below). Per-step override falls back to
+            // the plan-level harness, then to config default.
+            let (harness_name, harness_config) =
+                harness::resolve_harness(&current_step, &effective_plan, config)?;
+            let harness_label = output::format_harness_label_with_override(
+                harness_name,
+                harness_config.color.as_deref(),
+                out.color,
+            );
             eprintln!(
-                "[{}/{}] > Step {}: {} ...",
-                i + 1,
-                total,
-                step_num,
-                current_step.title
+                "[{}/{}] > Step {} \"{}\" ({})",
+                step_num, total_now, step_num, current_step.title, harness_label
             );
         }
 
@@ -193,11 +400,19 @@ pub async fn run_plan(
             workdir,
             &hook_ctx,
             abort_rx.clone(),
+            executor::ExecuteOptions {
+                verbose: options.verbose,
+                step_num_in_plan: step_num,
+                step_total: total_now,
+                json_output: out.format == OutputFormat::Json,
+                color: out.color,
+            },
         )
         .await?;
 
         let elapsed = started.elapsed();
         result.steps_executed += 1;
+        executed_step_ids.insert(current_step.id.clone());
 
         // Print result / emit step_finished event.
         let outcome_str = match step_result.outcome {
@@ -213,7 +428,7 @@ pub async fn run_plan(
                     step_id: current_step.id.clone(),
                     step_title: current_step.title.clone(),
                     step_num,
-                    step_total: total,
+                    step_total: total_now,
                     outcome: outcome.to_string(),
                     attempts: step_result.attempts_used,
                     duration_secs: elapsed.as_secs_f64(),
@@ -228,11 +443,10 @@ pub async fn run_plan(
                 emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
                     eprintln!(
-                        "[{}/{}] > {} ... OK (attempt {}, {:.0}s)",
-                        i + 1,
-                        total,
+                        "[{}/{}] > {} ... OK ({:.0}s)",
+                        step_num,
+                        total_now,
                         current_step.title,
-                        step_result.attempts_used,
                         elapsed.as_secs_f64()
                     );
                 }
@@ -243,8 +457,8 @@ pub async fn run_plan(
                 if out.format != OutputFormat::Json {
                     eprintln!(
                         "[{}/{}] > {} ... FAILED (after {} attempts, {:.0}s)",
-                        i + 1,
-                        total,
+                        step_num,
+                        total_now,
                         current_step.title,
                         step_result.attempts_used,
                         elapsed.as_secs_f64()
@@ -259,7 +473,10 @@ pub async fn run_plan(
             StepOutcome::Aborted => {
                 emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
-                    eprintln!("[{}/{}] > {} ... ABORTED", i + 1, total, current_step.title);
+                    eprintln!(
+                        "[{}/{}] > {} ... ABORTED",
+                        step_num, total_now, current_step.title
+                    );
                 }
                 storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
                 result.final_status = PlanStatus::Aborted;
@@ -270,7 +487,10 @@ pub async fn run_plan(
                 result.steps_failed += 1;
                 emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
-                    eprintln!("[{}/{}] > {} ... TIMEOUT", i + 1, total, current_step.title);
+                    eprintln!(
+                        "[{}/{}] > {} ... TIMEOUT",
+                        step_num, total_now, current_step.title
+                    );
                 }
                 storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
                 result.final_status = PlanStatus::Failed;
@@ -280,6 +500,11 @@ pub async fn run_plan(
         }
 
         result.step_results.push(step_result);
+
+        // `--one`: stop after executing the captured target.
+        if one_target_id.is_some() {
+            break;
+        }
     }
 
     // All steps completed successfully.
@@ -459,7 +684,32 @@ pub async fn run_all_plans(
     let plan_by_id: HashMap<String, Plan> =
         runnable.into_iter().map(|p| (p.id.clone(), p)).collect();
 
-    // 3. Capture the run's starting SHA (used for plans with no deps).
+    // 3. Capture the run's starting SHA (used for plans with no deps) and,
+    // on the stash-managing path, stash any dirty tree + record the source
+    // branch for teardown.
+    let teardown = if !options.current_branch && !options.dry_run {
+        let source_branch = {
+            let workdir_owned = workdir.to_path_buf();
+            blocking_git(move || git::get_current_branch(&workdir_owned))
+                .await
+                .context("Failed to get current git branch")?
+        };
+        let stash_ref = stash_if_dirty(workdir, "all", options.auto_stash).await?;
+        let _ = run_lock::record_source_branch_and_stash(
+            conn,
+            project,
+            &source_branch,
+            stash_ref.as_ref().map(|s| s.as_str()),
+        );
+        Some(TeardownState {
+            workdir: workdir.to_path_buf(),
+            source_branch,
+            stash_ref,
+        })
+    } else {
+        None
+    };
+
     let run_start_sha = if options.current_branch || options.dry_run {
         String::new()
     } else {
@@ -468,6 +718,57 @@ pub async fn run_all_plans(
             .await
             .context("could not capture starting HEAD SHA")?
     };
+
+    let inner = run_all_plans_inner(
+        conn,
+        project,
+        config,
+        workdir,
+        options,
+        abort_rx,
+        out,
+        topo_order,
+        plan_by_id,
+        run_start_sha,
+    )
+    .await;
+
+    if let Some(td) = teardown {
+        match &inner {
+            Ok(_) => {
+                restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref())
+                    .await?;
+            }
+            Err(_) => {
+                if let Err(te) = restore_working_tree(
+                    &td.workdir,
+                    &td.source_branch,
+                    td.stash_ref.as_ref(),
+                )
+                .await
+                {
+                    eprintln!("Warning: teardown after failed --all run: {te}");
+                }
+            }
+        }
+    }
+
+    inner
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_all_plans_inner(
+    conn: &Connection,
+    project: &str,
+    config: &Config,
+    workdir: &Path,
+    options: &RunOptions,
+    abort_rx: watch::Receiver<bool>,
+    out: &OutputContext,
+    topo_order: Vec<String>,
+    plan_by_id: HashMap<String, Plan>,
+    run_start_sha: String,
+) -> Result<Vec<PlanRunResult>> {
 
     // 4. Build deps_of map for the in-scope plan set.
     let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
@@ -563,13 +864,7 @@ pub async fn run_all_plans(
 
         // Set up the branch ourselves (unless the user wants current-branch mode).
         if !options.current_branch && !options.dry_run {
-            setup_branch(
-                workdir,
-                plan,
-                branch_plan.parent_sha.as_deref(),
-                options.auto_stash,
-            )
-            .await?;
+            setup_branch(workdir, plan, branch_plan.parent_sha.as_deref()).await?;
 
             // Merge any additional deps' SHAs for multi-parent plans.
             for other_sha in &branch_plan.merge_shas {
@@ -614,6 +909,7 @@ pub async fn run_all_plans(
             auto_stash: options.auto_stash,
             harness_override: options.harness_override.clone(),
             dry_run: options.dry_run,
+            verbose: options.verbose,
         };
 
         let result = run_plan(
@@ -726,6 +1022,16 @@ pub async fn resume_plan(
     abort_rx: watch::Receiver<bool>,
     out: &OutputContext,
 ) -> Result<PlanRunResult> {
+    // Validate status early so the sweep never fires on a plan the caller
+    // can't resume anyway (e.g. Archived, Complete).
+    validate_plan_status(plan)?;
+
+    // Sweep stale InProgress rows BEFORE locating the resume point. The run
+    // lock is held by the caller, so any InProgress row is definitively
+    // orphaned. This runs the same log path as `run_plan`; `run_plan` below
+    // also calls sweep but on a clean plan it's a no-op.
+    sweep_and_log_stale_in_progress(conn, plan, out)?;
+
     // Find the resume point.
     let steps = storage::list_steps(conn, &plan.id)?;
     let resume_idx = find_resume_point(&steps)?;
@@ -741,8 +1047,11 @@ pub async fn resume_plan(
 
     let step_num = resume_idx + 1; // 1-based
     eprintln!(
-        "Resuming plan '{}' from step {} '{}'",
-        plan.slug, step_num, step.title
+        "Resuming plan '{}' at step {}/{} '{}' (earliest non-complete by sort_key)",
+        plan.slug,
+        step_num,
+        steps.len(),
+        step.title
     );
 
     // With the Phase 3 default flip, omitting `step` means "run all remaining
@@ -839,7 +1148,125 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
     }
 }
 
+/// If the working tree is dirty, stash it with a ralph-branded message and
+/// return the stash's commit SHA. Returns `Ok(None)` on a clean tree. Bails
+/// with a user-facing error when the tree is dirty and `auto_stash` is
+/// false.
+///
+/// The stash message is `"ralph: auto-stash for plan '<slug>' at
+/// <ISO-8601>"` so teardown (or manual recovery) can locate it by subject.
+async fn stash_if_dirty(
+    workdir: &Path,
+    plan_slug: &str,
+    auto_stash: bool,
+) -> Result<Option<StashRef>> {
+    let workdir_owned = workdir.to_path_buf();
+    let dirty = blocking_git(move || git::has_uncommitted_changes(&workdir_owned)).await?;
+    if !dirty {
+        return Ok(None);
+    }
+
+    if !auto_stash {
+        let workdir_owned = workdir.to_path_buf();
+        let files = blocking_git(move || git::get_all_changed_files(&workdir_owned)).await?;
+        let mut msg = format!(
+            "Working tree has uncommitted changes; refusing to switch branches \
+             with {} file(s) dirty:\n",
+            files.len(),
+        );
+        for f in &files {
+            msg.push_str("  ");
+            msg.push_str(f);
+            msg.push('\n');
+        }
+        msg.push_str(
+            "Re-run without --no-auto-stash to let ralph preserve your changes \
+             via `git stash push --include-untracked`, or stash/commit them manually first.",
+        );
+        bail!(msg);
+    }
+
+    // Timestamp for traceability; the pairing of plan slug + timestamp makes
+    // every ralph stash line distinct on the stack.
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let message = format!("ralph: auto-stash for plan '{plan_slug}' at {ts}");
+
+    let workdir_owned = workdir.to_path_buf();
+    let msg_owned = message.clone();
+    let stash = blocking_git(move || git::stash_push_with_untracked(&workdir_owned, &msg_owned))
+        .await
+        .context("failed to stash dirty working tree before switching branches")?;
+    Ok(stash)
+}
+
+/// Switch back to `source_branch` and, if we stashed at run start, pop the
+/// stash. Called once at the end of the top-level run regardless of
+/// outcome.
+///
+/// On `checkout <source>` failure (e.g. the plan branch has uncommitted
+/// changes from a misbehaving hook), we surface the error and leave the
+/// user where they are. On `stash pop` conflict, we leave the stash on the
+/// stack and return a non-zero error — the user pops manually.
+async fn restore_working_tree(
+    workdir: &Path,
+    source_branch: &str,
+    stash_ref: Option<&StashRef>,
+) -> Result<()> {
+    // Only checkout if we're not already on the source branch (spares us
+    // a spurious "already on 'X'" message and a no-op write).
+    let current = {
+        let workdir_owned = workdir.to_path_buf();
+        blocking_git(move || git::get_current_branch(&workdir_owned)).await?
+    };
+
+    if current != source_branch {
+        let workdir_owned = workdir.to_path_buf();
+        let branch = source_branch.to_string();
+        let checkout_result =
+            blocking_git(move || git::checkout_branch(&workdir_owned, &branch)).await;
+        if let Err(e) = checkout_result {
+            bail!(
+                "Failed to checkout source branch '{source_branch}' during run teardown: {e}. \
+                 Your stash (if any) is still on the stack — run `git stash list` to inspect."
+            );
+        }
+    }
+
+    if let Some(stash) = stash_ref {
+        let workdir_owned = workdir.to_path_buf();
+        let stash_owned = stash.clone();
+        let outcome =
+            blocking_git(move || git::stash_pop(&workdir_owned, &stash_owned)).await?;
+        match outcome {
+            StashPopOutcome::Clean => {
+                eprintln!("Restored your uncommitted changes.");
+            }
+            StashPopOutcome::Conflicted(stderr) => {
+                bail!(
+                    "Pop of ralph's stash conflicts with committed work. \
+                     Your changes are preserved at {} — resolve manually with \
+                     `git stash pop {}`.\n{}",
+                    stash.as_str(),
+                    stash.as_str(),
+                    stderr,
+                );
+            }
+            StashPopOutcome::NotFound => {
+                eprintln!(
+                    "Warning: ralph's auto-stash ({}) was no longer on the stack at teardown.",
+                    stash.as_str(),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Set up the git branch for the plan.
+///
+/// Assumes the working tree is clean at entry — callers must run
+/// [`stash_if_dirty`] (or prove cleanliness another way) first.
 ///
 /// If the current branch matches the plan's branch, no action is taken.
 /// Otherwise:
@@ -852,7 +1279,6 @@ async fn setup_branch(
     workdir: &Path,
     plan: &Plan,
     parent_sha: Option<&str>,
-    auto_stash: bool,
 ) -> Result<()> {
     let current = {
         let workdir_owned = workdir.to_path_buf();
@@ -863,45 +1289,6 @@ async fn setup_branch(
 
     if current == plan.branch_name {
         return Ok(());
-    }
-
-    // Handle any dirty working-tree state before switching branches.
-    // Default (auto_stash=false) is to refuse: auto-committing untracked
-    // files has surprised users who had scratch work in the tree, so we
-    // preview the file list and bail unless the user opted in via
-    // `--auto-stash` or `config.auto_stash`.
-    {
-        let workdir_owned = workdir.to_path_buf();
-        let dirty = blocking_git(move || git::has_uncommitted_changes(&workdir_owned)).await?;
-        if dirty {
-            let workdir_owned = workdir.to_path_buf();
-            let files = blocking_git(move || git::get_all_changed_files(&workdir_owned)).await?;
-            if auto_stash {
-                let workdir_owned = workdir.to_path_buf();
-                let msg = format!(
-                    "ralph: auto-save before switching to branch '{}'",
-                    plan.branch_name
-                );
-                blocking_git(move || git::commit_changes(&workdir_owned, &msg)).await?;
-            } else {
-                let mut msg = format!(
-                    "Working tree has uncommitted changes; refusing to auto-commit \
-                     {} file(s) before switching to branch '{}':\n",
-                    files.len(),
-                    plan.branch_name
-                );
-                for f in &files {
-                    msg.push_str("  ");
-                    msg.push_str(f);
-                    msg.push('\n');
-                }
-                msg.push_str(
-                    "Re-run with --auto-stash (or set `auto_stash: true` in config.json) \
-                     to commit them automatically, or stage/discard them manually first.",
-                );
-                bail!(msg);
-            }
-        }
     }
 
     // Try to create and checkout the branch. If it already exists,
@@ -964,6 +1351,13 @@ where
 ///
 /// `all_plans` is orthogonal to this function and is handled by the
 /// multi-plan orchestrator, not the step selector.
+///
+/// As of the mid-run-insert fix, `run_plan` no longer calls this function
+/// directly — it uses sort_key-bound windowing via [`resolve_window`] so that
+/// step positions don't drift when new steps are inserted mid-run. The helper
+/// is retained under `#[cfg(test)]` because its tests document the intended
+/// legacy semantics that the new windowing code must still honor.
+#[cfg(test)]
 fn select_steps(all_steps: &[Step], options: &RunOptions) -> Result<Vec<Step>> {
     let total = all_steps.len();
 
@@ -1011,9 +1405,16 @@ fn step_number_in_plan(all_steps: &[Step], step: &Step) -> usize {
         .unwrap_or(0)
 }
 
-/// Find the resume point: the first step that is failed or in_progress.
+/// Find the resume point: the earliest non-complete step by sort_key order.
+///
+/// Post-sweep note: `resume_plan` now calls `sweep_stale_in_progress` before
+/// invoking this function, so in normal use no `InProgress` rows should ever
+/// be visible here. The `InProgress` arm is retained as a belt-and-suspenders
+/// guard in case the sweep is ever accidentally bypassed or reordered.
+/// Preference order: InProgress > Failed > Aborted > Pending.
 fn find_resume_point(steps: &[Step]) -> Result<usize> {
-    // First look for an in_progress step.
+    // Belt-and-suspenders: sweep should have cleared any InProgress, but if
+    // something skipped it, still prefer an in_progress step.
     if let Some(idx) = steps
         .iter()
         .position(|s| s.status == StepStatus::InProgress)
@@ -1026,7 +1427,7 @@ fn find_resume_point(steps: &[Step]) -> Result<usize> {
         return Ok(idx);
     }
 
-    // Then look for an aborted step.
+    // Then look for an aborted step (including rows the sweep just wrote).
     if let Some(idx) = steps.iter().position(|s| s.status == StepStatus::Aborted) {
         return Ok(idx);
     }
@@ -1037,6 +1438,166 @@ fn find_resume_point(steps: &[Step]) -> Result<usize> {
     }
 
     bail!("No failed, in-progress, or pending steps found to resume from")
+}
+
+/// True if a step is in a status that the runner loop will attempt to execute.
+/// Pre-existing Complete / Skipped steps are non-actionable.
+fn is_actionable(status: StepStatus) -> bool {
+    matches!(
+        status,
+        StepStatus::Pending
+            | StepStatus::Failed
+            | StepStatus::InProgress
+            | StepStatus::Aborted
+    )
+}
+
+/// Resolved sort_key bounds for a run window.
+///
+/// `--from`/`--to` are 1-based step numbers from the CLI, but step positions
+/// shift when steps are inserted mid-run. We translate the position-based
+/// bounds into sort_keys once at run start, then filter each iteration's
+/// re-queried step list by sort_key — which is stable across inserts.
+#[derive(Debug, Clone)]
+struct RunWindow {
+    /// Lower-bound sort_key (inclusive). `None` means "from the first step".
+    from_key: Option<String>,
+    /// Upper-bound sort_key (inclusive). `None` means "to the last step".
+    to_key: Option<String>,
+}
+
+impl RunWindow {
+    /// True if a step's sort_key falls within this window.
+    fn contains_key(&self, sort_key: &str) -> bool {
+        if let Some(ref from) = self.from_key
+            && sort_key < from.as_str()
+        {
+            return false;
+        }
+        if let Some(ref to) = self.to_key
+            && sort_key > to.as_str()
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// Resolve the run window (sort_key bounds) from [`RunOptions`] against the
+/// plan's current step list.
+///
+/// Validates that `--from` / `--to` are in range. For `--one`, the window is
+/// still the full plan — the `one_target_id` captured at run start is what
+/// enforces the single-step semantics, not the window.
+fn resolve_window(all_steps: &[Step], options: &RunOptions) -> Result<RunWindow> {
+    let total = all_steps.len();
+
+    if let Some(from) = options.from
+        && (from == 0 || from > total)
+    {
+        bail!(
+            "Start step {} is out of range (plan has {} steps)",
+            from,
+            total
+        );
+    }
+    if let Some(to) = options.to
+        && (to == 0 || to > total)
+    {
+        bail!(
+            "End step {} is out of range (plan has {} steps)",
+            to,
+            total
+        );
+    }
+    if let (Some(from), Some(to)) = (options.from, options.to)
+        && from > to
+    {
+        bail!(
+            "Start step {} is greater than end step {}",
+            from,
+            to
+        );
+    }
+
+    let from_key = options.from.map(|n| all_steps[n - 1].sort_key.clone());
+    let to_key = options.to.map(|n| all_steps[n - 1].sort_key.clone());
+
+    Ok(RunWindow { from_key, to_key })
+}
+
+/// Sweep any stale InProgress step rows and emit a log line if the sweep
+/// actually touched anything. Shared between [`run_plan`] and [`resume_plan`].
+fn sweep_and_log_stale_in_progress(
+    conn: &Connection,
+    plan: &Plan,
+    out: &OutputContext,
+) -> Result<Vec<Step>> {
+    let swept = storage::sweep_stale_in_progress(conn, &plan.id)?;
+    if swept.is_empty() {
+        return Ok(swept);
+    }
+
+    // Resolve step numbers from the post-sweep step list (sort_keys are
+    // stable, so positions line up).
+    let all_steps = storage::list_steps(conn, &plan.id)?;
+    if out.format == OutputFormat::Json {
+        let events: Vec<output::StaleStep> = swept
+            .iter()
+            .map(|s| output::StaleStep {
+                step_id: s.id.clone(),
+                step_num: step_number_in_plan(&all_steps, s),
+                title: s.title.clone(),
+            })
+            .collect();
+        output::emit_ndjson(&RunEvent::StaleStepsSwept { steps: events })?;
+    } else {
+        let summary = format_step_list(&swept, &all_steps);
+        eprintln!(
+            "> Swept {} stale in_progress step(s) from prior crashed run: {}",
+            swept.len(),
+            summary
+        );
+    }
+    Ok(swept)
+}
+
+/// Report newly-inserted steps (the plan grew between runner iterations).
+fn report_plan_grew(new_inserts: &[Step], all_steps: &[Step], out: &OutputContext) -> Result<()> {
+    if out.format == OutputFormat::Json {
+        let events: Vec<output::StaleStep> = new_inserts
+            .iter()
+            .map(|s| output::StaleStep {
+                step_id: s.id.clone(),
+                step_num: step_number_in_plan(all_steps, s),
+                title: s.title.clone(),
+            })
+            .collect();
+        output::emit_ndjson(&RunEvent::PlanGrew { steps: events })?;
+    } else {
+        let summary = format_step_list(new_inserts, all_steps);
+        eprintln!(
+            "> Plan grew: +{} step(s) ({}) inserted mid-run",
+            new_inserts.len(),
+            summary
+        );
+    }
+    Ok(())
+}
+
+/// Format a list of steps as `#N 'title', #M 'title'` for log messages.
+fn format_step_list(steps: &[Step], all_steps: &[Step]) -> String {
+    steps
+        .iter()
+        .map(|s| {
+            format!(
+                "#{} '{}'",
+                step_number_in_plan(all_steps, s),
+                s.title
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Find the current step: first step that is not complete or skipped.
@@ -1119,6 +1680,7 @@ mod tests {
             updated_at: Utc::now(),
             prompt_prefix: None,
             prompt_suffix: None,
+            context_prepend: None,
         }
     }
 
@@ -1193,6 +1755,7 @@ mod tests {
                 model: None,
                 skipped_reason: None,
                 change_policy: crate::plan::ChangePolicy::Required,
+                tags: vec![],
             })
             .collect()
     }
@@ -1356,6 +1919,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -1367,6 +1931,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1430,6 +1995,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         storage::create_step(
@@ -1440,6 +2006,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1468,6 +2035,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         storage::create_step(
@@ -1478,6 +2046,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1509,6 +2078,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -1532,6 +2102,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1551,6 +2122,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1583,6 +2155,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1605,6 +2178,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1631,6 +2205,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1742,6 +2317,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1768,6 +2344,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -2092,10 +2669,11 @@ mod tests {
             updated_at: Utc::now(),
             prompt_prefix: None,
             prompt_suffix: None,
+            context_prepend: None,
         };
 
         // Should create feat/rooted rooted at initial_sha.
-        setup_branch(&dir, &plan, Some(&initial_sha), false)
+        setup_branch(&dir, &plan, Some(&initial_sha))
             .await
             .unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/rooted");
@@ -2129,6 +2707,7 @@ mod tests {
             updated_at: Utc::now(),
             prompt_prefix: None,
             prompt_suffix: None,
+            context_prepend: None,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -2143,7 +2722,7 @@ mod tests {
             }
         });
 
-        setup_branch(&dir, &plan, None, false).await.unwrap();
+        setup_branch(&dir, &plan, None).await.unwrap();
         ticker.await.unwrap();
 
         // The ticker's 50 × 1ms sleeps only make progress if the runtime
@@ -2182,6 +2761,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -2193,6 +2773,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -2224,68 +2805,65 @@ mod tests {
         assert_eq!(result.final_status, PlanStatus::Complete);
     }
 
-    // -- setup_branch auto-stash preview/opt-out (L10) --
+    // -- stash_if_dirty / setup_branch --
 
-    /// Acceptance for L10: a dirty tree without `--auto-stash` must bail
-    /// rather than silently sweep untracked files into a commit. The error
-    /// must surface the files so the user can stage them intentionally.
+    /// With `--no-auto-stash`, a dirty tree must bail cleanly and list the
+    /// files that are blocking the switch so the user can stage or
+    /// discard them intentionally.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_setup_branch_refuses_dirty_tree_without_auto_stash() {
+    async fn test_dirty_tree_no_auto_stash_bails_cleanly() {
         use std::fs;
 
         let (_tmp, dir) = init_git_repo();
-        // Drop an untracked file into the tree.
         fs::write(dir.join("scratch.txt"), "wip").unwrap();
 
-        let plan = Plan {
-            id: "p1".to_string(),
-            slug: "test".to_string(),
-            project: dir.to_string_lossy().to_string(),
-            branch_name: "feat/dirty".to_string(),
-            description: String::new(),
-            status: PlanStatus::Ready,
-            harness: None,
-            agent: None,
-            deterministic_tests: vec![],
-            plan_harness: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-        };
-
-        let err = setup_branch(&dir, &plan, None, false)
+        let err = stash_if_dirty(&dir, "demo", /*auto_stash=*/ false)
             .await
-            .expect_err("dirty tree without auto_stash must bail");
+            .expect_err("dirty tree with auto_stash=false must bail");
         let msg = format!("{err}");
         assert!(
             msg.contains("scratch.txt"),
-            "error must list the untracked file, got: {msg}"
+            "error must list the dirty file, got: {msg}"
         );
         assert!(
-            msg.contains("--auto-stash"),
-            "error must point users at the opt-in flag, got: {msg}"
+            msg.contains("--no-auto-stash"),
+            "error must point users at the opt-out flag, got: {msg}"
         );
 
-        // Nothing was swept into a commit; the branch was not switched.
+        // Nothing was swept; the tree is still dirty.
         assert!(git::has_uncommitted_changes(&dir).unwrap());
-        assert_ne!(git::get_current_branch(&dir).unwrap(), "feat/dirty");
     }
 
-    /// With `auto_stash: true` the old behavior is preserved: dirty state
-    /// is committed and the new branch is checked out.
+    /// Default (auto_stash=true) stash-push + stash-pop round trip: the
+    /// dirty file survives a fake run and reappears with identical
+    /// contents once teardown runs.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_setup_branch_auto_stash_commits_dirty_tree() {
+    async fn test_dirty_tree_default_auto_stash_push_pop_round_trip() {
         use std::fs;
 
         let (_tmp, dir) = init_git_repo();
-        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+        fs::write(dir.join("scratch.txt"), "wip-contents").unwrap();
+        // Also modify a tracked file so we exercise both paths.
+        fs::write(dir.join("README.md"), "# modified\n").unwrap();
 
+        let source_branch = git::get_current_branch(&dir).unwrap();
+
+        let stash = stash_if_dirty(&dir, "demo", /*auto_stash=*/ true)
+            .await
+            .unwrap()
+            .expect("expected a stash SHA");
+
+        // Tree is clean; scratch.txt is gone; tracked file is reverted.
+        assert!(!git::has_uncommitted_changes(&dir).unwrap());
+        assert!(!dir.join("scratch.txt").exists());
+        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "# hi");
+
+        // Set up a branch (simulates a run).
         let plan = Plan {
             id: "p1".to_string(),
-            slug: "test".to_string(),
+            slug: "demo".to_string(),
             project: dir.to_string_lossy().to_string(),
-            branch_name: "feat/auto".to_string(),
+            branch_name: "feat/stash-roundtrip".to_string(),
             description: String::new(),
             status: PlanStatus::Ready,
             harness: None,
@@ -2296,18 +2874,39 @@ mod tests {
             updated_at: Utc::now(),
             prompt_prefix: None,
             prompt_suffix: None,
+            context_prepend: None,
         };
+        setup_branch(&dir, &plan, None).await.unwrap();
+        assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/stash-roundtrip");
 
-        setup_branch(&dir, &plan, None, true).await.unwrap();
-        assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/auto");
-        assert!(!git::has_uncommitted_changes(&dir).unwrap());
+        // Teardown: back to source_branch + pop stash.
+        restore_working_tree(&dir, &source_branch, Some(&stash))
+            .await
+            .unwrap();
+
+        assert_eq!(git::get_current_branch(&dir).unwrap(), source_branch);
+        assert_eq!(
+            fs::read_to_string(dir.join("scratch.txt")).unwrap(),
+            "wip-contents",
+            "untracked file must be restored by the pop"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# modified\n",
+            "tracked modification must be restored by the pop"
+        );
     }
 
-    /// A clean tree must not require the opt-in. This also confirms we
-    /// didn't regress the zero-change fast path.
+    /// A clean tree returns None from `stash_if_dirty` regardless of
+    /// `auto_stash`, and teardown with no stash is just a branch switch.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_setup_branch_clean_tree_proceeds_without_auto_stash() {
+    async fn test_clean_tree_no_stash_needed() {
         let (_tmp, dir) = init_git_repo();
+
+        let result_off = stash_if_dirty(&dir, "demo", false).await.unwrap();
+        assert!(result_off.is_none());
+        let result_on = stash_if_dirty(&dir, "demo", true).await.unwrap();
+        assert!(result_on.is_none());
 
         let plan = Plan {
             id: "p1".to_string(),
@@ -2324,9 +2923,518 @@ mod tests {
             updated_at: Utc::now(),
             prompt_prefix: None,
             prompt_suffix: None,
+            context_prepend: None,
+        };
+        let source_branch = git::get_current_branch(&dir).unwrap();
+        setup_branch(&dir, &plan, None).await.unwrap();
+        assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");
+        restore_working_tree(&dir, &source_branch, None).await.unwrap();
+        assert_eq!(git::get_current_branch(&dir).unwrap(), source_branch);
+    }
+
+    /// If the run produced a commit that CONFLICTS with the stashed
+    /// working-tree state, teardown must leave the stash on the stack
+    /// and return a non-zero error so the user can recover manually.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_stash_pop_conflict_during_teardown_preserves_stash() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        let source_branch = git::get_current_branch(&dir).unwrap();
+
+        // Pre-stash: README has version A queued up.
+        fs::write(dir.join("README.md"), "# version A\n").unwrap();
+        let stash = stash_if_dirty(&dir, "demo", true)
+            .await
+            .unwrap()
+            .expect("sha");
+
+        // Simulate a run that commits a divergent README to the source
+        // branch. In practice this would be on the plan branch, but the
+        // conflict materializes the same way when popping.
+        fs::write(dir.join("README.md"), "# version B\n").unwrap();
+        git::commit_changes(&dir, "divergent commit").unwrap();
+
+        let err = restore_working_tree(&dir, &source_branch, Some(&stash))
+            .await
+            .expect_err("pop must surface the conflict");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(stash.as_str()),
+            "error must surface the stash SHA for manual recovery, got: {msg}"
+        );
+
+        // The stash is still on the stack.
+        let still_there =
+            git::find_stash_by_message(&dir, "ralph: auto-stash for plan 'demo'").unwrap();
+        assert_eq!(still_there.as_ref(), Some(&stash));
+    }
+
+    /// The teardown path must fire even when the inner plan body fails.
+    /// Drive `run_plan` against a plan with no steps — this produces an
+    /// inner `bail!` AFTER stash_if_dirty + setup_branch have run — and
+    /// assert that teardown still switched us back to the source branch
+    /// and popped the stash.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_stash_pop_on_failure_still_fires() {
+        use std::fs;
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+        let source_branch = git::get_current_branch(&dir).unwrap();
+
+        // Seed a dirty tree.
+        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+
+        // A plan with zero steps will hit `bail!("Plan ... has no steps")`
+        // inside run_plan_inner — i.e. after the stash + branch setup.
+        let conn = setup();
+        let plan =
+            storage::create_plan(&conn, "empty", &project, "feat/empty", "d", None, None, &[])
+                .unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "empty", &project)
+            .unwrap()
+            .unwrap();
+
+        // Seed a run_locks row so `record_source_branch_and_stash` inside
+        // run_plan has a target. Keeping it minimal — the column defaults
+        // cover everything else.
+        use rusqlite::params;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                project,
+                std::process::id() as i64,
+                plan.id.as_str(),
+                plan.slug.as_str()
+            ],
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, true, true);
+        // current_branch=false so run_plan drives the stash/branch/teardown
+        // path; auto_stash=true mirrors the CLI default.
+        let options = RunOptions {
+            auto_stash: true,
+            ..Default::default()
         };
 
-        setup_branch(&dir, &plan, None, false).await.unwrap();
-        assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");
+        let err = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .expect_err("no-steps plan must surface an error");
+        assert!(
+            format!("{err}").contains("has no steps"),
+            "unexpected error: {err}"
+        );
+
+        // Teardown must have switched us back to the source branch.
+        assert_eq!(git::get_current_branch(&dir).unwrap(), source_branch);
+        // And popped the stash — scratch.txt reappears.
+        assert_eq!(fs::read_to_string(dir.join("scratch.txt")).unwrap(), "wip");
+        // The stash is gone.
+        let remaining = git::find_stash_by_message(&dir, "ralph: auto-stash").unwrap();
+        assert!(remaining.is_none(), "stash should have been popped");
+    }
+
+    /// Regression: if `setup_branch` fails AFTER `stash_if_dirty` has already
+    /// created a stash, the teardown path must still pop the stash. Without
+    /// the fix, a bad branch name would leave the user's uncommitted work
+    /// stranded on the stash stack.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_setup_branch_failure_still_restores_stash() {
+        use std::fs;
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+        let source_branch = git::get_current_branch(&dir).unwrap();
+
+        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+
+        // `..` in a branch name is rejected by git-check-ref-format, so
+        // create_and_checkout_branch will fail — exercising the
+        // post-stash-pre-teardown failure window.
+        let conn = setup();
+        let plan =
+            storage::create_plan(&conn, "bad", &project, "feat/bad..branch", "d", None, None, &[])
+                .unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "bad", &project)
+            .unwrap()
+            .unwrap();
+
+        use rusqlite::params;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                project,
+                std::process::id() as i64,
+                plan.id.as_str(),
+                plan.slug.as_str()
+            ],
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, true, true);
+        let options = RunOptions {
+            auto_stash: true,
+            ..Default::default()
+        };
+
+        let err = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .expect_err("invalid branch name must surface an error");
+        // Sanity: the error is the branch-setup error, not a teardown error.
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("has no steps"),
+            "should fail at branch setup, not later: {msg}"
+        );
+
+        // Still on the source branch (setup never switched).
+        assert_eq!(git::get_current_branch(&dir).unwrap(), source_branch);
+        // Stash was popped — scratch.txt is back in the working tree.
+        assert_eq!(fs::read_to_string(dir.join("scratch.txt")).unwrap(), "wip");
+        // No stash left behind.
+        let remaining = git::find_stash_by_message(&dir, "ralph: auto-stash").unwrap();
+        assert!(
+            remaining.is_none(),
+            "stash must be popped after setup_branch failure, found: {remaining:?}"
+        );
+    }
+
+    /// Simulates a crash: stash_if_dirty creates the stash, then the
+    /// process disappears before restore_working_tree runs. The stash
+    /// must survive on the stack for manual recovery.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_crash_leaves_stash_on_stack() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+
+        let stash = stash_if_dirty(&dir, "crashy", true)
+            .await
+            .unwrap()
+            .expect("sha");
+
+        // Simulate the crash: skip the teardown entirely. The stash must
+        // still be findable by its message and its SHA must still be on
+        // the stack.
+        let recovered =
+            git::find_stash_by_message(&dir, "ralph: auto-stash for plan 'crashy'").unwrap();
+        assert_eq!(recovered.as_ref(), Some(&stash));
+    }
+
+    // -- sweep_stale_in_progress / stale-step recovery --
+
+    /// Unit test for the storage helper: an orphaned InProgress row is flipped
+    /// to Aborted and returned to the caller. Equivalent to what
+    /// `run_plan` / `resume_plan` rely on at startup after a crashed prior run.
+    #[test]
+    fn test_stale_in_progress_swept_on_run_start() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None,
+            None,
+        )
+        .unwrap();
+        let (s2, _) = storage::create_step(
+            &conn, &plan.id, "Second", "d2", None, None, &[], None, None, None,
+            None,
+        )
+        .unwrap();
+
+        // Seed two InProgress rows — simulates a runner crash mid-execution.
+        storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
+        storage::update_step_status(&conn, &s2.id, StepStatus::InProgress).unwrap();
+
+        let swept = storage::sweep_stale_in_progress(&conn, &plan.id).unwrap();
+        assert_eq!(swept.len(), 2);
+        // Returned rows reflect the PRE-update status recorded by RETURNING's
+        // semantics, but they're flipped in the DB. What we care about is
+        // that the DB side now reads Aborted.
+        let after = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(after[0].status, StepStatus::Aborted);
+        assert_eq!(after[1].status, StepStatus::Aborted);
+    }
+
+    /// Sweep is a no-op when there are no InProgress rows — ensures we don't
+    /// clobber Complete/Failed/Pending rows.
+    #[test]
+    fn test_stale_sweep_noop_without_in_progress() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None,
+            None,
+        )
+        .unwrap();
+        let (s2, _) = storage::create_step(
+            &conn, &plan.id, "Second", "d2", None, None, &[], None, None, None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        storage::update_step_status(&conn, &s2.id, StepStatus::Failed).unwrap();
+
+        let swept = storage::sweep_stale_in_progress(&conn, &plan.id).unwrap();
+        assert!(swept.is_empty());
+
+        let after = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(after[0].status, StepStatus::Complete);
+        assert_eq!(after[1].status, StepStatus::Failed);
+    }
+
+    /// End-to-end test of the sweep + log path invoked from `run_plan` /
+    /// `resume_plan`. We can't easily drive the full runner loop without a
+    /// real git repo and harness, so drive `sweep_and_log_stale_in_progress`
+    /// directly — it's the exact code the runner calls.
+    #[test]
+    fn test_sweep_and_log_wrapper_flips_and_returns_rows() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "s", "/p")
+            .unwrap()
+            .unwrap();
+        let out = OutputContext::from_cli(false, true, true);
+
+        let swept = sweep_and_log_stale_in_progress(&conn, &plan, &out).unwrap();
+        assert_eq!(swept.len(), 1);
+
+        let after = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(after[0].status, StepStatus::Aborted);
+    }
+
+    // -- RunWindow / resolve_window tests --
+
+    #[test]
+    fn test_resolve_window_no_bounds_covers_all() {
+        let steps = make_steps(5);
+        let options = RunOptions::default();
+        let window = resolve_window(&steps, &options).unwrap();
+        for s in &steps {
+            assert!(window.contains_key(&s.sort_key));
+        }
+    }
+
+    #[test]
+    fn test_resolve_window_from_to_bounds() {
+        let steps = make_steps(5);
+        let options = RunOptions {
+            from: Some(2),
+            to: Some(4),
+            ..Default::default()
+        };
+        let window = resolve_window(&steps, &options).unwrap();
+        assert!(!window.contains_key(&steps[0].sort_key));
+        assert!(window.contains_key(&steps[1].sort_key));
+        assert!(window.contains_key(&steps[2].sort_key));
+        assert!(window.contains_key(&steps[3].sort_key));
+        assert!(!window.contains_key(&steps[4].sort_key));
+    }
+
+    #[test]
+    fn test_resolve_window_tolerates_midrun_insert() {
+        // Simulates the mid-run-insert scenario: the window was resolved
+        // against a 3-step plan, then a 4th step was inserted with a
+        // sort_key BETWEEN the original step 1 and step 2. The new step
+        // must be accepted by the window because it falls within the
+        // resolved sort_key bounds.
+        let mut steps = make_steps(3);
+        // Ensure sort keys are lexicographically ordered and leave a gap.
+        steps[0].sort_key = "a0".to_string();
+        steps[1].sort_key = "a5".to_string();
+        steps[2].sort_key = "a9".to_string();
+
+        let options = RunOptions::default(); // full range
+        let window = resolve_window(&steps, &options).unwrap();
+
+        // A new step with sort_key "a3" (between a0 and a5) must be in
+        // the window.
+        assert!(window.contains_key("a3"));
+    }
+
+    #[test]
+    fn test_resolve_window_out_of_range_errors() {
+        let steps = make_steps(3);
+        let options = RunOptions {
+            from: Some(5),
+            ..Default::default()
+        };
+        assert!(resolve_window(&steps, &options).is_err());
+    }
+
+    #[test]
+    fn test_resolve_window_from_greater_than_to_errors() {
+        let steps = make_steps(5);
+        let options = RunOptions {
+            from: Some(4),
+            to: Some(2),
+            ..Default::default()
+        };
+        assert!(resolve_window(&steps, &options).is_err());
+    }
+
+    /// Regression test for the progress-header fix: the header should display
+    /// `step_num` / `plan_total`, not `slice_pos` / `slice_len`. Full-loop
+    /// integration is hard (needs a real harness), so assert the helper that
+    /// computes step_num works for a plan-relative position after mid-run
+    /// inserts would have shifted a slice-relative counter.
+    #[test]
+    fn test_progress_header_uses_plan_relative_numbers() {
+        // Plan has 5 steps initially, we imagine a run of steps 3..=5 (so
+        // slice-relative numerator would be 1,2,3). `step_number_in_plan`
+        // must return 3,4,5 — the plan-relative indices.
+        let steps = make_steps(5);
+        let slice = &steps[2..];
+        assert_eq!(step_number_in_plan(&steps, &slice[0]), 3);
+        assert_eq!(step_number_in_plan(&steps, &slice[1]), 4);
+        assert_eq!(step_number_in_plan(&steps, &slice[2]), 5);
+
+        // After a mid-run insert, plan size changes. `step_number_in_plan`
+        // re-derives from the passed-in list, so the number reflects the
+        // step's current position.
+        let mut grown = steps.clone();
+        let new_step = Step {
+            id: "s_new".to_string(),
+            plan_id: "p1".to_string(),
+            sort_key: "a05".to_string(), // between s0=a0 and s1=a1
+            title: "Inserted".to_string(),
+            description: "d".to_string(),
+            agent: None,
+            harness: None,
+            acceptance_criteria: vec![],
+            status: StepStatus::Pending,
+            attempts: 0,
+            max_retries: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: None,
+            skipped_reason: None,
+            change_policy: crate::plan::ChangePolicy::Required,
+            tags: vec![],
+        };
+        grown.insert(1, new_step.clone());
+        // The inserted step becomes step 2; what was step 2 (s1) is now
+        // step 3.
+        assert_eq!(step_number_in_plan(&grown, &new_step), 2);
+        assert_eq!(step_number_in_plan(&grown, &steps[1]), 3);
+        // Plan size grew.
+        assert_eq!(grown.len(), 6);
+    }
+
+    /// Unit test of the re-query logic: once a step is executed, the runner
+    /// adds it to `executed_step_ids` and will not re-execute it even if the
+    /// re-query returns the full step list again on the next iteration.
+    /// Full integration (driving a real runner loop with a mid-run storage
+    /// insert) is infeasible without a real harness, so this asserts the
+    /// "find next actionable" lookup that the loop uses.
+    #[test]
+    fn test_mid_run_step_insertion_picked_up() {
+        use std::collections::HashSet;
+
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None,
+            None,
+        )
+        .unwrap();
+        let (s2, _) = storage::create_step(
+            &conn, &plan.id, "Second", "d2", None, None, &[], None, None, None,
+            None,
+        )
+        .unwrap();
+
+        // Simulate iteration 1: load steps, "execute" s1.
+        let initial = storage::list_steps(&conn, &plan.id).unwrap();
+        let window = resolve_window(&initial, &RunOptions::default()).unwrap();
+        let mut known: HashSet<String> = initial.iter().map(|s| s.id.clone()).collect();
+        let mut executed: HashSet<String> = HashSet::new();
+
+        let next = initial
+            .iter()
+            .find(|s| {
+                window.contains_key(&s.sort_key)
+                    && is_actionable(s.status)
+                    && !executed.contains(&s.id)
+            })
+            .unwrap();
+        assert_eq!(next.id, s1.id);
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        executed.insert(s1.id.clone());
+
+        // Between iterations, the running agent inserts a new step at a
+        // sort_key BETWEEN s1 and s2 (simulates `ralph step add` mid-run).
+        let mid_key = crate::frac_index::key_between(&s1.sort_key, &s2.sort_key).unwrap();
+        let (new_step, _) = storage::create_step_at(
+            &conn,
+            &plan.id,
+            &mid_key,
+            "Inserted",
+            "dN",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Iteration 2: re-query. Detect new inserts. Find next actionable.
+        let refreshed = storage::list_steps(&conn, &plan.id).unwrap();
+        let new_inserts: Vec<Step> = refreshed
+            .iter()
+            .filter(|s| !known.contains(&s.id))
+            .filter(|s| window.contains_key(&s.sort_key))
+            .cloned()
+            .collect();
+        assert_eq!(new_inserts.len(), 1);
+        assert_eq!(new_inserts[0].id, new_step.id);
+        for s in &refreshed {
+            known.insert(s.id.clone());
+        }
+
+        let next2 = refreshed
+            .iter()
+            .find(|s| {
+                window.contains_key(&s.sort_key)
+                    && is_actionable(s.status)
+                    && !executed.contains(&s.id)
+            })
+            .unwrap();
+        // The inserted step must now be picked up BEFORE s2, because its
+        // sort_key is between s1 and s2.
+        assert_eq!(next2.id, new_step.id);
+        assert_ne!(next2.id, s2.id);
+    }
+
+    // -- is_actionable --
+
+    #[test]
+    fn test_is_actionable_statuses() {
+        assert!(is_actionable(StepStatus::Pending));
+        assert!(is_actionable(StepStatus::Failed));
+        assert!(is_actionable(StepStatus::InProgress));
+        assert!(is_actionable(StepStatus::Aborted));
+        assert!(!is_actionable(StepStatus::Complete));
+        assert!(!is_actionable(StepStatus::Skipped));
     }
 }

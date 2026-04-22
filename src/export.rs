@@ -41,6 +41,11 @@ pub struct ExportedPlanMeta {
     pub depends_on: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_harness: Option<String>,
+    /// Per-plan context-prepend override. Omitted from the JSON when the
+    /// plan is using the system default so pre-V14 export output is
+    /// unchanged for plans that didn't customize their prepend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_prepend: Option<String>,
 }
 
 /// Step stripped of internal fields.
@@ -58,6 +63,10 @@ pub struct ExportedStep {
     /// the JSON see the policy explicitly rather than having to assume the
     /// serde default.
     pub change_policy: ChangePolicy,
+    /// Free-form string tags. Omitted from the JSON when the step has no
+    /// tags so pre-V13 export output is unchanged for untagged steps.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +94,7 @@ pub fn build_exported_plan(
         deterministic_tests: plan.deterministic_tests.clone(),
         depends_on: depends_on_slugs,
         plan_harness: plan.plan_harness.clone(),
+        context_prepend: plan.context_prepend.clone(),
     };
 
     let exported_steps: Vec<ExportedStep> = steps
@@ -98,6 +108,7 @@ pub fn build_exported_plan(
             max_retries: s.max_retries,
             model: s.model.clone(),
             change_policy: s.change_policy,
+            tags: s.tags.clone(),
         })
         .collect();
 
@@ -191,6 +202,7 @@ mod tests {
             Some(3),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -202,6 +214,7 @@ mod tests {
             None,
             Some("codex"),
             &[],
+            None,
             None,
             None,
             None,
@@ -268,6 +281,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -319,6 +333,7 @@ mod tests {
             Some(2),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -357,6 +372,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -407,6 +423,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         storage::create_step(
@@ -420,6 +437,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         storage::create_step(
@@ -430,6 +448,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -470,6 +489,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -486,5 +506,70 @@ mod tests {
         let step_obj = &parsed["steps"][0];
         assert!(step_obj.get("status").is_none());
         assert!(step_obj.get("attempts").is_none());
+    }
+
+    #[test]
+    fn test_export_includes_tags() {
+        // Exported JSON must carry through user-supplied tags verbatim, and
+        // must omit the `tags` field entirely for untagged steps so pre-V13
+        // consumers see unchanged output.
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            "tags-export",
+            "/tmp/proj",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        let tags = vec!["FIX".to_string(), "REGRESSION".to_string()];
+        storage::create_step(
+            &conn,
+            &plan.id,
+            "Tagged",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            Some(&tags),
+        )
+        .unwrap();
+        // Untagged sibling.
+        storage::create_step(
+            &conn,
+            &plan.id,
+            "Untagged",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        assert_eq!(exported.steps[0].tags, tags);
+        assert!(exported.steps[1].tags.is_empty());
+
+        let json = serde_json::to_string(&exported).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Tagged step emits the array literal.
+        let tagged_tags = &parsed["steps"][0]["tags"];
+        assert!(tagged_tags.is_array());
+        assert_eq!(tagged_tags[0], "FIX");
+        assert_eq!(tagged_tags[1], "REGRESSION");
+        // Untagged step omits the field (skip_serializing_if).
+        assert!(parsed["steps"][1].get("tags").is_none());
     }
 }

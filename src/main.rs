@@ -30,13 +30,40 @@ use clap::Parser;
 
 use crate::cli::{
     AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
-    PlanHarnessCommand, PromptCommand, StepCommand,
+    PlanHarnessCommand, PlanPrependCommand, PromptCommand, StepCommand,
 };
 
 use crate::commands::resolve_project;
 use crate::output::OutputContext;
 use crate::plan::Plan;
 use crate::runner::RunOptions;
+
+/// Read the body for `ralph plan prepend set` from exactly one of the three
+/// accepted input sources. Clap's `conflicts_with_all` guarantees at most
+/// one of `text` / `file` / `stdin` is set; this helper enforces the
+/// "at least one" half and normalises to a `String`.
+fn resolve_prepend_input(
+    text: Option<String>,
+    file: Option<std::path::PathBuf>,
+    stdin: bool,
+) -> Result<String> {
+    use std::io::Read;
+    match (text, file, stdin) {
+        (Some(t), None, false) => Ok(t),
+        (None, Some(path), false) => std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read prepend source file: {}", path.display())),
+        (None, None, true) => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("Failed to read prepend text from stdin")?;
+            Ok(buf)
+        }
+        _ => anyhow::bail!(
+            "Exactly one of --text, --file, or --stdin is required for `ralph plan prepend set`"
+        ),
+    }
+}
 
 /// Resolve a plan from an optional slug: if provided, look it up; otherwise
 /// find the active plan for the project. `include_complete` controls whether
@@ -205,13 +232,33 @@ fn main() -> Result<()> {
                     std::process::exit(exit_code);
                 }
             },
+            PlanCommand::Prepend(prepend_cmd) => match prepend_cmd {
+                PlanPrependCommand::Set {
+                    plan,
+                    text,
+                    file,
+                    stdin,
+                } => {
+                    let p = resolve_plan(&conn, plan, &project, true)?;
+                    let body = resolve_prepend_input(text, file, stdin)?;
+                    commands::plan_prepend_set(&conn, &p, &body, &out)
+                }
+                PlanPrependCommand::Show { plan, default } => {
+                    let p = resolve_plan(&conn, plan, &project, true)?;
+                    commands::plan_prepend_show(&conn, &p, default, &out)
+                }
+                PlanPrependCommand::Clear { plan } => {
+                    let p = resolve_plan(&conn, plan, &project, true)?;
+                    commands::plan_prepend_clear(&conn, &p, &out)
+                }
+            },
         },
 
         // -- Step --
         Command::Step(subcmd) => match subcmd {
-            StepCommand::List { plan } => {
+            StepCommand::List { plan, tags } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::step_list(&conn, &p.slug, &project, &config, &out)
+                commands::step_list(&conn, &p.slug, &project, &config, &tags, &out)
             }
             StepCommand::Add {
                 title,
@@ -224,6 +271,7 @@ fn main() -> Result<()> {
                 criteria,
                 max_retries,
                 change_policy,
+                tags,
                 import_json,
             } => {
                 // Precedence: per-subcommand --harness overrides the global
@@ -261,6 +309,7 @@ fn main() -> Result<()> {
                         &criteria,
                         max_retries,
                         change_policy,
+                        &tags,
                         &out,
                     )
                 }
@@ -295,6 +344,8 @@ fn main() -> Result<()> {
                 max_retries,
                 clear_max_retries,
                 change_policy,
+                tags,
+                clear_tags,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::step_edit(
@@ -312,6 +363,8 @@ fn main() -> Result<()> {
                     max_retries,
                     clear_max_retries,
                     change_policy,
+                    &tags,
+                    clear_tags,
                     &out,
                 )
             }
@@ -382,9 +435,10 @@ fn main() -> Result<()> {
             dry_run,
             skip_preflight,
             current_branch,
-            auto_stash,
+            no_auto_stash,
             harness: run_harness,
             force,
+            verbose,
         } => {
             let workdir = std::path::Path::new(&project);
             // Precedence: `ralph run --harness X` beats `ralph --harness Y run`,
@@ -393,18 +447,24 @@ fn main() -> Result<()> {
             // so it wins.
             let harness_override = run_harness.or(cli.harness);
 
-            // The CLI flag is additive over the config default, so turning
-            // on `auto_stash: true` in config.json always works and
-            // `--auto-stash` flips it on for a single run.
+            // `auto_stash` is default-on. `--no-auto-stash` forces it off
+            // for a single run; `config.auto_stash = false` sets a per-user
+            // default of "don't stash". The CLI flag always wins when set.
+            let auto_stash = if no_auto_stash {
+                false
+            } else {
+                config.auto_stash
+            };
             let options = RunOptions {
                 all_plans: all,
                 one,
                 from,
                 to,
                 current_branch,
-                auto_stash: auto_stash || config.auto_stash,
+                auto_stash,
                 harness_override,
                 dry_run,
+                verbose,
             };
 
             if all {
@@ -744,7 +804,15 @@ fn main() -> Result<()> {
         }
 
         // -- Doctor --
-        Command::Doctor => commands::cmd_doctor(&config, &out),
+        Command::Doctor => commands::cmd_doctor(&config, std::path::Path::new(&project), &out),
+
+        // -- Config --
+        Command::Config(sub) => match sub {
+            cli::ConfigCommand::Show => commands::config_cmd::config_show(&out),
+            cli::ConfigCommand::SetTimezone { tz } => {
+                commands::config_cmd::config_set_timezone(&tz)
+            }
+        },
 
         // -- Completions --
         Command::Completions { shell } => {

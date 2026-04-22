@@ -256,6 +256,7 @@ mod tests {
             updated_at: Utc::now(),
             prompt_prefix: None,
             prompt_suffix: None,
+            context_prepend: None,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
@@ -275,6 +276,7 @@ mod tests {
                 model: None,
                 skipped_reason: None,
                 change_policy: crate::plan::ChangePolicy::Required,
+                tags: vec![],
             })
             .collect();
         App::new(plan, steps, &Config::default())
@@ -345,6 +347,7 @@ mod tests {
             updated_at: Utc::now(),
             prompt_prefix: None,
             prompt_suffix: None,
+            context_prepend: None,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -363,6 +366,7 @@ mod tests {
             model: None,
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
+            tags: vec![],
         }];
         let config = Config {
             max_retries_per_step: 7,

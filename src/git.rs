@@ -63,6 +63,7 @@ pub fn has_uncommitted_changes(workdir: &Path) -> Result<bool> {
 /// Stage **all** changes (tracked + untracked) and commit with `message`.
 ///
 /// This is a convenience wrapper equivalent to `git add -A && git commit -m <message>`.
+#[allow(dead_code)]
 pub fn commit_changes(workdir: &Path, message: &str) -> Result<()> {
     git(workdir, &["add", "-A"]).context("git add -A failed")?;
     git(workdir, &["commit", "-m", message]).context("git commit failed")?;
@@ -226,6 +227,247 @@ pub fn merge_sha(workdir: &Path, sha: &str) -> Result<()> {
     git(workdir, &["merge", "--no-ff", sha])
         .with_context(|| format!("could not merge {sha} into current branch"))?;
     Ok(())
+}
+
+/// Plain `git checkout <branch>` — does NOT create the branch.
+///
+/// Used by the run-teardown path to switch back to the source branch before
+/// popping the ralph-owned stash.
+pub fn checkout_branch(workdir: &Path, branch: &str) -> Result<()> {
+    git(workdir, &["checkout", branch])
+        .with_context(|| format!("could not checkout branch '{branch}'"))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Stash helpers
+// ---------------------------------------------------------------------------
+
+/// Stable identifier for a stash created by ralph.
+///
+/// Wraps the stash's **commit SHA** (the `W` commit, not the `stash@{N}`
+/// reference) because `stash@{N}` shifts whenever the user creates or drops
+/// another stash during a run. The SHA is stable for the lifetime of the
+/// stash. Compare for equality, don't parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StashRef(pub String);
+
+impl StashRef {
+    /// The underlying commit SHA.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Terminal outcome of popping a ralph-owned stash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StashPopOutcome {
+    /// Stash applied and was dropped from the stack.
+    Clean,
+    /// `git stash pop` exited non-zero or left conflict markers. The stash
+    /// was NOT dropped; the SHA is still valid and the user can pop it
+    /// manually after resolving. The `String` carries the git stderr so
+    /// callers can surface it.
+    Conflicted(String),
+    /// The stash SHA no longer exists in the stash list (e.g. the user
+    /// dropped it manually between push and pop).
+    NotFound,
+}
+
+/// `git stash push --include-untracked -m <message>`.
+///
+/// Returns:
+/// - `Ok(Some(stash_ref))` when something was stashed. The SHA is the `W`
+///   commit of the new stash entry, captured immediately by grepping `git
+///   stash list` for `message`.
+/// - `Ok(None)` when the tree was clean and git reported "No local changes
+///   to save" — there's nothing to pop later.
+/// - `Err(_)` when `git stash push` itself failed for any reason other than
+///   a clean tree (e.g. not a git repo, permission error).
+pub fn stash_push_with_untracked(workdir: &Path, message: &str) -> Result<Option<StashRef>> {
+    // `git stash push` on a clean tree exits 0 with "No local changes to
+    // save" on stdout — we have to distinguish that case from a real stash.
+    // Rather than string-match stdout (brittle across locales), we ask git
+    // for the pre-push stash list, push, and diff.
+    let before = stash_list_shas(workdir)?;
+
+    let output = Command::new("git")
+        .args([
+            "stash",
+            "push",
+            "--include-untracked",
+            "-m",
+            message,
+        ])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git stash push -m '{message}'"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git stash push failed (exit {}): {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    // Match by message against the post-push list. If nothing was pushed
+    // (clean tree), the match will find no new stash and we return None.
+    // If something was pushed, the new stash's SHA is one of (after -
+    // before) and its subject matches `message`.
+    let after = stash_list_shas_with_subjects(workdir)?;
+    for (sha, subject) in &after {
+        if !before.contains(sha) && subject_matches(subject, message) {
+            return Ok(Some(StashRef(sha.clone())));
+        }
+    }
+    // No new stash -> tree was clean.
+    Ok(None)
+}
+
+/// Pop the stash identified by `stash_ref`.
+///
+/// Implementation note: `git stash pop <sha>` doesn't exist directly —
+/// `pop` resolves its argument via `git stash apply` semantics, which do
+/// accept a commit SHA but don't drop it. We therefore run `apply <sha>`
+/// followed by `drop <stash@{N}>` where N is resolved from the current
+/// stash list. On apply conflict we skip the drop so the user's stash
+/// survives for manual recovery.
+pub fn stash_pop(workdir: &Path, stash_ref: &StashRef) -> Result<StashPopOutcome> {
+    // 1. Locate the stash@{N} entry whose commit SHA matches ours. If it's
+    //    gone, the user already dropped it.
+    let entries = stash_list_shas_with_refs(workdir)?;
+    let stash_ref_name = match entries.iter().find(|(sha, _)| sha == stash_ref.as_str()) {
+        Some((_, name)) => name.clone(),
+        None => return Ok(StashPopOutcome::NotFound),
+    };
+
+    // 2. Apply the stash by its commit SHA. This lets us be robust to
+    //    other stashes being pushed/popped between our push and pop — we
+    //    always apply exactly the commit we created.
+    let apply = Command::new("git")
+        .args(["stash", "apply", stash_ref.as_str()])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git stash apply {}", stash_ref.as_str()))?;
+
+    if !apply.status.success() {
+        let stderr = String::from_utf8_lossy(&apply.stderr).to_string();
+        return Ok(StashPopOutcome::Conflicted(stderr.trim().to_string()));
+    }
+
+    // `git stash apply` can exit 0 even when it wrote conflict markers —
+    // check the worktree for unmerged entries and refuse to drop if we
+    // find any.
+    let status_out = git(workdir, &["status", "--porcelain"])
+        .context("could not check git status after stash apply")?;
+    if has_conflict_marker(&status_out) {
+        return Ok(StashPopOutcome::Conflicted(
+            "conflict markers present after stash apply; not dropping".to_string(),
+        ));
+    }
+
+    // 3. Drop the named stash ref now that it's safely applied.
+    let drop_out = Command::new("git")
+        .args(["stash", "drop", &stash_ref_name])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git stash drop {stash_ref_name}"))?;
+
+    if !drop_out.status.success() {
+        let stderr = String::from_utf8_lossy(&drop_out.stderr);
+        bail!(
+            "stash apply succeeded but drop failed ({}): {} (manual: git stash list / git stash drop {})",
+            drop_out.status,
+            stderr.trim(),
+            stash_ref_name,
+        );
+    }
+
+    Ok(StashPopOutcome::Clean)
+}
+
+/// Find a stash (by its commit SHA) whose subject contains `message`.
+///
+/// Returns `None` if no stash matches. Used by recovery paths that want to
+/// locate a ralph-owned stash without needing the SHA.
+#[allow(dead_code)]
+pub fn find_stash_by_message(workdir: &Path, message: &str) -> Result<Option<StashRef>> {
+    let entries = stash_list_shas_with_subjects(workdir)?;
+    for (sha, subject) in entries {
+        if subject_matches(&subject, message) {
+            return Ok(Some(StashRef(sha)));
+        }
+    }
+    Ok(None)
+}
+
+/// Return the set of stash commit SHAs currently on the stack.
+fn stash_list_shas(workdir: &Path) -> Result<Vec<String>> {
+    let out = git(workdir, &["stash", "list", "--format=%H"])
+        .context("could not list git stash entries")?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect())
+}
+
+/// Return (sha, subject) pairs for each stash entry, in stack order.
+fn stash_list_shas_with_subjects(workdir: &Path) -> Result<Vec<(String, String)>> {
+    // `%H` = full SHA, `%gs` = reflog subject ("On branch: message"). Tab
+    // separator keeps it robust even if the message contains whitespace.
+    let out = git(workdir, &["stash", "list", "--format=%H%x09%gs"])
+        .context("could not list git stash entries")?;
+    let mut entries = Vec::new();
+    for line in out.lines() {
+        if let Some((sha, subj)) = line.split_once('\t') {
+            entries.push((sha.to_string(), subj.to_string()));
+        }
+    }
+    Ok(entries)
+}
+
+/// Return (sha, stash@{N}) pairs for each stash entry. Used by `stash_pop`
+/// to resolve the named ref that `git stash drop` requires.
+fn stash_list_shas_with_refs(workdir: &Path) -> Result<Vec<(String, String)>> {
+    let out = git(workdir, &["stash", "list", "--format=%H%x09%gd"])
+        .context("could not list git stash entries")?;
+    let mut entries = Vec::new();
+    for line in out.lines() {
+        if let Some((sha, name)) = line.split_once('\t') {
+            entries.push((sha.to_string(), name.to_string()));
+        }
+    }
+    Ok(entries)
+}
+
+/// A stash reflog subject looks like `On master: ralph: auto-stash for plan 'x' at ...`.
+/// Our caller passes in the exact message substring; we match by `contains`
+/// so the branch-prefix doesn't defeat the lookup.
+fn subject_matches(subject: &str, message: &str) -> bool {
+    subject.contains(message)
+}
+
+/// `git status --porcelain` marks unmerged paths with an XY prefix where one
+/// of X/Y is 'U' (or both letters are the same non-space — e.g. `DD`, `AA`).
+/// Those signal conflict markers. Returns true if any such line is present.
+fn has_conflict_marker(porcelain_out: &str) -> bool {
+    for line in porcelain_out.lines() {
+        let prefix = line.get(..2).unwrap_or("");
+        let mut chars = prefix.chars();
+        let x = chars.next().unwrap_or(' ');
+        let y = chars.next().unwrap_or(' ');
+        if x == 'U' || y == 'U' {
+            return true;
+        }
+        if x != ' ' && y != ' ' && x == y && matches!(x, 'A' | 'D') {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +731,127 @@ mod tests {
         let dir = tmp.path().to_path_buf();
         let result = stage_except(&dir, &["file.txt".to_string()]);
         assert!(result.is_err());
+    }
+
+    // ----- stash helpers -----
+
+    #[test]
+    fn test_stash_push_clean_tree_returns_none() {
+        let (_tmp, dir) = init_repo();
+        let result =
+            stash_push_with_untracked(&dir, "ralph: test stash on clean tree").unwrap();
+        assert!(
+            result.is_none(),
+            "clean tree should produce no stash, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_stash_push_dirty_tree_returns_sha_and_message() {
+        let (_tmp, dir) = init_repo();
+        // Tracked modification + an untracked file — the --include-untracked
+        // flag must pick both up.
+        fs::write(dir.join("README.md"), "# modified").unwrap();
+        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+        assert!(has_uncommitted_changes(&dir).unwrap());
+
+        let msg = "ralph: auto-stash for plan 'demo' at 2026-04-22T00:00:00Z";
+        let stash = stash_push_with_untracked(&dir, msg).unwrap().expect("sha");
+        // SHA-like shape.
+        assert_eq!(stash.as_str().len(), 40);
+        assert!(stash.as_str().chars().all(|c| c.is_ascii_hexdigit()));
+
+        // The stash was pushed and the tree is now clean.
+        assert!(!has_uncommitted_changes(&dir).unwrap());
+
+        // find_stash_by_message should locate our stash by substring match.
+        let found = find_stash_by_message(&dir, msg).unwrap().expect("found");
+        assert_eq!(found, stash);
+    }
+
+    #[test]
+    fn test_stash_pop_clean() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+        fs::write(dir.join("README.md"), "# modified").unwrap();
+
+        let msg = "ralph: pop-round-trip test";
+        let stash = stash_push_with_untracked(&dir, msg).unwrap().expect("sha");
+
+        // Tree is clean post-stash, and original tracked file is reverted.
+        assert!(!has_uncommitted_changes(&dir).unwrap());
+        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "# hello");
+        assert!(!dir.join("scratch.txt").exists());
+
+        // Pop restores both.
+        let outcome = stash_pop(&dir, &stash).unwrap();
+        assert_eq!(outcome, StashPopOutcome::Clean);
+        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "# modified");
+        assert_eq!(fs::read_to_string(dir.join("scratch.txt")).unwrap(), "wip");
+
+        // Stash is gone from the stack.
+        let after = find_stash_by_message(&dir, msg).unwrap();
+        assert!(after.is_none());
+    }
+
+    #[test]
+    fn test_stash_pop_conflict_leaves_stash_intact() {
+        let (_tmp, dir) = init_repo();
+
+        // Write version A to README and stash it.
+        fs::write(dir.join("README.md"), "# version A\n").unwrap();
+        let msg = "ralph: conflict test stash";
+        let stash = stash_push_with_untracked(&dir, msg).unwrap().expect("sha");
+
+        // Now commit a DIFFERENT change to README so the stashed version
+        // will conflict on pop.
+        fs::write(dir.join("README.md"), "# version B\n").unwrap();
+        commit_changes(&dir, "divergent").unwrap();
+
+        // Pop must report a conflict.
+        let outcome = stash_pop(&dir, &stash).unwrap();
+        assert!(
+            matches!(outcome, StashPopOutcome::Conflicted(_)),
+            "expected Conflicted, got {outcome:?}"
+        );
+
+        // The stash must still be on the stack so the user can recover.
+        let still_there = find_stash_by_message(&dir, msg).unwrap();
+        assert_eq!(still_there, Some(stash));
+    }
+
+    #[test]
+    fn test_find_stash_by_message_matches() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        let msg = "ralph: specific-marker-7f3";
+        let stash = stash_push_with_untracked(&dir, msg).unwrap().expect("sha");
+
+        let found = find_stash_by_message(&dir, msg).unwrap().expect("found");
+        assert_eq!(found, stash);
+
+        let missing =
+            find_stash_by_message(&dir, "ralph: no-such-marker").unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_stash_pop_not_found_when_dropped() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        let stash = stash_push_with_untracked(&dir, "ralph: gone")
+            .unwrap()
+            .expect("sha");
+
+        // User drops it manually.
+        let _ = Command::new("git")
+            .args(["stash", "drop", "stash@{0}"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        let outcome = stash_pop(&dir, &stash).unwrap();
+        assert_eq!(outcome, StashPopOutcome::NotFound);
     }
 
     #[test]

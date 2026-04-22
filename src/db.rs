@@ -22,6 +22,9 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v10,
     migrate_v11,
     migrate_v12,
+    migrate_v13,
+    migrate_v14,
+    migrate_v15,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -442,6 +445,62 @@ fn migrate_v12(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         ALTER TABLE steps ADD COLUMN change_policy TEXT NOT NULL DEFAULT 'required';
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V13: per-step tags column
+// ---------------------------------------------------------------------------
+
+fn migrate_v13(conn: &Connection) -> Result<()> {
+    // `tags` stores a JSON array of user-supplied string tags attached to a
+    // step. Storage + CRUD only — no execution-model semantics today. Every
+    // pre-V13 row is backfilled to `'[]'` (empty array) via the NOT NULL
+    // DEFAULT.
+    conn.execute_batch(
+        "
+        ALTER TABLE steps ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V14: per-plan context_prepend override
+// ---------------------------------------------------------------------------
+
+fn migrate_v14(conn: &Connection) -> Result<()> {
+    // `context_prepend` is the per-plan override for the default
+    // "how to introspect this plan" text injected at the top of every step's
+    // prompt. Nullable: `NULL` means "use the system default text baked into
+    // the binary" (see `prompt::DEFAULT_CONTEXT_PREPEND`). An empty string
+    // is an explicit "no prepend at all" escape hatch. Non-empty replaces
+    // the default verbatim — not concatenated with it.
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN context_prepend TEXT DEFAULT NULL;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V15: auto-stash bookkeeping on run_locks
+// ---------------------------------------------------------------------------
+
+fn migrate_v15(conn: &Connection) -> Result<()> {
+    // `source_branch` is the branch the user was on when `ralph run`
+    // started; we switch back to it during teardown before popping the
+    // stash. `stash_sha` is the commit SHA of the ralph-owned stash
+    // (NULL when the tree was clean at run start). Both nullable because
+    // the run_locks row is created before we've checked for dirty state,
+    // and because many runs won't have a stash at all.
+    conn.execute_batch(
+        "
+        ALTER TABLE run_locks ADD COLUMN source_branch TEXT;
+        ALTER TABLE run_locks ADD COLUMN stash_sha TEXT;
         ",
     )?;
     Ok(())
@@ -1125,6 +1184,214 @@ mod tests {
         {
             let _conn = open_at(&path).expect("first open runs all migrations");
         }
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v13_adds_tags_column() {
+        // Seed a pre-V13 database, populate a step, then let V13 apply and
+        // verify the new `tags` column exists with the '[]' default.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v12.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v12 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(12) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Legacy step", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V13 applies and backfills every row to '[]'.
+        let conn = open_at(&path).unwrap();
+
+        let tags: String = conn
+            .query_row(
+                "SELECT tags FROM steps WHERE id = ?1",
+                ["s1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tags, "[]", "pre-V13 rows should backfill to empty JSON array");
+
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM steps WHERE tags IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_count, 0, "NOT NULL DEFAULT must leave no NULLs");
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Second open must not reapply (ALTER TABLE would fail on duplicate column).
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v14_adds_context_prepend_column() {
+        // Seed a pre-V14 database, populate a plan, then let V14 apply and
+        // verify the new `context_prepend` column exists and defaults to NULL.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v13.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v13 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(13) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V14 applies and adds the column. Pre-V14 rows must
+        // default to NULL.
+        let conn = open_at(&path).unwrap();
+
+        let prepend: Option<String> = conn
+            .query_row(
+                "SELECT context_prepend FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            prepend, None,
+            "pre-V14 rows should default to NULL context_prepend"
+        );
+
+        // New inserts with an explicit value are preserved.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, context_prepend)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "slug2", "/proj", "b", "d", "custom prepend"],
+        )
+        .unwrap();
+        let p2: Option<String> = conn
+            .query_row(
+                "SELECT context_prepend FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(p2.as_deref(), Some("custom prepend"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Second open must not reapply (ALTER TABLE would fail on duplicate
+        // column).
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v15_adds_source_branch_and_stash_sha_columns() {
+        // Both columns are nullable and default to NULL; existing rows must
+        // survive the upgrade untouched, and inserts without the new columns
+        // must still work.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v14.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v14 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(14) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        // Seed a pre-V15 run_locks row.
+        conn.execute(
+            "INSERT INTO run_locks (project, pid) VALUES (?1, ?2)",
+            rusqlite::params!["/proj-v15", 1i64],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V15 applies. Pre-V15 row must have NULL in both new
+        // columns.
+        let conn = open_at(&path).unwrap();
+        let (src, sha): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT source_branch, stash_sha FROM run_locks WHERE project = ?1",
+                ["/proj-v15"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(src, None);
+        assert_eq!(sha, None);
+
+        // New inserts with explicit values round-trip.
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, source_branch, stash_sha)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["/proj-v15b", 2i64, "master", "deadbeef"],
+        )
+        .unwrap();
+        let (src2, sha2): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT source_branch, stash_sha FROM run_locks WHERE project = ?1",
+                ["/proj-v15b"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(src2.as_deref(), Some("master"));
+        assert_eq!(sha2.as_deref(), Some("deadbeef"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Second open is a no-op.
         let conn = open_at(&path).expect("re-open must not reapply migrations");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))

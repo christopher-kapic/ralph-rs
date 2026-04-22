@@ -4,6 +4,7 @@
 // each submodule re-exports its public functions through this module.
 
 mod agents;
+pub mod config_cmd;
 mod hooks;
 mod plan;
 mod prompt;
@@ -331,11 +332,15 @@ fn prompt_for_default(installed: &[&str]) -> Result<String> {
 // Doctor command
 // ---------------------------------------------------------------------------
 
-pub fn cmd_doctor(config: &config::Config, out: &OutputContext) -> Result<()> {
+pub fn cmd_doctor(
+    config: &config::Config,
+    workdir: &Path,
+    out: &OutputContext,
+) -> Result<()> {
     println!("ralph doctor");
     println!();
 
-    let checks = preflight::run_doctor_checks(config);
+    let checks = preflight::run_doctor_checks(config, workdir);
 
     let mut has_errors = false;
     for check in &checks {
@@ -516,6 +521,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -532,6 +538,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -575,6 +582,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -591,6 +599,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -608,6 +617,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -653,6 +663,7 @@ mod tests {
             &criteria,
             Some(5),
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -696,6 +707,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -713,6 +725,7 @@ mod tests {
             &criteria,
             Some(2),
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -756,6 +769,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -772,6 +786,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -816,6 +831,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -835,6 +851,8 @@ mod tests {
             None,
             false,
             None,
+            &[],
+            false,
             &test_out(),
         )
         .unwrap();
@@ -877,6 +895,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -924,6 +943,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -940,6 +960,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -956,6 +977,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1002,6 +1024,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1018,6 +1041,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1034,6 +1058,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1401,6 +1426,7 @@ mod tests {
             &[],
             None,
             None,
+            &[],
             &test_out(),
         )
         .unwrap();

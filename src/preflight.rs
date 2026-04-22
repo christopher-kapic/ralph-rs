@@ -5,16 +5,169 @@
 // - Test binary availability: extract binary from test commands, check via `which`
 // - Harness authentication: check GH_TOKEN for copilot
 // - Git dirty state: auto-commit with a descriptive message
+// - Disk space: fail fast if the project filesystem is nearly full
 
 use std::io::{self, Write};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
 use crate::config::{Config, HarnessConfig};
 use crate::git;
 use crate::output::OutputContext;
 use crate::plan::Plan;
+
+// ---------------------------------------------------------------------------
+// Disk space
+// ---------------------------------------------------------------------------
+
+/// Filesystem free/total byte counts at a given path.
+///
+/// `available_bytes` tracks the space reported by `statvfs::f_bavail` — the
+/// count visible to unprivileged users, which is what `ralph run` actually
+/// has to work with. The bigger `f_bfree` (root-reserved blocks included)
+/// would overstate headroom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskSpace {
+    pub available_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl DiskSpace {
+    /// Convert `available_bytes` to fractional gigabytes for display.
+    pub fn available_gb(&self) -> f64 {
+        self.available_bytes as f64 / 1_073_741_824.0
+    }
+}
+
+/// Probe free disk space at `path`.
+///
+/// On unix this calls `libc::statvfs` and returns
+/// `available = f_bavail * f_frsize`, `total = f_blocks * f_frsize`.
+/// On non-unix platforms this returns an error — ralph-rs is primarily
+/// used on Linux/macOS (see CLAUDE.md), and we'd rather surface "unknown"
+/// than a fabricated number.
+#[cfg(unix)]
+// libc struct field widths vary by platform (u32 on some BSDs, u64 on
+// glibc). Rather than fork this by target, allow the redundant casts.
+#[allow(clippy::unnecessary_cast)]
+pub fn disk_space(path: &Path) -> Result<DiskSpace> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| anyhow!("path contains interior NUL: {e}"))?;
+
+    // SAFETY: `statvfs` is a standard POSIX syscall. We zero-initialize the
+    // output struct before passing it in; the kernel fills it on success.
+    // The pointer is valid for the duration of the call and not retained.
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut buf) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(anyhow!("statvfs({}) failed: {}", path.display(), err));
+    }
+
+    // f_frsize is the "fundamental fragment size" — the unit f_bavail and
+    // f_blocks are denominated in. Coerce through u64 to avoid overflow on
+    // multi-TB filesystems and to absorb platform-specific field widths.
+    let frsize = buf.f_frsize as u64;
+    let bavail = buf.f_bavail as u64;
+    let blocks = buf.f_blocks as u64;
+    Ok(DiskSpace {
+        available_bytes: bavail.saturating_mul(frsize),
+        total_bytes: blocks.saturating_mul(frsize),
+    })
+}
+
+#[cfg(not(unix))]
+pub fn disk_space(_path: &Path) -> Result<DiskSpace> {
+    Err(anyhow!(
+        "disk space probing is not implemented on this platform"
+    ))
+}
+
+/// Classify a free-space reading into a preflight check result.
+///
+/// Pulled out of `run_doctor_checks` so unit tests can exercise the
+/// threshold logic without touching a real filesystem.
+///
+/// Thresholds (in bytes):
+/// - `>= 5 GB` → Pass
+/// - `[1 GB, 5 GB)` → Warning
+/// - `< 1 GB` → Error
+pub fn classify_disk_space(ds: &DiskSpace) -> CheckResult {
+    const GB: u64 = 1_073_741_824;
+    let gb_free = ds.available_gb();
+    if ds.available_bytes >= 5 * GB {
+        CheckResult {
+            name: "disk-space".to_string(),
+            severity: CheckSeverity::Pass,
+            message: format!("{gb_free:.1} GB free"),
+        }
+    } else if ds.available_bytes >= GB {
+        CheckResult {
+            name: "disk-space".to_string(),
+            severity: CheckSeverity::Warning,
+            message: format!(
+                "Disk space is low ({gb_free:.1} GB free) — long Rust builds may exhaust this"
+            ),
+        }
+    } else {
+        CheckResult {
+            name: "disk-space".to_string(),
+            severity: CheckSeverity::Error,
+            message: format!("Disk space critically low ({gb_free:.1} GB free)"),
+        }
+    }
+}
+
+/// Doctor check variant: probes `workdir` and classifies the result. If the
+/// probe itself fails (e.g. non-unix, missing path), returns a Warning so
+/// `ralph doctor` still renders cleanly instead of erroring out.
+fn check_disk_space(workdir: &Path) -> CheckResult {
+    match disk_space(workdir) {
+        Ok(ds) => classify_disk_space(&ds),
+        Err(e) => CheckResult {
+            name: "disk-space".to_string(),
+            severity: CheckSeverity::Warning,
+            message: format!("could not probe disk space: {e}"),
+        },
+    }
+}
+
+/// Minimum free bytes required to enter `ralph run`. Below this we refuse
+/// to start at all — Rust builds routinely need several GB and falling over
+/// mid-step corrupts SQLite state.
+const PRERUN_DISK_FLOOR_BYTES: u64 = 2 * 1_073_741_824; // 2 GB
+
+/// Preflight check variant: converts "disk < 2 GB" into a hard Error that
+/// causes `ralph run` to bail. Probe errors downgrade to a Warning so a
+/// weird-but-non-fatal filesystem doesn't block a run.
+fn check_prerun_disk_space(workdir: &Path) -> CheckResult {
+    match disk_space(workdir) {
+        Ok(ds) if ds.available_bytes < PRERUN_DISK_FLOOR_BYTES => CheckResult {
+            name: "disk-space".to_string(),
+            severity: CheckSeverity::Error,
+            message: format!(
+                "Pre-run check failed: only {:.1} GB free on project filesystem. \
+                 Rust builds typically need several GB. Free space or add \
+                 --skip-preflight to override.",
+                ds.available_gb()
+            ),
+        },
+        Ok(ds) => CheckResult {
+            name: "disk-space".to_string(),
+            severity: CheckSeverity::Pass,
+            message: format!("{:.1} GB free", ds.available_gb()),
+        },
+        Err(e) => CheckResult {
+            name: "disk-space".to_string(),
+            severity: CheckSeverity::Warning,
+            message: format!("could not probe disk space: {e}"),
+        },
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Check result types
@@ -121,6 +274,10 @@ pub fn run_preflight_checks(
 
     // 4. Git dirty state (informational only)
     checks.push(check_git_state(workdir));
+
+    // 5. Disk space — fail fast rather than crash mid-step with SQLITE_FULL
+    //    and a half-written 25 GB target/ directory.
+    checks.push(check_prerun_disk_space(workdir));
 
     Ok(PreflightResults { checks })
 }
@@ -312,7 +469,11 @@ pub(crate) fn is_binary_available(binary: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Run doctor checks: verify config, database, harness binaries, agents dir.
-pub fn run_doctor_checks(config: &Config) -> Vec<CheckResult> {
+///
+/// `workdir` is the project directory — passed through so the disk-space
+/// check reports on the filesystem where builds will actually land, not
+/// whichever filesystem happens to host ralph's config dir.
+pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
     let mut checks = Vec::new();
 
     // 1. Config exists and parses (if we got here, it parsed).
@@ -383,6 +544,11 @@ pub fn run_doctor_checks(config: &Config) -> Vec<CheckResult> {
             });
         }
     }
+
+    // 5. Disk space on the project workdir. Reported as a standalone check so
+    //    `ralph doctor` surfaces the same failure class that previously took
+    //    out a user mid-step (25 GB target/ filled the FS, SQLite wedged).
+    checks.push(check_disk_space(workdir));
 
     checks
 }
@@ -488,6 +654,8 @@ mod tests {
                 "GITHUB_TOKEN".to_string(),
             ],
             auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
         let result = check_harness_auth("copilot", &harness);
         assert_eq!(result.severity, CheckSeverity::Warning);
@@ -521,6 +689,8 @@ mod tests {
             default_model: None,
             auth_env_vars: vec![],
             auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
         let result = check_harness_auth("claude", &harness);
         assert_eq!(result.severity, CheckSeverity::Pass);
@@ -543,6 +713,8 @@ mod tests {
             default_model: None,
             auth_env_vars: vec![],
             auth_probe_args: vec!["--help".to_string()],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
         let result = check_harness_auth("custom", &harness);
         assert_eq!(result.severity, CheckSeverity::Pass);
@@ -565,6 +737,8 @@ mod tests {
             default_model: None,
             auth_env_vars: vec![],
             auth_probe_args: vec!["--ignored".to_string()],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
         let result = check_harness_auth("custom", &harness);
         assert_eq!(result.severity, CheckSeverity::Warning);
@@ -592,6 +766,8 @@ mod tests {
             default_model: None,
             auth_env_vars: vec![var.to_string()],
             auth_probe_args: vec!["--nope".to_string()],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
         };
         let result = check_harness_auth("custom", &harness);
         unsafe {
@@ -620,6 +796,8 @@ mod tests {
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+            color: None,
             },
         );
         let config = Config {
@@ -627,9 +805,11 @@ mod tests {
             max_retries_per_step: 3,
             timeout_secs: Some(300),
             hook_timeout_secs: 120,
-            auto_stash: false,
+            auto_stash: true,
             prompt_prefix: None,
             prompt_suffix: None,
+            min_free_disk_mb: 1024,
+            display_timezone: "UTC".to_string(),
             harnesses,
         };
         let now = chrono::Utc::now();
@@ -648,6 +828,7 @@ mod tests {
             updated_at: now,
             prompt_prefix: None,
             prompt_suffix: None,
+            context_prepend: None,
         };
         let results = run_preflight_checks(&plan, &config, tmp.path()).unwrap();
         let auth = results
@@ -729,12 +910,15 @@ mod tests {
             max_retries_per_step: 3,
             timeout_secs: Some(300),
             hook_timeout_secs: 120,
-            auto_stash: false,
+            auto_stash: true,
             prompt_prefix: None,
             prompt_suffix: None,
+            min_free_disk_mb: 1024,
+            display_timezone: "UTC".to_string(),
             harnesses: HashMap::new(),
         };
-        let checks = run_doctor_checks(&config);
+        let tmp = tempfile::tempdir().unwrap();
+        let checks = run_doctor_checks(&config, tmp.path());
         // Should have at least config, database, agents-dir checks
         assert!(checks.len() >= 3);
 
@@ -810,5 +994,117 @@ mod tests {
     #[test]
     fn test_is_binary_not_available() {
         assert!(!is_binary_available("definitely_not_a_real_binary_xyz"));
+    }
+
+    // -----------------------------------------------------------------
+    // Disk-space tests
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn test_disk_space_root_returns_plausible_values() {
+        // `/` must exist on every unix system. We can only assert portable
+        // invariants: the numbers are non-zero and available <= total.
+        let ds = disk_space(std::path::Path::new("/")).expect("statvfs(/) must succeed");
+        assert!(ds.total_bytes > 0, "total should be non-zero");
+        assert!(ds.available_bytes > 0, "available should be non-zero");
+        assert!(
+            ds.available_bytes <= ds.total_bytes,
+            "available ({}) must not exceed total ({})",
+            ds.available_bytes,
+            ds.total_bytes,
+        );
+    }
+
+    #[test]
+    fn test_classify_disk_space_pass() {
+        // >= 5 GB free → Pass
+        let ds = DiskSpace {
+            available_bytes: 10 * 1_073_741_824,
+            total_bytes: 100 * 1_073_741_824,
+        };
+        let result = classify_disk_space(&ds);
+        assert_eq!(result.severity, CheckSeverity::Pass);
+        assert_eq!(result.name, "disk-space");
+    }
+
+    #[test]
+    fn test_classify_disk_space_warning() {
+        // Between 1 and 5 GB → Warning
+        let ds = DiskSpace {
+            available_bytes: 2 * 1_073_741_824,
+            total_bytes: 100 * 1_073_741_824,
+        };
+        let result = classify_disk_space(&ds);
+        assert_eq!(result.severity, CheckSeverity::Warning);
+        assert!(
+            result.message.contains("low"),
+            "warning message should mention low disk, got: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn test_classify_disk_space_error() {
+        // < 1 GB → Error
+        let ds = DiskSpace {
+            available_bytes: 500 * 1_048_576, // 500 MB
+            total_bytes: 100 * 1_073_741_824,
+        };
+        let result = classify_disk_space(&ds);
+        assert_eq!(result.severity, CheckSeverity::Error);
+        assert!(
+            result.message.contains("critically low"),
+            "error message should mention critically low, got: {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn test_classify_disk_space_boundaries() {
+        const GB: u64 = 1_073_741_824;
+        // Exactly 5 GB → Pass
+        let at_5 = DiskSpace {
+            available_bytes: 5 * GB,
+            total_bytes: 100 * GB,
+        };
+        assert_eq!(classify_disk_space(&at_5).severity, CheckSeverity::Pass);
+        // Just below 5 GB → Warning
+        let just_below_5 = DiskSpace {
+            available_bytes: 5 * GB - 1,
+            total_bytes: 100 * GB,
+        };
+        assert_eq!(
+            classify_disk_space(&just_below_5).severity,
+            CheckSeverity::Warning
+        );
+        // Exactly 1 GB → Warning
+        let at_1 = DiskSpace {
+            available_bytes: GB,
+            total_bytes: 100 * GB,
+        };
+        assert_eq!(classify_disk_space(&at_1).severity, CheckSeverity::Warning);
+        // Just below 1 GB → Error
+        let just_below_1 = DiskSpace {
+            available_bytes: GB - 1,
+            total_bytes: 100 * GB,
+        };
+        assert_eq!(
+            classify_disk_space(&just_below_1).severity,
+            CheckSeverity::Error
+        );
+    }
+
+    #[test]
+    fn test_disk_space_available_gb() {
+        let ds = DiskSpace {
+            available_bytes: 1_073_741_824, // 1 GB
+            total_bytes: 10 * 1_073_741_824,
+        };
+        let gb = ds.available_gb();
+        assert!(
+            (gb - 1.0).abs() < 1e-9,
+            "expected ~1.0 GB, got {gb}"
+        );
     }
 }
