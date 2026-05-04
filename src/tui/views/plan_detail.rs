@@ -1,27 +1,40 @@
 // Plan detail view state
 //
 // Manages the state tracked by the plan-detail view of the TUI: selected step,
-// input mode, execution timer, and step list. This module is independent of
-// rendering and input handling so that it can be unit-tested without a
-// terminal.
+// input mode, execution timer, multi-selection, and step list. This module is
+// independent of rendering and input handling so that it can be unit-tested
+// without a terminal.
 
 use std::time::Instant;
 
 use ratatui::widgets::ListState;
 
 use crate::config::Config;
+use crate::frac_index::{self, FracIndexError};
 use crate::plan::{Plan, Step, StepStatus};
+use crate::tui::selection::Selection;
+use crate::tui::toast::ToastQueue;
 
 // ---------------------------------------------------------------------------
 // Input mode
 // ---------------------------------------------------------------------------
 
+/// Where the AddStep prompt is targeted: above the highlighted step (`i`) or
+/// below it (`a`). The dispatcher uses this to compute the new sort_key
+/// relative to the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddPosition {
+    Above,
+    Below,
+}
+
 /// Determines how keyboard input is interpreted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
-    /// Normal navigation mode (j/k/a/s/q).
+    /// Normal navigation mode (j/k/i/a/d/r/J/K/s/space/q).
     Normal,
-    /// Inline text input for adding a new step.
-    AddStep,
+    /// Inline text input for adding a new step at `position`.
+    AddStep(AddPosition),
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +72,16 @@ pub struct PlanDetailApp {
     /// Default retry budget per step, sourced from `Config.max_retries_per_step`,
     /// used when a step has no explicit `max_retries` override.
     pub default_max_retries: u32,
+
+    /// Multi-selection state, keyed by `Step.id` so the selection survives a
+    /// refresh that re-orders the step list. Drives the `[N]` badge on each
+    /// step row and the selection-aware `d` delete (TUI-plan.md §7).
+    pub selection: Selection<String>,
+
+    /// Toast queue rendered over the bottom chrome row. The dispatcher pushes
+    /// onto this after operations (`d` delete, `r` reset, J/K move) so the
+    /// user sees a transient confirmation.
+    pub toasts: ToastQueue,
 }
 
 impl PlanDetailApp {
@@ -76,6 +99,8 @@ impl PlanDetailApp {
             step_start_time: None,
             list_state,
             default_max_retries: config.max_retries_per_step,
+            selection: Selection::new(),
+            toasts: ToastQueue::new(),
         }
     }
 
@@ -103,19 +128,37 @@ impl PlanDetailApp {
 
     // -- Add step ---------------------------------------------------------
 
-    /// Switch to AddStep input mode.
-    pub fn enter_add_mode(&mut self) {
-        self.input_mode = InputMode::AddStep;
+    /// Switch to AddStep input mode targeting the slot *above* the cursor
+    /// (`i`). The dispatcher reads `compute_insert_above_sort_key` to place
+    /// the new step on confirm.
+    pub fn enter_add_mode_above(&mut self) {
+        self.input_mode = InputMode::AddStep(AddPosition::Above);
         self.input_buffer.clear();
     }
 
-    /// Confirm the add-step input. Returns the trimmed title if non-empty,
-    /// or `None` if the input was blank (cancelling the add).
-    pub fn confirm_add_step(&mut self) -> Option<String> {
+    /// Switch to AddStep input mode targeting the slot *below* the cursor
+    /// (`a`).
+    pub fn enter_add_mode_below(&mut self) {
+        self.input_mode = InputMode::AddStep(AddPosition::Below);
+        self.input_buffer.clear();
+    }
+
+    /// Confirm the add-step input. Returns the trimmed title together with
+    /// the position the prompt was opened for, or `None` if the input was
+    /// blank (cancelling the add).
+    pub fn confirm_add_step(&mut self) -> Option<(AddPosition, String)> {
+        let position = match self.input_mode {
+            InputMode::AddStep(p) => p,
+            InputMode::Normal => return None,
+        };
         let title = self.input_buffer.trim().to_string();
         self.input_buffer.clear();
         self.input_mode = InputMode::Normal;
-        if title.is_empty() { None } else { Some(title) }
+        if title.is_empty() {
+            None
+        } else {
+            Some((position, title))
+        }
     }
 
     /// Cancel inline input and return to Normal mode.
@@ -179,6 +222,174 @@ impl PlanDetailApp {
             .find(|s| s.status == StepStatus::InProgress)
     }
 
+    // -- Selection --------------------------------------------------------
+
+    /// Toggle multi-select on the highlighted step (`space`).
+    /// No-op when the step list is empty.
+    pub fn toggle_selection(&mut self) {
+        if self.steps.is_empty() {
+            return;
+        }
+        let id = self.steps[self.selected_index].id.clone();
+        self.selection.toggle(id);
+    }
+
+    /// Clear all selections without touching cursor or input mode.
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+    }
+
+    /// Handle `<esc>` in normal mode: clear the selection if any items are
+    /// selected, otherwise no-op (Esc does not pop the view; `q` / `h` / `←`
+    /// own that). Returns `true` when a selection was cleared.
+    pub fn escape_selection(&mut self) -> bool {
+        if self.selection.is_empty() {
+            false
+        } else {
+            self.selection.clear();
+            true
+        }
+    }
+
+    // -- Delete -----------------------------------------------------------
+
+    /// Step IDs that the next `d` delete should affect, per TUI-plan.md §7:
+    /// selection wins over the cursor target. With at least one step
+    /// selected, returns the selection in pick order; otherwise returns just
+    /// the highlighted step's ID. Empty when the step list is empty.
+    pub fn delete_targets(&self) -> Vec<String> {
+        if !self.selection.is_empty() {
+            self.selection.as_slice().to_vec()
+        } else if !self.steps.is_empty() {
+            vec![self.steps[self.selected_index].id.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    // -- Reset ------------------------------------------------------------
+
+    /// Step ID to reset, or `None` when the step list is empty. Cursor-only
+    /// (selection is ignored — reset is a single-step operation).
+    pub fn reset_target(&self) -> Option<String> {
+        if self.steps.is_empty() {
+            None
+        } else {
+            Some(self.steps[self.selected_index].id.clone())
+        }
+    }
+
+    // -- Move (Shift-J / Shift-K) -----------------------------------------
+
+    /// Step ID for Shift-K (move up), or `None` when the cursor cannot move
+    /// up (empty list or already at top).
+    pub fn move_up_target(&self) -> Option<String> {
+        if self.steps.is_empty() || self.selected_index == 0 {
+            None
+        } else {
+            Some(self.steps[self.selected_index].id.clone())
+        }
+    }
+
+    /// Step ID for Shift-J (move down), or `None` when the cursor cannot
+    /// move down (empty list or already at bottom).
+    pub fn move_down_target(&self) -> Option<String> {
+        if self.steps.is_empty() || self.selected_index + 1 >= self.steps.len() {
+            None
+        } else {
+            Some(self.steps[self.selected_index].id.clone())
+        }
+    }
+
+    // -- Sort-key computation ---------------------------------------------
+
+    /// Compute the new sort_key for inserting a step *above* the cursor.
+    /// Used by the `i` keybinding's confirm handler.
+    pub fn compute_insert_above_sort_key(&self) -> Result<String, FracIndexError> {
+        if self.steps.is_empty() {
+            return Ok(frac_index::initial_key());
+        }
+        let cur = &self.steps[self.selected_index];
+        if self.selected_index == 0 {
+            frac_index::key_between("", &cur.sort_key)
+        } else {
+            let prev = &self.steps[self.selected_index - 1];
+            frac_index::key_between(&prev.sort_key, &cur.sort_key)
+        }
+    }
+
+    /// Compute the new sort_key for appending a step *below* the cursor.
+    /// Used by the `a` keybinding's confirm handler.
+    pub fn compute_append_below_sort_key(&self) -> Result<String, FracIndexError> {
+        if self.steps.is_empty() {
+            return Ok(frac_index::initial_key());
+        }
+        let cur = &self.steps[self.selected_index];
+        if self.selected_index + 1 == self.steps.len() {
+            frac_index::key_after(&cur.sort_key)
+        } else {
+            let next = &self.steps[self.selected_index + 1];
+            frac_index::key_between(&cur.sort_key, &next.sort_key)
+        }
+    }
+
+    /// Compute the new sort_key needed to swap the highlighted step **up**
+    /// by one position. Returns `Ok(None)` when the cursor is already at
+    /// the top (no move possible).
+    pub fn compute_move_up_sort_key(&self) -> Result<Option<String>, FracIndexError> {
+        if self.steps.is_empty() || self.selected_index == 0 {
+            return Ok(None);
+        }
+        let target_idx = self.selected_index - 1;
+        // The moved step's new key needs to land between target_idx-1 and
+        // target_idx, so it sorts before the step currently at target_idx.
+        let new_key = if target_idx == 0 {
+            frac_index::key_between("", &self.steps[target_idx].sort_key)?
+        } else {
+            frac_index::key_between(
+                &self.steps[target_idx - 1].sort_key,
+                &self.steps[target_idx].sort_key,
+            )?
+        };
+        Ok(Some(new_key))
+    }
+
+    /// Compute the new sort_key needed to swap the highlighted step **down**
+    /// by one position. Returns `Ok(None)` when the cursor is already at
+    /// the bottom.
+    pub fn compute_move_down_sort_key(&self) -> Result<Option<String>, FracIndexError> {
+        if self.steps.is_empty() || self.selected_index + 1 >= self.steps.len() {
+            return Ok(None);
+        }
+        let target_idx = self.selected_index + 1;
+        // The moved step's new key needs to land between target_idx and
+        // target_idx+1 so it sorts after the step currently at target_idx.
+        let new_key = if target_idx + 1 == self.steps.len() {
+            frac_index::key_after(&self.steps[target_idx].sort_key)?
+        } else {
+            frac_index::key_between(
+                &self.steps[target_idx].sort_key,
+                &self.steps[target_idx + 1].sort_key,
+            )?
+        };
+        Ok(Some(new_key))
+    }
+
+    // -- Refresh ----------------------------------------------------------
+
+    /// Replace the step list (after a DB refresh) and clamp the cursor
+    /// into the new range. Selection is cleared because the next render
+    /// would otherwise show stale `[N]` badges for removed steps.
+    pub fn refresh_steps(&mut self, steps: Vec<Step>) {
+        self.steps = steps;
+        self.selection.clear();
+        if self.steps.is_empty() {
+            self.selected_index = 0;
+        } else if self.selected_index >= self.steps.len() {
+            self.selected_index = self.steps.len() - 1;
+        }
+    }
+
     // -- Timer ------------------------------------------------------------
 
     /// Start the live timer for the current step.
@@ -215,7 +426,7 @@ impl PlanDetailApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputMode, PlanDetailApp};
+    use super::{AddPosition, InputMode, PlanDetailApp};
     use crate::config::Config;
     use crate::plan::{Plan, PlanStatus, Step, StepStatus};
     use chrono::Utc;
@@ -246,6 +457,8 @@ mod tests {
             .map(|i| Step {
                 id: format!("s{i}"),
                 plan_id: "p1".to_string(),
+                // Use a0, a1, a2, ... so we have valid frac-index keys with
+                // room between them (a0 < a1 admits a midpoint via key_between).
                 sort_key: format!("a{i}"),
                 title: format!("Step {}", i + 1),
                 description: format!("Description {}", i + 1),
@@ -282,6 +495,7 @@ mod tests {
         assert_eq!(app.selected_index, 0);
         assert!(!app.should_pop);
         assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.selection.is_empty());
     }
 
     #[test]
@@ -344,32 +558,60 @@ mod tests {
     }
 
     #[test]
-    fn test_enter_add_mode() {
+    fn test_enter_add_mode_above() {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
 
-        app.enter_add_mode();
-        assert!(matches!(app.input_mode, InputMode::AddStep));
+        app.enter_add_mode_above();
+        assert_eq!(app.input_mode, InputMode::AddStep(AddPosition::Above));
         assert!(app.input_buffer.is_empty());
     }
 
     #[test]
-    fn test_confirm_add_step() {
+    fn test_enter_add_mode_below() {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
 
-        // Select step 1 (in_progress) then add
-        app.selected_index = 1;
-        app.enter_add_mode();
-        app.input_buffer = "New step title".to_string();
-        let title = app.confirm_add_step();
-
-        assert!(title.is_some());
-        assert_eq!(title.unwrap(), "New step title");
-        assert!(matches!(app.input_mode, InputMode::Normal));
+        app.enter_add_mode_below();
+        assert_eq!(app.input_mode, InputMode::AddStep(AddPosition::Below));
         assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_confirm_add_step_above() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+
+        app.selected_index = 1;
+        app.enter_add_mode_above();
+        app.input_buffer = "New step title".to_string();
+        let confirmed = app.confirm_add_step();
+
+        assert_eq!(
+            confirmed,
+            Some((AddPosition::Above, "New step title".to_string()))
+        );
+        assert_eq!(app.input_mode, InputMode::Normal);
+        assert!(app.input_buffer.is_empty());
+    }
+
+    #[test]
+    fn test_confirm_add_step_below() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+
+        app.enter_add_mode_below();
+        app.input_buffer = "Another title".to_string();
+        let confirmed = app.confirm_add_step();
+        assert_eq!(
+            confirmed,
+            Some((AddPosition::Below, "Another title".to_string()))
+        );
+        assert_eq!(app.input_mode, InputMode::Normal);
     }
 
     #[test]
@@ -378,11 +620,19 @@ mod tests {
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
 
-        app.enter_add_mode();
+        app.enter_add_mode_above();
         app.input_buffer = "   ".to_string();
-        let title = app.confirm_add_step();
-        assert!(title.is_none());
-        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(app.confirm_add_step().is_none());
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn test_confirm_add_step_in_normal_mode_returns_none() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        // No enter_add_mode_* call — confirm should bail.
+        assert!(app.confirm_add_step().is_none());
     }
 
     #[test]
@@ -391,10 +641,10 @@ mod tests {
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
 
-        app.enter_add_mode();
+        app.enter_add_mode_above();
         app.input_buffer = "Some text".to_string();
         app.cancel_input();
-        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert_eq!(app.input_mode, InputMode::Normal);
         assert!(app.input_buffer.is_empty());
     }
 
@@ -559,7 +809,328 @@ mod tests {
     #[test]
     fn test_input_mode_variants() {
         let _normal = InputMode::Normal;
-        let _add = InputMode::AddStep;
-        // Both variants are constructible without panic
+        let _add_above = InputMode::AddStep(AddPosition::Above);
+        let _add_below = InputMode::AddStep(AddPosition::Below);
+    }
+
+    // -- Selection --------------------------------------------------------
+
+    #[test]
+    fn test_toggle_selection_uses_step_id() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+
+        app.selected_index = 1;
+        app.toggle_selection();
+        assert!(app.selection.is_selected(&"s1".to_string()));
+        assert_eq!(app.selection.len(), 1);
+
+        // Toggling again clears it.
+        app.toggle_selection();
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn test_toggle_selection_empty_steps_is_noop() {
+        let plan = make_plan();
+        let mut app = PlanDetailApp::new(plan, vec![], &Config::default());
+        app.toggle_selection();
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn test_clear_selection() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.toggle_selection();
+        app.navigate_down();
+        app.toggle_selection();
+        assert_eq!(app.selection.len(), 2);
+        app.clear_selection();
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn test_escape_selection_clears_when_present() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.toggle_selection();
+        let consumed = app.escape_selection();
+        assert!(consumed, "esc with selection should be consumed");
+        assert!(app.selection.is_empty());
+        assert!(!app.should_pop, "esc must not pop the view");
+    }
+
+    #[test]
+    fn test_escape_selection_noop_when_empty() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        let consumed = app.escape_selection();
+        assert!(!consumed);
+        assert!(!app.should_pop);
+    }
+
+    // -- Delete targets ---------------------------------------------------
+
+    #[test]
+    fn test_delete_targets_returns_cursor_when_no_selection() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 2;
+        assert_eq!(app.delete_targets(), vec!["s2".to_string()]);
+    }
+
+    #[test]
+    fn test_delete_targets_uses_selection_in_pick_order() {
+        let plan = make_plan();
+        let steps = make_steps(4);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 2;
+        app.toggle_selection();
+        app.selected_index = 0;
+        app.toggle_selection();
+        app.selected_index = 3;
+        app.toggle_selection();
+        // Cursor on s3 should NOT short-circuit selection.
+        assert_eq!(
+            app.delete_targets(),
+            vec!["s2".to_string(), "s0".to_string(), "s3".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_delete_targets_empty_steps() {
+        let plan = make_plan();
+        let app = PlanDetailApp::new(plan, vec![], &Config::default());
+        assert!(app.delete_targets().is_empty());
+    }
+
+    // -- Reset target -----------------------------------------------------
+
+    #[test]
+    fn test_reset_target_returns_cursor_step_id() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 0;
+        assert_eq!(app.reset_target(), Some("s0".to_string()));
+        app.selected_index = 2;
+        assert_eq!(app.reset_target(), Some("s2".to_string()));
+    }
+
+    #[test]
+    fn test_reset_target_empty_steps() {
+        let plan = make_plan();
+        let app = PlanDetailApp::new(plan, vec![], &Config::default());
+        assert!(app.reset_target().is_none());
+    }
+
+    // -- Move targets -----------------------------------------------------
+
+    #[test]
+    fn test_move_up_target_at_top_returns_none() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let app = PlanDetailApp::new(plan, steps, &Config::default());
+        assert_eq!(app.selected_index, 0);
+        assert!(app.move_up_target().is_none());
+    }
+
+    #[test]
+    fn test_move_up_target_returns_step_id() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 1;
+        assert_eq!(app.move_up_target(), Some("s1".to_string()));
+    }
+
+    #[test]
+    fn test_move_down_target_at_bottom_returns_none() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 2;
+        assert!(app.move_down_target().is_none());
+    }
+
+    #[test]
+    fn test_move_down_target_returns_step_id() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 1;
+        assert_eq!(app.move_down_target(), Some("s1".to_string()));
+    }
+
+    #[test]
+    fn test_move_targets_empty_steps() {
+        let plan = make_plan();
+        let app = PlanDetailApp::new(plan, vec![], &Config::default());
+        assert!(app.move_up_target().is_none());
+        assert!(app.move_down_target().is_none());
+    }
+
+    // -- Sort-key computation ---------------------------------------------
+
+    #[test]
+    fn test_compute_insert_above_sort_key_at_top() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let app = PlanDetailApp::new(plan, steps, &Config::default());
+        // selected_index=0, cursor on first step (sort_key="a0").
+        let key = app
+            .compute_insert_above_sort_key()
+            .expect("insert above for cursor at top");
+        // Must sort strictly before "a0".
+        assert!(key.as_str() < "a0", "got {key}");
+    }
+
+    #[test]
+    fn test_compute_insert_above_sort_key_in_middle() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 1; // between a0 and a1
+        let key = app.compute_insert_above_sort_key().unwrap();
+        assert!(key.as_str() > "a0" && key.as_str() < "a1", "got {key}");
+    }
+
+    #[test]
+    fn test_compute_insert_above_sort_key_empty_steps() {
+        let plan = make_plan();
+        let app = PlanDetailApp::new(plan, vec![], &Config::default());
+        let key = app.compute_insert_above_sort_key().unwrap();
+        assert_eq!(key, crate::frac_index::initial_key());
+    }
+
+    #[test]
+    fn test_compute_append_below_sort_key_at_bottom() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 2; // last step is "a2"
+        let key = app.compute_append_below_sort_key().unwrap();
+        assert!(key.as_str() > "a2", "got {key}");
+    }
+
+    #[test]
+    fn test_compute_append_below_sort_key_in_middle() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 0; // between a0 and a1
+        let key = app.compute_append_below_sort_key().unwrap();
+        assert!(key.as_str() > "a0" && key.as_str() < "a1", "got {key}");
+    }
+
+    #[test]
+    fn test_compute_append_below_sort_key_empty_steps() {
+        let plan = make_plan();
+        let app = PlanDetailApp::new(plan, vec![], &Config::default());
+        let key = app.compute_append_below_sort_key().unwrap();
+        assert_eq!(key, crate::frac_index::initial_key());
+    }
+
+    #[test]
+    fn test_compute_move_up_sort_key_at_top_is_none() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let app = PlanDetailApp::new(plan, steps, &Config::default());
+        assert!(app.compute_move_up_sort_key().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_compute_move_up_sort_key_swaps_into_top_slot() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 1;
+        let key = app
+            .compute_move_up_sort_key()
+            .unwrap()
+            .expect("move up should yield a key");
+        // Should sort strictly before "a0" (the current top step).
+        assert!(key.as_str() < "a0", "got {key}");
+    }
+
+    #[test]
+    fn test_compute_move_up_sort_key_in_middle() {
+        let plan = make_plan();
+        let steps = make_steps(4);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 2; // step a2 swaps with a1 → land between a0 and a1
+        let key = app.compute_move_up_sort_key().unwrap().unwrap();
+        assert!(key.as_str() > "a0" && key.as_str() < "a1", "got {key}");
+    }
+
+    #[test]
+    fn test_compute_move_down_sort_key_at_bottom_is_none() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 2;
+        assert!(app.compute_move_down_sort_key().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_compute_move_down_sort_key_swaps_into_bottom_slot() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 1; // a1 swaps with a2 → land after a2
+        let key = app
+            .compute_move_down_sort_key()
+            .unwrap()
+            .expect("move down should yield a key");
+        assert!(key.as_str() > "a2", "got {key}");
+    }
+
+    #[test]
+    fn test_compute_move_down_sort_key_in_middle() {
+        let plan = make_plan();
+        let steps = make_steps(4);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 1; // a1 swaps with a2 → land between a2 and a3
+        let key = app.compute_move_down_sort_key().unwrap().unwrap();
+        assert!(key.as_str() > "a2" && key.as_str() < "a3", "got {key}");
+    }
+
+    // -- Refresh ----------------------------------------------------------
+
+    #[test]
+    fn test_refresh_steps_clamps_cursor_into_new_range() {
+        let plan = make_plan();
+        let steps = make_steps(5);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 4;
+        app.refresh_steps(make_steps(2));
+        assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn test_refresh_steps_resets_cursor_when_empty() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 2;
+        app.refresh_steps(vec![]);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_refresh_steps_clears_selection() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.toggle_selection();
+        assert_eq!(app.selection.len(), 1);
+        app.refresh_steps(make_steps(3));
+        assert!(app.selection.is_empty());
     }
 }

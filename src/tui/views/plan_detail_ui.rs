@@ -5,20 +5,23 @@
 // bar.
 
 use std::path::Path;
+use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
-use super::plan_detail::{InputMode, PlanDetailApp};
+use super::plan_detail::{AddPosition, InputMode, PlanDetailApp};
 use crate::plan::StepStatus;
 use crate::tui::chrome::{self, Chrome};
 use crate::tui::theme;
 
 /// Render the entire plan-detail view.
 pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
+    app.toasts.prune(Instant::now());
+
     let crumbs: [&str; 2] = ["ralph", app.plan.slug.as_str()];
     let hint = hint_for(app);
     let body = chrome::render(
@@ -38,15 +41,43 @@ pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
 
     draw_step_list(frame, app, main[0]);
     draw_step_detail(frame, app, main[1]);
+
+    if let Some(toast) = app.toasts.current() {
+        let area = frame.area();
+        if area.height >= 1 && area.width > 0 {
+            render_toast_overlay(frame, area, &toast.text, toast.color);
+        }
+    }
 }
 
 fn hint_for(app: &PlanDetailApp) -> String {
     match app.input_mode {
         InputMode::Normal => {
-            "[j/k] nav  [a] add step  [s] skip  [h/←/q] back".to_string()
+            "[j/k] nav  [space] sel  [i/a] add  [d] del  [r] reset  [J/K] move  [s] skip  [q] back"
+                .to_string()
         }
-        InputMode::AddStep => "[Enter] confirm  [Esc] cancel".to_string(),
+        InputMode::AddStep(_) => "[Enter] confirm  [Esc] cancel".to_string(),
     }
+}
+
+fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatui::style::Color) {
+    let max_toast = area.width.saturating_sub(1).max(1);
+    let desired = text.chars().count().min(max_toast as usize) as u16;
+    if desired == 0 {
+        return;
+    }
+    let toast_area = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: desired,
+        height: 1,
+    };
+    frame.render_widget(Clear, toast_area);
+    let para = Paragraph::new(Span::styled(
+        text.chars().take(toast_area.width as usize).collect::<String>(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(para, toast_area);
 }
 
 // ---------------------------------------------------------------------------
@@ -71,7 +102,19 @@ fn draw_step_list(frame: &mut Frame, app: &mut PlanDetailApp, area: Rect) {
                 StepStatus::Aborted => Style::default().fg(theme::STATUS_FAILED),
                 StepStatus::Pending => Style::default().fg(theme::STATUS_PENDING),
             };
-            ListItem::new(Line::from(Span::styled(label, style)))
+            // Selection badge ([N]) appended after the title when selected.
+            // §7 multi-select rendering — pick order drives N (1-based).
+            let mut spans = vec![Span::styled(label, style)];
+            if let Some(n) = app.selection.index_of(&step.id) {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    format!("[{n}]"),
+                    Style::default()
+                        .fg(theme::SELECTION)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -216,12 +259,17 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
         }
     }
 
-    // Input field for adding a step (shown below the detail when in AddStep mode)
-    if matches!(app.input_mode, InputMode::AddStep) {
+    // Input field for adding a step (shown below the detail when in AddStep mode).
+    // Label tells the user where the new step will land relative to the cursor.
+    if let InputMode::AddStep(pos) = app.input_mode {
+        let label = match pos {
+            AddPosition::Above => "Insert above (title): ",
+            AddPosition::Below => "Append below (title): ",
+        };
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled(
-                "New step title: ",
+                label,
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -334,7 +382,7 @@ mod tests {
     #[test]
     fn test_draw_add_mode() {
         let mut app = make_app(3);
-        app.enter_add_mode();
+        app.enter_add_mode_above();
         app.input_buffer = "New step".to_string();
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();

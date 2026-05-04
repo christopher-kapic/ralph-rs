@@ -852,7 +852,7 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     slug: &str,
 ) -> Result<()> {
     use crate::tui::views::plan_detail::PlanDetailApp;
-    use crate::tui::views::plan_detail_input;
+    use crate::tui::views::plan_detail_input::{self, InputAction};
     use crate::tui::views::plan_detail_ui;
     use crossterm::event::{self, Event, KeyEventKind};
 
@@ -867,9 +867,295 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             _ => continue,
         };
-        let _ = plan_detail_input::handle_key(&mut app, key);
+        let action = plan_detail_input::handle_key(&mut app, key);
+        match action {
+            InputAction::None | InputAction::Pop => {}
+            InputAction::AddStep(pos, title) => {
+                plan_detail_apply_add(conn, &mut app, pos, &title)?;
+            }
+            InputAction::SkipStep(step_id) => {
+                plan_detail_apply_skip(conn, &mut app, &step_id)?;
+            }
+            InputAction::Delete(targets) => {
+                plan_detail_apply_delete(terminal, conn, &mut app, &targets)?;
+            }
+            InputAction::Reset(step_id) => {
+                plan_detail_apply_reset(conn, &mut app, &step_id)?;
+            }
+            InputAction::MoveUp(step_id) => {
+                plan_detail_apply_move(conn, &mut app, &step_id, MoveDir::Up)?;
+            }
+            InputAction::MoveDown(step_id) => {
+                plan_detail_apply_move(conn, &mut app, &step_id, MoveDir::Down)?;
+            }
+        }
         if app.should_pop {
             return Ok(());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MoveDir {
+    Up,
+    Down,
+}
+
+/// Persist an `i` (insert above) / `a` (append below) action: compute the
+/// new sort_key from the cursor's neighbors, insert via `storage::create_step_at`,
+/// refresh the in-memory step list, and place the cursor on the new row so
+/// the user sees the result immediately.
+pub(crate) fn plan_detail_apply_add(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    position: crate::tui::views::plan_detail::AddPosition,
+    title: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::plan_detail::AddPosition;
+    use std::time::Instant;
+
+    let sort_key = match position {
+        AddPosition::Above => app.compute_insert_above_sort_key(),
+        AddPosition::Below => app.compute_append_below_sort_key(),
+    };
+    let sort_key = match sort_key {
+        Ok(k) => k,
+        Err(e) => {
+            app.toasts.push(
+                format!("Cannot insert step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return Ok(());
+        }
+    };
+
+    let plan_id = app.plan.id.clone();
+    let result = storage::create_step_at(
+        conn,
+        &plan_id,
+        &sort_key,
+        title,
+        "",
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+    );
+
+    match result {
+        Ok((new_step, _position_1based)) => {
+            let new_id = new_step.id.clone();
+            app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+            if let Some(idx) = app.steps.iter().position(|s| s.id == new_id) {
+                app.selected_index = idx;
+            }
+            app.toasts.push(
+                format!("Added step: {title}"),
+                ToastKind::Success,
+                Instant::now(),
+            );
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to add step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Persist an `s` skip action via `storage::mark_step_skipped`. The TUI's
+/// skip flow doesn't prompt for a reason — the operator can edit it later
+/// via the CLI (`ralph skip --reason`) if they want one.
+pub(crate) fn plan_detail_apply_skip(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    step_id: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    match storage::mark_step_skipped(conn, step_id, None) {
+        Ok(()) => {
+            let plan_id = app.plan.id.clone();
+            app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+            app.toasts
+                .push("Step skipped.", ToastKind::Success, Instant::now());
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to skip step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Render the `Delete N step(s)?` confirm dialog over the live plan-detail
+/// view, and on Yes call `storage::delete_step` for each target. The dialog
+/// composites onto the same terminal — see `confirm_with_plan_detail_background`.
+pub(crate) fn plan_detail_apply_delete<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    targets: &[String],
+) -> Result<()> {
+    use crate::tui::dialog;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let body = format!("Delete {} step(s)?", targets.len());
+    let confirm = dialog::Confirm {
+        title: "Delete steps",
+        body: &body,
+        default: false,
+    };
+    if !confirm_with_plan_detail_background(terminal, app, &confirm)? {
+        return Ok(());
+    }
+
+    let mut errors = 0usize;
+    for id in targets {
+        if let Err(e) = storage::delete_step(conn, id) {
+            errors += 1;
+            app.toasts.push(
+                format!("Failed to delete step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    let plan_id = app.plan.id.clone();
+    app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+    if errors == 0 {
+        let n = targets.len();
+        let msg = if n == 1 {
+            "Deleted 1 step.".to_string()
+        } else {
+            format!("Deleted {n} steps.")
+        };
+        app.toasts.push(msg, ToastKind::Success, Instant::now());
+    }
+    Ok(())
+}
+
+/// Persist an `r` reset action via `storage::reset_step` and refresh.
+pub(crate) fn plan_detail_apply_reset(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    step_id: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    match storage::reset_step(conn, step_id) {
+        Ok(()) => {
+            let plan_id = app.plan.id.clone();
+            app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+            app.toasts
+                .push("Step reset.", ToastKind::Success, Instant::now());
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to reset step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Persist a `Shift-J` / `Shift-K` move via `storage::update_step_sort_key`.
+/// Recomputes the cursor index after the refresh so the moved step stays
+/// highlighted (its position in the list changes but its identity does not).
+pub(crate) fn plan_detail_apply_move(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    step_id: &str,
+    dir: MoveDir,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let new_key = match dir {
+        MoveDir::Up => app.compute_move_up_sort_key(),
+        MoveDir::Down => app.compute_move_down_sort_key(),
+    };
+    let new_key = match new_key {
+        Ok(Some(k)) => k,
+        Ok(None) => return Ok(()), // already at edge — silent no-op
+        Err(e) => {
+            app.toasts.push(
+                format!("Cannot move step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return Ok(());
+        }
+    };
+
+    if let Err(e) = storage::update_step_sort_key(conn, step_id, &new_key) {
+        app.toasts.push(
+            format!("Failed to move step: {e}"),
+            ToastKind::Error,
+            Instant::now(),
+        );
+        return Ok(());
+    }
+
+    let plan_id = app.plan.id.clone();
+    app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+    if let Some(idx) = app.steps.iter().position(|s| s.id == step_id) {
+        app.selected_index = idx;
+    }
+    let label = match dir {
+        MoveDir::Up => "Moved step up.",
+        MoveDir::Down => "Moved step down.",
+    };
+    app.toasts
+        .push(label, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// Mirror of `confirm_with_background` for the plan-detail view: composites
+/// a confirm dialog over the live view so the user keeps context (cursor,
+/// selection, toasts) while answering.
+fn confirm_with_plan_detail_background<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    c: &crate::tui::dialog::Confirm<'_>,
+) -> Result<bool> {
+    use crate::tui::dialog::{self, Decision};
+    use crate::tui::views::plan_detail_ui;
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    loop {
+        terminal.draw(|f| {
+            plan_detail_ui::draw(f, app);
+            let area = f.area();
+            dialog::render(f, area, c);
+        })?;
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match dialog::decide_key(key, c.default) {
+                Decision::Yes => return Ok(true),
+                Decision::No => return Ok(false),
+                Decision::Pending => continue,
+            }
         }
     }
 }
