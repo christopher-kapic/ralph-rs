@@ -164,6 +164,15 @@ pub fn default_display_timezone() -> String {
     "UTC".to_string()
 }
 
+/// Default for `Config::harness_chunk_max_bytes`. Caps the size of a single
+/// `harness_chunk` / `test_chunk` NDJSON event payload so a runaway agent
+/// printing a huge unbroken line can't blow up the TUI's buffer or a
+/// downstream consumer. 4 KB is enough for any reasonable line of log
+/// output and matches the spec in TUI-plan §13.1.
+fn default_harness_chunk_max_bytes() -> usize {
+    4096
+}
+
 /// Top-level ralph-rs configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
@@ -210,6 +219,12 @@ pub struct Config {
     /// `chrono_tz::Tz::from_str` so typos fail loudly.
     #[serde(default = "default_display_timezone")]
     pub display_timezone: String,
+    /// Maximum byte length of a single `harness_chunk` / `test_chunk` NDJSON
+    /// event payload. Chunks larger than this are truncated before emission.
+    /// Default 4096 (see [`default_harness_chunk_max_bytes`]). Per
+    /// TUI-plan §13.1.
+    #[serde(default = "default_harness_chunk_max_bytes")]
+    pub harness_chunk_max_bytes: usize,
     /// Available harness definitions keyed by name.
     pub harnesses: HashMap<String, HarnessConfig>,
 }
@@ -615,6 +630,7 @@ impl Default for Config {
             prompt_suffix: None,
             min_free_disk_mb: default_min_free_disk_mb(),
             display_timezone: default_display_timezone(),
+            harness_chunk_max_bytes: default_harness_chunk_max_bytes(),
             harnesses,
         }
     }
@@ -1218,6 +1234,35 @@ mod tests {
         config
             .validate()
             .expect("America/New_York is a valid IANA name");
+    }
+
+    // -- harness_chunk_max_bytes -------------------------------------------
+
+    #[test]
+    fn test_harness_chunk_max_bytes_default_is_4096() {
+        let config = Config::default();
+        assert_eq!(config.harness_chunk_max_bytes, 4096);
+
+        // Missing from JSON should also default to 4096 (configs written
+        // before this field existed must keep loading).
+        let json = r#"{
+            "default_harness": "claude",
+            "max_retries_per_step": 3,
+            "harnesses": {"claude": {"command": "claude"}}
+        }"#;
+        let loaded: Config = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(loaded.harness_chunk_max_bytes, 4096);
+    }
+
+    #[test]
+    fn test_harness_chunk_max_bytes_round_trips() {
+        let config = Config {
+            harness_chunk_max_bytes: 8192,
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&config).expect("serialize");
+        let back: Config = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.harness_chunk_max_bytes, 8192);
     }
 
     // -- harness color override --------------------------------------------

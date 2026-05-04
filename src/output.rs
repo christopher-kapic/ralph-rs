@@ -7,12 +7,24 @@ use crate::plan::{
 use crate::run_lock::LiveRun;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, IsTerminal, Write};
 
 // ---------------------------------------------------------------------------
 // NDJSON run events
 // ---------------------------------------------------------------------------
+
+/// Which output stream a chunk came from.
+///
+/// Wraps the `stream` field of [`RunEvent::HarnessChunk`] and
+/// [`RunEvent::TestChunk`] so consumers don't have to string-match on a
+/// free-form value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChunkStream {
+    Stdout,
+    Stderr,
+}
 
 /// Events emitted as NDJSON (one JSON object per line) when `--json` is active
 /// on `run` or `resume`.
@@ -57,6 +69,43 @@ pub enum RunEvent {
         attempt: i32,
         prompt_chars: usize,
         prompt_preview: String,
+    },
+    /// Line-buffered chunk of harness output, one emit per newline.
+    /// `seq` is monotonic per run so consumers can reorder if needed.
+    /// `text` is truncated past `Config.harness_chunk_max_bytes`.
+    #[allow(dead_code)] // Emit site lands in a later step (TUI-plan §13.1).
+    HarnessChunk {
+        stream: ChunkStream,
+        text: String,
+        seq: u64,
+    },
+    /// Line-buffered chunk of deterministic-test output. Same shape as
+    /// `HarnessChunk` but `test_index` indexes into `plan.deterministic_tests`.
+    #[allow(dead_code)] // Emit site lands in a later step (TUI-plan §13.1).
+    TestChunk {
+        test_index: usize,
+        stream: ChunkStream,
+        text: String,
+        seq: u64,
+    },
+    /// Emitted on every transition recorded into `run_locks.phase`. Lets the
+    /// TUI redraw the phase indicator without polling.
+    #[allow(dead_code)] // Emit site lands in a later step (TUI-plan §13.1).
+    PhaseChanged { phase: Phase },
+    /// Final event for `ralph run`, replacing the role of `plan_complete` for
+    /// human-readable summary consumers. `plan_complete` is **kept** for one
+    /// release as a compat shim (still emitted alongside `summary`) so
+    /// meta-harnesses pinned to it don't break.
+    #[allow(dead_code)] // Emit site lands in a later step (TUI-plan §13.1).
+    Summary {
+        plan_status: PlanStatus,
+        steps_complete: usize,
+        steps_total: usize,
+        duration_secs: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        started_at: DateTime<Utc>,
+        ended_at: DateTime<Utc>,
     },
 }
 
@@ -1478,6 +1527,126 @@ mod tests {
         let utc: DateTime<Utc> = "2026-04-22T18:32:07Z".parse().unwrap();
         let s = format_instant_in_tz(utc, &chrono_tz::UTC);
         assert_eq!(s, "2026-04-22 18:32:07 UTC");
+    }
+
+    // -- RunEvent JSON shapes (TUI-plan §13.1 additions) --------------------
+
+    #[test]
+    fn test_harness_chunk_event_json_shape() {
+        let evt = RunEvent::HarnessChunk {
+            stream: ChunkStream::Stdout,
+            text: "hello\n".into(),
+            seq: 7,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["event"], "harness_chunk");
+        assert_eq!(val["stream"], "stdout");
+        assert_eq!(val["text"], "hello\n");
+        assert_eq!(val["seq"], 7);
+    }
+
+    #[test]
+    fn test_harness_chunk_stderr_serializes_snake_case() {
+        let evt = RunEvent::HarnessChunk {
+            stream: ChunkStream::Stderr,
+            text: "boom".into(),
+            seq: 0,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"stream\":\"stderr\""));
+    }
+
+    #[test]
+    fn test_test_chunk_event_json_shape() {
+        let evt = RunEvent::TestChunk {
+            test_index: 2,
+            stream: ChunkStream::Stderr,
+            text: "FAIL\n".into(),
+            seq: 42,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["event"], "test_chunk");
+        assert_eq!(val["test_index"], 2);
+        assert_eq!(val["stream"], "stderr");
+        assert_eq!(val["text"], "FAIL\n");
+        assert_eq!(val["seq"], 42);
+    }
+
+    #[test]
+    fn test_phase_changed_event_json_shape() {
+        let evt = RunEvent::PhaseChanged {
+            phase: Phase::Tests,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["event"], "phase_changed");
+        assert_eq!(val["phase"], "tests");
+    }
+
+    #[test]
+    fn test_phase_changed_serializes_each_phase_snake_case() {
+        for (phase, expected) in [
+            (Phase::Idle, "idle"),
+            (Phase::PreStepHook, "pre_step_hook"),
+            (Phase::Harness, "harness"),
+            (Phase::PreTestHook, "pre_test_hook"),
+            (Phase::Tests, "tests"),
+            (Phase::PostTestHook, "post_test_hook"),
+            (Phase::Commit, "commit"),
+            (Phase::Rollback, "rollback"),
+            (Phase::PostStepHook, "post_step_hook"),
+        ] {
+            let evt = RunEvent::PhaseChanged { phase };
+            let val: serde_json::Value = serde_json::from_str(&serde_json::to_string(&evt).unwrap())
+                .unwrap();
+            assert_eq!(val["phase"], expected);
+        }
+    }
+
+    #[test]
+    fn test_summary_event_json_shape_with_cost() {
+        let started: DateTime<Utc> = "2026-04-22T18:00:00Z".parse().unwrap();
+        let ended: DateTime<Utc> = "2026-04-22T18:32:07Z".parse().unwrap();
+        let evt = RunEvent::Summary {
+            plan_status: PlanStatus::Complete,
+            steps_complete: 3,
+            steps_total: 3,
+            duration_secs: 1927.0,
+            cost_usd: Some(0.42),
+            started_at: started,
+            ended_at: ended,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["event"], "summary");
+        assert_eq!(val["plan_status"], "complete");
+        assert_eq!(val["steps_complete"], 3);
+        assert_eq!(val["steps_total"], 3);
+        assert_eq!(val["duration_secs"], 1927.0);
+        assert_eq!(val["cost_usd"], 0.42);
+        assert_eq!(val["started_at"], "2026-04-22T18:00:00Z");
+        assert_eq!(val["ended_at"], "2026-04-22T18:32:07Z");
+    }
+
+    #[test]
+    fn test_summary_event_omits_cost_when_none() {
+        let evt = RunEvent::Summary {
+            plan_status: PlanStatus::Failed,
+            steps_complete: 1,
+            steps_total: 4,
+            duration_secs: 12.5,
+            cost_usd: None,
+            started_at: Utc::now(),
+            ended_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(
+            !json.contains("\"cost_usd\""),
+            "cost_usd must be omitted when None, got {json}"
+        );
+        assert!(json.contains("\"event\":\"summary\""));
     }
 
     #[test]
