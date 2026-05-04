@@ -1,12 +1,12 @@
-// TUI input handling
+// Plan detail view input handling
 //
-// Maps crossterm key events to App state mutations. Separates input
+// Maps crossterm key events to PlanDetailApp state mutations. Separates input
 // interpretation from rendering and state so it can be tested without a
 // terminal.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::app::{App, InputMode};
+use super::plan_detail::{InputMode, PlanDetailApp};
 
 /// Result of handling a key event.
 #[derive(Debug, PartialEq, Eq)]
@@ -22,7 +22,7 @@ pub enum InputAction {
 }
 
 /// Handle a key event and return the resulting action.
-pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
+pub fn handle_key(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
     match app.input_mode {
         InputMode::Normal => handle_normal_mode(app, key),
         InputMode::AddStep => handle_add_mode(app, key),
@@ -33,7 +33,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> InputAction {
 // Normal mode
 // ---------------------------------------------------------------------------
 
-fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputAction {
+fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
     match key.code {
         // Navigation
         KeyCode::Char('j') | KeyCode::Down => {
@@ -80,7 +80,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) -> InputAction {
 // AddStep mode
 // ---------------------------------------------------------------------------
 
-fn handle_add_mode(app: &mut App, key: KeyEvent) -> InputAction {
+fn handle_add_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
     match key.code {
         // Confirm
         KeyCode::Enter => {
@@ -127,7 +127,7 @@ mod tests {
     use crate::plan::{Plan, PlanStatus, Step, StepStatus};
     use chrono::Utc;
 
-    fn make_app(n: usize) -> App {
+    fn make_app(n: usize) -> PlanDetailApp {
         let plan = Plan {
             id: "p1".to_string(),
             slug: "test".to_string(),
@@ -171,7 +171,7 @@ mod tests {
                 tags: vec![],
             })
             .collect();
-        App::new(plan, steps, &Config::default())
+        PlanDetailApp::new(plan, steps, &Config::default())
     }
 
     fn key(code: KeyCode) -> KeyEvent {

@@ -1,7 +1,8 @@
-// TUI rendering
+// Plan detail view rendering
 //
-// Layout and widget construction for the interactive TUI, powered by ratatui.
-// Renders the step list, step detail panel, and keybinding help bar.
+// Layout and widget construction for the plan-detail view of the TUI, powered
+// by ratatui. Renders the step list, step detail panel, and keybinding help
+// bar.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -9,11 +10,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
-use super::app::{App, InputMode};
+use super::plan_detail::{InputMode, PlanDetailApp};
 use crate::plan::StepStatus;
 
-/// Render the entire TUI frame.
-pub fn draw(frame: &mut Frame, app: &mut App) {
+/// Render the entire plan-detail view.
+pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
     // Top-level vertical split: main content + help bar at bottom.
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -35,13 +36,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 // Step list (left panel)
 // ---------------------------------------------------------------------------
 
-fn draw_step_list(frame: &mut Frame, app: &mut App, area: Rect) {
+fn draw_step_list(frame: &mut Frame, app: &mut PlanDetailApp, area: Rect) {
     let items: Vec<ListItem> = app
         .steps
         .iter()
         .enumerate()
         .map(|(i, step)| {
-            let indicator = App::status_indicator(step.status);
+            let indicator = PlanDetailApp::status_indicator(step.status);
             let label = format!("{indicator} {}. {}", i + 1, step.title);
             let style = match step.status {
                 StepStatus::Complete => Style::default().fg(Color::Green),
@@ -80,7 +81,7 @@ fn draw_step_list(frame: &mut Frame, app: &mut App, area: Rect) {
 // Step detail (right panel)
 // ---------------------------------------------------------------------------
 
-fn draw_step_detail(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
     if app.steps.is_empty() {
         let empty = Paragraph::new("No steps in this plan.").block(
             Block::default()
@@ -207,7 +208,7 @@ fn draw_step_detail(frame: &mut Frame, app: &App, area: Rect) {
 // Help bar (bottom)
 // ---------------------------------------------------------------------------
 
-fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_help_bar(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
     let spans = match app.input_mode {
         InputMode::Normal => vec![
             Span::styled(" j", Style::default().add_modifier(Modifier::BOLD)),
@@ -240,7 +241,7 @@ mod tests {
     use crate::plan::{Plan, PlanStatus, Step, StepStatus};
     use chrono::Utc;
 
-    fn make_app(n: usize) -> App {
+    fn make_app(n: usize) -> PlanDetailApp {
         let plan = Plan {
             id: "p1".to_string(),
             slug: "test".to_string(),
@@ -280,7 +281,7 @@ mod tests {
                 tags: vec![],
             })
             .collect();
-        App::new(plan, steps, &Config::default())
+        PlanDetailApp::new(plan, steps, &Config::default())
     }
 
     #[test]
@@ -296,7 +297,10 @@ mod tests {
             StepStatus::Skipped,
             StepStatus::Aborted,
         ];
-        let indicators: Vec<&str> = statuses.iter().map(|s| App::status_indicator(*s)).collect();
+        let indicators: Vec<&str> = statuses
+            .iter()
+            .map(|s| PlanDetailApp::status_indicator(*s))
+            .collect();
         // All should be non-empty
         for ind in &indicators {
             assert!(!ind.is_empty());
@@ -374,7 +378,7 @@ mod tests {
             max_retries_per_step: 7,
             ..Default::default()
         };
-        let mut app = App::new(plan, steps, &config);
+        let mut app = PlanDetailApp::new(plan, steps, &config);
 
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
