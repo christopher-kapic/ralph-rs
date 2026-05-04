@@ -7,19 +7,33 @@
 // handoffs. For now the panes draw as bordered placeholders so the layout is
 // observable while the rest of the v1 plan lands.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::plan::{Plan, Step, StepStatus};
+use crate::config::Config;
+use crate::plan::{ChangePolicy, Plan, Step, StepStatus};
+use crate::prompt::DEFAULT_CONTEXT_PREPEND;
+use crate::storage::ProjectSettings;
 use crate::tui::chrome::{self, Chrome};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
+
+/// Sentinel rendered in dim style when a pane's source-of-truth value is
+/// `None` or empty. Distinguishes "no value configured" from "configured to
+/// the empty string" — the latter renders as a single literal blank line.
+const NONE_PLACEHOLDER: &str = "(none)";
+
+/// Sentinel rendered for an empty bottom-row cell (no harness/model/agent
+/// resolved). Bottom-row cells are single-line so we use an em-dash rather
+/// than the wordier `(none)`.
+const EMPTY_CELL: &str = "—";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -144,6 +158,27 @@ pub struct StepDetailApp {
     /// pushes onto this; later steps will use it for "Saved." style edit
     /// confirmations.
     pub toasts: ToastQueue,
+
+    /// Universal-prompt prefix sourced from `Config.prompt_prefix`. Cloned at
+    /// construction so the view doesn't need to retain a `&Config` reference.
+    pub config_prompt_prefix: Option<String>,
+
+    /// Universal-prompt suffix sourced from `Config.prompt_suffix`.
+    pub config_prompt_suffix: Option<String>,
+
+    /// Project-prompt wrap pair sourced from the `project_settings` row.
+    pub project_settings: ProjectSettings,
+
+    /// `Config.default_harness` — used as the bottom-row Harness fallback when
+    /// neither `step.harness` nor `plan.harness` is set.
+    pub default_harness_name: String,
+
+    /// Lookup of `harness_name → default_model` from `Config.harnesses`. The
+    /// bottom-row Model cell consults this only when `step.model` is `None`,
+    /// per the §8 "step → plan → config fallback" rule (plans don't currently
+    /// store a per-plan model — fallback skips straight to the harness's
+    /// configured default).
+    pub harness_default_models: HashMap<String, Option<String>>,
 }
 
 impl StepDetailApp {
@@ -151,12 +186,23 @@ impl StepDetailApp {
     /// caller is expected to pre-clamp the index into `0..steps.len()` (or
     /// pass `0` for an empty plan, in which case the view renders an empty
     /// sidebar).
-    pub fn new(plan: Plan, steps: Vec<Step>, selected_step_index: usize) -> Self {
+    pub fn new(
+        plan: Plan,
+        steps: Vec<Step>,
+        selected_step_index: usize,
+        config: &Config,
+        project_settings: ProjectSettings,
+    ) -> Self {
         let clamped = if steps.is_empty() {
             0
         } else {
             selected_step_index.min(steps.len() - 1)
         };
+        let harness_default_models = config
+            .harnesses
+            .iter()
+            .map(|(name, hc)| (name.clone(), hc.default_model.clone()))
+            .collect();
         Self {
             plan,
             steps,
@@ -168,6 +214,11 @@ impl StepDetailApp {
             terminal_width: 0,
             should_pop: false,
             toasts: ToastQueue::new(),
+            config_prompt_prefix: config.prompt_prefix.clone(),
+            config_prompt_suffix: config.prompt_suffix.clone(),
+            project_settings,
+            default_harness_name: config.default_harness.clone(),
+            harness_default_models,
         }
     }
 
@@ -270,6 +321,52 @@ impl StepDetailApp {
             Some(step) => format!("step {}: {}", self.selected_step_index + 1, step.title),
             None => "(no steps)".to_string(),
         }
+    }
+
+    // -- Bottom-row resolved values --------------------------------------
+
+    /// Resolved harness name for the current step:
+    /// `step.harness ?? plan.harness ?? config.default_harness`.
+    pub fn effective_harness(&self) -> String {
+        self.current_step()
+            .and_then(|s| s.harness.clone())
+            .or_else(|| self.plan.harness.clone())
+            .unwrap_or_else(|| self.default_harness_name.clone())
+    }
+
+    /// Resolved model for the current step:
+    /// `step.model ?? Config.harnesses[<resolved harness>].default_model`.
+    /// Plans don't currently carry a per-plan model column, so the fallback
+    /// jumps straight from step to the harness's config-level default.
+    pub fn effective_model(&self) -> Option<String> {
+        if let Some(step) = self.current_step()
+            && let Some(model) = step.model.clone()
+        {
+            return Some(model);
+        }
+        let harness = self.effective_harness();
+        self.harness_default_models
+            .get(&harness)
+            .cloned()
+            .flatten()
+    }
+
+    /// Resolved agent for the current step: `step.agent ?? plan.agent`.
+    pub fn effective_agent(&self) -> Option<String> {
+        self.current_step()
+            .and_then(|s| s.agent.clone())
+            .or_else(|| self.plan.agent.clone())
+    }
+
+    /// Resolved change policy. The column is non-nullable on the step row
+    /// (defaults to [`ChangePolicy::Required`]), so this is just the step's
+    /// own value — included as a method for symmetry with the other cells.
+    /// Returns the policy's default when the plan is empty (so a no-step
+    /// view still renders the bottom row without panicking).
+    pub fn effective_change_policy(&self) -> ChangePolicy {
+        self.current_step()
+            .map(|s| s.change_policy)
+            .unwrap_or_default()
     }
 }
 
@@ -441,31 +538,277 @@ fn draw_pane_stack(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // Equal-share layout: every pane gets a Constraint::Min(3) row so each is
-    // tall enough to render its border + at least one content line. Step-23
-    // will replace the placeholders with real per-pane bodies.
-    let constraints: Vec<Constraint> =
-        Pane::ORDER.iter().map(|_| Constraint::Min(3)).collect();
+    // Equal-share layout for the seven multi-line panes plus a fixed-height
+    // bottom row. The bottom row only renders one line of text, so pinning it
+    // at 3 cells (border + content + border) keeps it from greedily eating
+    // half the screen on tall terminals while leaving the seven prompt panes
+    // to share the remainder.
+    let mut constraints: Vec<Constraint> = Pane::ORDER
+        .iter()
+        .map(|p| match p {
+            Pane::BottomRow => Constraint::Length(3),
+            _ => Constraint::Min(3),
+        })
+        .collect();
+    // Layout::split panics if constraints is empty, but ORDER has 8 entries
+    // so this is unreachable; the explicit assertion documents the invariant.
+    debug_assert!(!constraints.is_empty());
+    if constraints.is_empty() {
+        constraints.push(Constraint::Min(3));
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
 
     for (i, pane) in Pane::ORDER.iter().enumerate() {
-        let focused = *pane == app.focused_pane;
-        let border_color = if focused { theme::CURSOR } else { Color::Cyan };
-        let mut block = Block::default()
-            .title(format!(" {} ", pane.title()))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color));
-        if focused {
-            block = block.border_style(
-                Style::default()
-                    .fg(border_color)
-                    .add_modifier(Modifier::BOLD),
-            );
+        draw_pane(frame, app, *pane, chunks[i]);
+    }
+}
+
+/// Draw one pane — the bordered block plus its read-only body content. The
+/// body is sourced from whichever column / config field §8 designates as the
+/// pane's source of truth.
+fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let focused = pane == app.focused_pane;
+    let border_color = if focused { theme::CURSOR } else { Color::Cyan };
+    let mut style = Style::default().fg(border_color);
+    if focused {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    let block = Block::default()
+        .title(format!(" {} ", pane.title()))
+        .borders(Borders::ALL)
+        .border_style(style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    match pane {
+        Pane::UniversalPrompt => render_wrap_pane(
+            frame,
+            inner,
+            app.config_prompt_prefix.as_deref(),
+            app.config_prompt_suffix.as_deref(),
+        ),
+        Pane::ProjectPrompt => render_wrap_pane(
+            frame,
+            inner,
+            app.project_settings.prompt_prefix.as_deref(),
+            app.project_settings.prompt_suffix.as_deref(),
+        ),
+        Pane::PlanContextPrepend => render_text_pane(
+            frame,
+            inner,
+            // `None` means "use DEFAULT_CONTEXT_PREPEND"; `Some("")` is the
+            // power-user "no prepend" escape hatch and renders as a literal
+            // blank — distinguishable from the dim `(none)` placeholder.
+            match app.plan.context_prepend.as_deref() {
+                Some(s) => Some(s),
+                None => Some(DEFAULT_CONTEXT_PREPEND),
+            },
+        ),
+        Pane::PlanPrompt => render_wrap_pane(
+            frame,
+            inner,
+            app.plan.prompt_prefix.as_deref(),
+            app.plan.prompt_suffix.as_deref(),
+        ),
+        Pane::StepPrompt => render_step_prompt(frame, app, inner),
+        Pane::Appended => render_appended_placeholder(frame, inner),
+        Pane::Tests => render_tests(frame, app, inner),
+        Pane::BottomRow => render_bottom_row(frame, app, inner),
+    }
+}
+
+/// Render a single text body (plan-context-prepend pane). `None` becomes the
+/// dim `(none)` placeholder; `Some("")` renders as an empty body.
+fn render_text_pane(frame: &mut Frame, area: Rect, text: Option<&str>) {
+    let para = match text {
+        None => Paragraph::new(Span::styled(
+            NONE_PLACEHOLDER,
+            Style::default().fg(theme::CHROME_DIM),
+        )),
+        Some(s) => Paragraph::new(s.to_string()),
+    }
+    .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+}
+
+/// Render a prefix/suffix wrap pane (Universal, Project, Plan prompt). Both
+/// halves render with bolded labels so the operator can tell which is which
+/// even when one side is empty. When both are absent we collapse to a single
+/// `(none)` line to match the other read-only renders.
+fn render_wrap_pane(frame: &mut Frame, area: Rect, prefix: Option<&str>, suffix: Option<&str>) {
+    let mut lines: Vec<Line> = Vec::new();
+    let label_style = Style::default().add_modifier(Modifier::BOLD);
+
+    if prefix.is_none() && suffix.is_none() {
+        lines.push(Line::from(Span::styled(
+            NONE_PLACEHOLDER,
+            Style::default().fg(theme::CHROME_DIM),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled("Prefix:", label_style)));
+        match prefix {
+            Some(s) if !s.is_empty() => {
+                for line in s.lines() {
+                    lines.push(Line::from(line.to_string()));
+                }
+            }
+            Some(_) => {
+                lines.push(Line::from(Span::styled(
+                    "(empty)",
+                    Style::default().fg(theme::CHROME_DIM),
+                )));
+            }
+            None => {
+                lines.push(Line::from(Span::styled(
+                    NONE_PLACEHOLDER,
+                    Style::default().fg(theme::CHROME_DIM),
+                )));
+            }
         }
-        frame.render_widget(block, chunks[i]);
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Suffix:", label_style)));
+        match suffix {
+            Some(s) if !s.is_empty() => {
+                for line in s.lines() {
+                    lines.push(Line::from(line.to_string()));
+                }
+            }
+            Some(_) => {
+                lines.push(Line::from(Span::styled(
+                    "(empty)",
+                    Style::default().fg(theme::CHROME_DIM),
+                )));
+            }
+            None => {
+                lines.push(Line::from(Span::styled(
+                    NONE_PLACEHOLDER,
+                    Style::default().fg(theme::CHROME_DIM),
+                )));
+            }
+        }
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+}
+
+/// Render the Step prompt pane: title, description, and the bulleted
+/// acceptance criteria.
+fn render_step_prompt(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+    let Some(step) = app.current_step() else {
+        let para = Paragraph::new(Span::styled(
+            "(no steps)",
+            Style::default().fg(theme::CHROME_DIM),
+        ));
+        frame.render_widget(para, area);
+        return;
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+
+    lines.push(Line::from(Span::styled(step.title.clone(), bold)));
+
+    if !step.description.is_empty() {
+        lines.push(Line::from(""));
+        for line in step.description.lines() {
+            lines.push(Line::from(line.to_string()));
+        }
+    }
+
+    if !step.acceptance_criteria.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Acceptance:", bold)));
+        for c in &step.acceptance_criteria {
+            lines.push(Line::from(format!("  • {c}")));
+        }
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+}
+
+/// Read-only placeholder for the Appended pane until step 24 wires up the
+/// per-attempt `h`/`l` paginator. Showing a dim "no retry context yet" string
+/// is more useful than leaving the body blank — the operator can tell at a
+/// glance that the pane is rendered, just empty for this step.
+fn render_appended_placeholder(frame: &mut Frame, area: Rect) {
+    let para = Paragraph::new(Span::styled(
+        "(retry context appears here once an attempt has run)",
+        Style::default().fg(theme::CHROME_DIM),
+    ))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+}
+
+/// Render the Tests pane: `plan.deterministic_tests` as a bulleted list, or
+/// a dim placeholder if no tests are configured.
+fn render_tests(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+    let lines: Vec<Line> = if app.plan.deterministic_tests.is_empty() {
+        vec![Line::from(Span::styled(
+            NONE_PLACEHOLDER,
+            Style::default().fg(theme::CHROME_DIM),
+        ))]
+    } else {
+        app.plan
+            .deterministic_tests
+            .iter()
+            .map(|t| Line::from(format!("• {t}")))
+            .collect()
+    };
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
+}
+
+/// Render the bottom row: four cells (Harness / Model / Agent / Change
+/// policy) split horizontally inside the pane's inner area. Effective values
+/// follow the step → plan → config fallback per §8.
+fn render_bottom_row(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+    let cells = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+            Constraint::Ratio(1, 4),
+        ])
+        .split(area);
+
+    let entries = [
+        ("Harness", Some(app.effective_harness())),
+        ("Model", app.effective_model()),
+        ("Agent", app.effective_agent()),
+        (
+            "Change policy",
+            Some(app.effective_change_policy().to_string()),
+        ),
+    ];
+
+    for (i, (label, value)) in entries.iter().enumerate() {
+        if cells[i].width == 0 {
+            continue;
+        }
+        let value_span = match value {
+            Some(s) if !s.is_empty() => Span::raw(s.clone()),
+            _ => Span::styled(EMPTY_CELL.to_string(), Style::default().fg(theme::CHROME_DIM)),
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                format!("{label}: "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            value_span,
+        ]);
+        let para = Paragraph::new(line);
+        frame.render_widget(para, cells[i]);
     }
 }
 
@@ -555,7 +898,13 @@ mod tests {
     }
 
     fn make_app(n: usize, selected: usize) -> StepDetailApp {
-        StepDetailApp::new(make_plan(), make_steps(n), selected)
+        StepDetailApp::new(
+            make_plan(),
+            make_steps(n),
+            selected,
+            &Config::default(),
+            ProjectSettings::default(),
+        )
     }
 
     // -- Pane order / titles ------------------------------------------------
@@ -887,5 +1236,372 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = make_app(3, 0);
         terminal.draw(|f| draw(f, &mut app)).unwrap();
+    }
+
+    // -- Read-only pane content (TUI-plan.md §8) ---------------------------
+
+    /// Concatenate every cell of the rendered buffer into one big string so
+    /// tests can assert that a given substring appears anywhere on the
+    /// screen. The TestBackend buffer is row-major, but `Buffer::content()`
+    /// already iterates in render order, so we just join symbols.
+    fn render_to_string(width: u16, height: u16, app: &mut StepDetailApp) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn universal_pane_renders_config_prefix_and_suffix() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let config = Config {
+            prompt_prefix: Some("CFG-PREFIX-MARKER".to_string()),
+            prompt_suffix: Some("CFG-SUFFIX-MARKER".to_string()),
+            ..Config::default()
+        };
+        let mut app = StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default());
+        let screen = render_to_string(140, 60, &mut app);
+        assert!(screen.contains("Universal prompt"), "{screen}");
+        assert!(screen.contains("CFG-PREFIX-MARKER"), "{screen}");
+        assert!(screen.contains("CFG-SUFFIX-MARKER"), "{screen}");
+    }
+
+    #[test]
+    fn universal_pane_shows_none_when_unset() {
+        let plan = make_plan();
+        let steps = make_steps(1);
+        // Default Config has a global prefix seeded by `ralph init`; clear
+        // both fields so the pane shows the (none) placeholder.
+        let config = Config {
+            prompt_prefix: None,
+            prompt_suffix: None,
+            ..Config::default()
+        };
+        let mut app = StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default());
+        let screen = render_to_string(140, 60, &mut app);
+        // The (none) placeholder must appear at least once — Universal is
+        // the first pane in the stack, so confirming any (none) is present
+        // is sufficient evidence the placeholder branch is reachable.
+        assert!(
+            screen.contains(NONE_PLACEHOLDER),
+            "expected (none) placeholder somewhere: {screen}"
+        );
+    }
+
+    #[test]
+    fn project_pane_renders_project_settings() {
+        let plan = make_plan();
+        let steps = make_steps(2);
+        let project_settings = ProjectSettings {
+            prompt_prefix: Some("PROJ-PRE-MARK".to_string()),
+            prompt_suffix: Some("PROJ-SUF-MARK".to_string()),
+        };
+        let mut app =
+            StepDetailApp::new(plan, steps, 0, &Config::default(), project_settings);
+        let screen = render_to_string(140, 60, &mut app);
+        assert!(screen.contains("Project prompt"), "{screen}");
+        assert!(screen.contains("PROJ-PRE-MARK"), "{screen}");
+        assert!(screen.contains("PROJ-SUF-MARK"), "{screen}");
+    }
+
+    #[test]
+    fn plan_context_prepend_pane_uses_default_when_none() {
+        // When plan.context_prepend is None, the pane renders
+        // DEFAULT_CONTEXT_PREPEND verbatim (the same string the runner injects
+        // into every step prompt).
+        let mut plan = make_plan();
+        plan.context_prepend = None;
+        let steps = make_steps(1);
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        let screen = render_to_string(140, 60, &mut app);
+        // The default prepend opens with "# Ralph context" — distinctive
+        // enough to confirm the fallback wired up correctly.
+        assert!(screen.contains("Ralph context"), "{screen}");
+    }
+
+    #[test]
+    fn plan_context_prepend_pane_uses_override() {
+        let mut plan = make_plan();
+        plan.context_prepend = Some("OVERRIDE-PREPEND-MARKER".to_string());
+        let steps = make_steps(1);
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        let screen = render_to_string(140, 60, &mut app);
+        assert!(screen.contains("OVERRIDE-PREPEND-MARKER"), "{screen}");
+        // The default's "Ralph context" header must NOT leak into the pane
+        // when an override is set (verifies we don't render *both*).
+        assert!(
+            !screen.contains("Ralph context"),
+            "override must replace default, got: {screen}"
+        );
+    }
+
+    #[test]
+    fn plan_prompt_pane_renders_plan_wraps() {
+        let mut plan = make_plan();
+        plan.prompt_prefix = Some("PLAN-PRE-MARK".to_string());
+        plan.prompt_suffix = Some("PLAN-SUF-MARK".to_string());
+        let mut app = StepDetailApp::new(
+            plan,
+            make_steps(1),
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        let screen = render_to_string(140, 60, &mut app);
+        assert!(screen.contains("Plan prompt"), "{screen}");
+        assert!(screen.contains("PLAN-PRE-MARK"), "{screen}");
+        assert!(screen.contains("PLAN-SUF-MARK"), "{screen}");
+    }
+
+    #[test]
+    fn step_prompt_pane_renders_title_description_and_criteria() {
+        let plan = make_plan();
+        let mut steps = make_steps(2);
+        steps[1].title = "STEP-TITLE-MARK".to_string();
+        steps[1].description = "STEP-DESC-MARK".to_string();
+        steps[1].acceptance_criteria = vec!["CRIT-A-MARK".into(), "CRIT-B-MARK".into()];
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            1,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        let screen = render_to_string(160, 80, &mut app);
+        assert!(screen.contains("STEP-TITLE-MARK"), "{screen}");
+        assert!(screen.contains("STEP-DESC-MARK"), "{screen}");
+        assert!(screen.contains("CRIT-A-MARK"), "{screen}");
+        assert!(screen.contains("CRIT-B-MARK"), "{screen}");
+        assert!(screen.contains("Acceptance:"), "{screen}");
+    }
+
+    #[test]
+    fn tests_pane_renders_deterministic_tests_as_bullets() {
+        let mut plan = make_plan();
+        plan.deterministic_tests = vec!["cargo test".into(), "cargo clippy".into()];
+        let mut app = StepDetailApp::new(
+            plan,
+            make_steps(1),
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        let screen = render_to_string(140, 60, &mut app);
+        assert!(screen.contains("• cargo test"), "{screen}");
+        assert!(screen.contains("• cargo clippy"), "{screen}");
+    }
+
+    #[test]
+    fn tests_pane_shows_none_when_no_tests() {
+        let mut plan = make_plan();
+        plan.deterministic_tests.clear();
+        let mut app = StepDetailApp::new(
+            plan,
+            make_steps(1),
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        let screen = render_to_string(140, 60, &mut app);
+        // The (none) placeholder appears in several panes — search the
+        // pane stack between "Tests" and the bottom row to confirm the
+        // tests pane itself rendered the placeholder.
+        let tests_idx = screen.find("Tests").expect("tests pane title rendered");
+        let after_tests = &screen[tests_idx..];
+        let bottom_idx = after_tests
+            .find("Harness")
+            .expect("bottom-row title rendered");
+        let tests_body = &after_tests[..bottom_idx];
+        assert!(
+            tests_body.contains(NONE_PLACEHOLDER),
+            "expected (none) within tests pane body: {tests_body}"
+        );
+    }
+
+    // -- Bottom-row resolved values ----------------------------------------
+
+    #[test]
+    fn effective_harness_falls_back_to_plan_then_config() {
+        let mut plan = make_plan();
+        plan.harness = Some("plan-harness".to_string());
+        let mut steps = make_steps(2);
+        // Step 0 has no harness override → falls back to plan.
+        // Step 1 overrides → wins.
+        steps[1].harness = Some("step-harness".to_string());
+
+        let app = StepDetailApp::new(
+            plan.clone(),
+            steps.clone(),
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        assert_eq!(app.effective_harness(), "plan-harness");
+
+        let app = StepDetailApp::new(
+            plan,
+            steps,
+            1,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        assert_eq!(app.effective_harness(), "step-harness");
+    }
+
+    #[test]
+    fn effective_harness_uses_default_when_neither_step_nor_plan_set() {
+        let mut plan = make_plan();
+        plan.harness = None;
+        let app = StepDetailApp::new(
+            plan,
+            make_steps(1),
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        assert_eq!(app.effective_harness(), Config::default().default_harness);
+    }
+
+    #[test]
+    fn effective_model_prefers_step_then_harness_default() {
+        let mut config = Config::default();
+        // Give the default harness a configured default model so the
+        // fallback path is observable.
+        config
+            .harnesses
+            .get_mut(&config.default_harness.clone())
+            .unwrap()
+            .default_model = Some("default-model".to_string());
+
+        // Step has no model override → fallback to harness default.
+        let plan = make_plan();
+        let app = StepDetailApp::new(
+            plan.clone(),
+            make_steps(1),
+            0,
+            &config,
+            ProjectSettings::default(),
+        );
+        assert_eq!(app.effective_model().as_deref(), Some("default-model"));
+
+        // Step overrides → wins.
+        let mut steps = make_steps(1);
+        steps[0].model = Some("step-model".to_string());
+        let app = StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default());
+        assert_eq!(app.effective_model().as_deref(), Some("step-model"));
+    }
+
+    #[test]
+    fn effective_agent_falls_back_from_step_to_plan() {
+        let mut plan = make_plan();
+        plan.agent = Some("plan-agent".to_string());
+        let mut steps = make_steps(2);
+        steps[1].agent = Some("step-agent".to_string());
+
+        let app = StepDetailApp::new(
+            plan.clone(),
+            steps.clone(),
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        assert_eq!(app.effective_agent().as_deref(), Some("plan-agent"));
+
+        let app = StepDetailApp::new(
+            plan,
+            steps,
+            1,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        assert_eq!(app.effective_agent().as_deref(), Some("step-agent"));
+    }
+
+    #[test]
+    fn effective_change_policy_returns_step_value() {
+        let plan = make_plan();
+        let mut steps = make_steps(1);
+        steps[0].change_policy = ChangePolicy::Optional;
+        let app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        assert_eq!(app.effective_change_policy(), ChangePolicy::Optional);
+    }
+
+    #[test]
+    fn bottom_row_renders_all_four_cells() {
+        let mut plan = make_plan();
+        plan.harness = Some("plan-harness".to_string());
+        plan.agent = Some("plan-agent".to_string());
+        let mut steps = make_steps(1);
+        steps[0].model = Some("BOTTOM-MODEL".to_string());
+        steps[0].change_policy = ChangePolicy::Optional;
+
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+        );
+        let screen = render_to_string(160, 80, &mut app);
+        // All four cell labels must appear, with their resolved values.
+        assert!(screen.contains("Harness:"), "{screen}");
+        assert!(screen.contains("plan-harness"), "{screen}");
+        assert!(screen.contains("Model:"), "{screen}");
+        assert!(screen.contains("BOTTOM-MODEL"), "{screen}");
+        assert!(screen.contains("Agent:"), "{screen}");
+        assert!(screen.contains("plan-agent"), "{screen}");
+        assert!(screen.contains("Change policy:"), "{screen}");
+        assert!(screen.contains("optional"), "{screen}");
+    }
+
+    #[test]
+    fn bottom_row_renders_em_dash_for_empty_agent_and_model() {
+        // No step.model, no harness default model, no agent anywhere — the
+        // Model and Agent cells must show the EMPTY_CELL sentinel.
+        let mut config = Config::default();
+        for hc in config.harnesses.values_mut() {
+            hc.default_model = None;
+        }
+        let mut plan = make_plan();
+        plan.agent = None;
+        let mut steps = make_steps(1);
+        steps[0].agent = None;
+        steps[0].model = None;
+
+        let mut app = StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default());
+        let screen = render_to_string(160, 80, &mut app);
+        assert!(
+            screen.contains(EMPTY_CELL),
+            "expected em-dash for empty cell: {screen}"
+        );
     }
 }
