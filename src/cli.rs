@@ -23,7 +23,11 @@ pub struct Cli {
     pub harness: Option<String>,
 
     /// Emit machine-readable JSON output instead of human-readable text.
-    #[arg(long, global = true)]
+    ///
+    /// `--jsonl` is accepted as a strict alias: NDJSON and JSONL are the
+    /// same format, and the alias exists so meta-harnesses can spell the
+    /// flag the way they expect.
+    #[arg(long, alias = "jsonl", global = true)]
     pub json: bool,
 
     /// Suppress progress and banner output.
@@ -33,6 +37,11 @@ pub struct Cli {
     /// Disable ANSI color output even when stdout is a TTY.
     #[arg(long, global = true)]
     pub no_color: bool,
+
+    /// Force non-interactive mode: skip the TUI and emit plain scripted
+    /// output even from a TTY. Auto-set when stdout is not a TTY.
+    #[arg(long, global = true)]
+    pub non_interactive: bool,
 
     #[command(subcommand)]
     pub command: Command,
@@ -1604,6 +1613,26 @@ mod tests {
     fn test_global_harness_flag() {
         let cli = Cli::try_parse_from(["ralph-rs", "--harness", "codex", "doctor"]).unwrap();
         assert_eq!(cli.harness.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn test_global_non_interactive_flag() {
+        let cli = Cli::try_parse_from(["ralph-rs", "--non-interactive", "plan", "list"]).unwrap();
+        assert!(cli.non_interactive);
+
+        // Default is false.
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "list"]).unwrap();
+        assert!(!cli.non_interactive);
+    }
+
+    #[test]
+    fn test_global_jsonl_alias_for_json() {
+        // Both spellings populate the same `json` field.
+        let cli = Cli::try_parse_from(["ralph-rs", "--json", "run"]).unwrap();
+        assert!(cli.json);
+
+        let cli = Cli::try_parse_from(["ralph-rs", "--jsonl", "run"]).unwrap();
+        assert!(cli.json);
     }
 
     #[test]
