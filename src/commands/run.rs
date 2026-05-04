@@ -259,6 +259,113 @@ pub fn run_tui_mode(
 }
 
 // ---------------------------------------------------------------------------
+// Plan-list TUI dispatcher (TUI-plan.md §2 / §5)
+// ---------------------------------------------------------------------------
+
+/// Launch the plan-list view for a bare `ralph` invocation.
+///
+/// Loads tiles from the DB, sets up the alternate-screen + raw-mode terminal,
+/// runs the draw / event loop until the user quits, and tears the terminal
+/// down. Routing into plan-detail on `enter` lands in tui-v1 step 19; for now
+/// `enter` is a no-op so the read-only landing screen has no dangling actions.
+pub fn run_plan_list_tui(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    _out: &OutputContext,
+) -> Result<()> {
+    use crate::tui::views::plan_list::{self, PlanListApp};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::execute;
+    use crossterm::terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
+
+    let tiles = build_plan_tiles(conn, project)?;
+    let mut app = PlanListApp::new(tiles, project, &config.display_timezone);
+
+    enable_raw_mode().context("enable raw mode")?;
+    let mut stdout = std::io::stdout();
+    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e).context("enter alternate screen");
+    }
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("create terminal")?;
+
+    let result: Result<()> = (|| {
+        loop {
+            terminal.draw(|f| plan_list::draw(f, &mut app))?;
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => app.navigate_down(),
+                    KeyCode::Char('k') | KeyCode::Up => app.navigate_up(),
+                    KeyCode::Char('g') => app.jump_top(),
+                    KeyCode::Char('G') => app.jump_bottom(),
+                    KeyCode::Enter => {
+                        // Step 19 of tui-v1 wires plan-detail routing onto the
+                        // selected slug; until then we just record the request.
+                        let _ = app.request_open();
+                    }
+                    KeyCode::Char('q') => app.request_quit(),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.request_quit();
+                    }
+                    _ => {}
+                }
+            }
+            if app.should_quit {
+                return Ok(());
+            }
+        }
+    })();
+
+    let _ = disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen);
+
+    result
+}
+
+/// Build the read-only tile rows the plan-list view renders. One tile per
+/// non-archived plan; recent first; counts come from `list_steps`; activity
+/// stamp comes from `last_log_started_at_for_plan`, falling back to
+/// `plan.created_at` so plans that have never run still show "Created …".
+fn build_plan_tiles(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<crate::tui::views::plan_list::PlanTile>> {
+    use crate::tui::views::plan_list::PlanTile;
+    let plans = storage::list_plans_sorted_by_recency(conn, project)?;
+    let mut tiles = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let steps = storage::list_steps(conn, &plan.id)?;
+        let total = steps.len() as u32;
+        let completed = steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Complete)
+            .count() as u32;
+        let last_run = storage::last_log_started_at_for_plan(conn, &plan.id)?;
+        let (last_activity, had_run) = match last_run {
+            Some(t) => (t, true),
+            None => (plan.created_at, false),
+        };
+        tiles.push(PlanTile {
+            plan,
+            completed,
+            total,
+            last_activity,
+            had_run,
+        });
+    }
+    Ok(tiles)
+}
+
+// ---------------------------------------------------------------------------
 // Status command
 // ---------------------------------------------------------------------------
 

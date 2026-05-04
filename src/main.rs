@@ -70,7 +70,7 @@ fn main() -> Result<()> {
     // write config.json before cmd_init runs — otherwise its "does the config
     // already exist?" check would always be true on a fresh install, silently
     // skipping the interactive harness prompt.
-    let config = if matches!(&cli.command, Command::Init { .. }) {
+    let config = if matches!(&cli.command, Some(Command::Init { .. })) {
         config::Config::default()
     } else {
         config::load_or_create_config()?
@@ -85,7 +85,25 @@ fn main() -> Result<()> {
     // Build output context from global CLI flags.
     let out = OutputContext::from_cli(cli.json, cli.quiet, cli.no_color);
 
-    match cli.command {
+    // Bare `ralph` (no subcommand) routes to the TUI plan-list view when
+    // stdout is a TTY and the user hasn't asked for non-interactive output.
+    // Anything else (piped stdout, --json, --non-interactive) prints clap
+    // help so scripts and ` ralph | cat` still get something useful.
+    let command = match cli.command {
+        Some(c) => c,
+        None => {
+            let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+            if stdout_is_tty && !cli.json && !cli.non_interactive {
+                return commands::run_plan_list_tui(&conn, &config, &project, &out);
+            }
+            use clap::CommandFactory;
+            let _ = Cli::command().print_help();
+            println!();
+            return Ok(());
+        }
+    };
+
+    match command {
         // -- Init --
         Command::Init {
             non_interactive,

@@ -148,9 +148,7 @@ pub fn list_plans(conn: &Connection, project: &str, all: bool) -> Result<Vec<Pla
 /// `steps.plan_id`, falling back to `plans.created_at` when the plan has no
 /// execution logs yet. Most recent first. Archived plans are excluded.
 ///
-/// Drives the TUI plan-list view (TUI-plan.md §5). Wired into the bare
-/// `ralph` invocation in tui-v1 step 13.
-#[allow(dead_code)]
+/// Drives the TUI plan-list view (TUI-plan.md §5).
 pub fn list_plans_sorted_by_recency(conn: &Connection, project: &str) -> Result<Vec<Plan>> {
     // Project the plan columns through the LEFT-JOIN with an alias so the
     // index positions seen by `Plan::from_row` line up with PLAN_COLUMNS.
@@ -177,6 +175,30 @@ pub fn list_plans_sorted_by_recency(conn: &Connection, project: &str) -> Result<
         plans.push(row?);
     }
     Ok(plans)
+}
+
+/// Most recent `execution_logs.started_at` across every step of `plan_id`,
+/// or `None` when the plan has no logged attempts. Used to drive the
+/// "Ran <date>" / "Created <date>" prefix on plan-list tiles.
+pub fn last_log_started_at_for_plan(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let mut stmt = conn.prepare(
+        "SELECT MAX(el.started_at) FROM execution_logs el \
+         JOIN steps s ON s.id = el.step_id \
+         WHERE s.plan_id = ?1",
+    )?;
+    let row: Option<String> = stmt.query_row(params![plan_id], |r| r.get(0))?;
+    match row {
+        Some(s) => {
+            let parsed = s
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .with_context(|| format!("parse execution_logs.started_at: {s}"))?;
+            Ok(Some(parsed))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Update a plan's status and set updated_at to now.
