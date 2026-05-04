@@ -1122,6 +1122,15 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
             plan.slug,
             plan.slug
         ),
+        // `Question` is a derived status — `plans.status` is never written
+        // to "question" in the DB, so this arm is defensive. If a caller
+        // ever materializes a Plan with Question (e.g. a future helper that
+        // shadows status when unanswered questions exist), refuse to run:
+        // the user must answer first.
+        PlanStatus::Question => bail!(
+            "Plan '{}' is paused for an unanswered question. Answer it first.",
+            plan.slug
+        ),
     }
 }
 
@@ -1610,6 +1619,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         }
     }
 
@@ -2599,6 +2609,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -2635,6 +2646,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -2802,6 +2814,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -2861,6 +2874,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");

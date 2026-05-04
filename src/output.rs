@@ -206,6 +206,7 @@ pub fn plan_status_icon(status: PlanStatus, color: bool) -> &'static str {
         (PlanStatus::Failed, true) => "\x1b[31m✘\x1b[0m",
         (PlanStatus::Aborted, true) => "\x1b[31m⊘\x1b[0m",
         (PlanStatus::Archived, true) => "\x1b[90m▪\x1b[0m",
+        (PlanStatus::Question, true) => "\x1b[33m?\x1b[0m",
         (PlanStatus::Planning, false) => "◯",
         (PlanStatus::Ready, false) => "◉",
         (PlanStatus::InProgress, false) => "▶",
@@ -213,6 +214,7 @@ pub fn plan_status_icon(status: PlanStatus, color: bool) -> &'static str {
         (PlanStatus::Failed, false) => "✘",
         (PlanStatus::Aborted, false) => "⊘",
         (PlanStatus::Archived, false) => "▪",
+        (PlanStatus::Question, false) => "?",
     }
 }
 
@@ -235,7 +237,7 @@ pub fn colored_termination_reason(reason: TerminationReason, color: bool) -> Str
         | TerminationReason::CommitFailed
         | TerminationReason::RollbackFailed
         | TerminationReason::InsufficientDiskSpace => "\x1b[31m",
-        TerminationReason::NoChanges => "\x1b[33m",
+        TerminationReason::NoChanges | TerminationReason::PausedForQuestion => "\x1b[33m",
         TerminationReason::Unknown => "\x1b[90m",
     };
     format!("{code}{}\x1b[0m", reason.as_str())
@@ -272,6 +274,7 @@ pub fn colored_plan_status(status: PlanStatus, color: bool) -> String {
         PlanStatus::Failed => "\x1b[31m",
         PlanStatus::Aborted => "\x1b[31m",
         PlanStatus::Archived => "\x1b[90m",
+        PlanStatus::Question => "\x1b[33m",
     };
     format!("{code}{}\x1b[0m", status.as_str())
 }

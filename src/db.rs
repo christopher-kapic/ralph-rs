@@ -25,6 +25,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v13,
     migrate_v14,
     migrate_v15,
+    migrate_v16,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -501,6 +502,49 @@ fn migrate_v15(conn: &Connection) -> Result<()> {
         "
         ALTER TABLE run_locks ADD COLUMN source_branch TEXT;
         ALTER TABLE run_locks ADD COLUMN stash_sha TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V16: per-step questions (opt-in pause-for-clarification feature)
+// ---------------------------------------------------------------------------
+
+fn migrate_v16(conn: &Connection) -> Result<()> {
+    // `plans.questions_enabled` is the per-plan opt-in toggle for the
+    // pause-for-question feature. Stored as INTEGER (0/1) because SQLite
+    // has no native bool. NOT NULL with DEFAULT 0 keeps every pre-V16 row
+    // explicitly opted-out.
+    //
+    // `step_questions` records each `ralph question ask` call made by a
+    // harness mid-run. `attempt` matches `execution_logs.attempt` so the
+    // runner can pull "questions asked during the current attempt" without
+    // joining through execution_logs. `answer` stays NULL until the user
+    // answers via `ralph question answer` or the TUI; the partial index on
+    // `answer WHERE answer IS NULL` keeps the "is this plan paused?" lookup
+    // O(rows-with-unanswered-questions) instead of O(all-rows).
+    //
+    // ON DELETE CASCADE on step_id mirrors the rest of the schema: drop a
+    // plan/step and its questions go with it.
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN questions_enabled INTEGER NOT NULL DEFAULT 0;
+
+        CREATE TABLE step_questions (
+            id TEXT PRIMARY KEY,
+            step_id TEXT NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+            attempt INTEGER NOT NULL,
+            question TEXT NOT NULL,
+            suggestions TEXT NOT NULL DEFAULT '[]',
+            answer TEXT,
+            asked_at TEXT NOT NULL,
+            answered_at TEXT
+        );
+
+        CREATE INDEX idx_step_questions_step ON step_questions(step_id);
+        CREATE INDEX idx_step_questions_unanswered
+            ON step_questions(answer) WHERE answer IS NULL;
         ",
     )?;
     Ok(())
@@ -1394,6 +1438,155 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v16_adds_questions_enabled_and_step_questions() {
+        // Seed a pre-V16 database, populate a plan + step, then let V16 apply
+        // and verify the new column defaults, table, and indexes.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v15.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v15 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(15) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V16 applies. Pre-V16 rows must default to 0 (disabled).
+        let conn = open_at(&path).unwrap();
+
+        let qe: i64 = conn
+            .query_row(
+                "SELECT questions_enabled FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(qe, 0, "pre-V16 rows should default questions_enabled to 0");
+
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM plans WHERE questions_enabled IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_count, 0, "NOT NULL DEFAULT must leave no NULLs");
+
+        // step_questions table exists and accepts a happy-path insert.
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "q1",
+                "s1",
+                1,
+                "Should I do A or B?",
+                r#"["A","B"]"#,
+                "2026-05-04T00:00:00.000Z",
+            ],
+        )
+        .unwrap();
+
+        let answer: Option<String> = conn
+            .query_row(
+                "SELECT answer FROM step_questions WHERE id = ?1",
+                ["q1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(answer, None, "fresh question rows have NULL answer");
+
+        // Cascade delete: dropping the step removes its questions.
+        conn.execute("DELETE FROM steps WHERE id = ?1", ["s1"])
+            .unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM step_questions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "step deletion must cascade to step_questions");
+
+        // Both indexes exist.
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='step_questions' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(indexes.contains(&"idx_step_questions_step".to_string()));
+        assert!(indexes.contains(&"idx_step_questions_unanswered".to_string()));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Second open is a no-op (re-running V16 would fail on duplicate
+        // column / duplicate table).
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v16_runs_clean_on_fresh_db() {
+        // A fresh in-memory DB applies every migration including V16
+        // without requiring the staged-from-V15 path above.
+        let conn = open_memory().expect("open_memory");
+
+        // questions_enabled defaults to 0 on fresh inserts.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d"],
+        )
+        .unwrap();
+        let qe: i64 = conn
+            .query_row(
+                "SELECT questions_enabled FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(qe, 0);
+
+        // Explicit 1 round-trips.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, questions_enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "slug2", "/proj", "b", "d", 1i64],
+        )
+        .unwrap();
+        let qe: i64 = conn
+            .query_row(
+                "SELECT questions_enabled FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(qe, 1);
     }
 
     #[test]

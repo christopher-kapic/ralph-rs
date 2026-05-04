@@ -144,6 +144,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {

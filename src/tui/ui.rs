@@ -257,6 +257,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
@@ -348,6 +349,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
