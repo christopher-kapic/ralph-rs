@@ -8,6 +8,7 @@
 pub mod chrome;
 pub mod dialog;
 pub mod editor;
+pub mod palette;
 pub mod selection;
 pub mod theme;
 pub mod toast;
