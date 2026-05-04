@@ -229,16 +229,6 @@ pub fn merge_sha(workdir: &Path, sha: &str) -> Result<()> {
     Ok(())
 }
 
-/// Plain `git checkout <branch>` — does NOT create the branch.
-///
-/// Used by the run-teardown path to switch back to the source branch before
-/// popping the ralph-owned stash.
-pub fn checkout_branch(workdir: &Path, branch: &str) -> Result<()> {
-    git(workdir, &["checkout", branch])
-        .with_context(|| format!("could not checkout branch '{branch}'"))?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Stash helpers
 // ---------------------------------------------------------------------------

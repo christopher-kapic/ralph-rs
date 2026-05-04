@@ -139,13 +139,10 @@ pub async fn run_plan(
         // uncommitted work stranded on the stash stack.
         let td = TeardownState {
             workdir: workdir.to_path_buf(),
-            source_branch,
             stash_ref,
         };
         if let Err(setup_err) = setup_branch(workdir, &effective_plan, None).await {
-            if let Err(te) =
-                restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref()).await
-            {
+            if let Err(te) = restore_working_tree(&td.workdir, td.stash_ref.as_ref()).await {
                 eprintln!("Warning: teardown after failed branch setup: {te}");
             }
             return Err(setup_err);
@@ -174,15 +171,12 @@ pub async fn run_plan(
         match &outcome {
             Ok(_) => {
                 // Don't mask a teardown error with a success.
-                restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref()).await?;
+                restore_working_tree(&td.workdir, td.stash_ref.as_ref()).await?;
             }
             Err(_) => {
                 // Run already failed; log teardown errors but don't mask
                 // the original failure.
-                if let Err(te) =
-                    restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref())
-                        .await
-                {
+                if let Err(te) = restore_working_tree(&td.workdir, td.stash_ref.as_ref()).await {
                     eprintln!("Warning: teardown after failed run: {te}");
                 }
             }
@@ -196,7 +190,6 @@ pub async fn run_plan(
 /// Handed to `restore_working_tree` during teardown.
 struct TeardownState {
     workdir: std::path::PathBuf,
-    source_branch: String,
     stash_ref: Option<StashRef>,
 }
 
@@ -696,7 +689,6 @@ pub async fn run_all_plans(
         );
         Some(TeardownState {
             workdir: workdir.to_path_buf(),
-            source_branch,
             stash_ref,
         })
     } else {
@@ -729,13 +721,10 @@ pub async fn run_all_plans(
     if let Some(td) = teardown {
         match &inner {
             Ok(_) => {
-                restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref()).await?;
+                restore_working_tree(&td.workdir, td.stash_ref.as_ref()).await?;
             }
             Err(_) => {
-                if let Err(te) =
-                    restore_working_tree(&td.workdir, &td.source_branch, td.stash_ref.as_ref())
-                        .await
-                {
+                if let Err(te) = restore_working_tree(&td.workdir, td.stash_ref.as_ref()).await {
                     eprintln!("Warning: teardown after failed --all run: {te}");
                 }
             }
@@ -1187,39 +1176,13 @@ async fn stash_if_dirty(
     Ok(stash)
 }
 
-/// Switch back to `source_branch` and, if we stashed at run start, pop the
-/// stash. Called once at the end of the top-level run regardless of
-/// outcome.
+/// If we stashed at run start, pop the stash on whatever branch the run
+/// left us on (typically the plan branch). Called once at the end of the
+/// top-level run regardless of outcome.
 ///
-/// On `checkout <source>` failure (e.g. the plan branch has uncommitted
-/// changes from a misbehaving hook), we surface the error and leave the
-/// user where they are. On `stash pop` conflict, we leave the stash on the
-/// stack and return a non-zero error — the user pops manually.
-async fn restore_working_tree(
-    workdir: &Path,
-    source_branch: &str,
-    stash_ref: Option<&StashRef>,
-) -> Result<()> {
-    // Only checkout if we're not already on the source branch (spares us
-    // a spurious "already on 'X'" message and a no-op write).
-    let current = {
-        let workdir_owned = workdir.to_path_buf();
-        blocking_git(move || git::get_current_branch(&workdir_owned)).await?
-    };
-
-    if current != source_branch {
-        let workdir_owned = workdir.to_path_buf();
-        let branch = source_branch.to_string();
-        let checkout_result =
-            blocking_git(move || git::checkout_branch(&workdir_owned, &branch)).await;
-        if let Err(e) = checkout_result {
-            bail!(
-                "Failed to checkout source branch '{source_branch}' during run teardown: {e}. \
-                 Your stash (if any) is still on the stack — run `git stash list` to inspect."
-            );
-        }
-    }
-
+/// On `stash pop` conflict, we leave the stash on the stack and return a
+/// non-zero error — the user pops manually.
+async fn restore_working_tree(workdir: &Path, stash_ref: Option<&StashRef>) -> Result<()> {
     if let Some(stash) = stash_ref {
         let workdir_owned = workdir.to_path_buf();
         let stash_owned = stash.clone();
@@ -2846,12 +2809,18 @@ mod tests {
             "feat/stash-roundtrip"
         );
 
-        // Teardown: back to source_branch + pop stash.
-        restore_working_tree(&dir, &source_branch, Some(&stash))
-            .await
-            .unwrap();
+        // Teardown: pop stash on the plan branch (no checkout back).
+        restore_working_tree(&dir, Some(&stash)).await.unwrap();
 
-        assert_eq!(git::get_current_branch(&dir).unwrap(), source_branch);
+        assert_eq!(
+            git::get_current_branch(&dir).unwrap(),
+            "feat/stash-roundtrip",
+            "teardown must leave us on the plan branch, not source",
+        );
+        // Silence the unused-binding warning; source_branch capture is kept
+        // to document intent (run started here) but teardown no longer
+        // checks it out.
+        let _ = source_branch;
         assert_eq!(
             fs::read_to_string(dir.join("scratch.txt")).unwrap(),
             "wip-contents",
@@ -2865,7 +2834,8 @@ mod tests {
     }
 
     /// A clean tree returns None from `stash_if_dirty` regardless of
-    /// `auto_stash`, and teardown with no stash is just a branch switch.
+    /// `auto_stash`, and teardown with no stash is a no-op (we stay on the
+    /// plan branch).
     #[tokio::test(flavor = "current_thread")]
     async fn test_clean_tree_no_stash_needed() {
         let (_tmp, dir) = init_git_repo();
@@ -2892,13 +2862,14 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
         };
-        let source_branch = git::get_current_branch(&dir).unwrap();
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");
-        restore_working_tree(&dir, &source_branch, None)
-            .await
-            .unwrap();
-        assert_eq!(git::get_current_branch(&dir).unwrap(), source_branch);
+        restore_working_tree(&dir, None).await.unwrap();
+        assert_eq!(
+            git::get_current_branch(&dir).unwrap(),
+            "feat/clean",
+            "teardown without a stash is a no-op; stay on the plan branch",
+        );
     }
 
     /// If the run produced a commit that CONFLICTS with the stashed
@@ -2909,7 +2880,6 @@ mod tests {
         use std::fs;
 
         let (_tmp, dir) = init_git_repo();
-        let source_branch = git::get_current_branch(&dir).unwrap();
 
         // Pre-stash: README has version A queued up.
         fs::write(dir.join("README.md"), "# version A\n").unwrap();
@@ -2924,7 +2894,7 @@ mod tests {
         fs::write(dir.join("README.md"), "# version B\n").unwrap();
         git::commit_changes(&dir, "divergent commit").unwrap();
 
-        let err = restore_working_tree(&dir, &source_branch, Some(&stash))
+        let err = restore_working_tree(&dir, Some(&stash))
             .await
             .expect_err("pop must surface the conflict");
         let msg = format!("{err}");
@@ -2942,8 +2912,7 @@ mod tests {
     /// The teardown path must fire even when the inner plan body fails.
     /// Drive `run_plan` against a plan with no steps — this produces an
     /// inner `bail!` AFTER stash_if_dirty + setup_branch have run — and
-    /// assert that teardown still switched us back to the source branch
-    /// and popped the stash.
+    /// assert that teardown still popped the stash on the plan branch.
     #[tokio::test(flavor = "current_thread")]
     async fn test_stash_pop_on_failure_still_fires() {
         use std::fs;
@@ -2951,7 +2920,6 @@ mod tests {
 
         let (_tmp, dir) = init_git_repo();
         let project = dir.to_string_lossy().to_string();
-        let source_branch = git::get_current_branch(&dir).unwrap();
 
         // Seed a dirty tree.
         fs::write(dir.join("scratch.txt"), "wip").unwrap();
@@ -3000,9 +2968,9 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        // Teardown must have switched us back to the source branch.
-        assert_eq!(git::get_current_branch(&dir).unwrap(), source_branch);
-        // And popped the stash — scratch.txt reappears.
+        // Teardown leaves us on the plan branch (no checkout back) and
+        // pops the stash there — scratch.txt reappears.
+        assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/empty");
         assert_eq!(fs::read_to_string(dir.join("scratch.txt")).unwrap(), "wip");
         // The stash is gone.
         let remaining = git::find_stash_by_message(&dir, "ralph: auto-stash").unwrap();
