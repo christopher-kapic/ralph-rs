@@ -5,5 +5,6 @@
 // graceful shutdown — as the interactive counterpart to the non-interactive
 // runner.
 
+pub mod chrome;
 pub mod view;
 pub mod views;

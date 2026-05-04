@@ -4,6 +4,8 @@
 // by ratatui. Renders the step list, step detail panel, and keybinding help
 // bar.
 
+use std::path::Path;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -12,24 +14,36 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use super::plan_detail::{InputMode, PlanDetailApp};
 use crate::plan::StepStatus;
+use crate::tui::chrome::{self, Chrome};
 
 /// Render the entire plan-detail view.
 pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
-    // Top-level vertical split: main content + help bar at bottom.
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(1)])
-        .split(frame.area());
+    let crumbs: [&str; 2] = ["ralph", app.plan.slug.as_str()];
+    let hint = hint_for(app);
+    let body = chrome::render(
+        frame,
+        &Chrome {
+            breadcrumbs: &crumbs,
+            hint: &hint,
+            cwd: Path::new(&app.plan.project),
+        },
+    );
 
     // Main content: step list (left) + step detail (right).
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(outer[0]);
+        .split(body);
 
     draw_step_list(frame, app, main[0]);
     draw_step_detail(frame, app, main[1]);
-    draw_help_bar(frame, app, outer[1]);
+}
+
+fn hint_for(app: &PlanDetailApp) -> String {
+    match app.input_mode {
+        InputMode::Normal => "[j/k] nav  [a] add step  [s] skip  [q] quit".to_string(),
+        InputMode::AddStep => "[Enter] confirm  [Esc] cancel".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -202,36 +216,6 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
-}
-
-// ---------------------------------------------------------------------------
-// Help bar (bottom)
-// ---------------------------------------------------------------------------
-
-fn draw_help_bar(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
-    let spans = match app.input_mode {
-        InputMode::Normal => vec![
-            Span::styled(" j", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("/"),
-            Span::styled("k", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" navigate  "),
-            Span::styled("a", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" add step  "),
-            Span::styled("s", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" skip  "),
-            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" quit"),
-        ],
-        InputMode::AddStep => vec![
-            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" confirm  "),
-            Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" cancel"),
-        ],
-    };
-
-    let help = Paragraph::new(Line::from(spans)).style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(help, area);
 }
 
 #[cfg(test)]
