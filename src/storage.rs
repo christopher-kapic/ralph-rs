@@ -353,6 +353,25 @@ pub fn set_plan_context_prepend(
     Ok(())
 }
 
+/// Replace the plan's deterministic test commands. The slice is JSON-encoded
+/// into the `deterministic_tests` column verbatim — empty slice clears the
+/// list (one row of `[]`).
+pub fn set_plan_deterministic_tests(
+    conn: &Connection,
+    plan_id: &str,
+    tests: &[String],
+) -> Result<()> {
+    let tests_json = serde_json::to_string(tests)?;
+    let affected = conn.execute(
+        "UPDATE plans SET deterministic_tests = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![tests_json, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Project settings (prompt prefix/suffix at project scope)
 // ---------------------------------------------------------------------------
@@ -3913,5 +3932,45 @@ mod tests {
         set_plan_context_prepend(&conn, &plan.id, None).unwrap();
         let reloaded = get_plan_by_slug(&conn, "ctx", "/proj").unwrap().unwrap();
         assert_eq!(reloaded.context_prepend, None);
+    }
+
+    #[test]
+    fn test_set_plan_deterministic_tests_round_trip() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            "tests-rt",
+            "/proj",
+            "b",
+            "d",
+            None,
+            None,
+            &["cargo build".to_string()],
+        )
+        .unwrap();
+
+        // Sanity: row was created with the seeded list.
+        assert_eq!(plan.deterministic_tests, vec!["cargo build".to_string()]);
+
+        // Replace with a multi-test list.
+        let new_tests = vec!["cargo test".to_string(), "cargo clippy".to_string()];
+        set_plan_deterministic_tests(&conn, &plan.id, &new_tests).unwrap();
+        let reloaded = get_plan_by_slug(&conn, "tests-rt", "/proj").unwrap().unwrap();
+        assert_eq!(reloaded.deterministic_tests, new_tests);
+
+        // Empty slice clears the list.
+        set_plan_deterministic_tests(&conn, &plan.id, &[]).unwrap();
+        let reloaded = get_plan_by_slug(&conn, "tests-rt", "/proj").unwrap().unwrap();
+        assert!(reloaded.deterministic_tests.is_empty());
+    }
+
+    #[test]
+    fn test_set_plan_deterministic_tests_unknown_plan_errors() {
+        let conn = setup();
+        let err = set_plan_deterministic_tests(&conn, "no-such-plan", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("Plan not found"),
+            "unexpected error: {err}"
+        );
     }
 }

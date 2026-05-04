@@ -74,13 +74,29 @@ pub const SAVED_TOAST: &str = "Saved.";
 /// as the initial buffer (or that the user didn't modify).
 pub const NO_CHANGES_TOAST: &str = "No changes.";
 
-/// Header line used by the Universal- and Project-prompt panes' two-section
-/// editor format. The body that follows up to the next header (or EOF) is
-/// the `prompt_prefix` value.
+/// Prefix used when toasting a parse failure from the Step-prompt or Tests
+/// pane editor handoff. The full toast appends the parser's error message so
+/// the user can fix the structural problem and re-edit.
+pub const PARSE_ERROR_TOAST_PREFIX: &str = "Edit not saved: ";
+
+/// Header line used by the Universal-, Project-, and Plan-prompt panes'
+/// two-section editor format. The body that follows up to the next header
+/// (or EOF) is the `prompt_prefix` value.
 const PREFIX_HEADER: &str = "## Prefix";
 
 /// Header line for the Suffix section — paired with [`PREFIX_HEADER`] above.
 const SUFFIX_HEADER: &str = "## Suffix";
+
+/// Top-level header introducing the title in the Step-prompt editor format.
+/// Marks a single-line section: the first non-blank line after this header
+/// is the title and any further content before the next header is rejected.
+const STEP_TITLE_HEADER: &str = "# Title";
+
+/// Header for the Step-prompt description section (multi-line body).
+const STEP_DESCRIPTION_HEADER: &str = "## Description";
+
+/// Header for the Step-prompt acceptance-criteria section (bulleted list).
+const STEP_CRITERIA_HEADER: &str = "## Acceptance criteria";
 
 // ---------------------------------------------------------------------------
 // Pane enum
@@ -142,7 +158,7 @@ impl Pane {
 
 /// Outcome of a `c` editor handoff on one of the editable text panes.
 /// Drives which toast the dispatcher pushes after the handoff returns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditOutcome {
     /// `$EDITOR`/`$VISUAL` not set, OR the editor exited non-zero — nothing
     /// was persisted. Maps to the [`NO_EDITOR_TOAST`] message in red.
@@ -153,6 +169,12 @@ pub enum EditOutcome {
     /// Editor exited zero but the value matches the initial buffer (no
     /// edits to record). Nothing was written back.
     NoChanges,
+    /// Editor exited zero but the saved buffer failed structural validation
+    /// (e.g. missing section header in the Step-prompt format). Nothing was
+    /// written; the dispatcher toasts a red error and the user is expected
+    /// to retry. The string is the parser's diagnostic — short enough to
+    /// fit the toast bar.
+    ParseError(String),
 }
 
 /// Format a prefix/suffix pair into the two-section markdown blob shown to
@@ -238,6 +260,230 @@ fn trim_to_option(s: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Parsed step-prompt sections returned by [`parse_step_pane`]. Re-assembled
+/// by `edit_step_prompt_pane` into a `storage::update_step_fields_ext` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StepPaneParts {
+    pub title: String,
+    pub description: String,
+    pub acceptance_criteria: Vec<String>,
+}
+
+/// Render the Step-prompt pane's three-section editor format. Headers are
+/// always emitted so the user sees the structure even when one section is
+/// empty. Acceptance criteria render as `- <item>` bullets so the round-trip
+/// parser has an unambiguous list shape to detect.
+pub(crate) fn format_step_pane(
+    title: &str,
+    description: &str,
+    acceptance_criteria: &[String],
+) -> String {
+    let mut out = String::new();
+    out.push_str(STEP_TITLE_HEADER);
+    out.push('\n');
+    out.push_str(title.trim());
+    out.push('\n');
+    out.push('\n');
+    out.push_str(STEP_DESCRIPTION_HEADER);
+    out.push('\n');
+    let desc = description.trim_end_matches('\n');
+    if !desc.is_empty() {
+        out.push_str(desc);
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(STEP_CRITERIA_HEADER);
+    out.push('\n');
+    for c in acceptance_criteria {
+        out.push_str("- ");
+        out.push_str(c.trim());
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse the Step-prompt three-section blob written by `$EDITOR` back into
+/// its components. Returns an error describing the parse problem when the
+/// blob is malformed — the caller toasts the error and leaves the source of
+/// truth untouched.
+///
+/// Validation rules:
+/// - The `# Title` section must contain exactly one non-blank line.
+/// - All three headers (Title, Description, Acceptance criteria) must
+///   appear at least once. Missing headers yield an error so a user who
+///   accidentally deletes a section while editing is told what's wrong
+///   rather than silently overwriting with empty data.
+/// - Bullet lines under "Acceptance criteria" begin with `-` or `*` followed
+///   by whitespace; non-bullet, non-blank lines are rejected.
+pub(crate) fn parse_step_pane(text: &str) -> Result<StepPaneParts> {
+    enum Section {
+        None,
+        Title,
+        Description,
+        Criteria,
+    }
+
+    let mut section = Section::None;
+    let mut saw_title = false;
+    let mut saw_description = false;
+    let mut saw_criteria = false;
+
+    let mut title_lines: Vec<String> = Vec::new();
+    let mut description_lines: Vec<String> = Vec::new();
+    let mut criteria: Vec<String> = Vec::new();
+
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == STEP_TITLE_HEADER {
+            section = Section::Title;
+            saw_title = true;
+            continue;
+        }
+        if trimmed == STEP_DESCRIPTION_HEADER {
+            section = Section::Description;
+            saw_description = true;
+            continue;
+        }
+        if trimmed == STEP_CRITERIA_HEADER {
+            section = Section::Criteria;
+            saw_criteria = true;
+            continue;
+        }
+
+        match section {
+            Section::None => {
+                // Free-form text before any header is silently dropped — the
+                // file is not a general-purpose markdown document.
+            }
+            Section::Title => {
+                if !trimmed.is_empty() {
+                    title_lines.push(trimmed.to_string());
+                }
+            }
+            Section::Description => {
+                description_lines.push(line.to_string());
+            }
+            Section::Criteria => {
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let bullet = trimmed
+                    .strip_prefix("- ")
+                    .or_else(|| trimmed.strip_prefix("* "))
+                    .or_else(|| {
+                        // Tolerate a bare leading `-` / `*` with no space
+                        // (some editors auto-strip trailing whitespace), but
+                        // reject anything else so a stray paragraph doesn't
+                        // get silently absorbed as a criterion.
+                        if trimmed == "-" || trimmed == "*" {
+                            Some("")
+                        } else {
+                            None
+                        }
+                    });
+                match bullet {
+                    Some(item) => {
+                        let item = item.trim();
+                        if !item.is_empty() {
+                            criteria.push(item.to_string());
+                        }
+                    }
+                    None => {
+                        anyhow::bail!(
+                            "Acceptance criteria line {} is not a bullet (`- item`): {trimmed:?}",
+                            idx + 1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if !saw_title {
+        anyhow::bail!("Missing `{STEP_TITLE_HEADER}` header");
+    }
+    if !saw_description {
+        anyhow::bail!("Missing `{STEP_DESCRIPTION_HEADER}` header");
+    }
+    if !saw_criteria {
+        anyhow::bail!("Missing `{STEP_CRITERIA_HEADER}` header");
+    }
+    if title_lines.is_empty() {
+        anyhow::bail!("Title is empty");
+    }
+    if title_lines.len() > 1 {
+        anyhow::bail!(
+            "Title must be a single line; got {} non-blank lines",
+            title_lines.len()
+        );
+    }
+
+    // Trim leading/trailing blank lines from the description body so editor
+    // noise doesn't drift the value across no-op round-trips. Internal blank
+    // lines are preserved verbatim.
+    let description = trim_blank_block(&description_lines);
+
+    Ok(StepPaneParts {
+        title: title_lines.into_iter().next().unwrap(),
+        description,
+        acceptance_criteria: criteria,
+    })
+}
+
+/// Strip leading and trailing fully-blank lines from `lines`, then re-join
+/// the remaining lines with `\n`. Used to normalize the description body so
+/// editor-injected blank lines around a section don't flip a no-op edit to
+/// "Saved".
+fn trim_blank_block(lines: &[String]) -> String {
+    let start = lines.iter().position(|l| !l.trim().is_empty());
+    let end = lines.iter().rposition(|l| !l.trim().is_empty());
+    match (start, end) {
+        (Some(s), Some(e)) => lines[s..=e].join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Render the Tests pane editor format: one test command per line, with a
+/// short comment header explaining the format. Blank entries are not emitted
+/// so the round-trip parser observes the same list it was given.
+pub(crate) fn format_tests_pane(tests: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str("# One test command per line. Blank lines and `#` comments are ignored.\n");
+    out.push('\n');
+    for t in tests {
+        let line = t.trim();
+        if !line.is_empty() {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Parse the Tests pane editor format into the list of test commands. Blank
+/// lines and lines whose first non-whitespace char is `#` are ignored;
+/// everything else is taken verbatim (after trimming surrounding whitespace).
+///
+/// Returns an error only if the blob is *visibly* malformed — today the
+/// parser is permissive enough that almost any text round-trips, so the
+/// error path exists mainly to give the editor handoff a fallible API
+/// matching the step-prompt parser. A single-line input that turns out to
+/// be only comments is a valid "clear all tests" edit.
+pub(crate) fn parse_tests_pane(text: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        out.push(trimmed.to_string());
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -698,6 +944,137 @@ impl StepDetailApp {
         }
         storage::set_plan_context_prepend(conn, &self.plan.id, Some(&new_normalized))?;
         self.plan.context_prepend = Some(new_normalized);
+        Ok(EditOutcome::Saved)
+    }
+
+    /// `c` on the Plan-prompt pane: round-trip `plan.prompt_prefix` and
+    /// `plan.prompt_suffix` through `$EDITOR` using the same two-section
+    /// format as the universal/project panes. Each side is updated
+    /// independently so a no-op on one half doesn't churn `updated_at`.
+    pub fn edit_plan_prompt_pane<E>(
+        &mut self,
+        conn: &Connection,
+        edit_fn: E,
+    ) -> Result<EditOutcome>
+    where
+        E: FnOnce(&str) -> Result<Option<String>>,
+    {
+        let initial = format_wrap_pane(
+            self.plan.prompt_prefix.as_deref(),
+            self.plan.prompt_suffix.as_deref(),
+        );
+        let new_text = match edit_fn(&initial)? {
+            None => return Ok(EditOutcome::NoEditor),
+            Some(s) => s,
+        };
+        let (new_prefix, new_suffix) = parse_wrap_pane(&new_text);
+        if new_prefix == self.plan.prompt_prefix && new_suffix == self.plan.prompt_suffix {
+            return Ok(EditOutcome::NoChanges);
+        }
+        if new_prefix != self.plan.prompt_prefix {
+            storage::set_plan_prompt_prefix(conn, &self.plan.id, new_prefix.as_deref())?;
+            self.plan.prompt_prefix = new_prefix;
+        }
+        if new_suffix != self.plan.prompt_suffix {
+            storage::set_plan_prompt_suffix(conn, &self.plan.id, new_suffix.as_deref())?;
+            self.plan.prompt_suffix = new_suffix;
+        }
+        Ok(EditOutcome::Saved)
+    }
+
+    /// `c` on the Step-prompt pane: round-trip `step.title`,
+    /// `step.description`, and `step.acceptance_criteria` through `$EDITOR`
+    /// as a single three-section markdown blob and persist via
+    /// [`storage::update_step_fields_ext`].
+    ///
+    /// On parse failure (missing header, empty title, malformed bullet)
+    /// returns [`EditOutcome::ParseError`] without writing — the dispatcher
+    /// shows a red toast and the user re-edits.
+    ///
+    /// No-ops when the plan has no steps under the current selection (the
+    /// pane already renders a `(no steps)` placeholder in that case).
+    pub fn edit_step_prompt_pane<E>(
+        &mut self,
+        conn: &Connection,
+        edit_fn: E,
+    ) -> Result<EditOutcome>
+    where
+        E: FnOnce(&str) -> Result<Option<String>>,
+    {
+        let Some(step) = self.steps.get(self.selected_step_index).cloned() else {
+            return Ok(EditOutcome::NoChanges);
+        };
+        let initial = format_step_pane(&step.title, &step.description, &step.acceptance_criteria);
+        let new_text = match edit_fn(&initial)? {
+            None => return Ok(EditOutcome::NoEditor),
+            Some(s) => s,
+        };
+        let parts = match parse_step_pane(&new_text) {
+            Ok(p) => p,
+            Err(e) => return Ok(EditOutcome::ParseError(e.to_string())),
+        };
+
+        let title_changed = parts.title != step.title;
+        let description_changed = parts.description != step.description;
+        let criteria_changed = parts.acceptance_criteria != step.acceptance_criteria;
+
+        if !title_changed && !description_changed && !criteria_changed {
+            return Ok(EditOutcome::NoChanges);
+        }
+
+        storage::update_step_fields_ext(
+            conn,
+            &step.id,
+            title_changed.then_some(parts.title.as_str()),
+            description_changed.then_some(parts.description.as_str()),
+            None,
+            None,
+            criteria_changed.then_some(parts.acceptance_criteria.as_slice()),
+            None,
+            None,
+            None,
+            None,
+        )?;
+        // Refresh the in-memory step so the pane re-renders without a reload.
+        if let Some(step_mut) = self.steps.get_mut(self.selected_step_index) {
+            if title_changed {
+                step_mut.title = parts.title;
+            }
+            if description_changed {
+                step_mut.description = parts.description;
+            }
+            if criteria_changed {
+                step_mut.acceptance_criteria = parts.acceptance_criteria;
+            }
+        }
+        Ok(EditOutcome::Saved)
+    }
+
+    /// `c` on the Tests pane: round-trip `plan.deterministic_tests` through
+    /// `$EDITOR` (one test per line, blank/`#`-prefixed lines ignored) and
+    /// persist via [`storage::set_plan_deterministic_tests`].
+    pub fn edit_tests_pane<E>(
+        &mut self,
+        conn: &Connection,
+        edit_fn: E,
+    ) -> Result<EditOutcome>
+    where
+        E: FnOnce(&str) -> Result<Option<String>>,
+    {
+        let initial = format_tests_pane(&self.plan.deterministic_tests);
+        let new_text = match edit_fn(&initial)? {
+            None => return Ok(EditOutcome::NoEditor),
+            Some(s) => s,
+        };
+        let new_tests = match parse_tests_pane(&new_text) {
+            Ok(t) => t,
+            Err(e) => return Ok(EditOutcome::ParseError(e.to_string())),
+        };
+        if new_tests == self.plan.deterministic_tests {
+            return Ok(EditOutcome::NoChanges);
+        }
+        storage::set_plan_deterministic_tests(conn, &self.plan.id, &new_tests)?;
+        self.plan.deterministic_tests = new_tests;
         Ok(EditOutcome::Saved)
     }
 }
@@ -2824,6 +3201,473 @@ mod tests {
         assert_eq!(
             reloaded.context_prepend.as_deref(),
             Some("SCRIPT-WROTE-THIS")
+        );
+    }
+
+    // -- Step-prompt pane format/parse round-trips ------------------------
+
+    #[test]
+    fn parse_step_pane_round_trips_full_step() {
+        let formatted = format_step_pane(
+            "My step title",
+            "First desc line\n\nSecond desc paragraph",
+            &["Criterion A".to_string(), "Criterion B".to_string()],
+        );
+        let parts = parse_step_pane(&formatted).unwrap();
+        assert_eq!(parts.title, "My step title");
+        assert_eq!(parts.description, "First desc line\n\nSecond desc paragraph");
+        assert_eq!(
+            parts.acceptance_criteria,
+            vec!["Criterion A".to_string(), "Criterion B".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_step_pane_round_trips_with_no_criteria() {
+        // A step legitimately has no acceptance criteria (the existing CLI
+        // accepts `--criteria` zero times); the round-trip must preserve
+        // that as an empty Vec rather than a phantom one-item list.
+        let formatted = format_step_pane("title", "body", &[]);
+        let parts = parse_step_pane(&formatted).unwrap();
+        assert_eq!(parts.title, "title");
+        assert_eq!(parts.description, "body");
+        assert!(parts.acceptance_criteria.is_empty());
+    }
+
+    #[test]
+    fn parse_step_pane_round_trips_with_empty_description() {
+        let formatted = format_step_pane("title", "", &["only-crit".to_string()]);
+        let parts = parse_step_pane(&formatted).unwrap();
+        assert_eq!(parts.title, "title");
+        assert_eq!(parts.description, "");
+        assert_eq!(parts.acceptance_criteria, vec!["only-crit".to_string()]);
+    }
+
+    #[test]
+    fn parse_step_pane_accepts_asterisk_bullets() {
+        // The renderer always uses `- ` but we accept `* ` on input for
+        // editor-paste convenience.
+        let text = "# Title\nT\n## Description\n## Acceptance criteria\n* a\n* b\n";
+        let parts = parse_step_pane(text).unwrap();
+        assert_eq!(
+            parts.acceptance_criteria,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_step_pane_trims_trailing_blank_lines_in_description() {
+        let text = "# Title\nT\n## Description\n\nbody\n\n\n## Acceptance criteria\n";
+        let parts = parse_step_pane(text).unwrap();
+        assert_eq!(parts.description, "body");
+    }
+
+    #[test]
+    fn parse_step_pane_rejects_missing_title_header() {
+        let text = "## Description\nbody\n## Acceptance criteria\n";
+        let err = parse_step_pane(text).unwrap_err();
+        assert!(
+            err.to_string().contains("# Title"),
+            "expected title-header complaint: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_step_pane_rejects_missing_description_header() {
+        let text = "# Title\nT\n## Acceptance criteria\n";
+        let err = parse_step_pane(text).unwrap_err();
+        assert!(
+            err.to_string().contains("## Description"),
+            "expected description-header complaint: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_step_pane_rejects_missing_criteria_header() {
+        let text = "# Title\nT\n## Description\nbody\n";
+        let err = parse_step_pane(text).unwrap_err();
+        assert!(
+            err.to_string().contains("## Acceptance criteria"),
+            "expected criteria-header complaint: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_step_pane_rejects_empty_title() {
+        let text = "# Title\n\n## Description\nbody\n## Acceptance criteria\n";
+        let err = parse_step_pane(text).unwrap_err();
+        assert!(
+            err.to_string().contains("Title is empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_step_pane_rejects_multi_line_title() {
+        let text = "# Title\nline-one\nline-two\n## Description\n## Acceptance criteria\n";
+        let err = parse_step_pane(text).unwrap_err();
+        assert!(
+            err.to_string().contains("single line"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_step_pane_rejects_non_bullet_in_criteria() {
+        let text = "# Title\nT\n## Description\n## Acceptance criteria\nstray paragraph\n";
+        let err = parse_step_pane(text).unwrap_err();
+        assert!(
+            err.to_string().contains("not a bullet"),
+            "got: {err}"
+        );
+    }
+
+    // -- Tests pane format/parse round-trips -----------------------------
+
+    #[test]
+    fn parse_tests_pane_round_trips_simple_list() {
+        let formatted = format_tests_pane(&[
+            "cargo build".to_string(),
+            "cargo test".to_string(),
+        ]);
+        let parsed = parse_tests_pane(&formatted).unwrap();
+        assert_eq!(
+            parsed,
+            vec!["cargo build".to_string(), "cargo test".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_tests_pane_round_trips_empty_list() {
+        let formatted = format_tests_pane(&[]);
+        let parsed = parse_tests_pane(&formatted).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_tests_pane_ignores_blank_and_comment_lines() {
+        // Mixed blanks, comments, and real test commands — only the real
+        // commands survive in the right order.
+        let text = "\
+# header comment
+cargo build
+
+# inline comment
+cargo test
+   # indented comment
+cargo clippy
+";
+        let parsed = parse_tests_pane(text).unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                "cargo build".to_string(),
+                "cargo test".to_string(),
+                "cargo clippy".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_tests_pane_trims_each_line() {
+        let text = "  cargo build  \n\tcargo test\n";
+        let parsed = parse_tests_pane(text).unwrap();
+        assert_eq!(
+            parsed,
+            vec!["cargo build".to_string(), "cargo test".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_tests_pane_treats_comment_only_as_clear_all() {
+        // The user wipes every test by leaving the file with only the help
+        // comment header — that should round-trip to an empty list, not
+        // an error.
+        let text = "# only the help text remains\n";
+        let parsed = parse_tests_pane(text).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    // -- edit_plan_prompt_pane --------------------------------------------
+
+    #[test]
+    fn edit_plan_prompt_no_editor_short_circuits() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        let outcome = app.edit_plan_prompt_pane(&conn, fake_editor(None)).unwrap();
+        assert_eq!(outcome, EditOutcome::NoEditor);
+    }
+
+    #[test]
+    fn edit_plan_prompt_no_changes_skips_writes() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        app.plan.prompt_prefix = Some("a".to_string());
+        let buffer = format_wrap_pane(Some("a"), None);
+        let outcome = app
+            .edit_plan_prompt_pane(&conn, fake_editor(Some(buffer)))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::NoChanges);
+        // DB row still reflects the absence of the suffix and the seeded prefix.
+        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.prompt_prefix, None);
+        assert_eq!(reloaded.prompt_suffix, None);
+    }
+
+    #[test]
+    fn edit_plan_prompt_persists_changed_pair() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        let buffer = format_wrap_pane(Some("PLAN-PRE"), Some("PLAN-SUF"));
+        let outcome = app
+            .edit_plan_prompt_pane(&conn, fake_editor(Some(buffer)))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.prompt_prefix.as_deref(), Some("PLAN-PRE"));
+        assert_eq!(reloaded.prompt_suffix.as_deref(), Some("PLAN-SUF"));
+        assert_eq!(app.plan.prompt_prefix.as_deref(), Some("PLAN-PRE"));
+        assert_eq!(app.plan.prompt_suffix.as_deref(), Some("PLAN-SUF"));
+    }
+
+    // -- edit_step_prompt_pane --------------------------------------------
+
+    /// Build a StepDetailApp with a plan + a single step materialized in `conn`,
+    /// so writes via `update_step_fields_ext` land on a real row that can
+    /// then be reloaded.
+    fn setup_step_app(conn: &Connection) -> StepDetailApp {
+        let plan = crate::storage::create_plan(
+            conn,
+            "tui-v1",
+            "/proj",
+            "tui-v1",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _pos) = crate::storage::create_step(
+            conn,
+            &plan.id,
+            "Original title",
+            "Original description",
+            None,
+            None,
+            &["original-crit".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        StepDetailApp::new(
+            plan,
+            vec![step],
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn edit_step_prompt_no_editor_short_circuits() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_step_app(&conn);
+        let outcome = app.edit_step_prompt_pane(&conn, fake_editor(None)).unwrap();
+        assert_eq!(outcome, EditOutcome::NoEditor);
+    }
+
+    #[test]
+    fn edit_step_prompt_no_changes_when_buffer_round_trips_unchanged() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_step_app(&conn);
+        let initial = format_step_pane(
+            &app.steps[0].title,
+            &app.steps[0].description,
+            &app.steps[0].acceptance_criteria,
+        );
+        let outcome = app
+            .edit_step_prompt_pane(&conn, fake_editor(Some(initial)))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::NoChanges);
+    }
+
+    #[test]
+    fn edit_step_prompt_persists_changed_step() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_step_app(&conn);
+        let buffer = format_step_pane(
+            "NEW-TITLE",
+            "NEW-DESCRIPTION",
+            &["NEW-CRIT-A".to_string(), "NEW-CRIT-B".to_string()],
+        );
+        let outcome = app
+            .edit_step_prompt_pane(&conn, fake_editor(Some(buffer)))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        // App's in-memory step is in sync.
+        assert_eq!(app.steps[0].title, "NEW-TITLE");
+        assert_eq!(app.steps[0].description, "NEW-DESCRIPTION");
+        assert_eq!(
+            app.steps[0].acceptance_criteria,
+            vec!["NEW-CRIT-A".to_string(), "NEW-CRIT-B".to_string()]
+        );
+        // DB row reloads to the same values.
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].title, "NEW-TITLE");
+        assert_eq!(reloaded[0].description, "NEW-DESCRIPTION");
+        assert_eq!(
+            reloaded[0].acceptance_criteria,
+            vec!["NEW-CRIT-A".to_string(), "NEW-CRIT-B".to_string()]
+        );
+    }
+
+    #[test]
+    fn edit_step_prompt_returns_parse_error_on_missing_header() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_step_app(&conn);
+        // Strip out the description header — parser must reject this and
+        // *not* write to the steps row.
+        let bad = "# Title\nstill the title\n## Acceptance criteria\n- c\n";
+        let outcome = app
+            .edit_step_prompt_pane(&conn, fake_editor(Some(bad.to_string())))
+            .unwrap();
+        match outcome {
+            EditOutcome::ParseError(msg) => {
+                assert!(msg.contains("## Description"), "got: {msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+        // The row still has the original title — no partial save happened.
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].title, "Original title");
+        assert_eq!(reloaded[0].description, "Original description");
+    }
+
+    #[test]
+    fn edit_step_prompt_returns_parse_error_on_empty_title() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_step_app(&conn);
+        let bad = "# Title\n\n## Description\nbody\n## Acceptance criteria\n";
+        let outcome = app
+            .edit_step_prompt_pane(&conn, fake_editor(Some(bad.to_string())))
+            .unwrap();
+        assert!(matches!(outcome, EditOutcome::ParseError(_)));
+        // No write happened.
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].title, "Original title");
+    }
+
+    // -- edit_tests_pane --------------------------------------------------
+
+    #[test]
+    fn edit_tests_pane_no_editor_short_circuits() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        let outcome = app.edit_tests_pane(&conn, fake_editor(None)).unwrap();
+        assert_eq!(outcome, EditOutcome::NoEditor);
+    }
+
+    #[test]
+    fn edit_tests_pane_no_changes_when_unchanged() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        app.plan.deterministic_tests = vec!["cargo build".to_string()];
+        storage::set_plan_deterministic_tests(&conn, &app.plan.id, &app.plan.deterministic_tests)
+            .unwrap();
+        let initial = format_tests_pane(&app.plan.deterministic_tests);
+        let outcome = app
+            .edit_tests_pane(&conn, fake_editor(Some(initial)))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::NoChanges);
+    }
+
+    #[test]
+    fn edit_tests_pane_persists_changed_list() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        let buffer = format_tests_pane(&[
+            "cargo test".to_string(),
+            "cargo clippy".to_string(),
+        ]);
+        let outcome = app
+            .edit_tests_pane(&conn, fake_editor(Some(buffer)))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        assert_eq!(
+            app.plan.deterministic_tests,
+            vec!["cargo test".to_string(), "cargo clippy".to_string()]
+        );
+        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reloaded.deterministic_tests,
+            vec!["cargo test".to_string(), "cargo clippy".to_string()]
+        );
+    }
+
+    #[test]
+    fn edit_tests_pane_can_clear_all_tests() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        app.plan.deterministic_tests = vec!["cargo test".to_string()];
+        storage::set_plan_deterministic_tests(&conn, &app.plan.id, &app.plan.deterministic_tests)
+            .unwrap();
+        // User wipes the file down to just comments — round-trip yields an
+        // empty list and the storage row is updated.
+        let outcome = app
+            .edit_tests_pane(&conn, fake_editor(Some("# (no tests)\n".to_string())))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        assert!(app.plan.deterministic_tests.is_empty());
+        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
+            .unwrap()
+            .unwrap();
+        assert!(reloaded.deterministic_tests.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_tests_pane_round_trips_through_mock_editor_script() {
+        // Acceptance test mirroring step 25's mock-script test for the
+        // single-string panes — exercise the real editor::edit_at handoff.
+        use crate::tui::editor::edit_at;
+        use std::os::unix::fs::PermissionsExt;
+
+        let conn = crate::db::open_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("ed.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'cargo test\\ncargo clippy -- -D warnings\\n' > \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut app = setup_project_app(&conn, "/proj");
+        let outcome = app
+            .edit_tests_pane(&conn, |initial| {
+                edit_at(
+                    script.to_str().unwrap(),
+                    &tmp.path().join("buf.md"),
+                    initial,
+                )
+            })
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reloaded.deterministic_tests,
+            vec!["cargo test".to_string(), "cargo clippy -- -D warnings".to_string()]
         );
     }
 }
