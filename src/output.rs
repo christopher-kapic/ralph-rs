@@ -80,7 +80,6 @@ pub enum RunEvent {
     },
     /// Line-buffered chunk of deterministic-test output. Same shape as
     /// `HarnessChunk` but `test_index` indexes into `plan.deterministic_tests`.
-    #[allow(dead_code)] // Emit site lands in a later step (TUI-plan §13.1).
     TestChunk {
         test_index: usize,
         stream: ChunkStream,

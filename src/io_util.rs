@@ -62,6 +62,12 @@ pub struct ChunkEmitter {
 /// The task takes ownership of `reader`. If a read errors mid-stream, it
 /// returns whatever was accumulated so far rather than erroring out — the
 /// parent still needs diagnostic output. On EOF it returns normally.
+///
+/// Production callers use [`drain_bounded_with_emitter`] (with `None` to
+/// disable emission, or a configured emitter to also stream chunk events);
+/// this no-emitter convenience wrapper is preserved for any future caller
+/// that doesn't need streaming.
+#[allow(dead_code)]
 pub fn drain_bounded<R>(reader: Option<R>, cap: usize) -> JoinHandle<Vec<u8>>
 where
     R: AsyncRead + Unpin + Send + 'static,

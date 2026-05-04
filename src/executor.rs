@@ -989,10 +989,34 @@ pub async fn execute_step(
                         ChildUpdate::Clear,
                         exec_opts.json_output,
                     )?;
+                    // Build a chunk-emit config mirroring the harness path:
+                    // share the per-run `chunk_seq` counter and the same
+                    // `chunk_max_bytes` cap. Only enabled when this run is
+                    // emitting NDJSON; otherwise pass `None` so the test
+                    // runner stays a pure tail-capturer. Per TUI-plan §13.1.
+                    let test_chunk_cfg = exec_opts
+                        .chunk_seq
+                        .clone()
+                        .filter(|_| exec_opts.json_output)
+                        .map(|seq| test_runner::TestChunkConfig {
+                            seq,
+                            max_bytes: exec_opts.chunk_max_bytes,
+                            sink: Arc::new(|test_index, stream, text, seq| {
+                                let _ = crate::output::emit_ndjson(
+                                    &crate::output::RunEvent::TestChunk {
+                                        test_index,
+                                        stream,
+                                        text,
+                                        seq,
+                                    },
+                                );
+                            }),
+                        });
                     let test_results = test_runner::run_tests(
                         &plan.deterministic_tests,
                         workdir,
                         abort_rx.clone(),
+                        test_chunk_cfg,
                     )
                     .await;
                     let strings: Vec<String> = test_results

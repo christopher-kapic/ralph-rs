@@ -3,11 +3,14 @@
 // Executes deterministic test commands (shell commands) and collects structured results.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use tokio::process::Command;
 use tokio::sync::watch;
 
 use crate::io_util;
+use crate::output::ChunkStream;
 
 /// Per-stream cap for concurrent test-command pipe drainers. Tests are usually
 /// chattier than harness invocations but shorter-lived, so 1 MiB per stream is
@@ -29,6 +32,27 @@ pub struct TestResult {
     pub output_tail: String,
     /// Whether the command succeeded (exit code 0).
     pub passed: bool,
+}
+
+/// Sink invoked once per emitted line of deterministic-test output. Receives
+/// the index of the test in `plan.deterministic_tests`, the stream label, the
+/// (possibly truncated) line text, and the monotonic `seq` allocated for this
+/// emit.
+pub type TestChunkSink = Arc<dyn Fn(usize, ChunkStream, String, u64) + Send + Sync + 'static>;
+
+/// Per-run configuration for streaming `RunEvent::TestChunk` events from each
+/// deterministic-test command's stdout/stderr.
+///
+/// `seq` is shared across **all** tests and both streams so the consumer sees
+/// a strictly monotonic counter for the test phase. The runner threads the
+/// same `Arc<AtomicU64>` it uses for `HarnessChunk` events through here, so a
+/// single counter is monotonic across the whole run; per the acceptance
+/// criteria, that means it is also monotonic across (and within) the test
+/// phase. `max_bytes` mirrors `Config.harness_chunk_max_bytes`.
+pub struct TestChunkConfig {
+    pub seq: Arc<AtomicU64>,
+    pub max_bytes: usize,
+    pub sink: TestChunkSink,
 }
 
 /// Aggregated results from running a suite of test commands.
@@ -57,6 +81,11 @@ const TAIL_LINES: usize = 50;
 /// * `cwd` – working directory for each command.
 /// * `abort_rx` – watch channel; when it flips to `true`, any running test is
 ///   killed and the run is reported as aborted.
+/// * `chunk_cfg` – when `Some`, each test command's stdout/stderr is also
+///   streamed line-by-line through the sink (one emit per newline plus a
+///   final flush of any unterminated trailing line). When `None`, no chunk
+///   events are emitted — only the captured output tail is returned. Per
+///   TUI-plan §13.1.
 ///
 /// # Returns
 /// A [`TestResults`] summarising the run.
@@ -64,6 +93,7 @@ pub async fn run_tests(
     tests: &[String],
     cwd: &Path,
     abort_rx: watch::Receiver<bool>,
+    chunk_cfg: Option<TestChunkConfig>,
 ) -> TestResults {
     let mut results: Vec<TestResult> = Vec::with_capacity(tests.len());
     let mut all_passed = true;
@@ -77,7 +107,11 @@ pub async fn run_tests(
             break;
         }
 
-        let (result, was_aborted) = run_single_test(cmd, cwd, abort_rx.clone()).await;
+        let emitters = chunk_cfg
+            .as_ref()
+            .map(|cfg| build_test_emitters(cfg, i))
+            .unwrap_or((None, None));
+        let (result, was_aborted) = run_single_test(cmd, cwd, abort_rx.clone(), emitters).await;
         let passed = result.passed;
         results.push(result);
 
@@ -103,11 +137,46 @@ pub async fn run_tests(
     }
 }
 
+/// Build the per-stream `ChunkEmitter` pair for a single test command.
+///
+/// Both emitters share `cfg.seq`, so seq is monotonic across stdout *and*
+/// stderr of the same test, and across all tests in the phase. The sink is
+/// curried with `test_index` so the inner [`io_util::ChunkSink`] only needs
+/// the per-line `(stream, text, seq)` tuple.
+fn build_test_emitters(
+    cfg: &TestChunkConfig,
+    test_index: usize,
+) -> (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>) {
+    let sink_for_stdout = cfg.sink.clone();
+    let sink_for_stderr = cfg.sink.clone();
+    let stdout_inner: io_util::ChunkSink = Arc::new(move |stream, text, seq| {
+        sink_for_stdout(test_index, stream, text, seq);
+    });
+    let stderr_inner: io_util::ChunkSink = Arc::new(move |stream, text, seq| {
+        sink_for_stderr(test_index, stream, text, seq);
+    });
+    (
+        Some(io_util::ChunkEmitter {
+            stream: ChunkStream::Stdout,
+            seq: cfg.seq.clone(),
+            max_bytes: cfg.max_bytes,
+            sink: stdout_inner,
+        }),
+        Some(io_util::ChunkEmitter {
+            stream: ChunkStream::Stderr,
+            seq: cfg.seq.clone(),
+            max_bytes: cfg.max_bytes,
+            sink: stderr_inner,
+        }),
+    )
+}
+
 /// Run a single shell command and capture its output, racing against an abort signal.
 async fn run_single_test(
     cmd: &str,
     cwd: &Path,
     mut abort_rx: watch::Receiver<bool>,
+    emitters: (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>),
 ) -> (TestResult, bool) {
     let mut command = Command::new("sh");
     command
@@ -146,8 +215,20 @@ async fn run_single_test(
     // on the child. A test that emits more than the kernel pipe buffer
     // (~64 KiB) would otherwise block on write(2) while we block on wait(),
     // deadlocking. See `io_util::drain_bounded` for the full rationale.
-    let stdout_task = io_util::drain_bounded(child.stdout.take(), TEST_OUTPUT_TAIL_BYTES);
-    let stderr_task = io_util::drain_bounded(child.stderr.take(), TEST_OUTPUT_TAIL_BYTES);
+    //
+    // When `emitters.0` / `emitters.1` are populated, each drainer also
+    // emits one `RunEvent::TestChunk` per newline via the curried sink.
+    let (stdout_emitter, stderr_emitter) = emitters;
+    let stdout_task = io_util::drain_bounded_with_emitter(
+        child.stdout.take(),
+        TEST_OUTPUT_TAIL_BYTES,
+        stdout_emitter,
+    );
+    let stderr_task = io_util::drain_bounded_with_emitter(
+        child.stderr.take(),
+        TEST_OUTPUT_TAIL_BYTES,
+        stderr_emitter,
+    );
 
     tokio::select! {
         status = child.wait() => {
@@ -294,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn test_all_pass() {
         let tests = vec!["true".to_string(), "echo hello".to_string()];
-        let res = run_tests(&tests, &cwd(), never_abort()).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
         assert!(res.all_passed);
         assert!(!res.aborted);
         assert_eq!(res.results.len(), 2);
@@ -312,7 +393,7 @@ mod tests {
             "false".to_string(),
             "echo should_not_run".to_string(),
         ];
-        let res = run_tests(&tests, &cwd(), never_abort()).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
         assert!(!res.all_passed);
         assert_eq!(res.results.len(), 2);
         assert_eq!(res.first_failure_index, Some(1));
@@ -323,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn test_captures_output() {
         let tests = vec!["echo hello_world".to_string()];
-        let res = run_tests(&tests, &cwd(), never_abort()).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
         assert!(res.all_passed);
         assert!(res.results[0].output_tail.contains("hello_world"));
     }
@@ -331,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn test_captures_stderr() {
         let tests = vec!["echo err_output >&2".to_string()];
-        let res = run_tests(&tests, &cwd(), never_abort()).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
         assert!(res.all_passed);
         assert!(res.results[0].output_tail.contains("err_output"));
     }
@@ -339,7 +420,7 @@ mod tests {
     #[tokio::test]
     async fn test_exit_code_nonzero() {
         let tests = vec!["exit 42".to_string()];
-        let res = run_tests(&tests, &cwd(), never_abort()).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
         assert!(!res.all_passed);
         assert_eq!(res.results[0].exit_code, Some(42));
         assert!(!res.results[0].passed);
@@ -372,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_tests() {
         let tests: Vec<String> = vec![];
-        let res = run_tests(&tests, &cwd(), never_abort()).await;
+        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
         assert!(res.all_passed);
         assert!(res.results.is_empty());
         assert!(res.first_failure_index.is_none());
@@ -383,7 +464,7 @@ mod tests {
     async fn test_respects_cwd() {
         let tests = vec!["pwd".to_string()];
         let dir = std::env::temp_dir();
-        let res = run_tests(&tests, &dir, never_abort()).await;
+        let res = run_tests(&tests, &dir, never_abort(), None).await;
         assert!(res.all_passed);
         let canonical = dir.canonicalize().unwrap();
         let output_canonical = PathBuf::from(res.results[0].output_tail.trim())
@@ -405,7 +486,7 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let res = run_tests(&tests, &cwd(), rx).await;
+        let res = run_tests(&tests, &cwd(), rx, None).await;
         let elapsed = start.elapsed();
 
         abort_handle.await.ok();
@@ -428,7 +509,7 @@ mod tests {
         let (tx, rx) = watch::channel(false);
         let _ = tx.send(true);
 
-        let res = run_tests(&tests, &cwd(), rx).await;
+        let res = run_tests(&tests, &cwd(), rx, None).await;
         assert!(res.aborted);
         assert!(!res.all_passed);
         assert!(res.results.is_empty());
@@ -449,7 +530,7 @@ mod tests {
         let start = std::time::Instant::now();
         let res = tokio::time::timeout(
             Duration::from_secs(30),
-            run_tests(&tests, &cwd(), never_abort()),
+            run_tests(&tests, &cwd(), never_abort(), None),
         )
         .await
         .expect("test_runner should not deadlock on large output");
@@ -470,5 +551,124 @@ mod tests {
             elapsed < Duration::from_secs(10),
             "500 KB output took too long: {elapsed:?}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // TestChunk emission (TUI-plan §13.1)
+    // -------------------------------------------------------------------
+
+    /// Capturing sink: pushes `(test_index, stream, text, seq)` tuples into
+    /// a shared `Mutex<Vec<_>>` so tests can inspect emission without going
+    /// through `emit_ndjson` (which would write to stdout).
+    fn collecting_chunk_cfg(
+        max_bytes: usize,
+    ) -> (
+        TestChunkConfig,
+        Arc<std::sync::Mutex<Vec<(usize, ChunkStream, String, u64)>>>,
+    ) {
+        let collected: Arc<std::sync::Mutex<Vec<(usize, ChunkStream, String, u64)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_for_sink = collected.clone();
+        let sink: TestChunkSink = Arc::new(move |idx, stream, text, seq| {
+            collected_for_sink
+                .lock()
+                .unwrap()
+                .push((idx, stream, text, seq));
+        });
+        let cfg = TestChunkConfig {
+            seq: Arc::new(AtomicU64::new(0)),
+            max_bytes,
+            sink,
+        };
+        (cfg, collected)
+    }
+
+    /// Acceptance criterion: running a plan with two tests produces
+    /// `TestChunk` events tagged with `test_index` 0 and 1 respectively,
+    /// `seq` is monotonic across the whole phase, and `stream` carries the
+    /// originating pipe.
+    #[tokio::test]
+    async fn test_chunk_events_tagged_with_correct_test_index() {
+        let tests = vec![
+            "echo first-line; echo first-err >&2".to_string(),
+            "echo second-line; echo second-err >&2".to_string(),
+        ];
+        let (cfg, collected) = collecting_chunk_cfg(4096);
+        let res = run_tests(&tests, &cwd(), never_abort(), Some(cfg)).await;
+        assert!(res.all_passed, "tests should pass: {res:?}");
+
+        let events = collected.lock().unwrap().clone();
+        // Two tests, each emitting one stdout + one stderr line → 4 events.
+        assert_eq!(events.len(), 4, "expected 4 events, got {events:?}");
+
+        // Group by test_index. The first test must have test_index 0; the
+        // second must have test_index 1. Both indices must be present.
+        let test0: Vec<_> = events.iter().filter(|e| e.0 == 0).cloned().collect();
+        let test1: Vec<_> = events.iter().filter(|e| e.0 == 1).cloned().collect();
+        assert_eq!(test0.len(), 2, "expected 2 events for test 0: {test0:?}");
+        assert_eq!(test1.len(), 2, "expected 2 events for test 1: {test1:?}");
+
+        // The first test's events must reference its own command's lines,
+        // not the second test's. (Tests run sequentially, so by the time
+        // test 1 starts, test 0's emitter is already dropped.)
+        let test0_texts: Vec<&str> = test0.iter().map(|e| e.2.as_str()).collect();
+        let test1_texts: Vec<&str> = test1.iter().map(|e| e.2.as_str()).collect();
+        assert!(
+            test0_texts.contains(&"first-line"),
+            "test 0 should have 'first-line': {test0_texts:?}"
+        );
+        assert!(
+            test0_texts.contains(&"first-err"),
+            "test 0 should have 'first-err': {test0_texts:?}"
+        );
+        assert!(
+            test1_texts.contains(&"second-line"),
+            "test 1 should have 'second-line': {test1_texts:?}"
+        );
+        assert!(
+            test1_texts.contains(&"second-err"),
+            "test 1 should have 'second-err': {test1_texts:?}"
+        );
+
+        // Stream labels: exactly one stdout + one stderr per test.
+        for (label, group) in [("test 0", &test0), ("test 1", &test1)] {
+            let stdout_count = group
+                .iter()
+                .filter(|e| matches!(e.1, ChunkStream::Stdout))
+                .count();
+            let stderr_count = group
+                .iter()
+                .filter(|e| matches!(e.1, ChunkStream::Stderr))
+                .count();
+            assert_eq!(stdout_count, 1, "{label} stdout count: {group:?}");
+            assert_eq!(stderr_count, 1, "{label} stderr count: {group:?}");
+        }
+
+        // seq is monotonic and gap-free across the entire test phase. Tests
+        // run sequentially, so test 0's seqs must all be lower than test 1's.
+        let mut all_seqs: Vec<u64> = events.iter().map(|e| e.3).collect();
+        all_seqs.sort();
+        assert_eq!(all_seqs, vec![0, 1, 2, 3], "seq must be 0..3");
+        let test0_max = test0.iter().map(|e| e.3).max().unwrap();
+        let test1_min = test1.iter().map(|e| e.3).min().unwrap();
+        assert!(
+            test0_max < test1_min,
+            "all of test 0's seqs must precede all of test 1's: \
+             test0={test0:?} test1={test1:?}"
+        );
+    }
+
+    /// `chunk_cfg = None` is the back-compat path: no events are emitted
+    /// and the captured tail still works. Verifies the chunk-emit path is
+    /// strictly additive.
+    #[tokio::test]
+    async fn test_chunk_no_emission_when_cfg_is_none() {
+        let tests = vec!["echo no-stream".to_string()];
+        // We can't easily prove "no events" via the public sink API since
+        // there is no sink to observe; we instead verify that the captured
+        // tail behavior is preserved exactly as it was before.
+        let res = run_tests(&tests, &cwd(), never_abort(), None).await;
+        assert!(res.all_passed);
+        assert!(res.results[0].output_tail.contains("no-stream"));
     }
 }
