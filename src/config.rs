@@ -282,12 +282,20 @@ impl Config {
     /// Used by `ralph config set-timezone` and any future mutator paths.
     /// Validates before writing so we never persist a broken config.
     pub fn save(&self) -> Result<()> {
-        self.validate()?;
         let dir = config_dir()?;
-        fs::create_dir_all(&dir)
+        self.save_at(&dir)
+    }
+
+    /// Path-explicit form of [`Self::save`] — writes `<dir>/config.json`
+    /// atomically. Used by tests that round-trip against a tempdir; the TUI
+    /// universal-prompt pane edit handoff also routes through here so
+    /// non-default `XDG_CONFIG_HOME` setups stay correct.
+    pub(crate) fn save_at(&self, dir: &Path) -> Result<()> {
+        self.validate()?;
+        fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create config directory {}", dir.display()))?;
         let path = dir.join("config.json");
-        write_config_atomic(&dir, &path, self)
+        write_config_atomic(dir, &path, self)
     }
 }
 
