@@ -15,6 +15,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use super::plan_detail::{InputMode, PlanDetailApp};
 use crate::plan::StepStatus;
 use crate::tui::chrome::{self, Chrome};
+use crate::tui::theme;
 
 /// Render the entire plan-detail view.
 pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
@@ -59,14 +60,14 @@ fn draw_step_list(frame: &mut Frame, app: &mut PlanDetailApp, area: Rect) {
             let indicator = PlanDetailApp::status_indicator(step.status);
             let label = format!("{indicator} {}. {}", i + 1, step.title);
             let style = match step.status {
-                StepStatus::Complete => Style::default().fg(Color::Green),
+                StepStatus::Complete => Style::default().fg(theme::STATUS_COMPLETE),
                 StepStatus::InProgress => Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme::STATUS_IN_PROGRESS)
                     .add_modifier(Modifier::BOLD),
-                StepStatus::Failed => Style::default().fg(Color::Red),
-                StepStatus::Skipped => Style::default().fg(Color::DarkGray),
-                StepStatus::Aborted => Style::default().fg(Color::Red),
-                StepStatus::Pending => Style::default().fg(Color::White),
+                StepStatus::Failed => Style::default().fg(theme::STATUS_FAILED),
+                StepStatus::Skipped => Style::default().fg(theme::CHROME_DIM),
+                StepStatus::Aborted => Style::default().fg(theme::STATUS_FAILED),
+                StepStatus::Pending => Style::default().fg(theme::STATUS_PENDING),
             };
             ListItem::new(Line::from(Span::styled(label, style)))
         })
@@ -118,12 +119,12 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
 
     // Status
     let status_color = match step.status {
-        StepStatus::Complete => Color::Green,
-        StepStatus::InProgress => Color::Yellow,
-        StepStatus::Failed => Color::Red,
-        StepStatus::Skipped => Color::DarkGray,
-        StepStatus::Aborted => Color::Red,
-        StepStatus::Pending => Color::White,
+        StepStatus::Complete => theme::STATUS_COMPLETE,
+        StepStatus::InProgress => theme::STATUS_IN_PROGRESS,
+        StepStatus::Failed => theme::STATUS_FAILED,
+        StepStatus::Skipped => theme::CHROME_DIM,
+        StepStatus::Aborted => theme::STATUS_FAILED,
+        StepStatus::Pending => theme::STATUS_PENDING,
     };
     lines.push(Line::from(vec![
         Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),

@@ -6,5 +6,7 @@
 // runner.
 
 pub mod chrome;
+pub mod theme;
+pub mod toast;
 pub mod view;
 pub mod views;
