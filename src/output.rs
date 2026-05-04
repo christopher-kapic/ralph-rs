@@ -73,7 +73,6 @@ pub enum RunEvent {
     /// Line-buffered chunk of harness output, one emit per newline.
     /// `seq` is monotonic per run so consumers can reorder if needed.
     /// `text` is truncated past `Config.harness_chunk_max_bytes`.
-    #[allow(dead_code)] // Emit site lands in a later step (TUI-plan §13.1).
     HarnessChunk {
         stream: ChunkStream,
         text: String,

@@ -6,6 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -269,6 +271,13 @@ async fn run_plan_inner(
     let mut known_step_ids: HashSet<String> = initial_steps.iter().map(|s| s.id.clone()).collect();
     let mut executed_step_ids: HashSet<String> = HashSet::new();
 
+    // Monotonic per-run counter for `HarnessChunk` / `TestChunk` event
+    // `seq` fields. Created once here so the same `Arc<AtomicU64>` is
+    // threaded through every `execute_step` call — `seq` stays unique
+    // across step boundaries within a single `ralph run`. Per
+    // TUI-plan §13.1.
+    let chunk_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
     // For `--one`, we need to stop after the first step actually executed;
     // capture its ID at the start (the earliest actionable step in the
     // window) and exit after it completes. Positions can shift due to
@@ -392,6 +401,8 @@ async fn run_plan_inner(
                 step_total: total_now,
                 json_output: out.format == OutputFormat::Json,
                 color: out.color,
+                chunk_seq: Some(chunk_seq.clone()),
+                chunk_max_bytes: config.harness_chunk_max_bytes,
             },
         )
         .await?;

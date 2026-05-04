@@ -4,6 +4,8 @@
 // resolve harness → build prompt → spawn → wait → test → commit/rollback.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +17,7 @@ use crate::git;
 use crate::harness::{self, HarnessOutput};
 use crate::hooks::{self, HookContext};
 use crate::io_util;
+use crate::output::ChunkStream;
 use crate::plan::{ChangePolicy, Phase, Plan, Step, StepStatus, TerminationReason, TestStatus};
 use crate::prompt::{self, PromptWrap, PromptWraps, RetryContext};
 use crate::run_lock::process_start_token;
@@ -59,7 +62,7 @@ pub struct StepResult {
 /// the per-attempt progress sub-header and prompt preview. Kept separate
 /// from the persistent [`Config`] knobs because these are read from CLI
 /// flags / output context, not config.json.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ExecuteOptions {
     /// Skip truncation on the per-attempt prompt preview.
@@ -75,6 +78,30 @@ pub struct ExecuteOptions {
     pub json_output: bool,
     /// True when stderr should be ANSI-colored.
     pub color: bool,
+    /// Monotonic per-run `seq` counter shared across stdout/stderr drainers
+    /// (and across all step invocations in a single `ralph run`). `None`
+    /// disables `HarnessChunk` event emission entirely — used by tests and
+    /// non-NDJSON runs. Created once per run by the runner so the
+    /// counter survives across step boundaries. See TUI-plan §13.1.
+    pub chunk_seq: Option<Arc<AtomicU64>>,
+    /// Truncation cap for each emitted chunk's `text` payload. Mirrors
+    /// [`Config::harness_chunk_max_bytes`]. Ignored when `chunk_seq` is
+    /// `None`.
+    pub chunk_max_bytes: usize,
+}
+
+impl Default for ExecuteOptions {
+    fn default() -> Self {
+        Self {
+            verbose: false,
+            step_num_in_plan: 0,
+            step_total: 0,
+            json_output: false,
+            color: false,
+            chunk_seq: None,
+            chunk_max_bytes: 4096,
+        }
+    }
 }
 
 /// Max chars of prompt included in the non-verbose preview and the
@@ -797,8 +824,21 @@ pub async fn execute_step(
             exec_opts.json_output,
         )?;
 
-        // Wait with timeout and abort racing.
-        let wait_result = wait_with_timeout_and_abort(child, timeout, abort_rx.clone()).await;
+        // Wait with timeout and abort racing. Build the chunk-emitter
+        // config from the shared per-run seq counter; pass `None` when the
+        // runner isn't streaming NDJSON so the drainer stays a pure
+        // tail-capturer.
+        let chunk_emit = exec_opts
+            .chunk_seq
+            .clone()
+            .filter(|_| exec_opts.json_output)
+            .map(|seq| ChunkEmitConfig {
+                seq,
+                max_bytes: exec_opts.chunk_max_bytes,
+            });
+        let emitters = build_chunk_emitters(chunk_emit);
+        let wait_result =
+            wait_with_timeout_and_abort(child, timeout, abort_rx.clone(), emitters).await;
         let duration_secs = started_at.elapsed().as_secs_f64();
 
         match wait_result {
@@ -1359,6 +1399,65 @@ pub async fn execute_step(
 // Wait helpers
 // ---------------------------------------------------------------------------
 
+/// Per-attempt configuration for the chunk-emission side of the harness
+/// drainers. `seq` is shared across both stdout and stderr (and across the
+/// whole run) so consumers see a strictly monotonic stream.
+#[derive(Clone)]
+struct ChunkEmitConfig {
+    seq: Arc<AtomicU64>,
+    max_bytes: usize,
+}
+
+/// Build the per-stream `ChunkEmitter` pair used by [`wait_with_timeout_and_abort`].
+///
+/// Both emitters reference the *same* `seq` counter so a `HarnessChunk`
+/// event's `seq` is unique within the run regardless of which stream it came
+/// from.
+///
+/// Production callers go through this wrapper, which uses
+/// [`crate::output::emit_ndjson`] as the sink; tests use
+/// [`build_chunk_emitters_with_sink`] directly with a capturing sink so they
+/// don't have to redirect stdout. Serialization or write failures from the
+/// production sink are swallowed (best-effort streaming — losing one chunk
+/// should not break the run; the captured tail is still recorded in the
+/// execution log).
+fn build_chunk_emitters(
+    cfg: Option<ChunkEmitConfig>,
+) -> (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>) {
+    let sink: io_util::ChunkSink = Arc::new(|stream, text, seq| {
+        let _ = crate::output::emit_ndjson(&crate::output::RunEvent::HarnessChunk {
+            stream,
+            text,
+            seq,
+        });
+    });
+    build_chunk_emitters_with_sink(cfg, sink)
+}
+
+/// Sink-injectable variant of [`build_chunk_emitters`]. When `cfg` is `None`
+/// the sink is dropped without ever being called.
+fn build_chunk_emitters_with_sink(
+    cfg: Option<ChunkEmitConfig>,
+    sink: io_util::ChunkSink,
+) -> (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>) {
+    let Some(cfg) = cfg else {
+        return (None, None);
+    };
+    let stdout_emitter = io_util::ChunkEmitter {
+        stream: ChunkStream::Stdout,
+        seq: cfg.seq.clone(),
+        max_bytes: cfg.max_bytes,
+        sink: sink.clone(),
+    };
+    let stderr_emitter = io_util::ChunkEmitter {
+        stream: ChunkStream::Stderr,
+        seq: cfg.seq.clone(),
+        max_bytes: cfg.max_bytes,
+        sink,
+    };
+    (Some(stdout_emitter), Some(stderr_emitter))
+}
+
 /// Outcome of waiting for a harness process.
 enum WaitResult {
     /// Process completed (may have succeeded or failed).
@@ -1379,18 +1478,37 @@ enum WaitResult {
 ///   hasn't completed.
 /// - On **abort**: SIGTERM is sent, followed by a 5-second grace period,
 ///   then SIGKILL if still running.
+///
+/// When `emitters` is non-`None` for a stream, that drainer also emits
+/// [`crate::output::RunEvent::HarnessChunk`] events one-per-newline as the
+/// child produces output. The same `seq` counter is typically shared across
+/// stdout and stderr so consumers can reorder by `seq`.
+///
+/// Production callers build `emitters` via [`build_chunk_emitters`]; tests
+/// use [`build_chunk_emitters_with_sink`] to capture events without
+/// touching stdout.
 async fn wait_with_timeout_and_abort(
     mut child: tokio::process::Child,
     timeout: Option<Duration>,
     mut abort_rx: watch::Receiver<bool>,
+    emitters: (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>),
 ) -> WaitResult {
     // Take stdout/stderr handles before entering select! so we can still
     // access `child` mutably for kill/wait. Spawn concurrent drain tasks
     // *immediately*: a child that writes more than the pipe buffer
     // (~64 KiB) would otherwise block on write(2) while we block on wait(),
     // deadlocking. Draining concurrently keeps the pipe flowing.
-    let stdout_task = io_util::drain_bounded(child.stdout.take(), HARNESS_OUTPUT_TAIL_BYTES);
-    let stderr_task = io_util::drain_bounded(child.stderr.take(), HARNESS_OUTPUT_TAIL_BYTES);
+    let (stdout_emitter, stderr_emitter) = emitters;
+    let stdout_task = io_util::drain_bounded_with_emitter(
+        child.stdout.take(),
+        HARNESS_OUTPUT_TAIL_BYTES,
+        stdout_emitter,
+    );
+    let stderr_task = io_util::drain_bounded_with_emitter(
+        child.stderr.take(),
+        HARNESS_OUTPUT_TAIL_BYTES,
+        stderr_emitter,
+    );
 
     match timeout {
         Some(dur) => {
@@ -3809,5 +3927,177 @@ mod tests {
 
         let fresh_step = storage::get_step(&conn, &step.id).unwrap();
         assert_eq!(fresh_step.status, StepStatus::Failed);
+    }
+
+    // -------------------------------------------------------------------
+    // HarnessChunk emission (TUI-plan §13.1)
+    // -------------------------------------------------------------------
+
+    /// `build_chunk_emitters_with_sink` should produce a `Some(...)`
+    /// emitter pair when given a config and `(None, None)` when the config
+    /// is absent. This is the wiring contract: `wait_with_timeout_and_abort`
+    /// only emits when its emitters are populated.
+    #[test]
+    fn test_build_chunk_emitters_returns_none_when_cfg_is_none() {
+        let dummy_sink: io_util::ChunkSink = Arc::new(|_, _, _| {});
+        let (out, err) = build_chunk_emitters_with_sink(None, dummy_sink);
+        assert!(out.is_none(), "stdout emitter should be None");
+        assert!(err.is_none(), "stderr emitter should be None");
+    }
+
+    #[test]
+    fn test_build_chunk_emitters_carries_seq_and_max_bytes() {
+        let seq = Arc::new(AtomicU64::new(0));
+        let cfg = Some(ChunkEmitConfig {
+            seq: seq.clone(),
+            max_bytes: 128,
+        });
+        let dummy_sink: io_util::ChunkSink = Arc::new(|_, _, _| {});
+        let (out, err) = build_chunk_emitters_with_sink(cfg, dummy_sink);
+        let out = out.expect("stdout emitter should be Some");
+        let err = err.expect("stderr emitter should be Some");
+        assert_eq!(out.stream, ChunkStream::Stdout);
+        assert_eq!(err.stream, ChunkStream::Stderr);
+        assert_eq!(out.max_bytes, 128);
+        assert_eq!(err.max_bytes, 128);
+        // Both emitters must reference the *same* counter so seq is
+        // monotonic across streams.
+        assert!(
+            Arc::ptr_eq(&out.seq, &err.seq),
+            "stdout and stderr emitters must share the same seq counter"
+        );
+        assert!(
+            Arc::ptr_eq(&out.seq, &seq),
+            "emitters must reference the caller's counter"
+        );
+    }
+
+    /// End-to-end: `wait_with_timeout_and_abort` driving a real subprocess
+    /// that prints N stdout lines + M stderr lines must emit N+M
+    /// `HarnessChunk` events with `seq` 0..N+M-1 (no gaps, no duplicates),
+    /// and lines longer than `max_bytes` must be truncated.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_wait_with_timeout_and_abort_emits_harness_chunks() {
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        // Build a child that prints 3 stdout lines and 1 stderr line. The
+        // last stdout line is 50 bytes long so we can verify truncation
+        // when max_bytes < 50.
+        let long_line = "x".repeat(50);
+        let script = format!(
+            "echo line-one; echo line-two; echo {long_line}; echo err-one >&2"
+        );
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(&script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null());
+        let child = cmd.spawn().expect("spawn sh");
+
+        let collected: Arc<std::sync::Mutex<Vec<(ChunkStream, String, u64)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_for_sink = collected.clone();
+        let sink: io_util::ChunkSink = Arc::new(move |stream, text, seq| {
+            collected_for_sink.lock().unwrap().push((stream, text, seq));
+        });
+
+        let max_bytes = 10;
+        let cfg = Some(ChunkEmitConfig {
+            seq: Arc::new(AtomicU64::new(0)),
+            max_bytes,
+        });
+        let emitters = build_chunk_emitters_with_sink(cfg, sink);
+
+        let (_tx, rx) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_with_timeout_and_abort(child, None, rx, emitters),
+        )
+        .await
+        .expect("wait timed out");
+
+        match result {
+            WaitResult::Completed(Ok(_)) => {}
+            WaitResult::Completed(Err(e)) => panic!("harness errored: {e}"),
+            WaitResult::Timeout { .. } => panic!("unexpected Timeout"),
+            WaitResult::Aborted => panic!("unexpected Aborted"),
+        }
+
+        let mut events = collected.lock().unwrap().clone();
+        events.sort_by_key(|e| e.2);
+
+        // 4 lines total → 4 events with seq 0..3 (no gaps).
+        assert_eq!(events.len(), 4, "expected 4 events, got {events:?}");
+        let seqs: Vec<u64> = events.iter().map(|e| e.2).collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3], "seq must be 0..N-1");
+
+        // Every emitted text is at most max_bytes bytes.
+        for (_, text, _) in &events {
+            assert!(
+                text.len() <= max_bytes,
+                "text exceeded max_bytes: {} bytes ({text:?})",
+                text.len(),
+            );
+        }
+
+        // Verify the long line was truncated and the stderr line landed
+        // with the Stderr label.
+        let texts: Vec<&str> = events.iter().map(|(_, t, _)| t.as_str()).collect();
+        assert!(
+            texts.contains(&"line-one"),
+            "expected 'line-one' in events: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"line-two"),
+            "expected 'line-two' in events: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.starts_with('x') && t.len() == max_bytes),
+            "expected truncated long line in events: {texts:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(s, t, _)| *s == ChunkStream::Stderr && t == "err-one"),
+            "expected stderr 'err-one' event: {events:?}"
+        );
+    }
+
+    /// Sanity: when emitters are `(None, None)`, the wait function must
+    /// still capture stdout/stderr correctly — the chunk-emit path is
+    /// strictly additive and must not regress the tail-capture contract.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_wait_with_timeout_and_abort_no_emit_when_emitters_none() {
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo captured; echo err-captured >&2")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null());
+        let child = cmd.spawn().expect("spawn sh");
+
+        let (_tx, rx) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_with_timeout_and_abort(child, None, rx, (None, None)),
+        )
+        .await
+        .expect("wait timed out");
+
+        match result {
+            WaitResult::Completed(Ok(out)) => {
+                assert!(out.success);
+                assert!(out.stdout.contains("captured"));
+                assert!(out.stderr.contains("err-captured"));
+            }
+            WaitResult::Completed(Err(e)) => panic!("harness errored: {e}"),
+            WaitResult::Timeout { .. } => panic!("unexpected Timeout"),
+            WaitResult::Aborted => panic!("unexpected Aborted"),
+        }
     }
 }
