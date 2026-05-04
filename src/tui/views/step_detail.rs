@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::config::Config;
-use crate::plan::{ChangePolicy, Plan, Step, StepStatus};
+use crate::plan::{ChangePolicy, ExecutionLog, Plan, Step, StepStatus};
 use crate::prompt::DEFAULT_CONTEXT_PREPEND;
 use crate::storage::ProjectSettings;
 use crate::tui::chrome::{self, Chrome};
@@ -179,6 +179,16 @@ pub struct StepDetailApp {
     /// store a per-plan model — fallback skips straight to the harness's
     /// configured default).
     pub harness_default_models: HashMap<String, Option<String>>,
+
+    /// Execution-log rows for the focused step, sorted by `attempt` ASC (oldest
+    /// first). Source for the Appended pane; `h`/`l` paginate by index.
+    pub execution_logs: Vec<ExecutionLog>,
+
+    /// Index into `execution_logs` for the attempt currently shown in the
+    /// Appended pane. Defaults to the most recent attempt (`len - 1`) on view
+    /// construction, per TUI-plan.md §8 ("most recent by default"). When
+    /// `execution_logs` is empty this is `0` and ignored by the renderer.
+    pub appended_attempt_index: usize,
 }
 
 impl StepDetailApp {
@@ -192,6 +202,7 @@ impl StepDetailApp {
         selected_step_index: usize,
         config: &Config,
         project_settings: ProjectSettings,
+        execution_logs: Vec<ExecutionLog>,
     ) -> Self {
         let clamped = if steps.is_empty() {
             0
@@ -203,6 +214,7 @@ impl StepDetailApp {
             .iter()
             .map(|(name, hc)| (name.clone(), hc.default_model.clone()))
             .collect();
+        let appended_attempt_index = execution_logs.len().saturating_sub(1);
         Self {
             plan,
             steps,
@@ -219,6 +231,8 @@ impl StepDetailApp {
             project_settings,
             default_harness_name: config.default_harness.clone(),
             harness_default_models,
+            execution_logs,
+            appended_attempt_index,
         }
     }
 
@@ -295,6 +309,80 @@ impl StepDetailApp {
     /// Signal the dispatcher to pop this view back to plan-detail.
     pub fn request_pop(&mut self) {
         self.should_pop = true;
+    }
+
+    // -- Appended pane pagination (TUI-plan.md §8 "Appended-prompt navigation")
+
+    /// Currently focused execution log in the Appended pane, or `None` when
+    /// the step has no recorded attempts yet.
+    pub fn current_appended_log(&self) -> Option<&ExecutionLog> {
+        self.execution_logs.get(self.appended_attempt_index)
+    }
+
+    /// True when the Appended pane is on the leftmost (oldest) attempt — the
+    /// state where `h`/`←` falls through to popping the view per §8.
+    pub fn appended_at_leftmost(&self) -> bool {
+        self.appended_attempt_index == 0
+    }
+
+    /// True when the Appended pane is on the rightmost (newest) attempt;
+    /// `l`/`→` is a no-op in this state.
+    pub fn appended_at_rightmost(&self) -> bool {
+        self.execution_logs.is_empty()
+            || self.appended_attempt_index + 1 >= self.execution_logs.len()
+    }
+
+    /// Move the Appended pane to the previous (older) attempt. Returns true
+    /// when the index actually moved; false at the leftmost or with empty
+    /// logs (so callers can fall through to a pop).
+    pub fn appended_prev(&mut self) -> bool {
+        if self.execution_logs.is_empty() || self.appended_attempt_index == 0 {
+            return false;
+        }
+        self.appended_attempt_index -= 1;
+        true
+    }
+
+    /// Move the Appended pane to the next (newer) attempt. Returns true when
+    /// the index actually moved; false when already at the rightmost or with
+    /// empty logs.
+    pub fn appended_next(&mut self) -> bool {
+        if self.appended_at_rightmost() {
+            return false;
+        }
+        self.appended_attempt_index += 1;
+        true
+    }
+
+    /// Handle `h` / `←` in the step-detail view per §8. The Appended pane
+    /// intercepts the key first when a previous attempt exists; otherwise
+    /// (Appended at leftmost OR any other pane focused) the view pops back
+    /// to plan-detail.
+    pub fn handle_left(&mut self) {
+        if self.focused_pane == Pane::Appended && self.appended_prev() {
+            return;
+        }
+        self.request_pop();
+    }
+
+    /// Handle `l` / `→` in the step-detail view per §8. Only meaningful on
+    /// the Appended pane (advances to the next attempt); a no-op elsewhere.
+    pub fn handle_right(&mut self) {
+        if self.focused_pane == Pane::Appended {
+            self.appended_next();
+        }
+    }
+
+    /// Title shown on the Appended pane's bordered block. Includes the
+    /// `(attempt N/M)` segment when the step has at least one execution log;
+    /// falls back to the bare label when there are no recorded attempts.
+    pub fn appended_pane_title(&self) -> String {
+        if self.execution_logs.is_empty() {
+            return Pane::Appended.title().to_string();
+        }
+        let total = self.execution_logs.len();
+        let n = self.appended_attempt_index + 1;
+        format!("Appended (attempt {n}/{total})")
     }
 
     // -- Step accessors --------------------------------------------------
@@ -579,8 +667,12 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
     if focused {
         style = style.add_modifier(Modifier::BOLD);
     }
+    let title_text = match pane {
+        Pane::Appended => app.appended_pane_title(),
+        _ => pane.title().to_string(),
+    };
     let block = Block::default()
-        .title(format!(" {} ", pane.title()))
+        .title(format!(" {title_text} "))
         .borders(Borders::ALL)
         .border_style(style);
     let inner = block.inner(area);
@@ -620,7 +712,7 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
             app.plan.prompt_suffix.as_deref(),
         ),
         Pane::StepPrompt => render_step_prompt(frame, app, inner),
-        Pane::Appended => render_appended_placeholder(frame, inner),
+        Pane::Appended => render_appended(frame, app, inner),
         Pane::Tests => render_tests(frame, app, inner),
         Pane::BottomRow => render_bottom_row(frame, app, inner),
     }
@@ -736,17 +828,79 @@ fn render_step_prompt(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
     frame.render_widget(para, area);
 }
 
-/// Read-only placeholder for the Appended pane until step 24 wires up the
-/// per-attempt `h`/`l` paginator. Showing a dim "no retry context yet" string
-/// is more useful than leaving the body blank — the operator can tell at a
-/// glance that the pane is rendered, just empty for this step.
-fn render_appended_placeholder(frame: &mut Frame, area: Rect) {
-    let para = Paragraph::new(Span::styled(
-        "(retry context appears here once an attempt has run)",
-        Style::default().fg(theme::CHROME_DIM),
-    ))
-    .wrap(Wrap { trim: false });
+/// Render the Appended pane body: read-only retry context for the focused
+/// attempt. Spec wording (TUI-plan.md §8) is "previous diff, test output,
+/// modified files" — i.e., the data sourced from attempt N-1 and appended to
+/// attempt N's prompt. Attempt 1 has no previous attempt, so it renders a
+/// dim placeholder; an empty execution log renders the same shape it had
+/// before any attempts ran.
+fn render_appended(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+    if app.execution_logs.is_empty() {
+        let para = Paragraph::new(Span::styled(
+            "(retry context appears here once an attempt has run)",
+            Style::default().fg(theme::CHROME_DIM),
+        ))
+        .wrap(Wrap { trim: false });
+        frame.render_widget(para, area);
+        return;
+    }
+
+    // First attempt has no preceding log to source retry context from.
+    if app.appended_attempt_index == 0 {
+        let para = Paragraph::new(Span::styled(
+            "(first attempt — no appended retry context)",
+            Style::default().fg(theme::CHROME_DIM),
+        ))
+        .wrap(Wrap { trim: false });
+        frame.render_widget(para, area);
+        return;
+    }
+
+    // Source-of-truth: the previous attempt's diff and test output. Match
+    // format_retry_context's truncation knobs (200 / 100 lines) so the pane
+    // shows the same content the runner actually appended.
+    let prev = &app.execution_logs[app.appended_attempt_index - 1];
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme::CHROME_DIM);
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(Span::styled("Previous diff:", bold)));
+    match prev.diff.as_deref() {
+        Some(d) if !d.is_empty() => {
+            for line in truncate_lines(d, 200).lines() {
+                lines.push(Line::from(line.to_string()));
+            }
+        }
+        _ => lines.push(Line::from(Span::styled(NONE_PLACEHOLDER, dim))),
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Previous test output:", bold)));
+    if prev.test_results.is_empty() {
+        lines.push(Line::from(Span::styled(NONE_PLACEHOLDER, dim)));
+    } else {
+        let joined = prev.test_results.join("\n");
+        for line in truncate_lines(&joined, 100).lines() {
+            lines.push(Line::from(line.to_string()));
+        }
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, area);
+}
+
+/// Cap `text` at `max_lines` lines, appending an `... (N lines omitted) ...`
+/// marker when truncated. Mirrors the runner's `truncate_text` so the pane
+/// surfaces the same view the prompt builder appends.
+fn truncate_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max_lines {
+        text.to_string()
+    } else {
+        let omitted = lines.len() - max_lines;
+        let head = &lines[..max_lines];
+        format!("{}\n... ({omitted} lines omitted) ...", head.join("\n"))
+    }
 }
 
 /// Render the Tests pane: `plan.deterministic_tests` as a bulleted list, or
@@ -904,6 +1058,45 @@ mod tests {
             selected,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
+        )
+    }
+
+    /// Build a fake execution log row for a given attempt number with optional
+    /// diff / test output. Matches the column shape of `ExecutionLog` so
+    /// pagination tests can construct multi-attempt histories.
+    fn make_log(attempt: i32, diff: Option<&str>, test_output: Option<&str>) -> ExecutionLog {
+        ExecutionLog {
+            id: attempt as i64,
+            step_id: "s0".to_string(),
+            attempt,
+            started_at: Utc::now(),
+            duration_secs: Some(1.0),
+            prompt_text: None,
+            diff: diff.map(str::to_string),
+            test_results: test_output.map(|s| vec![s.to_string()]).unwrap_or_default(),
+            rolled_back: false,
+            committed: false,
+            commit_hash: None,
+            harness_stdout: None,
+            harness_stderr: None,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            session_id: None,
+            termination_reason: None,
+            test_status: None,
+        }
+    }
+
+    fn make_app_with_logs(n: usize, selected: usize, logs: Vec<ExecutionLog>) -> StepDetailApp {
+        StepDetailApp::new(
+            make_plan(),
+            make_steps(n),
+            selected,
+            &Config::default(),
+            ProjectSettings::default(),
+            logs,
         )
     }
 
@@ -1270,7 +1463,8 @@ mod tests {
             prompt_suffix: Some("CFG-SUFFIX-MARKER".to_string()),
             ..Config::default()
         };
-        let mut app = StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default());
+        let mut app =
+            StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default(), Vec::new());
         let screen = render_to_string(140, 60, &mut app);
         assert!(screen.contains("Universal prompt"), "{screen}");
         assert!(screen.contains("CFG-PREFIX-MARKER"), "{screen}");
@@ -1288,7 +1482,8 @@ mod tests {
             prompt_suffix: None,
             ..Config::default()
         };
-        let mut app = StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default());
+        let mut app =
+            StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default(), Vec::new());
         let screen = render_to_string(140, 60, &mut app);
         // The (none) placeholder must appear at least once — Universal is
         // the first pane in the stack, so confirming any (none) is present
@@ -1307,8 +1502,14 @@ mod tests {
             prompt_prefix: Some("PROJ-PRE-MARK".to_string()),
             prompt_suffix: Some("PROJ-SUF-MARK".to_string()),
         };
-        let mut app =
-            StepDetailApp::new(plan, steps, 0, &Config::default(), project_settings);
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &Config::default(),
+            project_settings,
+            Vec::new(),
+        );
         let screen = render_to_string(140, 60, &mut app);
         assert!(screen.contains("Project prompt"), "{screen}");
         assert!(screen.contains("PROJ-PRE-MARK"), "{screen}");
@@ -1329,6 +1530,7 @@ mod tests {
             0,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         let screen = render_to_string(140, 60, &mut app);
         // The default prepend opens with "# Ralph context" — distinctive
@@ -1347,6 +1549,7 @@ mod tests {
             0,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         let screen = render_to_string(140, 60, &mut app);
         assert!(screen.contains("OVERRIDE-PREPEND-MARKER"), "{screen}");
@@ -1369,6 +1572,7 @@ mod tests {
             0,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         let screen = render_to_string(140, 60, &mut app);
         assert!(screen.contains("Plan prompt"), "{screen}");
@@ -1389,6 +1593,7 @@ mod tests {
             1,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         let screen = render_to_string(160, 80, &mut app);
         assert!(screen.contains("STEP-TITLE-MARK"), "{screen}");
@@ -1408,6 +1613,7 @@ mod tests {
             0,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         let screen = render_to_string(140, 60, &mut app);
         assert!(screen.contains("• cargo test"), "{screen}");
@@ -1424,6 +1630,7 @@ mod tests {
             0,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         let screen = render_to_string(140, 60, &mut app);
         // The (none) placeholder appears in several panes — search the
@@ -1458,6 +1665,7 @@ mod tests {
             0,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         assert_eq!(app.effective_harness(), "plan-harness");
 
@@ -1467,6 +1675,7 @@ mod tests {
             1,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         assert_eq!(app.effective_harness(), "step-harness");
     }
@@ -1481,6 +1690,7 @@ mod tests {
             0,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         assert_eq!(app.effective_harness(), Config::default().default_harness);
     }
@@ -1504,13 +1714,21 @@ mod tests {
             0,
             &config,
             ProjectSettings::default(),
+            Vec::new(),
         );
         assert_eq!(app.effective_model().as_deref(), Some("default-model"));
 
         // Step overrides → wins.
         let mut steps = make_steps(1);
         steps[0].model = Some("step-model".to_string());
-        let app = StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default());
+        let app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &config,
+            ProjectSettings::default(),
+            Vec::new(),
+        );
         assert_eq!(app.effective_model().as_deref(), Some("step-model"));
     }
 
@@ -1527,6 +1745,7 @@ mod tests {
             0,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         assert_eq!(app.effective_agent().as_deref(), Some("plan-agent"));
 
@@ -1536,6 +1755,7 @@ mod tests {
             1,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         assert_eq!(app.effective_agent().as_deref(), Some("step-agent"));
     }
@@ -1551,6 +1771,7 @@ mod tests {
             0,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         assert_eq!(app.effective_change_policy(), ChangePolicy::Optional);
     }
@@ -1570,6 +1791,7 @@ mod tests {
             0,
             &Config::default(),
             ProjectSettings::default(),
+            Vec::new(),
         );
         let screen = render_to_string(160, 80, &mut app);
         // All four cell labels must appear, with their resolved values.
@@ -1581,6 +1803,267 @@ mod tests {
         assert!(screen.contains("plan-agent"), "{screen}");
         assert!(screen.contains("Change policy:"), "{screen}");
         assert!(screen.contains("optional"), "{screen}");
+    }
+
+    // -- Appended pane pagination (TUI-plan.md §8) -------------------------
+
+    #[test]
+    fn appended_default_index_is_most_recent_attempt() {
+        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let app = make_app_with_logs(1, 0, logs);
+        // Default is the last index (newest) per §8 "most recent attempt by default".
+        assert_eq!(app.appended_attempt_index, 2);
+        assert_eq!(app.current_appended_log().map(|l| l.attempt), Some(3));
+    }
+
+    #[test]
+    fn appended_default_index_is_zero_when_no_logs() {
+        let app = make_app_with_logs(1, 0, Vec::new());
+        // saturating_sub keeps index at 0 with no logs; current_appended_log
+        // is None.
+        assert_eq!(app.appended_attempt_index, 0);
+        assert!(app.current_appended_log().is_none());
+    }
+
+    #[test]
+    fn appended_at_leftmost_is_true_when_index_zero() {
+        let app = make_app_with_logs(1, 0, vec![make_log(1, None, None)]);
+        assert!(app.appended_at_leftmost());
+    }
+
+    #[test]
+    fn appended_at_leftmost_is_true_with_empty_logs() {
+        // Empty logs is treated as already at the leftmost so `h` falls
+        // through to popping the view (there's nothing to paginate).
+        let app = make_app_with_logs(1, 0, Vec::new());
+        assert!(app.appended_at_leftmost());
+    }
+
+    #[test]
+    fn appended_at_rightmost_is_true_at_last_index_and_when_empty() {
+        let logs = vec![make_log(1, None, None), make_log(2, None, None)];
+        let app = make_app_with_logs(1, 0, logs);
+        // Default lands on the rightmost (newest).
+        assert!(app.appended_at_rightmost());
+
+        let app = make_app_with_logs(1, 0, Vec::new());
+        assert!(app.appended_at_rightmost());
+    }
+
+    #[test]
+    fn appended_prev_decrements_and_returns_true() {
+        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let mut app = make_app_with_logs(1, 0, logs);
+        assert_eq!(app.appended_attempt_index, 2);
+        assert!(app.appended_prev());
+        assert_eq!(app.appended_attempt_index, 1);
+        assert!(app.appended_prev());
+        assert_eq!(app.appended_attempt_index, 0);
+        // Already at leftmost — returns false, index unchanged.
+        assert!(!app.appended_prev());
+        assert_eq!(app.appended_attempt_index, 0);
+    }
+
+    #[test]
+    fn appended_prev_returns_false_with_no_logs() {
+        let mut app = make_app_with_logs(1, 0, Vec::new());
+        assert!(!app.appended_prev());
+    }
+
+    #[test]
+    fn appended_next_increments_and_returns_true() {
+        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let mut app = make_app_with_logs(1, 0, logs);
+        // Walk back to attempt 1, then advance forward.
+        app.appended_attempt_index = 0;
+        assert!(app.appended_next());
+        assert_eq!(app.appended_attempt_index, 1);
+        assert!(app.appended_next());
+        assert_eq!(app.appended_attempt_index, 2);
+        // Already at rightmost — returns false.
+        assert!(!app.appended_next());
+        assert_eq!(app.appended_attempt_index, 2);
+    }
+
+    #[test]
+    fn appended_next_returns_false_with_no_logs() {
+        let mut app = make_app_with_logs(1, 0, Vec::new());
+        assert!(!app.appended_next());
+    }
+
+    #[test]
+    fn handle_left_pops_for_non_appended_pane_regardless_of_logs() {
+        // Even with paginatable logs, h on a non-Appended pane just pops.
+        let logs = vec![make_log(1, None, None), make_log(2, None, None)];
+        let mut app = make_app_with_logs(1, 0, logs);
+        app.focused_pane = Pane::StepPrompt;
+        app.handle_left();
+        assert!(app.should_pop);
+    }
+
+    #[test]
+    fn handle_left_paginates_when_appended_focused_and_not_leftmost() {
+        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let mut app = make_app_with_logs(1, 0, logs);
+        app.focused_pane = Pane::Appended;
+        // Default index is rightmost (2). h moves to 1 without popping.
+        app.handle_left();
+        assert_eq!(app.appended_attempt_index, 1);
+        assert!(!app.should_pop);
+
+        // h again moves to leftmost (0), still no pop.
+        app.handle_left();
+        assert_eq!(app.appended_attempt_index, 0);
+        assert!(!app.should_pop);
+    }
+
+    #[test]
+    fn handle_left_pops_when_appended_at_leftmost() {
+        // From the leftmost (oldest) attempt, h pops the view per §8's
+        // explicit "back to plan-detail" special case.
+        let logs = vec![make_log(1, None, None), make_log(2, None, None)];
+        let mut app = make_app_with_logs(1, 0, logs);
+        app.focused_pane = Pane::Appended;
+        app.appended_attempt_index = 0;
+        app.handle_left();
+        assert_eq!(app.appended_attempt_index, 0, "still at leftmost");
+        assert!(app.should_pop);
+    }
+
+    #[test]
+    fn handle_left_pops_when_appended_focused_with_no_logs() {
+        // Empty logs is treated as already-at-leftmost — h pops.
+        let mut app = make_app_with_logs(1, 0, Vec::new());
+        app.focused_pane = Pane::Appended;
+        app.handle_left();
+        assert!(app.should_pop);
+    }
+
+    #[test]
+    fn handle_left_pops_when_appended_focused_with_single_attempt() {
+        // Single attempt ⇒ also at leftmost; h pops.
+        let mut app = make_app_with_logs(1, 0, vec![make_log(1, None, None)]);
+        app.focused_pane = Pane::Appended;
+        assert!(app.appended_at_leftmost());
+        app.handle_left();
+        assert!(app.should_pop);
+    }
+
+    #[test]
+    fn handle_right_paginates_when_appended_focused_and_not_rightmost() {
+        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let mut app = make_app_with_logs(1, 0, logs);
+        app.focused_pane = Pane::Appended;
+        app.appended_attempt_index = 0;
+        app.handle_right();
+        assert_eq!(app.appended_attempt_index, 1);
+        assert!(!app.should_pop);
+
+        app.handle_right();
+        assert_eq!(app.appended_attempt_index, 2);
+        assert!(!app.should_pop);
+    }
+
+    #[test]
+    fn handle_right_no_op_at_rightmost() {
+        let logs = vec![make_log(1, None, None), make_log(2, None, None)];
+        let mut app = make_app_with_logs(1, 0, logs);
+        app.focused_pane = Pane::Appended;
+        // Default index is rightmost.
+        app.handle_right();
+        assert_eq!(app.appended_attempt_index, 1);
+        assert!(!app.should_pop);
+    }
+
+    #[test]
+    fn handle_right_no_op_for_non_appended_pane() {
+        // l on any other pane is a no-op (TUI-plan.md §8 keys table).
+        let logs = vec![make_log(1, None, None), make_log(2, None, None)];
+        let mut app = make_app_with_logs(1, 0, logs);
+        app.focused_pane = Pane::StepPrompt;
+        app.appended_attempt_index = 0;
+        app.handle_right();
+        assert_eq!(
+            app.appended_attempt_index, 0,
+            "non-Appended l must not paginate"
+        );
+        assert!(!app.should_pop);
+    }
+
+    #[test]
+    fn handle_right_no_op_with_no_logs() {
+        let mut app = make_app_with_logs(1, 0, Vec::new());
+        app.focused_pane = Pane::Appended;
+        app.handle_right();
+        assert!(!app.should_pop);
+    }
+
+    // -- Appended pane title -----------------------------------------------
+
+    #[test]
+    fn appended_pane_title_includes_attempt_count() {
+        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let app = make_app_with_logs(1, 0, logs);
+        // Default is rightmost ⇒ attempt 3/3.
+        assert_eq!(app.appended_pane_title(), "Appended (attempt 3/3)");
+    }
+
+    #[test]
+    fn appended_pane_title_changes_with_pagination() {
+        let logs = vec![make_log(1, None, None), make_log(2, None, None)];
+        let mut app = make_app_with_logs(1, 0, logs);
+        assert_eq!(app.appended_pane_title(), "Appended (attempt 2/2)");
+        app.appended_prev();
+        assert_eq!(app.appended_pane_title(), "Appended (attempt 1/2)");
+    }
+
+    #[test]
+    fn appended_pane_title_falls_back_when_no_logs() {
+        let app = make_app_with_logs(1, 0, Vec::new());
+        // No attempts yet ⇒ bare title.
+        assert_eq!(app.appended_pane_title(), "Appended");
+    }
+
+    // -- Appended pane render ----------------------------------------------
+
+    #[test]
+    fn appended_pane_renders_dynamic_title_when_attempts_exist() {
+        let logs = vec![make_log(1, None, None), make_log(2, None, None)];
+        let mut app = make_app_with_logs(1, 0, logs);
+        let screen = render_to_string(160, 80, &mut app);
+        assert!(
+            screen.contains("Appended (attempt 2/2)"),
+            "expected dynamic title, got: {screen}"
+        );
+    }
+
+    #[test]
+    fn appended_pane_renders_first_attempt_placeholder() {
+        // On attempt 1 there is no preceding attempt to source retry context
+        // from — the body must be an explicit dim placeholder, not a panic.
+        let logs = vec![make_log(1, Some("ignored"), Some("ignored"))];
+        let mut app = make_app_with_logs(1, 0, logs);
+        let screen = render_to_string(160, 80, &mut app);
+        assert!(
+            screen.contains("first attempt"),
+            "expected first-attempt placeholder, got: {screen}"
+        );
+    }
+
+    #[test]
+    fn appended_pane_renders_previous_diff_and_test_output() {
+        let logs = vec![
+            make_log(1, Some("DIFF-MARK"), Some("TEST-MARK")),
+            make_log(2, None, None),
+        ];
+        let mut app = make_app_with_logs(1, 0, logs);
+        // Default lands on attempt 2 — its "appended" content is sourced
+        // from attempt 1's diff and test output.
+        let screen = render_to_string(160, 80, &mut app);
+        assert!(screen.contains("Previous diff:"), "{screen}");
+        assert!(screen.contains("DIFF-MARK"), "{screen}");
+        assert!(screen.contains("Previous test output:"), "{screen}");
+        assert!(screen.contains("TEST-MARK"), "{screen}");
     }
 
     #[test]
@@ -1597,7 +2080,8 @@ mod tests {
         steps[0].agent = None;
         steps[0].model = None;
 
-        let mut app = StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default());
+        let mut app =
+            StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default(), Vec::new());
         let screen = render_to_string(160, 80, &mut app);
         assert!(
             screen.contains(EMPTY_CELL),
