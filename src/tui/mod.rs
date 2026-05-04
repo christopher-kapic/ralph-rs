@@ -9,6 +9,7 @@ pub mod chrome;
 pub mod dialog;
 pub mod editor;
 pub mod palette;
+pub mod palette_dispatch;
 pub mod run_dialog;
 pub mod selection;
 pub mod theme;
