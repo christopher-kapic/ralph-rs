@@ -19,6 +19,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget};
 
 use crate::plan::{Plan, PlanStatus};
 use crate::tui::chrome::{self, Chrome};
+use crate::tui::selection::Selection;
 use crate::tui::theme;
 
 /// Height of a single plan tile (including its top + bottom border rows).
@@ -54,8 +55,7 @@ pub struct PlanTile {
 /// Plan-list view state.
 ///
 /// Independent of rendering and input handling so it can be unit-tested
-/// without a terminal. Selection multi-select / [N] badges are not part of
-/// step 12; that lands in tui-v1 step 14.
+/// without a terminal.
 pub struct PlanListApp {
     /// Tiles in display order (most recent first; archived excluded).
     pub tiles: Vec<PlanTile>,
@@ -64,6 +64,10 @@ pub struct PlanListApp {
     /// Top of the visible tile window — first tile shown on screen. Bumped
     /// during navigation to keep `selected_index` on-screen.
     pub scroll_offset: usize,
+    /// Multi-selection state, keyed by `Plan.id` so the selection survives a
+    /// refresh that re-orders the tile list. See `Selection` for ordering
+    /// semantics that drive the `[N]` badge.
+    pub selection: Selection<String>,
     /// Whether the user has requested a quit.
     pub should_quit: bool,
     /// Whether the user has requested to open the highlighted tile (push
@@ -86,6 +90,7 @@ impl PlanListApp {
             tiles,
             selected_index: 0,
             scroll_offset: 0,
+            selection: Selection::new(),
             should_quit: false,
             open_request: false,
             display_timezone: display_timezone.into(),
@@ -129,6 +134,36 @@ impl PlanListApp {
             return;
         }
         self.selected_index = self.tiles.len() - 1;
+    }
+
+    // -- Selection --------------------------------------------------------
+
+    /// Toggle multi-select on the currently highlighted tile (`space`).
+    /// No-op when the tile list is empty.
+    pub fn toggle_selection(&mut self) {
+        if self.tiles.is_empty() {
+            return;
+        }
+        let id = self.tiles[self.selected_index].plan.id.clone();
+        self.selection.toggle(id);
+    }
+
+    /// Clear all selections without touching cursor or quit state.
+    pub fn clear_selection(&mut self) {
+        self.selection.clear();
+    }
+
+    /// Handle `<esc>` per TUI-plan.md §5: clear the selection if any items
+    /// are selected, otherwise quit. Returns `true` when the press
+    /// consumed a non-empty selection (so the caller can suppress quit).
+    pub fn escape(&mut self) -> bool {
+        if self.selection.is_empty() {
+            self.should_quit = true;
+            false
+        } else {
+            self.selection.clear();
+            true
+        }
     }
 
     // -- Routing ----------------------------------------------------------
@@ -212,7 +247,7 @@ fn status_dot_color(status: PlanStatus) -> ratatui::style::Color {
 /// Draw the plan-list view, including persistent chrome.
 pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
     let crumbs: [&str; 1] = ["ralph"];
-    let hint = "[j/k] nav  [g/G] top/bottom  [enter] open  [q] quit";
+    let hint = "[j/k] nav  [g/G] top/bottom  [enter] open  [space] select  [q] quit";
     let body = chrome::render(
         frame,
         &Chrome {
@@ -249,7 +284,9 @@ pub fn render_tiles(buf: &mut Buffer, area: Rect, app: &PlanListApp) {
             width: area.width,
             height: tile_h,
         };
-        render_tile(buf, tile_area, tile, idx == app.selected_index, &app.display_timezone);
+        let highlighted = idx == app.selected_index;
+        let badge = app.selection.index_of(&tile.plan.id);
+        render_tile(buf, tile_area, tile, highlighted, badge, &app.display_timezone);
     }
 }
 
@@ -272,11 +309,24 @@ fn update_scroll(app: &mut PlanListApp, body_height: u16) {
     }
 }
 
-fn render_tile(buf: &mut Buffer, area: Rect, tile: &PlanTile, highlighted: bool, tz: &str) {
-    let border_style = if highlighted {
-        Style::default().fg(theme::CURSOR)
-    } else {
-        Style::default().fg(theme::CHROME_DIM)
+fn render_tile(
+    buf: &mut Buffer,
+    area: Rect,
+    tile: &PlanTile,
+    highlighted: bool,
+    selection_badge: Option<usize>,
+    tz: &str,
+) {
+    // §5 border/title color rules:
+    //   default     → CHROME_DIM
+    //   highlighted → CURSOR (#f7d135)
+    //   selected    → SELECTION (#56d0d9)
+    //   both        → SELECTION border + CURSOR-tinted title
+    let selected = selection_badge.is_some();
+    let border_style = match (highlighted, selected) {
+        (_, true) => Style::default().fg(theme::SELECTION),
+        (true, false) => Style::default().fg(theme::CURSOR),
+        (false, false) => Style::default().fg(theme::CHROME_DIM),
     };
 
     let block = Block::default()
@@ -294,12 +344,41 @@ fn render_tile(buf: &mut Buffer, area: Rect, tile: &PlanTile, highlighted: bool,
     // 4 inner rows of a 6-row tile (TUI-plan.md §5). Each row is rendered
     // independently so a clipped inner area (e.g. terminal too short)
     // gracefully drops the bottom rows instead of corrupting layout.
+    let mut title_style = Style::default().add_modifier(Modifier::BOLD);
+    if highlighted && selected {
+        // "Highlighted **and** selected" tints the title with CURSOR so the
+        // user can see both states at once even though the border is
+        // SELECTION-colored.
+        title_style = title_style.fg(theme::CURSOR);
+    }
+    // Reserve space at the right edge of the title row for the `[N]` badge
+    // when this tile is selected. Badge format is `[<digits>]`, e.g. `[12]`.
+    let badge_text = selection_badge.map(|n| format!("[{n}]"));
+    let badge_cols = badge_text.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+    let title_max = (inner.width as usize).saturating_sub(badge_cols);
     let title = Paragraph::new(Line::from(Span::styled(
-        truncate(tile.plan.slug.as_str(), inner.width as usize),
-        Style::default().add_modifier(Modifier::BOLD),
+        truncate(tile.plan.slug.as_str(), title_max),
+        title_style,
     )));
     let title_area = Rect { height: 1, ..inner };
     title.render(title_area, buf);
+    if let Some(text) = badge_text
+        && (inner.width as usize) >= badge_cols
+    {
+        let badge = Paragraph::new(Span::styled(
+            text,
+            Style::default()
+                .fg(theme::SELECTION)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let badge_area = Rect {
+            x: inner.x + inner.width - badge_cols as u16,
+            y: inner.y,
+            width: badge_cols as u16,
+            height: 1,
+        };
+        badge.render(badge_area, buf);
+    }
 
     if inner.height >= 3 {
         let ts_area = Rect {
@@ -557,7 +636,7 @@ mod tests {
         tile.total = 7;
         tile.had_run = true;
         tile.last_activity = Utc.with_ymd_and_hms(2026, 5, 4, 14, 32, 0).unwrap();
-        render_tile(&mut buf, area, &tile, true, "UTC");
+        render_tile(&mut buf, area, &tile, true, None, "UTC");
 
         // Title row contains the slug.
         let row1 = (0..40)
@@ -628,6 +707,134 @@ mod tests {
         app.selected_index = 1;
         update_scroll(&mut app, 24);
         assert_eq!(app.scroll_offset, 1);
+    }
+
+    // -- Selection (state) --------------------------------------------------
+
+    #[test]
+    fn test_toggle_selection_uses_plan_id() {
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.selected_index = 1;
+        app.toggle_selection();
+        assert!(app.selection.is_selected(&"id-plan-1".to_string()));
+        assert_eq!(app.selection.len(), 1);
+
+        // Toggling the same tile again clears it.
+        app.toggle_selection();
+        assert!(!app.selection.is_selected(&"id-plan-1".to_string()));
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn test_toggle_selection_preserves_order_across_tiles() {
+        let mut app = PlanListApp::new(make_tiles(4), "/proj", "UTC");
+        app.selected_index = 2;
+        app.toggle_selection();
+        app.selected_index = 0;
+        app.toggle_selection();
+        app.selected_index = 3;
+        app.toggle_selection();
+        // Order = pick order, not list order.
+        assert_eq!(
+            app.selection.as_slice(),
+            &[
+                "id-plan-2".to_string(),
+                "id-plan-0".to_string(),
+                "id-plan-3".to_string(),
+            ]
+        );
+        assert_eq!(app.selection.index_of(&"id-plan-2".to_string()), Some(1));
+        assert_eq!(app.selection.index_of(&"id-plan-0".to_string()), Some(2));
+        assert_eq!(app.selection.index_of(&"id-plan-3".to_string()), Some(3));
+    }
+
+    #[test]
+    fn test_toggle_selection_empty_tiles_is_noop() {
+        let mut app = PlanListApp::new(vec![], "/proj", "UTC");
+        app.toggle_selection();
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn test_escape_with_no_selection_quits() {
+        let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
+        let consumed = app.escape();
+        assert!(!consumed, "esc without selection should not be consumed");
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_escape_with_selection_clears_and_does_not_quit() {
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.toggle_selection();
+        assert_eq!(app.selection.len(), 1);
+        let consumed = app.escape();
+        assert!(consumed, "esc with selection should be consumed");
+        assert!(app.selection.is_empty());
+        assert!(!app.should_quit);
+    }
+
+    // -- Selection (rendering) ---------------------------------------------
+
+    #[test]
+    fn test_render_tile_with_badge_emits_index_marker() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
+        let area = buf.area;
+        let tile = make_tile("plan");
+        // Selected, not highlighted: SELECTION border + [N] badge.
+        render_tile(&mut buf, area, &tile, false, Some(2), "UTC");
+        let row1 = (0..30).map(|x| buf[(x, 1)].symbol()).collect::<String>();
+        assert!(row1.contains("plan"), "title missing: {row1:?}");
+        assert!(row1.contains("[2]"), "badge missing: {row1:?}");
+    }
+
+    #[test]
+    fn test_render_tile_badge_paints_top_border_corner_with_selection_color() {
+        // Selected tile (no cursor) → border color is SELECTION on every
+        // cell of the top border row.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 6));
+        let area = buf.area;
+        let tile = make_tile("plan");
+        render_tile(&mut buf, area, &tile, false, Some(1), "UTC");
+        // Top-left corner cell carries the border style.
+        let style = buf[(0, 0)].style();
+        assert_eq!(style.fg, Some(theme::SELECTION));
+    }
+
+    #[test]
+    fn test_render_tile_highlighted_only_uses_cursor_border() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 6));
+        let area = buf.area;
+        let tile = make_tile("plan");
+        render_tile(&mut buf, area, &tile, true, None, "UTC");
+        let style = buf[(0, 0)].style();
+        assert_eq!(style.fg, Some(theme::CURSOR));
+    }
+
+    #[test]
+    fn test_render_tile_highlighted_and_selected_uses_selection_border() {
+        // §5: both states → SELECTION border with CURSOR-tinted title.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 6));
+        let area = buf.area;
+        let tile = make_tile("plan");
+        render_tile(&mut buf, area, &tile, true, Some(1), "UTC");
+        // Border color is SELECTION.
+        assert_eq!(buf[(0, 0)].style().fg, Some(theme::SELECTION));
+        // The first character of the slug ("p") sits at inner.x = 1, y = 1.
+        // Its fg should be CURSOR.
+        assert_eq!(buf[(1, 1)].symbol(), "p");
+        assert_eq!(buf[(1, 1)].style().fg, Some(theme::CURSOR));
+    }
+
+    #[test]
+    fn test_render_tiles_renders_badge_for_selected_plan() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
+        let area = buf.area;
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.toggle_selection();
+        render_tiles(&mut buf, area, &app);
+        let row1 = (0..30).map(|x| buf[(x, 1)].symbol()).collect::<String>();
+        assert!(row1.contains("[1]"), "expected [1] badge: {row1:?}");
     }
 
     #[test]

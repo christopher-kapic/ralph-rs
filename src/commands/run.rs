@@ -306,6 +306,10 @@ pub fn run_plan_list_tui(
                     KeyCode::Char('k') | KeyCode::Up => app.navigate_up(),
                     KeyCode::Char('g') => app.jump_top(),
                     KeyCode::Char('G') => app.jump_bottom(),
+                    KeyCode::Char(' ') => app.toggle_selection(),
+                    KeyCode::Esc => {
+                        let _ = app.escape();
+                    }
                     KeyCode::Enter => {
                         // Step 19 of tui-v1 wires plan-detail routing onto the
                         // selected slug; until then we just record the request.
