@@ -205,6 +205,10 @@ struct ExecCtx<'a> {
     hook_ctx: &'a HookContext,
     step_num: i32,
     max_attempts: i32,
+    /// True when the parent runner is emitting NDJSON. Threaded to
+    /// [`write_phase`] so phase transitions also emit a
+    /// [`crate::output::RunEvent::PhaseChanged`].
+    json_output: bool,
 }
 
 /// Write a phase transition to the run_locks row. Thin wrapper over
@@ -218,6 +222,10 @@ struct ExecCtx<'a> {
 /// attempt after the harness spawns), and [`ChildUpdate::Clear`] wipes both
 /// columns to NULL (used by every post-harness phase so the row stops
 /// advertising a dead pid).
+///
+/// When `json_output` is true, a [`crate::output::RunEvent::PhaseChanged`]
+/// is emitted to stdout after the storage update so NDJSON consumers (the
+/// TUI, meta-harnesses) can redraw the phase indicator without polling.
 #[allow(clippy::too_many_arguments)]
 fn write_phase(
     conn: &Connection,
@@ -230,6 +238,7 @@ fn write_phase(
     phase: Phase,
     current_command: Option<&str>,
     child: ChildUpdate<'_>,
+    json_output: bool,
 ) -> Result<()> {
     storage::update_live_phase(
         conn,
@@ -242,7 +251,11 @@ fn write_phase(
         execution_log_id,
         current_command,
         child,
-    )
+    )?;
+    if json_output {
+        crate::output::emit_ndjson(&crate::output::RunEvent::PhaseChanged { phase })?;
+    }
+    Ok(())
 }
 
 /// Optional harness output fields attached to a terminal failure.
@@ -288,6 +301,7 @@ async fn finalize_failure(
             Phase::Rollback,
             None,
             ChildUpdate::Clear,
+            ctx.json_output,
         )?;
         git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)?;
         true
@@ -348,6 +362,7 @@ async fn finalize_failure(
         Phase::PostStepHook,
         None,
         ChildUpdate::Clear,
+        ctx.json_output,
     )?;
     hooks::run_post_step(
         ctx.conn,
@@ -510,6 +525,7 @@ pub async fn execute_step(
         hook_ctx,
         step_num,
         max_attempts,
+        json_output: exec_opts.json_output,
     };
 
     // Previous attempt context for retries.
@@ -638,6 +654,7 @@ pub async fn execute_step(
             Phase::PreStepHook,
             None,
             ChildUpdate::Clear,
+            exec_opts.json_output,
         )?;
 
         // Run pre-step hook.
@@ -676,6 +693,7 @@ pub async fn execute_step(
                     Phase::PostStepHook,
                     None,
                     ChildUpdate::Clear,
+                    exec_opts.json_output,
                 )?;
                 hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir)
                     .await?;
@@ -698,6 +716,7 @@ pub async fn execute_step(
                 Phase::PostStepHook,
                 None,
                 ChildUpdate::Clear,
+                exec_opts.json_output,
             )?;
             hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir).await?;
             continue;
@@ -737,6 +756,7 @@ pub async fn execute_step(
             Phase::Harness,
             Some(harness_name),
             ChildUpdate::Keep,
+            exec_opts.json_output,
         )?;
 
         // Spawn harness subprocess. The tempfile (if any) must outlive
@@ -774,6 +794,7 @@ pub async fn execute_step(
                 },
                 None => ChildUpdate::Keep,
             },
+            exec_opts.json_output,
         )?;
 
         // Wait with timeout and abort racing.
@@ -850,6 +871,7 @@ pub async fn execute_step(
                             Phase::Rollback,
                             None,
                             ChildUpdate::Clear,
+                            exec_opts.json_output,
                         )?;
                         git::rollback_except(workdir, &pre_existing_untracked)?;
                     }
@@ -904,6 +926,7 @@ pub async fn execute_step(
                         Phase::PreTestHook,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     if let Err(e) =
                         hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir).await
@@ -924,6 +947,7 @@ pub async fn execute_step(
                         Phase::Tests,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     let test_results = test_runner::run_tests(
                         &plan.deterministic_tests,
@@ -951,6 +975,7 @@ pub async fn execute_step(
                         Phase::PostTestHook,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     hooks::run_post_test(
                         conn,
@@ -1000,6 +1025,7 @@ pub async fn execute_step(
                             Phase::Rollback,
                             None,
                             ChildUpdate::Clear,
+                            exec_opts.json_output,
                         )?;
                         git::rollback_except(workdir, &pre_existing_untracked)?;
                     }
@@ -1070,6 +1096,7 @@ pub async fn execute_step(
                         Phase::PostStepHook,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir)
                         .await?;
@@ -1099,6 +1126,7 @@ pub async fn execute_step(
                         Phase::Commit,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     git::stage_except(workdir, &pre_existing_untracked)?;
                     git::commit_staged(workdir, &commit_msg)?;
@@ -1147,6 +1175,7 @@ pub async fn execute_step(
                         Phase::PostStepHook,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir)
                         .await?;
@@ -1220,6 +1249,7 @@ pub async fn execute_step(
                         Phase::Rollback,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     git::rollback_except(workdir, &pre_existing_untracked)?;
                 }

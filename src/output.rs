@@ -90,7 +90,6 @@ pub enum RunEvent {
     },
     /// Emitted on every transition recorded into `run_locks.phase`. Lets the
     /// TUI redraw the phase indicator without polling.
-    #[allow(dead_code)] // Emit site lands in a later step (TUI-plan §13.1).
     PhaseChanged { phase: Phase },
     /// Final event for `ralph run`, replacing the role of `plan_complete` for
     /// human-readable summary consumers. `plan_complete` is **kept** for one
