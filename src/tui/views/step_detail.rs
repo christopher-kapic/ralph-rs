@@ -26,6 +26,9 @@ use crate::storage::{self, ProjectSettings};
 use crate::tui::chrome::{self, Chrome};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
+use crate::tui::views::step_detail_picker::{
+    BottomCell, PickerKind, PickerOutcome, PickerState,
+};
 
 /// Sentinel rendered in dim style when a pane's source-of-truth value is
 /// `None` or empty. Distinguishes "no value configured" from "configured to
@@ -564,6 +567,16 @@ pub struct StepDetailApp {
     /// construction, per TUI-plan.md §8 ("most recent by default"). When
     /// `execution_logs` is empty this is `0` and ignored by the renderer.
     pub appended_attempt_index: usize,
+
+    /// Currently focused sub-cell within the bottom row. `h`/`l` walks
+    /// between cells while [`Pane::BottomRow`] has focus; `c` opens the
+    /// picker for the focused cell (TUI-plan.md §8 "Bottom-row inline editors").
+    pub bottom_focus: BottomCell,
+
+    /// Active bottom-row picker, or `None` when no picker is open. Set by
+    /// [`Self::open_picker_for_focused_cell`] and cleared by either a
+    /// `Cancelled` or `Submit` outcome from the picker's key loop.
+    pub picker: Option<PickerState>,
 }
 
 impl StepDetailApp {
@@ -608,6 +621,8 @@ impl StepDetailApp {
             harness_default_models,
             execution_logs,
             appended_attempt_index,
+            bottom_focus: BottomCell::Harness,
+            picker: None,
         }
     }
 
@@ -729,23 +744,217 @@ impl StepDetailApp {
         true
     }
 
-    /// Handle `h` / `←` in the step-detail view per §8. The Appended pane
-    /// intercepts the key first when a previous attempt exists; otherwise
-    /// (Appended at leftmost OR any other pane focused) the view pops back
-    /// to plan-detail.
+    /// Handle `h` / `←` in the step-detail view per §8. Three priority
+    /// branches:
+    ///
+    /// 1. Appended pane with a previous attempt available — paginate left.
+    /// 2. BottomRow pane with a sub-cell to the left — move bottom focus.
+    /// 3. Otherwise (any pane, edges fall through) — pop the view.
     pub fn handle_left(&mut self) {
         if self.focused_pane == Pane::Appended && self.appended_prev() {
+            return;
+        }
+        if self.focused_pane == Pane::BottomRow
+            && let Some(prev) = self.bottom_focus.move_left()
+        {
+            self.bottom_focus = prev;
             return;
         }
         self.request_pop();
     }
 
-    /// Handle `l` / `→` in the step-detail view per §8. Only meaningful on
-    /// the Appended pane (advances to the next attempt); a no-op elsewhere.
+    /// Handle `l` / `→` in the step-detail view per §8 + step 27. Either
+    /// advances the Appended-pane attempt index or moves bottom-row focus
+    /// one cell to the right; on any other pane (or at the row's right
+    /// edge) it's a no-op.
     pub fn handle_right(&mut self) {
         if self.focused_pane == Pane::Appended {
             self.appended_next();
+            return;
         }
+        if self.focused_pane == Pane::BottomRow
+            && let Some(next) = self.bottom_focus.move_right()
+        {
+            self.bottom_focus = next;
+        }
+    }
+
+    // -- Bottom-row pickers (TUI-plan.md §8 + step 27) -------------------
+
+    /// Open the picker for the currently focused bottom-row sub-cell.
+    /// `agents` is the sorted, deduplicated list of agent filenames (without
+    /// the `.md` extension) — passed in rather than fetched from disk so
+    /// tests can inject a known list and the dispatcher can refresh once
+    /// per picker open.
+    ///
+    /// No-op when the focused pane isn't [`Pane::BottomRow`] or when a
+    /// picker is already open. When the plan has no steps, the picker still
+    /// builds against the resolved (fallback) values — the Submit path then
+    /// short-circuits in `apply_picker_submit` since there's no step row to
+    /// write to.
+    pub fn open_picker_for_focused_cell(&mut self, agents: &[String]) {
+        if self.focused_pane != Pane::BottomRow || self.picker.is_some() {
+            return;
+        }
+        let harnesses = self.harness_picker_options();
+        let harness = self.effective_harness();
+        let model_default = self.harness_default_models.get(&harness).cloned().flatten();
+        let current_model = self.current_step().and_then(|s| s.model.clone());
+        let current_agent = self.current_step().and_then(|s| s.agent.clone());
+        let current_policy = self.effective_change_policy();
+
+        let picker = match self.bottom_focus {
+            BottomCell::Harness => {
+                PickerState::for_harness(&harnesses, Some(harness.as_str()))
+            }
+            BottomCell::Model => {
+                PickerState::for_model(model_default.as_deref(), current_model.as_deref())
+            }
+            BottomCell::Agent => {
+                PickerState::for_agent(agents, current_agent.as_deref())
+            }
+            BottomCell::ChangePolicy => PickerState::for_change_policy(current_policy),
+        };
+        self.picker = Some(picker);
+    }
+
+    /// Close any open picker without writing — used by the Cancelled
+    /// outcome and on view pop.
+    pub fn close_picker(&mut self) {
+        self.picker = None;
+    }
+
+    /// Sorted, deduplicated `Config.harnesses` keys, derived from the
+    /// per-harness `default_model` lookup we already cached at construction.
+    /// Sorting keeps the picker order deterministic across renders.
+    fn harness_picker_options(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.harness_default_models.keys().cloned().collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Apply a picker submission. Writes the chosen value through
+    /// [`storage::update_step_fields_ext`] and refreshes the matching
+    /// in-memory step field so the bottom row re-renders the new value
+    /// without a reload. No-op when the plan has no steps under the
+    /// current selection.
+    ///
+    /// `kind` and `value` come straight from [`PickerOutcome::Submit`].
+    /// The Change-policy submission is parsed back to the enum;
+    /// unrecognized strings (which the picker can't produce in normal use)
+    /// are rejected to keep the column constraint intact.
+    pub fn apply_picker_submit(
+        &mut self,
+        conn: &Connection,
+        kind: PickerKind,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        let Some(step) = self.steps.get(self.selected_step_index).cloned() else {
+            // Empty plan — the picker shouldn't have opened, but be defensive.
+            return Ok(());
+        };
+        match kind {
+            PickerKind::Harness => {
+                storage::update_step_fields_ext(
+                    conn,
+                    &step.id,
+                    None,
+                    None,
+                    None,
+                    Some(Some(value)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+                if let Some(s) = self.steps.get_mut(self.selected_step_index) {
+                    s.harness = Some(value.to_string());
+                }
+            }
+            PickerKind::Model => {
+                storage::update_step_fields_ext(
+                    conn,
+                    &step.id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(Some(value)),
+                    None,
+                    None,
+                )?;
+                if let Some(s) = self.steps.get_mut(self.selected_step_index) {
+                    s.model = Some(value.to_string());
+                }
+            }
+            PickerKind::Agent => {
+                storage::update_step_fields_ext(
+                    conn,
+                    &step.id,
+                    None,
+                    None,
+                    Some(Some(value)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+                if let Some(s) = self.steps.get_mut(self.selected_step_index) {
+                    s.agent = Some(value.to_string());
+                }
+            }
+            PickerKind::ChangePolicy => {
+                let policy: ChangePolicy = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("Unrecognized change policy: {value}"))?;
+                storage::update_step_fields_ext(
+                    conn,
+                    &step.id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(policy),
+                    None,
+                )?;
+                if let Some(s) = self.steps.get_mut(self.selected_step_index) {
+                    s.change_policy = policy;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drive one key event into the active picker. Wraps
+    /// [`PickerState::handle_key`] so the dispatcher doesn't have to clone
+    /// the `kind` / `value` out of the borrow checker's way: returning
+    /// `Some(Submit)` means the caller should call
+    /// [`Self::apply_picker_submit`] and then `close_picker`.
+    pub fn picker_handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Option<PickerOutcome> {
+        let picker = self.picker.as_mut()?;
+        let outcome = picker.handle_key(key);
+        // The state machine reports Pending when the user confirms the
+        // synthetic Custom… row — flip the mode so the next render shows
+        // the input field.
+        if outcome == PickerOutcome::Pending
+            && key.code == crossterm::event::KeyCode::Enter
+            && picker.is_custom_row_selected()
+        {
+            picker.enter_custom_input();
+        }
+        Some(outcome)
     }
 
     /// Title shown on the Appended pane's bordered block. Includes the
@@ -1119,6 +1328,10 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
 
     draw_sidebar(frame, app, main[0]);
     draw_pane_stack(frame, app, main[1]);
+
+    if let Some(picker) = &app.picker {
+        super::step_detail_picker::render(frame, frame.area(), picker);
+    }
 
     if let Some(toast) = app.toasts.current() {
         let area = frame.area();
@@ -1558,28 +1771,36 @@ fn render_bottom_row(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
         .split(area);
 
     let entries = [
-        ("Harness", Some(app.effective_harness())),
-        ("Model", app.effective_model()),
-        ("Agent", app.effective_agent()),
+        (BottomCell::Harness, "Harness", Some(app.effective_harness())),
+        (BottomCell::Model, "Model", app.effective_model()),
+        (BottomCell::Agent, "Agent", app.effective_agent()),
         (
+            BottomCell::ChangePolicy,
             "Change policy",
             Some(app.effective_change_policy().to_string()),
         ),
     ];
 
-    for (i, (label, value)) in entries.iter().enumerate() {
+    let row_focused = app.focused_pane == Pane::BottomRow;
+    for (i, (cell, label, value)) in entries.iter().enumerate() {
         if cells[i].width == 0 {
             continue;
         }
+        let cell_focused = row_focused && app.bottom_focus == *cell;
+        let label_style = if cell_focused {
+            Style::default()
+                .fg(theme::CURSOR)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
         let value_span = match value {
             Some(s) if !s.is_empty() => Span::raw(s.clone()),
             _ => Span::styled(EMPTY_CELL.to_string(), Style::default().fg(theme::CHROME_DIM)),
         };
         let line = Line::from(vec![
-            Span::styled(
-                format!("{label}: "),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(format!("{label}: "), label_style),
             value_span,
         ]);
         let para = Paragraph::new(line);
@@ -3669,5 +3890,412 @@ cargo clippy
             reloaded.deterministic_tests,
             vec!["cargo test".to_string(), "cargo clippy -- -D warnings".to_string()]
         );
+    }
+
+    // -- Bottom-row sub-cell focus + picker integration (TUI-plan §8 + step 27) --
+
+    use crate::tui::views::step_detail_picker::{
+        BottomCell, PickerKind, PickerMode, PickerOutcome,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn k(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Build a step-app with a real DB-backed plan + step row so picker
+    /// submissions can be verified by reloading the row. Mirrors
+    /// `setup_step_app` but used here for picker tests.
+    fn setup_picker_app(conn: &Connection) -> StepDetailApp {
+        let plan = crate::storage::create_plan(
+            conn,
+            "tui-v1",
+            "/proj",
+            "tui-v1",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _pos) = crate::storage::create_step(
+            conn,
+            &plan.id,
+            "Original title",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        StepDetailApp::new(
+            plan,
+            vec![step],
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+            Vec::new(),
+        )
+    }
+
+    // -- bottom_focus: default + h/l movement -----------------------------
+
+    #[test]
+    fn bottom_focus_defaults_to_harness() {
+        let app = make_app(1, 0);
+        assert_eq!(app.bottom_focus, BottomCell::Harness);
+    }
+
+    #[test]
+    fn handle_right_on_bottom_row_walks_cells() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.handle_right();
+        assert_eq!(app.bottom_focus, BottomCell::Model);
+        app.handle_right();
+        assert_eq!(app.bottom_focus, BottomCell::Agent);
+        app.handle_right();
+        assert_eq!(app.bottom_focus, BottomCell::ChangePolicy);
+        // At the rightmost — no-op.
+        app.handle_right();
+        assert_eq!(app.bottom_focus, BottomCell::ChangePolicy);
+        assert!(!app.should_pop);
+    }
+
+    #[test]
+    fn handle_left_on_bottom_row_walks_cells_and_pops_at_leftmost() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.bottom_focus = BottomCell::ChangePolicy;
+        app.handle_left();
+        assert_eq!(app.bottom_focus, BottomCell::Agent);
+        app.handle_left();
+        assert_eq!(app.bottom_focus, BottomCell::Model);
+        app.handle_left();
+        assert_eq!(app.bottom_focus, BottomCell::Harness);
+        // At the leftmost — h falls through to popping the view per §8.
+        assert!(!app.should_pop);
+        app.handle_left();
+        assert!(app.should_pop);
+    }
+
+    #[test]
+    fn handle_right_on_non_bottom_pane_does_not_move_bottom_focus() {
+        // Sanity check — l on Step prompt must not pollute bottom_focus.
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::StepPrompt;
+        app.handle_right();
+        assert_eq!(app.bottom_focus, BottomCell::Harness);
+    }
+
+    #[test]
+    fn handle_left_on_non_bottom_pane_pops_without_touching_bottom_focus() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::StepPrompt;
+        app.bottom_focus = BottomCell::Model; // pre-existing focus
+        app.handle_left();
+        assert!(app.should_pop);
+        assert_eq!(app.bottom_focus, BottomCell::Model);
+    }
+
+    // -- open_picker_for_focused_cell -------------------------------------
+
+    #[test]
+    fn open_picker_no_op_when_not_on_bottom_row() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::StepPrompt;
+        app.open_picker_for_focused_cell(&[]);
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn open_picker_no_op_when_already_open() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.open_picker_for_focused_cell(&[]);
+        assert!(app.picker.is_some());
+        let kind_before = app.picker.as_ref().unwrap().kind;
+        // Try to open again with a different focus — the existing picker
+        // must not be replaced.
+        app.bottom_focus = BottomCell::ChangePolicy;
+        app.open_picker_for_focused_cell(&[]);
+        assert_eq!(app.picker.as_ref().unwrap().kind, kind_before);
+    }
+
+    #[test]
+    fn open_picker_for_harness_cell_uses_config_keys() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.bottom_focus = BottomCell::Harness;
+        app.open_picker_for_focused_cell(&[]);
+        let picker = app.picker.as_ref().expect("picker open");
+        assert_eq!(picker.kind, PickerKind::Harness);
+        // The default Config seeds at least the "claude" harness; the
+        // picker should preselect the effective harness.
+        assert!(!picker.items.is_empty());
+    }
+
+    #[test]
+    fn open_picker_for_model_cell_includes_custom() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.bottom_focus = BottomCell::Model;
+        app.open_picker_for_focused_cell(&[]);
+        let picker = app.picker.as_ref().expect("picker open");
+        assert_eq!(picker.kind, PickerKind::Model);
+        // At least one entry — the synthetic Custom… row is always present.
+        assert!(!picker.items.is_empty());
+    }
+
+    #[test]
+    fn open_picker_for_agent_cell_uses_provided_list() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.bottom_focus = BottomCell::Agent;
+        app.open_picker_for_focused_cell(&["alpha".into(), "beta".into()]);
+        let picker = app.picker.as_ref().expect("picker open");
+        assert_eq!(picker.kind, PickerKind::Agent);
+        assert_eq!(picker.items.len(), 2);
+    }
+
+    #[test]
+    fn open_picker_for_change_policy_lists_two_options() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.bottom_focus = BottomCell::ChangePolicy;
+        app.open_picker_for_focused_cell(&[]);
+        let picker = app.picker.as_ref().expect("picker open");
+        assert_eq!(picker.kind, PickerKind::ChangePolicy);
+        assert_eq!(picker.items.len(), 2);
+    }
+
+    #[test]
+    fn close_picker_clears_state() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.open_picker_for_focused_cell(&[]);
+        assert!(app.picker.is_some());
+        app.close_picker();
+        assert!(app.picker.is_none());
+    }
+
+    // -- picker_handle_key key plumbing -----------------------------------
+
+    #[test]
+    fn picker_handle_key_returns_none_when_no_picker_open() {
+        let mut app = make_app(1, 0);
+        assert!(app.picker_handle_key(k(KeyCode::Esc)).is_none());
+    }
+
+    #[test]
+    fn picker_handle_key_esc_returns_cancelled() {
+        // Acceptance criterion: esc cancellation (no DB write).
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.bottom_focus = BottomCell::ChangePolicy;
+        app.open_picker_for_focused_cell(&[]);
+        let outcome = app.picker_handle_key(k(KeyCode::Esc)).unwrap();
+        assert_eq!(outcome, PickerOutcome::Cancelled);
+    }
+
+    #[test]
+    fn picker_handle_key_enter_on_value_returns_submit() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.bottom_focus = BottomCell::ChangePolicy;
+        app.open_picker_for_focused_cell(&[]);
+        // Move from required (idx 0) to optional (idx 1).
+        let _ = app.picker_handle_key(k(KeyCode::Char('j')));
+        let outcome = app.picker_handle_key(k(KeyCode::Enter)).unwrap();
+        match outcome {
+            PickerOutcome::Submit { kind, value } => {
+                assert_eq!(kind, PickerKind::ChangePolicy);
+                assert_eq!(value, "optional");
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn picker_handle_key_enter_on_custom_flips_into_input_mode() {
+        let mut app = make_app(1, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.bottom_focus = BottomCell::Model;
+        app.open_picker_for_focused_cell(&[]);
+        // Walk to the last item — the synthetic Custom… row.
+        let len = app.picker.as_ref().unwrap().items.len();
+        for _ in 0..len.saturating_sub(1) {
+            let _ = app.picker_handle_key(k(KeyCode::Char('j')));
+        }
+        // Confirm — picker_handle_key should flip into input mode.
+        let outcome = app.picker_handle_key(k(KeyCode::Enter)).unwrap();
+        assert_eq!(outcome, PickerOutcome::Pending);
+        assert!(matches!(
+            app.picker.as_ref().unwrap().mode,
+            PickerMode::CustomInput { .. }
+        ));
+    }
+
+    // -- apply_picker_submit: DB writes -----------------------------------
+
+    #[test]
+    fn apply_picker_submit_harness_writes_through_update_step_fields_ext() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_picker_app(&conn);
+        app.apply_picker_submit(&conn, PickerKind::Harness, "codex")
+            .unwrap();
+        // In-memory step refreshed.
+        assert_eq!(app.steps[0].harness.as_deref(), Some("codex"));
+        // DB row reloads to the same value.
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].harness.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn apply_picker_submit_model_writes_through_update_step_fields_ext() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_picker_app(&conn);
+        app.apply_picker_submit(&conn, PickerKind::Model, "claude-opus-4-7")
+            .unwrap();
+        assert_eq!(app.steps[0].model.as_deref(), Some("claude-opus-4-7"));
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    #[test]
+    fn apply_picker_submit_agent_writes_through_update_step_fields_ext() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_picker_app(&conn);
+        app.apply_picker_submit(&conn, PickerKind::Agent, "rust-impl")
+            .unwrap();
+        assert_eq!(app.steps[0].agent.as_deref(), Some("rust-impl"));
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].agent.as_deref(), Some("rust-impl"));
+    }
+
+    #[test]
+    fn apply_picker_submit_change_policy_writes_optional() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_picker_app(&conn);
+        // Default policy is required — switch to optional.
+        assert_eq!(app.steps[0].change_policy, ChangePolicy::Required);
+        app.apply_picker_submit(&conn, PickerKind::ChangePolicy, "optional")
+            .unwrap();
+        assert_eq!(app.steps[0].change_policy, ChangePolicy::Optional);
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].change_policy, ChangePolicy::Optional);
+    }
+
+    #[test]
+    fn apply_picker_submit_change_policy_rejects_unknown_string() {
+        // The picker can't produce an invalid string in normal use, but the
+        // apply path validates as a defense against future code that builds
+        // a PickerOutcome::Submit by hand.
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_picker_app(&conn);
+        let res = app.apply_picker_submit(&conn, PickerKind::ChangePolicy, "garbage");
+        assert!(res.is_err());
+        // Step row untouched — change_policy stays at the default.
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].change_policy, ChangePolicy::Required);
+    }
+
+    #[test]
+    fn apply_picker_submit_no_op_on_empty_plan() {
+        // Empty plan ⇒ no step row to write to. The apply path silently
+        // returns Ok rather than panicking on the missing index.
+        let conn = crate::db::open_memory().unwrap();
+        let plan = crate::storage::create_plan(
+            &conn, "empty", "/proj2", "empty", "desc", None, None, &[],
+        )
+        .unwrap();
+        let mut app = StepDetailApp::new(
+            plan,
+            Vec::new(),
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+            Vec::new(),
+        );
+        let res = app.apply_picker_submit(&conn, PickerKind::Harness, "codex");
+        assert!(res.is_ok());
+    }
+
+    // -- End-to-end flows: open → confirm → apply / open → cancel ---------
+
+    #[test]
+    fn end_to_end_open_select_apply_change_policy() {
+        // Acceptance: selection + DB write through the full picker flow.
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_picker_app(&conn);
+        app.focused_pane = Pane::BottomRow;
+        app.bottom_focus = BottomCell::ChangePolicy;
+        app.open_picker_for_focused_cell(&[]);
+
+        // Move from Required (idx 0) to Optional (idx 1) and confirm.
+        let _ = app.picker_handle_key(k(KeyCode::Char('j')));
+        let outcome = app.picker_handle_key(k(KeyCode::Enter)).unwrap();
+        match outcome {
+            PickerOutcome::Submit { kind, value } => {
+                app.apply_picker_submit(&conn, kind, &value).unwrap();
+                app.close_picker();
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+        assert!(app.picker.is_none());
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].change_policy, ChangePolicy::Optional);
+    }
+
+    #[test]
+    fn end_to_end_open_esc_no_db_write() {
+        // Acceptance: esc cancellation leaves the row untouched.
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_picker_app(&conn);
+        app.focused_pane = Pane::BottomRow;
+        app.bottom_focus = BottomCell::ChangePolicy;
+        app.open_picker_for_focused_cell(&[]);
+        let outcome = app.picker_handle_key(k(KeyCode::Esc)).unwrap();
+        assert_eq!(outcome, PickerOutcome::Cancelled);
+        app.close_picker();
+        assert!(app.picker.is_none());
+        // Row unchanged.
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].change_policy, ChangePolicy::Required);
+    }
+
+    #[test]
+    fn end_to_end_model_custom_input_submits_typed_value() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_picker_app(&conn);
+        app.focused_pane = Pane::BottomRow;
+        app.bottom_focus = BottomCell::Model;
+        app.open_picker_for_focused_cell(&[]);
+
+        // Walk to the Custom… row (always last).
+        let len = app.picker.as_ref().unwrap().items.len();
+        for _ in 0..len.saturating_sub(1) {
+            let _ = app.picker_handle_key(k(KeyCode::Char('j')));
+        }
+        // Confirm — flips into input mode.
+        let _ = app.picker_handle_key(k(KeyCode::Enter)).unwrap();
+        for c in "claude-opus-4-7".chars() {
+            let _ = app.picker_handle_key(k(KeyCode::Char(c)));
+        }
+        // Submit the typed value.
+        let outcome = app.picker_handle_key(k(KeyCode::Enter)).unwrap();
+        match outcome {
+            PickerOutcome::Submit { kind, value } => {
+                assert_eq!(kind, PickerKind::Model);
+                app.apply_picker_submit(&conn, kind, &value).unwrap();
+            }
+            other => panic!("expected Submit, got {other:?}"),
+        }
+        let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].model.as_deref(), Some("claude-opus-4-7"));
     }
 }
