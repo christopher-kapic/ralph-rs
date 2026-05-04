@@ -214,6 +214,26 @@ pub fn update_plan_status(conn: &Connection, plan_id: &str, status: PlanStatus) 
     Ok(())
 }
 
+/// Set the `plans.questions_enabled` flag and bump `updated_at`.
+///
+/// Drives the `Q` keybinding in the TUI plan list (TUI-plan.md §17) and the
+/// `ralph plan questions on|off` CLI commands. SQLite has no native bool, so
+/// the value is stored as INTEGER 0/1.
+pub fn set_plan_questions_enabled(
+    conn: &Connection,
+    plan_id: &str,
+    enabled: bool,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET questions_enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![enabled as i64, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
 /// Delete a plan (cascades to steps and execution_logs via FK).
 pub fn delete_plan(conn: &Connection, plan_id: &str) -> Result<()> {
     let affected = conn.execute("DELETE FROM plans WHERE id = ?1", params![plan_id])?;
@@ -1846,6 +1866,29 @@ mod tests {
         assert_eq!(found.status, PlanStatus::InProgress);
         // updated_at should have changed
         assert!(found.updated_at >= plan.updated_at);
+    }
+
+    #[test]
+    fn test_set_plan_questions_enabled_flips_column() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        assert!(!plan.questions_enabled, "default should be off");
+
+        set_plan_questions_enabled(&conn, &plan.id, true).unwrap();
+        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert!(on.questions_enabled);
+        assert!(on.updated_at >= plan.updated_at);
+
+        set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
+        let off = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert!(!off.questions_enabled);
+    }
+
+    #[test]
+    fn test_set_plan_questions_enabled_missing_plan_errs() {
+        let conn = setup();
+        let err = set_plan_questions_enabled(&conn, "no-such-id", true).unwrap_err();
+        assert!(err.to_string().contains("Plan not found"));
     }
 
     #[test]

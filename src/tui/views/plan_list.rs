@@ -192,6 +192,15 @@ impl PlanListApp {
         self.should_quit = true;
     }
 
+    // -- Cursor target ----------------------------------------------------
+
+    /// The plan currently under the cursor, if any. Used by single-target
+    /// keybindings (`A` approve, `Q` toggle questions) that act only on the
+    /// highlighted tile and ignore multi-selection.
+    pub fn cursor_plan(&self) -> Option<&Plan> {
+        self.tiles.get(self.selected_index).map(|t| &t.plan)
+    }
+
     // -- Archive ----------------------------------------------------------
 
     /// Plan IDs that the next `d` archive should affect, per TUI-plan.md §5:
@@ -206,6 +215,17 @@ impl PlanListApp {
             vec![self.tiles[self.selected_index].plan.id.clone()]
         } else {
             Vec::new()
+        }
+    }
+
+    /// Replace one plan's row in-place after a single-plan mutation (e.g. `A`
+    /// approve, `Q` questions toggle). Unlike [`Self::refresh_tiles`], this
+    /// preserves selection, cursor, and scroll — appropriate for cursor-only
+    /// actions that do not consume the selection. No-op if `updated.id` is
+    /// not currently in the tile list.
+    pub fn update_plan_in_place(&mut self, updated: Plan) {
+        if let Some(tile) = self.tiles.iter_mut().find(|t| t.plan.id == updated.id) {
+            tile.plan = updated;
         }
     }
 
@@ -288,8 +308,7 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
     app.toasts.prune(Instant::now());
 
     let crumbs: [&str; 1] = ["ralph"];
-    let hint =
-        "[j/k] nav  [g/G] top/bottom  [enter] open  [space] select  [d] archive  [q] quit";
+    let hint = "[j/k] nav  [enter] open  [space] select  [A] approve  [Q] questions  [d] archive  [q] quit";
     let body = chrome::render(
         frame,
         &Chrome {
@@ -911,6 +930,22 @@ mod tests {
         assert!(row1.contains("[1]"), "expected [1] badge: {row1:?}");
     }
 
+    // -- Cursor target ------------------------------------------------------
+
+    #[test]
+    fn cursor_plan_returns_highlighted_plan() {
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.selected_index = 1;
+        let plan = app.cursor_plan().expect("expected cursor plan");
+        assert_eq!(plan.slug, "plan-1");
+    }
+
+    #[test]
+    fn cursor_plan_empty_returns_none() {
+        let app = PlanListApp::new(vec![], "/proj", "UTC");
+        assert!(app.cursor_plan().is_none());
+    }
+
     // -- Archive targets ----------------------------------------------------
 
     #[test]
@@ -945,6 +980,56 @@ mod tests {
     fn archive_targets_empty_tiles_no_selection() {
         let app = PlanListApp::new(vec![], "/proj", "UTC");
         assert!(app.archive_targets().is_empty());
+    }
+
+    // -- In-place update ----------------------------------------------------
+
+    #[test]
+    fn update_plan_in_place_replaces_matching_tile() {
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.selected_index = 1;
+        let mut updated = make_plan("plan-1");
+        updated.status = PlanStatus::Ready;
+        updated.questions_enabled = true;
+        app.update_plan_in_place(updated);
+        let tile = &app.tiles[1];
+        assert_eq!(tile.plan.status, PlanStatus::Ready);
+        assert!(tile.plan.questions_enabled);
+        // Other tiles unchanged.
+        assert_eq!(app.tiles[0].plan.status, PlanStatus::Ready);
+        assert!(!app.tiles[0].plan.questions_enabled);
+    }
+
+    #[test]
+    fn update_plan_in_place_preserves_selection_and_cursor() {
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.selected_index = 2;
+        app.toggle_selection();
+        app.selected_index = 0;
+        app.toggle_selection();
+        assert_eq!(app.selection.len(), 2);
+
+        let mut updated = make_plan("plan-1");
+        updated.status = PlanStatus::Failed;
+        app.update_plan_in_place(updated);
+
+        // Selection and cursor are untouched.
+        assert_eq!(app.selection.len(), 2);
+        assert_eq!(app.selected_index, 0);
+        assert!(app.selection.is_selected(&"id-plan-2".to_string()));
+        assert!(app.selection.is_selected(&"id-plan-0".to_string()));
+    }
+
+    #[test]
+    fn update_plan_in_place_no_match_is_noop() {
+        let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
+        let mut other = make_plan("other");
+        other.id = "id-not-in-list".to_string();
+        app.update_plan_in_place(other);
+        // Tiles unchanged.
+        assert_eq!(app.tiles.len(), 2);
+        assert_eq!(app.tiles[0].plan.slug, "plan-0");
+        assert_eq!(app.tiles[1].plan.slug, "plan-1");
     }
 
     // -- Refresh tiles ------------------------------------------------------

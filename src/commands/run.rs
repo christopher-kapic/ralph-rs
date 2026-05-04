@@ -341,6 +341,12 @@ pub fn run_plan_list_tui(
                             app.toasts.push(msg, ToastKind::Success, Instant::now());
                         }
                     }
+                    KeyCode::Char('A') => {
+                        plan_list_approve_cursor(conn, project, &mut app)?;
+                    }
+                    KeyCode::Char('Q') => {
+                        plan_list_toggle_questions_cursor(conn, project, &mut app)?;
+                    }
                     KeyCode::Esc => {
                         let _ = app.escape();
                     }
@@ -398,6 +404,75 @@ fn confirm_with_background<B: ratatui::backend::Backend>(
             }
         }
     }
+}
+
+/// `A` action in the plan-list view (TUI-plan.md §5): approve the cursor
+/// target. Flips `Planning` → `Ready` via `update_plan_status`, refreshes the
+/// in-memory tile in place (preserving selection / cursor), and toasts. Plans
+/// already past Planning surface an info toast instead — mirroring the CLI's
+/// `plan approve` rejection but without aborting the TUI session.
+pub(crate) fn plan_list_approve_cursor(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) -> Result<()> {
+    use crate::plan::PlanStatus;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let target = app
+        .cursor_plan()
+        .map(|p| (p.id.clone(), p.slug.clone(), p.status));
+    let Some((id, slug, status)) = target else {
+        return Ok(());
+    };
+    if status == PlanStatus::Planning {
+        storage::update_plan_status(conn, &id, PlanStatus::Ready)?;
+        if let Some(updated) = storage::get_plan_by_slug(conn, &slug, project)? {
+            app.update_plan_in_place(updated);
+        }
+        app.toasts
+            .push("Plan approved.", ToastKind::Success, Instant::now());
+    } else {
+        app.toasts.push(
+            format!("Plan is in {status} status; nothing to approve."),
+            ToastKind::Info,
+            Instant::now(),
+        );
+    }
+    Ok(())
+}
+
+/// `Q` action in the plan-list view (TUI-plan.md §17): flip
+/// `plans.questions_enabled` on the cursor target via
+/// `set_plan_questions_enabled`, refresh the tile in place, and toast the new
+/// state. Cursor-only — selection is ignored.
+pub(crate) fn plan_list_toggle_questions_cursor(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let target = app
+        .cursor_plan()
+        .map(|p| (p.id.clone(), p.slug.clone(), p.questions_enabled));
+    let Some((id, slug, current)) = target else {
+        return Ok(());
+    };
+    let next = !current;
+    storage::set_plan_questions_enabled(conn, &id, next)?;
+    if let Some(updated) = storage::get_plan_by_slug(conn, &slug, project)? {
+        app.update_plan_in_place(updated);
+    }
+    let msg = if next {
+        "Questions enabled."
+    } else {
+        "Questions disabled."
+    };
+    app.toasts.push(msg, ToastKind::Success, Instant::now());
+    Ok(())
 }
 
 /// Build the read-only tile rows the plan-list view renders. One tile per
@@ -2145,5 +2220,148 @@ mod run_dispatch_tests {
             ..defaults()
         };
         assert!(!is_default_run_invocation(&global_only, true));
+    }
+}
+
+#[cfg(test)]
+mod plan_list_action_tests {
+    //! Integration tests for the `A` (approve) and `Q` (toggle questions)
+    //! keybinding handlers in the plan-list TUI view. Exercise the public
+    //! action helpers end-to-end against an in-memory DB so the tests cover
+    //! both the storage write and the in-place tile update.
+
+    use super::*;
+    use crate::db;
+    use crate::plan::PlanStatus;
+    use crate::tui::views::plan_list::PlanListApp;
+
+    fn seed_app(project: &str) -> (Connection, PlanListApp) {
+        let conn = db::open_memory().unwrap();
+        // Two plans so we can verify the cursor target is the one mutated.
+        storage::create_plan(&conn, "alpha", project, "b1", "d", None, None, &[]).unwrap();
+        storage::create_plan(&conn, "beta", project, "b2", "d", None, None, &[]).unwrap();
+        let tiles = build_plan_tiles(&conn, project).unwrap();
+        let app = PlanListApp::new(tiles, project, "UTC");
+        (conn, app)
+    }
+
+    #[test]
+    fn approve_cursor_flips_planning_to_ready() {
+        let project = "/tmp/approve-flow";
+        let (conn, mut app) = seed_app(project);
+        // Cursor on the first tile (most-recent first → "beta").
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+        assert_eq!(app.cursor_plan().unwrap().status, PlanStatus::Planning);
+
+        plan_list_approve_cursor(&conn, project, &mut app).unwrap();
+
+        // DB row was updated.
+        let from_db = storage::get_plan_by_slug(&conn, &target_slug, project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db.status, PlanStatus::Ready);
+
+        // In-memory tile is updated in-place; cursor / scroll preserved.
+        assert_eq!(app.cursor_plan().unwrap().status, PlanStatus::Ready);
+        assert_eq!(app.cursor_plan().unwrap().slug, target_slug);
+
+        // Toast confirms the action.
+        let toast = app.toasts.current().expect("toast should be present");
+        assert_eq!(toast.text, "Plan approved.");
+    }
+
+    #[test]
+    fn approve_cursor_on_non_planning_emits_info_toast_and_keeps_status() {
+        let project = "/tmp/approve-noop";
+        let (conn, mut app) = seed_app(project);
+        // Pre-flip the cursor target to Ready so A becomes a no-op write.
+        let id = app.cursor_plan().unwrap().id.clone();
+        storage::update_plan_status(&conn, &id, PlanStatus::Ready).unwrap();
+        // Refresh tiles so the in-memory state reflects the pre-flipped status.
+        app.refresh_tiles(build_plan_tiles(&conn, project).unwrap());
+
+        plan_list_approve_cursor(&conn, project, &mut app).unwrap();
+
+        let from_db = storage::get_plan_by_slug(&conn, &app.cursor_plan().unwrap().slug, project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db.status, PlanStatus::Ready);
+        let toast = app.toasts.current().expect("toast should be present");
+        assert!(
+            toast.text.contains("nothing to approve"),
+            "expected info toast, got: {toast:?}"
+        );
+    }
+
+    #[test]
+    fn approve_cursor_empty_app_is_noop() {
+        let conn = db::open_memory().unwrap();
+        let mut app = PlanListApp::new(vec![], "/proj", "UTC");
+        plan_list_approve_cursor(&conn, "/proj", &mut app).unwrap();
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn toggle_questions_flips_column_and_toasts_new_state() {
+        let project = "/tmp/questions-toggle";
+        let (conn, mut app) = seed_app(project);
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+        assert!(!app.cursor_plan().unwrap().questions_enabled);
+
+        // First press: off → on.
+        plan_list_toggle_questions_cursor(&conn, project, &mut app).unwrap();
+        let after_on = storage::get_plan_by_slug(&conn, &target_slug, project)
+            .unwrap()
+            .unwrap();
+        assert!(after_on.questions_enabled);
+        assert!(app.cursor_plan().unwrap().questions_enabled);
+        assert_eq!(
+            app.toasts.current().unwrap().text,
+            "Questions enabled."
+        );
+
+        // Second press: on → off.
+        plan_list_toggle_questions_cursor(&conn, project, &mut app).unwrap();
+        let after_off = storage::get_plan_by_slug(&conn, &target_slug, project)
+            .unwrap()
+            .unwrap();
+        assert!(!after_off.questions_enabled);
+        assert!(!app.cursor_plan().unwrap().questions_enabled);
+        assert_eq!(
+            app.toasts.current().unwrap().text,
+            "Questions disabled."
+        );
+    }
+
+    #[test]
+    fn toggle_questions_does_not_touch_non_cursor_tiles() {
+        let project = "/tmp/questions-cursor-only";
+        let (conn, mut app) = seed_app(project);
+        let cursor_slug = app.cursor_plan().unwrap().slug.clone();
+        // The other tile.
+        let other_slug = app
+            .tiles
+            .iter()
+            .map(|t| t.plan.slug.clone())
+            .find(|s| s != &cursor_slug)
+            .unwrap();
+
+        plan_list_toggle_questions_cursor(&conn, project, &mut app).unwrap();
+
+        let other = storage::get_plan_by_slug(&conn, &other_slug, project)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !other.questions_enabled,
+            "non-cursor plan must remain untouched"
+        );
+    }
+
+    #[test]
+    fn toggle_questions_empty_app_is_noop() {
+        let conn = db::open_memory().unwrap();
+        let mut app = PlanListApp::new(vec![], "/proj", "UTC");
+        plan_list_toggle_questions_cursor(&conn, "/proj", &mut app).unwrap();
+        assert!(app.toasts.is_empty());
     }
 }
