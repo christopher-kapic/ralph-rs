@@ -8,6 +8,7 @@
 
 use std::path::Path;
 use std::str::FromStr;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use ratatui::Frame;
@@ -15,12 +16,13 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::plan::{Plan, PlanStatus};
 use crate::tui::chrome::{self, Chrome};
 use crate::tui::selection::Selection;
 use crate::tui::theme;
+use crate::tui::toast::ToastQueue;
 
 /// Height of a single plan tile (including its top + bottom border rows).
 /// Matches the layout sketch in TUI-plan.md §5.
@@ -81,6 +83,10 @@ pub struct PlanListApp {
     /// `cwd` rendering and is exposed so the dispatcher can route `enter`
     /// events to plan-detail without re-resolving.
     pub project: String,
+    /// Toast queue rendered over the bottom chrome row. The dispatcher pushes
+    /// onto this after destructive operations (`d` archive) so the user sees
+    /// a transient confirmation.
+    pub toasts: ToastQueue,
 }
 
 impl PlanListApp {
@@ -95,6 +101,7 @@ impl PlanListApp {
             open_request: false,
             display_timezone: display_timezone.into(),
             project: project.into(),
+            toasts: ToastQueue::new(),
         }
     }
 
@@ -184,6 +191,38 @@ impl PlanListApp {
     pub fn request_quit(&mut self) {
         self.should_quit = true;
     }
+
+    // -- Archive ----------------------------------------------------------
+
+    /// Plan IDs that the next `d` archive should affect, per TUI-plan.md §5:
+    /// selection wins over the cursor target. With at least one tile selected,
+    /// returns the selection in pick order; otherwise returns just the
+    /// highlighted tile's plan id. Empty if there are no tiles and nothing
+    /// selected.
+    pub fn archive_targets(&self) -> Vec<String> {
+        if !self.selection.is_empty() {
+            self.selection.as_slice().to_vec()
+        } else if !self.tiles.is_empty() {
+            vec![self.tiles[self.selected_index].plan.id.clone()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Replace the tile list (after a DB refresh) and reset transient state:
+    /// selection is cleared and the cursor is clamped into the new range.
+    /// `scroll_offset` is left to be re-computed on the next draw via
+    /// `update_scroll`.
+    pub fn refresh_tiles(&mut self, tiles: Vec<PlanTile>) {
+        self.tiles = tiles;
+        self.selection.clear();
+        if self.tiles.is_empty() {
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+        } else if self.selected_index >= self.tiles.len() {
+            self.selected_index = self.tiles.len() - 1;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,8 +285,11 @@ fn status_dot_color(status: PlanStatus) -> ratatui::style::Color {
 
 /// Draw the plan-list view, including persistent chrome.
 pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
+    app.toasts.prune(Instant::now());
+
     let crumbs: [&str; 1] = ["ralph"];
-    let hint = "[j/k] nav  [g/G] top/bottom  [enter] open  [space] select  [q] quit";
+    let hint =
+        "[j/k] nav  [g/G] top/bottom  [enter] open  [space] select  [d] archive  [q] quit";
     let body = chrome::render(
         frame,
         &Chrome {
@@ -258,6 +300,38 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
     );
     update_scroll(app, body.height);
     render_tiles(frame.buffer_mut(), body, app);
+
+    // Toast slot lives over the bottom chrome row — overwrites the hint while
+    // a toast is current, leaves cwd/version on the right alone.
+    if let Some(toast) = app.toasts.current() {
+        let area = frame.area();
+        if area.height >= 1 && area.width > 0 {
+            render_toast_overlay(frame, area, &toast.text, toast.color);
+        }
+    }
+}
+
+fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatui::style::Color) {
+    // Cap toast width so a short message doesn't clobber the bottom-right
+    // cwd/version column. A 1-char trailing pad keeps the toast visually
+    // distinct from the cwd when both fit on the row.
+    let max_toast = area.width.saturating_sub(1).max(1);
+    let desired = text.chars().count().min(max_toast as usize) as u16;
+    if desired == 0 {
+        return;
+    }
+    let toast_area = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: desired,
+        height: 1,
+    };
+    frame.render_widget(Clear, toast_area);
+    let para = Paragraph::new(Span::styled(
+        truncate(text, toast_area.width as usize),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(para, toast_area);
 }
 
 /// Render the tile column into the supplied buffer area.
@@ -835,6 +909,110 @@ mod tests {
         render_tiles(&mut buf, area, &app);
         let row1 = (0..30).map(|x| buf[(x, 1)].symbol()).collect::<String>();
         assert!(row1.contains("[1]"), "expected [1] badge: {row1:?}");
+    }
+
+    // -- Archive targets ----------------------------------------------------
+
+    #[test]
+    fn archive_targets_returns_cursor_when_no_selection() {
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.selected_index = 1;
+        assert_eq!(app.archive_targets(), vec!["id-plan-1".to_string()]);
+    }
+
+    #[test]
+    fn archive_targets_returns_selection_in_order_when_present() {
+        let mut app = PlanListApp::new(make_tiles(4), "/proj", "UTC");
+        // Select 2, 0, 3 in pick order; cursor still on 2 (last toggled).
+        app.selected_index = 2;
+        app.toggle_selection();
+        app.selected_index = 0;
+        app.toggle_selection();
+        app.selected_index = 3;
+        app.toggle_selection();
+        // Cursor target id-plan-3 must NOT short-circuit the selection list.
+        assert_eq!(
+            app.archive_targets(),
+            vec![
+                "id-plan-2".to_string(),
+                "id-plan-0".to_string(),
+                "id-plan-3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn archive_targets_empty_tiles_no_selection() {
+        let app = PlanListApp::new(vec![], "/proj", "UTC");
+        assert!(app.archive_targets().is_empty());
+    }
+
+    // -- Refresh tiles ------------------------------------------------------
+
+    #[test]
+    fn refresh_tiles_clears_selection() {
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.toggle_selection();
+        assert_eq!(app.selection.len(), 1);
+        app.refresh_tiles(make_tiles(2));
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn refresh_tiles_clamps_cursor_into_new_range() {
+        let mut app = PlanListApp::new(make_tiles(5), "/proj", "UTC");
+        app.selected_index = 4;
+        // Simulate archiving the last 3 plans — only 2 left.
+        app.refresh_tiles(make_tiles(2));
+        assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn refresh_tiles_resets_cursor_when_list_empties() {
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.selected_index = 2;
+        app.refresh_tiles(vec![]);
+        assert_eq!(app.selected_index, 0);
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn refresh_tiles_preserves_in_range_cursor() {
+        let mut app = PlanListApp::new(make_tiles(5), "/proj", "UTC");
+        app.selected_index = 1;
+        app.refresh_tiles(make_tiles(4));
+        assert_eq!(app.selected_index, 1);
+    }
+
+    // -- Toast rendering ----------------------------------------------------
+
+    #[test]
+    fn draw_renders_toast_text_over_bottom_row() {
+        use crate::tui::toast::ToastKind;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.toasts
+            .push("Archived 1 plan.", ToastKind::Success, Instant::now());
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let bottom_y = buffer.area().height - 1;
+        let bottom_row = (0..buffer.area().width)
+            .map(|x| buffer[(x, bottom_y)].symbol())
+            .collect::<String>();
+        assert!(
+            bottom_row.contains("Archived 1 plan."),
+            "toast text missing on bottom row: {bottom_row:?}"
+        );
+        // Toast should be styled with TOAST_SUCCESS color.
+        assert_eq!(
+            buffer[(0, bottom_y)].style().fg,
+            Some(theme::TOAST_SUCCESS)
+        );
     }
 
     #[test]

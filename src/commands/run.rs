@@ -274,6 +274,9 @@ pub fn run_plan_list_tui(
     project: &str,
     _out: &OutputContext,
 ) -> Result<()> {
+    use crate::plan::PlanStatus;
+    use crate::tui::dialog;
+    use crate::tui::toast::ToastKind;
     use crate::tui::views::plan_list::{self, PlanListApp};
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use crossterm::execute;
@@ -282,6 +285,7 @@ pub fn run_plan_list_tui(
     };
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
+    use std::time::Instant;
 
     let tiles = build_plan_tiles(conn, project)?;
     let mut app = PlanListApp::new(tiles, project, &config.display_timezone);
@@ -307,6 +311,36 @@ pub fn run_plan_list_tui(
                     KeyCode::Char('g') => app.jump_top(),
                     KeyCode::Char('G') => app.jump_bottom(),
                     KeyCode::Char(' ') => app.toggle_selection(),
+                    KeyCode::Char('d') => {
+                        let targets = app.archive_targets();
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        let body = format!("Archive {} plan(s)?", targets.len());
+                        let confirm = dialog::Confirm {
+                            title: "Archive plans",
+                            body: &body,
+                            default: false,
+                        };
+                        if confirm_with_background(&mut terminal, &mut app, &confirm)? {
+                            for id in &targets {
+                                storage::update_plan_status(
+                                    conn,
+                                    id,
+                                    PlanStatus::Archived,
+                                )?;
+                            }
+                            let new_tiles = build_plan_tiles(conn, project)?;
+                            app.refresh_tiles(new_tiles);
+                            let n = targets.len();
+                            let msg = if n == 1 {
+                                "Archived 1 plan.".to_string()
+                            } else {
+                                format!("Archived {n} plans.")
+                            };
+                            app.toasts.push(msg, ToastKind::Success, Instant::now());
+                        }
+                    }
                     KeyCode::Esc => {
                         let _ = app.escape();
                     }
@@ -333,6 +367,37 @@ pub fn run_plan_list_tui(
     let _ = execute!(stdout, LeaveAlternateScreen);
 
     result
+}
+
+/// Render the plan-list view as the dialog's background and block on a
+/// yes/no decision. Mirrors `dialog::run` but composites the live view under
+/// the modal so the user keeps context (cursor, selection badges, tiles) while
+/// answering. Returns the user's choice.
+fn confirm_with_background<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+    c: &crate::tui::dialog::Confirm<'_>,
+) -> Result<bool> {
+    use crate::tui::dialog::{self, Decision};
+    use crate::tui::views::plan_list;
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    loop {
+        terminal.draw(|f| {
+            plan_list::draw(f, app);
+            let area = f.area();
+            dialog::render(f, area, c);
+        })?;
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match dialog::decide_key(key, c.default) {
+                Decision::Yes => return Ok(true),
+                Decision::No => return Ok(false),
+                Decision::Pending => continue,
+            }
+        }
+    }
 }
 
 /// Build the read-only tile rows the plan-list view renders. One tile per
