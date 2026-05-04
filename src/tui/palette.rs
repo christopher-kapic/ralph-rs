@@ -74,8 +74,13 @@ pub enum PaletteCommand {
     StepEditTags,
     /// `/cancel`.
     Cancel,
-    /// `/export <slug>`.
-    Export(String),
+    /// `/export <slug> [-o <path>]`. `output` is `None` when the user
+    /// omitted `-o`; the dispatcher falls back to `<slug>.ralph.json` in
+    /// the cwd.
+    Export {
+        slug: String,
+        output: Option<String>,
+    },
     /// `/import <path>`.
     Import(String),
     /// `/quit` or `/q`.
@@ -112,7 +117,7 @@ impl PaletteCommand {
             PaletteCommand::StepUnsetHook => "/step unset-hook",
             PaletteCommand::StepEditTags => "/step edit --tags",
             PaletteCommand::Cancel => "/cancel",
-            PaletteCommand::Export(_) => "/export",
+            PaletteCommand::Export { .. } => "/export",
             PaletteCommand::Import(_) => "/import",
             PaletteCommand::Quit => "/quit",
             PaletteCommand::Help => "/help",
@@ -266,12 +271,19 @@ pub fn parse(input: &str) -> Result<PaletteCommand, ParseError> {
         // /cancel
         ["cancel"] => Ok(PaletteCommand::Cancel),
 
-        // /export <slug>
+        // /export <slug> [-o <path>]
         ["export"] => Err(ParseError::MissingArgument {
             command: "/export",
             arg: "<slug>",
         }),
-        ["export", slug] => Ok(PaletteCommand::Export((*slug).to_string())),
+        ["export", slug] => Ok(PaletteCommand::Export {
+            slug: (*slug).to_string(),
+            output: None,
+        }),
+        ["export", slug, "-o", path] => Ok(PaletteCommand::Export {
+            slug: (*slug).to_string(),
+            output: Some((*path).to_string()),
+        }),
 
         // /import <path>
         ["import"] => Err(ParseError::MissingArgument {
@@ -954,7 +966,17 @@ mod tests {
     fn parses_export_import() {
         assert_eq!(
             parse("/export my-plan"),
-            Ok(PaletteCommand::Export("my-plan".to_string()))
+            Ok(PaletteCommand::Export {
+                slug: "my-plan".to_string(),
+                output: None,
+            })
+        );
+        assert_eq!(
+            parse("/export my-plan -o /tmp/out.json"),
+            Ok(PaletteCommand::Export {
+                slug: "my-plan".to_string(),
+                output: Some("/tmp/out.json".to_string()),
+            })
         );
         assert!(matches!(
             parse("/export"),
@@ -1337,7 +1359,10 @@ mod tests {
             PaletteCommand::StepUnsetHook,
             PaletteCommand::StepEditTags,
             PaletteCommand::Cancel,
-            PaletteCommand::Export(String::new()),
+            PaletteCommand::Export {
+                slug: String::new(),
+                output: None,
+            },
             PaletteCommand::Import(String::new()),
             PaletteCommand::Quit,
             PaletteCommand::Help,

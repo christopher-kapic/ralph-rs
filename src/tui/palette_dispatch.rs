@@ -18,8 +18,20 @@
 //
 // The remaining v1-deferred commands route to `PaletteAction::ComingSoon`
 // with the actual sub-view step number from the tui-v1 plan map (33–36).
-// Step #32 picks up `/cancel`, `/export`, `/import`, `/quit`, `/help`; until
-// then those still fall through to `PaletteAction::Deferred`.
+//
+// Step #32 wires `/cancel`, `/export`, `/import`, `/quit`, `/help`:
+// * `/cancel` — mirrors the `S` keybinding's "stop the live run" action.
+//   The pure dispatcher always emits `CancelRun`; the consuming view checks
+//   whether there's an actual live run before forwarding the signal.
+// * `/export <slug> [-o <path>]` — resolves the slug against the visible
+//   plan list and emits an `Export` action. When `-o` is omitted the
+//   consumer writes to `<slug>.ralph.json` in the cwd (TUI-plan.md §9).
+// * `/import <path>` — emits an `Import` action; the consuming view reads
+//   the file and prompts for a fresh slug if it conflicts with an existing
+//   plan.
+// * `/quit` (and `/q`) — emits `Quit`; the consuming view exits the TUI.
+// * `/help` — surfaces a `ComingSoon` action targeting step 43 (the help
+//   overlay) so the dispatcher loop can toast a placeholder until then.
 
 use crate::plan::PlanStatus;
 use crate::tui::palette::{ParseError, PaletteCommand};
@@ -77,9 +89,10 @@ pub struct PaletteContext<'a> {
 /// TUI event loop matches on the variant and runs the corresponding side
 /// effect (open a dialog, spawn a subprocess, push a view, or toast).
 ///
-/// Variants for commands that step #30 doesn't wire collapse into
-/// [`PaletteAction::Deferred`] so future steps can light them up incrementally
-/// without breaking existing tests.
+/// Commands whose sub-views haven't landed yet collapse into
+/// [`PaletteAction::ComingSoon`] with the target tui-v1 step number, so the
+/// dispatcher loop can render a uniform "coming soon" toast until the
+/// real implementation lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteAction {
     /// Nothing to do (e.g. blank input).
@@ -165,15 +178,33 @@ pub enum PaletteAction {
         from: u32,
         to: u32,
     },
-    /// Recognized command stubbed for a later tui-v1 step (33–36). Caller
-    /// renders a `Coming soon — landing in step <N>` info toast.
+    /// `/cancel` — request that the consuming view stop the live run.
+    /// Mirrors the `S` keybinding (TUI-plan.md §9). The pure dispatcher
+    /// emits this unconditionally; the view checks whether there is a
+    /// live run before forwarding the signal and toasts otherwise.
+    CancelRun,
+    /// `/export <slug> [-o <path>]` — write the resolved plan's portable
+    /// JSON to `output` (or `<slug>.ralph.json` in cwd when `output` is
+    /// `None`). The slug has already been resolved against the visible
+    /// plan list, so the consumer can call [`crate::export::export_plan`]
+    /// directly without re-validating.
+    Export {
+        slug: String,
+        output: Option<String>,
+    },
+    /// `/import <path>` — read `path` and create a new plan. The consumer
+    /// is responsible for calling [`crate::import::read_plan_file`] and
+    /// prompting for a fresh slug if the imported slug collides with an
+    /// existing plan in the project.
+    Import { path: String },
+    /// `/quit` or `/q` — exit the TUI cleanly.
+    Quit,
+    /// Recognized command stubbed for a later tui-v1 step (33–36, 43).
+    /// Caller renders a `Coming soon — landing in step <N>` info toast.
     ComingSoon {
         label: &'static str,
         target_step: u32,
     },
-    /// Recognized command whose dispatch lands in a later tui-v1 step. Carries
-    /// the canonical label so the loop can render a placeholder toast.
-    Deferred(&'static str),
 }
 
 // ---------------------------------------------------------------------------
@@ -248,10 +279,27 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
             target_step: 36,
         },
 
-        // Everything else is wired in step 32 (per the tui-v1 plan).
-        // Keep the label so the dispatcher loop can render a stable
-        // "<verb> not yet implemented" toast.
-        other => PaletteAction::Deferred(other.label()),
+        // -- /cancel ------------------------------------------------------
+        PaletteCommand::Cancel => PaletteAction::CancelRun,
+
+        // -- /export <slug> [-o <path>] -----------------------------------
+        PaletteCommand::Export { slug, output } => {
+            dispatch_export(slug, output.as_deref(), ctx)
+        }
+
+        // -- /import <path> -----------------------------------------------
+        PaletteCommand::Import(path) => PaletteAction::Import {
+            path: path.clone(),
+        },
+
+        // -- /quit / /q ---------------------------------------------------
+        PaletteCommand::Quit => PaletteAction::Quit,
+
+        // -- /help (overlay lands in step 43) -----------------------------
+        PaletteCommand::Help => PaletteAction::ComingSoon {
+            label: cmd.label(),
+            target_step: 43,
+        },
     }
 }
 
@@ -473,6 +521,27 @@ fn dispatch_step_skip(num: Option<u32>, ctx: &PaletteContext<'_>) -> PaletteActi
             message: "Open a plan first to skip a step.".to_string(),
             kind: ToastKind::Info,
         },
+    }
+}
+
+fn dispatch_export(
+    slug: &str,
+    output: Option<&str>,
+    ctx: &PaletteContext<'_>,
+) -> PaletteAction {
+    // /export looks up the slug against both active and archived plans.
+    // Exporting an archived plan is intentional — the JSON snapshot is the
+    // user's escape hatch before a `/plan delete`.
+    if find_by_slug(ctx.plans, slug)
+        .or_else(|| find_by_slug(ctx.archived, slug))
+        .is_some()
+    {
+        PaletteAction::Export {
+            slug: slug.to_string(),
+            output: output.map(str::to_string),
+        }
+    } else {
+        unknown_plan_toast(slug)
     }
 }
 
@@ -1004,29 +1073,114 @@ mod tests {
         );
     }
 
-    // -- Deferred passthrough ---------------------------------------------
+    // -- /cancel ----------------------------------------------------------
 
     #[test]
-    fn unwired_commands_become_deferred_with_label() {
-        // /quit, /export, /import, /cancel, /help land in step 32 — they
-        // still fall through to Deferred so the next step can pick them up.
+    fn cancel_emits_cancelrun_unconditionally() {
+        // The pure dispatcher doesn't know about live runs — the consuming
+        // view checks for one and toasts otherwise. Verify the action shape
+        // for both an empty context and one with a focused plan.
         let c = Ctx::new();
-        assert_eq!(dispatch_str("/quit", &c), PaletteAction::Deferred("/quit"));
+        assert_eq!(dispatch_str("/cancel", &c), PaletteAction::CancelRun);
+
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::InProgress)];
+        c.focused_slug = Some("alpha".to_string());
+        assert_eq!(dispatch_str("/cancel", &c), PaletteAction::CancelRun);
+    }
+
+    // -- /quit ------------------------------------------------------------
+
+    #[test]
+    fn quit_emits_quit_action() {
+        let c = Ctx::new();
+        assert_eq!(dispatch_str("/quit", &c), PaletteAction::Quit);
+        // Alias /q parses to the same command.
+        assert_eq!(dispatch_str("/q", &c), PaletteAction::Quit);
+    }
+
+    // -- /help ------------------------------------------------------------
+
+    #[test]
+    fn help_routes_to_step_43() {
+        // Help overlay itself lands in step 43; until then the dispatcher
+        // returns ComingSoon so the loop can toast a placeholder.
+        let c = Ctx::new();
         assert_eq!(
             dispatch_str("/help", &c),
-            PaletteAction::Deferred("/help")
+            PaletteAction::ComingSoon {
+                label: "/help",
+                target_step: 43,
+            }
         );
+    }
+
+    // -- /export ----------------------------------------------------------
+
+    #[test]
+    fn export_named_active_plan_emits_export() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        let action = dispatch_str("/export alpha", &c);
         assert_eq!(
-            dispatch_str("/cancel", &c),
-            PaletteAction::Deferred("/cancel")
+            action,
+            PaletteAction::Export {
+                slug: "alpha".to_string(),
+                output: None,
+            }
         );
+    }
+
+    #[test]
+    fn export_with_explicit_output_path() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        let action = dispatch_str("/export alpha -o /tmp/out.json", &c);
         assert_eq!(
-            dispatch_str("/export my-plan", &c),
-            PaletteAction::Deferred("/export")
+            action,
+            PaletteAction::Export {
+                slug: "alpha".to_string(),
+                output: Some("/tmp/out.json".to_string()),
+            }
         );
+    }
+
+    #[test]
+    fn export_resolves_archived_plan() {
+        // Archived plans are exportable — their JSON snapshot is the user's
+        // escape hatch before a /plan delete.
+        let mut c = Ctx::new();
+        c.archived = vec![plan_ref("frozen", PlanStatus::Archived)];
+        let action = dispatch_str("/export frozen", &c);
         assert_eq!(
-            dispatch_str("/import /tmp/p.json", &c),
-            PaletteAction::Deferred("/import")
+            action,
+            PaletteAction::Export {
+                slug: "frozen".to_string(),
+                output: None,
+            }
+        );
+    }
+
+    #[test]
+    fn export_unknown_slug_toasts_error() {
+        let c = Ctx::new();
+        let action = dispatch_str("/export ghost", &c);
+        assert_eq!(action, unknown_plan_toast("ghost"));
+    }
+
+    // -- /import ----------------------------------------------------------
+
+    #[test]
+    fn import_emits_import_action_with_path() {
+        // The pure dispatcher just forwards the path. The consuming view
+        // reads the file and prompts for a fresh slug on collision.
+        let c = Ctx::new();
+        let action = dispatch_str("/import /tmp/plan.json", &c);
+        assert_eq!(
+            action,
+            PaletteAction::Import {
+                path: "/tmp/plan.json".to_string(),
+            }
         );
     }
 
