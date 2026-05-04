@@ -308,7 +308,7 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
     app.toasts.prune(Instant::now());
 
     let crumbs: [&str; 1] = ["ralph"];
-    let hint = "[j/k] nav  [enter] open  [space] select  [A] approve  [Q] questions  [d] archive  [q] quit";
+    let hint = "[j/k] nav  [enter] open  [space] select  [i] new  [A] approve  [Q] questions  [d] archive  [q] quit";
     let body = chrome::render(
         frame,
         &Chrome {

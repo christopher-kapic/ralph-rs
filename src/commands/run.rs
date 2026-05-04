@@ -347,6 +347,9 @@ pub fn run_plan_list_tui(
                     KeyCode::Char('Q') => {
                         plan_list_toggle_questions_cursor(conn, project, &mut app)?;
                     }
+                    KeyCode::Char('i') | KeyCode::Char('a') => {
+                        plan_list_create_plan(conn, config, project, &mut terminal, &mut app)?;
+                    }
                     KeyCode::Esc => {
                         let _ = app.escape();
                     }
@@ -472,6 +475,110 @@ pub(crate) fn plan_list_toggle_questions_cursor(
         "Questions disabled."
     };
     app.toasts.push(msg, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// `i` / `a` action in the plan-list view (TUI-plan.md §5): open the inline
+/// "New plan" modal, drive the slug → description → tests state machine,
+/// and on submit insert a row via `storage::create_plan`. Loops the draw +
+/// event-read locally so the modal renders over the live plan-list as a
+/// background. Cancellation (`Esc` / `Ctrl-C`) just returns; on submit the
+/// cursor jumps to the freshly-created plan via [`plan_list_apply_create`].
+fn plan_list_create_plan<B: ratatui::backend::Backend>(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) -> Result<()> {
+    use crate::tui::views::create_plan::{self, CreatePlanModal, Outcome};
+    use crate::tui::views::plan_list;
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let mut modal = CreatePlanModal::new();
+
+    loop {
+        terminal.draw(|f| {
+            plan_list::draw(f, app);
+            let area = f.area();
+            create_plan::render(f, area, &modal);
+        })?;
+
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+
+        match modal.handle_key(key) {
+            Outcome::Pending => continue,
+            Outcome::Cancelled => return Ok(()),
+            Outcome::Submit {
+                slug,
+                description,
+                tests,
+            } => {
+                plan_list_apply_create(conn, config, project, app, &slug, &description, &tests)?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Pure-storage half of the create-plan flow. Inserts the plan via
+/// `storage::create_plan`, refreshes the tile list, and re-positions the
+/// cursor on the new plan. Toasts a success or — on a storage failure (e.g.
+/// duplicate slug) — an error message. Factored apart from the event loop so
+/// it can be integration-tested without a terminal.
+pub(crate) fn plan_list_apply_create(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+    slug: &str,
+    description: &str,
+    tests: &[String],
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    // Branch name auto-defaults to the slug, matching the CLI's
+    // `plan create` behavior when `--branch` is omitted.
+    let branch_name = slug;
+    let harness = Some(config.default_harness.as_str());
+    let agent: Option<&str> = None;
+
+    match storage::create_plan(
+        conn,
+        slug,
+        project,
+        branch_name,
+        description,
+        harness,
+        agent,
+        tests,
+    ) {
+        Ok(plan) => {
+            let new_tiles = build_plan_tiles(conn, project)?;
+            let new_index = new_tiles
+                .iter()
+                .position(|t| t.plan.id == plan.id)
+                .unwrap_or(0);
+            app.refresh_tiles(new_tiles);
+            app.selected_index = new_index;
+            app.toasts.push(
+                format!("Created plan: {slug}"),
+                ToastKind::Success,
+                Instant::now(),
+            );
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to create plan: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2363,5 +2470,113 @@ mod plan_list_action_tests {
         let mut app = PlanListApp::new(vec![], "/proj", "UTC");
         plan_list_toggle_questions_cursor(&conn, "/proj", &mut app).unwrap();
         assert!(app.toasts.is_empty());
+    }
+
+    // -- create-plan -----------------------------------------------------
+
+    #[test]
+    fn apply_create_inserts_plan_and_positions_cursor_on_it() {
+        let project = "/tmp/create-plan-flow";
+        let (conn, mut app) = seed_app(project);
+        let config = Config::default();
+        let initial_len = app.tiles.len();
+
+        plan_list_apply_create(
+            &conn,
+            &config,
+            project,
+            &mut app,
+            "gamma",
+            "A new plan",
+            &["cargo test".to_string()],
+        )
+        .unwrap();
+
+        // Tile list grew by one and the cursor lands on the new plan
+        // regardless of where it sorts.
+        assert_eq!(app.tiles.len(), initial_len + 1);
+        let cursor = app.cursor_plan().expect("cursor target");
+        assert_eq!(cursor.slug, "gamma");
+
+        // DB row exists with the expected fields.
+        let row = storage::get_plan_by_slug(&conn, "gamma", project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.description, "A new plan");
+        assert_eq!(row.deterministic_tests, vec!["cargo test".to_string()]);
+        // Default harness comes from `Config::default()`.
+        assert_eq!(row.harness.as_deref(), Some("claude"));
+        assert!(row.agent.is_none());
+        // Branch name defaults to the slug.
+        assert_eq!(row.branch_name, "gamma");
+
+        let toast = app.toasts.current().expect("success toast");
+        assert!(
+            toast.text.contains("gamma"),
+            "expected slug in toast, got: {toast:?}"
+        );
+    }
+
+    #[test]
+    fn apply_create_with_empty_tests_passes_empty_vec() {
+        let project = "/tmp/create-plan-no-tests";
+        let (conn, mut app) = seed_app(project);
+        let config = Config::default();
+
+        plan_list_apply_create(&conn, &config, project, &mut app, "delta", "d", &[]).unwrap();
+
+        let row = storage::get_plan_by_slug(&conn, "delta", project)
+            .unwrap()
+            .unwrap();
+        assert!(row.deterministic_tests.is_empty());
+    }
+
+    #[test]
+    fn apply_create_uses_configured_default_harness() {
+        let project = "/tmp/create-plan-harness";
+        let (conn, mut app) = seed_app(project);
+        let mut config = Config::default();
+        // Default config defines a "codex" harness — rebind the global
+        // default to it so we exercise non-claude harness selection.
+        config.default_harness = "codex".to_string();
+
+        plan_list_apply_create(&conn, &config, project, &mut app, "epsilon", "", &[]).unwrap();
+
+        let row = storage::get_plan_by_slug(&conn, "epsilon", project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.harness.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn apply_create_duplicate_slug_emits_error_toast_and_leaves_tiles_untouched() {
+        let project = "/tmp/create-plan-dup";
+        let (conn, mut app) = seed_app(project);
+        let config = Config::default();
+        let before_len = app.tiles.len();
+
+        // "alpha" already exists from `seed_app`.
+        plan_list_apply_create(&conn, &config, project, &mut app, "alpha", "", &[]).unwrap();
+
+        assert_eq!(app.tiles.len(), before_len, "tile count unchanged");
+        let toast = app.toasts.current().expect("error toast");
+        assert!(
+            toast.text.starts_with("Failed to create plan"),
+            "unexpected toast text: {toast:?}"
+        );
+    }
+
+    #[test]
+    fn apply_create_clears_selection_via_refresh() {
+        let project = "/tmp/create-plan-clears-selection";
+        let (conn, mut app) = seed_app(project);
+        let config = Config::default();
+        // Select a tile; create-plan should wipe it via refresh_tiles.
+        app.toggle_selection();
+        assert_eq!(app.selection.len(), 1);
+
+        plan_list_apply_create(&conn, &config, project, &mut app, "zeta", "z", &[]).unwrap();
+
+        assert!(app.selection.is_empty());
     }
 }
