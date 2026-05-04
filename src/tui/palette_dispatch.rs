@@ -5,11 +5,21 @@
 // us exercise every command end-to-end through the parser without forking a
 // subprocess, opening a confirm dialog, or touching the database.
 //
-// Step #30 wires the following commands through to real actions:
-// `/run <branch>`, `/plan harness [<name>]`, `/plan show [<slug>]`,
-// `/plan archive [<slug>]`, `/plan unarchive <slug>`, `/plan delete <slug>`,
-// `/plan approve [<slug>]`. Other recognized commands resolve to
-// [`PaletteAction::Deferred`]; their wiring lands in step #31 onward.
+// Step #30 wired `/run [<branch>]`, `/plan harness [<name>]`,
+// `/plan show [<slug>]`, `/plan archive [<slug>]`, `/plan unarchive <slug>`,
+// `/plan delete <slug>`, `/plan approve [<slug>]`.
+//
+// Step #31 wires the v1-deferred routes per TUI-plan.md §9:
+// * `/plan questions on|off [<slug>]` — flips `plans.questions_enabled` via
+//   the surrounding view's storage helper.
+// * `/step add <title>` — appends a new step to the focused plan.
+// * `/step skip [<num>]` — mirrors the `s` keybinding's `runner::skip_step`.
+// * `/step move <num> --to <m>` — re-keys a step into a new position.
+//
+// The remaining v1-deferred commands route to `PaletteAction::ComingSoon`
+// with the actual sub-view step number from the tui-v1 plan map (33–36).
+// Step #32 picks up `/cancel`, `/export`, `/import`, `/quit`, `/help`; until
+// then those still fall through to `PaletteAction::Deferred`.
 
 use crate::plan::PlanStatus;
 use crate::tui::palette::{ParseError, PaletteCommand};
@@ -120,6 +130,47 @@ pub enum PaletteAction {
     /// `/plan approve [<slug>]` — flip `Planning` → `Ready` (toast otherwise).
     /// No confirm — mirrors the plan-list `A` keybinding.
     Approve { plan_id: String, slug: String },
+    /// `/plan questions on|off [<slug>]` — flip `plans.questions_enabled` via
+    /// `storage::set_plan_questions_enabled`. Mirrors the `Q` keybinding on
+    /// the plan-list tile.
+    SetQuestionsEnabled {
+        plan_id: String,
+        slug: String,
+        enabled: bool,
+    },
+    /// `/step add <title>` — append a new step to the focused plan via
+    /// `storage::create_step`. The caller defaults the rest of the column
+    /// values (no agent, no harness override, empty criteria, etc.) — the
+    /// step-detail view is the right place to fill those in afterwards.
+    AddStep {
+        plan_id: String,
+        slug: String,
+        title: String,
+    },
+    /// `/step skip [<num>]` — mirrors the `s` keybinding via `runner::skip_step`.
+    /// `step_num` is 1-based; `None` means "skip the current step" (whichever
+    /// step `runner::skip_step`'s default selection lands on).
+    SkipStep {
+        plan_id: String,
+        slug: String,
+        step_num: Option<u32>,
+    },
+    /// `/step move <num> --to <m>` — re-key the 1-based step at position
+    /// `from` to land at position `to`. The caller resolves a fractional sort
+    /// key between the new neighbours via `frac_index::key_between` and
+    /// writes it with `storage::update_step_sort_key`.
+    MoveStep {
+        plan_id: String,
+        slug: String,
+        from: u32,
+        to: u32,
+    },
+    /// Recognized command stubbed for a later tui-v1 step (33–36). Caller
+    /// renders a `Coming soon — landing in step <N>` info toast.
+    ComingSoon {
+        label: &'static str,
+        target_step: u32,
+    },
     /// Recognized command whose dispatch lands in a later tui-v1 step. Carries
     /// the canonical label so the loop can render a placeholder toast.
     Deferred(&'static str),
@@ -156,7 +207,48 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
         // -- /plan approve [<slug>] ---------------------------------------
         PaletteCommand::PlanApprove(slug) => dispatch_plan_approve(slug.as_deref(), ctx),
 
-        // Everything else is wired in steps 31–32 (per the tui-v1 plan).
+        // -- /plan questions on|off [<slug>] ------------------------------
+        PaletteCommand::PlanQuestionsOn(slug) => {
+            dispatch_plan_questions(slug.as_deref(), true, ctx)
+        }
+        PaletteCommand::PlanQuestionsOff(slug) => {
+            dispatch_plan_questions(slug.as_deref(), false, ctx)
+        }
+
+        // -- /step add <title> --------------------------------------------
+        PaletteCommand::StepAdd(title) => dispatch_step_add(title, ctx),
+
+        // -- /step skip [<num>] -------------------------------------------
+        PaletteCommand::StepSkip(num) => dispatch_step_skip(*num, ctx),
+
+        // -- /step move <num> --to <m> ------------------------------------
+        PaletteCommand::StepMove { num, to } => dispatch_step_move(*num, *to, ctx),
+
+        // -- v1-deferred sub-views (steps 33–36) --------------------------
+        // The toast text is rendered by the dispatcher loop from the
+        // `target_step`. Sub-view step numbers come from the tui-v1 plan map.
+        PaletteCommand::PlanDependencyAdd
+        | PaletteCommand::PlanDependencyRemove
+        | PaletteCommand::PlanDependencyList => PaletteAction::ComingSoon {
+            label: cmd.label(),
+            target_step: 33,
+        },
+        PaletteCommand::PlanSetHook | PaletteCommand::PlanUnsetHook | PaletteCommand::PlanHooks => {
+            PaletteAction::ComingSoon {
+                label: cmd.label(),
+                target_step: 34,
+            }
+        }
+        PaletteCommand::StepSetHook | PaletteCommand::StepUnsetHook => PaletteAction::ComingSoon {
+            label: cmd.label(),
+            target_step: 35,
+        },
+        PaletteCommand::StepEditTags => PaletteAction::ComingSoon {
+            label: cmd.label(),
+            target_step: 36,
+        },
+
+        // Everything else is wired in step 32 (per the tui-v1 plan).
         // Keep the label so the dispatcher loop can render a stable
         // "<verb> not yet implemented" toast.
         other => PaletteAction::Deferred(other.label()),
@@ -323,6 +415,91 @@ fn dispatch_plan_approve(slug: Option<&str>, ctx: &PaletteContext<'_>) -> Palett
             kind: ToastKind::Info,
         },
         ResolvedSlug::Unknown(name) => unknown_plan_toast(&name),
+    }
+}
+
+fn dispatch_plan_questions(
+    slug: Option<&str>,
+    enabled: bool,
+    ctx: &PaletteContext<'_>,
+) -> PaletteAction {
+    match resolve_slug(slug, ctx) {
+        ResolvedSlug::Some(target) => PaletteAction::SetQuestionsEnabled {
+            plan_id: target.id,
+            slug: target.slug,
+            enabled,
+        },
+        ResolvedSlug::Missing => PaletteAction::Toast {
+            message: "No plan selected.".to_string(),
+            kind: ToastKind::Info,
+        },
+        ResolvedSlug::Unknown(name) => unknown_plan_toast(&name),
+    }
+}
+
+fn dispatch_step_add(title: &str, ctx: &PaletteContext<'_>) -> PaletteAction {
+    let title = title.trim();
+    if title.is_empty() {
+        return PaletteAction::Toast {
+            message: "/step add requires a non-empty title.".to_string(),
+            kind: ToastKind::Error,
+        };
+    }
+    match resolve_slug(None, ctx) {
+        ResolvedSlug::Some(target) => PaletteAction::AddStep {
+            plan_id: target.id,
+            slug: target.slug,
+            title: title.to_string(),
+        },
+        // Plan-list and archived-list don't have a single open plan, but the
+        // focus pointer is enough — every concrete view that hosts the
+        // palette (plan-detail, step-detail) sets `focused_slug` to the open
+        // plan. Without a focused plan we can't pick a target.
+        ResolvedSlug::Missing | ResolvedSlug::Unknown(_) => PaletteAction::Toast {
+            message: "Open a plan first to add a step.".to_string(),
+            kind: ToastKind::Info,
+        },
+    }
+}
+
+fn dispatch_step_skip(num: Option<u32>, ctx: &PaletteContext<'_>) -> PaletteAction {
+    match resolve_slug(None, ctx) {
+        ResolvedSlug::Some(target) => PaletteAction::SkipStep {
+            plan_id: target.id,
+            slug: target.slug,
+            step_num: num,
+        },
+        ResolvedSlug::Missing | ResolvedSlug::Unknown(_) => PaletteAction::Toast {
+            message: "Open a plan first to skip a step.".to_string(),
+            kind: ToastKind::Info,
+        },
+    }
+}
+
+fn dispatch_step_move(from: u32, to: u32, ctx: &PaletteContext<'_>) -> PaletteAction {
+    if from == 0 || to == 0 {
+        return PaletteAction::Toast {
+            message: "/step move: step numbers are 1-based.".to_string(),
+            kind: ToastKind::Error,
+        };
+    }
+    if from == to {
+        return PaletteAction::Toast {
+            message: format!("/step move: step {from} is already at position {to}."),
+            kind: ToastKind::Info,
+        };
+    }
+    match resolve_slug(None, ctx) {
+        ResolvedSlug::Some(target) => PaletteAction::MoveStep {
+            plan_id: target.id,
+            slug: target.slug,
+            from,
+            to,
+        },
+        ResolvedSlug::Missing | ResolvedSlug::Unknown(_) => PaletteAction::Toast {
+            message: "Open a plan first to move a step.".to_string(),
+            kind: ToastKind::Info,
+        },
     }
 }
 
@@ -831,11 +1008,319 @@ mod tests {
 
     #[test]
     fn unwired_commands_become_deferred_with_label() {
-        // Step 30 doesn't wire /step add — it should fall through to
-        // Deferred so step 31 can pick it up.
+        // /quit, /export, /import, /cancel, /help land in step 32 — they
+        // still fall through to Deferred so the next step can pick them up.
         let c = Ctx::new();
-        let action = dispatch_str("/step add hello world", &c);
-        assert_eq!(action, PaletteAction::Deferred("/step add"));
+        assert_eq!(dispatch_str("/quit", &c), PaletteAction::Deferred("/quit"));
+        assert_eq!(
+            dispatch_str("/help", &c),
+            PaletteAction::Deferred("/help")
+        );
+        assert_eq!(
+            dispatch_str("/cancel", &c),
+            PaletteAction::Deferred("/cancel")
+        );
+        assert_eq!(
+            dispatch_str("/export my-plan", &c),
+            PaletteAction::Deferred("/export")
+        );
+        assert_eq!(
+            dispatch_str("/import /tmp/p.json", &c),
+            PaletteAction::Deferred("/import")
+        );
+    }
+
+    // -- /plan questions on|off -------------------------------------------
+
+    #[test]
+    fn plan_questions_on_named_flips_flag() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        let action = dispatch_str("/plan questions on alpha", &c);
+        assert_eq!(
+            action,
+            PaletteAction::SetQuestionsEnabled {
+                plan_id: "id-alpha".to_string(),
+                slug: "alpha".to_string(),
+                enabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_questions_off_named_flips_flag() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        let action = dispatch_str("/plan questions off alpha", &c);
+        assert_eq!(
+            action,
+            PaletteAction::SetQuestionsEnabled {
+                plan_id: "id-alpha".to_string(),
+                slug: "alpha".to_string(),
+                enabled: false,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_questions_on_omitted_uses_focus() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
+        let action = dispatch_str("/plan questions on", &c);
+        assert_eq!(
+            action,
+            PaletteAction::SetQuestionsEnabled {
+                plan_id: "id-alpha".to_string(),
+                slug: "alpha".to_string(),
+                enabled: true,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_questions_unknown_slug_toasts_error() {
+        let c = Ctx::new();
+        let action = dispatch_str("/plan questions on ghost", &c);
+        assert_eq!(action, unknown_plan_toast("ghost"));
+    }
+
+    #[test]
+    fn plan_questions_omitted_with_no_focus_toasts_info() {
+        let c = Ctx::new();
+        let action = dispatch_str("/plan questions off", &c);
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "No plan selected.".to_string(),
+                kind: ToastKind::Info,
+            }
+        );
+    }
+
+    // -- /step add --------------------------------------------------------
+
+    #[test]
+    fn step_add_with_focus_returns_addstep() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
+        let action = dispatch_str("/step add do the thing", &c);
+        assert_eq!(
+            action,
+            PaletteAction::AddStep {
+                plan_id: "id-alpha".to_string(),
+                slug: "alpha".to_string(),
+                title: "do the thing".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn step_add_without_focus_toasts_info() {
+        let c = Ctx::new();
+        let action = dispatch_str("/step add hello", &c);
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "Open a plan first to add a step.".to_string(),
+                kind: ToastKind::Info,
+            }
+        );
+    }
+
+    #[test]
+    fn step_add_with_whitespace_title_toasts_error() {
+        // The parser preserves multi-word titles by re-joining tokens, so a
+        // pure-whitespace title can't actually reach the dispatcher through
+        // `parse()` (split_whitespace drops it). Build the command directly
+        // to verify the dispatcher's defensive guard.
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
+        let cmd = PaletteCommand::StepAdd("   ".to_string());
+        let action = dispatch(&cmd, &c.as_ctx());
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "/step add requires a non-empty title.".to_string(),
+                kind: ToastKind::Error,
+            }
+        );
+    }
+
+    // -- /step skip -------------------------------------------------------
+
+    #[test]
+    fn step_skip_with_focus_no_num_returns_skipstep_none() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::InProgress)];
+        c.focused_slug = Some("alpha".to_string());
+        let action = dispatch_str("/step skip", &c);
+        assert_eq!(
+            action,
+            PaletteAction::SkipStep {
+                plan_id: "id-alpha".to_string(),
+                slug: "alpha".to_string(),
+                step_num: None,
+            }
+        );
+    }
+
+    #[test]
+    fn step_skip_with_explicit_num() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
+        let action = dispatch_str("/step skip 3", &c);
+        assert_eq!(
+            action,
+            PaletteAction::SkipStep {
+                plan_id: "id-alpha".to_string(),
+                slug: "alpha".to_string(),
+                step_num: Some(3),
+            }
+        );
+    }
+
+    #[test]
+    fn step_skip_without_focus_toasts_info() {
+        let c = Ctx::new();
+        let action = dispatch_str("/step skip", &c);
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "Open a plan first to skip a step.".to_string(),
+                kind: ToastKind::Info,
+            }
+        );
+    }
+
+    // -- /step move -------------------------------------------------------
+
+    #[test]
+    fn step_move_returns_movestep() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
+        let action = dispatch_str("/step move 3 --to 5", &c);
+        assert_eq!(
+            action,
+            PaletteAction::MoveStep {
+                plan_id: "id-alpha".to_string(),
+                slug: "alpha".to_string(),
+                from: 3,
+                to: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn step_move_without_focus_toasts_info() {
+        let c = Ctx::new();
+        let action = dispatch_str("/step move 3 --to 5", &c);
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "Open a plan first to move a step.".to_string(),
+                kind: ToastKind::Info,
+            }
+        );
+    }
+
+    #[test]
+    fn step_move_same_position_toasts_info() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
+        let action = dispatch_str("/step move 3 --to 3", &c);
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "/step move: step 3 is already at position 3.".to_string(),
+                kind: ToastKind::Info,
+            }
+        );
+    }
+
+    #[test]
+    fn step_move_zero_indexed_args_rejected() {
+        // Defensive: parser accepts 0 as a u32, but step numbers are 1-based.
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
+        let action = dispatch(
+            &PaletteCommand::StepMove { num: 0, to: 5 },
+            &c.as_ctx(),
+        );
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "/step move: step numbers are 1-based.".to_string(),
+                kind: ToastKind::Error,
+            }
+        );
+    }
+
+    // -- v1-deferred sub-views become ComingSoon --------------------------
+
+    #[test]
+    fn plan_dependency_subcommands_route_to_step_33() {
+        let c = Ctx::new();
+        for input in [
+            "/plan dependency add",
+            "/plan dependency remove",
+            "/plan dependency list",
+        ] {
+            match dispatch_str(input, &c) {
+                PaletteAction::ComingSoon { label, target_step } => {
+                    assert!(label.starts_with("/plan dependency"), "label: {label}");
+                    assert_eq!(target_step, 33);
+                }
+                other => panic!("expected ComingSoon for {input}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn plan_hook_subcommands_route_to_step_34() {
+        let c = Ctx::new();
+        for input in ["/plan set-hook", "/plan unset-hook", "/plan hooks"] {
+            match dispatch_str(input, &c) {
+                PaletteAction::ComingSoon { label, target_step } => {
+                    assert!(label.starts_with("/plan "), "label: {label}");
+                    assert_eq!(target_step, 34);
+                }
+                other => panic!("expected ComingSoon for {input}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn step_hook_subcommands_route_to_step_35() {
+        let c = Ctx::new();
+        for input in ["/step set-hook", "/step unset-hook"] {
+            match dispatch_str(input, &c) {
+                PaletteAction::ComingSoon { label, target_step } => {
+                    assert!(label.starts_with("/step "), "label: {label}");
+                    assert_eq!(target_step, 35);
+                }
+                other => panic!("expected ComingSoon for {input}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn step_edit_tags_routes_to_step_36() {
+        let c = Ctx::new();
+        let action = dispatch_str("/step edit --tags", &c);
+        assert_eq!(
+            action,
+            PaletteAction::ComingSoon {
+                label: "/step edit --tags",
+                target_step: 36,
+            }
+        );
     }
 
     // -- Parse-error mapping ----------------------------------------------
