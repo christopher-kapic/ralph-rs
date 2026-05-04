@@ -26,7 +26,7 @@ use std::path::Path;
 use crate::config;
 use crate::db;
 use crate::output::{self, OutputContext};
-use crate::plan::Step;
+use crate::plan::{Plan, Step};
 use crate::preflight;
 use crate::storage;
 
@@ -44,6 +44,28 @@ pub fn resolve_project(project: Option<&Path>) -> Result<String> {
         .canonicalize()
         .with_context(|| format!("Cannot resolve project path: {}", dir.display()))?;
     Ok(canonical.to_string_lossy().into_owned())
+}
+
+/// Resolve a plan from an optional slug: if provided, look it up; otherwise
+/// find the active plan for the project. `include_complete` controls whether
+/// completed plans count as "active" (useful for status/log).
+pub fn resolve_plan(
+    conn: &Connection,
+    slug: Option<String>,
+    project: &str,
+    include_complete: bool,
+) -> Result<Plan> {
+    match slug {
+        Some(s) if s.is_empty() => {
+            bail!(
+                "Plan slug cannot be empty. Specify a non-empty slug or omit the argument to use the active plan."
+            )
+        }
+        Some(s) => storage::get_plan_by_slug(conn, &s, project)?
+            .with_context(|| format!("Plan not found: {s}")),
+        None => storage::find_active_plan(conn, project, include_complete)?
+            .context("No active plan found. Specify a plan slug as a positional argument."),
+    }
 }
 
 /// Resolve a step reference: either a 1-based positional number within the

@@ -1,14 +1,262 @@
 // Run-related CLI command implementations (status, log, cancel)
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+use crate::config::Config;
 use crate::output::{self, OutputContext, OutputFormat};
-use crate::plan::{ChangePolicy, ExecutionLog, StepStatus};
+use crate::plan::{self, ChangePolicy, ExecutionLog, StepStatus};
+use crate::preflight;
 use crate::run_lock::{self, LiveRun};
+use crate::runner::{self, RunOptions};
+use crate::signal;
 use crate::storage;
+
+// ---------------------------------------------------------------------------
+// Run dispatch
+// ---------------------------------------------------------------------------
+
+/// All inputs the `Run` subcommand needs to dispatch, gathered into one struct
+/// so the CLI surface, the routing decision, and the TUI placeholder can pass
+/// them around as a unit.
+#[derive(Debug, Clone, Default)]
+pub struct RunArgs {
+    pub plan_slug: Option<String>,
+    pub one: bool,
+    pub all: bool,
+    pub from: Option<usize>,
+    pub to: Option<usize>,
+    pub dry_run: bool,
+    pub skip_preflight: bool,
+    pub current_branch: bool,
+    pub no_auto_stash: bool,
+    pub run_harness: Option<String>,
+    pub force: bool,
+    pub verbose: bool,
+    /// The global `--harness` flag (root `Cli` field). Run-specific
+    /// `--harness` takes precedence; both being unset is the default case.
+    pub cli_harness: Option<String>,
+    /// The global `--non-interactive` flag.
+    pub non_interactive: bool,
+    /// The global `--json`/`--jsonl` flag.
+    pub json: bool,
+}
+
+/// Whether `ralph run` was invoked with all defaults — meaning the routing
+/// rule from TUI-plan.md §2 should drop the user into TUI mode.
+///
+/// "Default" means: no Run-specific flags set, no global `--non-interactive`,
+/// no `--json`/`--jsonl`, no `--harness` override at either scope, and stdout
+/// is a real TTY. A bare plan slug is allowed — `ralph run my-plan` is still
+/// considered default.
+///
+/// `stdout_is_tty` is passed in rather than detected internally so the
+/// routing decision is unit-testable without reaching the real terminal.
+pub fn is_default_run_invocation(args: &RunArgs, stdout_is_tty: bool) -> bool {
+    if !stdout_is_tty {
+        return false;
+    }
+    if args.non_interactive || args.json {
+        return false;
+    }
+    !args.one
+        && !args.all
+        && args.from.is_none()
+        && args.to.is_none()
+        && !args.dry_run
+        && !args.skip_preflight
+        && !args.current_branch
+        && !args.no_auto_stash
+        && !args.force
+        && !args.verbose
+        && args.run_harness.is_none()
+        && args.cli_harness.is_none()
+}
+
+/// Dispatch a `ralph run` invocation through today's runner — the
+/// non-interactive path used by scripts and meta-harnesses.
+///
+/// Both [`run_tui_mode`] and the direct-CLI path call this so they share a
+/// single source of truth for run-lock acquisition, preflight, and the
+/// chained-vs-single-plan branches.
+pub fn dispatch_run(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    args: RunArgs,
+    out: &OutputContext,
+) -> Result<()> {
+    let workdir = Path::new(project);
+
+    // Precedence: `ralph run --harness X` beats `ralph --harness Y run`,
+    // which in turn falls back to the plan's own harness and then the
+    // config default. The per-subcommand flag is the most specific, so it
+    // wins.
+    let harness_override = args.run_harness.or(args.cli_harness);
+
+    // `auto_stash` is default-on. `--no-auto-stash` forces it off for a
+    // single run; `config.auto_stash = false` sets a per-user default of
+    // "don't stash". The CLI flag always wins when set.
+    let auto_stash = if args.no_auto_stash {
+        false
+    } else {
+        config.auto_stash
+    };
+    let options = RunOptions {
+        all_plans: args.all,
+        one: args.one,
+        from: args.from,
+        to: args.to,
+        current_branch: args.current_branch,
+        auto_stash,
+        harness_override,
+        dry_run: args.dry_run,
+        verbose: args.verbose,
+    };
+
+    if args.all {
+        if args.from.is_some() || args.to.is_some() {
+            anyhow::bail!(
+                "--from/--to cannot be combined with --all (step numbers are per-plan and not comparable across plans)"
+            );
+        }
+        if args.plan_slug.is_some() {
+            eprintln!("Warning: plan slug argument is ignored when --all is set.");
+        }
+
+        // Acquire the per-project run lock so two concurrent `ralph run`
+        // invocations can't clobber each other. Dry runs skip the lock since
+        // they don't mutate state.
+        let _run_lock = if !args.dry_run {
+            Some(run_lock::acquire(conn, project, None, None, args.force)?)
+        } else {
+            None
+        };
+
+        // Preflight every runnable plan before starting the chain so we
+        // fail fast if anything is misconfigured.
+        if !args.skip_preflight && !args.dry_run {
+            let runnable: Vec<_> = storage::list_plans(conn, project, false)?
+                .into_iter()
+                .filter(|p| {
+                    matches!(
+                        p.status,
+                        plan::PlanStatus::Ready
+                            | plan::PlanStatus::InProgress
+                            | plan::PlanStatus::Failed
+                    )
+                })
+                .collect();
+
+            let mut any_errors = false;
+            for p in &runnable {
+                eprintln!("Running preflight checks for '{}'...", p.slug);
+                let results = preflight::run_preflight_checks(p, config, workdir)?;
+                results.print_report(out);
+                if !results.is_ok() {
+                    any_errors = true;
+                }
+            }
+            if any_errors {
+                anyhow::bail!(
+                    "Preflight checks failed for one or more plans. Use --skip-preflight to bypass."
+                );
+            }
+        }
+
+        let rt = tokio::runtime::Runtime::new()?;
+        let results = rt.block_on(async {
+            let abort_rx = signal::install_and_spawn();
+            runner::run_all_plans(conn, project, config, workdir, &options, abort_rx, out).await
+        })?;
+
+        let total = results.len();
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        for r in &results {
+            eprintln!(
+                "  - {}: {} ({}/{} steps succeeded)",
+                r.plan_slug, r.final_status, r.steps_succeeded, r.steps_executed
+            );
+            if r.final_status == plan::PlanStatus::Complete {
+                succeeded += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        eprintln!(
+            "Ran {} plan(s): {} succeeded, {} failed",
+            total, succeeded, failed
+        );
+        return Ok(());
+    }
+
+    // Single-plan run path.
+    let plan = super::resolve_plan(conn, args.plan_slug, project, false)?;
+    let slug = plan.slug.clone();
+
+    // Acquire the per-project run lock before doing any mutating work.
+    // Dry runs skip the lock.
+    let _run_lock = if !args.dry_run {
+        Some(run_lock::acquire(
+            conn,
+            project,
+            Some(&plan.slug),
+            Some(&plan.id),
+            args.force,
+        )?)
+    } else {
+        None
+    };
+
+    // Preflight checks
+    if !args.skip_preflight && !args.dry_run {
+        eprintln!("Running preflight checks...");
+        let preflight_results = preflight::run_preflight_checks(&plan, config, workdir)?;
+        preflight_results.print_report(out);
+
+        if !preflight_results.is_ok() {
+            anyhow::bail!("Preflight checks failed. Use --skip-preflight to bypass.");
+        }
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(async {
+        let abort_rx = signal::install_and_spawn();
+        runner::run_plan(conn, &plan, config, workdir, &options, abort_rx, out).await
+    })?;
+
+    if result.steps_failed > 0 {
+        eprintln!(
+            "Plan '{}' failed: {}/{} steps succeeded",
+            slug, result.steps_succeeded, result.steps_executed
+        );
+    } else {
+        eprintln!(
+            "Plan '{}' complete: {}/{} steps succeeded",
+            slug, result.steps_succeeded, result.steps_executed
+        );
+    }
+    Ok(())
+}
+
+/// TUI-mode dispatcher for `ralph run`. Step 22 of the tui-v1 plan wires this
+/// up to the real plan-detail view; for now it's a placeholder that produces
+/// today's output exactly. The routing decision in main.rs (via
+/// [`is_default_run_invocation`]) is what makes this function reachable on
+/// bare `ralph run` / `ralph run <slug>` invocations from a TTY.
+pub fn run_tui_mode(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    args: RunArgs,
+    out: &OutputContext,
+) -> Result<()> {
+    dispatch_run(conn, config, project, args, out)
+}
 
 // ---------------------------------------------------------------------------
 // Status command
@@ -1561,5 +1809,165 @@ mod status_live_view_tests {
             !json.contains("child_pid"),
             "cleared child_pid must be absent from status JSON: {json}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run dispatch routing tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod run_dispatch_tests {
+    use super::*;
+
+    fn defaults() -> RunArgs {
+        RunArgs::default()
+    }
+
+    #[test]
+    fn bare_invocation_on_tty_routes_to_tui() {
+        // `ralph run` from a TTY with no flags is the canonical TUI entry.
+        assert!(is_default_run_invocation(&defaults(), true));
+    }
+
+    #[test]
+    fn bare_invocation_with_plan_slug_routes_to_tui() {
+        // A plan-slug positional alone does not count as a "non-default flag";
+        // `ralph run my-plan` from a TTY still drops to the TUI.
+        let args = RunArgs {
+            plan_slug: Some("my-plan".to_string()),
+            ..defaults()
+        };
+        assert!(is_default_run_invocation(&args, true));
+    }
+
+    #[test]
+    fn non_tty_stdout_bypasses_tui() {
+        // Piping to `tee` (or any non-TTY) must keep today's runner path.
+        assert!(!is_default_run_invocation(&defaults(), false));
+    }
+
+    #[test]
+    fn non_interactive_flag_bypasses_tui() {
+        // `--non-interactive` is the explicit opt-out from the TUI even on
+        // a real TTY (e.g. user wants to capture scripted output via `tee`).
+        let args = RunArgs {
+            non_interactive: true,
+            ..defaults()
+        };
+        assert!(!is_default_run_invocation(&args, true));
+    }
+
+    #[test]
+    fn json_flag_bypasses_tui() {
+        // `--json` / `--jsonl` are scripted-output formats; they must keep
+        // today's NDJSON behavior regardless of TTY status.
+        let args = RunArgs {
+            json: true,
+            ..defaults()
+        };
+        assert!(!is_default_run_invocation(&args, true));
+    }
+
+    #[test]
+    fn run_specific_flags_each_bypass_tui() {
+        // Every Run-subcommand flag listed in TUI-plan.md §2 must drop
+        // today's runner path. Using a single per-flag sweep so adding a
+        // new flag forces an explicit decision in this test.
+        let cases: Vec<(&str, RunArgs)> = vec![
+            (
+                "--one",
+                RunArgs {
+                    one: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--all",
+                RunArgs {
+                    all: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--from",
+                RunArgs {
+                    from: Some(2),
+                    ..defaults()
+                },
+            ),
+            (
+                "--to",
+                RunArgs {
+                    to: Some(5),
+                    ..defaults()
+                },
+            ),
+            (
+                "--dry-run",
+                RunArgs {
+                    dry_run: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--skip-preflight",
+                RunArgs {
+                    skip_preflight: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--current-branch",
+                RunArgs {
+                    current_branch: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--no-auto-stash",
+                RunArgs {
+                    no_auto_stash: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--force",
+                RunArgs {
+                    force: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--verbose",
+                RunArgs {
+                    verbose: true,
+                    ..defaults()
+                },
+            ),
+        ];
+        for (label, args) in cases {
+            assert!(
+                !is_default_run_invocation(&args, true),
+                "{label} must bypass TUI mode"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_override_at_either_scope_bypasses_tui() {
+        // Per-subcommand and global `--harness` both count as a non-default
+        // override. Either alone is enough to take today's runner path.
+        let run_only = RunArgs {
+            run_harness: Some("codex".to_string()),
+            ..defaults()
+        };
+        assert!(!is_default_run_invocation(&run_only, true));
+
+        let global_only = RunArgs {
+            cli_harness: Some("codex".to_string()),
+            ..defaults()
+        };
+        assert!(!is_default_run_invocation(&global_only, true));
     }
 }
