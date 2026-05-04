@@ -1,0 +1,414 @@
+{
+  "ralph_rs_version": "0.1.14",
+  "exported_at": "2026-05-04T19:43:48.422470470+00:00",
+  "plan": {
+    "slug": "tui-v1",
+    "branch_name": "tui-v1",
+    "description": "Build the full interactive TUI per TUI-plan.md, including v1-deferred items (plan dependencies UI, plan/step hook UIs, step tag editor). Foundations: V16 migration for the questions feature, NDJSON event-schema expansion, --non-interactive/--jsonl flags. Then multi-view TUI skeleton (plan list, archived list, plan detail, step detail) with command palette, sub-views, and full question feature backed by `ralph question ask`. The authoritative spec is TUI-plan.md at the project root — every step references the relevant section.",
+    "harness": null,
+    "agent": null,
+    "deterministic_tests": [
+      "cargo build",
+      "cargo test",
+      "cargo clippy -- -D warnings"
+    ]
+  },
+  "steps": [
+    {
+      "title": "Add --non-interactive global flag and --jsonl alias for --json",
+      "description": "TUI-plan.md §10. In src/cli.rs: add `non_interactive: bool` to the root `Cli` struct alongside `--json`, `--quiet`, `--no-color`. Add `--jsonl` as a clap alias on the existing `--json` flag (same field, both spellings accepted). No call sites consume `non_interactive` yet — this step only plumbs the flag.\n\nAcceptance: `ralph run --jsonl` and `ralph run --json` both parse; `ralph --non-interactive plan list` parses; existing tests pass; `cargo clippy -- -D warnings` clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Route ralph run with no non-default flags to a TUI-mode dispatcher (placeholder)",
+      "description": "TUI-plan.md §2. In src/main.rs / src/commands/run.rs: when dispatching `Run {...}`, compute `is_default_invocation` = no flags set besides plan slug and `--non-interactive` not set and stdout is a TTY. If false, take today's runner path unchanged. If true, route through a new `commands::run::run_tui_mode` function that for now just calls today's runner (placeholder; step 22 wires the real plan-detail view). Bare `ralph` (no subcommand) still routes to clap help — that route changes in step 14.\n\nAcceptance: `ralph run --one`, `ralph run --dry-run`, `ralph run --json`, etc. behave exactly as today; `ralph run` (bare) and `ralph run <slug>` (bare) route through `run_tui_mode` (which still produces today's output for now); piping to `tee` (non-TTY) bypasses TUI mode. Tests cover the routing logic.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "V16 migration: questions_enabled column + step_questions table + new enum variants",
+      "description": "TUI-plan.md §17 storage. In src/db.rs: add `migrate_v16` that (a) `ALTER TABLE plans ADD COLUMN questions_enabled INTEGER NOT NULL DEFAULT 0`, (b) creates `step_questions(id TEXT PK, step_id TEXT NOT NULL REFERENCES steps(id) ON DELETE CASCADE, attempt INTEGER NOT NULL, question TEXT NOT NULL, suggestions TEXT NOT NULL DEFAULT '[]', answer TEXT, asked_at TEXT NOT NULL, answered_at TEXT)` plus index `idx_step_questions_step` on step_id and partial index `idx_step_questions_unanswered` on `answer WHERE answer IS NULL`. In src/plan.rs: add `PlanStatus::Question` variant and `TerminationReason::PausedForQuestion` variant with as_str/Display/FromStr roundtrips and serde rename to snake_case. Update PLAN_COLUMNS if needed.\n\nNote: `Question` is the *derived* status — a plan reports Question whenever any unanswered step_questions row exists for one of its steps. The plans.status column tracks the underlying lifecycle (in_progress/ready/etc) and is not directly written to Question; un-shadowing happens automatically when the user answers.\n\nAcceptance: migration runs cleanly on a fresh DB and on a DB with V15 already applied; `cargo test` passes including new roundtrip tests for both enum variants; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Expand RunEvent enum with HarnessChunk, TestChunk, PhaseChanged, Summary",
+      "description": "TUI-plan.md §13.1. In src/output.rs: add four variants to `RunEvent` (no emit sites yet, just the schema). Shapes:\n- `HarnessChunk { stream: \\\"stdout\\\"|\\\"stderr\\\", text, seq }` — line-buffered output with monotonic seq.\n- `TestChunk { test_index, stream, text, seq }` — same shape, scoped to test phase.\n- `PhaseChanged { phase }` — emitted at every run_locks.phase transition.\n- `Summary { plan_status, steps_complete, steps_total, duration_secs, cost_usd?, started_at, ended_at }` — final event, will run alongside PlanComplete (kept as a compat shim for one release).\n\nIn src/config.rs: add `harness_chunk_max_bytes: usize` (default 4096). In docs/ndjson-events.md (NEW): document the full event schema.\n\nAcceptance: variants serialize with snake_case `event` tags; tests for each new variant's JSON shape; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Emit PhaseChanged events at every run_locks.phase transition",
+      "description": "In src/executor.rs: find every site that updates run_locks.phase (PreStepHook, Harness, PreTestHook, Tests, PostTestHook, Commit, Rollback, PostStepHook) and emit a `RunEvent::PhaseChanged` after the update when OutputFormat::Ndjson is active. Use the existing `output::emit_ndjson` plumbing.\n\nUpdate existing event-sequence tests in executor.rs / runner.rs / output.rs to either filter to lifecycle events (StepStarted/StepFinished/PlanComplete) or accept the new interleaved PhaseChanged events. Don't drop coverage — adapt assertions.\n\nAcceptance: a step run in NDJSON mode emits PhaseChanged events in the order PreStepHook→Harness→PreTestHook→Tests→PostTestHook→Commit→PostStepHook (or Rollback path); all tests pass; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Emit HarnessChunk events from harness stdout/stderr capture",
+      "description": "TUI-plan.md §13.1. In src/harness.rs: in the subprocess output capture path, emit per-line `RunEvent::HarnessChunk` events when OutputFormat::Ndjson is active. Truncate each chunk's text at `Config.harness_chunk_max_bytes`. Maintain a monotonic `seq` counter per run (passed via the executor or held in a per-run state). One emit per newline.\n\nUpdate or add tests verifying chunks are emitted, ordered, and truncated.\n\nAcceptance: a harness producing N output lines yields N HarnessChunk events with seq 0..N-1; lines exceeding `harness_chunk_max_bytes` are truncated; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Emit TestChunk events from deterministic test runner",
+      "description": "In src/test_runner.rs: emit `RunEvent::TestChunk { test_index, stream, text, seq }` for each output line during deterministic test execution. `test_index` is the position in `plan.deterministic_tests`; `stream` is stdout or stderr; `seq` is monotonic across the test phase.\n\nAcceptance: running a plan with two tests produces TestChunk events tagged with test_index 0 and 1 respectively; sequence numbers are monotonic; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "TUI multi-view skeleton: View enum + mechanical move of existing TUI into views/plan_detail",
+      "description": "TUI-plan.md §15. In src/tui/: create `view.rs` with `pub enum View { PlanList, ArchivedList, PlanDetail, StepDetail }`. Create `views/` directory.\n\nMechanical move (NO behavior change): move existing `app.rs` (App struct + tests) into `views/plan_detail.rs`, renaming `App` → `PlanDetailApp`. Move existing `ui.rs` rendering into `views/plan_detail_ui.rs`. Move existing `input.rs` handling into `views/plan_detail_input.rs`. Move the existing tests in `src/tui/mod.rs` into `views/plan_detail.rs` so they live next to the code they cover. Update `src/tui/mod.rs` to re-export the new module structure.\n\nAcceptance: `ralph run` produces identical TUI behavior as before; ALL existing tui tests pass with import paths updated only — no test removed, no test changed semantically; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Persistent chrome rendering (top breadcrumb + bottom hint + cwd/version)",
+      "description": "TUI-plan.md §4. Create src/tui/chrome.rs with:\n- Top-bar breadcrumb (`ralph › <slug> › step N: <title>`, view-specific).\n- Bottom-bar left hint line (per-view text).\n- Bottom-right `<cwd>  ralph v<version>` — cwd shortened with `~` substitution, left-truncated with `…` if too wide for terminal width. Version from `env!(\\\"CARGO_PKG_VERSION\\\")`.\n\nRender the chrome from a single function called by every view. Tests cover truncation logic (cwd shortening, left-truncate-with-ellipsis).\n\nAcceptance: chrome renders in plan_detail view with correct cwd and version; truncation tests pass for narrow terminals; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Theme module + toast module",
+      "description": "TUI-plan.md §12. Create src/tui/theme.rs exporting named ratatui `Color` constants per the §12 table: cursor (#f7d135), selection (#56d0d9), status_complete (#34d058), status_in_progress (#f7d135), status_pending (#3b82f6), status_failed (#ef4444), status_question (#a855f7), chrome_dim (gray), toast_error/info/success. Truecolor used directly; Color::Rgb works.\n\nCreate src/tui/toast.rs with `struct Toast { text, color, expires_at }` and a `ToastQueue` that auto-expires entries after 3 seconds and supports manual dismiss with `<esc>`. Tests cover queue state + expiry timing (fake clock).\n\nAcceptance: theme constants compile and are used in plan_detail rendering for status glyphs; toast tests pass; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Confirm-dialog primitive + EDITOR handoff module",
+      "description": "TUI-plan.md §11, §14. Create src/tui/dialog.rs: a blocking modal yes/no dialog returning bool. Used by archive/delete/cancel flows. Customizable title and body text.\n\nCreate src/tui/editor.rs: `pub fn edit_in_editor(initial_text: &str) -> Result<Option<String>>`. Reads $EDITOR (then $VISUAL); if both unset, returns Ok(None) and the caller toasts the missing-editor error. Suspends terminal via `LeaveAlternateScreen + DisableMouseCapture`, spawns the editor inheriting stdio, restores on exit. Tempfile under `~/.local/share/ralph-rs/tmp/<scope>-<id>-<rand>.md`, deleted on success. Returns Ok(None) on non-zero editor exit.\n\nAcceptance: tests with mocked $EDITOR (use `echo > $1` or similar); dialog tests cover y/N branches; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Plan list view (read-only): tile rendering, sort by recency, j/k/g/G nav",
+      "description": "TUI-plan.md §5. Create src/tui/views/plan_list.rs. Render tiles per the §5 sketch: slug title, \\\"Ran <date>\\\" (if any execution_log exists for the plan) else \\\"Created <date>\\\", colored status dot + \\\"<completed>/<total>\\\". Date formatted with Config.display_timezone via chrono-tz: \\\"Mon DD at HH:MM AM/PM\\\".\n\nAdd new storage function `storage::list_plans_sorted_by_recency(conn, project)` using a LEFT JOIN with `MAX(execution_logs.started_at)` per plan, falling back to `plans.created_at`, descending. Excludes archived. Tests for the SQL.\n\nWire j/k/↓/↑ navigation (with wrap), g (top), G (bottom). enter/→/l routes to plan-detail (use existing plan-detail entry path; pushing the View stack is fine even though selection logic is step 14). Initial cursor on the first tile.\n\nAcceptance: plan-list view renders; sort tests pass; navigation tests pass; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Bare ralph routes to plan-list view (visible TUI entry point)",
+      "description": "TUI-plan.md §2. In src/cli.rs: make the root `Cli.command` Optional (or add a default subcommand). In src/main.rs: when Command is None, launch the plan-list view (step 12). Stdout-not-TTY case still falls back to clap help (or prints a hint).\n\nAcceptance: `ralph` (no args) opens the plan-list view in a TTY; piped (`ralph | cat`) prints clap help / hint; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Cross-view selection state with space toggle and [N] badges",
+      "description": "TUI-plan.md §5/§7. Add a selection-state mixin (or struct field) reusable across plan_list and plan_detail. Implements: ordered set of selected indices/IDs, `space` toggles selection on the highlighted item, selection-order index is preserved (first selected = 1, second = 2, …). Render `[N]` badge in the top-right of selected tiles (and in the step list later).\n\nBorder-color rules per §5: highlighted = #f7d135, selected = #56d0d9, both = #56d0d9 border + cursor-tinted title.\n\n`<esc>` clears selection when present (otherwise quits/pops). Tests cover selection ordering, toggle, esc-clear.\n\nAcceptance: selection visually distinguishable from cursor; selection ordering preserved; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Plan list d archive (selection-aware, confirm dialog)",
+      "description": "TUI-plan.md §5. Wire `d` keybinding in plan_list. Selection-aware: if any plans selected, archive them all in selection order; otherwise archive the cursor target. Confirm dialog: `Archive <N> plan(s)? [y/N]`. On confirm: call `storage::update_plan_status(_, _, PlanStatus::Archived)` for each. Toast on completion. Clear selection after archive.\n\nAcceptance: d on a single plan with no selection archives that plan; d with a selection archives all selected; cancel from dialog leaves state unchanged; tests cover both branches; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Plan list A approve + Q toggle questions_enabled",
+      "description": "TUI-plan.md §5/§17. Wire `A` keybinding in plan_list to call `storage::update_plan_status(_, _, PlanStatus::Ready)` for the cursor target. Toast: `Plan approved.`.\n\nWire `Q` keybinding to toggle `plans.questions_enabled` for the cursor target. Add new storage helper `set_plan_questions_enabled(conn, plan_id, bool)`. Toast: `Questions enabled.` or `Questions disabled.`.\n\nAcceptance: A flips status from Planning to Ready; Q flips the column; tests cover both; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Plan list i/a create-plan modal (slug → description → tests)",
+      "description": "TUI-plan.md §5 \\\"Create-plan flow\\\". On `i` or `a`: open inline modal with three sequential fields (slug, description, tests). `<enter>` advances to next field (or submits when on the last); `<tab>` switches focus between fields. Tests field is comma-separated; parsed into Vec<String>. `<esc>` cancels at any point.\n\nOn submit: call `storage::create_plan(slug, project_path, description, tests, harness=config.default_harness, agent=None, branch_name=auto)`. Cursor jumps to the new plan in the list (re-sort after create — new plan has no logs, so sorts by created_at).\n\nAcceptance: modal state machine tests pass; created plan appears in list; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Archived tile + archived list view",
+      "description": "TUI-plan.md §5/§6. In plan_list rendering: when archived plan count > 0, render an \\\"Archived (<N>)\\\" tile with red border at the bottom of the tile list. Pressing enter/→/l on this tile pushes `View::ArchivedList`.\n\nCreate src/tui/views/archived_list.rs. Reuses plan-list tile rendering but filters to `PlanStatus::Archived`. Header: \\\"Archived plans\\\". Keybindings:\n- `space` multi-select.\n- `d` permanently delete (selection-aware) with mandatory confirm: `Permanently delete <N> plan(s)? This cannot be undone. [y/N]`. Calls `storage::delete_plan`.\n- `enter`/`→`/`l` unarchive (selection-aware): status → Ready.\n- `←`/`h`/`q` pops to plan list.\n\nAcceptance: archived tile only renders when archived plans exist; archived view's d/enter behaviors covered by tests; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Plan detail view: extend with right-pane summary + plan-list routing",
+      "description": "TUI-plan.md §7. In src/tui/views/plan_detail.rs (already moved in step 8): add the right pane that shows the highlighted step's read-only summary when no run is live — title, status, attempt count (\\\"<attempts>/<max_retries>\\\"), harness, model, agent, tests list. Existing left-pane step list rendering stays intact.\n\nUpdate breadcrumb to `ralph › <slug>` (set via the chrome system from step 9). Route `enter` from plan_list to push View::PlanDetail. `←`/`h`/`q` pops to plan list.\n\nAcceptance: existing plan_detail tests still pass; new tests cover the right-pane content for each step status; routing from plan_list works; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Plan detail step ops: i/a add, d delete, r reset, Shift-J/K move",
+      "description": "TUI-plan.md §7. Wire keybindings:\n- `i`: insert step *above* highlighted; inline title prompt; calls `storage::create_step_at` with sort_key between previous and current.\n- `a`: append step *below* highlighted; inline title prompt; sort_key between current and next.\n- `d`: selection-aware delete with confirm dialog (`Delete <N> step(s)? [y/N]`); calls `storage::delete_step`.\n- `r`: reset highlighted step (`storage::reset_step` — clears status to pending and attempts to 0).\n- `Shift-J` / `Shift-K`: move highlighted (or selected) step down / up one position; recompute sort_key via frac_index between the new neighbors and call `storage::update_step_sort_key`.\n\nAcceptance: tests for each keybinding's state transitions; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Plan detail s/R/S keybindings (skip / run / cancel)",
+      "description": "TUI-plan.md §7. Wire keybindings:\n- `s`: skip currently-running step using existing `request_skip` path.\n- `R`: run / resume the plan. For now spawns `ralph run --non-interactive <slug>` as a tokio child process and watches DB for changes (DB poll for status). Step 36 upgrades this to NDJSON streaming. No-op if a run is already live for this plan.\n- `S`: stop the live run via `ralph cancel` semantics (SIGTERM with timeout, fall back to SIGKILL).\n\nBanner / right-pane indicator: show \\\"Running step N\\\" when active, with the live timer. Phase indication can be a simple string for now (proper phase rendering arrives with NDJSON streaming in step 36).\n\nAcceptance: R spawns the runner subprocess and the TUI visibly shows its progress via DB polling; S cancels a live run; existing skip behavior preserved; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Step detail skeleton: pane stack, j/k nav, h pop, z zen mode + auto-zen <100 cols",
+      "description": "TUI-plan.md §8 + §18 Q5. Create src/tui/views/step_detail.rs. Pane stack layout per the §8 sketch: Universal prompt → Project prompt → Plan context-prepend → Plan prompt → Step prompt (initial focus) → Appended → Tests → Bottom row (Harness/Model/Agent/Change-policy).\n\nVertical j/k (↑/↓) moves between panes, NOT within text. h/← pops view to plan_detail (Appended pane gets its own h/← logic in step 25; for now h on any pane pops). `z` toggles zen mode (default = full step-list sidebar visible like plan_detail's; zen = thin ~4-col gutter with just step number + status glyph). Auto-zen forced when `term_width < 100` with first-time toast `Terminal too narrow — zen mode forced.`; while forced, `z` is disabled.\n\nBreadcrumb updates to `ralph › <slug> › step N: <title>`.\n\nAcceptance: pane focus tests cover initial focus + up/down wrapping; zen toggle tests; auto-zen triggers below threshold; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Step detail read-only render of all editable text panes + bottom row",
+      "description": "TUI-plan.md §8 \\\"Pane semantics\\\" table. Render each pane's text by reading the source of truth:\n- Universal: Config.prompt_prefix, Config.prompt_suffix.\n- Project: project_settings row (via storage::get_project_settings).\n- Plan context-prepend: plan.context_prepend, falling back to DEFAULT_CONTEXT_PREPEND.\n- Plan prompt: plan.prompt_prefix, plan.prompt_suffix.\n- Step prompt: step.title + step.description + step.acceptance_criteria.\n- Tests: plan.deterministic_tests as a bullet list.\n\nBottom row 4 cells displayed read-only: Harness / Model / Agent / Change-policy. Effective values use step → plan → config fallback.\n\nNo editing yet (steps 25–27 add `c`).\n\nAcceptance: panes render with correct content for a fixture plan/step; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Step detail Appended pane: per-attempt retry context with h/l pagination",
+      "description": "TUI-plan.md §8 \\\"Appended-prompt navigation\\\". Read execution_logs for the focused step (newest-first, via storage::list_execution_logs_for_step). Show the most recent attempt by default. Title: \\\"Appended (attempt N/M)\\\".\n\nInside the Appended pane:\n- `l` / `→`: next attempt (newer).\n- `h` / `←`: previous attempt (older). From the *leftmost* (oldest) attempt, `h` pops the step-detail view back to plan-detail. This is the spec's special-case behavior.\n\nFor all other panes, `h` already pops view (from step 22). The Appended pane intercepts h first if a previous attempt exists.\n\nAcceptance: pagination tests cover empty, one-attempt, multi-attempt; pop-from-leftmost works; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "c editor handoff for single-string panes (Universal, Project, Plan context-prepend)",
+      "description": "TUI-plan.md §8 + §18 Q3. Wire `c` keybinding on the Universal, Project, and Plan-context-prepend panes. Each:\n1. Read current value from the source of truth.\n2. Call `tui::editor::edit_in_editor(initial)`. On Ok(None) toast `No \\$EDITOR set — set one in your shell to edit prompts in-place.` (red).\n3. On Ok(Some(new)): write back to the source of truth. Toast `Saved.` if changed, `No changes.` if not.\n\nSources / sinks:\n- Universal → `~/.config/ralph-rs/config.json`. Add new helper `Config::save(&self) -> Result<()>` that does plain serde round-trip via `serde_json::to_string_pretty`. The user has accepted that hand-written comments don't survive (see §18 Q3). The pane edits prompt_prefix and prompt_suffix as a single file with `## Prefix`/`## Suffix` sections; parse on save back to two fields.\n- Project → project_settings via `storage::set_project_prompt_prefix` and `set_project_prompt_suffix` (same file format with two sections).\n- Plan context-prepend → `plans.context_prepend` via `storage::set_plan_context_prepend` (single string, no sections).\n\nAcceptance: tests with mocked $EDITOR (env var override + script that writes a known string); round-trip persists correctly; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "c editor handoff for structured panes (Plan prompt, Step prompt, Tests)",
+      "description": "TUI-plan.md §8. Same pattern as step 25 but for the structured panes:\n- Plan prompt: edits plan.prompt_prefix and plan.prompt_suffix as one file with `## Prefix`/`## Suffix` sections; calls existing storage helpers.\n- Step prompt: edits step.title + step.description + step.acceptance_criteria as one file with `# Title`/`## Description`/`## Acceptance criteria` sections; acceptance criteria parsed as a bulleted list. Calls `storage::update_step_fields_ext`.\n- Tests: edits plan.deterministic_tests as one file, one test per line, blank lines and comment lines (`#`) ignored. Writes via the existing plan-update path or a new helper.\n\nIf parsing fails on save, toast a red error with the parse problem and DO NOT write — return the user to editing.\n\nAcceptance: round-trip tests for each parser; malformed input is rejected without writing; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Bottom-row pickers: harness, model, agent, change_policy",
+      "description": "TUI-plan.md §8 \\\"Bottom-row inline editors\\\". `h`/`l` moves focus within the bottom row (4 cells). `c` on the focused cell opens a picker:\n- Harness: list from `Config.harnesses` keys; selection writes to `step.harness`.\n- Model: list from the chosen harness's known models (HarnessConfig.default_model + any documented set), plus a \\\"Custom...\\\" option that opens a text-input modal. Writes to `step.model`.\n- Agent: list `~/.config/ralph-rs/agents/*.md` filenames (without extension); writes to `step.agent`.\n- Change policy: 2-item picker (Required / Optional); writes to `step.change_policy`.\n\n`<esc>` cancels each picker. All writes go through `storage::update_step_fields_ext` so the existing column-update path is reused.\n\nAcceptance: picker tests cover selection, esc cancellation, and DB write; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Command palette infra: : / dual entry + parser + tab completion",
+      "description": "TUI-plan.md §9. Create src/tui/palette.rs. `:` and `/` both open an input bar at the bottom of the screen; both submit through the same parser. `<enter>` submits, `<esc>` cancels.\n\nParser: split on whitespace, first token is the verb (with leading slash optional after the prefix key). Recognized verbs map to enum `PaletteCommand` (variants for each command from §9). Unknown verbs toast `Unknown command: <verb>`.\n\nTab completion: `<tab>` cycles through known commands matching the current input prefix. After a recognized verb, `<tab>` cycles through valid arguments per the verb (harness names from Config.harnesses, plan slugs from `storage::list_plans`, branch names from `git branch --list` shelled out via std::process::Command). Wrap-around.\n\nFor now, none of the commands are wired (those are steps 29–31). Each command currently toasts `<verb> not yet implemented`. Tests cover the parser + completion logic.\n\nAcceptance: palette opens/closes; tab cycles correctly; parser tests cover all listed verbs; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Palette /run with branch-choice dialog",
+      "description": "TUI-plan.md §9.1. Wire `/run` palette command.\n\nTarget: selection (in selection order) if non-empty, else cursor.\n\nSingle plan: open dialog `Use current branch [Enter] | New branch [n] | Cancel [esc]`.\n- Enter / current: spawn `ralph run --non-interactive --current-branch <slug>` and push plan_detail view of the running plan.\n- n / new: prompt for branch name (defaults to plan.branch_name); spawn runner without --current-branch (it switches to plan.branch_name).\n- esc: cancel.\n\nMulti-plan: same dialog but --current-branch is forced (per spec). On enter: spawn runners sequentially in selection order, all on cwd's current branch. On new-branch: prompt for one name, switch to it (creating if needed), then run all selected plans there.\n\nAcceptance: dialog state machine tested; runner is actually spawned (use a stub child for tests); clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Palette /run <branch>, /plan harness, /plan show|archive|unarchive|delete|approve",
+      "description": "TUI-plan.md §9. Wire:\n- `/run <branch>`: short-circuits the dialog — runs in --current-branch mode on <branch>. If the branch doesn't exist, prompt to create (confirm dialog), then `git checkout -b <branch>` and run. Uses the same selection-aware target logic as `/run`.\n- `/plan harness` and `/plan harness <name>`: invoke existing `plan_harness::generate` flow. Uses `Config.default_harness` if no name given.\n- `/plan show [<slug>]`: pushes a read-only plan summary view (or just routes to plan_detail).\n- `/plan archive [<slug>]` / `/plan unarchive <slug>` / `/plan delete <slug>`: equivalent to the keybinding versions, with confirm dialog where applicable.\n- `/plan approve [<slug>]`: equivalent to `A` keybinding.\n\nAcceptance: each command tested at least via parser → action dispatch; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Palette routes for v1-deferred commands (stubs, real sub-views in steps 32-35)",
+      "description": "TUI-plan.md §9. Wire palette command parsing + routing for the v1-deferred items. `/plan questions on|off [<slug>]` actually works (uses set_plan_questions_enabled from step 16). The rest route to placeholder sub-views that toast `Coming soon — landing in step <N>`:\n- `/plan dependency add|remove|list` → stub for step 32.\n- `/plan set-hook|unset-hook|hooks` → stub for step 33.\n- `/step set-hook|unset-hook` → stub for step 34.\n- `/step edit --tags` → stub for step 35.\n\n`/step add <title>`, `/step skip [<num>]`, `/step move <num> --to <m>` — wired functionally (these use existing storage helpers; not deferred).\n\nAcceptance: parser tests cover every new command; the toasts fire on the deferred ones; the working ones actually do their thing; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Palette /export, /import, /cancel, /quit, /help",
+      "description": "TUI-plan.md §9. Wire:\n- `/export <slug> [-o <path>]`: calls existing export path. Default output path: `<slug>.ralph.json` in cwd.\n- `/import <path>`: calls existing import path. If slug conflict, prompt for a new slug.\n- `/cancel`: equivalent to `S` keybinding (cancel live run).\n- `/quit` / `/q`: exit TUI.\n- `/help`: open help overlay (overlay itself is built in step 43; for now toast `Help overlay coming in step 43`).\n\nAcceptance: each command tested; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Plan dependencies sub-view",
+      "description": "TUI-plan.md §1 \\\"v1-included CLI parity items\\\" (originally deferred but pulled in). Create src/tui/views/plan_dependencies.rs. Entered via `/plan dependency` palette commands or a `D` keybinding from plan_detail.\n\nUI: a table listing `plan.depends_on` slugs (read via storage::list_plan_dependencies). Keybindings:\n- `a`: open slug picker (list of other plans in the project) for adding. Reject if `storage::would_create_cycle` returns true (toast).\n- `d`: remove the highlighted dependency via `storage::remove_plan_dependency`.\n- `q`/`<esc>` pops back.\n\nReplace the stub from step 31 with this real view.\n\nAcceptance: tests cover add/remove/cycle-rejection; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Plan hook attachment sub-view",
+      "description": "TUI-plan.md §1. Create src/tui/views/plan_hooks.rs. Entered via `/plan set-hook|hooks` or a keybinding. UI: list of currently-attached hooks per lifecycle (PreStep, PostStep, PreTest, PostTest from hook_library::Lifecycle).\n\nKeybindings:\n- `a`: open lifecycle picker → hook picker (from `hook_library::list_hooks`) → calls existing `storage::set_plan_hook` (or whatever the existing CLI path uses for `plan set-hook`).\n- `d`: removes the highlighted attachment via `storage::unset_plan_hook`.\n- `q`/`<esc>` pops back.\n\nReplace the stub from step 31.\n\nAcceptance: tests cover add/remove/render for each lifecycle; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Step hook attachment sub-view",
+      "description": "TUI-plan.md §1. Create src/tui/views/step_hooks.rs. Entered via `/step set-hook` or a keybinding from step_detail. Same UX shape as plan_hooks.rs but step-scoped — uses the existing step-hook storage helpers.\n\nReplace the stub from step 31.\n\nAcceptance: tests cover add/remove for each lifecycle, scoped to a step; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Step tag editor sub-view",
+      "description": "TUI-plan.md §1. Create src/tui/views/step_tags.rs. Entered via `/step edit --tags` or a keybinding. UI: list of current `step.tags`. Keybindings:\n- `i`: text input modal to add a new tag (validate non-empty, no duplicates).\n- `d`: remove highlighted tag.\n- `<enter>` / `q`: save full tag list back via `storage::update_step_fields_ext` and pop.\n- `<esc>`: discard changes and pop.\n\nReplace the stub from step 31.\n\nAcceptance: tests cover add/remove, dedup, save-vs-cancel; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Live run integration: NDJSON streaming from TUI-spawned runner",
+      "description": "TUI-plan.md §13. Create src/tui/events.rs. When the TUI spawns the runner (R keybinding, /run command), spawn `ralph run --json --non-interactive <slug>` via `tokio::process::Command` with piped stdout. Wrap stdout in `BufReader::new`, read line by line, parse each line as `RunEvent` via serde_json. Dispatch each event into the App via a tokio mpsc channel.\n\nPlan-detail right pane (when this plan is the live one) renders:\n- Current phase (from PhaseChanged events; mapped to a human label).\n- Step elapsed timer (uses step_start_time, already tracked).\n- Last ~20 lines of harness stdout (HarnessChunk text, latest first or scrolling tail).\n- Last ~20 lines of test output (TestChunk).\n- `J`/`K` to scroll the tails.\n\nReplace the DB-poll fallback from step 21 for TUI-spawned runs (DB poll still used for read-only attach in step 37).\n\nAcceptance: integration test with a fake runner emitting NDJSON to stdout — TUI dispatches events into the App; rendering reflects the latest chunks; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Read-only attach + edit lockdown",
+      "description": "TUI-plan.md §13.2. On TUI start, check the run_locks table for the project. If a row exists for a different process (TUI didn't spawn it), set the App into read-only mode:\n- Disable edit keys per the §13.2 list:\n  - plan_list: i/a/A/d/Q.\n  - plan_detail: i/a/d/r/s/R/Shift-J/Shift-K.\n  - step_detail: c on every editable pane, a (answer question).\n- Persistent banner across all views: `🔒 Read-only — run in progress (PID <n>). [S] cancel  [q] quit`.\n- Still enabled: navigation, viewing, S (cancel), q (quit), ?.\n\nWhen the lock is released (poll every 500ms), banner disappears and edit keys come back. Toast: `Run finished — edits enabled.`.\n\nAcceptance: state-machine tests for the lockdown; banner renders correctly; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "ralph question ask CLI: positional + stdin + repeatable -s/--suggest, run-lock binding",
+      "description": "TUI-plan.md §17 \\\"CLI surface\\\" + \\\"Binding model\\\" + \\\"Behavior when questions are disabled\\\". Add `Question(QuestionCommand)` variant to src/cli.rs. Create src/commands/question.rs.\n\n`ralph question ask [<question>] [-s/--suggest <answer>]...`:\n1. Read question text: positional arg if present, else stdin.\n2. Read run lock for current project (cwd or --project). If no lock, exit non-zero with: `ralph question ask: no active ralph run found for this project. This command only works while a step is being executed by `ralph run`.`\n3. From the lock row read step_id and current execution_logs.attempt for that step.\n4. Read plans.questions_enabled. If false, exit non-zero with the encouraging message from §17 (\\\"do your best… do not retry this command.\\\"). NO DB write.\n5. Otherwise insert a step_questions row (uuid v4 id, suggestions as JSON array, asked_at = now, answer/answered_at = NULL). Exit 0.\n\nAcceptance: integration tests for all three branches (no lock, disabled, enabled); clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "ralph question list/answer/show + ralph plan questions on/off CLI commands",
+      "description": "TUI-plan.md §17 \\\"CLI surface for answering\\\" + \\\"Toggling questions on/off\\\".\n\nAdd to src/commands/question.rs:\n- `ralph question list [<plan-slug>]`: enumerate open questions (answer IS NULL) across plans (or one plan), with index numbers like `[1]` and the question text + plan/step context.\n- `ralph question answer <num> <text>`: by index from list, write answer + answered_at = now.\n- `ralph question show <num>`: print the full question text + suggestions.\n\nAdd `Plan(PlanCommand::Questions { state: \\\"on\\\"|\\\"off\\\", slug })` to src/cli.rs and src/commands/plan.rs:\n- `ralph plan questions on <slug>` / `ralph plan questions off <slug>`: toggles plans.questions_enabled via storage::set_plan_questions_enabled.\n\nAcceptance: integration tests for each subcommand; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Question prompt injection + Previously-answered-questions retry context",
+      "description": "TUI-plan.md §17 \\\"Prompt injection\\\" + \\\"Retry context after answering\\\". In src/prompt.rs:\n\nWhen `plan.questions_enabled == true`, append the §17 \\\"Asking the user a question\\\" block at the very end of `build_step_prompt`, after the existing focus instruction. The text is verbatim from §17.\n\nWhen the step has answered questions (step_questions rows where answer IS NOT NULL for the current step), inject a `## Previously answered questions` section *between* Plan context and Step details. Format per §17: `> Q: ...` and `> A: ...` quote blocks for each Q&A pair, in chronological order.\n\nAdd a new `Plan` field or storage helper to fetch answered questions for a step.\n\nAcceptance: tests verify both injections render correctly with mock plan/step/questions; injection is absent when questions_enabled = false and when there are no answered questions; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Runner integration for questions: detect unanswered, skip tests/commit, paused_for_question",
+      "description": "TUI-plan.md §17 \\\"Runner integration\\\". In src/executor.rs after the harness exits:\n\n1. Query unanswered step_questions for this step + this attempt.\n2. If any exist:\n   - SKIP test execution (the pause is not a failed test).\n   - SKIP commit. Roll back any diff produced by the harness using existing rollback path.\n   - Write the execution_logs row for this attempt with `termination_reason = paused_for_question`.\n   - Increment step.attempts as for any other attempt (single counter; per §17 design note).\n   - Release the run lock cleanly and exit. The plan's effective status is now `Question` (derived from the unanswered row; see plan.rs derived-status helper).\n3. If no unanswered: proceed as today (tests, commit, retry-or-success).\n\nAdd a derived-status helper somewhere reasonable: `plan_effective_status(conn, plan_id) -> PlanStatus` that returns Question if any unanswered step_questions exist for any step in the plan, else plans.status.\n\nAcceptance: integration tests with a stub harness that simulates calling `ralph question ask` (just inserts a row directly); runner pauses correctly; tests cover the happy path (no questions) too; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "TUI question surfaces + answer modal + resume-implementation prompt",
+      "description": "TUI-plan.md §17 \\\"TUI surface\\\".\n\nPlan list: status dot is purple (#a855f7) when the plan has any unanswered question. Tile shows a one-line teaser of the oldest unanswered question, truncated.\n\nPlan detail: when unanswered questions exist, banner pane above the right panel: `❓ <count> open question(s) — press [A] to answer`. Pressing A pushes step_detail focused on the relevant step.\n\nStep detail: new pane between Step prompt and Appended titled `Open question(s)`. Lists each unanswered question with its suggestions (rendered as `[1] suggestion1` etc). j/k moves between questions. `a` opens the answer modal:\n```\n❓ <question text>\n  [1] suggestion 1\n  [2] suggestion 2\n  [c] Custom answer (opens \\$EDITOR)\n  [esc] Cancel\n```\nNumber keys select that suggestion verbatim; `c` opens \\$EDITOR for free-form. On submit, write answer + answered_at via storage helper.\n\nAfter answering the LAST open question for the plan (anywhere — plan-detail banner, step-detail pane, or via CLI signal/poll), pop a modal: `All questions answered. Resume implementation now? [Y/n]`. Y spawns `ralph run` (reusing the previous run's branch mode — current-branch flag from the latest run row); n leaves it.\n\nAcceptance: tests cover the answer modal state machine, custom-answer path, resume-prompt logic; clippy clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    },
+    {
+      "title": "Help overlay (?) + final docs and polish",
+      "description": "TUI-plan.md §15 + §16 \\\"Build phase 13\\\". Add `?` keybinding (works in every view) that toggles a help overlay listing all current view's bindings. Group by category (Navigation, Selection, Edit, Run, etc.). `?` or `<esc>` closes.\n\nFinalize docs/ndjson-events.md (started in step 4): document every RunEvent variant, payload shape, when it's emitted, and consumer expectations. Add a TUI section to README.md (overview, screenshots if feasible, key commands). Add a TUI section to CLAUDE.md so future agents know about the multi-view architecture.\n\nPolish pass: ensure every toast uses theme color tokens (not raw colors); make sure the persistent chrome is consistent across all views; check that the breadcrumb updates correctly on every view push/pop; final clippy clean of all new modules.\n\nAcceptance: help overlay tests cover routing in each view; docs files exist with substantive content; clippy --all-targets -- -D warnings clean.",
+      "agent": null,
+      "harness": null,
+      "acceptance_criteria": [],
+      "max_retries": null,
+      "change_policy": "required"
+    }
+  ]
+}
