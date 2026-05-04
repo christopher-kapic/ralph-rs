@@ -42,7 +42,9 @@ pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
 
 fn hint_for(app: &PlanDetailApp) -> String {
     match app.input_mode {
-        InputMode::Normal => "[j/k] nav  [a] add step  [s] skip  [q] quit".to_string(),
+        InputMode::Normal => {
+            "[j/k] nav  [a] add step  [s] skip  [h/←/q] back".to_string()
+        }
         InputMode::AddStep => "[Enter] confirm  [Esc] cancel".to_string(),
     }
 }
@@ -131,13 +133,13 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
         Span::styled(step.status.as_str(), Style::default().fg(status_color)),
     ]));
 
-    // Agent
-    if let Some(agent) = step.agent.as_deref().or(app.plan.agent.as_deref()) {
-        lines.push(Line::from(vec![
-            Span::styled("Agent: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(agent),
-        ]));
-    }
+    // Attempt counter
+    let max_retries = step.max_retries.unwrap_or(app.default_max_retries as i32);
+    let max_attempts = max_retries + 1;
+    lines.push(Line::from(vec![
+        Span::styled("Attempts: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(format!("{}/{}", step.attempts, max_attempts)),
+    ]));
 
     // Harness
     if let Some(harness) = step.harness.as_deref().or(app.plan.harness.as_deref()) {
@@ -147,13 +149,34 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
         ]));
     }
 
-    // Attempt counter
-    let max_retries = step.max_retries.unwrap_or(app.default_max_retries as i32);
-    let max_attempts = max_retries + 1;
-    lines.push(Line::from(vec![
-        Span::styled("Attempts: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!("{}/{}", step.attempts, max_attempts)),
-    ]));
+    // Model — step-level only; the harness's default model is config-derived
+    // so we don't try to surface a fallback here.
+    if let Some(model) = step.model.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled("Model: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(model),
+        ]));
+    }
+
+    // Agent
+    if let Some(agent) = step.agent.as_deref().or(app.plan.agent.as_deref()) {
+        lines.push(Line::from(vec![
+            Span::styled("Agent: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(agent),
+        ]));
+    }
+
+    // Plan-level deterministic tests. These run after each step's harness
+    // attempt; rendering them on the step summary lets the operator see what
+    // gating commands are in play without leaving the view.
+    if !app.plan.deterministic_tests.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Tests:", Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+        for cmd in &app.plan.deterministic_tests {
+            lines.push(Line::from(format!("  • {cmd}")));
+        }
+    }
 
     // Live timer (only for in-progress steps)
     if step.status == StepStatus::InProgress {
@@ -411,5 +434,225 @@ mod tests {
         // A subsequent render with no navigation must not reset the offset.
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.list_state.offset(), offset_after_scroll);
+    }
+
+    // -- Right-pane summary content ----------------------------------------
+
+    /// Render the plan-detail view and return the buffer as a flat newline-
+    /// joined string for substring assertions. Helper for the right-pane
+    /// summary tests below.
+    fn rendered(app: &mut PlanDetailApp, w: u16, h: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area().height)
+            .map(|y| {
+                (0..buffer.area().width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Build a single-step app with the given status / overrides for
+    /// right-pane assertions. Plan-level harness is `claude` and tests are a
+    /// two-command list; step-level overrides default to `None`.
+    fn app_with_step(
+        status: StepStatus,
+        attempts: i32,
+        max_retries: Option<i32>,
+        step_harness: Option<&str>,
+        step_agent: Option<&str>,
+        step_model: Option<&str>,
+    ) -> PlanDetailApp {
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "demo".to_string(),
+            project: "/proj".to_string(),
+            branch_name: "feat".to_string(),
+            description: "d".to_string(),
+            status: PlanStatus::Ready,
+            harness: Some("claude".to_string()),
+            agent: None,
+            deterministic_tests: vec![
+                "cargo test".to_string(),
+                "cargo clippy -- -D warnings".to_string(),
+            ],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
+            context_prepend: None,
+            questions_enabled: false,
+        };
+        let steps = vec![Step {
+            id: "s0".to_string(),
+            plan_id: "p1".to_string(),
+            sort_key: "a0".to_string(),
+            title: "Write migration".to_string(),
+            description: "Add column".to_string(),
+            agent: step_agent.map(|s| s.to_string()),
+            harness: step_harness.map(|s| s.to_string()),
+            acceptance_criteria: vec!["builds".to_string()],
+            status,
+            attempts,
+            max_retries,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: step_model.map(|s| s.to_string()),
+            skipped_reason: None,
+            change_policy: crate::plan::ChangePolicy::Required,
+            tags: vec![],
+        }];
+        PlanDetailApp::new(plan, steps, &Config::default())
+    }
+
+    #[test]
+    fn right_pane_renders_full_summary_for_pending_step() {
+        // Pending step: status row, attempt counter, harness fallback to plan,
+        // tests list. No timer line (only InProgress).
+        let mut app = app_with_step(
+            StepStatus::Pending,
+            0,
+            Some(3),
+            None,
+            None,
+            None,
+        );
+        let out = rendered(&mut app, 80, 24);
+        assert!(out.contains("Title: Write migration"), "title missing:\n{out}");
+        assert!(out.contains("Status: pending"), "status missing:\n{out}");
+        assert!(out.contains("Attempts: 0/4"), "attempts missing:\n{out}");
+        assert!(out.contains("Harness: claude"), "harness missing:\n{out}");
+        assert!(out.contains("Tests:"), "tests header missing:\n{out}");
+        assert!(out.contains("• cargo test"), "test cmd missing:\n{out}");
+        assert!(
+            out.contains("• cargo clippy"),
+            "clippy cmd missing:\n{out}"
+        );
+        assert!(!out.contains("Elapsed:"), "no timer for pending:\n{out}");
+    }
+
+    #[test]
+    fn right_pane_renders_in_progress_attempt_counter() {
+        // 2/3 in the spec example means attempt 2 of 3 total attempts; the
+        // implementation reports `<attempts>/(max_retries + 1)`.
+        let mut app = app_with_step(
+            StepStatus::InProgress,
+            2,
+            Some(2),
+            None,
+            None,
+            None,
+        );
+        let out = rendered(&mut app, 80, 24);
+        assert!(
+            out.contains("Status: in_progress"),
+            "status missing:\n{out}"
+        );
+        assert!(out.contains("Attempts: 2/3"), "attempts missing:\n{out}");
+    }
+
+    #[test]
+    fn right_pane_renders_step_level_overrides() {
+        let mut app = app_with_step(
+            StepStatus::Pending,
+            0,
+            Some(3),
+            Some("codex"),
+            Some("rust-impl"),
+            Some("claude-opus-4"),
+        );
+        let out = rendered(&mut app, 80, 24);
+        assert!(out.contains("Harness: codex"), "step harness:\n{out}");
+        assert!(out.contains("Agent: rust-impl"), "step agent:\n{out}");
+        assert!(out.contains("Model: claude-opus-4"), "step model:\n{out}");
+    }
+
+    #[test]
+    fn right_pane_renders_complete_status() {
+        let mut app = app_with_step(
+            StepStatus::Complete,
+            1,
+            Some(3),
+            None,
+            None,
+            None,
+        );
+        let out = rendered(&mut app, 80, 24);
+        assert!(out.contains("Status: complete"), "status:\n{out}");
+        assert!(out.contains("Attempts: 1/4"), "attempts:\n{out}");
+    }
+
+    #[test]
+    fn right_pane_renders_failed_status() {
+        let mut app = app_with_step(
+            StepStatus::Failed,
+            3,
+            Some(2),
+            None,
+            None,
+            None,
+        );
+        let out = rendered(&mut app, 80, 24);
+        assert!(out.contains("Status: failed"), "status:\n{out}");
+        assert!(out.contains("Attempts: 3/3"), "attempts:\n{out}");
+    }
+
+    #[test]
+    fn right_pane_renders_skipped_status() {
+        let mut app = app_with_step(
+            StepStatus::Skipped,
+            0,
+            Some(3),
+            None,
+            None,
+            None,
+        );
+        let out = rendered(&mut app, 80, 24);
+        assert!(out.contains("Status: skipped"), "status:\n{out}");
+    }
+
+    #[test]
+    fn right_pane_renders_aborted_status() {
+        let mut app = app_with_step(
+            StepStatus::Aborted,
+            1,
+            Some(3),
+            None,
+            None,
+            None,
+        );
+        let out = rendered(&mut app, 80, 24);
+        assert!(out.contains("Status: aborted"), "status:\n{out}");
+    }
+
+    #[test]
+    fn right_pane_omits_tests_when_plan_has_none() {
+        // A plan with no deterministic_tests should render no Tests header
+        // (rather than "Tests:" followed by blank).
+        let mut app = make_app(1);
+        // make_app's plan has empty deterministic_tests.
+        let out = rendered(&mut app, 80, 24);
+        assert!(
+            !out.contains("Tests:"),
+            "Tests: header should be hidden when empty:\n{out}"
+        );
+    }
+
+    #[test]
+    fn breadcrumb_shows_ralph_arrow_slug() {
+        // §7: top breadcrumb is `ralph › <slug>`. The chrome row is the
+        // first row of the rendered output.
+        let mut app = make_app(1);
+        let out = rendered(&mut app, 80, 5);
+        let top_row = out.lines().next().unwrap();
+        assert!(
+            top_row.contains("ralph › test"),
+            "expected `ralph › test` on top row: {top_row:?}"
+        );
     }
 }

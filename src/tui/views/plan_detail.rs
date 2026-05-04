@@ -45,8 +45,10 @@ pub struct PlanDetailApp {
     /// Text buffer for inline input (used in AddStep mode).
     pub input_buffer: String,
 
-    /// Whether the user has requested a quit.
-    pub should_quit: bool,
+    /// Whether the user has requested to pop this view back to the plan list
+    /// (`←`/`h`/`q`, or Ctrl-C). The dispatcher consumes this and exits the
+    /// plan-detail event loop.
+    pub should_pop: bool,
 
     /// Start time of the current in-progress step (for the live timer).
     pub step_start_time: Option<Instant>,
@@ -70,7 +72,7 @@ impl PlanDetailApp {
             selected_index: 0,
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
-            should_quit: false,
+            should_pop: false,
             step_start_time: None,
             list_state,
             default_max_retries: config.max_retries_per_step,
@@ -142,11 +144,12 @@ impl PlanDetailApp {
         }
     }
 
-    // -- Quit -------------------------------------------------------------
+    // -- Pop --------------------------------------------------------------
 
-    /// Signal that the user wants to quit.
-    pub fn request_quit(&mut self) {
-        self.should_quit = true;
+    /// Signal the dispatcher to pop this view back to the plan list.
+    /// Driven by `←`/`h`/`q` and Ctrl-C per TUI-plan.md §7.
+    pub fn request_pop(&mut self) {
+        self.should_pop = true;
     }
 
     // -- Step state updates -----------------------------------------------
@@ -277,7 +280,7 @@ mod tests {
         assert_eq!(app.plan.slug, "test-plan");
         assert_eq!(app.steps.len(), 3);
         assert_eq!(app.selected_index, 0);
-        assert!(!app.should_quit);
+        assert!(!app.should_pop);
         assert!(matches!(app.input_mode, InputMode::Normal));
     }
 
@@ -421,14 +424,14 @@ mod tests {
     }
 
     #[test]
-    fn test_quit() {
+    fn test_request_pop() {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
 
-        assert!(!app.should_quit);
-        app.request_quit();
-        assert!(app.should_quit);
+        assert!(!app.should_pop);
+        app.request_pop();
+        assert!(app.should_pop);
     }
 
     #[test]

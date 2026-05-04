@@ -365,10 +365,20 @@ pub fn run_plan_list_tui(
                                 )?;
                                 refresh_plan_list_state(conn, project, &mut app)?;
                             }
-                            // Plan-detail routing lands in tui-v1 step 19;
-                            // until then `enter` on a regular tile is a noop.
-                            Some(crate::tui::views::plan_list::OpenRequest::Plan(_))
-                            | None => {}
+                            Some(crate::tui::views::plan_list::OpenRequest::Plan(slug)) => {
+                                run_plan_detail_tui(
+                                    &mut terminal,
+                                    conn,
+                                    config,
+                                    project,
+                                    &slug,
+                                )?;
+                                // The plan-detail view can mutate step state
+                                // (skip / add) and counters; refresh tiles so
+                                // the user sees up-to-date totals on return.
+                                refresh_plan_list_state(conn, project, &mut app)?;
+                            }
+                            None => {}
                         }
                         // Reset so a future tick doesn't re-dispatch.
                         app.open_request = None;
@@ -816,6 +826,50 @@ fn confirm_with_archived_background<B: ratatui::backend::Backend>(
                 Decision::No => return Ok(false),
                 Decision::Pending => continue,
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan-detail TUI dispatcher (TUI-plan.md §7)
+// ---------------------------------------------------------------------------
+
+/// Run the plan-detail event loop until the user pops back. Reuses the
+/// already-open terminal and raw-mode session — the caller
+/// (`run_plan_list_tui` after `enter` on a plan tile) owns terminal
+/// teardown.
+///
+/// Step 19 wires the read-only path: navigation (`j`/`k`) updates the
+/// right-pane summary; `←`/`h`/`q`/Ctrl-C pops back to the plan list. Step
+/// ops (`i`/`a`/`d`/`r`/Shift-J/K) and run controls (`R`/`S`/`s`) land in
+/// later tui-v1 steps; the input handler already routes them but the
+/// dispatcher ignores the resulting actions for now.
+fn run_plan_detail_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    slug: &str,
+) -> Result<()> {
+    use crate::tui::views::plan_detail::PlanDetailApp;
+    use crate::tui::views::plan_detail_input;
+    use crate::tui::views::plan_detail_ui;
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+    let steps = storage::list_steps(conn, &plan.id)?;
+    let mut app = PlanDetailApp::new(plan, steps, config);
+
+    loop {
+        terminal.draw(|f| plan_detail_ui::draw(f, &mut app))?;
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+        let _ = plan_detail_input::handle_key(&mut app, key);
+        if app.should_pop {
+            return Ok(());
         }
     }
 }

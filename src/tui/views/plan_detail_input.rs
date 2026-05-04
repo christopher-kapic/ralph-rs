@@ -17,8 +17,9 @@ pub enum InputAction {
     AddStep(String),
     /// The user requested to skip the step with the given ID.
     SkipStep(String),
-    /// The user requested to quit.
-    Quit,
+    /// The user requested to pop back to the plan list (`←`/`h`/`q` or
+    /// Ctrl-C). TUI-plan.md §7.
+    Pop,
 }
 
 /// Handle a key event and return the resulting action.
@@ -60,16 +61,18 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             }
         }
 
-        // Quit
-        KeyCode::Char('q') => {
-            app.request_quit();
-            InputAction::Quit
+        // Pop back to plan list (TUI-plan.md §7).
+        KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
+            app.request_pop();
+            InputAction::Pop
         }
 
-        // Ctrl+C also triggers quit
+        // Ctrl+C pops the plan-detail view (one level), matching the
+        // archived-list view's pattern. The plan-list dispatcher owns
+        // whole-TUI exit.
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.request_quit();
-            InputAction::Quit
+            app.request_pop();
+            InputAction::Pop
         }
 
         _ => InputAction::None,
@@ -103,11 +106,12 @@ fn handle_add_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             InputAction::None
         }
 
-        // Ctrl+C quits even in add mode
+        // Ctrl+C cancels the input and pops the view, mirroring
+        // archived-list's escape behavior.
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.cancel_input();
-            app.request_quit();
-            InputAction::Quit
+            app.request_pop();
+            InputAction::Pop
         }
 
         // Character input
@@ -236,22 +240,38 @@ mod tests {
     }
 
     #[test]
-    fn test_q_quits() {
+    fn test_q_pops() {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Char('q')));
-        assert_eq!(action, InputAction::Quit);
-        assert!(app.should_quit);
+        assert_eq!(action, InputAction::Pop);
+        assert!(app.should_pop);
     }
 
     #[test]
-    fn test_ctrl_c_quits() {
+    fn test_h_pops() {
+        let mut app = make_app(3);
+        let action = handle_key(&mut app, key(KeyCode::Char('h')));
+        assert_eq!(action, InputAction::Pop);
+        assert!(app.should_pop);
+    }
+
+    #[test]
+    fn test_left_arrow_pops() {
+        let mut app = make_app(3);
+        let action = handle_key(&mut app, key(KeyCode::Left));
+        assert_eq!(action, InputAction::Pop);
+        assert!(app.should_pop);
+    }
+
+    #[test]
+    fn test_ctrl_c_pops() {
         let mut app = make_app(3);
         let action = handle_key(
             &mut app,
             key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
-        assert_eq!(action, InputAction::Quit);
-        assert!(app.should_quit);
+        assert_eq!(action, InputAction::Pop);
+        assert!(app.should_pop);
     }
 
     #[test]
@@ -317,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_mode_ctrl_c_quits() {
+    fn test_add_mode_ctrl_c_pops() {
         let mut app = make_app(3);
         app.enter_add_mode();
         app.input_buffer = "partial".to_string();
@@ -326,8 +346,8 @@ mod tests {
             &mut app,
             key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
-        assert_eq!(action, InputAction::Quit);
-        assert!(app.should_quit);
+        assert_eq!(action, InputAction::Pop);
+        assert!(app.should_pop);
         assert!(matches!(app.input_mode, InputMode::Normal));
         assert!(app.input_buffer.is_empty());
     }
