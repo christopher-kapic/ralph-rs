@@ -839,11 +839,11 @@ fn confirm_with_archived_background<B: ratatui::backend::Backend>(
 /// (`run_plan_list_tui` after `enter` on a plan tile) owns terminal
 /// teardown.
 ///
-/// Step 19 wires the read-only path: navigation (`j`/`k`) updates the
-/// right-pane summary; `←`/`h`/`q`/Ctrl-C pops back to the plan list. Step
-/// ops (`i`/`a`/`d`/`r`/Shift-J/K) and run controls (`R`/`S`/`s`) land in
-/// later tui-v1 steps; the input handler already routes them but the
-/// dispatcher ignores the resulting actions for now.
+/// Step 21 of tui-v1 adds the run controls (`R`/`S`): the loop polls
+/// `run_locks` on each tick so the in-memory step list and "Running
+/// step N" banner reflect runner-subprocess progress. Pressing `R`
+/// spawns a `ralph run --non-interactive <slug>` child and `S` sends
+/// `ralph cancel` semantics (SIGTERM with timeout, then SIGKILL).
 fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
@@ -861,8 +861,38 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     let steps = storage::list_steps(conn, &plan.id)?;
     let mut app = PlanDetailApp::new(plan, steps, config);
 
+    let mut runner_child: Option<std::process::Child> = None;
+
     loop {
+        // Refresh DB-backed state so the UI reflects runner progress between
+        // key presses. The live-run snapshot drives the banner; the step list
+        // mirrors status changes the runner subprocess is writing.
+        let live_snapshot = storage::get_live_run(conn, project)
+            .ok()
+            .flatten()
+            .filter(|l| l.plan_slug.as_deref() == Some(slug));
+        app.update_live_run(live_snapshot);
+        if let Ok(latest_steps) = storage::list_steps(conn, &app.plan.id) {
+            app.sync_steps_from_db(latest_steps);
+        }
+
+        // Reap a finished runner subprocess so its pid doesn't linger as a
+        // zombie. We don't surface the exit status here — the run lock
+        // disappearance is the user-visible signal that the run is done.
+        if let Some(c) = runner_child.as_mut()
+            && let Ok(Some(_status)) = c.try_wait()
+        {
+            runner_child = None;
+        }
+
         terminal.draw(|f| plan_detail_ui::draw(f, &mut app))?;
+
+        // Poll with a short timeout so the live timer + DB poll keep ticking
+        // even when the user isn't pressing keys. 250ms balances UI
+        // smoothness against polling cost.
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             _ => continue,
@@ -888,8 +918,20 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
             InputAction::MoveDown(step_id) => {
                 plan_detail_apply_move(conn, &mut app, &step_id, MoveDir::Down)?;
             }
+            InputAction::Run => {
+                plan_detail_apply_run(conn, &mut app, project, slug, &mut runner_child)?;
+            }
+            InputAction::Stop => {
+                plan_detail_apply_stop(conn, &mut app, project, slug)?;
+            }
         }
         if app.should_pop {
+            // The spawned runner is its own process; popping the view
+            // doesn't kill it. Reap it iff it has already exited so we
+            // don't leave a zombie behind on the way out.
+            if let Some(c) = runner_child.as_mut() {
+                let _ = c.try_wait();
+            }
             return Ok(());
         }
     }
@@ -992,6 +1034,132 @@ pub(crate) fn plan_detail_apply_skip(
         Err(e) => {
             app.toasts.push(
                 format!("Failed to skip step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Persist an `R` run / resume action: spawn `ralph run --non-interactive
+/// <slug>` as a child process so the TUI can keep polling the DB while the
+/// runner advances the plan. Stdio is redirected to /dev/null so the
+/// subprocess output doesn't conflict with the TUI's raw-mode display —
+/// step 36 of tui-v1 swaps this out for an NDJSON pipe.
+///
+/// No-op (info toast) if a run is already live for this plan, matching the
+/// acceptance criteria in TUI-plan.md §7.
+pub(crate) fn plan_detail_apply_run(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    project: &str,
+    slug: &str,
+    runner_child: &mut Option<std::process::Child>,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let already_live = storage::get_live_run(conn, project)?
+        .map(|l| l.plan_slug.as_deref() == Some(slug))
+        .unwrap_or(false);
+    if already_live {
+        app.toasts.push(
+            "Run already live for this plan.",
+            ToastKind::Info,
+            Instant::now(),
+        );
+        return Ok(());
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            app.toasts.push(
+                format!("Cannot locate ralph binary: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return Ok(());
+        }
+    };
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("-C")
+        .arg(project)
+        .arg("--non-interactive")
+        .arg("run")
+        .arg(slug)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    match cmd.spawn() {
+        Ok(child) => {
+            *runner_child = Some(child);
+            app.toasts.push(
+                format!("Started run for {slug}"),
+                ToastKind::Success,
+                Instant::now(),
+            );
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to start run: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Persist an `S` stop action by routing through `cmd_cancel`, which
+/// implements the SIGTERM-with-timeout-then-SIGKILL semantics used by the
+/// `ralph cancel` CLI. The 15s default mirrors the CLI default and is long
+/// enough for a runner mid-phase to write its rollback / finalize records.
+pub(crate) fn plan_detail_apply_stop(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    project: &str,
+    slug: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let live = storage::get_live_run(conn, project)?
+        .filter(|l| l.plan_slug.as_deref() == Some(slug));
+    if live.is_none() {
+        app.toasts.push(
+            "No live run for this plan.",
+            ToastKind::Info,
+            Instant::now(),
+        );
+        return Ok(());
+    }
+
+    // Quiet plain-format context so cmd_cancel doesn't print progress dots
+    // through the alternate screen during the brief SIGTERM wait.
+    let cancel_out = OutputContext {
+        format: OutputFormat::Plain,
+        quiet: true,
+        color: false,
+    };
+    match cmd_cancel(
+        conn,
+        project,
+        Some(slug),
+        false,
+        Duration::from_secs(15),
+        &cancel_out,
+    ) {
+        Ok(()) => {
+            app.toasts
+                .push("Run cancelled.", ToastKind::Success, Instant::now());
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to cancel run: {e}"),
                 ToastKind::Error,
                 Instant::now(),
             );

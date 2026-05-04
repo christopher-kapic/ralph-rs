@@ -53,7 +53,7 @@ pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
 fn hint_for(app: &PlanDetailApp) -> String {
     match app.input_mode {
         InputMode::Normal => {
-            "[j/k] nav  [space] sel  [i/a] add  [d] del  [r] reset  [J/K] move  [s] skip  [q] back"
+            "[j/k] nav  [space] sel  [i/a] add  [d] del  [r] reset  [J/K] move  [s] skip  [R] run  [S] stop  [q] back"
                 .to_string()
         }
         InputMode::AddStep(_) => "[Enter] confirm  [Esc] cancel".to_string(),
@@ -155,6 +155,41 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
 
     let step = &app.steps[app.selected_index];
     let mut lines: Vec<Line> = Vec::new();
+
+    // Live-run banner (TUI-plan.md §7): when a runner is bound to this plan,
+    // surface "Running step N (phase) MM:SS" so the user sees progress
+    // regardless of which step the cursor is on. Phase is rendered as a
+    // simple string for now — proper phase visuals land with NDJSON
+    // streaming in step 36.
+    if app.is_run_live() {
+        let step_label = match app.live_step_num() {
+            Some(n) => format!("▶ Running step {n}"),
+            None => "▶ Running...".to_string(),
+        };
+        let phase_label = app
+            .live_run
+            .as_ref()
+            .and_then(|l| l.phase.as_ref())
+            .map(|p| format!(" ({})", p.as_str()))
+            .unwrap_or_default();
+        let elapsed = app.elapsed_secs();
+        let mins = (elapsed as u64) / 60;
+        let secs = (elapsed as u64) % 60;
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{step_label}{phase_label}"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{mins:02}:{secs:02}"),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
 
     // Title
     lines.push(Line::from(vec![
@@ -689,6 +724,61 @@ mod tests {
             !out.contains("Tests:"),
             "Tests: header should be hidden when empty:\n{out}"
         );
+    }
+
+    #[test]
+    fn right_pane_renders_running_step_banner_when_live() {
+        // §7 acceptance: when a runner is bound to this plan, the right
+        // pane shows "Running step N (phase)" alongside the live timer.
+        let mut app = make_app(3);
+        app.update_live_run(Some(crate::run_lock::LiveRun {
+            project: "/proj".to_string(),
+            pid: 1234,
+            pid_start_token: None,
+            plan_id: Some("p1".to_string()),
+            plan_slug: Some("test".to_string()),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            step_id: Some("s1".to_string()),
+            step_num: Some(2),
+            attempt: Some(1),
+            max_attempts: Some(4),
+            phase: Some(crate::plan::Phase::Harness),
+            phase_started_at: None,
+            current_command: None,
+            execution_log_id: None,
+            child_pid: None,
+            child_start_token: None,
+            updated_at: None,
+            source_branch: None,
+            stash_sha: None,
+        }));
+        let out = rendered(&mut app, 80, 24);
+        assert!(
+            out.contains("Running step 2"),
+            "running banner missing:\n{out}"
+        );
+        assert!(out.contains("(harness)"), "phase missing:\n{out}");
+    }
+
+    #[test]
+    fn right_pane_omits_running_banner_when_no_live_run() {
+        // No update_live_run call → banner is hidden.
+        let mut app = make_app(3);
+        let out = rendered(&mut app, 80, 24);
+        assert!(
+            !out.contains("Running step"),
+            "banner should be hidden without live run:\n{out}"
+        );
+    }
+
+    #[test]
+    fn hint_bar_advertises_run_and_stop_keybinds() {
+        // §7 keybinding: bottom hint must include [R] run and [S] stop so
+        // the controls are discoverable in the chrome footer.
+        let mut app = make_app(1);
+        let out = rendered(&mut app, 120, 6);
+        assert!(out.contains("[R] run"), "missing [R] hint:\n{out}");
+        assert!(out.contains("[S] stop"), "missing [S] hint:\n{out}");
     }
 
     #[test]

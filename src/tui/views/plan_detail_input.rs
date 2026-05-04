@@ -29,6 +29,12 @@ pub enum InputAction {
     /// The user requested to pop back to the plan list (`←`/`h`/`q` or
     /// Ctrl-C). TUI-plan.md §7.
     Pop,
+    /// The user pressed `R` to spawn / resume the runner subprocess for this
+    /// plan. The dispatcher checks for an existing live run before spawning.
+    Run,
+    /// The user pressed `S` to stop the live run via `ralph cancel` semantics
+    /// (SIGTERM with timeout, fall back to SIGKILL).
+    Stop,
 }
 
 /// Handle a key event and return the resulting action.
@@ -118,6 +124,12 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
                 InputAction::None
             }
         }
+
+        // Run / resume the plan (TUI-plan.md §7).
+        KeyCode::Char('R') => InputAction::Run,
+
+        // Stop the live run (TUI-plan.md §7).
+        KeyCode::Char('S') => InputAction::Stop,
 
         // Esc clears selection if any; otherwise no-op (Esc does NOT pop the
         // view — `q`/`h`/`←` own that).
@@ -401,6 +413,20 @@ mod tests {
         app.selected_index = 0; // InProgress step
         let action = handle_key(&mut app, key(KeyCode::Char('s')));
         assert_eq!(action, InputAction::SkipStep("s0".to_string()));
+    }
+
+    #[test]
+    fn test_shift_r_emits_run_action() {
+        let mut app = make_app(3);
+        let action = handle_key(&mut app, key(KeyCode::Char('R')));
+        assert_eq!(action, InputAction::Run);
+    }
+
+    #[test]
+    fn test_shift_s_emits_stop_action() {
+        let mut app = make_app(3);
+        let action = handle_key(&mut app, key(KeyCode::Char('S')));
+        assert_eq!(action, InputAction::Stop);
     }
 
     #[test]

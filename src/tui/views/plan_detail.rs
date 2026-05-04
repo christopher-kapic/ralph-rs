@@ -12,6 +12,7 @@ use ratatui::widgets::ListState;
 use crate::config::Config;
 use crate::frac_index::{self, FracIndexError};
 use crate::plan::{Plan, Step, StepStatus};
+use crate::run_lock::LiveRun;
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
 
@@ -82,6 +83,13 @@ pub struct PlanDetailApp {
     /// onto this after operations (`d` delete, `r` reset, J/K move) so the
     /// user sees a transient confirmation.
     pub toasts: ToastQueue,
+
+    /// Snapshot of the live `run_locks` row for this plan, refreshed by the
+    /// dispatcher on each poll tick. `Some` when a runner subprocess (spawned
+    /// by `R` here or by an external `ralph run`) is bound to this plan; the
+    /// renderer reads `step_num` and `phase` to draw the "Running step N"
+    /// banner per TUI-plan.md §7.
+    pub live_run: Option<LiveRun>,
 }
 
 impl PlanDetailApp {
@@ -101,6 +109,7 @@ impl PlanDetailApp {
             default_max_retries: config.max_retries_per_step,
             selection: Selection::new(),
             toasts: ToastQueue::new(),
+            live_run: None,
         }
     }
 
@@ -390,6 +399,62 @@ impl PlanDetailApp {
         }
     }
 
+    /// Replace the step list during a periodic DB poll (TUI-plan.md §7
+    /// `R`/`S` flow), preserving cursor and selection by step ID. Differs
+    /// from `refresh_steps` — which is called after a user-initiated mutation
+    /// — in that selection survives unless an explicitly-selected step has
+    /// disappeared.
+    pub fn sync_steps_from_db(&mut self, steps: Vec<Step>) {
+        let cursor_id = self.steps.get(self.selected_index).map(|s| s.id.clone());
+        self.steps = steps;
+
+        // Restore cursor by step ID; on disappearance, clamp the index.
+        if let Some(id) = cursor_id
+            && let Some(idx) = self.steps.iter().position(|s| s.id == id)
+        {
+            self.selected_index = idx;
+        } else if self.steps.is_empty() {
+            self.selected_index = 0;
+        } else if self.selected_index >= self.steps.len() {
+            self.selected_index = self.steps.len() - 1;
+        }
+
+        // Drop selection entries for steps that no longer exist.
+        let valid: std::collections::HashSet<String> =
+            self.steps.iter().map(|s| s.id.clone()).collect();
+        self.selection.retain(|id| valid.contains(id));
+    }
+
+    // -- Live-run snapshot ------------------------------------------------
+
+    /// Update the cached live-run snapshot. When the in-progress step
+    /// changes (or transitions in/out of the running state), the live timer
+    /// is reset so "Elapsed" reflects the *current* step rather than the
+    /// previous one.
+    pub fn update_live_run(&mut self, live: Option<LiveRun>) {
+        let prev_step = self.live_run.as_ref().and_then(|l| l.step_id.clone());
+        let next_step = live.as_ref().and_then(|l| l.step_id.clone());
+        self.live_run = live;
+        if prev_step != next_step {
+            if next_step.is_some() {
+                self.start_step_timer();
+            } else {
+                self.stop_step_timer();
+            }
+        }
+    }
+
+    /// 1-based step number reported by the live runner, or `None` when no
+    /// run is active for this plan. Used by the right-pane banner.
+    pub fn live_step_num(&self) -> Option<i32> {
+        self.live_run.as_ref().and_then(|l| l.step_num)
+    }
+
+    /// True iff a runner is currently bound to this plan.
+    pub fn is_run_live(&self) -> bool {
+        self.live_run.is_some()
+    }
+
     // -- Timer ------------------------------------------------------------
 
     /// Start the live timer for the current step.
@@ -429,6 +494,7 @@ mod tests {
     use super::{AddPosition, InputMode, PlanDetailApp};
     use crate::config::Config;
     use crate::plan::{Plan, PlanStatus, Step, StepStatus};
+    use crate::run_lock::LiveRun;
     use chrono::Utc;
 
     fn make_plan() -> Plan {
@@ -1132,5 +1198,141 @@ mod tests {
         assert_eq!(app.selection.len(), 1);
         app.refresh_steps(make_steps(3));
         assert!(app.selection.is_empty());
+    }
+
+    // -- sync_steps_from_db -----------------------------------------------
+
+    #[test]
+    fn test_sync_steps_preserves_cursor_by_id() {
+        // Cursor on s2; refresh shuffles position but the cursor follows
+        // s2's new index instead of clamping to a numeric position.
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 2;
+
+        let mut new_steps = make_steps(3);
+        new_steps.reverse();
+        let new_index_of_s2 = new_steps.iter().position(|s| s.id == "s2").unwrap();
+        app.sync_steps_from_db(new_steps);
+        assert_eq!(app.selected_index, new_index_of_s2);
+    }
+
+    #[test]
+    fn test_sync_steps_preserves_selection_when_steps_survive() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.toggle_selection(); // selects s0
+        app.navigate_down();
+        app.toggle_selection(); // selects s1
+        assert_eq!(app.selection.len(), 2);
+
+        // Same set of steps from DB → selection retained.
+        app.sync_steps_from_db(make_steps(3));
+        assert_eq!(app.selection.len(), 2);
+        assert!(app.selection.is_selected(&"s0".to_string()));
+        assert!(app.selection.is_selected(&"s1".to_string()));
+    }
+
+    #[test]
+    fn test_sync_steps_drops_selection_for_disappeared_step() {
+        let plan = make_plan();
+        let steps = make_steps(4);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 1;
+        app.toggle_selection(); // s1
+        app.selected_index = 3;
+        app.toggle_selection(); // s3
+        assert_eq!(app.selection.len(), 2);
+
+        // Only s0..s2 remain — s3 disappeared.
+        app.sync_steps_from_db(make_steps(3));
+        assert_eq!(app.selection.len(), 1);
+        assert!(app.selection.is_selected(&"s1".to_string()));
+        assert!(!app.selection.is_selected(&"s3".to_string()));
+    }
+
+    #[test]
+    fn test_sync_steps_clamps_cursor_when_target_disappears() {
+        let plan = make_plan();
+        let steps = make_steps(5);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.selected_index = 4;
+        app.sync_steps_from_db(make_steps(2));
+        assert_eq!(app.selected_index, 1);
+    }
+
+    // -- live_run snapshot ------------------------------------------------
+
+    fn make_live_run(plan_slug: &str, step_id: Option<&str>, step_num: Option<i32>) -> LiveRun {
+        LiveRun {
+            project: "/proj".to_string(),
+            pid: 1234,
+            pid_start_token: None,
+            plan_id: Some("p1".to_string()),
+            plan_slug: Some(plan_slug.to_string()),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            step_id: step_id.map(|s| s.to_string()),
+            step_num,
+            attempt: Some(1),
+            max_attempts: Some(4),
+            phase: Some(crate::plan::Phase::Harness),
+            phase_started_at: None,
+            current_command: None,
+            execution_log_id: None,
+            child_pid: None,
+            child_start_token: None,
+            updated_at: None,
+            source_branch: None,
+            stash_sha: None,
+        }
+    }
+
+    #[test]
+    fn test_update_live_run_starts_timer_when_step_appears() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        assert!(!app.is_run_live());
+        assert!(app.step_start_time.is_none());
+
+        app.update_live_run(Some(make_live_run("test-plan", Some("s1"), Some(2))));
+        assert!(app.is_run_live());
+        assert!(app.step_start_time.is_some());
+        assert_eq!(app.live_step_num(), Some(2));
+    }
+
+    #[test]
+    fn test_update_live_run_stops_timer_when_run_ends() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.update_live_run(Some(make_live_run("test-plan", Some("s1"), Some(2))));
+        assert!(app.step_start_time.is_some());
+
+        app.update_live_run(None);
+        assert!(!app.is_run_live());
+        assert!(app.step_start_time.is_none());
+        assert_eq!(app.live_step_num(), None);
+    }
+
+    #[test]
+    fn test_update_live_run_resets_timer_on_step_change() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let mut app = PlanDetailApp::new(plan, steps, &Config::default());
+        app.update_live_run(Some(make_live_run("test-plan", Some("s1"), Some(2))));
+        let first_start = app.step_start_time.unwrap();
+
+        // Pause briefly so Instant comparisons are unambiguous.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        app.update_live_run(Some(make_live_run("test-plan", Some("s2"), Some(3))));
+        let second_start = app.step_start_time.unwrap();
+        assert!(
+            second_start > first_start,
+            "timer should restart when in-progress step changes"
+        );
+        assert_eq!(app.live_step_num(), Some(3));
     }
 }

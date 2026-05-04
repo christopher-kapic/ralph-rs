@@ -67,6 +67,14 @@ impl<K: Clone + PartialEq> Selection<K> {
         self.keys.clear();
     }
 
+    /// Drop selected keys for which `predicate` returns `false`. Used by the
+    /// plan-detail dispatcher's periodic DB poll to discard selection entries
+    /// for steps that have been deleted by another process; surviving keys
+    /// keep their relative order so badge numbers stay contiguous.
+    pub fn retain<F: FnMut(&K) -> bool>(&mut self, predicate: F) {
+        self.keys.retain(predicate);
+    }
+
     /// Read-only view of selected keys in selection order.
     pub fn as_slice(&self) -> &[K] {
         &self.keys
