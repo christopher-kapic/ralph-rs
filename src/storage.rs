@@ -142,6 +142,43 @@ pub fn list_plans(conn: &Connection, project: &str, all: bool) -> Result<Vec<Pla
     Ok(plans)
 }
 
+/// List non-archived plans for a project, sorted by recency.
+///
+/// "Recency" is `MAX(execution_logs.started_at)` joined through
+/// `steps.plan_id`, falling back to `plans.created_at` when the plan has no
+/// execution logs yet. Most recent first. Archived plans are excluded.
+///
+/// Drives the TUI plan-list view (TUI-plan.md §5). Wired into the bare
+/// `ralph` invocation in tui-v1 step 13.
+#[allow(dead_code)]
+pub fn list_plans_sorted_by_recency(conn: &Connection, project: &str) -> Result<Vec<Plan>> {
+    // Project the plan columns through the LEFT-JOIN with an alias so the
+    // index positions seen by `Plan::from_row` line up with PLAN_COLUMNS.
+    let plan_cols = PLAN_COLUMNS
+        .split(", ")
+        .map(|c| format!("p.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT {plan_cols} \
+         FROM plans p \
+         LEFT JOIN ( \
+             SELECT s.plan_id AS plan_id, MAX(l.started_at) AS last_run \
+             FROM steps s JOIN execution_logs l ON l.step_id = s.id \
+             GROUP BY s.plan_id \
+         ) lr ON lr.plan_id = p.id \
+         WHERE p.project = ?1 AND p.status != ?2 \
+         ORDER BY COALESCE(lr.last_run, p.created_at) DESC, p.created_at DESC"
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let rows = stmt.query_map(params![project, PlanStatus::Archived.as_str()], Plan::from_row)?;
+    let mut plans = Vec::new();
+    for row in rows {
+        plans.push(row?);
+    }
+    Ok(plans)
+}
+
 /// Update a plan's status and set updated_at to now.
 pub fn update_plan_status(conn: &Connection, plan_id: &str, status: PlanStatus) -> Result<()> {
     let affected = conn.execute(
@@ -1591,6 +1628,132 @@ mod tests {
 
         let all = list_plans(&conn, "/proj-a", true).unwrap();
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_list_plans_sorted_by_recency_no_logs_uses_created_at() {
+        // With no execution_logs rows, the order should be `created_at DESC`.
+        let conn = setup();
+
+        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        // Force distinct created_at stamps so ordering is deterministic.
+        conn.execute(
+            "UPDATE plans SET created_at = ?1 WHERE id = ?2",
+            params!["2026-01-01T00:00:00.000Z", p1.id],
+        )
+        .unwrap();
+        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        conn.execute(
+            "UPDATE plans SET created_at = ?1 WHERE id = ?2",
+            params!["2026-03-01T00:00:00.000Z", p2.id],
+        )
+        .unwrap();
+        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        conn.execute(
+            "UPDATE plans SET created_at = ?1 WHERE id = ?2",
+            params!["2026-02-01T00:00:00.000Z", p3.id],
+        )
+        .unwrap();
+
+        let plans = list_plans_sorted_by_recency(&conn, "/proj").unwrap();
+        let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["p2", "p3", "p1"]);
+    }
+
+    #[test]
+    fn test_list_plans_sorted_by_recency_logs_win_over_created_at() {
+        // A plan with a recent execution log should sort above a plan that
+        // was created more recently but has never been run.
+        let conn = setup();
+
+        // p1 created earliest, but will get a recent log.
+        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        conn.execute(
+            "UPDATE plans SET created_at = ?1 WHERE id = ?2",
+            params!["2026-01-01T00:00:00.000Z", p1.id],
+        )
+        .unwrap();
+        // p2 created most recently, but never run.
+        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        conn.execute(
+            "UPDATE plans SET created_at = ?1 WHERE id = ?2",
+            params!["2026-04-01T00:00:00.000Z", p2.id],
+        )
+        .unwrap();
+
+        // Add a step + execution log to p1, dated after p2's created_at.
+        let (step, _) = create_step(
+            &conn, &p1.id, "s", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
+        conn.execute(
+            "UPDATE execution_logs SET started_at = ?1 WHERE id = ?2",
+            params!["2026-05-01T00:00:00.000Z", log.id],
+        )
+        .unwrap();
+
+        let plans = list_plans_sorted_by_recency(&conn, "/proj").unwrap();
+        let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["p1", "p2"]);
+    }
+
+    #[test]
+    fn test_list_plans_sorted_by_recency_uses_max_log() {
+        // When a plan has multiple logs, the MAX(started_at) wins.
+        let conn = setup();
+
+        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+
+        // p1 has an old log + a fresh log → MAX is fresh.
+        let (s1, _) = create_step(
+            &conn, &p1.id, "s1", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        let l_old = create_execution_log(&conn, &s1.id, 1, None, None).unwrap();
+        conn.execute(
+            "UPDATE execution_logs SET started_at = ?1 WHERE id = ?2",
+            params!["2026-01-01T00:00:00.000Z", l_old.id],
+        )
+        .unwrap();
+        let l_new = create_execution_log(&conn, &s1.id, 2, None, None).unwrap();
+        conn.execute(
+            "UPDATE execution_logs SET started_at = ?1 WHERE id = ?2",
+            params!["2026-06-01T00:00:00.000Z", l_new.id],
+        )
+        .unwrap();
+
+        // p2 has one log between p1's old and new.
+        let (s2, _) = create_step(
+            &conn, &p2.id, "s2", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        let l_p2 = create_execution_log(&conn, &s2.id, 1, None, None).unwrap();
+        conn.execute(
+            "UPDATE execution_logs SET started_at = ?1 WHERE id = ?2",
+            params!["2026-03-01T00:00:00.000Z", l_p2.id],
+        )
+        .unwrap();
+
+        let plans = list_plans_sorted_by_recency(&conn, "/proj").unwrap();
+        let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["p1", "p2"]);
+    }
+
+    #[test]
+    fn test_list_plans_sorted_by_recency_excludes_archived_and_other_projects() {
+        let conn = setup();
+
+        let _own = create_plan(&conn, "own", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let archived =
+            create_plan(&conn, "archived", "/proj", "b2", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &archived.id, PlanStatus::Archived).unwrap();
+        let _other = create_plan(&conn, "other", "/elsewhere", "b3", "d", None, None, &[]).unwrap();
+
+        let plans = list_plans_sorted_by_recency(&conn, "/proj").unwrap();
+        let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["own"]);
     }
 
     #[test]
