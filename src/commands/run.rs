@@ -288,7 +288,9 @@ pub fn run_plan_list_tui(
     use std::time::Instant;
 
     let tiles = build_plan_tiles(conn, project)?;
-    let mut app = PlanListApp::new(tiles, project, &config.display_timezone);
+    let archived_count = storage::count_archived_plans(conn, project)?;
+    let mut app = PlanListApp::new(tiles, project, &config.display_timezone)
+        .with_archived_count(archived_count);
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = std::io::stdout();
@@ -330,8 +332,7 @@ pub fn run_plan_list_tui(
                                     PlanStatus::Archived,
                                 )?;
                             }
-                            let new_tiles = build_plan_tiles(conn, project)?;
-                            app.refresh_tiles(new_tiles);
+                            refresh_plan_list_state(conn, project, &mut app)?;
                             let n = targets.len();
                             let msg = if n == 1 {
                                 "Archived 1 plan.".to_string()
@@ -353,10 +354,24 @@ pub fn run_plan_list_tui(
                     KeyCode::Esc => {
                         let _ = app.escape();
                     }
-                    KeyCode::Enter => {
-                        // Step 19 of tui-v1 wires plan-detail routing onto the
-                        // selected slug; until then we just record the request.
-                        let _ = app.request_open();
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        match app.request_open() {
+                            Some(crate::tui::views::plan_list::OpenRequest::Archived) => {
+                                run_archived_list_tui(
+                                    &mut terminal,
+                                    conn,
+                                    project,
+                                    &config.display_timezone,
+                                )?;
+                                refresh_plan_list_state(conn, project, &mut app)?;
+                            }
+                            // Plan-detail routing lands in tui-v1 step 19;
+                            // until then `enter` on a regular tile is a noop.
+                            Some(crate::tui::views::plan_list::OpenRequest::Plan(_))
+                            | None => {}
+                        }
+                        // Reset so a future tick doesn't re-dispatch.
+                        app.open_request = None;
                     }
                     KeyCode::Char('q') => app.request_quit(),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -559,11 +574,12 @@ pub(crate) fn plan_list_apply_create(
     ) {
         Ok(plan) => {
             let new_tiles = build_plan_tiles(conn, project)?;
+            let archived_count = storage::count_archived_plans(conn, project)?;
             let new_index = new_tiles
                 .iter()
                 .position(|t| t.plan.id == plan.id)
                 .unwrap_or(0);
-            app.refresh_tiles(new_tiles);
+            app.refresh_tiles(new_tiles, archived_count);
             app.selected_index = new_index;
             app.toasts.push(
                 format!("Created plan: {slug}"),
@@ -590,8 +606,24 @@ fn build_plan_tiles(
     conn: &Connection,
     project: &str,
 ) -> Result<Vec<crate::tui::views::plan_list::PlanTile>> {
-    use crate::tui::views::plan_list::PlanTile;
     let plans = storage::list_plans_sorted_by_recency(conn, project)?;
+    plans_into_tiles(conn, plans)
+}
+
+/// Mirror of [`build_plan_tiles`] for the archived plan list view (§6).
+fn build_archived_tiles(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<crate::tui::views::plan_list::PlanTile>> {
+    let plans = storage::list_archived_plans_sorted_by_recency(conn, project)?;
+    plans_into_tiles(conn, plans)
+}
+
+fn plans_into_tiles(
+    conn: &Connection,
+    plans: Vec<crate::plan::Plan>,
+) -> Result<Vec<crate::tui::views::plan_list::PlanTile>> {
+    use crate::tui::views::plan_list::PlanTile;
     let mut tiles = Vec::with_capacity(plans.len());
     for plan in plans {
         let steps = storage::list_steps(conn, &plan.id)?;
@@ -614,6 +646,178 @@ fn build_plan_tiles(
         });
     }
     Ok(tiles)
+}
+
+/// Refresh the plan-list view's tile list AND archived-count from the DB.
+/// Used after every operation that can change either set: archive, create,
+/// or returning from the archived-list view.
+pub(crate) fn refresh_plan_list_state(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) -> Result<()> {
+    let tiles = build_plan_tiles(conn, project)?;
+    let archived_count = storage::count_archived_plans(conn, project)?;
+    app.refresh_tiles(tiles, archived_count);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Archived-list TUI dispatcher (TUI-plan.md §6)
+// ---------------------------------------------------------------------------
+
+/// Run the archived-list event loop until the user pops back. Reuses the
+/// already-open terminal and raw-mode session — the caller (`run_plan_list_tui`
+/// after `enter` on the Archived sentinel) owns terminal teardown.
+fn run_archived_list_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    project: &str,
+    display_timezone: &str,
+) -> Result<()> {
+    use crate::tui::dialog;
+    use crate::tui::views::archived_list::{self, ArchivedListApp};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    let tiles = build_archived_tiles(conn, project)?;
+    let mut app = ArchivedListApp::new(tiles, project, display_timezone);
+
+    loop {
+        terminal.draw(|f| archived_list::draw(f, &mut app))?;
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.navigate_down(),
+            KeyCode::Char('k') | KeyCode::Up => app.navigate_up(),
+            KeyCode::Char('g') => app.jump_top(),
+            KeyCode::Char('G') => app.jump_bottom(),
+            KeyCode::Char(' ') => app.toggle_selection(),
+            KeyCode::Char('d') => {
+                let targets = app.action_targets();
+                if targets.is_empty() {
+                    continue;
+                }
+                let body = format!(
+                    "Permanently delete {} plan(s)? This cannot be undone.",
+                    targets.len()
+                );
+                let confirm = dialog::Confirm {
+                    title: "Permanently delete plans",
+                    body: &body,
+                    default: false,
+                };
+                if confirm_with_archived_background(terminal, &mut app, &confirm)? {
+                    archived_list_apply_delete(conn, project, &mut app, &targets)?;
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let targets = app.action_targets();
+                if targets.is_empty() {
+                    continue;
+                }
+                archived_list_apply_unarchive(conn, project, &mut app, &targets)?;
+            }
+            KeyCode::Esc => {
+                let _ = app.escape();
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
+                app.request_pop();
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.request_pop();
+            }
+            _ => {}
+        }
+        if app.should_pop {
+            return Ok(());
+        }
+    }
+}
+
+/// Permanently delete the targeted plans via `storage::delete_plan`, refresh
+/// the in-memory tile list, and toast. Factored apart from the event loop so
+/// it can be integration-tested without a real terminal.
+pub(crate) fn archived_list_apply_delete(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::archived_list::ArchivedListApp,
+    targets: &[String],
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    for id in targets {
+        storage::delete_plan(conn, id)?;
+    }
+    let new_tiles = build_archived_tiles(conn, project)?;
+    app.refresh_tiles(new_tiles);
+    let n = targets.len();
+    let msg = if n == 1 {
+        "Permanently deleted 1 plan.".to_string()
+    } else {
+        format!("Permanently deleted {n} plans.")
+    };
+    app.toasts.push(msg, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// Unarchive the targeted plans (status → Ready), refresh the in-memory tile
+/// list, and toast. Factored apart for testing.
+pub(crate) fn archived_list_apply_unarchive(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::archived_list::ArchivedListApp,
+    targets: &[String],
+) -> Result<()> {
+    use crate::plan::PlanStatus;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    for id in targets {
+        storage::update_plan_status(conn, id, PlanStatus::Ready)?;
+    }
+    let new_tiles = build_archived_tiles(conn, project)?;
+    app.refresh_tiles(new_tiles);
+    let n = targets.len();
+    let msg = if n == 1 {
+        "Unarchived 1 plan.".to_string()
+    } else {
+        format!("Unarchived {n} plans.")
+    };
+    app.toasts.push(msg, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// Mirror of `confirm_with_background` for the archived-list view: composites
+/// a confirm dialog over the live archived view so the user keeps context
+/// (cursor, selection) while answering.
+fn confirm_with_archived_background<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut crate::tui::views::archived_list::ArchivedListApp,
+    c: &crate::tui::dialog::Confirm<'_>,
+) -> Result<bool> {
+    use crate::tui::dialog::{self, Decision};
+    use crate::tui::views::archived_list;
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    loop {
+        terminal.draw(|f| {
+            archived_list::draw(f, app);
+            let area = f.area();
+            dialog::render(f, area, c);
+        })?;
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match dialog::decide_key(key, c.default) {
+                Decision::Yes => return Ok(true),
+                Decision::No => return Ok(false),
+                Decision::Pending => continue,
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2385,7 +2589,7 @@ mod plan_list_action_tests {
         let id = app.cursor_plan().unwrap().id.clone();
         storage::update_plan_status(&conn, &id, PlanStatus::Ready).unwrap();
         // Refresh tiles so the in-memory state reflects the pre-flipped status.
-        app.refresh_tiles(build_plan_tiles(&conn, project).unwrap());
+        app.refresh_tiles(build_plan_tiles(&conn, project).unwrap(), 0);
 
         plan_list_approve_cursor(&conn, project, &mut app).unwrap();
 
@@ -2578,5 +2782,172 @@ mod plan_list_action_tests {
         plan_list_apply_create(&conn, &config, project, &mut app, "zeta", "z", &[]).unwrap();
 
         assert!(app.selection.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Archived-list dispatcher tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod archived_list_dispatcher_tests {
+    //! Integration tests for the archived-list view's `d` (permanently delete)
+    //! and `enter` (unarchive) actions. Drives the public action helpers
+    //! against an in-memory DB so we cover both the storage write and the
+    //! in-memory tile refresh.
+
+    use super::*;
+    use crate::db;
+    use crate::plan::PlanStatus;
+    use crate::tui::views::archived_list::ArchivedListApp;
+
+    fn seed_archived(project: &str) -> (Connection, ArchivedListApp) {
+        let conn = db::open_memory().unwrap();
+        let a = storage::create_plan(&conn, "alpha", project, "b1", "d", None, None, &[]).unwrap();
+        let b = storage::create_plan(&conn, "beta", project, "b2", "d", None, None, &[]).unwrap();
+        let g = storage::create_plan(&conn, "gamma", project, "b3", "d", None, None, &[]).unwrap();
+        // Archive every plan so the archived view sees three rows.
+        storage::update_plan_status(&conn, &a.id, PlanStatus::Archived).unwrap();
+        storage::update_plan_status(&conn, &b.id, PlanStatus::Archived).unwrap();
+        storage::update_plan_status(&conn, &g.id, PlanStatus::Archived).unwrap();
+        let tiles = build_archived_tiles(&conn, project).unwrap();
+        let app = ArchivedListApp::new(tiles, project, "UTC");
+        (conn, app)
+    }
+
+    #[test]
+    fn delete_targets_removes_from_db_and_tile_list() {
+        let project = "/tmp/archived-delete";
+        let (conn, mut app) = seed_archived(project);
+        // Cursor target by default: most recent (gamma) — capture its slug.
+        let target_id = app.cursor_plan().unwrap().id.clone();
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+
+        archived_list_apply_delete(&conn, project, &mut app, &[target_id.clone()]).unwrap();
+
+        // DB row gone.
+        assert!(
+            storage::get_plan_by_slug(&conn, &target_slug, project)
+                .unwrap()
+                .is_none()
+        );
+        // In-memory tile list shrunk by one and no longer contains it.
+        assert_eq!(app.tiles.len(), 2);
+        assert!(app.tiles.iter().all(|t| t.plan.id != target_id));
+        // Toast confirms the destructive action.
+        let toast = app.toasts.current().expect("toast should be present");
+        assert_eq!(toast.text, "Permanently deleted 1 plan.");
+    }
+
+    #[test]
+    fn delete_with_multi_selection_pluralizes_toast() {
+        let project = "/tmp/archived-delete-multi";
+        let (conn, mut app) = seed_archived(project);
+        // Select all three.
+        app.toggle_selection();
+        app.selected_index = 1;
+        app.toggle_selection();
+        app.selected_index = 2;
+        app.toggle_selection();
+        let targets = app.action_targets();
+        assert_eq!(targets.len(), 3);
+
+        archived_list_apply_delete(&conn, project, &mut app, &targets).unwrap();
+
+        // All three plans gone.
+        assert_eq!(app.tiles.len(), 0);
+        assert_eq!(
+            storage::count_archived_plans(&conn, project).unwrap(),
+            0
+        );
+        let toast = app.toasts.current().expect("toast should be present");
+        assert_eq!(toast.text, "Permanently deleted 3 plans.");
+    }
+
+    #[test]
+    fn unarchive_targets_flips_status_to_ready_and_drops_from_archived_view() {
+        let project = "/tmp/archived-unarchive";
+        let (conn, mut app) = seed_archived(project);
+        let target_id = app.cursor_plan().unwrap().id.clone();
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+
+        archived_list_apply_unarchive(&conn, project, &mut app, &[target_id.clone()]).unwrap();
+
+        // Status flipped to Ready in the DB.
+        let row = storage::get_plan_by_slug(&conn, &target_slug, project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, PlanStatus::Ready);
+        // The unarchived plan is gone from the archived view's tile list.
+        assert!(app.tiles.iter().all(|t| t.plan.id != target_id));
+        assert_eq!(app.tiles.len(), 2);
+        // Toast confirms.
+        let toast = app.toasts.current().expect("toast should be present");
+        assert_eq!(toast.text, "Unarchived 1 plan.");
+    }
+
+    #[test]
+    fn unarchive_with_multi_selection_pluralizes_toast() {
+        let project = "/tmp/archived-unarchive-multi";
+        let (conn, mut app) = seed_archived(project);
+        app.toggle_selection();
+        app.selected_index = 1;
+        app.toggle_selection();
+        let targets = app.action_targets();
+        assert_eq!(targets.len(), 2);
+
+        archived_list_apply_unarchive(&conn, project, &mut app, &targets).unwrap();
+
+        assert_eq!(app.tiles.len(), 1);
+        assert_eq!(
+            storage::count_archived_plans(&conn, project).unwrap(),
+            1
+        );
+        let toast = app.toasts.current().expect("toast should be present");
+        assert_eq!(toast.text, "Unarchived 2 plans.");
+    }
+
+    #[test]
+    fn unarchive_empties_view_when_last_archived_plan_returns() {
+        let project = "/tmp/archived-unarchive-last";
+        let conn = db::open_memory().unwrap();
+        let only = storage::create_plan(&conn, "only", project, "b", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &only.id, PlanStatus::Archived).unwrap();
+        let tiles = build_archived_tiles(&conn, project).unwrap();
+        let mut app = ArchivedListApp::new(tiles, project, "UTC");
+        assert_eq!(app.tiles.len(), 1);
+
+        archived_list_apply_unarchive(&conn, project, &mut app, &[only.id.clone()]).unwrap();
+
+        assert!(app.tiles.is_empty());
+        assert_eq!(app.selected_index, 0);
+        // archived count went to zero, so a subsequent plan-list refresh
+        // will hide the sentinel.
+        assert_eq!(
+            storage::count_archived_plans(&conn, project).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn delete_clears_selection_via_refresh() {
+        let project = "/tmp/archived-delete-clears";
+        let (conn, mut app) = seed_archived(project);
+        app.toggle_selection();
+        let targets = app.action_targets();
+
+        archived_list_apply_delete(&conn, project, &mut app, &targets).unwrap();
+
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn enter_path_targets_cursor_when_no_selection() {
+        // The dispatcher uses `app.action_targets()` for both `d` and `enter`;
+        // when nothing is selected it should fall through to the cursor row.
+        let project = "/tmp/archived-cursor-fallback";
+        let (_conn, mut app) = seed_archived(project);
+        app.selected_index = 1;
+        let cursor_id = app.cursor_plan().unwrap().id.clone();
+        assert_eq!(app.action_targets(), vec![cursor_id]);
     }
 }

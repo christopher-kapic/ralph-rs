@@ -4,6 +4,7 @@
 // TUI-plan.md §15, the multi-view shell routes rendering and input handling
 // through these modules so each view's state is self-contained.
 
+pub mod archived_list;
 pub mod create_plan;
 pub mod plan_detail;
 pub mod plan_detail_input;

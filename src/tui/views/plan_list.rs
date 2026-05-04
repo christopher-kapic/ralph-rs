@@ -54,6 +54,14 @@ pub struct PlanTile {
 // View state
 // ---------------------------------------------------------------------------
 
+/// What the user requested to open with `enter` / `→` / `l`. Either a plan
+/// (push plan-detail) or the archived plan list (push `View::ArchivedList`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenRequest {
+    Plan(String),
+    Archived,
+}
+
 /// Plan-list view state.
 ///
 /// Independent of rendering and input handling so it can be unit-tested
@@ -61,7 +69,13 @@ pub struct PlanTile {
 pub struct PlanListApp {
     /// Tiles in display order (most recent first; archived excluded).
     pub tiles: Vec<PlanTile>,
+    /// Number of archived plans for this project. When non-zero an extra
+    /// "Archived (N)" tile is rendered after the regular tiles and is also
+    /// reachable by the cursor (TUI-plan.md §5).
+    pub archived_count: u32,
     /// Currently highlighted tile (0-based). 0 even when `tiles` is empty.
+    /// Indexes the combined navigable list: regular tiles first, then the
+    /// archived sentinel slot when [`Self::archived_tile_visible`].
     pub selected_index: usize,
     /// Top of the visible tile window — first tile shown on screen. Bumped
     /// during navigation to keep `selected_index` on-screen.
@@ -73,8 +87,9 @@ pub struct PlanListApp {
     /// Whether the user has requested a quit.
     pub should_quit: bool,
     /// Whether the user has requested to open the highlighted tile (push
-    /// the plan-detail view). The dispatcher consumes this and resets it.
-    pub open_request: bool,
+    /// the plan-detail view, or the archived list when the cursor is on the
+    /// archived sentinel). The dispatcher consumes this and resets it.
+    pub open_request: Option<OpenRequest>,
     /// IANA timezone used to format the per-tile timestamp. Sourced from
     /// `Config.display_timezone` and validated by `Config::validate` at load
     /// time, so an invalid string here is a programming error.
@@ -90,38 +105,68 @@ pub struct PlanListApp {
 }
 
 impl PlanListApp {
-    /// Construct a new plan-list view with cursor on the first tile.
+    /// Construct a new plan-list view with cursor on the first tile and no
+    /// archived tile visible. Use [`Self::with_archived_count`] to attach the
+    /// archived plan count if you have it at construction time.
     pub fn new(tiles: Vec<PlanTile>, project: impl Into<String>, display_timezone: impl Into<String>) -> Self {
         Self {
             tiles,
+            archived_count: 0,
             selected_index: 0,
             scroll_offset: 0,
             selection: Selection::new(),
             should_quit: false,
-            open_request: false,
+            open_request: None,
             display_timezone: display_timezone.into(),
             project: project.into(),
             toasts: ToastQueue::new(),
         }
     }
 
+    /// Builder-style setter for the archived plan count. Drives the optional
+    /// "Archived (N)" sentinel tile.
+    pub fn with_archived_count(mut self, count: u32) -> Self {
+        self.archived_count = count;
+        self
+    }
+
+    // -- Archived sentinel ------------------------------------------------
+
+    /// True when the archived sentinel tile should be rendered + reachable.
+    pub fn archived_tile_visible(&self) -> bool {
+        self.archived_count > 0
+    }
+
+    /// Total number of cursor-reachable items: regular tiles plus the
+    /// archived sentinel when visible.
+    pub fn navigable_count(&self) -> usize {
+        self.tiles.len() + if self.archived_tile_visible() { 1 } else { 0 }
+    }
+
+    /// True when the cursor is currently on the archived sentinel tile.
+    pub fn is_archived_cursor(&self) -> bool {
+        self.archived_tile_visible() && self.selected_index >= self.tiles.len()
+    }
+
     // -- Navigation -------------------------------------------------------
 
     /// Move cursor down one tile, wrapping at the bottom.
     pub fn navigate_down(&mut self) {
-        if self.tiles.is_empty() {
+        let n = self.navigable_count();
+        if n == 0 {
             return;
         }
-        self.selected_index = (self.selected_index + 1) % self.tiles.len();
+        self.selected_index = (self.selected_index + 1) % n;
     }
 
     /// Move cursor up one tile, wrapping at the top.
     pub fn navigate_up(&mut self) {
-        if self.tiles.is_empty() {
+        let n = self.navigable_count();
+        if n == 0 {
             return;
         }
         if self.selected_index == 0 {
-            self.selected_index = self.tiles.len() - 1;
+            self.selected_index = n - 1;
         } else {
             self.selected_index -= 1;
         }
@@ -129,7 +174,7 @@ impl PlanListApp {
 
     /// Jump to the first tile (`g`).
     pub fn jump_top(&mut self) {
-        if self.tiles.is_empty() {
+        if self.navigable_count() == 0 {
             return;
         }
         self.selected_index = 0;
@@ -137,18 +182,20 @@ impl PlanListApp {
 
     /// Jump to the last tile (`G`).
     pub fn jump_bottom(&mut self) {
-        if self.tiles.is_empty() {
+        let n = self.navigable_count();
+        if n == 0 {
             return;
         }
-        self.selected_index = self.tiles.len() - 1;
+        self.selected_index = n - 1;
     }
 
     // -- Selection --------------------------------------------------------
 
     /// Toggle multi-select on the currently highlighted tile (`space`).
-    /// No-op when the tile list is empty.
+    /// No-op when the tile list is empty or the cursor is on the archived
+    /// sentinel — the sentinel can't participate in multi-select.
     pub fn toggle_selection(&mut self) {
-        if self.tiles.is_empty() {
+        if self.tiles.is_empty() || self.is_archived_cursor() {
             return;
         }
         let id = self.tiles[self.selected_index].plan.id.clone();
@@ -175,16 +222,23 @@ impl PlanListApp {
 
     // -- Routing ----------------------------------------------------------
 
-    /// Signal the dispatcher to push plan-detail for the highlighted tile.
+    /// Signal the dispatcher to push plan-detail for the highlighted tile, or
+    /// the archived list when the archived sentinel is selected.
     ///
-    /// Returns the selected plan slug if a tile is highlighted. Sets the
-    /// `open_request` flag so frame loops can act on it once and reset.
-    pub fn request_open(&mut self) -> Option<String> {
-        if self.tiles.is_empty() {
-            return None;
+    /// Returns the [`OpenRequest`] when something is highlighted. Sets
+    /// `open_request` so frame loops can act on it once and reset.
+    pub fn request_open(&mut self) -> Option<OpenRequest> {
+        if self.is_archived_cursor() {
+            let req = OpenRequest::Archived;
+            self.open_request = Some(req.clone());
+            return Some(req);
         }
-        self.open_request = true;
-        Some(self.tiles[self.selected_index].plan.slug.clone())
+        if let Some(tile) = self.tiles.get(self.selected_index) {
+            let req = OpenRequest::Plan(tile.plan.slug.clone());
+            self.open_request = Some(req.clone());
+            return Some(req);
+        }
+        None
     }
 
     /// Signal that the user wants to quit.
@@ -196,8 +250,12 @@ impl PlanListApp {
 
     /// The plan currently under the cursor, if any. Used by single-target
     /// keybindings (`A` approve, `Q` toggle questions) that act only on the
-    /// highlighted tile and ignore multi-selection.
+    /// highlighted tile and ignore multi-selection. Returns `None` when the
+    /// cursor is on the archived sentinel.
     pub fn cursor_plan(&self) -> Option<&Plan> {
+        if self.is_archived_cursor() {
+            return None;
+        }
         self.tiles.get(self.selected_index).map(|t| &t.plan)
     }
 
@@ -206,12 +264,13 @@ impl PlanListApp {
     /// Plan IDs that the next `d` archive should affect, per TUI-plan.md §5:
     /// selection wins over the cursor target. With at least one tile selected,
     /// returns the selection in pick order; otherwise returns just the
-    /// highlighted tile's plan id. Empty if there are no tiles and nothing
-    /// selected.
+    /// highlighted tile's plan id. Empty if there are no tiles, nothing
+    /// selected, or the cursor is parked on the archived sentinel (which has
+    /// no underlying plan to archive).
     pub fn archive_targets(&self) -> Vec<String> {
         if !self.selection.is_empty() {
             self.selection.as_slice().to_vec()
-        } else if !self.tiles.is_empty() {
+        } else if !self.tiles.is_empty() && !self.is_archived_cursor() {
             vec![self.tiles[self.selected_index].plan.id.clone()]
         } else {
             Vec::new()
@@ -229,18 +288,20 @@ impl PlanListApp {
         }
     }
 
-    /// Replace the tile list (after a DB refresh) and reset transient state:
-    /// selection is cleared and the cursor is clamped into the new range.
-    /// `scroll_offset` is left to be re-computed on the next draw via
-    /// `update_scroll`.
-    pub fn refresh_tiles(&mut self, tiles: Vec<PlanTile>) {
+    /// Replace the tile list and archived count (after a DB refresh) and
+    /// reset transient state: selection is cleared and the cursor is clamped
+    /// into the new navigable range. `scroll_offset` is left to be
+    /// re-computed on the next draw via `update_scroll`.
+    pub fn refresh_tiles(&mut self, tiles: Vec<PlanTile>, archived_count: u32) {
         self.tiles = tiles;
+        self.archived_count = archived_count;
         self.selection.clear();
-        if self.tiles.is_empty() {
+        let nav = self.navigable_count();
+        if nav == 0 {
             self.selected_index = 0;
             self.scroll_offset = 0;
-        } else if self.selected_index >= self.tiles.len() {
-            self.selected_index = self.tiles.len() - 1;
+        } else if self.selected_index >= nav {
+            self.selected_index = nav - 1;
         }
     }
 }
@@ -358,7 +419,7 @@ fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatu
 /// Exposed so unit tests can render straight into a `Buffer` without
 /// constructing a `Terminal` / `TestBackend`.
 pub fn render_tiles(buf: &mut Buffer, area: Rect, app: &PlanListApp) {
-    if app.tiles.is_empty() {
+    if app.tiles.is_empty() && !app.archived_tile_visible() {
         let empty = Paragraph::new("No plans for this project. Press `i` to create one.");
         empty.render(area, buf);
         return;
@@ -368,9 +429,9 @@ pub fn render_tiles(buf: &mut Buffer, area: Rect, app: &PlanListApp) {
     if visible == 0 {
         return;
     }
-    let end = (app.scroll_offset + visible).min(app.tiles.len());
+    let nav = app.navigable_count();
+    let end = (app.scroll_offset + visible).min(nav);
     for (slot, idx) in (app.scroll_offset..end).enumerate() {
-        let tile = &app.tiles[idx];
         let tile_area = Rect {
             x: area.x,
             y: area.y + (slot as u16) * tile_h,
@@ -378,14 +439,21 @@ pub fn render_tiles(buf: &mut Buffer, area: Rect, app: &PlanListApp) {
             height: tile_h,
         };
         let highlighted = idx == app.selected_index;
-        let badge = app.selection.index_of(&tile.plan.id);
-        render_tile(buf, tile_area, tile, highlighted, badge, &app.display_timezone);
+        if idx < app.tiles.len() {
+            let tile = &app.tiles[idx];
+            let badge = app.selection.index_of(&tile.plan.id);
+            render_tile(buf, tile_area, tile, highlighted, badge, &app.display_timezone);
+        } else {
+            // Archived sentinel — last navigable slot when visible.
+            render_archived_sentinel(buf, tile_area, app.archived_count, highlighted);
+        }
     }
 }
 
 /// Adjust `scroll_offset` so the highlighted tile is visible.
 fn update_scroll(app: &mut PlanListApp, body_height: u16) {
-    if app.tiles.is_empty() {
+    let nav = app.navigable_count();
+    if nav == 0 {
         app.scroll_offset = 0;
         return;
     }
@@ -402,7 +470,46 @@ fn update_scroll(app: &mut PlanListApp, body_height: u16) {
     }
 }
 
-fn render_tile(
+/// Render the "Archived (N)" sentinel tile with a red border (TUI-plan.md
+/// §5). When the cursor is on this slot the border switches to CURSOR.
+pub(crate) fn render_archived_sentinel(
+    buf: &mut Buffer,
+    area: Rect,
+    count: u32,
+    highlighted: bool,
+) {
+    let border_style = if highlighted {
+        Style::default().fg(theme::CURSOR)
+    } else {
+        Style::default().fg(theme::STATUS_FAILED)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    let inner = block.inner(area);
+    block.render(area, buf);
+    if inner.height == 0 {
+        return;
+    }
+    let title = format!("Archived ({count})");
+    let title_para = Paragraph::new(Line::from(Span::styled(
+        truncate(&title, inner.width as usize),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    let title_area = Rect { height: 1, ..inner };
+    title_para.render(title_area, buf);
+    if inner.height >= 2 {
+        let hint = "Press → / l / enter to view";
+        let hint_area = Rect { y: inner.y + 1, height: 1, ..inner };
+        let hint_para = Paragraph::new(truncate(hint, inner.width as usize));
+        hint_para.render(hint_area, buf);
+    }
+}
+
+/// Render a single plan tile into `area`. `pub(crate)` so the archived list
+/// view can reuse the exact same tile body (TUI-plan.md §6 says the archived
+/// view has the same layout as the plan list).
+pub(crate) fn render_tile(
     buf: &mut Buffer,
     area: Rect,
     tile: &PlanTile,
@@ -504,7 +611,7 @@ fn render_tile(
 /// when truncation occurs. Width is approximated by `char` count, which is
 /// good enough for the slugs / timestamps the tile renders (no CJK / emoji
 /// in those fields).
-fn truncate(s: &str, max_cols: usize) -> String {
+pub(crate) fn truncate(s: &str, max_cols: usize) -> String {
     if max_cols == 0 {
         return String::new();
     }
@@ -572,7 +679,7 @@ mod tests {
         assert_eq!(app.selected_index, 0);
         assert_eq!(app.scroll_offset, 0);
         assert!(!app.should_quit);
-        assert!(!app.open_request);
+        assert!(app.open_request.is_none());
     }
 
     #[test]
@@ -636,17 +743,17 @@ mod tests {
     fn test_request_open_returns_selected_slug() {
         let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
         app.selected_index = 1;
-        let slug = app.request_open();
-        assert_eq!(slug.as_deref(), Some("plan-1"));
-        assert!(app.open_request);
+        let req = app.request_open();
+        assert_eq!(req, Some(OpenRequest::Plan("plan-1".to_string())));
+        assert_eq!(app.open_request, Some(OpenRequest::Plan("plan-1".to_string())));
     }
 
     #[test]
     fn test_request_open_empty_returns_none() {
         let mut app = PlanListApp::new(vec![], "/proj", "UTC");
-        let slug = app.request_open();
-        assert!(slug.is_none());
-        assert!(!app.open_request);
+        let req = app.request_open();
+        assert!(req.is_none());
+        assert!(app.open_request.is_none());
     }
 
     #[test]
@@ -1039,7 +1146,7 @@ mod tests {
         let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
         app.toggle_selection();
         assert_eq!(app.selection.len(), 1);
-        app.refresh_tiles(make_tiles(2));
+        app.refresh_tiles(make_tiles(2), 0);
         assert!(app.selection.is_empty());
     }
 
@@ -1048,7 +1155,7 @@ mod tests {
         let mut app = PlanListApp::new(make_tiles(5), "/proj", "UTC");
         app.selected_index = 4;
         // Simulate archiving the last 3 plans — only 2 left.
-        app.refresh_tiles(make_tiles(2));
+        app.refresh_tiles(make_tiles(2), 0);
         assert_eq!(app.selected_index, 1);
     }
 
@@ -1056,7 +1163,7 @@ mod tests {
     fn refresh_tiles_resets_cursor_when_list_empties() {
         let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
         app.selected_index = 2;
-        app.refresh_tiles(vec![]);
+        app.refresh_tiles(vec![], 0);
         assert_eq!(app.selected_index, 0);
         assert_eq!(app.scroll_offset, 0);
     }
@@ -1065,8 +1172,20 @@ mod tests {
     fn refresh_tiles_preserves_in_range_cursor() {
         let mut app = PlanListApp::new(make_tiles(5), "/proj", "UTC");
         app.selected_index = 1;
-        app.refresh_tiles(make_tiles(4));
+        app.refresh_tiles(make_tiles(4), 0);
         assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn refresh_tiles_clamps_cursor_to_archived_sentinel_when_only_archived_remain() {
+        // Last regular plan was just archived — tile list empties but the
+        // archived sentinel takes its place, so the cursor should land on it.
+        let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
+        app.selected_index = 1;
+        app.refresh_tiles(vec![], 1);
+        assert!(app.archived_tile_visible());
+        assert_eq!(app.selected_index, 0);
+        assert!(app.is_archived_cursor());
     }
 
     // -- Toast rendering ----------------------------------------------------
@@ -1097,6 +1216,160 @@ mod tests {
         assert_eq!(
             buffer[(0, bottom_y)].style().fg,
             Some(theme::TOAST_SUCCESS)
+        );
+    }
+
+    // -- Archived sentinel --------------------------------------------------
+
+    #[test]
+    fn archived_tile_invisible_when_count_zero() {
+        let app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
+        assert!(!app.archived_tile_visible());
+        assert_eq!(app.navigable_count(), 2);
+    }
+
+    #[test]
+    fn archived_tile_visible_when_count_positive() {
+        let app = PlanListApp::new(make_tiles(2), "/proj", "UTC").with_archived_count(7);
+        assert!(app.archived_tile_visible());
+        assert_eq!(app.navigable_count(), 3);
+    }
+
+    #[test]
+    fn navigation_includes_archived_sentinel_slot() {
+        let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC").with_archived_count(1);
+        // index 0 → 1 → 2 (sentinel) → wraps back to 0
+        assert_eq!(app.selected_index, 0);
+        app.navigate_down();
+        assert_eq!(app.selected_index, 1);
+        app.navigate_down();
+        assert_eq!(app.selected_index, 2);
+        assert!(app.is_archived_cursor());
+        app.navigate_down();
+        assert_eq!(app.selected_index, 0);
+        assert!(!app.is_archived_cursor());
+    }
+
+    #[test]
+    fn jump_bottom_lands_on_archived_when_visible() {
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC").with_archived_count(2);
+        app.jump_bottom();
+        assert_eq!(app.selected_index, 3);
+        assert!(app.is_archived_cursor());
+    }
+
+    #[test]
+    fn cursor_plan_returns_none_when_on_archived_sentinel() {
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC").with_archived_count(1);
+        app.selected_index = 1;
+        assert!(app.is_archived_cursor());
+        assert!(app.cursor_plan().is_none());
+    }
+
+    #[test]
+    fn toggle_selection_on_archived_sentinel_is_noop() {
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC").with_archived_count(1);
+        app.selected_index = 1;
+        app.toggle_selection();
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn archive_targets_empty_when_cursor_on_archived_sentinel() {
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC").with_archived_count(1);
+        app.selected_index = 1;
+        assert!(app.archive_targets().is_empty());
+    }
+
+    #[test]
+    fn request_open_on_archived_sentinel_returns_archived_variant() {
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC").with_archived_count(1);
+        app.selected_index = 1;
+        let req = app.request_open();
+        assert_eq!(req, Some(OpenRequest::Archived));
+        assert_eq!(app.open_request, Some(OpenRequest::Archived));
+    }
+
+    #[test]
+    fn request_open_on_plan_when_no_tiles_but_archived_visible() {
+        // Empty tile list + archived sentinel: selected_index 0 IS the
+        // sentinel, so open should produce Archived rather than None.
+        let mut app = PlanListApp::new(vec![], "/proj", "UTC").with_archived_count(3);
+        let req = app.request_open();
+        assert_eq!(req, Some(OpenRequest::Archived));
+    }
+
+    #[test]
+    fn render_tiles_renders_archived_sentinel_at_bottom() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 18));
+        let area = buf.area;
+        let app = PlanListApp::new(make_tiles(2), "/proj", "UTC").with_archived_count(5);
+        render_tiles(&mut buf, area, &app);
+        // Sentinel sits at the bottom, after the two tiles (each 6 rows).
+        // Top of sentinel border = row 12. Title row = row 13.
+        let sentinel_title = (0..40)
+            .map(|x| buf[(x, 13)].symbol())
+            .collect::<String>();
+        assert!(
+            sentinel_title.contains("Archived (5)"),
+            "expected 'Archived (5)' on row 13: {sentinel_title:?}"
+        );
+        let sentinel_hint = (0..40)
+            .map(|x| buf[(x, 14)].symbol())
+            .collect::<String>();
+        assert!(
+            sentinel_hint.contains("enter"),
+            "expected enter hint on row 14: {sentinel_hint:?}"
+        );
+    }
+
+    #[test]
+    fn render_tiles_skips_archived_sentinel_when_count_zero() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 18));
+        let area = buf.area;
+        let app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
+        render_tiles(&mut buf, area, &app);
+        // Row 13 (where the sentinel would land) is blank.
+        let row = (0..40).map(|x| buf[(x, 13)].symbol()).collect::<String>();
+        assert!(
+            !row.contains("Archived"),
+            "sentinel should not render when count = 0: {row:?}"
+        );
+    }
+
+    #[test]
+    fn render_archived_sentinel_uses_red_border_when_not_highlighted() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
+        let area = buf.area;
+        render_archived_sentinel(&mut buf, area, 4, false);
+        // Top-left border cell carries the border style.
+        assert_eq!(buf[(0, 0)].style().fg, Some(theme::STATUS_FAILED));
+    }
+
+    #[test]
+    fn render_archived_sentinel_uses_cursor_border_when_highlighted() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
+        let area = buf.area;
+        render_archived_sentinel(&mut buf, area, 4, true);
+        assert_eq!(buf[(0, 0)].style().fg, Some(theme::CURSOR));
+    }
+
+    #[test]
+    fn render_tiles_empty_with_archived_visible_renders_only_sentinel() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 6));
+        let area = buf.area;
+        let app = PlanListApp::new(vec![], "/proj", "UTC").with_archived_count(2);
+        render_tiles(&mut buf, area, &app);
+        let row = (0..40).map(|x| buf[(x, 1)].symbol()).collect::<String>();
+        assert!(
+            row.contains("Archived (2)"),
+            "expected sentinel title: {row:?}"
+        );
+        // The "No plans" placeholder must not render when the sentinel exists.
+        let row0 = (0..40).map(|x| buf[(x, 0)].symbol()).collect::<String>();
+        assert!(
+            !row0.contains("No plans"),
+            "placeholder should be suppressed: {row0:?}"
         );
     }
 

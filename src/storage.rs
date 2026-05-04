@@ -177,6 +177,53 @@ pub fn list_plans_sorted_by_recency(conn: &Connection, project: &str) -> Result<
     Ok(plans)
 }
 
+/// List archived plans for a project, sorted by recency.
+///
+/// Mirror of [`list_plans_sorted_by_recency`] for the archived plan list view
+/// (TUI-plan.md §6): same recency ordering, but the `WHERE` clause keeps only
+/// plans whose `status = 'archived'`.
+pub fn list_archived_plans_sorted_by_recency(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<Plan>> {
+    let plan_cols = PLAN_COLUMNS
+        .split(", ")
+        .map(|c| format!("p.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT {plan_cols} \
+         FROM plans p \
+         LEFT JOIN ( \
+             SELECT s.plan_id AS plan_id, MAX(l.started_at) AS last_run \
+             FROM steps s JOIN execution_logs l ON l.step_id = s.id \
+             GROUP BY s.plan_id \
+         ) lr ON lr.plan_id = p.id \
+         WHERE p.project = ?1 AND p.status = ?2 \
+         ORDER BY COALESCE(lr.last_run, p.created_at) DESC, p.created_at DESC"
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let rows = stmt.query_map(params![project, PlanStatus::Archived.as_str()], Plan::from_row)?;
+    let mut plans = Vec::new();
+    for row in rows {
+        plans.push(row?);
+    }
+    Ok(plans)
+}
+
+/// Number of archived plans for a project. Drives the conditional "Archived
+/// (N)" tile rendered at the bottom of the plan-list view (TUI-plan.md §5).
+pub fn count_archived_plans(conn: &Connection, project: &str) -> Result<u32> {
+    let mut stmt = conn.prepare(
+        "SELECT COUNT(*) FROM plans WHERE project = ?1 AND status = ?2",
+    )?;
+    let n: i64 = stmt.query_row(
+        params![project, PlanStatus::Archived.as_str()],
+        |r| r.get(0),
+    )?;
+    Ok(n as u32)
+}
+
 /// Most recent `execution_logs.started_at` across every step of `plan_id`,
 /// or `None` when the plan has no logged attempts. Used to drive the
 /// "Ran <date>" / "Created <date>" prefix on plan-list tiles.
@@ -1796,6 +1843,55 @@ mod tests {
         let plans = list_plans_sorted_by_recency(&conn, "/proj").unwrap();
         let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
         assert_eq!(slugs, vec!["own"]);
+    }
+
+    #[test]
+    fn test_list_archived_plans_sorted_by_recency_only_returns_archived() {
+        let conn = setup();
+
+        let active = create_plan(&conn, "active", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let arch_a =
+            create_plan(&conn, "arch-a", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let arch_b =
+            create_plan(&conn, "arch-b", "/proj", "b3", "d", None, None, &[]).unwrap();
+        let other =
+            create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &arch_a.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &arch_b.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &other.id, PlanStatus::Archived).unwrap();
+
+        let plans = list_archived_plans_sorted_by_recency(&conn, "/proj").unwrap();
+        let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
+        // Both /proj archived plans, but not the active one or the other-project one.
+        assert!(slugs.contains(&"arch-a"));
+        assert!(slugs.contains(&"arch-b"));
+        assert!(!slugs.contains(&"active"));
+        assert!(!slugs.contains(&"other"));
+        assert_eq!(slugs.len(), 2);
+        let _ = active;
+    }
+
+    #[test]
+    fn test_count_archived_plans() {
+        let conn = setup();
+
+        assert_eq!(count_archived_plans(&conn, "/proj").unwrap(), 0);
+
+        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        // Different project — must not count.
+        let other =
+            create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
+
+        // p1 still planning; only p2 and p3 archived.
+        update_plan_status(&conn, &p2.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &p3.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &other.id, PlanStatus::Archived).unwrap();
+        let _ = p1;
+
+        assert_eq!(count_archived_plans(&conn, "/proj").unwrap(), 2);
+        assert_eq!(count_archived_plans(&conn, "/elsewhere").unwrap(), 1);
     }
 
     #[test]
