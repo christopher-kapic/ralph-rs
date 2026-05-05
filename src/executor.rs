@@ -46,6 +46,12 @@ pub enum StepOutcome {
     Aborted,
     /// The harness process exceeded the timeout.
     Timeout,
+    /// The harness called `ralph question ask` during the attempt, leaving one
+    /// or more unanswered `step_questions` rows. Tests + commit are skipped,
+    /// any diff is rolled back, and the plan's effective status becomes
+    /// [`crate::plan::PlanStatus::Question`] until the user answers (TUI-plan
+    /// §17). The runner stops the loop cleanly so the run lock is released.
+    PausedForQuestion,
 }
 
 /// Result returned from [`execute_step`].
@@ -404,6 +410,100 @@ async fn finalize_failure(
 
     Ok(StepResult {
         outcome: reason.to_outcome(),
+        step_id: ctx.step.id.clone(),
+        attempts_used: attempt,
+        commit_hash: None,
+    })
+}
+
+/// Finalize an attempt that paused because the harness left unanswered
+/// `step_questions` rows behind (TUI-plan.md §17 "Runner integration").
+///
+/// Skips tests + commit, rolls back any diff the harness produced, writes the
+/// `execution_logs` row with `termination_reason = paused_for_question`, and
+/// returns the step's status to [`StepStatus::Pending`] so the user's next
+/// `ralph run` (after answering) picks it up cleanly. Leaving it `InProgress`
+/// would be swept to `Aborted` at the start of the next run and pollute the
+/// audit trail with a synthetic abort. `step.attempts` was already bumped at
+/// the top of the retry loop, mirroring the "single counter" rule from §17.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_paused_for_question(
+    ctx: &ExecCtx<'_>,
+    exec_log_id: i64,
+    duration_secs: f64,
+    attempt: i32,
+    diff: Option<&str>,
+    stdout: &str,
+    stderr: &str,
+    parsed: &ParsedHarnessOutput,
+) -> Result<StepResult> {
+    let rolled_back = if git::has_uncommitted_changes(ctx.workdir)? {
+        write_phase(
+            ctx.conn,
+            ctx.plan,
+            &ctx.step.id,
+            ctx.step_num,
+            attempt,
+            ctx.max_attempts,
+            Some(exec_log_id),
+            Phase::Rollback,
+            None,
+            ChildUpdate::Clear,
+            ctx.json_output,
+        )?;
+        git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)?;
+        true
+    } else {
+        false
+    };
+
+    storage::update_execution_log(
+        ctx.conn,
+        exec_log_id,
+        Some(duration_secs),
+        diff,
+        &[],
+        rolled_back,
+        false,
+        None,
+        Some(stdout),
+        Some(stderr),
+        parsed.cost_usd,
+        parsed.input_tokens,
+        parsed.output_tokens,
+        parsed.session_id.as_deref(),
+        Some(TerminationReason::PausedForQuestion),
+        Some(TestStatus::NotRun),
+    )?;
+
+    storage::update_step_status(ctx.conn, &ctx.step.id, StepStatus::Pending)?;
+
+    write_phase(
+        ctx.conn,
+        ctx.plan,
+        &ctx.step.id,
+        ctx.step_num,
+        attempt,
+        ctx.max_attempts,
+        Some(exec_log_id),
+        Phase::PostStepHook,
+        None,
+        ChildUpdate::Clear,
+        ctx.json_output,
+    )?;
+    hooks::run_post_step(
+        ctx.conn,
+        ctx.hook_ctx,
+        ctx.plan,
+        ctx.step,
+        attempt,
+        "paused",
+        ctx.workdir,
+    )
+    .await?;
+
+    Ok(StepResult {
+        outcome: StepOutcome::PausedForQuestion,
         step_id: ctx.step.id.clone(),
         attempts_used: attempt,
         commit_hash: None,
@@ -866,6 +966,30 @@ pub async fn execute_step(
                 } else {
                     Vec::new()
                 };
+
+                // Pause if the harness left unanswered `step_questions` rows
+                // behind during this attempt (TUI-plan.md §17). Tested first
+                // — even on non-zero exit — so a harness that asks then
+                // crashes still surfaces as a pause: the user's clarification
+                // is the prerequisite for any retry, regardless of whether
+                // the crash was a side effect of the harness's own
+                // self-terminate-after-asking path.
+                let unanswered =
+                    storage::count_unanswered_questions_for_attempt(conn, &step.id, attempt)?;
+                if unanswered > 0 {
+                    let _ = changed_files; // unused on this path
+                    return finalize_paused_for_question(
+                        &ctx,
+                        exec_log.id,
+                        duration_secs,
+                        attempt,
+                        diff.as_deref(),
+                        &output.stdout,
+                        &output.stderr,
+                        &parsed,
+                    )
+                    .await;
+                }
 
                 // Harness exited non-zero (or was killed by a signal). Do not
                 // run tests — the harness didn't finish its work, so a passing
@@ -2000,10 +2124,12 @@ mod tests {
             StepOutcome::Failed,
             StepOutcome::Aborted,
             StepOutcome::Timeout,
+            StepOutcome::PausedForQuestion,
         ];
-        assert_eq!(outcomes.len(), 4);
+        assert_eq!(outcomes.len(), 5);
         assert_eq!(StepOutcome::Success, StepOutcome::Success);
         assert_ne!(StepOutcome::Success, StepOutcome::Failed);
+        assert_ne!(StepOutcome::Success, StepOutcome::PausedForQuestion);
     }
 
     #[test]
@@ -4131,5 +4257,412 @@ mod tests {
             WaitResult::Timeout { .. } => panic!("unexpected Timeout"),
             WaitResult::Aborted => panic!("unexpected Aborted"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Question pause integration (TUI-plan §17 step 42)
+    // -------------------------------------------------------------------
+
+    /// Insert an unanswered `step_questions` row tagged to a given (step,
+    /// attempt). Simulates what the harness would do via `ralph question
+    /// ask`. Used by the question-pause integration tests to drive the
+    /// "harness left a question behind" branch in `execute_step`.
+    #[cfg(test)]
+    fn insert_unanswered_question(conn: &Connection, step_id: &str, attempt: i32, question: &str) {
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
+             VALUES (?1, ?2, ?3, ?4, '[]', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), step_id, attempt, question],
+        )
+        .expect("seed step_questions row");
+    }
+
+    /// Build a minimal Config registering the given harness path under `name`.
+    #[cfg(test)]
+    fn config_with_harness(name: &str, harness_path: &std::path::Path) -> Config {
+        use crate::config::HarnessConfig;
+        let mut config = Config::default();
+        config.harnesses.insert(
+            name.to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                color: None,
+            },
+        );
+        config
+    }
+
+    /// Pause path with a clean-exit, no-diff harness. The harness runs cleanly
+    /// but a `step_questions` row exists for (step, attempt=1). Expected:
+    /// outcome PausedForQuestion, step status reset to Pending,
+    /// step.attempts ticked to 1, exec_log row carries paused_for_question +
+    /// NotRun, no commit was made.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_paused_for_question_no_diff_skips_tests_and_commit() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        let head_before = crate::git::get_commit_hash(&dir).unwrap();
+
+        // Noop harness — clean exit, no diff.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_noop_harness(harness_tmp.path());
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("noop"),
+            None,
+            // Configure deterministic tests so we can assert they were skipped
+            // — pause must skip the test phase even when tests are configured.
+            &["true".to_string()],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(2), // budget > 1 to confirm pause does not retry
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Simulate `ralph question ask` writing a row before the harness
+        // exits — execute_step will bump step.attempts to 1 then query.
+        insert_unanswered_question(&conn, &step.id, 1, "Use SQLite or Postgres?");
+
+        let config = config_with_harness("noop", &harness_path);
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(false);
+
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
+        assert_eq!(result.attempts_used, 1);
+        assert!(result.commit_hash.is_none());
+
+        // Step status returned to Pending so a re-run picks it up cleanly,
+        // and attempts ticked once.
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Pending);
+        assert_eq!(updated.attempts, 1);
+
+        // Exactly one log row, carrying the pause termination reason and
+        // NotRun test status (tests must NOT have run).
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].attempt, 1);
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::PausedForQuestion)
+        );
+        assert_eq!(logs[0].test_status, Some(TestStatus::NotRun));
+        assert!(
+            logs[0].test_results.is_empty(),
+            "no tests ran on a paused attempt; test_results must be empty"
+        );
+        assert!(!logs[0].committed, "pause must not commit");
+        assert!(!logs[0].rolled_back, "no diff means nothing to roll back");
+
+        // HEAD did not advance — pause skipped the commit.
+        let head_after = crate::git::get_commit_hash(&dir).unwrap();
+        assert_eq!(head_before, head_after, "pause must not advance HEAD");
+
+        // The plan's effective status is now Question (derived) even though
+        // the underlying plans.status column may still be in_progress.
+        let effective = storage::plan_effective_status(&conn, &plan.id).unwrap();
+        assert_eq!(effective, crate::plan::PlanStatus::Question);
+    }
+
+    /// Pause path with a harness that produced a diff. The diff must be
+    /// rolled back as part of the pause finalize, leaving the workdir clean.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_paused_for_question_rolls_back_diff() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        // Harness that writes a file inside the workdir, then exits 0.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_large_output_harness(harness_tmp.path(), &dir, 64, true);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("touchy"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        insert_unanswered_question(&conn, &step.id, 1, "What name should I use?");
+
+        let config = config_with_harness("touchy", &harness_path);
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(false);
+
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
+
+        // Workdir must be clean after pause: the file the harness created
+        // was rolled back, and no commit was made.
+        assert!(
+            !crate::git::has_uncommitted_changes(&dir).unwrap(),
+            "pause must roll back any harness-produced diff"
+        );
+        assert!(
+            !dir.join("ralph-test-output.txt").exists(),
+            "rolled-back path: harness's file must be gone"
+        );
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::PausedForQuestion)
+        );
+        assert!(logs[0].rolled_back, "rolled_back flag must be set");
+        assert!(!logs[0].committed);
+    }
+
+    /// Happy path regression: a clean run on a question-enabled plan that
+    /// happens to leave NO question rows behind must proceed normally
+    /// (commit, success). Confirms the question check is purely additive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_no_questions_proceeds_to_commit_normally() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        // Harness writes a file so the commit path is exercised.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_large_output_harness(harness_tmp.path(), &dir, 64, true);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("happy"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // No `step_questions` row inserted — happy path.
+
+        let config = config_with_harness("happy", &harness_path);
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(false);
+
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        assert!(result.commit_hash.is_some(), "no-question path must commit");
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::Success)
+        );
+        assert!(logs[0].committed);
+
+        // And the plan's effective status reflects the actual stored value
+        // — no Question shadow when there are no unanswered rows.
+        let effective = storage::plan_effective_status(&conn, &plan.id).unwrap();
+        assert_ne!(effective, crate::plan::PlanStatus::Question);
+    }
+
+    /// A question row tagged to a *different* attempt (e.g. left over from a
+    /// prior, already-answered attempt) must NOT trigger a pause on the
+    /// current attempt. The detector scopes by (step, attempt), so an
+    /// orphan row at attempt=0 does not interfere with attempt=1's
+    /// happy-path completion.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_question_for_different_attempt_does_not_pause() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_large_output_harness(harness_tmp.path(), &dir, 64, true);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("happy"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Pre-existing answered question on attempt 1 (the upcoming attempt
+        // number) — answered rows must not pause. Insert it directly so the
+        // helper, which writes unanswered rows, can't be repurposed here.
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
+             VALUES ('prev', ?1, 1, 'old?', '[]', 'yes', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
+            rusqlite::params![&step.id],
+        ).unwrap();
+
+        let config = config_with_harness("happy", &harness_path);
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(false);
+
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Success,
+            "answered rows must not pause — got {result:?}",
+        );
     }
 }

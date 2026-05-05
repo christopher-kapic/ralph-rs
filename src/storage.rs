@@ -421,6 +421,59 @@ pub fn set_question_answer(conn: &Connection, question_id: &str, answer: &str) -
     Ok(())
 }
 
+/// Count unanswered `step_questions` rows for a specific (step, attempt) pair.
+///
+/// Driven by [`crate::executor::execute_step`] after the harness exits to
+/// detect whether the harness called `ralph question ask` during this attempt
+/// (TUI-plan.md §17 "Runner integration"). A non-zero count means the runner
+/// must skip tests + commit, roll back any diff, and pause the plan.
+pub fn count_unanswered_questions_for_attempt(
+    conn: &Connection,
+    step_id: &str,
+    attempt: i32,
+) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM step_questions
+         WHERE step_id = ?1 AND attempt = ?2 AND answer IS NULL",
+        params![step_id, attempt],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Compute the *effective* status of a plan.
+///
+/// Per TUI-plan.md §17, [`PlanStatus::Question`] is a derived state — never
+/// written to the `plans.status` column. A plan reports `Question` whenever
+/// any unanswered `step_questions` row exists for one of its steps; the
+/// underlying lifecycle column un-shadows automatically once the user
+/// answers the last open question.
+///
+/// This helper is the single source of truth for that derivation: read the
+/// stored status, then upgrade to `Question` if any open question exists.
+/// Used by upcoming TUI question surfaces (TUI-plan §17 step 43).
+#[allow(dead_code)]
+pub fn plan_effective_status(conn: &Connection, plan_id: &str) -> Result<PlanStatus> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM step_questions q
+         JOIN steps s ON s.id = q.step_id
+         WHERE s.plan_id = ?1 AND q.answer IS NULL",
+        params![plan_id],
+        |row| row.get(0),
+    )?;
+    if count > 0 {
+        return Ok(PlanStatus::Question);
+    }
+    let status_str: String = conn.query_row(
+        "SELECT status FROM plans WHERE id = ?1",
+        params![plan_id],
+        |row| row.get(0),
+    )?;
+    use std::str::FromStr;
+    PlanStatus::from_str(&status_str)
+        .map_err(|e| anyhow::anyhow!("Invalid plan status '{status_str}' for plan {plan_id}: {e}"))
+}
+
 /// Delete a plan (cascades to steps and execution_logs via FK).
 pub fn delete_plan(conn: &Connection, plan_id: &str) -> Result<()> {
     let affected = conn.execute("DELETE FROM plans WHERE id = ?1", params![plan_id])?;
@@ -2186,6 +2239,134 @@ mod tests {
         assert_eq!(answered[0].answer, "A1.");
         assert_eq!(answered[1].question, "Q3?");
         assert_eq!(answered[1].answer, "A3.");
+    }
+
+    #[test]
+    fn test_count_unanswered_questions_for_attempt_scopes_by_step_and_attempt() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Different combinations of (attempt, answer state) so we can verify
+        // the scoping. Only attempt=2 with answer=NULL should count.
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
+             VALUES ('q1', ?1, 1, 'a1', '[]', 'done', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
+            params![&step.id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
+             VALUES ('q2', ?1, 1, 'old open', '[]', '2026-05-01T10:00:00.000Z')",
+            params![&step.id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
+             VALUES ('q3', ?1, 2, 'current open A', '[]', '2026-05-01T10:00:00.000Z')",
+            params![&step.id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
+             VALUES ('q4', ?1, 2, 'current open B', '[]', '2026-05-01T10:00:00.000Z')",
+            params![&step.id],
+        ).unwrap();
+
+        assert_eq!(
+            count_unanswered_questions_for_attempt(&conn, &step.id, 2).unwrap(),
+            2,
+            "two unanswered rows for attempt=2",
+        );
+        assert_eq!(
+            count_unanswered_questions_for_attempt(&conn, &step.id, 1).unwrap(),
+            1,
+            "one unanswered row for attempt=1 (the answered one is excluded)",
+        );
+        assert_eq!(
+            count_unanswered_questions_for_attempt(&conn, &step.id, 99).unwrap(),
+            0,
+            "no rows for an attempt that doesn't exist",
+        );
+    }
+
+    #[test]
+    fn test_plan_effective_status_returns_question_when_unanswered_exists() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Set the underlying lifecycle to in_progress so we can verify the
+        // derived status overrides it.
+        update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
+
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
+             VALUES ('q1', ?1, 1, 'open?', '[]', '2026-05-01T10:00:00.000Z')",
+            params![&step.id],
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_effective_status(&conn, &plan.id).unwrap(),
+            PlanStatus::Question,
+            "an unanswered row must shadow the underlying lifecycle"
+        );
+    }
+
+    #[test]
+    fn test_plan_effective_status_returns_underlying_when_no_open_questions() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        update_plan_status(&conn, &plan.id, PlanStatus::Complete).unwrap();
+
+        // Answered rows must not trigger the Question shadow.
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
+             VALUES ('q1', ?1, 1, 'old?', '[]', 'yes', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
+            params![&step.id],
+        ).unwrap();
+
+        assert_eq!(
+            plan_effective_status(&conn, &plan.id).unwrap(),
+            PlanStatus::Complete,
+        );
     }
 
     #[test]

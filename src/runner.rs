@@ -417,6 +417,7 @@ async fn run_plan_inner(
             StepOutcome::Failed => "failed",
             StepOutcome::Aborted => "aborted",
             StepOutcome::Timeout => "timeout",
+            StepOutcome::PausedForQuestion => "paused_for_question",
         };
 
         let emit_finished = |outcome: &str| -> Result<()> {
@@ -491,6 +492,23 @@ async fn run_plan_inner(
                 }
                 storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
                 result.final_status = PlanStatus::Failed;
+                result.step_results.push(step_result);
+                return Ok(result);
+            }
+            StepOutcome::PausedForQuestion => {
+                emit_finished(outcome_str)?;
+                if out.format != OutputFormat::Json {
+                    eprintln!(
+                        "[{}/{}] > {} ... PAUSED (open question — answer to resume)",
+                        step_num, total_now, current_step.title
+                    );
+                }
+                // Don't write `Question` to plans.status — it's a *derived*
+                // status (TUI-plan.md §17). Leave the underlying lifecycle
+                // (`in_progress`) alone so it un-shadows automatically once
+                // the user answers. The PlanRunResult reports the derived
+                // state for the caller's benefit.
+                result.final_status = PlanStatus::Question;
                 result.step_results.push(step_result);
                 return Ok(result);
             }
