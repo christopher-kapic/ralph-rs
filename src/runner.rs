@@ -302,6 +302,26 @@ async fn run_plan_inner(
             return Ok(result);
         }
 
+        // Check the operator's graceful-pause flag between steps. The read +
+        // clear is atomic so a subsequent `ralph resume` doesn't immediately
+        // re-pause. We leave `plans.status` as-is (InProgress) — pause is a
+        // transient runner-control signal, not a status transition — so
+        // resume's normal "find earliest non-complete step" path Just Works.
+        if storage::take_plan_pause_requested(conn, &effective_plan.id)? {
+            if out.format == OutputFormat::Json {
+                output::emit_ndjson(&RunEvent::PausedByUser {
+                    plan_slug: effective_plan.slug.clone(),
+                })?;
+            } else {
+                eprintln!(
+                    "> Paused by user request after {} step(s). Use `ralph resume` to continue.",
+                    result.steps_executed,
+                );
+            }
+            result.final_status = PlanStatus::InProgress;
+            return Ok(result);
+        }
+
         // Re-fetch the step list. This is the core of the mid-run-insert fix.
         let all_steps = storage::list_steps(conn, &effective_plan.id)?;
 
@@ -1649,6 +1669,7 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         }
     }
 
@@ -2639,6 +2660,7 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -2676,6 +2698,7 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -2773,6 +2796,167 @@ mod tests {
         assert_eq!(result.final_status, PlanStatus::Complete);
     }
 
+    /// Regression: when `plans.pause_requested` is set, the runner's between-
+    /// steps check must exit cleanly before executing the next step, clear
+    /// the flag in the same transaction so a subsequent `ralph resume`
+    /// doesn't immediately re-pause, and report InProgress (not Complete /
+    /// Failed) so the live-run summary reflects the pause.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_pause_requested_stops_between_steps_and_clears_flag() {
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+
+        let conn = setup();
+        let plan =
+            storage::create_plan(&conn, "p", &project, "feat/p", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
+
+        // Three steps. Mark step 1 Complete so the runner enters the loop
+        // with a real "next step" candidate. The pause check at the top of
+        // the loop fires before that candidate ever gets executed, exercising
+        // exactly the between-steps boundary the spec describes.
+        for (i, title) in ["s1", "s2", "s3"].iter().enumerate() {
+            let (s, _) = storage::create_step(
+                &conn,
+                &plan.id,
+                title,
+                "d",
+                None,
+                None,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            if i == 0 {
+                storage::update_step_status(&conn, &s.id, StepStatus::Complete).unwrap();
+            }
+        }
+
+        // Operator requests pause before the runner ever reaches step 2.
+        storage::set_plan_pause_requested(&conn, &plan.id, true).unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let result = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        // No new step should have run — the pause check fires before the
+        // executor is invoked.
+        assert_eq!(result.steps_executed, 0);
+        assert_eq!(result.steps_succeeded, 0);
+        // Final status stays InProgress (deliberate pause, not failure).
+        assert_eq!(result.final_status, PlanStatus::InProgress);
+
+        // Flag must be cleared so a subsequent run/resume isn't immediately
+        // re-paused.
+        assert!(
+            !storage::get_plan_pause_requested(&conn, &plan.id).unwrap(),
+            "pause_requested must be cleared on entry-to-pause",
+        );
+
+        // Steps 2 and 3 stayed pending — neither was started or skipped.
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[1].status, StepStatus::Pending);
+        assert_eq!(steps[2].status, StepStatus::Pending);
+    }
+
+    /// Regression: after a paused run, `resume_plan` must continue from the
+    /// next pending step normally — no additional pause logic, since the
+    /// runner cleared the flag on entry-to-pause.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_resume_after_pause_does_not_re_pause() {
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+
+        let conn = setup();
+        let plan =
+            storage::create_plan(&conn, "p", &project, "feat/p", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
+
+        // Two steps — step 1 already complete, step 2 pending.
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "first",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        let (_s2, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "second",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Pause-then-resume: set the flag, run (which clears it via the
+        // between-steps check), then call resume_plan — the flag stays clear
+        // and the runner enters the executor for step 2 (which fails because
+        // there's no harness configured, but only AFTER passing the pause
+        // check, which is what we're verifying).
+        storage::set_plan_pause_requested(&conn, &plan.id, true).unwrap();
+        let plan_obj = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let _paused = run_plan(&conn, &plan_obj, &config, &dir, &options, rx.clone(), &out)
+            .await
+            .unwrap();
+        assert!(!storage::get_plan_pause_requested(&conn, &plan_obj.id).unwrap());
+
+        // Re-running with the flag clear MUST NOT short-circuit the loop —
+        // the runner gets to the "find next actionable step" path. We don't
+        // assert success here because there's no real harness; what we
+        // assert is that pause_requested is still false after the second
+        // call (so a future resume keeps progressing).
+        let _second = run_plan(&conn, &plan_obj, &config, &dir, &options, rx, &out).await;
+        assert!(
+            !storage::get_plan_pause_requested(&conn, &plan_obj.id).unwrap(),
+            "pause_requested stays clear across the boundary",
+        );
+    }
+
     // -- stash_if_dirty / setup_branch --
 
     /// With `--no-auto-stash`, a dirty tree must bail cleanly and list the
@@ -2844,6 +3028,7 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -2904,6 +3089,7 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");

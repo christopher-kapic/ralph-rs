@@ -50,6 +50,11 @@ pub enum InputAction {
     /// The user pressed `Q` to flip the plan's `questions_enabled` column
     /// (TUI-plan.md §17 'Toggle surfaces').
     ToggleQuestionsEnabled,
+    /// The user pressed `P` while a run is live to toggle the operator's
+    /// graceful-pause request. The dispatcher flips `plans.pause_requested`
+    /// — first press sets it (runner stops after the current step), second
+    /// press clears it (cancels the request before the boundary fires).
+    TogglePauseRequested,
 }
 
 /// True when J/K should scroll the live-run tails (TUI-plan.md §13) instead
@@ -198,6 +203,13 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
         // when locked.
         KeyCode::Char('Q') if !locked => InputAction::ToggleQuestionsEnabled,
 
+        // Graceful pause: toggle `plans.pause_requested` while a run is live.
+        // The runner reads + clears the flag between step boundaries, so the
+        // first press signals "stop after current step" and the second press
+        // (before the boundary fires) cancels that request. Only meaningful
+        // while a run is in flight, hence the `is_run_live()` gate.
+        KeyCode::Char('P') if app.is_run_live() => InputAction::TogglePauseRequested,
+
         // Open step detail for the highlighted step (TUI-plan.md §7).
         // Read-only navigation, so allowed even while locked.
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -306,6 +318,7 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
@@ -508,6 +521,26 @@ mod tests {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Char('Q')));
         assert_eq!(action, InputAction::ToggleQuestionsEnabled);
+    }
+
+    #[test]
+    fn test_shift_p_emits_toggle_pause_when_run_live() {
+        // P is gated on `is_run_live()`, which is true once a subscription
+        // is wired (TUI-spawned runner) or a LiveRun row is observed.
+        let mut app = make_app(3);
+        app.subscribed = true;
+        assert!(app.is_run_live());
+        let action = handle_key(&mut app, key(KeyCode::Char('P')));
+        assert_eq!(action, InputAction::TogglePauseRequested);
+    }
+
+    #[test]
+    fn test_shift_p_is_noop_when_no_run_live() {
+        // No subscription, no live_run row → P should fall through silently.
+        let mut app = make_app(3);
+        assert!(!app.is_run_live());
+        let action = handle_key(&mut app, key(KeyCode::Char('P')));
+        assert_eq!(action, InputAction::None);
     }
 
     #[test]

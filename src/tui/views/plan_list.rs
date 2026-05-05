@@ -975,6 +975,7 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         }
     }
 

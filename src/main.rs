@@ -502,6 +502,19 @@ fn main() -> Result<()> {
             Ok(())
         }
 
+        // -- Pause --
+        Command::Pause { plan: plan_slug } => {
+            let plan = resolve_plan(&conn, plan_slug, &project, false)?;
+            storage::set_plan_pause_requested(&conn, &plan.id, true)?;
+            if !cli.quiet {
+                eprintln!(
+                    "Pause requested for plan '{}'. The runner will stop after the current step finishes.",
+                    plan.slug,
+                );
+            }
+            Ok(())
+        }
+
         // -- Cancel --
         Command::Cancel {
             plan: plan_slug,

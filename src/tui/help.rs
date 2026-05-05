@@ -253,6 +253,7 @@ pub fn for_plan_detail() -> HelpModel {
                 "Run",
                 vec![
                     ("R", "Run / resume this plan"),
+                    ("P", "Pause after current step (graceful)"),
                     ("S", "Stop the live run"),
                     ("s", "Skip the running step"),
                 ],

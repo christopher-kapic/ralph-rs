@@ -208,6 +208,14 @@ pub fn dispatch_event(app: &mut PlanDetailApp, event: &RunEvent) {
         RunEvent::PlanComplete { .. } | RunEvent::Summary { .. } => {
             app.note_run_finished();
         }
+        RunEvent::PausedByUser { .. } => {
+            app.note_run_finished();
+            app.toasts.push(
+                "Paused. Use `ralph resume` to continue.",
+                crate::tui::toast::ToastKind::Success,
+                std::time::Instant::now(),
+            );
+        }
         // Other events (PromptPrepared, StaleStepsSwept, PlanGrew) update
         // book-keeping handled by the DB-side sync; the right pane has no
         // dedicated rendering for them.
@@ -246,6 +254,7 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         }
     }
 

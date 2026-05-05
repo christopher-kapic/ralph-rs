@@ -27,6 +27,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v15,
     migrate_v16,
     migrate_v17,
+    migrate_v18,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -569,6 +570,28 @@ fn migrate_v17(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         ALTER TABLE run_locks ADD COLUMN parent_tui_pid INTEGER;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V18: pause_requested column on plans (graceful between-step pause)
+// ---------------------------------------------------------------------------
+
+fn migrate_v18(conn: &Connection) -> Result<()> {
+    // `plans.pause_requested` lets the user (via the TUI `P` keybinding or
+    // `ralph pause` CLI) ask the runner to stop after the currently-executing
+    // step finishes — distinct from the immediate SIGTERM-on-`S` path. The
+    // runner inspects it between steps and exits with
+    // `TerminationReason::PausedByUser`, clearing the flag in the same
+    // transaction so a subsequent `ralph resume` doesn't immediately re-pause.
+    //
+    // Stored as INTEGER (0/1) because SQLite has no native bool. NOT NULL
+    // with DEFAULT 0 keeps every pre-V18 row explicitly opted-out.
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0;
         ",
     )?;
     Ok(())
@@ -1636,6 +1659,73 @@ mod tests {
         assert_eq!(version, CURRENT_VERSION);
 
         // Second open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v18_adds_pause_requested_to_plans() {
+        // Seed a pre-V18 DB with a plans row, run V18, and verify that the
+        // existing row defaults to pause_requested = 0 (preserves prior
+        // behavior on upgrade).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v17.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v17 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(17) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V18 applies. Pre-V18 row must default to 0.
+        let conn = open_at(&path).unwrap();
+        let pr: i64 = conn
+            .query_row(
+                "SELECT pause_requested FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pr, 0, "pre-V18 plans must default pause_requested to 0");
+
+        // Fresh inserts also default to 0; explicit 1 round-trips.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, pause_requested)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", 1i64],
+        )
+        .unwrap();
+        let pr2: i64 = conn
+            .query_row(
+                "SELECT pause_requested FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pr2, 1);
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
         let conn = open_at(&path).expect("re-open must not reapply migrations");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))

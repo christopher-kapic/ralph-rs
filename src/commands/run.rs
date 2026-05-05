@@ -2407,6 +2407,9 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
             InputAction::ToggleQuestionsEnabled => {
                 plan_detail_apply_toggle_questions(conn, &mut app)?;
             }
+            InputAction::TogglePauseRequested => {
+                plan_detail_apply_toggle_pause(conn, &mut app)?;
+            }
         }
         if app.should_pop {
             // Dropping the subscription tears down its tokio runtime and
@@ -2855,6 +2858,51 @@ pub(crate) fn plan_detail_apply_move(
         MoveDir::Down => "Moved step down.",
     };
     app.toasts.push(label, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// `P` action in the plan-detail view: toggle `plans.pause_requested` for
+/// the focused plan and toast the new state. The runner reads + clears the
+/// flag between step boundaries (see `storage::take_plan_pause_requested`),
+/// so first press requests "stop after current step" and a second press
+/// before the boundary fires cancels that request. The wrapping input arm
+/// already gated on `is_run_live()`, so we don't re-check that here.
+pub(crate) fn plan_detail_apply_toggle_pause(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let current = match storage::get_plan_pause_requested(conn, &app.plan.id) {
+        Ok(v) => v,
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to read pause flag: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return Ok(());
+        }
+    };
+    let next = !current;
+    if let Err(e) = storage::set_plan_pause_requested(conn, &app.plan.id, next) {
+        app.toasts.push(
+            format!("Failed to update pause flag: {e}"),
+            ToastKind::Error,
+            Instant::now(),
+        );
+        return Ok(());
+    }
+    if let Some(updated) = storage::get_plan_by_slug(conn, &app.plan.slug, &app.plan.project)? {
+        app.plan = updated;
+    }
+    let msg = if next {
+        "Pause requested. Will stop after current step finishes."
+    } else {
+        "Pause request cancelled."
+    };
+    app.toasts.push(msg, ToastKind::Success, Instant::now());
     Ok(())
 }
 
@@ -4716,6 +4764,7 @@ fn build_status_summary(
             in_progress,
         },
         live: live_display,
+        pause_requested: plan.pause_requested,
     };
     Ok((summary, steps))
 }
@@ -4747,6 +4796,10 @@ fn render_status_plain(
         "  Progress: {}/{} complete, {} failed, {} skipped, {} pending, {} in-progress",
         c.complete, c.total, c.failed, c.skipped, c.pending, c.in_progress
     );
+
+    if summary.pause_requested {
+        println!("  pause_requested: true");
+    }
 
     if let Some(lv) = summary.live.as_ref() {
         print_live_block(lv, steps);
@@ -6981,6 +7034,7 @@ mod step_detail_dispatcher_tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -7963,6 +8017,7 @@ mod sub_view_routing_tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
         let steps = vec![Step {
             id: "step-1".to_string(),
@@ -8212,6 +8267,65 @@ mod sub_view_routing_tests {
             plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(forwarded.is_none(), "Toast must not forward: {forwarded:?}");
     }
+
+    // -- Plan-detail [P] pause toggle (TUI-plan.md §17 manual pause) ----------
+
+    #[test]
+    fn plan_detail_apply_toggle_pause_first_press_sets_flag_and_toasts() {
+        let project = "/tmp/pause-toggle-1";
+        let (conn, mut app) = seed_plan_detail(project);
+        // Default state: pause_requested = false.
+        assert!(!app.plan.pause_requested);
+
+        plan_detail_apply_toggle_pause(&conn, &mut app).unwrap();
+
+        // DB row + in-memory plan both flipped to true.
+        assert!(storage::get_plan_pause_requested(&conn, &app.plan.id).unwrap());
+        assert!(app.plan.pause_requested);
+
+        // Toast surfaces the "stop after current step" message so the user
+        // sees acknowledgement of the request.
+        let active = app
+            .toasts
+            .current()
+            .expect("toast must surface confirmation");
+        assert!(
+            active.text.contains("Pause requested"),
+            "first press toast should mention pause request, got {:?}",
+            active.text
+        );
+    }
+
+    #[test]
+    fn plan_detail_apply_toggle_pause_second_press_clears_flag_and_toasts_cancel() {
+        let project = "/tmp/pause-toggle-2";
+        let (conn, mut app) = seed_plan_detail(project);
+
+        // Pre-set the flag — simulates "user pressed P once already".
+        storage::set_plan_pause_requested(&conn, &app.plan.id, true).unwrap();
+        if let Some(updated) = storage::get_plan_by_slug(&conn, &app.plan.slug, &app.plan.project)
+            .unwrap()
+        {
+            app.plan = updated;
+        }
+        assert!(app.plan.pause_requested);
+
+        plan_detail_apply_toggle_pause(&conn, &mut app).unwrap();
+
+        // DB row + in-memory plan both flipped back to false.
+        assert!(!storage::get_plan_pause_requested(&conn, &app.plan.id).unwrap());
+        assert!(!app.plan.pause_requested);
+
+        let active = app
+            .toasts
+            .current()
+            .expect("cancel toast must surface");
+        assert!(
+            active.text.contains("cancelled"),
+            "second press toast should mention cancel, got {:?}",
+            active.text
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8352,6 +8466,7 @@ mod mouse_routing_tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
         PlanDetailApp::new(plan, Vec::new(), &Config::default())
     }
@@ -8374,6 +8489,7 @@ mod mouse_routing_tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
         let step = Step {
             id: "step-1".to_string(),

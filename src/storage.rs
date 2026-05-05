@@ -281,6 +281,69 @@ pub fn set_plan_questions_enabled(conn: &Connection, plan_id: &str, enabled: boo
     Ok(())
 }
 
+/// Set the `plans.pause_requested` flag and bump `updated_at`.
+///
+/// Drives the `P` keybinding in the TUI plan-detail view and the
+/// `ralph pause` CLI. The runner reads this between step boundaries (see
+/// [`get_plan_pause_requested`]) and exits with
+/// `TerminationReason::PausedByUser` when set, clearing the flag in the
+/// same transaction. SQLite has no native bool, so the value is stored as
+/// INTEGER 0/1.
+pub fn set_plan_pause_requested(conn: &Connection, plan_id: &str, requested: bool) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET pause_requested = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![requested as i64, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// Read the `plans.pause_requested` flag for a plan.
+pub fn get_plan_pause_requested(conn: &Connection, plan_id: &str) -> Result<bool> {
+    let value: i64 = match conn.query_row(
+        "SELECT pause_requested FROM plans WHERE id = ?1",
+        params![plan_id],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            anyhow::bail!("Plan not found: {plan_id}");
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok(value != 0)
+}
+
+/// Atomically read `plans.pause_requested` and, if set, clear it in the
+/// same transaction. Returns `true` when the flag was set on entry (and
+/// has now been cleared), `false` otherwise. Used by the runner at step
+/// boundaries so a subsequent `ralph resume` doesn't immediately re-pause.
+pub fn take_plan_pause_requested(conn: &Connection, plan_id: &str) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let value: i64 = match tx.query_row(
+        "SELECT pause_requested FROM plans WHERE id = ?1",
+        params![plan_id],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            anyhow::bail!("Plan not found: {plan_id}");
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let was_set = value != 0;
+    if was_set {
+        tx.execute(
+            "UPDATE plans SET pause_requested = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![plan_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(was_set)
+}
+
 /// One open (unanswered) `step_questions` row enriched with the plan + step
 /// context the CLI list/show commands need to render. Driven by
 /// [`list_open_questions`].
@@ -2209,6 +2272,53 @@ mod tests {
         set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
         let off = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
         assert!(!off.questions_enabled);
+    }
+
+    #[test]
+    fn test_set_plan_pause_requested_round_trips() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        assert!(!plan.pause_requested, "default should be false");
+        assert!(!get_plan_pause_requested(&conn, &plan.id).unwrap());
+
+        set_plan_pause_requested(&conn, &plan.id, true).unwrap();
+        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert!(on.pause_requested);
+        assert!(get_plan_pause_requested(&conn, &plan.id).unwrap());
+        assert!(on.updated_at >= plan.updated_at);
+
+        set_plan_pause_requested(&conn, &plan.id, false).unwrap();
+        let off = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert!(!off.pause_requested);
+        assert!(!get_plan_pause_requested(&conn, &plan.id).unwrap());
+    }
+
+    #[test]
+    fn test_take_plan_pause_requested_clears_flag_atomically() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+
+        // Unset → take returns false, flag stays cleared.
+        assert!(!take_plan_pause_requested(&conn, &plan.id).unwrap());
+        assert!(!get_plan_pause_requested(&conn, &plan.id).unwrap());
+
+        // Set, then take → returns true and clears the flag in one shot so
+        // the runner's between-step check is one-shot per request.
+        set_plan_pause_requested(&conn, &plan.id, true).unwrap();
+        assert!(take_plan_pause_requested(&conn, &plan.id).unwrap());
+        assert!(
+            !get_plan_pause_requested(&conn, &plan.id).unwrap(),
+            "take must clear the flag",
+        );
+        // Subsequent take returns false (idempotent on a cleared flag).
+        assert!(!take_plan_pause_requested(&conn, &plan.id).unwrap());
+    }
+
+    #[test]
+    fn test_set_plan_pause_requested_missing_plan_errs() {
+        let conn = setup();
+        let err = set_plan_pause_requested(&conn, "no-such-id", true).unwrap_err();
+        assert!(err.to_string().contains("Plan not found"));
     }
 
     #[test]

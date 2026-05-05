@@ -119,8 +119,17 @@ fn hint_for(app: &PlanDetailApp) -> String {
     }
     match app.input_mode {
         InputMode::Normal => {
-            "[j/k] nav  [enter] open  [space] sel  [i/a] add  [d] del  [s] skip  [R] run  [S] stop  [/:] cmd  [q] back"
-                .to_string()
+            // While a run is live, surface `[P] pause` (graceful stop after
+            // the current step) alongside the existing `[S] stop` (immediate
+            // cancel). Outside a live run there's nothing to pause, so the
+            // hint stays compact.
+            if app.is_run_live() {
+                "[j/k] nav  [enter] open  [space] sel  [i/a] add  [d] del  [s] skip  [R] run  [P] pause  [S] stop  [/:] cmd  [q] back"
+                    .to_string()
+            } else {
+                "[j/k] nav  [enter] open  [space] sel  [i/a] add  [d] del  [s] skip  [R] run  [S] stop  [/:] cmd  [q] back"
+                    .to_string()
+            }
         }
         InputMode::AddStep(_) => "[Enter] confirm  [Esc] cancel".to_string(),
     }
@@ -458,6 +467,7 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
@@ -553,6 +563,7 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -678,6 +689,7 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
