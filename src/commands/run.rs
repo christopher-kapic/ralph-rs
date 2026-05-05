@@ -2088,6 +2088,80 @@ fn load_step_hooks_view_state(
 }
 
 // ---------------------------------------------------------------------------
+// Step-tags dispatcher (TUI-plan.md §1)
+// ---------------------------------------------------------------------------
+
+/// Run the step-tags event loop until the user pops back. Mirrors
+/// [`run_step_hooks_tui`] but for the per-step free-form tag list: reuses
+/// the parent terminal and raw-mode session, owns the crossterm event
+/// loop, and persists the working tag list via
+/// [`storage::update_step_fields_ext`] when the [`StepTagsApp`] state
+/// machine returns [`Outcome::SaveAndPop`]. [`Outcome::DiscardAndPop`]
+/// pops without writing.
+///
+/// Help-overlay routing happens inside [`StepTagsApp::handle_key`] (step
+/// 14), so a stuck `?` overlay can always be dismissed with `?`/`<esc>`/
+/// `q`/Ctrl-C without reaching the per-mode handlers.
+fn run_step_tags_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    step_id: &str,
+) -> Result<()> {
+    use crate::tui::views::step_tags::{Outcome, StepTagsApp, render};
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let step = storage::get_step(conn, step_id)?;
+    let plan_id = step.plan_id.clone();
+    let plan_slug = storage::get_plan_slug_by_id(conn, &plan_id)?.unwrap_or_default();
+    let steps = storage::list_steps(conn, &plan_id)?;
+    let step_num = steps
+        .iter()
+        .position(|s| s.id == step_id)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let step_label = format!("#{step_num} — {}", step.title);
+
+    let mut app = StepTagsApp::new(
+        step_id.to_string(),
+        plan_slug,
+        step_label,
+        step.tags.clone(),
+    );
+
+    loop {
+        terminal.draw(|f| render(f, f.area(), &mut app))?;
+
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+        match app.handle_key(key) {
+            Outcome::Pending => {}
+            Outcome::DiscardAndPop => return Ok(()),
+            Outcome::SaveAndPop { tags } => {
+                storage::update_step_fields_ext(
+                    conn,
+                    step_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&tags),
+                )?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Step-detail dispatcher (TUI-plan.md §8 + §17)
 // ---------------------------------------------------------------------------
 
@@ -2323,6 +2397,15 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
                 if let Some(step) = app.current_step() {
                     let step_id = step.id.clone();
                     run_step_hooks_tui(terminal, conn, project, &step_id)?;
+                }
+            }
+            // Open the step-tags sub-view (TUI-plan.md §1). Suppressed
+            // during read-only attach so an external runner's lock isn't
+            // bypassed by mutating per-step tags.
+            KeyCode::Char('T') if app.can_edit_panes() => {
+                if let Some(step) = app.current_step() {
+                    let step_id = step.id.clone();
+                    run_step_tags_tui(terminal, conn, &step_id)?;
                 }
             }
             KeyCode::Esc => {
