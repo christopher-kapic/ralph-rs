@@ -206,7 +206,11 @@ pub fn for_archived_list() -> HelpModel {
             ),
             Group::new(
                 "Other",
-                vec![("?", "Toggle this help"), ("Ctrl-C", "Back to plan list")],
+                vec![
+                    ("r", "Refresh from DB"),
+                    ("?", "Toggle this help"),
+                    ("Ctrl-C", "Back to plan list"),
+                ],
             ),
         ],
     )

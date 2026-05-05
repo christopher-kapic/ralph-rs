@@ -823,6 +823,9 @@ fn run_archived_list_tui<B: ratatui::backend::Backend>(
                 }
                 archived_list_apply_unarchive(conn, project, &mut app, &targets)?;
             }
+            KeyCode::Char('r') => {
+                archived_list_refresh(conn, project, &mut app)?;
+            }
             KeyCode::Esc => {
                 let _ = app.escape();
             }
@@ -891,6 +894,25 @@ pub(crate) fn archived_list_apply_unarchive(
         format!("Unarchived {n} plans.")
     };
     app.toasts.push(msg, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// `r` action in the archived-list view (TUI-plan.md §6 inherits §5): re-query
+/// archived plans from the DB and toast the user. Mirrors
+/// [`plan_list_refresh`] — refresh is a pure read operation, so it remains
+/// available even when the run lock is held externally.
+pub(crate) fn archived_list_refresh(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::archived_list::ArchivedListApp,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let new_tiles = build_archived_tiles(conn, project)?;
+    app.refresh_tiles(new_tiles);
+    app.toasts
+        .push("Refreshed.", ToastKind::Info, Instant::now());
     Ok(())
 }
 
@@ -4258,5 +4280,52 @@ mod archived_list_dispatcher_tests {
         app.selected_index = 1;
         let cursor_id = app.cursor_plan().unwrap().id.clone();
         assert_eq!(app.action_targets(), vec![cursor_id]);
+    }
+
+    #[test]
+    fn refresh_picks_up_externally_archived_plan_and_toasts() {
+        // Mirrors plan-list `r`: an external mutation (here, archiving a new
+        // plan) becomes visible in the in-memory tile list only after `r`.
+        let project = "/tmp/archived-refresh-pickup";
+        let (conn, mut app) = seed_archived(project);
+        let initial_len = app.tiles.len();
+
+        let delta =
+            storage::create_plan(&conn, "delta", project, "b4", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &delta.id, PlanStatus::Archived).unwrap();
+        // Without a refresh, the tile list is still stale.
+        assert_eq!(app.tiles.len(), initial_len);
+
+        archived_list_refresh(&conn, project, &mut app).unwrap();
+
+        assert_eq!(app.tiles.len(), initial_len + 1);
+        assert!(app.tiles.iter().any(|t| t.plan.slug == "delta"));
+        assert_eq!(app.toasts.current().unwrap().text, "Refreshed.");
+    }
+
+    #[test]
+    fn refresh_drops_externally_unarchived_plan() {
+        let project = "/tmp/archived-refresh-unarchive";
+        let (conn, mut app) = seed_archived(project);
+        let id = app.tiles[0].plan.id.clone();
+
+        storage::update_plan_status(&conn, &id, PlanStatus::Ready).unwrap();
+        archived_list_refresh(&conn, project, &mut app).unwrap();
+
+        assert_eq!(app.tiles.len(), 2);
+        assert!(!app.tiles.iter().any(|t| t.plan.id == id));
+    }
+
+    #[test]
+    fn refresh_on_empty_archived_view_still_toasts() {
+        let project = "/tmp/archived-refresh-empty";
+        let conn = db::open_memory().unwrap();
+        let tiles = build_archived_tiles(&conn, project).unwrap();
+        let mut app = ArchivedListApp::new(tiles, project, "UTC");
+
+        archived_list_refresh(&conn, project, &mut app).unwrap();
+
+        assert!(app.tiles.is_empty());
+        assert_eq!(app.toasts.current().unwrap().text, "Refreshed.");
     }
 }
