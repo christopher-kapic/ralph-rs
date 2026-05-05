@@ -138,8 +138,18 @@ Drawn on every screen.
 
 ### Layout
 
-Single-column vertical list of plan tiles, scrollable. The plan-list view is
-the entire screen except for the persistent chrome.
+Two-panel horizontal split, mirroring plan-detail (§7):
+
+- **Left pane** (~40% width): scrollable column of plan tiles.
+- **Right pane** (~60% width): preview of the **highlighted plan's** step
+  list — identical compact rows to plan-detail's left sidebar
+  (`<num> <glyph> <title>`), rendered via a shared `step_list_widget`
+  extracted from `plan_detail_ui`. Read-only on this screen; pressing
+  `enter`/`→`/`l` pushes plan-detail where the same widget becomes the
+  primary navigation column.
+
+When the cursor is on the **Archived tile**, the right pane is blank
+(no placeholder text — leaving it empty avoids visual noise).
 
 ### Plan tile
 
@@ -167,6 +177,12 @@ Width fills the available column. Height: 6 rows including borders.
     badge in the top-right corner of the box.
   - Highlighted **and** selected: `#56d0d9` border with `#f7d135`-tinted title
     line (so the user can see both states without ambiguity).
+- Corner badges:
+  - **Top-right**: `[N]` selection-order badge when multi-selected (above).
+  - **Top-left**: small `?` glyph when `plan.questions_enabled = true`.
+    Absence means the toggle is off. Distinct from the purple status
+    dot in §17, which signals an *unanswered* question is currently
+    blocking the plan — both can render simultaneously.
 
 ### Sort order
 
