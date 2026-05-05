@@ -1918,6 +1918,9 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             }
             KeyCode::Char('h') | KeyCode::Left => app.handle_left(),
             KeyCode::Char('l') | KeyCode::Right => app.handle_right(),
+            KeyCode::Char('z') => {
+                app.toggle_zen();
+            }
             KeyCode::Char('q') => app.request_pop(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.request_pop();
