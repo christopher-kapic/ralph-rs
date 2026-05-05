@@ -10,6 +10,7 @@ pub mod plan_dependencies;
 pub mod plan_detail;
 pub mod plan_detail_input;
 pub mod plan_detail_ui;
+pub mod plan_hooks;
 pub mod plan_list;
 pub mod step_detail;
 pub mod step_detail_picker;

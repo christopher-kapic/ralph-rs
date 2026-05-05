@@ -207,7 +207,15 @@ pub enum PaletteAction {
     /// else focus) and the consuming view loads dep / candidate snapshots
     /// from storage on entry.
     OpenPlanDependencies { plan_id: String, slug: String },
-    /// Recognized command stubbed for a later tui-v1 step (34–36, 43).
+    /// `/plan set-hook|unset-hook|hooks [<slug>]` — push the plan-hooks
+    /// sub-view for `plan_id` (TUI-plan.md §1, step 34). The sub-view owns
+    /// add/remove via `a`/`d` keybindings and a two-step lifecycle/hook
+    /// picker; the verb in the palette is just the entry door. The
+    /// orchestrator resolves `slug` (explicit if given, else focus) and the
+    /// consuming view loads the attachment / library snapshots from storage
+    /// and the hook library on entry.
+    OpenPlanHooks { plan_id: String, slug: String },
+    /// Recognized command stubbed for a later tui-v1 step (35–36, 43).
     /// Caller renders a `Coming soon — landing in step <N>` info toast.
     ComingSoon {
         label: &'static str,
@@ -271,15 +279,17 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
         | PaletteCommand::PlanDependencyRemove
         | PaletteCommand::PlanDependencyList => dispatch_plan_dependencies(ctx),
 
-        // -- v1-deferred sub-views (steps 34–36) --------------------------
+        // -- /plan set-hook|unset-hook|hooks ------------------------------
+        // All three subcommands push the same sub-view (step 34). The
+        // sub-view owns add (`a`) / remove (`d`) interactively, so the
+        // verb in the palette is just the entry door.
+        PaletteCommand::PlanSetHook | PaletteCommand::PlanUnsetHook | PaletteCommand::PlanHooks => {
+            dispatch_plan_hooks(ctx)
+        }
+
+        // -- v1-deferred sub-views (steps 35–36) --------------------------
         // The toast text is rendered by the dispatcher loop from the
         // `target_step`. Sub-view step numbers come from the tui-v1 plan map.
-        PaletteCommand::PlanSetHook | PaletteCommand::PlanUnsetHook | PaletteCommand::PlanHooks => {
-            PaletteAction::ComingSoon {
-                label: cmd.label(),
-                target_step: 34,
-            }
-        }
         PaletteCommand::StepSetHook | PaletteCommand::StepUnsetHook => PaletteAction::ComingSoon {
             label: cmd.label(),
             target_step: 35,
@@ -567,6 +577,21 @@ fn dispatch_plan_dependencies(ctx: &PaletteContext<'_>) -> PaletteAction {
         },
         ResolvedSlug::Missing | ResolvedSlug::Unknown(_) => PaletteAction::Toast {
             message: "Open a plan first to edit dependencies.".to_string(),
+            kind: ToastKind::Info,
+        },
+    }
+}
+
+fn dispatch_plan_hooks(ctx: &PaletteContext<'_>) -> PaletteAction {
+    // Same shape as `dispatch_plan_dependencies` — the sub-view is the verb;
+    // the palette command merely opens it against the focused plan.
+    match resolve_slug(None, ctx) {
+        ResolvedSlug::Some(target) => PaletteAction::OpenPlanHooks {
+            plan_id: target.id,
+            slug: target.slug,
+        },
+        ResolvedSlug::Missing | ResolvedSlug::Unknown(_) => PaletteAction::Toast {
+            message: "Open a plan first to edit hooks.".to_string(),
             kind: ToastKind::Info,
         },
     }
@@ -1478,18 +1503,35 @@ mod tests {
         );
     }
 
+    // -- /plan set-hook|unset-hook|hooks routes to OpenPlanHooks (step 34) --
+
     #[test]
-    fn plan_hook_subcommands_route_to_step_34() {
-        let c = Ctx::new();
+    fn plan_hook_subcommands_route_to_open_plan_hooks() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
         for input in ["/plan set-hook", "/plan unset-hook", "/plan hooks"] {
             match dispatch_str(input, &c) {
-                PaletteAction::ComingSoon { label, target_step } => {
-                    assert!(label.starts_with("/plan "), "label: {label}");
-                    assert_eq!(target_step, 34);
+                PaletteAction::OpenPlanHooks { plan_id, slug } => {
+                    assert_eq!(plan_id, "id-alpha");
+                    assert_eq!(slug, "alpha");
                 }
-                other => panic!("expected ComingSoon for {input}, got {other:?}"),
+                other => panic!("expected OpenPlanHooks for {input}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn plan_hook_subcommands_toast_when_no_focused_plan() {
+        let c = Ctx::new();
+        let action = dispatch_str("/plan set-hook", &c);
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "Open a plan first to edit hooks.".to_string(),
+                kind: ToastKind::Info,
+            }
+        );
     }
 
     #[test]
