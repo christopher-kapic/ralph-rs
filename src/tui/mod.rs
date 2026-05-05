@@ -9,6 +9,7 @@ pub mod chrome;
 pub mod dialog;
 pub mod editor;
 pub mod events;
+pub mod help;
 pub mod palette;
 pub mod palette_dispatch;
 pub mod read_only;

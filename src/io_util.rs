@@ -259,6 +259,8 @@ mod tests {
 
     // -- ChunkEmitter / drain_bounded_with_emitter ---------------------------
 
+    type CollectedChunks = Arc<std::sync::Mutex<Vec<(ChunkStream, String, u64)>>>;
+
     /// Build a ChunkEmitter whose sink pushes `(stream, text, seq)` tuples
     /// into a shared `Mutex<Vec<_>>` for the test to inspect. Returns the
     /// emitter and the collected-events handle.
@@ -266,11 +268,8 @@ mod tests {
         stream: ChunkStream,
         seq: Arc<AtomicU64>,
         max_bytes: usize,
-    ) -> (
-        ChunkEmitter,
-        Arc<std::sync::Mutex<Vec<(ChunkStream, String, u64)>>>,
-    ) {
-        let collected: Arc<std::sync::Mutex<Vec<(ChunkStream, String, u64)>>> =
+    ) -> (ChunkEmitter, CollectedChunks) {
+        let collected: CollectedChunks =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let collected_for_sink = collected.clone();
         let sink: ChunkSink = Arc::new(move |s, t, n| {

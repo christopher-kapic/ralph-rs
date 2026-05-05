@@ -15,6 +15,7 @@ use crate::frac_index::{self, FracIndexError};
 use crate::plan::{Phase, Plan, Step, StepStatus};
 use crate::run_lock::LiveRun;
 use crate::tui::events::{TAIL_BUFFER_LINES, TAIL_VISIBLE_LINES};
+use crate::tui::help::HelpState;
 use crate::tui::read_only::ReadOnly;
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
@@ -138,6 +139,10 @@ pub struct PlanDetailApp {
     /// banner pane and the `A` keybinding that pushes step-detail focused on
     /// the originating step. Refreshed by the dispatcher each poll tick.
     pub open_questions: Vec<crate::storage::OpenQuestion>,
+    /// Help-overlay state. `?` toggles visibility; while visible the
+    /// dispatcher routes input through [`HelpState::intercept_key`] before
+    /// passing keys to the per-view input handler (TUI-plan.md §15).
+    pub help: HelpState,
 }
 
 impl PlanDetailApp {
@@ -167,6 +172,7 @@ impl PlanDetailApp {
             test_tail_scroll: 0,
             read_only: ReadOnly::Editable,
             open_questions: Vec::new(),
+            help: HelpState::new(),
         }
     }
 

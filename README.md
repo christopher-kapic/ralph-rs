@@ -183,6 +183,99 @@ Each hook runs with a wall-clock budget controlled by `hook_timeout_secs` in `co
 
 For the full model (library layout, scope rules, sharing, worked examples for Claude Code / Codex / clippy), see [docs/review-hooks.md](docs/review-hooks.md).
 
+## Interactive TUI
+
+Running `ralph` with no subcommand drops into a vim-flavored TUI modeled
+on lazygit. From here you can navigate plans, edit prompts, run plans,
+and answer questions raised by the harness without leaving the terminal.
+
+```bash
+ralph             # plan list (landing screen)
+ralph run         # plan detail of the active plan, auto-starting the run
+ralph run <slug>  # plan detail of <slug>, auto-starting the run
+```
+
+The TUI is **opt-in** — passing any non-default flag to `ralph run`
+(e.g., `--one`, `--all`, `--harness`, `--json`) keeps today's
+non-interactive behavior so scripts don't regress. The
+`--non-interactive` flag forces the same path from a TTY for cases like
+`ralph run | tee log.txt`.
+
+### Views
+
+The TUI is multi-view, with `?` opening a help overlay listing the
+bindings of the current view at any time:
+
+| View              | Entered by                                    | What it does                                  |
+|-------------------|-----------------------------------------------|-----------------------------------------------|
+| Plan list         | `ralph`                                        | Landing screen; tile per plan, sort by recency |
+| Archived list     | `enter` on the "Archived (N)" tile             | Same layout as plan list; `enter` unarchives, `d` permanently deletes |
+| Plan detail       | `enter` on a plan tile, or `ralph run`         | Step list + right-pane summary or live run tails |
+| Step detail       | `enter` on a step in plan detail               | Stacked editable prompt panes (`c` opens `$EDITOR`) |
+| Sub-views         | `D` (deps), palette `/plan set-hook`, etc.     | Plan dependencies, plan hooks, step hooks, step tags |
+
+### Common keybindings
+
+The full list lives behind `?` in each view; this is the cheat sheet.
+
+| Action                                  | Plan list      | Archived  | Plan detail        | Step detail   |
+|-----------------------------------------|----------------|-----------|--------------------|---------------|
+| Navigate                                | `j` / `k`      | `j` / `k` | `j` / `k`          | `j` / `k` (panes) |
+| Open / drill in                         | `enter` / `l`  | (unarchive) | `enter` / `l`    | (focus pane)  |
+| Pop view                                | `q`            | `q` / `h` | `q` / `h`          | `q` / `h`     |
+| Multi-select                            | `space`        | `space`   | `space`            | —             |
+| Create                                  | `i` / `a`      | —         | `i` (above) / `a` (below) | — (palette: `/step add`) |
+| Delete                                  | `d` (archive)  | `d` (delete) | `d`             | —             |
+| Approve plan                            | `A`            | —         | (palette `/plan approve`) | —      |
+| Toggle questions on plan                | `Q`            | —         | (palette `/plan questions on\|off`) | — |
+| Run / resume                            | (palette `/run`) | —       | `R`                | —             |
+| Stop the live run                       | —              | —         | `S`                | —             |
+| Skip running step                       | —              | —         | `s`                | —             |
+| Edit pane in `$EDITOR`                  | —              | —         | —                  | `c`           |
+| Answer open question                    | —              | —         | `A`                | `a` on questions pane |
+| Move step                               | —              | —         | `Shift-J`/`Shift-K` | —            |
+| Reset step                              | —              | —         | `r`                | —             |
+| Plan dependencies                       | —              | —         | `D`                | —             |
+| Help overlay                            | `?`            | `?`       | `?`                | `?`           |
+| Command palette                         | `/` or `:`     | `/` or `:` | `/` or `:`        | `/` or `:`    |
+
+### Command palette
+
+Pressing `/` or `:` opens an inline palette like in lazygit. Tab cycles
+candidates; `enter` runs:
+
+```
+/run [<branch>]
+/plan harness [<name>]
+/plan show|archive|unarchive|delete|approve|questions on|off [<slug>]
+/plan dependency add|remove|list
+/plan set-hook|unset-hook|hooks
+/step add <title>
+/step skip [<num>]
+/step move <num> --to <m>
+/step set-hook|unset-hook|edit --tags
+/cancel
+/export <slug> [-o <path>]
+/import <path>
+/quit
+/help
+```
+
+### Live runs and questions
+
+When the TUI spawns the runner subprocess, the right pane streams
+NDJSON events from the runner: harness stdout/stderr, test output,
+phase transitions, and the final summary. See
+[docs/ndjson-events.md](docs/ndjson-events.md) for the event schema —
+the same stream is what `--json` / `--jsonl` emit on stdout.
+
+If `questions_enabled` is on for the plan, the harness can pause the
+run with `ralph question ask "..."`. The TUI surfaces a `❓` indicator
+on the step, opens an answer modal on `A` or `a`, and offers to resume
+the implementation once the last open question is answered.
+
+For the full UX spec, see [TUI-plan.md](TUI-plan.md).
+
 ## License
 
 MIT

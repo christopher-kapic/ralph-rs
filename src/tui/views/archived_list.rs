@@ -17,6 +17,7 @@ use ratatui::widgets::{Clear, Paragraph, Widget};
 
 use crate::plan::Plan;
 use crate::tui::chrome::{self, Chrome};
+use crate::tui::help::{self, HelpState};
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
 use crate::tui::views::plan_list::{self, PlanTile, TILE_HEIGHT};
@@ -40,6 +41,10 @@ pub struct ArchivedListApp {
     pub toasts: ToastQueue,
     /// Set when the user asks to return to the main plan list (`←`/`h`/`q`).
     pub should_pop: bool,
+    /// Help-overlay state. `?` toggles visibility; while visible the
+    /// dispatcher routes input through [`HelpState::intercept_key`] before
+    /// touching any view bindings (TUI-plan.md §15).
+    pub help: HelpState,
 }
 
 impl ArchivedListApp {
@@ -58,6 +63,7 @@ impl ArchivedListApp {
             project: project.into(),
             toasts: ToastQueue::new(),
             should_pop: false,
+            help: HelpState::new(),
         }
     }
 
@@ -194,6 +200,12 @@ pub fn draw(frame: &mut Frame, app: &mut ArchivedListApp) {
         if area.height >= 1 && area.width > 0 {
             render_toast_overlay(frame, area, &toast.text, toast.color);
         }
+    }
+
+    // Help overlay sits on top of everything else when `?` has been pressed.
+    if app.help.is_visible() {
+        let area = frame.area();
+        help::render(frame, area, &help::for_archived_list());
     }
 }
 
@@ -501,5 +513,32 @@ mod tests {
             top.contains("Archived plans"),
             "expected breadcrumb header: {top:?}"
         );
+    }
+
+    // -- Help overlay (TUI-plan.md §15) ---------------------------------
+
+    #[test]
+    fn help_state_default_hidden() {
+        let app = ArchivedListApp::new(make_tiles(1), "/proj", "UTC");
+        assert!(!app.help.is_visible());
+    }
+
+    #[test]
+    fn help_intercepts_question_mark_and_esc() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = ArchivedListApp::new(make_tiles(1), "/proj", "UTC");
+        let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(
+            app.help.intercept_key(q),
+            crate::tui::help::InterceptResult::Opened
+        );
+        assert!(app.help.is_visible());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            app.help.intercept_key(esc),
+            crate::tui::help::InterceptResult::Closed
+        );
+        assert!(!app.help.is_visible());
     }
 }

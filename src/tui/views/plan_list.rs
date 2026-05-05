@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::plan::{Plan, PlanStatus};
 use crate::tui::chrome::{self, Chrome};
+use crate::tui::help::{self, HelpState};
 use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::selection::Selection;
 use crate::tui::theme;
@@ -116,6 +117,10 @@ pub struct PlanListApp {
     /// keybindings (`i`/`a`/`A`/`d`/`Q`) are suppressed and the persistent
     /// banner replaces the bottom hint line.
     pub read_only: ReadOnly,
+    /// Help-overlay state. `?` toggles visibility; while visible the
+    /// dispatcher routes input through [`HelpState::intercept_key`] before
+    /// touching any view bindings (TUI-plan.md §15).
+    pub help: HelpState,
 }
 
 impl PlanListApp {
@@ -135,6 +140,7 @@ impl PlanListApp {
             project: project.into(),
             toasts: ToastQueue::new(),
             read_only: ReadOnly::Editable,
+            help: HelpState::new(),
         }
     }
 
@@ -413,6 +419,12 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
         if area.height >= 1 && area.width > 0 {
             render_toast_overlay(frame, area, &toast.text, toast.color);
         }
+    }
+
+    // Help overlay sits on top of everything else when `?` has been pressed.
+    if app.help.is_visible() {
+        let area = frame.area();
+        help::render(frame, area, &help::for_plan_list());
     }
 }
 
@@ -1498,5 +1510,28 @@ mod tests {
         app.set_read_only(ReadOnly::Locked { pid: 4242 });
         assert_eq!(app.read_only, ReadOnly::Locked { pid: 4242 });
         assert!(app.read_only.is_locked());
+    }
+
+    // -- Help overlay (TUI-plan.md §15) ---------------------------------
+
+    #[test]
+    fn help_state_default_hidden() {
+        let app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        assert!(!app.help.is_visible());
+    }
+
+    #[test]
+    fn help_intercepts_question_mark_and_esc() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        let r = app.help.intercept_key(q);
+        assert_eq!(r, crate::tui::help::InterceptResult::Opened);
+        assert!(app.help.is_visible());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let r = app.help.intercept_key(esc);
+        assert_eq!(r, crate::tui::help::InterceptResult::Closed);
+        assert!(!app.help.is_visible());
     }
 }

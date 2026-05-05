@@ -24,6 +24,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 
+use crate::tui::help::{self, HelpState};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
 
@@ -91,6 +92,10 @@ pub struct PlanDependenciesApp {
     pub mode: Mode,
     /// Toast queue rendered over the bottom hint row.
     pub toasts: ToastQueue,
+    /// Help-overlay state. `?` toggles visibility; while visible the
+    /// dispatcher routes input through [`HelpState::intercept_key`] before
+    /// passing keys to the per-mode handler (TUI-plan.md §15).
+    pub help: HelpState,
 }
 
 impl PlanDependenciesApp {
@@ -110,6 +115,7 @@ impl PlanDependenciesApp {
             picker_cursor: 0,
             mode: Mode::List,
             toasts: ToastQueue::new(),
+            help: HelpState::new(),
         }
     }
 
@@ -134,6 +140,13 @@ impl PlanDependenciesApp {
     /// Pure key handler. Routes to the per-mode handler so tests can drive
     /// arbitrary key sequences without crossterm.
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+        // §15 help overlay: route `?` toggle / dismissal first. While the
+        // overlay is up the sub-view's per-mode handlers are skipped so
+        // `j/k`/`a`/`d` don't fire under it.
+        if self.help.intercept_key(key) != help::InterceptResult::Passthrough {
+            return Outcome::Pending;
+        }
+
         // Ctrl-C always pops the sub-view, mirroring the plan-detail view.
         if let KeyCode::Char('c') = key.code
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -360,6 +373,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut PlanDependenciesApp) {
     // -- Picker overlay ---------------------------------------------------
     if app.mode == Mode::Picker {
         render_picker(frame, area, app);
+    }
+
+    // -- Help overlay -----------------------------------------------------
+    if app.help.is_visible() {
+        help::render(frame, area, &help::for_plan_dependencies());
     }
 }
 
@@ -783,6 +801,61 @@ mod tests {
         terminal
             .draw(|f| render(f, f.area(), &mut app))
             .unwrap();
+    }
+
+    // -- Help overlay (TUI-plan.md §15) ---------------------------------
+
+    #[test]
+    fn help_state_default_hidden() {
+        let app =
+            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![]);
+        assert!(!app.help.is_visible());
+    }
+
+    #[test]
+    fn handle_key_question_mark_opens_help_in_list_mode() {
+        let mut app = PlanDependenciesApp::new(
+            "p1".into(),
+            "parent".into(),
+            vec![pref("d1", "a")],
+            vec![],
+        );
+        // `?` is consumed by the help routing — returns Pending and the
+        // sub-view's per-mode handler doesn't fire.
+        let r = app.handle_key(key(KeyCode::Char('?')));
+        assert_eq!(r, Outcome::Pending);
+        assert!(app.help.is_visible());
+    }
+
+    #[test]
+    fn handle_key_esc_closes_help_without_popping() {
+        let mut app =
+            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![]);
+        app.help.open();
+        // Without the help intercept, `<esc>` in List mode would pop the
+        // sub-view (Outcome::Pop). With the overlay open it must just close
+        // the overlay and stay in the sub-view (Outcome::Pending).
+        let r = app.handle_key(key(KeyCode::Esc));
+        assert_eq!(r, Outcome::Pending);
+        assert!(!app.help.is_visible());
+    }
+
+    #[test]
+    fn handle_key_swallows_input_while_help_visible() {
+        let mut app = PlanDependenciesApp::new(
+            "p1".into(),
+            "parent".into(),
+            vec![pref("d1", "a"), pref("d2", "b")],
+            vec![],
+        );
+        app.help.open();
+        // `j` would normally move the cursor; with the overlay up it must
+        // be consumed instead.
+        let before = app.list_cursor;
+        let r = app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(r, Outcome::Pending);
+        assert_eq!(app.list_cursor, before, "j must not move cursor under help");
+        assert!(app.help.is_visible());
     }
 
     // -- End-to-end storage round-trip tests -----------------------------

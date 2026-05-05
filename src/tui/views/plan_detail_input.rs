@@ -819,4 +819,30 @@ mod tests {
         assert_eq!(action, InputAction::None);
         assert!(app.harness_tail_scroll < before, "tail scroll should still work");
     }
+
+    // -- Help overlay (TUI-plan.md §15) ---------------------------------
+
+    #[test]
+    fn help_state_default_hidden() {
+        let app = make_app(3);
+        assert!(!app.help.is_visible());
+    }
+
+    #[test]
+    fn help_intercepts_question_mark_and_esc() {
+        let mut app = make_app(3);
+        let q = key(KeyCode::Char('?'));
+        assert_eq!(
+            app.help.intercept_key(q),
+            crate::tui::help::InterceptResult::Opened
+        );
+        assert!(app.help.is_visible());
+
+        let esc = key(KeyCode::Esc);
+        assert_eq!(
+            app.help.intercept_key(esc),
+            crate::tui::help::InterceptResult::Closed
+        );
+        assert!(!app.help.is_visible());
+    }
 }

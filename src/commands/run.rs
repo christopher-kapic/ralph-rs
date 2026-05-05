@@ -343,6 +343,14 @@ pub fn run_plan_list_tui(
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
+                // §15 help overlay: `?` toggles, `<esc>`/`q`/Ctrl-C close. While
+                // the overlay is visible the dispatcher swallows every key
+                // (Consumed/Closed/Opened) so view bindings don't fire under
+                // it. Passthrough means the overlay is hidden and we proceed
+                // with the normal match below.
+                if app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough {
+                    continue;
+                }
                 let locked = app.read_only.is_locked();
                 match key.code {
                     KeyCode::Char('j') | KeyCode::Down => app.navigate_down(),
@@ -743,6 +751,10 @@ fn run_archived_list_tui<B: ratatui::backend::Backend>(
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             _ => continue,
         };
+        // §15 help overlay: see plan-list dispatcher for the routing rule.
+        if app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough {
+            continue;
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.navigate_down(),
             KeyCode::Char('k') | KeyCode::Up => app.navigate_up(),
@@ -899,7 +911,7 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     use crate::tui::events::{self as tui_events, RunSubscription};
     use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
     use crate::tui::toast::ToastKind;
-    use crate::tui::views::plan_detail::PlanDetailApp;
+    use crate::tui::views::plan_detail::{self, PlanDetailApp};
     use crate::tui::views::plan_detail_input::{self, InputAction};
     use crate::tui::views::plan_detail_ui;
     use crossterm::event::{self, Event, KeyEventKind};
@@ -1004,6 +1016,15 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             _ => continue,
         };
+        // §15 help overlay: route `?` toggle / dismissal through the help
+        // state before the per-view input handler so view bindings don't
+        // fire while the overlay is up. Add-mode is exempt — `?` is a valid
+        // text-input character there.
+        if matches!(app.input_mode, plan_detail::InputMode::Normal)
+            && app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough
+        {
+            continue;
+        }
         let action = plan_detail_input::handle_key(&mut app, key);
         match action {
             InputAction::None | InputAction::Pop => {}
@@ -1721,6 +1742,16 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             _ => continue,
         };
+
+        // §15 help overlay: `?` toggles, `<esc>`/`q`/Ctrl-C close. Run before
+        // the modal handlers so a stuck overlay can always be dismissed; we
+        // skip interception while a modal is up so the modal owns the keymap.
+        if app.answer_modal.is_none()
+            && app.resume_modal.is_none()
+            && app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough
+        {
+            continue;
+        }
 
         // Modals are exclusive: the resume modal is only opened when no
         // answer modal is also open, and vice versa.
@@ -3930,10 +3961,12 @@ mod plan_list_action_tests {
     fn apply_create_uses_configured_default_harness() {
         let project = "/tmp/create-plan-harness";
         let (conn, mut app) = seed_app(project);
-        let mut config = Config::default();
         // Default config defines a "codex" harness — rebind the global
         // default to it so we exercise non-claude harness selection.
-        config.default_harness = "codex".to_string();
+        let config = Config {
+            default_harness: "codex".to_string(),
+            ..Config::default()
+        };
 
         plan_list_apply_create(&conn, &config, project, &mut app, "epsilon", "", &[]).unwrap();
 
@@ -4013,7 +4046,7 @@ mod archived_list_dispatcher_tests {
         let target_id = app.cursor_plan().unwrap().id.clone();
         let target_slug = app.cursor_plan().unwrap().slug.clone();
 
-        archived_list_apply_delete(&conn, project, &mut app, &[target_id.clone()]).unwrap();
+        archived_list_apply_delete(&conn, project, &mut app, std::slice::from_ref(&target_id)).unwrap();
 
         // DB row gone.
         assert!(
@@ -4061,7 +4094,7 @@ mod archived_list_dispatcher_tests {
         let target_id = app.cursor_plan().unwrap().id.clone();
         let target_slug = app.cursor_plan().unwrap().slug.clone();
 
-        archived_list_apply_unarchive(&conn, project, &mut app, &[target_id.clone()]).unwrap();
+        archived_list_apply_unarchive(&conn, project, &mut app, std::slice::from_ref(&target_id)).unwrap();
 
         // Status flipped to Ready in the DB.
         let row = storage::get_plan_by_slug(&conn, &target_slug, project)
@@ -4107,7 +4140,7 @@ mod archived_list_dispatcher_tests {
         let mut app = ArchivedListApp::new(tiles, project, "UTC");
         assert_eq!(app.tiles.len(), 1);
 
-        archived_list_apply_unarchive(&conn, project, &mut app, &[only.id.clone()]).unwrap();
+        archived_list_apply_unarchive(&conn, project, &mut app, std::slice::from_ref(&only.id)).unwrap();
 
         assert!(app.tiles.is_empty());
         assert_eq!(app.selected_index, 0);

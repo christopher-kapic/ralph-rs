@@ -24,6 +24,7 @@ use crate::plan::{ChangePolicy, ExecutionLog, Plan, Step, StepStatus};
 use crate::prompt::DEFAULT_CONTEXT_PREPEND;
 use crate::storage::{self, ProjectSettings};
 use crate::tui::chrome::{self, Chrome};
+use crate::tui::help::{self, HelpState};
 use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
@@ -616,6 +617,10 @@ pub struct StepDetailApp {
     /// [`Self::note_answer_persisted`] when the just-applied answer was the
     /// plan's last open question; cleared by either Accept or Decline.
     pub resume_modal: Option<crate::tui::views::answer_modal::ResumeModal>,
+    /// Help-overlay state. `?` toggles visibility; while visible the
+    /// dispatcher routes input through [`HelpState::intercept_key`] before
+    /// touching pane navigation or modal handlers (TUI-plan.md §15).
+    pub help: HelpState,
 }
 
 impl StepDetailApp {
@@ -668,6 +673,7 @@ impl StepDetailApp {
             plan_open_questions_count: 0,
             answer_modal: None,
             resume_modal: None,
+            help: HelpState::new(),
         }
     }
 
@@ -1521,6 +1527,12 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
         if area.height >= 1 && area.width > 0 {
             render_toast_overlay(frame, area, &toast.text, toast.color);
         }
+    }
+
+    // Help overlay sits on top of everything else when `?` has been pressed.
+    if app.help.is_visible() {
+        let area = frame.area();
+        help::render(frame, area, &help::for_step_detail());
     }
 }
 
@@ -4879,5 +4891,32 @@ cargo clippy
         assert!(!app.can_edit_panes());
         app.set_read_only(ReadOnly::Editable);
         assert!(app.can_edit_panes(), "edits must come back when lock is released");
+    }
+
+    // -- Help overlay (TUI-plan.md §15) ---------------------------------
+
+    #[test]
+    fn step_detail_help_default_hidden() {
+        let app = make_app(3, 0);
+        assert!(!app.help.is_visible());
+    }
+
+    #[test]
+    fn step_detail_help_intercepts_question_mark_and_esc() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app(3, 0);
+        let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert_eq!(
+            app.help.intercept_key(q),
+            crate::tui::help::InterceptResult::Opened
+        );
+        assert!(app.help.is_visible());
+
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(
+            app.help.intercept_key(esc),
+            crate::tui::help::InterceptResult::Closed
+        );
+        assert!(!app.help.is_visible());
     }
 }

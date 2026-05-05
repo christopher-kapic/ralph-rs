@@ -343,8 +343,8 @@ mod tests {
     #[test]
     fn resume_preserves_current_branch_flag() {
         let m1 = ResumeModal::new("plan", true);
-        assert_eq!(m1.current_branch, true);
+        assert!(m1.current_branch);
         let m2 = ResumeModal::new("plan", false);
-        assert_eq!(m2.current_branch, false);
+        assert!(!m2.current_branch);
     }
 }

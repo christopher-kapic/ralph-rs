@@ -17,6 +17,7 @@ use super::plan_detail::{AddPosition, InputMode, PlanDetailApp};
 use crate::plan::{Phase, StepStatus};
 use crate::tui::chrome::{self, Chrome};
 use crate::tui::events::TAIL_VISIBLE_LINES;
+use crate::tui::help;
 use crate::tui::read_only;
 use crate::tui::theme;
 
@@ -51,6 +52,12 @@ pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
         if area.height >= 1 && area.width > 0 {
             render_toast_overlay(frame, area, &toast.text, toast.color);
         }
+    }
+
+    // Help overlay sits on top of everything else when `?` has been pressed.
+    if app.help.is_visible() {
+        let area = frame.area();
+        help::render(frame, area, &help::for_plan_detail());
     }
 }
 
@@ -196,13 +203,13 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
             Span::styled(
                 format!("{step_label}{phase_label}"),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme::STATUS_IN_PROGRESS)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(
                 format!("{mins:02}:{secs:02}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::STATUS_IN_PROGRESS),
             ),
         ]));
         lines.push(Line::from(""));
@@ -316,7 +323,7 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
             Span::styled("Elapsed: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!("{mins:02}:{secs:02}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::STATUS_IN_PROGRESS),
             ),
         ]));
     }

@@ -52,11 +52,68 @@ src/
     agents.rs          — Agent file CRUD commands
     hooks.rs           — Hook library CRUD, export/import commands
   tui/
-    mod.rs             — TUI module entry + tests
-    app.rs             — App state (plan, steps, selection, input mode)
-    ui.rs              — Ratatui rendering (layout, colors)
-    input.rs           — Vim keybinding input handling (j/k, a, s, q, Ctrl+C)
+    mod.rs             — TUI module entry
+    view.rs            — `View` enum (PlanList, ArchivedList, PlanDetail, StepDetail)
+    chrome.rs          — Persistent top breadcrumb + bottom hint/cwd/version bar
+    theme.rs           — Color tokens (truecolor `Color::Rgb` constants)
+    toast.rs           — Transient bottom-row message bar with TTL
+    dialog.rs          — Confirm-dialog primitive (yes/no over a background view)
+    editor.rs          — `$EDITOR` handoff (round-trip text through a tempfile)
+    events.rs          — NDJSON `RunEvent` subscription wiring (TUI → runner subprocess)
+    help.rs            — `?` help overlay (per-view binding model + render)
+    palette.rs         — `/` / `:` slash-command parser + tab completion
+    palette_dispatch.rs — Maps parsed palette commands to per-view actions
+    read_only.rs       — Read-only attach state when an external runner holds the lock
+    run_dialog.rs      — `/run` 3-button branch-choice dialog
+    selection.rs       — Multi-selection state (with `[N]` badge ordering)
+    views/
+      plan_list.rs     — Landing screen: tile per plan, sort by recency
+      archived_list.rs — Same layout as plan_list but for archived plans
+      plan_detail.rs   — Plan-detail view state
+      plan_detail_input.rs — Pure key handler returning `InputAction`s
+      plan_detail_ui.rs — Plan-detail rendering (step list + right pane)
+      step_detail.rs   — Step-detail pane stack (Universal/Project/Plan/Step prompts, etc.)
+      step_detail_picker.rs — Bottom-row pickers (harness/model/agent/change_policy)
+      create_plan.rs   — Inline create-plan modal (slug → description → tests)
+      answer_modal.rs  — `❓` answer modal + post-answer resume modal
+      plan_dependencies.rs — Plan-dependency sub-view (List + Picker modes)
+      plan_hooks.rs    — Plan-hook attachment sub-view
+      step_hooks.rs    — Step-hook attachment sub-view
+      step_tags.rs     — Step tag editor sub-view
 ```
+
+## TUI architecture
+
+The TUI is **multi-view** (plan list / archived list / plan detail /
+step detail) with sub-views pushed on top for plan dependencies, plan
+hooks, step hooks, and step tags. Each view is a self-contained `App`
+struct with pure state-machine methods, plus a separate render function
+and a per-view input handler — splitting these three lets us
+unit-test state transitions without spinning up a real terminal.
+
+The dispatchers live in `src/commands/run.rs` (`run_plan_list_tui`,
+`run_archived_list_tui`, `run_plan_detail_tui`, `run_step_detail_tui`,
+`run_plan_dependencies_tui`). They own the alternate-screen / raw-mode
+session, the crossterm event loop, and any DB/storage write-throughs.
+Sub-view state machines expose a pure `handle_key(KeyEvent) -> Outcome`
+method; the dispatcher executes the side effect and loops on `Pending`.
+
+Routing into the TUI is conditional: `ralph` (no subcommand) and
+`ralph run` with no non-default flags drop into the TUI. **Any
+non-default flag** (`--one`, `--all`, `--harness`, `--json`, …) keeps
+today's non-interactive behavior so scripts don't regress. The
+`--non-interactive` flag and a non-TTY stdout both force the
+non-interactive path.
+
+Runtime communication between the TUI and a TUI-spawned runner is
+NDJSON over the runner's stdout (same stream as `--json` / `--jsonl`).
+See [docs/ndjson-events.md](docs/ndjson-events.md) for the schema.
+
+The help overlay (`?`) toggles a centered modal listing the bindings of
+the current view, grouped by category. Per-view binding models live in
+`src/tui/help.rs`; each view's `App` carries a `HelpState` field whose
+`intercept_key` is consulted before the view's normal input handler so
+view bindings don't fire under the overlay.
 
 ## Key Design Decisions
 
