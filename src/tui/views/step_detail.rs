@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
+use crossterm::event::MouseEvent;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -700,6 +701,11 @@ impl StepDetailApp {
     pub fn palette_active(&self) -> bool {
         self.palette_bar.is_some()
     }
+
+    /// Mouse-event entry point routed from the dispatcher's event loop.
+    /// No-op by default — see [`super::plan_list::PlanListApp::handle_mouse`]
+    /// for the rationale. Per-view drag handling is added in later steps.
+    pub fn handle_mouse(&mut self, _event: MouseEvent) {}
 
     /// Update the read-only state. Called by the dispatcher after each
     /// `run_locks` poll. While `Locked`, the `c` editor handoff and the

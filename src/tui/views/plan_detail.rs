@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+use crossterm::event::MouseEvent;
 use ratatui::widgets::ListState;
 
 use crate::config::Config;
@@ -198,6 +199,11 @@ impl PlanDetailApp {
     pub fn palette_active(&self) -> bool {
         self.palette_bar.is_some()
     }
+
+    /// Mouse-event entry point routed from the dispatcher's event loop.
+    /// No-op by default — see [`super::plan_list::PlanListApp::handle_mouse`]
+    /// for the rationale. Per-view drag handling is added in later steps.
+    pub fn handle_mouse(&mut self, _event: MouseEvent) {}
 
     /// Replace the cached open-question list (after a DB poll). Drives the
     /// §17 banner + the `A` keybinding's target. Empty input clears the list,

@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::time::Instant;
 
+use crossterm::event::MouseEvent;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -88,6 +89,11 @@ impl ArchivedListApp {
     pub fn palette_active(&self) -> bool {
         self.palette_bar.is_some()
     }
+
+    /// Mouse-event entry point routed from the dispatcher's event loop.
+    /// No-op by default — see [`super::plan_list::PlanListApp::handle_mouse`]
+    /// for the rationale. Per-view drag handling is added in later steps.
+    pub fn handle_mouse(&mut self, _event: MouseEvent) {}
 
     // -- Navigation -------------------------------------------------------
 

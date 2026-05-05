@@ -132,6 +132,12 @@ Drawn on every screen.
 - **Top bar**: breadcrumb of the current view (e.g.
   `ralph › my-plan › step 3: "Add migration"`).
 
+> **Mouse capture & native selection.** The TUI enables mouse capture so views
+> can route `Event::Mouse` to per-view drag handlers; this suppresses the
+> terminal's native click-drag text selection. Most terminals let users hold
+> **Shift** while clicking/dragging to bypass program mouse capture and select
+> text natively (and use the system clipboard).
+
 ---
 
 ## 5. View 1 — Plan list (`ralph` with no args)

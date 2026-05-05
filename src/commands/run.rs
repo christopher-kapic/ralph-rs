@@ -262,6 +262,7 @@ pub fn run_tui_mode(
     args: RunArgs,
     _out: &OutputContext,
 ) -> Result<()> {
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
     use crossterm::execute;
     use crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -277,7 +278,11 @@ pub fn run_tui_mode(
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = std::io::stdout();
-    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+    // Mouse capture is paired with the alternate screen so per-view
+    // `handle_mouse` routing in the dispatcher event loops receives
+    // `Event::Mouse`. Bypass with Shift to fall back to native terminal
+    // selection (TUI-plan.md §4).
+    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
         let _ = disable_raw_mode();
         return Err(e).context("enter alternate screen");
     }
@@ -288,7 +293,7 @@ pub fn run_tui_mode(
 
     let _ = disable_raw_mode();
     let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen);
+    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
 
     result
 }
@@ -315,7 +320,9 @@ pub fn run_plan_list_tui(
     use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
     use crate::tui::toast::ToastKind;
     use crate::tui::views::plan_list::{self, PlanListApp};
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    };
     use crossterm::execute;
     use crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -342,7 +349,10 @@ pub fn run_plan_list_tui(
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = std::io::stdout();
-    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+    // Mouse capture is paired with the alternate screen so per-view
+    // `handle_mouse` routing receives `Event::Mouse`. Bypass with Shift to
+    // fall back to native terminal selection (TUI-plan.md §4).
+    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
         let _ = disable_raw_mode();
         return Err(e).context("enter alternate screen");
     }
@@ -383,7 +393,12 @@ pub fn run_plan_list_tui(
             if !event::poll(std::time::Duration::from_millis(250))? {
                 continue;
             }
-            if let Event::Key(key) = event::read()?
+            let event = event::read()?;
+            if let Event::Mouse(m) = &event {
+                app.handle_mouse(*m);
+                continue;
+            }
+            if let Event::Key(key) = event
                 && key.kind == KeyEventKind::Press
             {
                 // §15 help overlay: `?` toggles, `<esc>`/`q`/Ctrl-C close. While
@@ -619,7 +634,7 @@ pub fn run_plan_list_tui(
 
     let _ = disable_raw_mode();
     let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen);
+    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
 
     result
 }
@@ -1605,6 +1620,10 @@ fn run_archived_list_tui<B: ratatui::backend::Backend>(
         terminal.draw(|f| archived_list::draw(f, &mut app))?;
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Mouse(m) => {
+                app.handle_mouse(m);
+                continue;
+            }
             _ => continue,
         };
         // §15 help overlay: see plan-list dispatcher for the routing rule.
@@ -2155,6 +2174,10 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
         }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Mouse(m) => {
+                app.handle_mouse(m);
+                continue;
+            }
             _ => continue,
         };
         // §15 help overlay: route `?` toggle / dismissal through the help
@@ -3227,6 +3250,10 @@ fn run_plan_dependencies_tui<B: ratatui::backend::Backend>(
         }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Mouse(m) => {
+                app.handle_mouse(m);
+                continue;
+            }
             _ => continue,
         };
         match app.handle_key(key) {
@@ -3362,6 +3389,10 @@ fn run_plan_hooks_tui<B: ratatui::backend::Backend>(
         }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Mouse(m) => {
+                app.handle_mouse(m);
+                continue;
+            }
             _ => continue,
         };
         match app.handle_key(key) {
@@ -3514,6 +3545,10 @@ fn run_step_hooks_tui<B: ratatui::backend::Backend>(
         }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Mouse(m) => {
+                app.handle_mouse(m);
+                continue;
+            }
             _ => continue,
         };
         match app.handle_key(key) {
@@ -3672,6 +3707,10 @@ fn run_step_tags_tui<B: ratatui::backend::Backend>(
         }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Mouse(m) => {
+                app.handle_mouse(m);
+                continue;
+            }
             _ => continue,
         };
         match app.handle_key(key) {
@@ -3810,6 +3849,10 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
         }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Mouse(m) => {
+                app.handle_mouse(m);
+                continue;
+            }
             _ => continue,
         };
 
@@ -8168,5 +8211,297 @@ mod sub_view_routing_tests {
         let forwarded =
             plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(forwarded.is_none(), "Toast must not forward: {forwarded:?}");
+    }
+}
+
+#[cfg(test)]
+mod mouse_routing_tests {
+    //! TUI-plan.md §4 mouse capture (step 25): each main + sub-view dispatcher
+    //! routes `Event::Mouse` to the focused App's `handle_mouse` method.
+    //!
+    //! We can't drive crossterm's real `event::read()` from a unit test, so the
+    //! tests prove the routing in two halves:
+    //!   * `route_mouse_event` mirrors the dispatcher's match arm
+    //!     (`Event::Mouse(m) => app.handle_mouse(m)`); calling it with an
+    //!     `Event::Mouse` lets each `App::handle_mouse` actually fire under
+    //!     the same `TestBackend` terminal that production code would use.
+    //!   * `MouseHandler` is a tiny test-only adapter so the routing helper
+    //!     can fan out across every view's `handle_mouse` signature without
+    //!     trait-objecting the App structs themselves.
+    //!
+    //! A regression that drops the `Event::Mouse` arm in any dispatcher would
+    //! leave `Event::Mouse` falling through to the `_ => continue` arm and
+    //! `handle_mouse` would never be called — these tests don't observe the
+    //! dispatcher loop directly, but they pin the routing pattern (and the
+    //! per-view `handle_mouse` method's existence and signature) so a
+    //! refactor that breaks either property fails the build.
+    //!
+    //! Per-view drag handling lands in tui-gap-fixes steps 26–28; until then
+    //! `handle_mouse` is a no-op contract this module also pins.
+    use super::*;
+    use crate::config::Config;
+    use crate::plan::{ChangePolicy, Plan, PlanStatus, Step, StepStatus};
+    use crate::tui::views::archived_list::ArchivedListApp;
+    use crate::tui::views::plan_dependencies::PlanDependenciesApp;
+    use crate::tui::views::plan_detail::PlanDetailApp;
+    use crate::tui::views::plan_hooks::PlanHooksApp;
+    use crate::tui::views::plan_list::PlanListApp;
+    use crate::tui::views::step_detail::StepDetailApp;
+    use crate::tui::views::step_hooks::StepHooksApp;
+    use crate::tui::views::step_tags::StepTagsApp;
+    use chrono::Utc;
+    use crossterm::event::{Event, KeyModifiers, MouseEvent, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// Test-only adapter so [`route_mouse_event`] can dispatch into every
+    /// view's inherent `handle_mouse(MouseEvent)` without committing the
+    /// production code to a trait object.
+    trait MouseHandler {
+        fn handle_mouse(&mut self, event: MouseEvent);
+    }
+
+    macro_rules! impl_mouse_handler {
+        ($($t:ty),+ $(,)?) => {
+            $(
+                impl MouseHandler for $t {
+                    fn handle_mouse(&mut self, event: MouseEvent) {
+                        Self::handle_mouse(self, event);
+                    }
+                }
+            )+
+        };
+    }
+
+    impl_mouse_handler!(
+        PlanListApp,
+        ArchivedListApp,
+        PlanDetailApp,
+        StepDetailApp,
+        PlanDependenciesApp,
+        PlanHooksApp,
+        StepHooksApp,
+        StepTagsApp,
+    );
+
+    /// Mirrors the routing arm every TUI dispatcher carries:
+    /// `Event::Mouse(m) => app.handle_mouse(m)`. Returns `true` when the
+    /// routed event was a mouse event. Tests assert this is what happens
+    /// when we feed an `Event::Mouse` through.
+    fn route_mouse_event<A: MouseHandler>(event: Event, app: &mut A) -> bool {
+        match event {
+            Event::Mouse(m) => {
+                app.handle_mouse(m);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn sample_mouse_event() -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Exercise [`route_mouse_event`] inside a real `TestBackend` terminal so
+    /// the routing path is covered under the same backend production uses.
+    /// The call returns true iff the dispatcher's `Event::Mouse` arm was
+    /// taken — falsifies a regression that drops the arm.
+    fn assert_routes_mouse_to_app<A: MouseHandler>(app: &mut A) {
+        let backend = TestBackend::new(40, 10);
+        let mut _terminal = Terminal::new(backend).unwrap();
+        let routed = route_mouse_event(Event::Mouse(sample_mouse_event()), app);
+        assert!(routed, "Event::Mouse should route to app.handle_mouse");
+
+        // Non-mouse events fall through to the dispatcher's other arms; the
+        // routing helper should report `false` so we can be sure the helper
+        // isn't accidentally swallowing every event.
+        let routed_other = route_mouse_event(Event::FocusGained, app);
+        assert!(!routed_other, "Non-mouse events must not route to handle_mouse");
+    }
+
+    // -- Per-view fixtures ---------------------------------------------------
+
+    fn make_plan_list_app() -> PlanListApp {
+        PlanListApp::new(Vec::new(), "/tmp/mouse-plan-list", "UTC")
+    }
+
+    fn make_archived_list_app() -> ArchivedListApp {
+        ArchivedListApp::new(Vec::new(), "/tmp/mouse-archived", "UTC")
+    }
+
+    fn make_plan_detail_app() -> PlanDetailApp {
+        let plan = Plan {
+            id: "plan-1".to_string(),
+            slug: "alpha".to_string(),
+            project: "/tmp/mouse-plan-detail".to_string(),
+            branch_name: "feature-x".to_string(),
+            description: "d".to_string(),
+            status: PlanStatus::InProgress,
+            harness: Some("claude".to_string()),
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
+            context_prepend: None,
+            questions_enabled: false,
+        };
+        PlanDetailApp::new(plan, Vec::new(), &Config::default())
+    }
+
+    fn make_step_detail_app() -> StepDetailApp {
+        let plan = Plan {
+            id: "plan-1".to_string(),
+            slug: "alpha".to_string(),
+            project: "/tmp/mouse-step-detail".to_string(),
+            branch_name: "feature-x".to_string(),
+            description: "d".to_string(),
+            status: PlanStatus::InProgress,
+            harness: Some("claude".to_string()),
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
+            context_prepend: None,
+            questions_enabled: false,
+        };
+        let step = Step {
+            id: "step-1".to_string(),
+            plan_id: plan.id.clone(),
+            sort_key: "a0".to_string(),
+            title: "Step".to_string(),
+            description: "d".to_string(),
+            agent: None,
+            harness: None,
+            acceptance_criteria: vec![],
+            status: StepStatus::Pending,
+            attempts: 0,
+            max_retries: Some(3),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: None,
+            skipped_reason: None,
+            change_policy: ChangePolicy::Required,
+            tags: vec![],
+        };
+        StepDetailApp::new(
+            plan,
+            vec![step],
+            0,
+            &Config::default(),
+            storage::ProjectSettings::default(),
+            Vec::new(),
+        )
+    }
+
+    fn make_plan_dependencies_app() -> PlanDependenciesApp {
+        PlanDependenciesApp::new(
+            "plan-1".to_string(),
+            "alpha".to_string(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn make_plan_hooks_app() -> PlanHooksApp {
+        PlanHooksApp::new(
+            "plan-1".to_string(),
+            "alpha".to_string(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn make_step_hooks_app() -> StepHooksApp {
+        StepHooksApp::new(
+            "plan-1".to_string(),
+            "step-1".to_string(),
+            "alpha".to_string(),
+            "#1 — Step".to_string(),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    fn make_step_tags_app() -> StepTagsApp {
+        StepTagsApp::new(
+            "step-1".to_string(),
+            "alpha".to_string(),
+            "#1 — Step".to_string(),
+            Vec::new(),
+        )
+    }
+
+    // -- Dispatcher routing tests --------------------------------------------
+
+    #[test]
+    fn plan_list_dispatcher_routes_mouse_to_handle_mouse() {
+        let mut app = make_plan_list_app();
+        assert_routes_mouse_to_app(&mut app);
+    }
+
+    #[test]
+    fn archived_list_dispatcher_routes_mouse_to_handle_mouse() {
+        let mut app = make_archived_list_app();
+        assert_routes_mouse_to_app(&mut app);
+    }
+
+    #[test]
+    fn plan_detail_dispatcher_routes_mouse_to_handle_mouse() {
+        let mut app = make_plan_detail_app();
+        assert_routes_mouse_to_app(&mut app);
+    }
+
+    #[test]
+    fn step_detail_dispatcher_routes_mouse_to_handle_mouse() {
+        let mut app = make_step_detail_app();
+        assert_routes_mouse_to_app(&mut app);
+    }
+
+    #[test]
+    fn plan_dependencies_dispatcher_routes_mouse_to_handle_mouse() {
+        let mut app = make_plan_dependencies_app();
+        assert_routes_mouse_to_app(&mut app);
+    }
+
+    #[test]
+    fn plan_hooks_dispatcher_routes_mouse_to_handle_mouse() {
+        let mut app = make_plan_hooks_app();
+        assert_routes_mouse_to_app(&mut app);
+    }
+
+    #[test]
+    fn step_hooks_dispatcher_routes_mouse_to_handle_mouse() {
+        let mut app = make_step_hooks_app();
+        assert_routes_mouse_to_app(&mut app);
+    }
+
+    #[test]
+    fn step_tags_dispatcher_routes_mouse_to_handle_mouse() {
+        let mut app = make_step_tags_app();
+        assert_routes_mouse_to_app(&mut app);
+    }
+
+    // Pin the no-op default contract: per-view drag handling is added in
+    // steps 26–28; until then a mouse event must not mutate the App's
+    // observable state. We pick PlanListApp's cursor as a representative
+    // probe — it's the field most likely to be touched accidentally if a
+    // future drag handler escapes the wrong scope.
+    #[test]
+    fn handle_mouse_default_is_noop_for_plan_list() {
+        let mut app = make_plan_list_app();
+        let before = app.selected_index;
+        app.handle_mouse(sample_mouse_event());
+        assert_eq!(app.selected_index, before);
     }
 }

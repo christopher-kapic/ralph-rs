@@ -12,6 +12,7 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use crossterm::event::MouseEvent;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -194,6 +195,13 @@ impl PlanListApp {
     pub fn palette_active(&self) -> bool {
         self.palette_bar.is_some()
     }
+
+    /// Mouse-event entry point routed from the dispatcher's event loop. The
+    /// default implementation is a deliberate no-op — per-view drag/click
+    /// handling lands in later tui-gap-fixes steps; today the method exists
+    /// solely to absorb `Event::Mouse` so [`crossterm::event::EnableMouseCapture`]
+    /// in the dispatcher doesn't strand events on the floor.
+    pub fn handle_mouse(&mut self, _event: MouseEvent) {}
 
     /// Update the read-only state (called by the dispatcher each
     /// poll tick). Storing this on the App keeps draw + input handling

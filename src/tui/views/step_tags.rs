@@ -21,7 +21,7 @@
 // alternative termination, [`Outcome::DiscardAndPop`], skips the storage
 // write entirely and matches the user's `<esc>`-to-cancel mental model.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -108,6 +108,11 @@ impl StepTagsApp {
     pub fn push_toast(&mut self, msg: impl Into<String>, kind: ToastKind) {
         self.toasts.push(msg, kind, std::time::Instant::now());
     }
+
+    /// Mouse-event entry point routed from the dispatcher's event loop.
+    /// No-op by default — see [`super::plan_list::PlanListApp::handle_mouse`]
+    /// for the rationale. Per-view drag handling is added in later steps.
+    pub fn handle_mouse(&mut self, _event: MouseEvent) {}
 
     /// Pure key handler. Routes to the per-mode handler so tests can drive
     /// arbitrary key sequences without crossterm.
