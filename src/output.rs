@@ -27,8 +27,10 @@ pub enum ChunkStream {
 }
 
 /// Events emitted as NDJSON (one JSON object per line) when `--json` is active
-/// on `run` or `resume`.
-#[derive(Debug, Clone, Serialize)]
+/// on `run` or `resume`. The TUI subscribes to this stream when it spawns its
+/// own runner (see `tui::events`), so [`Deserialize`] is required alongside
+/// the producer-side [`Serialize`] derive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RunEvent {
     StepStarted {
@@ -99,7 +101,7 @@ pub enum RunEvent {
         steps_complete: usize,
         steps_total: usize,
         duration_secs: f64,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none", default)]
         cost_usd: Option<f64>,
         started_at: DateTime<Utc>,
         ended_at: DateTime<Utc>,
@@ -107,7 +109,7 @@ pub enum RunEvent {
 }
 
 /// Compact reference to a step for NDJSON payloads.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaleStep {
     pub step_id: String,
     pub step_num: usize,

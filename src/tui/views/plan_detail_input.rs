@@ -40,6 +40,14 @@ pub enum InputAction {
     OpenDependencies,
 }
 
+/// True when J/K should scroll the live-run tails (TUI-plan.md §13) instead
+/// of moving steps. Active whenever a subscription is wired AND the tails
+/// have buffered output — outside of a live run we keep the original
+/// step-move semantics so existing reorder-by-J/K muscle memory is intact.
+fn tails_take_priority(app: &PlanDetailApp) -> bool {
+    app.subscribed && app.has_tail_output()
+}
+
 /// Handle a key event and return the resulting action.
 pub fn handle_key(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
     match app.input_mode {
@@ -101,18 +109,28 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             }
         }
 
-        // Move down (Shift-J → 'J')
+        // Shift-J: scroll the right-pane tails one line newer when a live
+        // subscription is producing output (TUI-plan.md §13); otherwise
+        // fall through to the original step-reorder semantics.
         KeyCode::Char('J') => {
-            if let Some(id) = app.move_down_target() {
+            if tails_take_priority(app) {
+                app.scroll_tails_newer();
+                InputAction::None
+            } else if let Some(id) = app.move_down_target() {
                 InputAction::MoveDown(id)
             } else {
                 InputAction::None
             }
         }
 
-        // Move up (Shift-K → 'K')
+        // Shift-K: scroll the right-pane tails one line older when a live
+        // subscription is producing output (TUI-plan.md §13); otherwise
+        // fall through to the original step-reorder semantics.
         KeyCode::Char('K') => {
-            if let Some(id) = app.move_up_target() {
+            if tails_take_priority(app) {
+                app.scroll_tails_older();
+                InputAction::None
+            } else if let Some(id) = app.move_up_target() {
                 InputAction::MoveUp(id)
             } else {
                 InputAction::None
@@ -599,5 +617,55 @@ mod tests {
         handle_key(&mut app, key(KeyCode::Char('j')));
         assert_eq!(app.input_buffer, "j");
         assert_eq!(app.selected_index, 0);
+    }
+
+    // -- J/K dual semantics: scroll tails when subscription has output ---
+
+    #[test]
+    fn test_shift_j_scrolls_tails_when_subscription_has_output() {
+        let mut app = make_app(3);
+        app.attach_subscription();
+        for i in 0..5 {
+            app.push_harness_line(format!("h{i}"));
+        }
+        app.scroll_tails_older(); // anchor 1 back
+        let before = app.harness_tail_scroll;
+        let action = handle_key(&mut app, key(KeyCode::Char('J')));
+        assert_eq!(action, InputAction::None);
+        // J = newer = scroll decrements.
+        assert!(app.harness_tail_scroll < before);
+    }
+
+    #[test]
+    fn test_shift_k_scrolls_tails_when_subscription_has_output() {
+        let mut app = make_app(3);
+        app.attach_subscription();
+        for i in 0..5 {
+            app.push_harness_line(format!("h{i}"));
+        }
+        let before = app.harness_tail_scroll;
+        let action = handle_key(&mut app, key(KeyCode::Char('K')));
+        assert_eq!(action, InputAction::None);
+        // K = older = scroll increments.
+        assert!(app.harness_tail_scroll > before);
+    }
+
+    #[test]
+    fn test_shift_j_falls_through_to_move_step_when_no_subscription() {
+        let mut app = make_app(3);
+        // No subscription, no tails — preserve original step-move semantics.
+        app.selected_index = 0;
+        let action = handle_key(&mut app, key(KeyCode::Char('J')));
+        assert_eq!(action, InputAction::MoveDown("s0".to_string()));
+    }
+
+    #[test]
+    fn test_shift_j_falls_through_when_subscription_has_no_output_yet() {
+        let mut app = make_app(3);
+        // Subscription attached but no chunks delivered: J still moves the step.
+        app.attach_subscription();
+        app.selected_index = 0;
+        let action = handle_key(&mut app, key(KeyCode::Char('J')));
+        assert_eq!(action, InputAction::MoveDown("s0".to_string()));
     }
 }

@@ -851,6 +851,7 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     project: &str,
     slug: &str,
 ) -> Result<()> {
+    use crate::tui::events::{self as tui_events, RunSubscription};
     use crate::tui::views::plan_detail::PlanDetailApp;
     use crate::tui::views::plan_detail_input::{self, InputAction};
     use crate::tui::views::plan_detail_ui;
@@ -861,33 +862,49 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     let steps = storage::list_steps(conn, &plan.id)?;
     let mut app = PlanDetailApp::new(plan, steps, config);
 
-    let mut runner_child: Option<std::process::Child> = None;
+    let mut subscription: Option<RunSubscription> = None;
 
     loop {
-        // Refresh DB-backed state so the UI reflects runner progress between
-        // key presses. The live-run snapshot drives the banner; the step list
-        // mirrors status changes the runner subprocess is writing.
-        let live_snapshot = storage::get_live_run(conn, project)
-            .ok()
-            .flatten()
-            .filter(|l| l.plan_slug.as_deref() == Some(slug));
-        app.update_live_run(live_snapshot);
+        // -- Refresh state from the active source of truth ----------------
+        //
+        // TUI-plan.md §13 splits this in two:
+        //   - Subscription active (TUI spawned the runner): drain the
+        //     NDJSON stream and dispatch each event into the App. The DB
+        //     `run_locks` snapshot is intentionally skipped because the
+        //     stream gives us strictly fresher data and avoids the
+        //     250ms polling round-trip.
+        //   - No subscription (read-only attach landing in step 38): fall
+        //     back to polling `run_locks` so the banner still surfaces
+        //     externally-spawned runs.
+        if let Some(sub) = subscription.as_mut() {
+            for evt in sub.drain() {
+                tui_events::dispatch_event(&mut app, &evt);
+            }
+            // When the producer hangs up (subprocess exited and stdout
+            // closed), tear the subscription down so the next `R` press
+            // can spawn a fresh one. The App's run-live state is already
+            // cleared by `dispatch_event(PlanComplete | Summary)`; this
+            // also handles the no-events-but-disconnected case (e.g. the
+            // child failed to spawn).
+            if sub.is_disconnected() {
+                subscription = None;
+                app.detach_subscription();
+            }
+        } else {
+            let live_snapshot = storage::get_live_run(conn, project)
+                .ok()
+                .flatten()
+                .filter(|l| l.plan_slug.as_deref() == Some(slug));
+            app.update_live_run(live_snapshot);
+        }
         if let Ok(latest_steps) = storage::list_steps(conn, &app.plan.id) {
             app.sync_steps_from_db(latest_steps);
         }
 
-        // Reap a finished runner subprocess so its pid doesn't linger as a
-        // zombie. We don't surface the exit status here — the run lock
-        // disappearance is the user-visible signal that the run is done.
-        if let Some(c) = runner_child.as_mut()
-            && let Ok(Some(_status)) = c.try_wait()
-        {
-            runner_child = None;
-        }
-
         terminal.draw(|f| plan_detail_ui::draw(f, &mut app))?;
 
-        // Poll with a short timeout so the live timer + DB poll keep ticking
+        // Poll with a short timeout so the live timer keeps ticking and
+        // any newly-arrived NDJSON chunks are drained on the next iteration
         // even when the user isn't pressing keys. 250ms balances UI
         // smoothness against polling cost.
         if !event::poll(std::time::Duration::from_millis(250))? {
@@ -919,7 +936,13 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
                 plan_detail_apply_move(conn, &mut app, &step_id, MoveDir::Down)?;
             }
             InputAction::Run => {
-                plan_detail_apply_run(conn, &mut app, project, slug, &mut runner_child)?;
+                plan_detail_apply_run_streaming(
+                    conn,
+                    &mut app,
+                    project,
+                    slug,
+                    &mut subscription,
+                )?;
             }
             InputAction::Stop => {
                 plan_detail_apply_stop(conn, &mut app, project, slug)?;
@@ -929,12 +952,10 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
             }
         }
         if app.should_pop {
-            // The spawned runner is its own process; popping the view
-            // doesn't kill it. Reap it iff it has already exited so we
-            // don't leave a zombie behind on the way out.
-            if let Some(c) = runner_child.as_mut() {
-                let _ = c.try_wait();
-            }
+            // Dropping the subscription tears down its tokio runtime and
+            // (via `kill_on_drop`) terminates the runner subprocess.
+            // Step 38 (read-only attach) will detach instead of kill.
+            drop(subscription);
             return Ok(());
         }
     }
@@ -1048,11 +1069,18 @@ pub(crate) fn plan_detail_apply_skip(
 /// Persist an `R` run / resume action: spawn `ralph run --non-interactive
 /// <slug>` as a child process so the TUI can keep polling the DB while the
 /// runner advances the plan. Stdio is redirected to /dev/null so the
-/// subprocess output doesn't conflict with the TUI's raw-mode display —
-/// step 36 of tui-v1 swaps this out for an NDJSON pipe.
+/// subprocess output doesn't conflict with the TUI's raw-mode display.
+///
+/// Superseded by [`plan_detail_apply_run_streaming`] (TUI-plan.md §13) for
+/// the live plan-detail event loop, which forks via
+/// [`tui::events::spawn_streaming_runner`] and consumes the NDJSON event
+/// stream directly. Kept here because callers that don't need the right-pane
+/// tails — currently none in production but referenced from tests — can
+/// still spawn a fire-and-forget runner.
 ///
 /// No-op (info toast) if a run is already live for this plan, matching the
 /// acceptance criteria in TUI-plan.md §7.
+#[allow(dead_code)]
 pub(crate) fn plan_detail_apply_run(
     conn: &Connection,
     app: &mut crate::tui::views::plan_detail::PlanDetailApp,
@@ -1100,6 +1128,78 @@ pub(crate) fn plan_detail_apply_run(
     match cmd.spawn() {
         Ok(child) => {
             *runner_child = Some(child);
+            app.toasts.push(
+                format!("Started run for {slug}"),
+                ToastKind::Success,
+                Instant::now(),
+            );
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to start run: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// NDJSON-streaming variant of [`plan_detail_apply_run`] (TUI-plan.md §13).
+/// Forks `ralph run --json --non-interactive <slug>` via
+/// [`tui::events::spawn_streaming_runner`] and stashes the resulting
+/// [`RunSubscription`] on the dispatcher's stack so the next poll iteration
+/// can drain its events into the right-pane state.
+///
+/// On spawn failure the subscription stays `None` and the user gets a
+/// toast — same UX as the legacy [`plan_detail_apply_run`].
+pub(crate) fn plan_detail_apply_run_streaming(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    project: &str,
+    slug: &str,
+    subscription: &mut Option<crate::tui::events::RunSubscription>,
+) -> Result<()> {
+    use crate::tui::events::spawn_streaming_runner;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    if subscription.is_some() {
+        app.toasts.push(
+            "Run already live for this plan.",
+            ToastKind::Info,
+            Instant::now(),
+        );
+        return Ok(());
+    }
+    let already_live = storage::get_live_run(conn, project)?
+        .map(|l| l.plan_slug.as_deref() == Some(slug))
+        .unwrap_or(false);
+    if already_live {
+        app.toasts.push(
+            "Run already live for this plan.",
+            ToastKind::Info,
+            Instant::now(),
+        );
+        return Ok(());
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            app.toasts.push(
+                format!("Cannot locate ralph binary: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return Ok(());
+        }
+    };
+
+    match spawn_streaming_runner(exe, project.into(), slug.to_string(), false) {
+        Ok(sub) => {
+            *subscription = Some(sub);
+            app.attach_subscription();
             app.toasts.push(
                 format!("Started run for {slug}"),
                 ToastKind::Success,

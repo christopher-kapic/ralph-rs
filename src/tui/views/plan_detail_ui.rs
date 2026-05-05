@@ -14,8 +14,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use super::plan_detail::{AddPosition, InputMode, PlanDetailApp};
-use crate::plan::StepStatus;
+use crate::plan::{Phase, StepStatus};
 use crate::tui::chrome::{self, Chrome};
+use crate::tui::events::TAIL_VISIBLE_LINES;
 use crate::tui::theme;
 
 /// Render the entire plan-detail view.
@@ -156,21 +157,19 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
     let step = &app.steps[app.selected_index];
     let mut lines: Vec<Line> = Vec::new();
 
-    // Live-run banner (TUI-plan.md §7): when a runner is bound to this plan,
-    // surface "Running step N (phase) MM:SS" so the user sees progress
-    // regardless of which step the cursor is on. Phase is rendered as a
-    // simple string for now — proper phase visuals land with NDJSON
-    // streaming in step 36.
+    // Live-run banner (TUI-plan.md §7 / §13): when a runner is bound to
+    // this plan, surface "Running step N (phase) MM:SS" so the user sees
+    // progress regardless of which step the cursor is on. Phase prefers the
+    // NDJSON stream's `phase_changed` event over the DB-poll snapshot —
+    // see `PlanDetailApp::current_phase`.
     if app.is_run_live() {
         let step_label = match app.live_step_num() {
             Some(n) => format!("▶ Running step {n}"),
             None => "▶ Running...".to_string(),
         };
         let phase_label = app
-            .live_run
-            .as_ref()
-            .and_then(|l| l.phase.as_ref())
-            .map(|p| format!(" ({})", p.as_str()))
+            .current_phase()
+            .map(|p| format!(" ({})", phase_human_label(p)))
             .unwrap_or_default();
         let elapsed = app.elapsed_secs();
         let mins = (elapsed as u64) / 60;
@@ -189,6 +188,40 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
             ),
         ]));
         lines.push(Line::from(""));
+
+        // Tails — only render when the subscription has produced at least
+        // one chunk. Otherwise the panes would just say "(no output yet)"
+        // for the entire pre-harness phase, which is noise.
+        if !app.harness_tail.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Harness output",
+                Style::default()
+                    .fg(theme::CHROME_DIM)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for tail_line in app.visible_harness_tail(TAIL_VISIBLE_LINES) {
+                lines.push(Line::from(Span::styled(
+                    tail_line,
+                    Style::default().fg(theme::CHROME_DIM),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+        if !app.test_tail.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Test output",
+                Style::default()
+                    .fg(theme::CHROME_DIM)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for tail_line in app.visible_test_tail(TAIL_VISIBLE_LINES) {
+                lines.push(Line::from(Span::styled(
+                    tail_line,
+                    Style::default().fg(theme::CHROME_DIM),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
     }
 
     // Title
@@ -323,6 +356,28 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+// ---------------------------------------------------------------------------
+// Phase rendering
+// ---------------------------------------------------------------------------
+
+/// Map a [`Phase`] enum value to the user-facing label rendered in the
+/// right-pane banner. Mirrors the `Phase::as_str` snake_case identifier
+/// but spaces it out and capitalizes the first word so the banner reads
+/// as "Running step 3 (Pre-step hook)" rather than "(pre_step_hook)".
+fn phase_human_label(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Idle => "idle",
+        Phase::PreStepHook => "pre-step hook",
+        Phase::Harness => "harness",
+        Phase::PreTestHook => "pre-test hook",
+        Phase::Tests => "tests",
+        Phase::PostTestHook => "post-test hook",
+        Phase::Commit => "commit",
+        Phase::Rollback => "rollback",
+        Phase::PostStepHook => "post-step hook",
+    }
 }
 
 #[cfg(test)]

@@ -5,14 +5,16 @@
 // independent of rendering and input handling so that it can be unit-tested
 // without a terminal.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use ratatui::widgets::ListState;
 
 use crate::config::Config;
 use crate::frac_index::{self, FracIndexError};
-use crate::plan::{Plan, Step, StepStatus};
+use crate::plan::{Phase, Plan, Step, StepStatus};
 use crate::run_lock::LiveRun;
+use crate::tui::events::{TAIL_BUFFER_LINES, TAIL_VISIBLE_LINES};
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
 
@@ -90,6 +92,39 @@ pub struct PlanDetailApp {
     /// renderer reads `step_num` and `phase` to draw the "Running step N"
     /// banner per TUI-plan.md §7.
     pub live_run: Option<LiveRun>,
+
+    /// True iff the dispatcher has wired a [`crate::tui::events::RunSubscription`]
+    /// to this view (TUI-plan.md §13). Drives [`Self::is_run_live`] when no
+    /// `live_run` row has been observed yet — the subscription begins emitting
+    /// events the moment the child is spawned, so the TUI must render the
+    /// running-state right pane without waiting for the DB row to land.
+    pub subscribed: bool,
+
+    /// Step number of the most recent `step_started` event (1-based). Drives
+    /// the right-pane "Running step N" banner when the subscription is the
+    /// active source of truth (per §13, DB poll is dropped for TUI-spawned
+    /// runs). Cleared on `step_finished` / `plan_complete` / `summary`.
+    pub subscribed_step_num: Option<i32>,
+
+    /// Most recent `phase_changed` event. Same role as [`LiveRun::phase`] but
+    /// sourced from the NDJSON stream rather than a DB poll.
+    pub current_phase: Option<Phase>,
+
+    /// Rolling tail of harness stdout/stderr lines (oldest at front, newest
+    /// at back). Capped at [`TAIL_BUFFER_LINES`].
+    pub harness_tail: VecDeque<String>,
+
+    /// Rolling tail of deterministic-test stdout/stderr lines, same shape as
+    /// `harness_tail`.
+    pub test_tail: VecDeque<String>,
+
+    /// How many lines (counting from the newest) the user has scrolled back
+    /// in the harness tail via `K`. 0 means "follow the newest line"; values
+    /// > 0 freeze the view at an older window. `J` decrements toward 0.
+    pub harness_tail_scroll: usize,
+
+    /// Scroll offset for the test tail. Same semantics as `harness_tail_scroll`.
+    pub test_tail_scroll: usize,
 }
 
 impl PlanDetailApp {
@@ -110,6 +145,13 @@ impl PlanDetailApp {
             selection: Selection::new(),
             toasts: ToastQueue::new(),
             live_run: None,
+            subscribed: false,
+            subscribed_step_num: None,
+            current_phase: None,
+            harness_tail: VecDeque::new(),
+            test_tail: VecDeque::new(),
+            harness_tail_scroll: 0,
+            test_tail_scroll: 0,
         }
     }
 
@@ -445,14 +487,157 @@ impl PlanDetailApp {
     }
 
     /// 1-based step number reported by the live runner, or `None` when no
-    /// run is active for this plan. Used by the right-pane banner.
+    /// run is active for this plan. Used by the right-pane banner. Prefers
+    /// the NDJSON-derived `subscribed_step_num` over the DB-derived
+    /// `live_run.step_num` so the right pane reflects the freshest event
+    /// when both sources are populated (TUI-plan.md §13).
     pub fn live_step_num(&self) -> Option<i32> {
-        self.live_run.as_ref().and_then(|l| l.step_num)
+        self.subscribed_step_num
+            .or_else(|| self.live_run.as_ref().and_then(|l| l.step_num))
     }
 
-    /// True iff a runner is currently bound to this plan.
+    /// True iff a runner is currently bound to this plan — either via an
+    /// active TUI-spawned subscription (TUI-plan.md §13) or via a DB-poll
+    /// snapshot of `run_locks` (read-only attach, §13.2).
     pub fn is_run_live(&self) -> bool {
-        self.live_run.is_some()
+        self.subscribed || self.live_run.is_some()
+    }
+
+    // -- NDJSON-stream driven state (TUI-plan.md §13) ---------------------
+
+    /// Mark this view as bound to a TUI-spawned [`crate::tui::events::RunSubscription`].
+    /// Resets the per-run state (phase, tails, step number) so a fresh run
+    /// doesn't inherit stale chunks from a prior subscription.
+    pub fn attach_subscription(&mut self) {
+        self.subscribed = true;
+        self.subscribed_step_num = None;
+        self.current_phase = None;
+        self.harness_tail.clear();
+        self.test_tail.clear();
+        self.harness_tail_scroll = 0;
+        self.test_tail_scroll = 0;
+        self.start_step_timer();
+    }
+
+    /// Release a previously-attached subscription. Called by the dispatcher
+    /// when the channel disconnects (subprocess exited) or the user pops
+    /// the view.
+    pub fn detach_subscription(&mut self) {
+        self.subscribed = false;
+        self.subscribed_step_num = None;
+        self.current_phase = None;
+        self.stop_step_timer();
+    }
+
+    /// Push a harness-output line onto the tail, evicting from the front
+    /// when the buffer exceeds [`TAIL_BUFFER_LINES`]. Bumps `harness_tail_scroll`
+    /// so the view stays anchored at whatever the user scrolled to (i.e. the
+    /// addition doesn't yank the visible window forward).
+    pub fn push_harness_line(&mut self, line: String) {
+        push_into_tail(
+            &mut self.harness_tail,
+            line,
+            &mut self.harness_tail_scroll,
+        );
+    }
+
+    /// Push a deterministic-test-output line onto the test tail. Mirrors
+    /// [`Self::push_harness_line`].
+    pub fn push_test_line(&mut self, line: String) {
+        push_into_tail(&mut self.test_tail, line, &mut self.test_tail_scroll);
+    }
+
+    /// Update the cached current phase (NDJSON `phase_changed` event).
+    pub fn set_current_phase(&mut self, phase: Phase) {
+        self.current_phase = Some(phase);
+    }
+
+    /// Record that a `step_started` event just arrived: bring the run-live
+    /// state online if the subscription's first event preceded the DB-side
+    /// row, latch the step number, and reset the elapsed timer for the
+    /// freshly-started step.
+    pub fn note_step_started(&mut self, step_id: &str) {
+        self.subscribed = true;
+        self.start_step_timer();
+        self.subscribed_step_num = self
+            .steps
+            .iter()
+            .position(|s| s.id == step_id)
+            .map(|i| (i + 1) as i32);
+    }
+
+    /// Record that a `step_finished` event arrived. The timer keeps running
+    /// because the next step typically starts within milliseconds; if no
+    /// further `step_started` lands, [`Self::note_run_finished`] (driven by
+    /// `plan_complete` / `summary`) clears it.
+    pub fn note_step_finished(&mut self, _step_id: &str) {
+        // Intentionally minimal: the rolling timer is reset on the next
+        // `step_started`, and we don't want to flicker the right pane to a
+        // "no run" state between consecutive step_started events.
+    }
+
+    /// Record that the run as a whole completed (`plan_complete` or
+    /// `summary` event). Detaches the subscription state so the right pane
+    /// returns to the static idle layout.
+    pub fn note_run_finished(&mut self) {
+        self.detach_subscription();
+    }
+
+    /// Current phase as observed via the NDJSON stream (`phase_changed`),
+    /// falling back to the DB-poll snapshot when the subscription hasn't
+    /// emitted one yet.
+    pub fn current_phase(&self) -> Option<Phase> {
+        self.current_phase
+            .or_else(|| self.live_run.as_ref().and_then(|l| l.phase))
+    }
+
+    /// Read-only view of the harness tail (oldest first). Used by tests
+    /// and by the renderer to compute the visible window.
+    pub fn harness_tail_lines(&self) -> Vec<String> {
+        self.harness_tail.iter().cloned().collect()
+    }
+
+    /// Read-only view of the test tail (oldest first).
+    pub fn test_tail_lines(&self) -> Vec<String> {
+        self.test_tail.iter().cloned().collect()
+    }
+
+    /// Compute the visible slice of the harness tail given the right-pane
+    /// height in lines. Honors `harness_tail_scroll` so the user can pause
+    /// the auto-scroll and inspect older output. Returns oldest-first.
+    pub fn visible_harness_tail(&self, visible: usize) -> Vec<String> {
+        visible_window(&self.harness_tail, visible, self.harness_tail_scroll)
+    }
+
+    /// Compute the visible slice of the test tail. Same semantics as
+    /// [`Self::visible_harness_tail`].
+    pub fn visible_test_tail(&self, visible: usize) -> Vec<String> {
+        visible_window(&self.test_tail, visible, self.test_tail_scroll)
+    }
+
+    /// Scroll the tails one line **older** (J/K maps "older" to one of
+    /// `J`/`K` depending on the user's mental model — see `plan_detail_input`).
+    /// Bumps both tails together so the user only has to remember one shortcut.
+    pub fn scroll_tails_older(&mut self) {
+        self.harness_tail_scroll = (self.harness_tail_scroll + 1)
+            .min(self.harness_tail.len().saturating_sub(1));
+        self.test_tail_scroll =
+            (self.test_tail_scroll + 1).min(self.test_tail.len().saturating_sub(1));
+    }
+
+    /// Scroll the tails one line **newer**. Saturates at 0 so we don't
+    /// underflow.
+    pub fn scroll_tails_newer(&mut self) {
+        self.harness_tail_scroll = self.harness_tail_scroll.saturating_sub(1);
+        self.test_tail_scroll = self.test_tail_scroll.saturating_sub(1);
+    }
+
+    /// True when at least one of the tails has buffered any output. The
+    /// J/K input handler consults this to decide between "scroll tails"
+    /// and "move step" semantics: with no chunks at all, the user is
+    /// clearly trying to reorder steps, not scroll an empty pane.
+    pub fn has_tail_output(&self) -> bool {
+        !self.harness_tail.is_empty() || !self.test_tail.is_empty()
     }
 
     // -- Timer ------------------------------------------------------------
@@ -488,6 +673,57 @@ impl PlanDetailApp {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tail-buffer helpers
+// ---------------------------------------------------------------------------
+
+/// Append `line` to `tail`, evicting from the front when the buffer would
+/// exceed [`TAIL_BUFFER_LINES`]. If the user has scrolled back (`*scroll > 0`)
+/// the offset is bumped so the visible window stays anchored at the same
+/// line — otherwise an arriving chunk would yank the view forward.
+fn push_into_tail(tail: &mut VecDeque<String>, line: String, scroll: &mut usize) {
+    tail.push_back(line);
+    while tail.len() > TAIL_BUFFER_LINES {
+        tail.pop_front();
+        // The buffer shrunk by one from the front; if the user is parked
+        // mid-buffer we need to consume the same one from `scroll` to keep
+        // the visible window pinned.
+        if *scroll > 0 {
+            *scroll -= 1;
+        }
+    }
+    if *scroll > 0 {
+        // New chunk pushed in at the back; preserve the anchor by bumping
+        // the offset so the same older window stays visible.
+        let max_scroll = tail.len().saturating_sub(1);
+        if *scroll < max_scroll {
+            *scroll += 1;
+        }
+    }
+}
+
+/// Return the visible slice of a tail buffer (oldest-first), honoring the
+/// scroll offset. With `scroll = 0` the slice ends at the newest line; with
+/// `scroll = N` the slice ends N lines earlier. `visible` caps the slice
+/// length; the `TAIL_VISIBLE_LINES` default is wired in by callers.
+fn visible_window(tail: &VecDeque<String>, visible: usize, scroll: usize) -> Vec<String> {
+    if tail.is_empty() || visible == 0 {
+        return Vec::new();
+    }
+    let take = visible.min(tail.len());
+    let scroll = scroll.min(tail.len().saturating_sub(1));
+    let end = tail.len() - scroll;
+    let start = end.saturating_sub(take);
+    tail.iter().skip(start).take(end - start).cloned().collect()
+}
+
+#[allow(dead_code)]
+const _: () = {
+    // Sanity check: we expect the visible window default to be smaller than
+    // the buffered total so users can scroll beyond the on-screen tail.
+    assert!(TAIL_VISIBLE_LINES <= TAIL_BUFFER_LINES);
+};
 
 #[cfg(test)]
 mod tests {
@@ -1334,5 +1570,154 @@ mod tests {
             "timer should restart when in-progress step changes"
         );
         assert_eq!(app.live_step_num(), Some(3));
+    }
+
+    // -- NDJSON-stream-driven state (TUI-plan.md §13) ---------------------
+
+    #[test]
+    fn test_attach_subscription_marks_run_live_and_starts_timer() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        assert!(!app.is_run_live());
+        assert!(app.step_start_time.is_none());
+        app.attach_subscription();
+        assert!(app.is_run_live());
+        assert!(app.step_start_time.is_some());
+        assert_eq!(app.current_phase(), None);
+        assert!(app.harness_tail.is_empty());
+        assert!(app.test_tail.is_empty());
+    }
+
+    #[test]
+    fn test_attach_subscription_resets_prior_tails_and_phase() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.subscribed = true;
+        app.harness_tail.push_back("stale stdout".into());
+        app.test_tail.push_back("stale tests".into());
+        app.set_current_phase(crate::plan::Phase::Tests);
+        app.harness_tail_scroll = 5;
+
+        app.attach_subscription();
+        assert!(app.harness_tail.is_empty());
+        assert!(app.test_tail.is_empty());
+        assert_eq!(app.harness_tail_scroll, 0);
+        assert_eq!(app.test_tail_scroll, 0);
+        assert_eq!(app.current_phase, None);
+    }
+
+    #[test]
+    fn test_detach_subscription_clears_run_live_state() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.attach_subscription();
+        app.note_step_started("s1");
+        app.set_current_phase(crate::plan::Phase::Harness);
+        assert!(app.is_run_live());
+        app.detach_subscription();
+        assert!(!app.is_run_live());
+        assert!(app.step_start_time.is_none());
+        assert_eq!(app.current_phase, None);
+        assert_eq!(app.subscribed_step_num, None);
+    }
+
+    #[test]
+    fn test_push_harness_line_caps_at_buffer_lines() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        for i in 0..(super::TAIL_BUFFER_LINES + 50) {
+            app.push_harness_line(format!("line {i}"));
+        }
+        assert_eq!(app.harness_tail.len(), super::TAIL_BUFFER_LINES);
+        let oldest = app.harness_tail.front().unwrap();
+        // Oldest 50 lines were evicted.
+        assert_eq!(oldest, "line 50");
+    }
+
+    #[test]
+    fn test_visible_harness_tail_returns_newest_window() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        for i in 0..30 {
+            app.push_harness_line(format!("line {i}"));
+        }
+        let visible = app.visible_harness_tail(5);
+        assert_eq!(
+            visible,
+            vec![
+                "line 25".to_string(),
+                "line 26".to_string(),
+                "line 27".to_string(),
+                "line 28".to_string(),
+                "line 29".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_scroll_tails_older_then_newer_round_trip() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        for i in 0..10 {
+            app.push_harness_line(format!("h{i}"));
+            app.push_test_line(format!("t{i}"));
+        }
+        // Scroll older: window shifts back by 1 line.
+        app.scroll_tails_older();
+        let visible = app.visible_harness_tail(3);
+        assert_eq!(visible.last().map(String::as_str), Some("h8"));
+        // Scrolling newer brings us back to the newest line.
+        app.scroll_tails_newer();
+        let visible = app.visible_harness_tail(3);
+        assert_eq!(visible.last().map(String::as_str), Some("h9"));
+    }
+
+    #[test]
+    fn test_scroll_tails_anchored_when_new_chunk_arrives() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        for i in 0..5 {
+            app.push_harness_line(format!("h{i}"));
+        }
+        app.scroll_tails_older();
+        app.scroll_tails_older();
+        // Anchored 2 lines back from the newest.
+        let before = app.visible_harness_tail(3);
+        assert_eq!(before.last().map(String::as_str), Some("h2"));
+
+        app.push_harness_line("h5".into());
+        // The anchor should still point to "h2" — the new chunk did not
+        // yank the visible window forward.
+        let after = app.visible_harness_tail(3);
+        assert_eq!(after.last().map(String::as_str), Some("h2"));
+    }
+
+    #[test]
+    fn test_note_step_started_latches_step_num_from_step_list() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.note_step_started("s1");
+        // s1 is the second step → 1-based num = 2.
+        assert_eq!(app.subscribed_step_num, Some(2));
+        assert_eq!(app.live_step_num(), Some(2));
+    }
+
+    #[test]
+    fn test_note_step_started_unknown_id_clears_step_num() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.subscribed_step_num = Some(7);
+        app.note_step_started("does-not-exist");
+        assert_eq!(app.subscribed_step_num, None);
+    }
+
+    #[test]
+    fn test_current_phase_prefers_subscription_over_db_snapshot() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.update_live_run(Some(make_live_run("test-plan", Some("s1"), Some(2))));
+        assert_eq!(app.current_phase(), Some(crate::plan::Phase::Harness));
+        // A subscription-derived phase wins.
+        app.set_current_phase(crate::plan::Phase::Tests);
+        assert_eq!(app.current_phase(), Some(crate::plan::Phase::Tests));
+    }
+
+    #[test]
+    fn test_has_tail_output_false_until_first_chunk() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        app.attach_subscription();
+        assert!(!app.has_tail_output());
+        app.push_harness_line("first".into());
+        assert!(app.has_tail_output());
     }
 }
