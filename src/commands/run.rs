@@ -1925,6 +1925,169 @@ fn load_plan_hooks_view_state(
 }
 
 // ---------------------------------------------------------------------------
+// Step-hooks dispatcher (TUI-plan.md §1)
+// ---------------------------------------------------------------------------
+
+/// Run the step-hooks event loop until the user pops back. Mirrors
+/// [`run_plan_hooks_tui`] but for per-step attachments: reuses the parent
+/// terminal and raw-mode session, owns the crossterm event loop, and
+/// performs the storage write-throughs requested by the [`StepHooksApp`]
+/// state machine.
+///
+/// Help-overlay routing happens inside [`StepHooksApp::handle_key`] (step
+/// 14), so a stuck `?` overlay can always be dismissed with `?`/`<esc>`/
+/// `q`/Ctrl-C without reaching the per-mode handlers. `<esc>`/`q`/Ctrl-C
+/// in `Mode::List` pop back to step-detail.
+fn run_step_hooks_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    project: &str,
+    step_id: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::step_hooks::{Mode, Outcome, StepHooksApp, render};
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let step = storage::get_step(conn, step_id)?;
+    let plan_id = step.plan_id.clone();
+    let plan_slug = storage::get_plan_slug_by_id(conn, &plan_id)?.unwrap_or_default();
+    let steps = storage::list_steps(conn, &plan_id)?;
+    let step_num = steps
+        .iter()
+        .position(|s| s.id == step_id)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let step_label = format!("#{step_num} — {}", step.title);
+
+    let (attachments, candidates) =
+        load_step_hooks_view_state(conn, project, &plan_id, step_id)?;
+    let mut app = StepHooksApp::new(
+        plan_id.clone(),
+        step_id.to_string(),
+        plan_slug,
+        step_label,
+        attachments,
+        candidates,
+    );
+
+    loop {
+        terminal.draw(|f| render(f, f.area(), &mut app))?;
+
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+        match app.handle_key(key) {
+            Outcome::Pending => {}
+            Outcome::Pop => return Ok(()),
+            Outcome::AddRequested {
+                lifecycle,
+                hook_name,
+            } => {
+                if let Err(e) = storage::attach_hook_to_step(
+                    conn,
+                    &plan_id,
+                    step_id,
+                    lifecycle.as_str(),
+                    &hook_name,
+                ) {
+                    app.push_toast(format!("Failed to attach hook: {e}"), ToastKind::Error);
+                    continue;
+                }
+                let (attachments, candidates) =
+                    load_step_hooks_view_state(conn, project, &plan_id, step_id)?;
+                app.refresh(attachments, candidates);
+                // Drop back to the list so the user sees the new row.
+                app.mode = Mode::List;
+                app.push_toast(
+                    format!("Hook '{hook_name}' attached at {lifecycle}."),
+                    ToastKind::Success,
+                );
+            }
+            Outcome::RemoveRequested {
+                lifecycle,
+                hook_name,
+            } => {
+                match storage::detach_hook(
+                    conn,
+                    &plan_id,
+                    Some(step_id),
+                    lifecycle.as_str(),
+                    &hook_name,
+                ) {
+                    Ok(0) => {
+                        app.push_toast(
+                            format!("No per-step hook '{hook_name}' at {lifecycle}."),
+                            ToastKind::Info,
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        app.push_toast(
+                            format!("Failed to detach hook: {e}"),
+                            ToastKind::Error,
+                        );
+                        continue;
+                    }
+                }
+                let (attachments, candidates) =
+                    load_step_hooks_view_state(conn, project, &plan_id, step_id)?;
+                app.refresh(attachments, candidates);
+                app.push_toast(
+                    format!("Hook '{hook_name}' detached from {lifecycle}."),
+                    ToastKind::Success,
+                );
+            }
+        }
+    }
+}
+
+/// Read the per-step hook attachments and the in-scope hook-library
+/// candidates for `(plan_id, step_id)`. Plan-wide rows (`step_id IS NULL`)
+/// are excluded — those are managed by the plan-hooks sub-view.
+fn load_step_hooks_view_state(
+    conn: &Connection,
+    project: &str,
+    plan_id: &str,
+    step_id: &str,
+) -> Result<(
+    Vec<crate::tui::views::step_hooks::StepHookRef>,
+    Vec<crate::tui::views::step_hooks::HookCandidate>,
+)> {
+    use crate::hook_library::{self, Lifecycle};
+    use crate::tui::views::step_hooks::{HookCandidate, StepHookRef};
+
+    let rows = storage::list_all_hooks_for_plan(conn, plan_id)?;
+    let mut attachments: Vec<StepHookRef> = Vec::new();
+    for row in rows {
+        if row.step_id.as_deref() != Some(step_id) {
+            continue;
+        }
+        let lifecycle = Lifecycle::parse(&row.lifecycle)?;
+        attachments.push(StepHookRef {
+            lifecycle,
+            hook_name: row.hook_name,
+        });
+    }
+
+    let project_dir = std::path::PathBuf::from(project);
+    let all = hook_library::load_all().unwrap_or_default();
+    let candidates: Vec<HookCandidate> = hook_library::filter_by_project(all, &project_dir)
+        .into_iter()
+        .map(|h| HookCandidate {
+            name: h.name,
+            description: h.description,
+        })
+        .collect();
+
+    Ok((attachments, candidates))
+}
+
+// ---------------------------------------------------------------------------
 // Step-detail dispatcher (TUI-plan.md §8 + §17)
 // ---------------------------------------------------------------------------
 
@@ -2152,6 +2315,15 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             KeyCode::Char('c') if app.can_edit_panes() => {
                 let dir = crate::config::config_dir()?;
                 step_detail_handle_c(&mut app, conn, config, &dir, edit_in_editor)?;
+            }
+            // Open the step-hooks sub-view (TUI-plan.md §1). Suppressed
+            // during read-only attach so an external runner's lock isn't
+            // bypassed by mutating per-step hook attachments.
+            KeyCode::Char('H') if app.can_edit_panes() => {
+                if let Some(step) = app.current_step() {
+                    let step_id = step.id.clone();
+                    run_step_hooks_tui(terminal, conn, project, &step_id)?;
+                }
             }
             KeyCode::Esc => {
                 step_detail_handle_esc(&mut app);
