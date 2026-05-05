@@ -1836,6 +1836,7 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
     target_step_id: &str,
 ) -> Result<()> {
     use crate::tui::editor::edit_in_editor;
+    use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
     use crate::tui::toast::ToastKind;
     use crate::tui::views::answer_modal::ResumeModalAction;
     use crate::tui::views::step_detail::{self, Pane, StepDetailApp};
@@ -1868,7 +1869,26 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
     app.focused_pane = Pane::OpenQuestions;
     refresh_step_detail_questions(conn, project, &mut app)?;
 
+    // §13.2 read-only attach: any `run_locks` row owned by an unrelated pid
+    // means an external runner is driving the plan; suppress edits until it
+    // releases. The tracker owns the poll cadence; observations are fed in
+    // each tick via [`step_detail_observe_read_only`].
+    let my_pid = std::process::id() as i64;
+    let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
+
     loop {
+        // §13.2 poll. Cadence is owned by the tracker (see read_only::POLL_INTERVAL).
+        let now = Instant::now();
+        if tracker.should_poll(now)
+            && let Ok(observed) = read_only::detect(conn, project, my_pid, None)
+        {
+            let transition = step_detail_observe_read_only(&mut tracker, &mut app, observed, now);
+            if transition == Transition::Released {
+                app.toasts
+                    .push(read_only::RELEASED_TOAST, ToastKind::Success, now);
+            }
+        }
+
         terminal.draw(|f| step_detail::draw(f, &mut app))?;
 
         if !event::poll(std::time::Duration::from_millis(250))? {
@@ -1891,7 +1911,13 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
                     PickerOutcome::Pending => {}
                     PickerOutcome::Cancelled => app.close_picker(),
                     PickerOutcome::Submit { kind, value } => {
-                        if let Err(e) = app.apply_picker_submit(conn, kind, &value) {
+                        // §13.2: if lockdown engaged after the picker was
+                        // opened, drop the submission rather than mutate the
+                        // DB. Picker is closed unconditionally so the user
+                        // returns to the underlying view.
+                        if app.can_edit_panes()
+                            && let Err(e) = app.apply_picker_submit(conn, kind, &value)
+                        {
                             app.toasts.push(
                                 format!("Failed to apply: {e}"),
                                 ToastKind::Error,
@@ -1958,7 +1984,9 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             // Pane navigation (j/k outside the questions pane).
             KeyCode::Char('j') | KeyCode::Down => app.focus_down(),
             KeyCode::Char('k') | KeyCode::Up => app.focus_up(),
-            KeyCode::Char('a') if app.focused_pane == Pane::OpenQuestions => {
+            KeyCode::Char('a')
+                if app.focused_pane == Pane::OpenQuestions && app.can_edit_panes() =>
+            {
                 let opened = app.open_answer_modal();
                 if !opened && !app.has_open_questions_for_step() {
                     app.toasts.push(
@@ -1977,11 +2005,13 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.request_pop();
             }
-            KeyCode::Char('c') if app.focused_pane == Pane::BottomRow => {
+            KeyCode::Char('c')
+                if app.focused_pane == Pane::BottomRow && app.can_edit_panes() =>
+            {
                 let agents = list_agent_names();
                 app.open_picker_for_focused_cell(&agents);
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') if app.can_edit_panes() => {
                 let dir = crate::config::config_dir()?;
                 step_detail_handle_c(&mut app, conn, config, &dir, edit_in_editor)?;
             }
@@ -1994,6 +2024,33 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             return Ok(());
         }
     }
+}
+
+/// Feed a fresh [`read_only::ReadOnly`] observation into the tracker, push
+/// the resulting state into the app, and return the [`Transition`] so the
+/// caller can decide whether to toast `RELEASED_TOAST`.
+///
+/// Extracted so dispatcher-level tests can drive the §13.2 lockdown wiring
+/// without spinning up a real terminal: the test inserts a `run_locks` row
+/// owned by an external pid, calls [`read_only::detect`], then feeds the
+/// observation through this helper and asserts that the app's edit gates
+/// flip.
+pub(crate) fn step_detail_observe_read_only(
+    tracker: &mut crate::tui::read_only::ReadOnlyTracker,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    observed: crate::tui::read_only::ReadOnly,
+    now: std::time::Instant,
+) -> crate::tui::read_only::Transition {
+    let transition = tracker.observe(observed, now);
+    app.set_read_only(tracker.state());
+    // Picker submissions are gated by `can_edit_panes()`, but if a picker
+    // was open when the lock engaged the user would still see it on screen
+    // until they pressed Esc. Closing it here mirrors the dispatcher's
+    // intent that edit affordances become inert while locked.
+    if !app.can_edit_panes() && app.picker.is_some() {
+        app.close_picker();
+    }
+    transition
 }
 
 /// Bare `c` on the step-detail view (TUI-plan.md §8 "Editing — `c`"):
@@ -4975,5 +5032,121 @@ mod step_detail_dispatcher_tests {
             step_detail_handle_c(&mut app, &conn, &Config::default(), dir.path(), editor).unwrap();
             assert!(app.toasts.is_empty(), "no toast on read-only pane {pane:?}");
         }
+    }
+
+    // -- §13.2 read-only attach (external run lock) ---------------------
+
+    /// Drive the dispatcher's `step_detail_observe_read_only` helper end to
+    /// end: insert a `run_locks` row owned by a foreign pid, run one
+    /// detect-then-observe cycle, and assert that every gate the dispatcher
+    /// consults flips closed; then release the lock and assert that edits
+    /// come back online with a `Released` transition.
+    #[test]
+    fn external_run_lock_engages_lockdown_and_blocks_edits() {
+        use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
+        use rusqlite::params;
+
+        let conn = crate::db::open_memory().unwrap();
+        let project = "/proj-step-detail-lock";
+        let external_pid: i64 = 0x7FFF_FFFE; // bogus, definitely not us
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![project, external_pid, "p1", "feat"],
+        )
+        .unwrap();
+
+        let mut app = db_app(&conn, project);
+        let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
+        let my_pid = std::process::id() as i64;
+        let now = Instant::now();
+
+        // First poll cycle: external lock → Engaged.
+        let observed = read_only::detect(&conn, project, my_pid, None).unwrap();
+        let transition = step_detail_observe_read_only(&mut tracker, &mut app, observed, now);
+        assert_eq!(transition, Transition::Engaged);
+        assert_eq!(app.read_only, ReadOnly::Locked { pid: external_pid });
+        assert!(
+            !app.can_edit_panes(),
+            "edits must be suppressed while an external runner holds the lock"
+        );
+
+        // Edit gates the dispatcher consults:
+        // - `a` on OpenQuestions: open_answer_modal must refuse to open even
+        //   when the focused step has questions.
+        app.focused_pane = Pane::OpenQuestions;
+        app.set_open_questions_for_step(vec![storage::OpenQuestion {
+            id: "q1".into(),
+            step_id: app.steps[0].id.clone(),
+            plan_id: app.plan.id.clone(),
+            plan_slug: app.plan.slug.clone(),
+            step_num: 1,
+            step_title: app.steps[0].title.clone(),
+            attempt: 1,
+            question: "Q?".into(),
+            suggestions: vec!["yes".into(), "no".into()],
+            asked_at: "2026-05-05T00:00:00Z".into(),
+        }]);
+        assert!(!app.open_answer_modal());
+        assert!(app.answer_modal.is_none());
+
+        // - `c` on BottomRow: the dispatcher's guard (`app.can_edit_panes()`)
+        //   must prevent the picker from opening. We simulate that gate
+        //   here.
+        app.focused_pane = Pane::BottomRow;
+        if app.can_edit_panes() {
+            app.open_picker_for_focused_cell(&[]);
+        }
+        assert!(app.picker.is_none(), "picker must not open while locked");
+
+        // - bare `c` on a text pane: same gate. step_detail_handle_c is
+        //   never called by the dispatcher when can_edit_panes() is false,
+        //   so no editor side effect is expected.
+        app.focused_pane = Pane::StepPrompt;
+        assert!(!app.can_edit_panes());
+
+        // Now release the lock and run another poll cycle: Locked → Editable.
+        conn.execute(
+            "DELETE FROM run_locks WHERE project = ?1",
+            params![project],
+        )
+        .unwrap();
+        let later = now + read_only::POLL_INTERVAL;
+        let observed = read_only::detect(&conn, project, my_pid, None).unwrap();
+        let transition = step_detail_observe_read_only(&mut tracker, &mut app, observed, later);
+        assert_eq!(transition, Transition::Released);
+        assert_eq!(app.read_only, ReadOnly::Editable);
+        assert!(app.can_edit_panes());
+    }
+
+    /// If a picker is open when lockdown engages, the helper should close it
+    /// so the user doesn't see a stale edit affordance over the read-only
+    /// banner.
+    #[test]
+    fn open_picker_is_closed_when_lockdown_engages() {
+        use crate::tui::read_only::{ReadOnly, ReadOnlyTracker};
+
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = db_app(&conn, "/proj-picker-lock");
+        app.focused_pane = Pane::BottomRow;
+        app.open_picker_for_focused_cell(&[]);
+        assert!(
+            app.picker.is_some(),
+            "test setup: picker should be open before lockdown engages"
+        );
+
+        let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
+        let now = Instant::now();
+        step_detail_observe_read_only(
+            &mut tracker,
+            &mut app,
+            ReadOnly::Locked { pid: 4242 },
+            now,
+        );
+
+        assert!(
+            app.picker.is_none(),
+            "an open picker must be torn down when an external lock engages"
+        );
     }
 }
