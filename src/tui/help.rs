@@ -342,6 +342,106 @@ pub fn for_plan_dependencies() -> HelpModel {
     )
 }
 
+/// Help model for the plan-hooks sub-view (TUI-plan.md §1, step 34).
+pub fn for_plan_hooks() -> HelpModel {
+    HelpModel::new(
+        "Help — Plan hooks",
+        vec![
+            Group::new(
+                "Navigation",
+                vec![
+                    ("j / ↓", "Next row"),
+                    ("k / ↑", "Previous row"),
+                    ("g / Home", "Jump to top"),
+                    ("G / End", "Jump to bottom"),
+                ],
+            ),
+            Group::new(
+                "Edit",
+                vec![
+                    ("a", "Open picker to attach a hook"),
+                    ("d", "Detach highlighted hook"),
+                    ("enter", "(picker) Choose lifecycle / attach hook"),
+                ],
+            ),
+            Group::new(
+                "Other",
+                vec![
+                    ("?", "Toggle this help"),
+                    ("q / <esc> / h / ← / Ctrl-C", "Back to plan detail"),
+                ],
+            ),
+        ],
+    )
+}
+
+/// Help model for the step-hooks sub-view (TUI-plan.md §1, step 35).
+pub fn for_step_hooks() -> HelpModel {
+    HelpModel::new(
+        "Help — Step hooks",
+        vec![
+            Group::new(
+                "Navigation",
+                vec![
+                    ("j / ↓", "Next row"),
+                    ("k / ↑", "Previous row"),
+                    ("g / Home", "Jump to top"),
+                    ("G / End", "Jump to bottom"),
+                ],
+            ),
+            Group::new(
+                "Edit",
+                vec![
+                    ("a", "Open picker to attach a hook"),
+                    ("d", "Detach highlighted hook"),
+                    ("enter", "(picker) Choose lifecycle / attach hook"),
+                ],
+            ),
+            Group::new(
+                "Other",
+                vec![
+                    ("?", "Toggle this help"),
+                    ("q / <esc> / h / ← / Ctrl-C", "Back to step detail"),
+                ],
+            ),
+        ],
+    )
+}
+
+/// Help model for the step-tags sub-view (TUI-plan.md §1, step 36).
+pub fn for_step_tags() -> HelpModel {
+    HelpModel::new(
+        "Help — Step tags",
+        vec![
+            Group::new(
+                "Navigation",
+                vec![
+                    ("j / ↓", "Next tag"),
+                    ("k / ↑", "Previous tag"),
+                    ("g / Home", "Jump to top"),
+                    ("G / End", "Jump to bottom"),
+                ],
+            ),
+            Group::new(
+                "Edit",
+                vec![
+                    ("i", "Open input modal to add a tag"),
+                    ("d", "Remove highlighted tag"),
+                ],
+            ),
+            Group::new(
+                "Save / cancel",
+                vec![
+                    ("enter / q", "Save and close"),
+                    ("<esc>", "Discard changes and close"),
+                    ("Ctrl-C", "Discard changes and close"),
+                ],
+            ),
+            Group::new("Other", vec![("?", "Toggle this help")]),
+        ],
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -634,6 +734,9 @@ mod tests {
             for_plan_detail(),
             for_step_detail(),
             for_plan_dependencies(),
+            for_plan_hooks(),
+            for_step_hooks(),
+            for_step_tags(),
         ] {
             let has_q = m
                 .groups

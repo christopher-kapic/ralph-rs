@@ -27,6 +27,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 
 use crate::hook_library::Lifecycle;
+use crate::tui::help::{self, HelpState};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
 
@@ -121,6 +122,10 @@ pub struct PlanHooksApp {
     pub mode: Mode,
     /// Toast queue rendered over the bottom hint row.
     pub toasts: ToastQueue,
+    /// Help-overlay state. `?` toggles visibility; while visible the
+    /// dispatcher routes input through [`HelpState::intercept_key`] before
+    /// passing keys to the per-mode handler (TUI-plan.md §15).
+    pub help: HelpState,
 }
 
 impl PlanHooksApp {
@@ -144,6 +149,7 @@ impl PlanHooksApp {
             hook_cursor: 0,
             mode: Mode::List,
             toasts: ToastQueue::new(),
+            help: HelpState::new(),
         }
     }
 
@@ -185,6 +191,12 @@ impl PlanHooksApp {
     /// Pure key handler. Routes to the per-mode handler so tests can drive
     /// arbitrary key sequences without crossterm.
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+        // §15 help overlay: route `?` toggle / dismissal first. While the
+        // overlay is up the sub-view's per-mode handlers are skipped.
+        if self.help.intercept_key(key) != help::InterceptResult::Passthrough {
+            return Outcome::Pending;
+        }
+
         // Ctrl-C always pops the sub-view, mirroring the plan-detail view.
         if let KeyCode::Char('c') = key.code
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -489,6 +501,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut PlanHooksApp) {
         Mode::List => {}
         Mode::LifecyclePicker => render_lifecycle_picker(frame, area, app),
         Mode::HookPicker { lifecycle } => render_hook_picker(frame, area, app, lifecycle),
+    }
+
+    // -- Help overlay -----------------------------------------------------
+    if app.help.is_visible() {
+        help::render(frame, area, &help::for_plan_hooks());
     }
 }
 
