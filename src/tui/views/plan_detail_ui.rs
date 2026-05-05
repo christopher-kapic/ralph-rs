@@ -40,10 +40,18 @@ pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
         },
     );
 
-    // Main content: step list (left) + step detail (right).
+    // Main content: step list (left) + step detail (right). The split is
+    // driven by `app.split_pct` so a mouse drag on the divider can resize
+    // both panes (TUI-plan.md, step 26). `last_body_width` is captured
+    // here so `handle_mouse` can convert the cursor's column into a percent.
+    app.last_body_width = body.width;
+    let split_pct = app.split_pct;
     let main = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([
+            Constraint::Percentage(split_pct),
+            Constraint::Percentage(100 - split_pct),
+        ])
         .split(body);
 
     draw_step_list(frame, app, main[0]);

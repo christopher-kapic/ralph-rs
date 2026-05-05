@@ -150,6 +150,22 @@ pub struct PlanDetailApp {
     /// [`PaletteBarState::on_key`] before any view bindings fire. `/` and
     /// `:` open it.
     pub palette_bar: Option<PaletteBarState>,
+
+    /// Horizontal split between the step list (left) and detail pane
+    /// (right) as a percent of the body width given to the left pane.
+    /// Default 40, clamped to 20..=80 by the mouse-drag handler so neither
+    /// pane can collapse. Session-only — never persisted to the DB.
+    pub split_pct: u16,
+
+    /// Body width recorded during the most recent `draw()`. Used by
+    /// [`Self::handle_mouse`] to convert the cursor's absolute column into
+    /// a percent of the body's horizontal extent. Zero before the first
+    /// frame; mouse handling no-ops while it's zero.
+    pub last_body_width: u16,
+
+    /// True while a left-mouse drag started on the divider column is
+    /// active. Cleared on `MouseEventKind::Up(Left)`.
+    pub dragging_split: bool,
 }
 
 impl PlanDetailApp {
@@ -181,6 +197,9 @@ impl PlanDetailApp {
             open_questions: Vec::new(),
             help: HelpState::new(),
             palette_bar: None,
+            split_pct: 40,
+            last_body_width: 0,
+            dragging_split: false,
         }
     }
 
@@ -201,9 +220,37 @@ impl PlanDetailApp {
     }
 
     /// Mouse-event entry point routed from the dispatcher's event loop.
-    /// No-op by default — see [`super::plan_list::PlanListApp::handle_mouse`]
-    /// for the rationale. Per-view drag handling is added in later steps.
-    pub fn handle_mouse(&mut self, _event: MouseEvent) {}
+    /// Implements draggable resize of the horizontal split between the step
+    /// list and the right pane: a left-button press within ±1 column of the
+    /// current divider arms a drag, subsequent drags recompute `split_pct`
+    /// from `cursor_column / last_body_width` (clamped 20..=80), and
+    /// release clears the drag flag.
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        if self.last_body_width == 0 {
+            return;
+        }
+        let body_width = self.last_body_width as u32;
+        let divider_col = (body_width * self.split_pct as u32 / 100) as i32;
+
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let col = event.column as i32;
+                if (col - divider_col).abs() <= 1 {
+                    self.dragging_split = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_split => {
+                let pct = (event.column as u32 * 100) / body_width.max(1);
+                self.split_pct = pct.clamp(20, 80) as u16;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging_split = false;
+            }
+            _ => {}
+        }
+    }
 
     /// Replace the cached open-question list (after a DB poll). Drives the
     /// §17 banner + the `A` keybinding's target. Empty input clears the list,
@@ -1876,5 +1923,113 @@ mod tests {
             crate::tui::palette::parse(&input),
             Ok(PaletteCommand::StepSkip(Some(3)))
         );
+    }
+
+    // -- Mouse-drag split (step 26) ---------------------------------------
+
+    /// Construct a [`MouseEvent`] at `(column, row)` with the given kind.
+    /// Helper for the divider-drag tests below — the modifiers field is
+    /// always empty since the drag bindings ignore them.
+    fn mouse_event(
+        column: u16,
+        row: u16,
+        kind: crossterm::event::MouseEventKind,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn split_drag_updates_split_pct() {
+        // Down on the divider, drag right by ~10 columns, release.
+        // Body width 100 with default split_pct 40 puts the divider at
+        // column 40; dragging the cursor to column 60 should land at 60%.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.last_body_width = 100;
+
+        assert_eq!(app.split_pct, 40);
+        assert!(!app.dragging_split);
+
+        app.handle_mouse(mouse_event(40, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(
+            app.dragging_split,
+            "Down at the divider column should arm the drag"
+        );
+
+        app.handle_mouse(mouse_event(60, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 60, "drag to col 60 / 100 → 60%");
+
+        app.handle_mouse(mouse_event(60, 5, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_split, "Up should clear the drag flag");
+    }
+
+    #[test]
+    fn split_drag_press_off_divider_does_not_arm() {
+        // ±1 column tolerance: pressing far from the divider should not
+        // arm a drag, so subsequent drag events leave split_pct alone.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.last_body_width = 100;
+
+        // Divider is at column 40; press at column 10.
+        app.handle_mouse(mouse_event(10, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(!app.dragging_split);
+
+        app.handle_mouse(mouse_event(70, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 40, "drag without arming should not resize");
+    }
+
+    #[test]
+    fn split_drag_clamps_to_20_and_80() {
+        // Past column 0 still yields 20%; past column 80% still yields 80%.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.last_body_width = 100;
+
+        app.handle_mouse(mouse_event(40, 5, MouseEventKind::Down(MouseButton::Left)));
+        // Drag to column 0 (and slightly past via underflow-safe path).
+        app.handle_mouse(mouse_event(0, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 20, "left clamp at 20%");
+
+        // Drag far right; with body_width 100, column 95 maps to 95%, but
+        // the clamp pins the percent at 80.
+        app.handle_mouse(mouse_event(95, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 80, "right clamp at 80%");
+
+        app.handle_mouse(mouse_event(95, 5, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_split);
+    }
+
+    #[test]
+    fn keyboard_navigation_works_during_drag() {
+        // j/k must continue to function regardless of dragging_split — the
+        // drag flag only affects which mouse-drag events update the split.
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(5), &Config::default());
+        app.dragging_split = true;
+
+        assert_eq!(app.selected_index, 0);
+        app.navigate_down();
+        assert_eq!(app.selected_index, 1);
+        app.navigate_down();
+        assert_eq!(app.selected_index, 2);
+        app.navigate_up();
+        assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn handle_mouse_no_op_before_first_draw() {
+        // Before the first frame `last_body_width` is zero; mouse events
+        // must not panic and must not arm a drag (divider would be at 0).
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        assert_eq!(app.last_body_width, 0);
+
+        app.handle_mouse(mouse_event(0, 0, MouseEventKind::Down(MouseButton::Left)));
+        assert!(!app.dragging_split);
     }
 }
