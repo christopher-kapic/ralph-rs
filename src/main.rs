@@ -30,13 +30,12 @@ use clap::Parser;
 
 use crate::cli::{
     AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
-    PlanHarnessCommand, PlanPrependCommand, PromptCommand, StepCommand,
+    PlanHarnessCommand, PlanPrependCommand, PromptCommand, QuestionCommand, QuestionsState,
+    StepCommand,
 };
 
-use crate::commands::resolve_project;
+use crate::commands::{resolve_plan, resolve_project};
 use crate::output::OutputContext;
-use crate::plan::Plan;
-use crate::runner::RunOptions;
 
 /// Read the body for `ralph plan prepend set` from exactly one of the three
 /// accepted input sources. Clap's `conflicts_with_all` guarantees at most
@@ -65,28 +64,6 @@ fn resolve_prepend_input(
     }
 }
 
-/// Resolve a plan from an optional slug: if provided, look it up; otherwise
-/// find the active plan for the project. `include_complete` controls whether
-/// completed plans count as "active" (useful for status/log).
-fn resolve_plan(
-    conn: &rusqlite::Connection,
-    slug: Option<String>,
-    project: &str,
-    include_complete: bool,
-) -> Result<Plan> {
-    match slug {
-        Some(s) if s.is_empty() => {
-            anyhow::bail!(
-                "Plan slug cannot be empty. Specify a non-empty slug or omit the argument to use the active plan."
-            )
-        }
-        Some(s) => storage::get_plan_by_slug(conn, &s, project)?
-            .with_context(|| format!("Plan not found: {s}")),
-        None => storage::find_active_plan(conn, project, include_complete)?
-            .context("No active plan found. Specify a plan slug as a positional argument."),
-    }
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -94,7 +71,7 @@ fn main() -> Result<()> {
     // write config.json before cmd_init runs — otherwise its "does the config
     // already exist?" check would always be true on a fresh install, silently
     // skipping the interactive harness prompt.
-    let config = if matches!(&cli.command, Command::Init { .. }) {
+    let config = if matches!(&cli.command, Some(Command::Init { .. })) {
         config::Config::default()
     } else {
         config::load_or_create_config()?
@@ -109,7 +86,25 @@ fn main() -> Result<()> {
     // Build output context from global CLI flags.
     let out = OutputContext::from_cli(cli.json, cli.quiet, cli.no_color);
 
-    match cli.command {
+    // Bare `ralph` (no subcommand) routes to the TUI plan-list view when
+    // stdout is a TTY and the user hasn't asked for non-interactive output.
+    // Anything else (piped stdout, --json, --non-interactive) prints clap
+    // help so scripts and ` ralph | cat` still get something useful.
+    let command = match cli.command {
+        Some(c) => c,
+        None => {
+            let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+            if stdout_is_tty && !cli.json && !cli.non_interactive {
+                return commands::run_plan_list_tui(&conn, &config, &project, &out);
+            }
+            use clap::CommandFactory;
+            let _ = Cli::command().print_help();
+            println!();
+            return Ok(());
+        }
+    };
+
+    match command {
         // -- Init --
         Command::Init {
             non_interactive,
@@ -232,6 +227,10 @@ fn main() -> Result<()> {
                     std::process::exit(exit_code);
                 }
             },
+            PlanCommand::Questions { state, slug } => {
+                let enabled = matches!(state, QuestionsState::On);
+                commands::cmd_plan_questions(&conn, &slug, &project, enabled, &out)
+            }
             PlanCommand::Prepend(prepend_cmd) => match prepend_cmd {
                 PlanPrependCommand::Set {
                     plan,
@@ -440,160 +439,36 @@ fn main() -> Result<()> {
             force,
             verbose,
         } => {
-            let workdir = std::path::Path::new(&project);
-            // Precedence: `ralph run --harness X` beats `ralph --harness Y run`,
-            // which in turn falls back to the plan's own harness and then the
-            // config default. The per-subcommand flag is the most specific,
-            // so it wins.
-            let harness_override = run_harness.or(cli.harness);
-
-            // `auto_stash` is default-on. `--no-auto-stash` forces it off
-            // for a single run; `config.auto_stash = false` sets a per-user
-            // default of "don't stash". The CLI flag always wins when set.
-            let auto_stash = if no_auto_stash {
-                false
-            } else {
-                config.auto_stash
-            };
-            let options = RunOptions {
-                all_plans: all,
+            let args = commands::RunArgs {
+                plan_slug,
                 one,
+                all,
                 from,
                 to,
-                current_branch,
-                auto_stash,
-                harness_override,
                 dry_run,
+                skip_preflight,
+                current_branch,
+                no_auto_stash,
+                run_harness,
+                force,
                 verbose,
+                cli_harness: cli.harness,
+                non_interactive: cli.non_interactive,
+                json: cli.json,
             };
 
-            if all {
-                if from.is_some() || to.is_some() {
-                    anyhow::bail!(
-                        "--from/--to cannot be combined with --all (step numbers are per-plan and not comparable across plans)"
-                    );
-                }
-                if plan_slug.is_some() {
-                    eprintln!("Warning: plan slug argument is ignored when --all is set.");
-                }
-
-                // Acquire the per-project run lock so two concurrent `ralph run`
-                // invocations can't clobber each other. Dry runs skip the lock
-                // since they don't mutate state.
-                let _run_lock = if !dry_run {
-                    Some(run_lock::acquire(&conn, &project, None, None, force)?)
-                } else {
-                    None
-                };
-
-                // Preflight every runnable plan before starting the chain so we
-                // fail fast if anything is misconfigured.
-                if !skip_preflight && !dry_run {
-                    let runnable: Vec<_> = storage::list_plans(&conn, &project, false)?
-                        .into_iter()
-                        .filter(|p| {
-                            matches!(
-                                p.status,
-                                plan::PlanStatus::Ready
-                                    | plan::PlanStatus::InProgress
-                                    | plan::PlanStatus::Failed
-                            )
-                        })
-                        .collect();
-
-                    let mut any_errors = false;
-                    for p in &runnable {
-                        eprintln!("Running preflight checks for '{}'...", p.slug);
-                        let results = preflight::run_preflight_checks(p, &config, workdir)?;
-                        results.print_report(&out);
-                        if !results.is_ok() {
-                            any_errors = true;
-                        }
-                    }
-                    if any_errors {
-                        anyhow::bail!(
-                            "Preflight checks failed for one or more plans. Use --skip-preflight to bypass."
-                        );
-                    }
-                }
-
-                let rt = tokio::runtime::Runtime::new()?;
-                let results = rt.block_on(async {
-                    let abort_rx = signal::install_and_spawn();
-                    runner::run_all_plans(
-                        &conn, &project, &config, workdir, &options, abort_rx, &out,
-                    )
-                    .await
-                })?;
-
-                let total = results.len();
-                let mut succeeded = 0usize;
-                let mut failed = 0usize;
-                for r in &results {
-                    eprintln!(
-                        "  - {}: {} ({}/{} steps succeeded)",
-                        r.plan_slug, r.final_status, r.steps_succeeded, r.steps_executed
-                    );
-                    if r.final_status == plan::PlanStatus::Complete {
-                        succeeded += 1;
-                    } else {
-                        failed += 1;
-                    }
-                }
-                eprintln!(
-                    "Ran {} plan(s): {} succeeded, {} failed",
-                    total, succeeded, failed
-                );
-                return Ok(());
-            }
-
-            // Single-plan run path.
-            let plan = resolve_plan(&conn, plan_slug, &project, false)?;
-            let slug = plan.slug.clone();
-
-            // Acquire the per-project run lock before doing any mutating work.
-            // Dry runs skip the lock.
-            let _run_lock = if !dry_run {
-                Some(run_lock::acquire(
-                    &conn,
-                    &project,
-                    Some(&plan.slug),
-                    Some(&plan.id),
-                    force,
-                )?)
+            // TUI-plan.md §2 routing: bare `ralph run` / `ralph run <slug>`
+            // from a TTY drops into TUI mode. Every other invocation (any
+            // non-default flag, `--non-interactive`, or non-TTY stdout) takes
+            // today's runner path unchanged so scripts see no regression.
+            // The TUI-mode dispatcher is a placeholder today — step 22 of the
+            // tui-v1 plan wires it to the real plan-detail view.
+            let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+            if commands::is_default_run_invocation(&args, stdout_is_tty) {
+                commands::run_tui_mode(&conn, &config, &project, args, &out)
             } else {
-                None
-            };
-
-            // Preflight checks
-            if !skip_preflight && !dry_run {
-                eprintln!("Running preflight checks...");
-                let preflight_results = preflight::run_preflight_checks(&plan, &config, workdir)?;
-                preflight_results.print_report(&out);
-
-                if !preflight_results.is_ok() {
-                    anyhow::bail!("Preflight checks failed. Use --skip-preflight to bypass.");
-                }
+                commands::dispatch_run(&conn, &config, &project, args, &out)
             }
-
-            let rt = tokio::runtime::Runtime::new()?;
-            let result = rt.block_on(async {
-                let abort_rx = signal::install_and_spawn();
-                runner::run_plan(&conn, &plan, &config, workdir, &options, abort_rx, &out).await
-            })?;
-
-            if result.steps_failed > 0 {
-                eprintln!(
-                    "Plan '{}' failed: {}/{} steps succeeded",
-                    slug, result.steps_succeeded, result.steps_executed
-                );
-            } else {
-                eprintln!(
-                    "Plan '{}' complete: {}/{} steps succeeded",
-                    slug, result.steps_succeeded, result.steps_executed
-                );
-            }
-            Ok(())
         }
 
         // -- Resume --
@@ -715,6 +590,63 @@ fn main() -> Result<()> {
                 &out,
             )
         }
+
+        // -- Question --
+        Command::Question(subcmd) => match subcmd {
+            QuestionCommand::Ask { question, suggest } => {
+                use crate::commands::question::{
+                    DISABLED_MESSAGE, NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome,
+                    record_question_ask,
+                };
+                use std::io::Read;
+
+                // Spec: positional arg if present, else stdin. Trim trailing
+                // whitespace (heredoc invocations always include a final
+                // newline) but leave embedded whitespace alone.
+                let q = match question {
+                    Some(t) => t,
+                    None => {
+                        let mut buf = String::new();
+                        std::io::stdin()
+                            .read_to_string(&mut buf)
+                            .context("Failed to read question text from stdin")?;
+                        buf.trim_end().to_string()
+                    }
+                };
+
+                match record_question_ask(&conn, &project, &q, &suggest)? {
+                    QuestionAskOutcome::NoActiveRun => {
+                        eprintln!("{NO_ACTIVE_RUN_MESSAGE}");
+                        std::process::exit(1);
+                    }
+                    QuestionAskOutcome::Disabled => {
+                        eprintln!("{DISABLED_MESSAGE}");
+                        std::process::exit(1);
+                    }
+                    QuestionAskOutcome::Recorded { .. } => Ok(()),
+                }
+            }
+            QuestionCommand::List { plan } => {
+                commands::question::cmd_question_list(&conn, &project, plan.as_deref(), &out)
+            }
+            QuestionCommand::Answer { num, text } => {
+                use std::io::Read;
+                let answer = match text {
+                    Some(t) => t,
+                    None => {
+                        let mut buf = String::new();
+                        std::io::stdin()
+                            .read_to_string(&mut buf)
+                            .context("Failed to read answer text from stdin")?;
+                        buf.trim_end().to_string()
+                    }
+                };
+                commands::question::cmd_question_answer(&conn, &project, num, &answer, &out)
+            }
+            QuestionCommand::Show { num } => {
+                commands::question::cmd_question_show(&conn, &project, num, &out)
+            }
+        },
 
         // -- Agents --
         Command::Agents(subcmd) => match subcmd {

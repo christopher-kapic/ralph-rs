@@ -6,6 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -269,6 +271,13 @@ async fn run_plan_inner(
     let mut known_step_ids: HashSet<String> = initial_steps.iter().map(|s| s.id.clone()).collect();
     let mut executed_step_ids: HashSet<String> = HashSet::new();
 
+    // Monotonic per-run counter for `HarnessChunk` / `TestChunk` event
+    // `seq` fields. Created once here so the same `Arc<AtomicU64>` is
+    // threaded through every `execute_step` call — `seq` stays unique
+    // across step boundaries within a single `ralph run`. Per
+    // TUI-plan §13.1.
+    let chunk_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
     // For `--one`, we need to stop after the first step actually executed;
     // capture its ID at the start (the earliest actionable step in the
     // window) and exit after it completes. Positions can shift due to
@@ -392,6 +401,8 @@ async fn run_plan_inner(
                 step_total: total_now,
                 json_output: out.format == OutputFormat::Json,
                 color: out.color,
+                chunk_seq: Some(chunk_seq.clone()),
+                chunk_max_bytes: config.harness_chunk_max_bytes,
             },
         )
         .await?;
@@ -406,6 +417,7 @@ async fn run_plan_inner(
             StepOutcome::Failed => "failed",
             StepOutcome::Aborted => "aborted",
             StepOutcome::Timeout => "timeout",
+            StepOutcome::PausedForQuestion => "paused_for_question",
         };
 
         let emit_finished = |outcome: &str| -> Result<()> {
@@ -480,6 +492,23 @@ async fn run_plan_inner(
                 }
                 storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
                 result.final_status = PlanStatus::Failed;
+                result.step_results.push(step_result);
+                return Ok(result);
+            }
+            StepOutcome::PausedForQuestion => {
+                emit_finished(outcome_str)?;
+                if out.format != OutputFormat::Json {
+                    eprintln!(
+                        "[{}/{}] > {} ... PAUSED (open question — answer to resume)",
+                        step_num, total_now, current_step.title
+                    );
+                }
+                // Don't write `Question` to plans.status — it's a *derived*
+                // status (TUI-plan.md §17). Leave the underlying lifecycle
+                // (`in_progress`) alone so it un-shadows automatically once
+                // the user answers. The PlanRunResult reports the derived
+                // state for the caller's benefit.
+                result.final_status = PlanStatus::Question;
                 result.step_results.push(step_result);
                 return Ok(result);
             }
@@ -1122,6 +1151,15 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
             plan.slug,
             plan.slug
         ),
+        // `Question` is a derived status — `plans.status` is never written
+        // to "question" in the DB, so this arm is defensive. If a caller
+        // ever materializes a Plan with Question (e.g. a future helper that
+        // shadows status when unanswered questions exist), refuse to run:
+        // the user must answer first.
+        PlanStatus::Question => bail!(
+            "Plan '{}' is paused for an unanswered question. Answer it first.",
+            plan.slug
+        ),
     }
 }
 
@@ -1610,6 +1648,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         }
     }
 
@@ -2599,6 +2638,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -2635,6 +2675,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -2802,6 +2843,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -2861,6 +2903,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");

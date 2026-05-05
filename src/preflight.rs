@@ -810,6 +810,7 @@ mod tests {
             prompt_suffix: None,
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
+            harness_chunk_max_bytes: 4096,
             harnesses,
         };
         let now = chrono::Utc::now();
@@ -829,6 +830,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         };
         let results = run_preflight_checks(&plan, &config, tmp.path()).unwrap();
         let auth = results
@@ -915,6 +917,7 @@ mod tests {
             prompt_suffix: None,
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
+            harness_chunk_max_bytes: 4096,
             harnesses: HashMap::new(),
         };
         let tmp = tempfile::tempdir().unwrap();

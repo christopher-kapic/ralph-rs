@@ -4,6 +4,8 @@
 // resolve harness → build prompt → spawn → wait → test → commit/rollback.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +17,7 @@ use crate::git;
 use crate::harness::{self, HarnessOutput};
 use crate::hooks::{self, HookContext};
 use crate::io_util;
+use crate::output::ChunkStream;
 use crate::plan::{ChangePolicy, Phase, Plan, Step, StepStatus, TerminationReason, TestStatus};
 use crate::prompt::{self, PromptWrap, PromptWraps, RetryContext};
 use crate::run_lock::process_start_token;
@@ -43,6 +46,12 @@ pub enum StepOutcome {
     Aborted,
     /// The harness process exceeded the timeout.
     Timeout,
+    /// The harness called `ralph question ask` during the attempt, leaving one
+    /// or more unanswered `step_questions` rows. Tests + commit are skipped,
+    /// any diff is rolled back, and the plan's effective status becomes
+    /// [`crate::plan::PlanStatus::Question`] until the user answers (TUI-plan
+    /// §17). The runner stops the loop cleanly so the run lock is released.
+    PausedForQuestion,
 }
 
 /// Result returned from [`execute_step`].
@@ -59,7 +68,7 @@ pub struct StepResult {
 /// the per-attempt progress sub-header and prompt preview. Kept separate
 /// from the persistent [`Config`] knobs because these are read from CLI
 /// flags / output context, not config.json.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ExecuteOptions {
     /// Skip truncation on the per-attempt prompt preview.
@@ -75,6 +84,30 @@ pub struct ExecuteOptions {
     pub json_output: bool,
     /// True when stderr should be ANSI-colored.
     pub color: bool,
+    /// Monotonic per-run `seq` counter shared across stdout/stderr drainers
+    /// (and across all step invocations in a single `ralph run`). `None`
+    /// disables `HarnessChunk` event emission entirely — used by tests and
+    /// non-NDJSON runs. Created once per run by the runner so the
+    /// counter survives across step boundaries. See TUI-plan §13.1.
+    pub chunk_seq: Option<Arc<AtomicU64>>,
+    /// Truncation cap for each emitted chunk's `text` payload. Mirrors
+    /// [`Config::harness_chunk_max_bytes`]. Ignored when `chunk_seq` is
+    /// `None`.
+    pub chunk_max_bytes: usize,
+}
+
+impl Default for ExecuteOptions {
+    fn default() -> Self {
+        Self {
+            verbose: false,
+            step_num_in_plan: 0,
+            step_total: 0,
+            json_output: false,
+            color: false,
+            chunk_seq: None,
+            chunk_max_bytes: 4096,
+        }
+    }
 }
 
 /// Max chars of prompt included in the non-verbose preview and the
@@ -205,6 +238,10 @@ struct ExecCtx<'a> {
     hook_ctx: &'a HookContext,
     step_num: i32,
     max_attempts: i32,
+    /// True when the parent runner is emitting NDJSON. Threaded to
+    /// [`write_phase`] so phase transitions also emit a
+    /// [`crate::output::RunEvent::PhaseChanged`].
+    json_output: bool,
 }
 
 /// Write a phase transition to the run_locks row. Thin wrapper over
@@ -218,6 +255,10 @@ struct ExecCtx<'a> {
 /// attempt after the harness spawns), and [`ChildUpdate::Clear`] wipes both
 /// columns to NULL (used by every post-harness phase so the row stops
 /// advertising a dead pid).
+///
+/// When `json_output` is true, a [`crate::output::RunEvent::PhaseChanged`]
+/// is emitted to stdout after the storage update so NDJSON consumers (the
+/// TUI, meta-harnesses) can redraw the phase indicator without polling.
 #[allow(clippy::too_many_arguments)]
 fn write_phase(
     conn: &Connection,
@@ -230,6 +271,7 @@ fn write_phase(
     phase: Phase,
     current_command: Option<&str>,
     child: ChildUpdate<'_>,
+    json_output: bool,
 ) -> Result<()> {
     storage::update_live_phase(
         conn,
@@ -242,7 +284,11 @@ fn write_phase(
         execution_log_id,
         current_command,
         child,
-    )
+    )?;
+    if json_output {
+        crate::output::emit_ndjson(&crate::output::RunEvent::PhaseChanged { phase })?;
+    }
+    Ok(())
 }
 
 /// Optional harness output fields attached to a terminal failure.
@@ -288,6 +334,7 @@ async fn finalize_failure(
             Phase::Rollback,
             None,
             ChildUpdate::Clear,
+            ctx.json_output,
         )?;
         git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)?;
         true
@@ -348,6 +395,7 @@ async fn finalize_failure(
         Phase::PostStepHook,
         None,
         ChildUpdate::Clear,
+        ctx.json_output,
     )?;
     hooks::run_post_step(
         ctx.conn,
@@ -362,6 +410,100 @@ async fn finalize_failure(
 
     Ok(StepResult {
         outcome: reason.to_outcome(),
+        step_id: ctx.step.id.clone(),
+        attempts_used: attempt,
+        commit_hash: None,
+    })
+}
+
+/// Finalize an attempt that paused because the harness left unanswered
+/// `step_questions` rows behind (TUI-plan.md §17 "Runner integration").
+///
+/// Skips tests + commit, rolls back any diff the harness produced, writes the
+/// `execution_logs` row with `termination_reason = paused_for_question`, and
+/// returns the step's status to [`StepStatus::Pending`] so the user's next
+/// `ralph run` (after answering) picks it up cleanly. Leaving it `InProgress`
+/// would be swept to `Aborted` at the start of the next run and pollute the
+/// audit trail with a synthetic abort. `step.attempts` was already bumped at
+/// the top of the retry loop, mirroring the "single counter" rule from §17.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_paused_for_question(
+    ctx: &ExecCtx<'_>,
+    exec_log_id: i64,
+    duration_secs: f64,
+    attempt: i32,
+    diff: Option<&str>,
+    stdout: &str,
+    stderr: &str,
+    parsed: &ParsedHarnessOutput,
+) -> Result<StepResult> {
+    let rolled_back = if git::has_uncommitted_changes(ctx.workdir)? {
+        write_phase(
+            ctx.conn,
+            ctx.plan,
+            &ctx.step.id,
+            ctx.step_num,
+            attempt,
+            ctx.max_attempts,
+            Some(exec_log_id),
+            Phase::Rollback,
+            None,
+            ChildUpdate::Clear,
+            ctx.json_output,
+        )?;
+        git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)?;
+        true
+    } else {
+        false
+    };
+
+    storage::update_execution_log(
+        ctx.conn,
+        exec_log_id,
+        Some(duration_secs),
+        diff,
+        &[],
+        rolled_back,
+        false,
+        None,
+        Some(stdout),
+        Some(stderr),
+        parsed.cost_usd,
+        parsed.input_tokens,
+        parsed.output_tokens,
+        parsed.session_id.as_deref(),
+        Some(TerminationReason::PausedForQuestion),
+        Some(TestStatus::NotRun),
+    )?;
+
+    storage::update_step_status(ctx.conn, &ctx.step.id, StepStatus::Pending)?;
+
+    write_phase(
+        ctx.conn,
+        ctx.plan,
+        &ctx.step.id,
+        ctx.step_num,
+        attempt,
+        ctx.max_attempts,
+        Some(exec_log_id),
+        Phase::PostStepHook,
+        None,
+        ChildUpdate::Clear,
+        ctx.json_output,
+    )?;
+    hooks::run_post_step(
+        ctx.conn,
+        ctx.hook_ctx,
+        ctx.plan,
+        ctx.step,
+        attempt,
+        "paused",
+        ctx.workdir,
+    )
+    .await?;
+
+    Ok(StepResult {
+        outcome: StepOutcome::PausedForQuestion,
         step_id: ctx.step.id.clone(),
         attempts_used: attempt,
         commit_hash: None,
@@ -510,6 +652,7 @@ pub async fn execute_step(
         hook_ctx,
         step_num,
         max_attempts,
+        json_output: exec_opts.json_output,
     };
 
     // Previous attempt context for retries.
@@ -591,6 +734,13 @@ pub async fn execute_step(
             plan: PromptWrap::from_opts(plan.prompt_prefix.as_ref(), plan.prompt_suffix.as_ref()),
         };
 
+        // Fetch any answered questions for this step so the next-attempt
+        // prompt re-injects the user's clarifications between Plan context
+        // and Step details (TUI-plan.md §17 "Retry context after answering").
+        // First attempts on un-paused steps return an empty slice — the call
+        // is one indexed lookup, no need to gate it on attempt > 1.
+        let answered_questions = storage::list_answered_questions_for_step(conn, &step.id)?;
+
         // Build prompt.
         let prompt_text = prompt::build_step_prompt(
             plan,
@@ -600,6 +750,7 @@ pub async fn execute_step(
             retry_context.as_ref(),
             harness_config.supports_agent_file,
             &wraps,
+            &answered_questions,
         );
 
         // Create execution log entry.
@@ -638,6 +789,7 @@ pub async fn execute_step(
             Phase::PreStepHook,
             None,
             ChildUpdate::Clear,
+            exec_opts.json_output,
         )?;
 
         // Run pre-step hook.
@@ -676,6 +828,7 @@ pub async fn execute_step(
                     Phase::PostStepHook,
                     None,
                     ChildUpdate::Clear,
+                    exec_opts.json_output,
                 )?;
                 hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir)
                     .await?;
@@ -698,6 +851,7 @@ pub async fn execute_step(
                 Phase::PostStepHook,
                 None,
                 ChildUpdate::Clear,
+                exec_opts.json_output,
             )?;
             hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir).await?;
             continue;
@@ -737,6 +891,7 @@ pub async fn execute_step(
             Phase::Harness,
             Some(harness_name),
             ChildUpdate::Keep,
+            exec_opts.json_output,
         )?;
 
         // Spawn harness subprocess. The tempfile (if any) must outlive
@@ -774,10 +929,24 @@ pub async fn execute_step(
                 },
                 None => ChildUpdate::Keep,
             },
+            exec_opts.json_output,
         )?;
 
-        // Wait with timeout and abort racing.
-        let wait_result = wait_with_timeout_and_abort(child, timeout, abort_rx.clone()).await;
+        // Wait with timeout and abort racing. Build the chunk-emitter
+        // config from the shared per-run seq counter; pass `None` when the
+        // runner isn't streaming NDJSON so the drainer stays a pure
+        // tail-capturer.
+        let chunk_emit = exec_opts
+            .chunk_seq
+            .clone()
+            .filter(|_| exec_opts.json_output)
+            .map(|seq| ChunkEmitConfig {
+                seq,
+                max_bytes: exec_opts.chunk_max_bytes,
+            });
+        let emitters = build_chunk_emitters(chunk_emit);
+        let wait_result =
+            wait_with_timeout_and_abort(child, timeout, abort_rx.clone(), emitters).await;
         let duration_secs = started_at.elapsed().as_secs_f64();
 
         match wait_result {
@@ -797,6 +966,30 @@ pub async fn execute_step(
                 } else {
                     Vec::new()
                 };
+
+                // Pause if the harness left unanswered `step_questions` rows
+                // behind during this attempt (TUI-plan.md §17). Tested first
+                // — even on non-zero exit — so a harness that asks then
+                // crashes still surfaces as a pause: the user's clarification
+                // is the prerequisite for any retry, regardless of whether
+                // the crash was a side effect of the harness's own
+                // self-terminate-after-asking path.
+                let unanswered =
+                    storage::count_unanswered_questions_for_attempt(conn, &step.id, attempt)?;
+                if unanswered > 0 {
+                    let _ = changed_files; // unused on this path
+                    return finalize_paused_for_question(
+                        &ctx,
+                        exec_log.id,
+                        duration_secs,
+                        attempt,
+                        diff.as_deref(),
+                        &output.stdout,
+                        &output.stderr,
+                        &parsed,
+                    )
+                    .await;
+                }
 
                 // Harness exited non-zero (or was killed by a signal). Do not
                 // run tests — the harness didn't finish its work, so a passing
@@ -850,6 +1043,7 @@ pub async fn execute_step(
                             Phase::Rollback,
                             None,
                             ChildUpdate::Clear,
+                            exec_opts.json_output,
                         )?;
                         git::rollback_except(workdir, &pre_existing_untracked)?;
                     }
@@ -904,6 +1098,7 @@ pub async fn execute_step(
                         Phase::PreTestHook,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     if let Err(e) =
                         hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir).await
@@ -924,11 +1119,36 @@ pub async fn execute_step(
                         Phase::Tests,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
+                    // Build a chunk-emit config mirroring the harness path:
+                    // share the per-run `chunk_seq` counter and the same
+                    // `chunk_max_bytes` cap. Only enabled when this run is
+                    // emitting NDJSON; otherwise pass `None` so the test
+                    // runner stays a pure tail-capturer. Per TUI-plan §13.1.
+                    let test_chunk_cfg = exec_opts
+                        .chunk_seq
+                        .clone()
+                        .filter(|_| exec_opts.json_output)
+                        .map(|seq| test_runner::TestChunkConfig {
+                            seq,
+                            max_bytes: exec_opts.chunk_max_bytes,
+                            sink: Arc::new(|test_index, stream, text, seq| {
+                                let _ = crate::output::emit_ndjson(
+                                    &crate::output::RunEvent::TestChunk {
+                                        test_index,
+                                        stream,
+                                        text,
+                                        seq,
+                                    },
+                                );
+                            }),
+                        });
                     let test_results = test_runner::run_tests(
                         &plan.deterministic_tests,
                         workdir,
                         abort_rx.clone(),
+                        test_chunk_cfg,
                     )
                     .await;
                     let strings: Vec<String> = test_results
@@ -951,6 +1171,7 @@ pub async fn execute_step(
                         Phase::PostTestHook,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     hooks::run_post_test(
                         conn,
@@ -1000,6 +1221,7 @@ pub async fn execute_step(
                             Phase::Rollback,
                             None,
                             ChildUpdate::Clear,
+                            exec_opts.json_output,
                         )?;
                         git::rollback_except(workdir, &pre_existing_untracked)?;
                     }
@@ -1070,6 +1292,7 @@ pub async fn execute_step(
                         Phase::PostStepHook,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir)
                         .await?;
@@ -1099,6 +1322,7 @@ pub async fn execute_step(
                         Phase::Commit,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     git::stage_except(workdir, &pre_existing_untracked)?;
                     git::commit_staged(workdir, &commit_msg)?;
@@ -1147,6 +1371,7 @@ pub async fn execute_step(
                         Phase::PostStepHook,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir)
                         .await?;
@@ -1220,6 +1445,7 @@ pub async fn execute_step(
                         Phase::Rollback,
                         None,
                         ChildUpdate::Clear,
+                        exec_opts.json_output,
                     )?;
                     git::rollback_except(workdir, &pre_existing_untracked)?;
                 }
@@ -1329,6 +1555,65 @@ pub async fn execute_step(
 // Wait helpers
 // ---------------------------------------------------------------------------
 
+/// Per-attempt configuration for the chunk-emission side of the harness
+/// drainers. `seq` is shared across both stdout and stderr (and across the
+/// whole run) so consumers see a strictly monotonic stream.
+#[derive(Clone)]
+struct ChunkEmitConfig {
+    seq: Arc<AtomicU64>,
+    max_bytes: usize,
+}
+
+/// Build the per-stream `ChunkEmitter` pair used by [`wait_with_timeout_and_abort`].
+///
+/// Both emitters reference the *same* `seq` counter so a `HarnessChunk`
+/// event's `seq` is unique within the run regardless of which stream it came
+/// from.
+///
+/// Production callers go through this wrapper, which uses
+/// [`crate::output::emit_ndjson`] as the sink; tests use
+/// [`build_chunk_emitters_with_sink`] directly with a capturing sink so they
+/// don't have to redirect stdout. Serialization or write failures from the
+/// production sink are swallowed (best-effort streaming — losing one chunk
+/// should not break the run; the captured tail is still recorded in the
+/// execution log).
+fn build_chunk_emitters(
+    cfg: Option<ChunkEmitConfig>,
+) -> (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>) {
+    let sink: io_util::ChunkSink = Arc::new(|stream, text, seq| {
+        let _ = crate::output::emit_ndjson(&crate::output::RunEvent::HarnessChunk {
+            stream,
+            text,
+            seq,
+        });
+    });
+    build_chunk_emitters_with_sink(cfg, sink)
+}
+
+/// Sink-injectable variant of [`build_chunk_emitters`]. When `cfg` is `None`
+/// the sink is dropped without ever being called.
+fn build_chunk_emitters_with_sink(
+    cfg: Option<ChunkEmitConfig>,
+    sink: io_util::ChunkSink,
+) -> (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>) {
+    let Some(cfg) = cfg else {
+        return (None, None);
+    };
+    let stdout_emitter = io_util::ChunkEmitter {
+        stream: ChunkStream::Stdout,
+        seq: cfg.seq.clone(),
+        max_bytes: cfg.max_bytes,
+        sink: sink.clone(),
+    };
+    let stderr_emitter = io_util::ChunkEmitter {
+        stream: ChunkStream::Stderr,
+        seq: cfg.seq.clone(),
+        max_bytes: cfg.max_bytes,
+        sink,
+    };
+    (Some(stdout_emitter), Some(stderr_emitter))
+}
+
 /// Outcome of waiting for a harness process.
 enum WaitResult {
     /// Process completed (may have succeeded or failed).
@@ -1349,18 +1634,37 @@ enum WaitResult {
 ///   hasn't completed.
 /// - On **abort**: SIGTERM is sent, followed by a 5-second grace period,
 ///   then SIGKILL if still running.
+///
+/// When `emitters` is non-`None` for a stream, that drainer also emits
+/// [`crate::output::RunEvent::HarnessChunk`] events one-per-newline as the
+/// child produces output. The same `seq` counter is typically shared across
+/// stdout and stderr so consumers can reorder by `seq`.
+///
+/// Production callers build `emitters` via [`build_chunk_emitters`]; tests
+/// use [`build_chunk_emitters_with_sink`] to capture events without
+/// touching stdout.
 async fn wait_with_timeout_and_abort(
     mut child: tokio::process::Child,
     timeout: Option<Duration>,
     mut abort_rx: watch::Receiver<bool>,
+    emitters: (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>),
 ) -> WaitResult {
     // Take stdout/stderr handles before entering select! so we can still
     // access `child` mutably for kill/wait. Spawn concurrent drain tasks
     // *immediately*: a child that writes more than the pipe buffer
     // (~64 KiB) would otherwise block on write(2) while we block on wait(),
     // deadlocking. Draining concurrently keeps the pipe flowing.
-    let stdout_task = io_util::drain_bounded(child.stdout.take(), HARNESS_OUTPUT_TAIL_BYTES);
-    let stderr_task = io_util::drain_bounded(child.stderr.take(), HARNESS_OUTPUT_TAIL_BYTES);
+    let (stdout_emitter, stderr_emitter) = emitters;
+    let stdout_task = io_util::drain_bounded_with_emitter(
+        child.stdout.take(),
+        HARNESS_OUTPUT_TAIL_BYTES,
+        stdout_emitter,
+    );
+    let stderr_task = io_util::drain_bounded_with_emitter(
+        child.stderr.take(),
+        HARNESS_OUTPUT_TAIL_BYTES,
+        stderr_emitter,
+    );
 
     match timeout {
         Some(dur) => {
@@ -1820,10 +2124,12 @@ mod tests {
             StepOutcome::Failed,
             StepOutcome::Aborted,
             StepOutcome::Timeout,
+            StepOutcome::PausedForQuestion,
         ];
-        assert_eq!(outcomes.len(), 4);
+        assert_eq!(outcomes.len(), 5);
         assert_eq!(StepOutcome::Success, StepOutcome::Success);
         assert_ne!(StepOutcome::Success, StepOutcome::Failed);
+        assert_ne!(StepOutcome::Success, StepOutcome::PausedForQuestion);
     }
 
     #[test]
@@ -3779,5 +4085,581 @@ mod tests {
 
         let fresh_step = storage::get_step(&conn, &step.id).unwrap();
         assert_eq!(fresh_step.status, StepStatus::Failed);
+    }
+
+    // -------------------------------------------------------------------
+    // HarnessChunk emission (TUI-plan §13.1)
+    // -------------------------------------------------------------------
+
+    /// `build_chunk_emitters_with_sink` should produce a `Some(...)`
+    /// emitter pair when given a config and `(None, None)` when the config
+    /// is absent. This is the wiring contract: `wait_with_timeout_and_abort`
+    /// only emits when its emitters are populated.
+    #[test]
+    fn test_build_chunk_emitters_returns_none_when_cfg_is_none() {
+        let dummy_sink: io_util::ChunkSink = Arc::new(|_, _, _| {});
+        let (out, err) = build_chunk_emitters_with_sink(None, dummy_sink);
+        assert!(out.is_none(), "stdout emitter should be None");
+        assert!(err.is_none(), "stderr emitter should be None");
+    }
+
+    #[test]
+    fn test_build_chunk_emitters_carries_seq_and_max_bytes() {
+        let seq = Arc::new(AtomicU64::new(0));
+        let cfg = Some(ChunkEmitConfig {
+            seq: seq.clone(),
+            max_bytes: 128,
+        });
+        let dummy_sink: io_util::ChunkSink = Arc::new(|_, _, _| {});
+        let (out, err) = build_chunk_emitters_with_sink(cfg, dummy_sink);
+        let out = out.expect("stdout emitter should be Some");
+        let err = err.expect("stderr emitter should be Some");
+        assert_eq!(out.stream, ChunkStream::Stdout);
+        assert_eq!(err.stream, ChunkStream::Stderr);
+        assert_eq!(out.max_bytes, 128);
+        assert_eq!(err.max_bytes, 128);
+        // Both emitters must reference the *same* counter so seq is
+        // monotonic across streams.
+        assert!(
+            Arc::ptr_eq(&out.seq, &err.seq),
+            "stdout and stderr emitters must share the same seq counter"
+        );
+        assert!(
+            Arc::ptr_eq(&out.seq, &seq),
+            "emitters must reference the caller's counter"
+        );
+    }
+
+    /// End-to-end: `wait_with_timeout_and_abort` driving a real subprocess
+    /// that prints N stdout lines + M stderr lines must emit N+M
+    /// `HarnessChunk` events with `seq` 0..N+M-1 (no gaps, no duplicates),
+    /// and lines longer than `max_bytes` must be truncated.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_wait_with_timeout_and_abort_emits_harness_chunks() {
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        // Build a child that prints 3 stdout lines and 1 stderr line. The
+        // last stdout line is 50 bytes long so we can verify truncation
+        // when max_bytes < 50.
+        let long_line = "x".repeat(50);
+        let script = format!("echo line-one; echo line-two; echo {long_line}; echo err-one >&2");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(&script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null());
+        let child = cmd.spawn().expect("spawn sh");
+
+        let collected: Arc<std::sync::Mutex<Vec<(ChunkStream, String, u64)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected_for_sink = collected.clone();
+        let sink: io_util::ChunkSink = Arc::new(move |stream, text, seq| {
+            collected_for_sink.lock().unwrap().push((stream, text, seq));
+        });
+
+        let max_bytes = 10;
+        let cfg = Some(ChunkEmitConfig {
+            seq: Arc::new(AtomicU64::new(0)),
+            max_bytes,
+        });
+        let emitters = build_chunk_emitters_with_sink(cfg, sink);
+
+        let (_tx, rx) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_with_timeout_and_abort(child, None, rx, emitters),
+        )
+        .await
+        .expect("wait timed out");
+
+        match result {
+            WaitResult::Completed(Ok(_)) => {}
+            WaitResult::Completed(Err(e)) => panic!("harness errored: {e}"),
+            WaitResult::Timeout { .. } => panic!("unexpected Timeout"),
+            WaitResult::Aborted => panic!("unexpected Aborted"),
+        }
+
+        let mut events = collected.lock().unwrap().clone();
+        events.sort_by_key(|e| e.2);
+
+        // 4 lines total → 4 events with seq 0..3 (no gaps).
+        assert_eq!(events.len(), 4, "expected 4 events, got {events:?}");
+        let seqs: Vec<u64> = events.iter().map(|e| e.2).collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3], "seq must be 0..N-1");
+
+        // Every emitted text is at most max_bytes bytes.
+        for (_, text, _) in &events {
+            assert!(
+                text.len() <= max_bytes,
+                "text exceeded max_bytes: {} bytes ({text:?})",
+                text.len(),
+            );
+        }
+
+        // Verify the long line was truncated and the stderr line landed
+        // with the Stderr label.
+        let texts: Vec<&str> = events.iter().map(|(_, t, _)| t.as_str()).collect();
+        assert!(
+            texts.contains(&"line-one"),
+            "expected 'line-one' in events: {texts:?}"
+        );
+        assert!(
+            texts.contains(&"line-two"),
+            "expected 'line-two' in events: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with('x') && t.len() == max_bytes),
+            "expected truncated long line in events: {texts:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(s, t, _)| *s == ChunkStream::Stderr && t == "err-one"),
+            "expected stderr 'err-one' event: {events:?}"
+        );
+    }
+
+    /// Sanity: when emitters are `(None, None)`, the wait function must
+    /// still capture stdout/stderr correctly — the chunk-emit path is
+    /// strictly additive and must not regress the tail-capture contract.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_wait_with_timeout_and_abort_no_emit_when_emitters_none() {
+        use std::time::Duration;
+        use tokio::process::Command;
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo captured; echo err-captured >&2")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null());
+        let child = cmd.spawn().expect("spawn sh");
+
+        let (_tx, rx) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_with_timeout_and_abort(child, None, rx, (None, None)),
+        )
+        .await
+        .expect("wait timed out");
+
+        match result {
+            WaitResult::Completed(Ok(out)) => {
+                assert!(out.success);
+                assert!(out.stdout.contains("captured"));
+                assert!(out.stderr.contains("err-captured"));
+            }
+            WaitResult::Completed(Err(e)) => panic!("harness errored: {e}"),
+            WaitResult::Timeout { .. } => panic!("unexpected Timeout"),
+            WaitResult::Aborted => panic!("unexpected Aborted"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Question pause integration (TUI-plan §17 step 42)
+    // -------------------------------------------------------------------
+
+    /// Insert an unanswered `step_questions` row tagged to a given (step,
+    /// attempt). Simulates what the harness would do via `ralph question
+    /// ask`. Used by the question-pause integration tests to drive the
+    /// "harness left a question behind" branch in `execute_step`.
+    #[cfg(test)]
+    fn insert_unanswered_question(conn: &Connection, step_id: &str, attempt: i32, question: &str) {
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
+             VALUES (?1, ?2, ?3, ?4, '[]', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), step_id, attempt, question],
+        )
+        .expect("seed step_questions row");
+    }
+
+    /// Build a minimal Config registering the given harness path under `name`.
+    #[cfg(test)]
+    fn config_with_harness(name: &str, harness_path: &std::path::Path) -> Config {
+        use crate::config::HarnessConfig;
+        let mut config = Config::default();
+        config.harnesses.insert(
+            name.to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                color: None,
+            },
+        );
+        config
+    }
+
+    /// Pause path with a clean-exit, no-diff harness. The harness runs cleanly
+    /// but a `step_questions` row exists for (step, attempt=1). Expected:
+    /// outcome PausedForQuestion, step status reset to Pending,
+    /// step.attempts ticked to 1, exec_log row carries paused_for_question +
+    /// NotRun, no commit was made.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_paused_for_question_no_diff_skips_tests_and_commit() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        let head_before = crate::git::get_commit_hash(&dir).unwrap();
+
+        // Noop harness — clean exit, no diff.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_noop_harness(harness_tmp.path());
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("noop"),
+            None,
+            // Configure deterministic tests so we can assert they were skipped
+            // — pause must skip the test phase even when tests are configured.
+            &["true".to_string()],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(2), // budget > 1 to confirm pause does not retry
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Simulate `ralph question ask` writing a row before the harness
+        // exits — execute_step will bump step.attempts to 1 then query.
+        insert_unanswered_question(&conn, &step.id, 1, "Use SQLite or Postgres?");
+
+        let config = config_with_harness("noop", &harness_path);
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(false);
+
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
+        assert_eq!(result.attempts_used, 1);
+        assert!(result.commit_hash.is_none());
+
+        // Step status returned to Pending so a re-run picks it up cleanly,
+        // and attempts ticked once.
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Pending);
+        assert_eq!(updated.attempts, 1);
+
+        // Exactly one log row, carrying the pause termination reason and
+        // NotRun test status (tests must NOT have run).
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].attempt, 1);
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::PausedForQuestion)
+        );
+        assert_eq!(logs[0].test_status, Some(TestStatus::NotRun));
+        assert!(
+            logs[0].test_results.is_empty(),
+            "no tests ran on a paused attempt; test_results must be empty"
+        );
+        assert!(!logs[0].committed, "pause must not commit");
+        assert!(!logs[0].rolled_back, "no diff means nothing to roll back");
+
+        // HEAD did not advance — pause skipped the commit.
+        let head_after = crate::git::get_commit_hash(&dir).unwrap();
+        assert_eq!(head_before, head_after, "pause must not advance HEAD");
+
+        // The plan's effective status is now Question (derived) even though
+        // the underlying plans.status column may still be in_progress.
+        let effective = storage::plan_effective_status(&conn, &plan.id).unwrap();
+        assert_eq!(effective, crate::plan::PlanStatus::Question);
+    }
+
+    /// Pause path with a harness that produced a diff. The diff must be
+    /// rolled back as part of the pause finalize, leaving the workdir clean.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_paused_for_question_rolls_back_diff() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        // Harness that writes a file inside the workdir, then exits 0.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_large_output_harness(harness_tmp.path(), &dir, 64, true);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("touchy"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        insert_unanswered_question(&conn, &step.id, 1, "What name should I use?");
+
+        let config = config_with_harness("touchy", &harness_path);
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(false);
+
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
+
+        // Workdir must be clean after pause: the file the harness created
+        // was rolled back, and no commit was made.
+        assert!(
+            !crate::git::has_uncommitted_changes(&dir).unwrap(),
+            "pause must roll back any harness-produced diff"
+        );
+        assert!(
+            !dir.join("ralph-test-output.txt").exists(),
+            "rolled-back path: harness's file must be gone"
+        );
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::PausedForQuestion)
+        );
+        assert!(logs[0].rolled_back, "rolled_back flag must be set");
+        assert!(!logs[0].committed);
+    }
+
+    /// Happy path regression: a clean run on a question-enabled plan that
+    /// happens to leave NO question rows behind must proceed normally
+    /// (commit, success). Confirms the question check is purely additive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_no_questions_proceeds_to_commit_normally() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        // Harness writes a file so the commit path is exercised.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_large_output_harness(harness_tmp.path(), &dir, 64, true);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("happy"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // No `step_questions` row inserted — happy path.
+
+        let config = config_with_harness("happy", &harness_path);
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(false);
+
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        assert!(result.commit_hash.is_some(), "no-question path must commit");
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].termination_reason, Some(TerminationReason::Success));
+        assert!(logs[0].committed);
+
+        // And the plan's effective status reflects the actual stored value
+        // — no Question shadow when there are no unanswered rows.
+        let effective = storage::plan_effective_status(&conn, &plan.id).unwrap();
+        assert_ne!(effective, crate::plan::PlanStatus::Question);
+    }
+
+    /// A question row tagged to a *different* attempt (e.g. left over from a
+    /// prior, already-answered attempt) must NOT trigger a pause on the
+    /// current attempt. The detector scopes by (step, attempt), so an
+    /// orphan row at attempt=0 does not interfere with attempt=1's
+    /// happy-path completion.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_question_for_different_attempt_does_not_pause() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_large_output_harness(harness_tmp.path(), &dir, 64, true);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("happy"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Pre-existing answered question on attempt 1 (the upcoming attempt
+        // number) — answered rows must not pause. Insert it directly so the
+        // helper, which writes unanswered rows, can't be repurposed here.
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
+             VALUES ('prev', ?1, 1, 'old?', '[]', 'yes', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
+            rusqlite::params![&step.id],
+        ).unwrap();
+
+        let config = config_with_harness("happy", &harness_path);
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(false);
+
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Success,
+            "answered rows must not pause — got {result:?}",
+        );
     }
 }

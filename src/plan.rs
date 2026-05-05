@@ -10,6 +10,13 @@ use std::fmt;
 // ---------------------------------------------------------------------------
 
 /// Status of a plan throughout its lifecycle.
+///
+/// Note: [`PlanStatus::Question`] is a *derived* status — it is never written
+/// to `plans.status`. A plan is reported as `Question` whenever any unanswered
+/// `step_questions` row exists for one of its steps; the underlying lifecycle
+/// (in_progress/ready/etc.) stays in the column and un-shadows automatically
+/// when the user answers. The variant exists in the enum so consumers
+/// (TUI/JSON output) can render the derived state uniformly with the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
@@ -21,6 +28,7 @@ pub enum PlanStatus {
     Failed,
     Aborted,
     Archived,
+    Question,
 }
 
 impl PlanStatus {
@@ -34,6 +42,7 @@ impl PlanStatus {
             Self::Failed => "failed",
             Self::Aborted => "aborted",
             Self::Archived => "archived",
+            Self::Question => "question",
         }
     }
 }
@@ -68,6 +77,7 @@ impl std::str::FromStr for PlanStatus {
             "failed" => Ok(Self::Failed),
             "aborted" => Ok(Self::Aborted),
             "archived" => Ok(Self::Archived),
+            "question" => Ok(Self::Question),
             other => Err(ParseStatusError(other.to_string())),
         }
     }
@@ -270,6 +280,12 @@ pub enum TerminationReason {
     /// can tell the difference between "the agent crashed" and "we never
     /// even started it because the FS was about to fill".
     InsufficientDiskSpace,
+    /// Harness exited cleanly but recorded one or more unanswered
+    /// `step_questions` rows during the attempt. The runner skips tests +
+    /// commit, rolls back any diff, and pauses the plan until the user
+    /// answers. Distinct from `HarnessFailed` so paused-for-clarification
+    /// history doesn't pollute real-failure metrics.
+    PausedForQuestion,
     Unknown,
 }
 
@@ -286,6 +302,7 @@ impl TerminationReason {
             Self::CommitFailed => "commit_failed",
             Self::RollbackFailed => "rollback_failed",
             Self::InsufficientDiskSpace => "insufficient_disk_space",
+            Self::PausedForQuestion => "paused_for_question",
             Self::Unknown => "unknown",
         }
     }
@@ -312,6 +329,7 @@ impl std::str::FromStr for TerminationReason {
             "commit_failed" => Ok(Self::CommitFailed),
             "rollback_failed" => Ok(Self::RollbackFailed),
             "insufficient_disk_space" => Ok(Self::InsufficientDiskSpace),
+            "paused_for_question" => Ok(Self::PausedForQuestion),
             "unknown" => Ok(Self::Unknown),
             other => Err(ParseStatusError(other.to_string())),
         }
@@ -379,11 +397,11 @@ impl std::str::FromStr for TestStatus {
 ///
 /// Matches the physical table layout after all migrations: V1 defined every
 /// column through `updated_at`, V5 appended `plan_harness`, V10 appended
-/// `prompt_prefix` and `prompt_suffix`, and V14 appended `context_prepend`
-/// via `ALTER TABLE ... ADD COLUMN`. Every `Plan`-returning query MUST use
-/// this list so [`Plan::from_row`]'s indices line up — a raw `SELECT *`
-/// would otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, prompt_prefix, prompt_suffix, context_prepend";
+/// `prompt_prefix` and `prompt_suffix`, V14 appended `context_prepend`, and
+/// V16 appended `questions_enabled` via `ALTER TABLE ... ADD COLUMN`. Every
+/// `Plan`-returning query MUST use this list so [`Plan::from_row`]'s indices
+/// line up — a raw `SELECT *` would otherwise swap columns.
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, prompt_prefix, prompt_suffix, context_prepend, questions_enabled";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +428,15 @@ pub struct Plan {
     /// is an explicit escape hatch meaning "no prepend at all".
     #[serde(default)]
     pub context_prepend: Option<String>,
+    /// Per-plan opt-in for the pause-for-question feature. When `false`
+    /// (default), `ralph question ask` invocations from a harness against a
+    /// step in this plan are rejected and no `step_questions` rows are
+    /// written. When `true`, the runner inspects unanswered questions
+    /// after each attempt and may pause the plan. Toggled via
+    /// `ralph plan questions on|off` and the `Q` keybinding in the TUI
+    /// plan list.
+    #[serde(default)]
+    pub questions_enabled: bool,
 }
 
 impl Plan {
@@ -418,7 +445,7 @@ impl Plan {
     /// Expected column order matches [`PLAN_COLUMNS`]:
     /// id, slug, project, branch_name, description, status, harness, agent,
     /// deterministic_tests, created_at, updated_at, plan_harness,
-    /// prompt_prefix, prompt_suffix, context_prepend
+    /// prompt_prefix, prompt_suffix, context_prepend, questions_enabled
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -440,6 +467,10 @@ impl Plan {
             rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
+        // `questions_enabled` is INTEGER NOT NULL DEFAULT 0 on disk; SQLite
+        // has no native bool, so read as i64 and coerce.
+        let questions_enabled_int: i64 = row.get(15)?;
+
         Ok(Plan {
             id: row.get(0)?,
             slug: row.get(1)?,
@@ -456,6 +487,7 @@ impl Plan {
             prompt_prefix: row.get(12)?,
             prompt_suffix: row.get(13)?,
             context_prepend: row.get(14)?,
+            questions_enabled: questions_enabled_int != 0,
         })
     }
 }
@@ -578,6 +610,21 @@ impl Step {
             tags,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// AnsweredQuestion struct
+// ---------------------------------------------------------------------------
+
+/// A question that the harness asked via `ralph question ask` and the user
+/// has since answered. Returned by
+/// [`crate::storage::list_answered_questions_for_step`] in chronological order
+/// and rendered into the prompt's "Previously answered questions" section on
+/// the next attempt of the step (TUI-plan.md §17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnsweredQuestion {
+    pub question: String,
+    pub answer: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -705,12 +752,28 @@ mod tests {
             PlanStatus::Failed,
             PlanStatus::Aborted,
             PlanStatus::Archived,
+            PlanStatus::Question,
         ];
         for status in &statuses {
             let s = status.as_str();
             let parsed: PlanStatus = s.parse().unwrap();
             assert_eq!(*status, parsed);
         }
+    }
+
+    #[test]
+    fn test_plan_status_question_serde_and_display() {
+        // The derived `Question` status must serialize as snake_case
+        // (matches every other variant) so the TUI/JSON output renders it
+        // uniformly without a special case.
+        assert_eq!(PlanStatus::Question.as_str(), "question");
+        assert_eq!(PlanStatus::Question.to_string(), "question");
+        assert_eq!(
+            serde_json::to_string(&PlanStatus::Question).unwrap(),
+            r#""question""#,
+        );
+        let parsed: PlanStatus = "question".parse().unwrap();
+        assert_eq!(parsed, PlanStatus::Question);
     }
 
     #[test]
@@ -1035,6 +1098,7 @@ mod tests {
             TerminationReason::CommitFailed,
             TerminationReason::RollbackFailed,
             TerminationReason::InsufficientDiskSpace,
+            TerminationReason::PausedForQuestion,
             TerminationReason::Unknown,
         ];
         for r in &reasons {
@@ -1042,6 +1106,24 @@ mod tests {
             let parsed: TerminationReason = s.parse().unwrap();
             assert_eq!(*r, parsed);
         }
+    }
+
+    #[test]
+    fn test_termination_reason_paused_for_question_serde_and_display() {
+        assert_eq!(
+            TerminationReason::PausedForQuestion.as_str(),
+            "paused_for_question",
+        );
+        assert_eq!(
+            TerminationReason::PausedForQuestion.to_string(),
+            "paused_for_question",
+        );
+        assert_eq!(
+            serde_json::to_string(&TerminationReason::PausedForQuestion).unwrap(),
+            r#""paused_for_question""#,
+        );
+        let parsed: TerminationReason = "paused_for_question".parse().unwrap();
+        assert_eq!(parsed, TerminationReason::PausedForQuestion);
     }
 
     #[test]

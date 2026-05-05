@@ -1,6 +1,6 @@
 // Prompt generation
 
-use crate::plan::{Plan, Step, StepStatus};
+use crate::plan::{AnsweredQuestion, Plan, Step, StepStatus};
 
 /// Default "how to introspect this plan" block prepended to every step's
 /// prompt. Plans can override it via [`Plan::context_prepend`]; a `None`
@@ -8,6 +8,40 @@ use crate::plan::{Plan, Step, StepStatus};
 /// verbatim (no concatenation with this default)", and `Some("")` is an
 /// explicit escape hatch meaning "no prepend at all".
 ///
+/// Trailing instruction appended to every step prompt when the plan has
+/// `questions_enabled = true` (TUI-plan.md §17). Verbatim from the spec —
+/// case, punctuation, and line breaks are load-bearing.
+pub const QUESTION_ASK_INSTRUCTION: &str = "\
+## Asking the user a question
+
+This plan has questions enabled, so you may pause and ask the user for
+clarification when you're genuinely blocked on a decision they need to
+make.
+
+Before asking, seriously consider whether the answer is already
+recoverable from:
+  - The plan description and step acceptance criteria above.
+  - The codebase itself (read the relevant files).
+  - A reasonable, conservative default that you can flag in a comment.
+
+Most decisions belong in the plan, not the implementation. Questions
+cost the user attention and break their flow.
+
+That said: when you genuinely cannot proceed without input, ask. A good
+question with suggested answers is far better than a wrong guess.
+
+To ask, run:
+
+    ralph question ask \"What should I do about X?\" \\
+      -s \"option A: ...\" \\
+      -s \"option B: ...\"
+
+Suggestions are optional but appreciated — the user can always type a
+custom answer. You may call `ralph question ask` multiple times in one
+attempt. After your last call, exit normally (zero status). The plan
+will pause; the user will answer in the TUI; your next attempt will
+receive every answered question in the appended retry context.";
+
 /// This string is a user-facing contract — case, punctuation, and line
 /// breaks are load-bearing and should not drift without a conscious bump.
 pub const DEFAULT_CONTEXT_PREPEND: &str = "\
@@ -125,13 +159,15 @@ pub fn effective_context_prepend(plan: &Plan) -> &str {
 /// 2. Agent pointer (instructs the harness to fetch the agent profile itself)
 /// 3. Retry context (if this is a retry attempt)
 /// 4. Plan context (plan description and overall goal)
-/// 5. Step details (title and description of current step)
-/// 6. Acceptance criteria (specific criteria the step must meet)
-/// 7. Plan step map — a compact titles-only list of ALL steps in the plan
+/// 5. Previously answered questions (only if `answered_questions` is non-empty)
+/// 6. Step details (title and description of current step)
+/// 7. Acceptance criteria (specific criteria the step must meet)
+/// 8. Plan step map — a compact titles-only list of ALL steps in the plan
 ///    with their current status, so the agent can see where it is in the
 ///    sequence without us paying O(n²) bytes for full prior descriptions
-/// 8. Deterministic tests (test commands that will be run after)
-/// 9. Focus instruction (reminder to stay focused on just this step)
+/// 9. Deterministic tests (test commands that will be run after)
+/// 10. Focus instruction (reminder to stay focused on just this step)
+/// 11. Question-ask instruction (only if `plan.questions_enabled`)
 ///
 /// Then the global/project/plan prompt prefix/suffix layers are wrapped
 /// around the joined sections: prefixes stack outermost→innermost at the
@@ -139,6 +175,13 @@ pub fn effective_context_prepend(plan: &Plan) -> &str {
 ///
 /// `all_steps` is the full ordered list of steps in the plan (as returned by
 /// `storage::list_steps`). `step` must be one of them — matched by `id`.
+///
+/// `answered_questions` is the chronological list of Q&A pairs for this step
+/// (from [`crate::storage::list_answered_questions_for_step`]). When non-empty
+/// the prompt injects a "Previously answered questions" section between Plan
+/// context and Step details so the harness sees the user's clarifications
+/// verbatim before re-attacking the step.
+#[allow(clippy::too_many_arguments)]
 pub fn build_step_prompt(
     plan: &Plan,
     step: &Step,
@@ -147,6 +190,7 @@ pub fn build_step_prompt(
     retry_context: Option<&RetryContext>,
     harness_supports_agent_file: bool,
     wraps: &PromptWraps<'_>,
+    answered_questions: &[AnsweredQuestion],
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
 
@@ -179,7 +223,15 @@ pub fn build_step_prompt(
     // 4. Plan context
     sections.push(format_plan_context(plan));
 
-    // 5. Step details (with 1-based position in the plan)
+    // 5. Previously answered questions — injected between plan context and
+    // step details so the harness sees the user's clarifications before
+    // re-reading the step description (TUI-plan.md §17 "Retry context after
+    // answering"). Empty slice contributes nothing.
+    if !answered_questions.is_empty() {
+        sections.push(format_answered_questions(answered_questions));
+    }
+
+    // 6. Step details (with 1-based position in the plan)
     let step_num = all_steps
         .iter()
         .position(|s| s.id == step.id)
@@ -187,25 +239,33 @@ pub fn build_step_prompt(
         .unwrap_or(0);
     sections.push(format_step_details(step, step_num, all_steps.len()));
 
-    // 6. Acceptance criteria
+    // 7. Acceptance criteria
     if !step.acceptance_criteria.is_empty() {
         sections.push(format_acceptance_criteria(&step.acceptance_criteria));
     }
 
-    // 7. Plan step map — titles-only listing of every step in the plan.
+    // 8. Plan step map — titles-only listing of every step in the plan.
     // Strictly linear in plan size (~80 bytes/step) vs the old quadratic
     // prior-step descriptions dump.
     if !all_steps.is_empty() {
         sections.push(format_plan_step_map(all_steps, &step.id));
     }
 
-    // 8. Deterministic tests
+    // 9. Deterministic tests
     if !plan.deterministic_tests.is_empty() {
         sections.push(format_deterministic_tests(&plan.deterministic_tests));
     }
 
-    // 9. Focus instruction
+    // 10. Focus instruction
     sections.push(format_focus_instruction(step));
+
+    // 11. Question-ask instruction — appended at the very end (after the
+    // focus instruction) when the plan opted into questions (TUI-plan.md §17
+    // "Prompt injection (when enabled)"). Other prompt layers (suffix wraps)
+    // stack outside this block.
+    if plan.questions_enabled {
+        sections.push(QUESTION_ASK_INSTRUCTION.to_string());
+    }
 
     // Layer prefix/suffix wraps around the joined sections. Each wrap layer
     // is inserted as its own `\n\n`-separated section, matching the rest of
@@ -273,6 +333,27 @@ fn format_plan_context(plan: &Plan) -> String {
         branch = plan.branch_name,
         project = plan.project,
     )
+}
+
+/// Render the "Previously answered questions" section. Each Q&A pair becomes
+/// two markdown blockquote lines (`> Q: ...` / `> A: ...`) separated by a
+/// blank line, in chronological order. Verbatim shape from TUI-plan.md §17.
+fn format_answered_questions(answered: &[AnsweredQuestion]) -> String {
+    let mut lines = vec![
+        "## Previously answered questions".to_string(),
+        String::new(),
+    ];
+    let last = answered.len().saturating_sub(1);
+    for (i, qa) in answered.iter().enumerate() {
+        lines.push(format!("> Q: {}", qa.question));
+        lines.push(format!("> A: {}", qa.answer));
+        if i != last {
+            // Blank line between pairs to keep each blockquote distinct in
+            // markdown rendering. The trailing pair has no separator.
+            lines.push(String::new());
+        }
+    }
+    lines.join("\n")
 }
 
 fn format_step_details(step: &Step, step_num: usize, total: usize) -> String {
@@ -409,6 +490,7 @@ mod tests {
             prompt_prefix: None,
             prompt_suffix: None,
             context_prepend: None,
+            questions_enabled: false,
         }
     }
 
@@ -473,6 +555,7 @@ mod tests {
             None,
             true, // harness supports agent file natively
             &PromptWraps::default(),
+            &[],
         );
 
         // Should contain plan context
@@ -518,6 +601,7 @@ mod tests {
             None,
             true,
             &PromptWraps::default(),
+            &[],
         );
 
         // The DEFAULT_CONTEXT_PREPEND starts with "# Ralph context" and lists
@@ -543,6 +627,7 @@ mod tests {
             None,
             true,
             &PromptWraps::default(),
+            &[],
         );
 
         // Custom text IS present …
@@ -571,6 +656,7 @@ mod tests {
             None,
             true,
             &PromptWraps::default(),
+            &[],
         );
 
         // Neither the default nor any custom prepend is present.
@@ -602,6 +688,7 @@ mod tests {
             None,
             true,
             &PromptWraps::default(),
+            &[],
         );
 
         // Titles ARE present in the step map.
@@ -644,6 +731,7 @@ mod tests {
             None,
             true,
             &PromptWraps::default(),
+            &[],
         );
 
         // Only the current step line has the arrow prefix.
@@ -669,6 +757,7 @@ mod tests {
             None,
             false, // harness does NOT support agent file natively
             &PromptWraps::default(),
+            &[],
         );
 
         // Pointer section should be present telling the agent to run
@@ -691,6 +780,7 @@ mod tests {
             None,
             true, // harness supports agent file natively
             &PromptWraps::default(),
+            &[],
         );
 
         // Pointer section should NOT be in the prompt — the harness gets
@@ -713,6 +803,7 @@ mod tests {
             None,
             false, // non-native, but no agent assigned
             &PromptWraps::default(),
+            &[],
         );
 
         assert!(!prompt.contains("# Agent Profile"));
@@ -739,6 +830,7 @@ mod tests {
             Some(&retry),
             true,
             &PromptWraps::default(),
+            &[],
         );
 
         assert!(prompt.contains("# Retry Context"));
@@ -766,6 +858,7 @@ mod tests {
             None,
             true,
             &PromptWraps::default(),
+            &[],
         );
 
         assert!(!prompt.contains("Acceptance criteria"));
@@ -786,6 +879,7 @@ mod tests {
             None,
             true,
             &PromptWraps::default(),
+            &[],
         );
 
         assert!(!prompt.contains("Post-harness validation"));
@@ -808,6 +902,7 @@ mod tests {
             None,
             true,
             &PromptWraps::default(),
+            &[],
         );
         assert!(
             !prompt.contains("All must pass"),
@@ -889,7 +984,8 @@ mod tests {
 
     #[test]
     fn test_prompt_section_order() {
-        let plan = make_plan();
+        let mut plan = make_plan();
+        plan.questions_enabled = true;
         let s1 = make_step_with("s1", "Prior", StepStatus::Complete);
         let s2 = make_step();
         let all_steps = vec![s1, s2.clone()];
@@ -900,6 +996,10 @@ mod tests {
             previous_test_output: None,
             files_modified: vec![],
         };
+        let answered = vec![AnsweredQuestion {
+            question: "Which DB?".to_string(),
+            answer: "SQLite".to_string(),
+        }];
 
         let prompt = build_step_prompt(
             &plan,
@@ -909,28 +1009,34 @@ mod tests {
             Some(&retry),
             false,
             &PromptWraps::default(),
+            &answered,
         );
 
         // Verify ordering:
-        // prepend -> agent -> retry -> plan -> step -> criteria -> step map -> tests -> focus
+        // prepend -> agent -> retry -> plan -> answered_questions -> step ->
+        // criteria -> step map -> tests -> focus -> ask-instruction
         let prepend_pos = prompt.find("# Ralph context").unwrap();
         let agent_pos = prompt.find("# Agent Profile").unwrap();
         let retry_pos = prompt.find("# Retry Context").unwrap();
         let plan_pos = prompt.find("# Plan:").unwrap();
+        let answered_pos = prompt.find("## Previously answered questions").unwrap();
         let step_pos = prompt.find("## Your step").unwrap();
         let criteria_pos = prompt.find("Acceptance criteria").unwrap();
         let map_pos = prompt.find("## Plan step map").unwrap();
         let tests_pos = prompt.find("Post-harness validation").unwrap();
         let focus_pos = prompt.find("Only modify files").unwrap();
+        let ask_pos = prompt.find("## Asking the user a question").unwrap();
 
         assert!(prepend_pos < agent_pos);
         assert!(agent_pos < retry_pos);
         assert!(retry_pos < plan_pos);
-        assert!(plan_pos < step_pos);
+        assert!(plan_pos < answered_pos);
+        assert!(answered_pos < step_pos);
         assert!(step_pos < criteria_pos);
         assert!(criteria_pos < map_pos);
         assert!(map_pos < tests_pos);
         assert!(tests_pos < focus_pos);
+        assert!(focus_pos < ask_pos);
     }
 
     #[test]
@@ -950,7 +1056,7 @@ mod tests {
             plan: PromptWrap::from_opts(Some(&plan_pre), Some(&plan_suf)),
         };
 
-        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &wraps);
+        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &wraps, &[]);
 
         // Prefixes stack outermost → innermost at the top, ahead of the
         // prepend section.
@@ -991,7 +1097,7 @@ mod tests {
             plan: PromptWrap::from_opts(Some(&plan_pre), None),
         };
 
-        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &wraps);
+        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &wraps, &[]);
 
         assert!(prompt.starts_with("PLAN-PRE"));
         assert!(
@@ -1024,5 +1130,184 @@ mod tests {
         let mut plan = make_plan();
         plan.context_prepend = Some(String::new());
         assert_eq!(effective_context_prepend(&plan), "");
+    }
+
+    // ---- Question injection (TUI-plan.md §17) ----
+
+    #[test]
+    fn test_question_ask_instruction_appended_when_questions_enabled() {
+        let mut plan = make_plan();
+        plan.questions_enabled = true;
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+            &[],
+        );
+
+        // Header + a few load-bearing markers from the §17 spec text.
+        assert!(prompt.contains("## Asking the user a question"));
+        assert!(prompt.contains("This plan has questions enabled"));
+        assert!(prompt.contains("ralph question ask"));
+        assert!(prompt.contains("Most decisions belong in the plan"));
+
+        // The ask-instruction sits AFTER the focus instruction so it's the
+        // last body section before any suffix wraps.
+        let focus_pos = prompt.find("Only modify files").unwrap();
+        let ask_pos = prompt.find("## Asking the user a question").unwrap();
+        assert!(focus_pos < ask_pos);
+    }
+
+    #[test]
+    fn test_question_ask_instruction_absent_when_questions_disabled() {
+        let plan = make_plan(); // questions_enabled defaults to false
+        assert!(!plan.questions_enabled);
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+            &[],
+        );
+
+        // No header, and no body text from the §17 ask block.
+        assert!(!prompt.contains("## Asking the user a question"));
+        assert!(!prompt.contains("This plan has questions enabled"));
+        // The body text uses unique phrasing — make sure it's gone too.
+        assert!(!prompt.contains("Most decisions belong in the plan"));
+    }
+
+    #[test]
+    fn test_previously_answered_questions_section_renders_qa_pairs() {
+        let plan = make_plan();
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+        let answered = vec![
+            AnsweredQuestion {
+                question: "Should this use Postgres or SQLite?".to_string(),
+                answer: "SQLite (already a dep)".to_string(),
+            },
+            AnsweredQuestion {
+                question: "Pick a logging crate.".to_string(),
+                answer: "tracing".to_string(),
+            },
+        ];
+
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+            &answered,
+        );
+
+        // Section heading is present.
+        assert!(prompt.contains("## Previously answered questions"));
+        // Each Q&A pair renders as a `> Q:` / `> A:` blockquote pair.
+        assert!(prompt.contains("> Q: Should this use Postgres or SQLite?"));
+        assert!(prompt.contains("> A: SQLite (already a dep)"));
+        assert!(prompt.contains("> Q: Pick a logging crate."));
+        assert!(prompt.contains("> A: tracing"));
+
+        // The section sits between Plan context and Step details.
+        let plan_pos = prompt.find("# Plan:").unwrap();
+        let answered_pos = prompt.find("## Previously answered questions").unwrap();
+        let step_pos = prompt.find("## Your step").unwrap();
+        assert!(plan_pos < answered_pos);
+        assert!(answered_pos < step_pos);
+
+        // Pairs render in the order supplied (chronological).
+        let q1_pos = prompt.find("Postgres or SQLite").unwrap();
+        let q2_pos = prompt.find("Pick a logging crate").unwrap();
+        assert!(q1_pos < q2_pos);
+    }
+
+    #[test]
+    fn test_previously_answered_questions_absent_when_empty() {
+        let plan = make_plan();
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+            &[],
+        );
+
+        assert!(!prompt.contains("## Previously answered questions"));
+        // No stray blockquote markers from this section either.
+        assert!(!prompt.contains("> Q:"));
+        assert!(!prompt.contains("> A:"));
+    }
+
+    #[test]
+    fn test_question_features_independent() {
+        // The "Previously answered questions" section is gated on the
+        // `answered_questions` slice, NOT on `questions_enabled`. If a plan
+        // had questions enabled, got answers, and then the user toggled the
+        // flag off, we still want the harness to see the answers it received
+        // on the prior attempt — otherwise the user's input is silently
+        // dropped from the next retry. Conversely, enabling questions on a
+        // fresh plan must not synthesize an empty section.
+        let mut plan = make_plan();
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+        let answered = vec![AnsweredQuestion {
+            question: "Q?".to_string(),
+            answer: "A.".to_string(),
+        }];
+
+        // Case 1: questions disabled, but answers exist (toggled-off-after-
+        // answering). Section IS rendered; ask-instruction is NOT.
+        plan.questions_enabled = false;
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+            &answered,
+        );
+        assert!(prompt.contains("## Previously answered questions"));
+        assert!(!prompt.contains("## Asking the user a question"));
+
+        // Case 2: questions enabled, but no answers yet. Ask-instruction IS
+        // rendered; previously-answered section is NOT.
+        plan.questions_enabled = true;
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &PromptWraps::default(),
+            &[],
+        );
+        assert!(!prompt.contains("## Previously answered questions"));
+        assert!(prompt.contains("## Asking the user a question"));
     }
 }

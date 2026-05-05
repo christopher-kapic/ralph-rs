@@ -23,7 +23,11 @@ pub struct Cli {
     pub harness: Option<String>,
 
     /// Emit machine-readable JSON output instead of human-readable text.
-    #[arg(long, global = true)]
+    ///
+    /// `--jsonl` is accepted as a strict alias: NDJSON and JSONL are the
+    /// same format, and the alias exists so meta-harnesses can spell the
+    /// flag the way they expect.
+    #[arg(long, alias = "jsonl", global = true)]
     pub json: bool,
 
     /// Suppress progress and banner output.
@@ -34,8 +38,16 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_color: bool,
 
+    /// Force non-interactive mode: skip the TUI and emit plain scripted
+    /// output even from a TTY. Auto-set when stdout is not a TTY.
+    #[arg(long, global = true)]
+    pub non_interactive: bool,
+
+    /// `None` means the user invoked bare `ralph` with no subcommand. From a
+    /// TTY the dispatcher routes this to the TUI plan-list view (TUI-plan.md
+    /// §2). With stdout piped, `main` falls back to printing clap's help.
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -249,6 +261,14 @@ pub enum Command {
         lines: Option<usize>,
     },
 
+    /// Ask the user a question or list/answer outstanding questions on a plan.
+    ///
+    /// `ralph question ask` is invoked by the harness mid-step to pause for
+    /// clarification on a per-plan opt-in question feature. See TUI-plan.md
+    /// §17 for the full design.
+    #[command(subcommand)]
+    Question(QuestionCommand),
+
     /// List and manage agent file templates.
     #[command(subcommand)]
     Agents(AgentsCommand),
@@ -430,6 +450,18 @@ pub enum PlanCommand {
     /// top of every step's prompt).
     #[command(subcommand)]
     Prepend(PlanPrependCommand),
+
+    /// Toggle the pause-for-question feature for a plan.
+    ///
+    /// `ralph plan questions on <slug>` enables the feature; off disables it.
+    /// Mirrors the `Q` keybinding in the TUI plan list.
+    Questions {
+        /// `on` to enable, `off` to disable.
+        state: QuestionsState,
+
+        /// Plan slug.
+        slug: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -820,6 +852,67 @@ pub enum PlanPrependCommand {
 }
 
 // ---------------------------------------------------------------------------
+// Question subcommands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum QuestionCommand {
+    /// Record a harness-asked question against the currently-executing step.
+    ///
+    /// Designed to be invoked by the harness mid-step. Binds to the live
+    /// `ralph run` for this project via the run lock; if no run is active,
+    /// or the plan does not have questions enabled, exits non-zero with an
+    /// explanatory message and writes nothing to the database.
+    Ask {
+        /// The question text. If omitted, read from stdin.
+        question: Option<String>,
+
+        /// A suggested answer. Repeatable. The user can always type a custom
+        /// answer; suggestions are hints, not a closed set.
+        #[arg(long = "suggest", short = 's', value_name = "ANSWER")]
+        suggest: Vec<String>,
+    },
+
+    /// List open (unanswered) questions for the current project.
+    ///
+    /// Output is numbered 1..N — those numbers are the input expected by
+    /// `ralph question answer` and `ralph question show`. Order is by
+    /// `asked_at` ASC then `id`, so a question's index does not change as
+    /// new questions arrive.
+    List {
+        /// Filter to questions on a specific plan slug. Without this, all
+        /// open questions on plans for the current project are listed.
+        plan: Option<String>,
+    },
+
+    /// Answer a specific open question by its index in `ralph question list`.
+    Answer {
+        /// 1-based index from `ralph question list`.
+        num: usize,
+
+        /// Answer text. If omitted, read from stdin (heredoc-friendly).
+        text: Option<String>,
+    },
+
+    /// Print a question's full text and any harness-supplied suggestions,
+    /// identified by its index in `ralph question list`.
+    Show {
+        /// 1-based index from `ralph question list`.
+        num: usize,
+    },
+}
+
+/// `on` / `off` value enum for `ralph plan questions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum QuestionsState {
+    /// Enable the per-plan pause-for-question feature.
+    On,
+    /// Disable the feature (the default for new plans).
+    Off,
+}
+
+// ---------------------------------------------------------------------------
 // Agents subcommands
 // ---------------------------------------------------------------------------
 
@@ -1027,7 +1120,26 @@ mod tests {
     #[test]
     fn test_parse_init() {
         let cli = Cli::try_parse_from(["ralph-rs", "init"]).unwrap();
-        assert!(matches!(cli.command, Command::Init { .. }));
+        assert!(matches!(cli.command.unwrap(), Command::Init { .. }));
+    }
+
+    #[test]
+    fn test_parse_bare_ralph_yields_none_command() {
+        // Bare `ralph` with no subcommand parses successfully and leaves
+        // `command` empty so main can route to the TUI plan-list view.
+        let cli = Cli::try_parse_from(["ralph-rs"]).unwrap();
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_parse_bare_ralph_with_global_flags() {
+        // Global flags without a subcommand still parse and leave `command`
+        // empty — main applies the routing rules from there.
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "--project", "/tmp", "--non-interactive"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(cli.non_interactive);
+        assert_eq!(cli.project.unwrap().to_str().unwrap(), "/tmp");
     }
 
     #[test]
@@ -1049,7 +1161,7 @@ mod tests {
             description,
             branch,
             ..
-        }) = cli.command
+        }) = cli.command.unwrap()
         {
             assert_eq!(slug, "my-feature");
             assert_eq!(description.as_deref(), Some("Add feature X"));
@@ -1062,7 +1174,7 @@ mod tests {
     #[test]
     fn test_parse_plan_list() {
         let cli = Cli::try_parse_from(["ralph-rs", "plan", "list", "--all"]).unwrap();
-        if let Command::Plan(PlanCommand::List { all, .. }) = cli.command {
+        if let Command::Plan(PlanCommand::List { all, .. }) = cli.command.unwrap() {
             assert!(all);
         } else {
             panic!("Expected Plan List");
@@ -1087,7 +1199,7 @@ mod tests {
             plan,
             description,
             ..
-        }) = cli.command
+        }) = cli.command.unwrap()
         {
             assert_eq!(title.as_deref(), Some("Implement parser"));
             assert_eq!(plan.as_deref(), Some("my-feature"));
@@ -1102,7 +1214,7 @@ mod tests {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "add", "--import-json", "-"]).unwrap();
         if let Command::Step(StepCommand::Add {
             title, import_json, ..
-        }) = cli.command
+        }) = cli.command.unwrap()
         {
             assert!(title.is_none());
             assert_eq!(import_json.as_deref(), Some("-"));
@@ -1130,7 +1242,7 @@ mod tests {
             plan,
             import_json,
             ..
-        }) = cli.command
+        }) = cli.command.unwrap()
         {
             assert_eq!(title.as_deref(), Some("my-plan"));
             assert!(plan.is_none());
@@ -1164,7 +1276,7 @@ mod tests {
     #[test]
     fn test_parse_run() {
         let cli = Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--all"]).unwrap();
-        if let Command::Run { plan, all, .. } = cli.command {
+        if let Command::Run { plan, all, .. } = cli.command.unwrap() {
             assert_eq!(plan.as_deref(), Some("my-feature"));
             assert!(all);
         } else {
@@ -1175,7 +1287,7 @@ mod tests {
     #[test]
     fn test_parse_run_one() {
         let cli = Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--one"]).unwrap();
-        if let Command::Run { plan, one, all, .. } = cli.command {
+        if let Command::Run { plan, one, all, .. } = cli.command.unwrap() {
             assert_eq!(plan.as_deref(), Some("my-feature"));
             assert!(one);
             assert!(!all);
@@ -1187,7 +1299,7 @@ mod tests {
     #[test]
     fn test_parse_run_single_alias() {
         let cli = Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--single"]).unwrap();
-        if let Command::Run { one, .. } = cli.command {
+        if let Command::Run { one, .. } = cli.command.unwrap() {
             assert!(one);
         } else {
             panic!("Expected Run");
@@ -1197,7 +1309,7 @@ mod tests {
     #[test]
     fn test_parse_run_all_plans() {
         let cli = Cli::try_parse_from(["ralph-rs", "run", "--all"]).unwrap();
-        if let Command::Run { all, one, .. } = cli.command {
+        if let Command::Run { all, one, .. } = cli.command.unwrap() {
             assert!(all);
             assert!(!one);
         } else {
@@ -1222,7 +1334,7 @@ mod tests {
             plan,
             current_branch,
             ..
-        } = cli.command
+        } = cli.command.unwrap()
         {
             assert_eq!(plan.as_deref(), Some("my-feature"));
             assert!(current_branch);
@@ -1237,7 +1349,7 @@ mod tests {
         // a single run. Default is "opt-out" now (the old flag was
         // `--auto-stash` and defaulted off).
         let cli = Cli::try_parse_from(["ralph-rs", "run", "--no-auto-stash"]).unwrap();
-        if let Command::Run { no_auto_stash, .. } = cli.command {
+        if let Command::Run { no_auto_stash, .. } = cli.command.unwrap() {
             assert!(no_auto_stash);
         } else {
             panic!("Expected Run");
@@ -1245,7 +1357,7 @@ mod tests {
 
         // Default must leave `no_auto_stash` false (i.e. auto-stash is on).
         let cli = Cli::try_parse_from(["ralph-rs", "run"]).unwrap();
-        if let Command::Run { no_auto_stash, .. } = cli.command {
+        if let Command::Run { no_auto_stash, .. } = cli.command.unwrap() {
             assert!(!no_auto_stash);
         } else {
             panic!("Expected Run");
@@ -1268,7 +1380,7 @@ mod tests {
 
         if let Command::Plan(PlanCommand::Create {
             slug, depends_on, ..
-        }) = cli.command
+        }) = cli.command.unwrap()
         {
             assert_eq!(slug, "my-feature");
             assert_eq!(depends_on, vec!["a".to_string(), "b".to_string()]);
@@ -1293,7 +1405,7 @@ mod tests {
         if let Command::Plan(PlanCommand::Dependency(PlanDependencyCommand::Add {
             slug,
             depends_on,
-        })) = cli.command
+        })) = cli.command.unwrap()
         {
             assert_eq!(slug, "foo");
             assert_eq!(depends_on, vec!["bar".to_string()]);
@@ -1327,7 +1439,7 @@ mod tests {
         if let Command::Plan(PlanCommand::Dependency(PlanDependencyCommand::Remove {
             slug,
             depends_on,
-        })) = cli.command
+        })) = cli.command.unwrap()
         {
             assert_eq!(slug, "foo");
             assert_eq!(depends_on, vec!["bar".to_string(), "baz".to_string()]);
@@ -1340,7 +1452,7 @@ mod tests {
     fn test_parse_plan_dependency_list() {
         let cli = Cli::try_parse_from(["ralph-rs", "plan", "dependency", "list", "foo"]).unwrap();
         if let Command::Plan(PlanCommand::Dependency(PlanDependencyCommand::List { slug })) =
-            cli.command
+            cli.command.unwrap()
         {
             assert_eq!(slug, "foo");
         } else {
@@ -1351,13 +1463,13 @@ mod tests {
     #[test]
     fn test_parse_resume() {
         let cli = Cli::try_parse_from(["ralph-rs", "resume"]).unwrap();
-        assert!(matches!(cli.command, Command::Resume { .. }));
+        assert!(matches!(cli.command.unwrap(), Command::Resume { .. }));
     }
 
     #[test]
     fn test_parse_skip() {
         let cli = Cli::try_parse_from(["ralph-rs", "skip", "--step", "3"]).unwrap();
-        if let Command::Skip { step, .. } = cli.command {
+        if let Command::Skip { step, .. } = cli.command.unwrap() {
             assert_eq!(step, Some(3));
         } else {
             panic!("Expected Skip");
@@ -1371,7 +1483,7 @@ mod tests {
             plan,
             force,
             timeout,
-        } = cli.command
+        } = cli.command.unwrap()
         {
             assert!(plan.is_none());
             assert!(!force);
@@ -1388,7 +1500,7 @@ mod tests {
             plan,
             force,
             timeout,
-        } = cli.command
+        } = cli.command.unwrap()
         {
             assert_eq!(plan.as_deref(), Some("myplan"));
             assert!(!force);
@@ -1401,7 +1513,7 @@ mod tests {
     #[test]
     fn test_parse_cancel_force() {
         let cli = Cli::try_parse_from(["ralph-rs", "cancel", "--force"]).unwrap();
-        if let Command::Cancel { force, .. } = cli.command {
+        if let Command::Cancel { force, .. } = cli.command.unwrap() {
             assert!(force);
         } else {
             panic!("Expected Cancel");
@@ -1411,7 +1523,7 @@ mod tests {
     #[test]
     fn test_parse_cancel_timeout() {
         let cli = Cli::try_parse_from(["ralph-rs", "cancel", "--timeout", "30"]).unwrap();
-        if let Command::Cancel { timeout, .. } = cli.command {
+        if let Command::Cancel { timeout, .. } = cli.command.unwrap() {
             assert_eq!(timeout, 30);
         } else {
             panic!("Expected Cancel");
@@ -1422,7 +1534,7 @@ mod tests {
     fn test_parse_export() {
         let cli = Cli::try_parse_from(["ralph-rs", "export", "my-plan", "--output", "plan.json"])
             .unwrap();
-        if let Command::Export { plan, output } = cli.command {
+        if let Command::Export { plan, output } = cli.command.unwrap() {
             assert_eq!(plan, "my-plan");
             assert_eq!(output.unwrap().to_str().unwrap(), "plan.json");
         } else {
@@ -1433,7 +1545,7 @@ mod tests {
     #[test]
     fn test_parse_import() {
         let cli = Cli::try_parse_from(["ralph-rs", "import", "plan.json"]).unwrap();
-        if let Command::Import { file, .. } = cli.command {
+        if let Command::Import { file, .. } = cli.command.unwrap() {
             assert_eq!(file.to_str().unwrap(), "plan.json");
         } else {
             panic!("Expected Import");
@@ -1443,7 +1555,7 @@ mod tests {
     #[test]
     fn test_parse_status() {
         let cli = Cli::try_parse_from(["ralph-rs", "status", "--verbose"]).unwrap();
-        if let Command::Status { verbose, .. } = cli.command {
+        if let Command::Status { verbose, .. } = cli.command.unwrap() {
             assert!(verbose);
         } else {
             panic!("Expected Status");
@@ -1453,7 +1565,7 @@ mod tests {
     #[test]
     fn test_parse_log() {
         let cli = Cli::try_parse_from(["ralph-rs", "log", "--step", "2", "--limit", "10"]).unwrap();
-        if let Command::Log { step, limit, .. } = cli.command {
+        if let Command::Log { step, limit, .. } = cli.command.unwrap() {
             assert_eq!(step, Some(2));
             assert_eq!(limit, Some(10));
         } else {
@@ -1464,20 +1576,23 @@ mod tests {
     #[test]
     fn test_parse_doctor() {
         let cli = Cli::try_parse_from(["ralph-rs", "doctor"]).unwrap();
-        assert!(matches!(cli.command, Command::Doctor));
+        assert!(matches!(cli.command.unwrap(), Command::Doctor));
     }
 
     #[test]
     fn test_parse_agents_list() {
         let cli = Cli::try_parse_from(["ralph-rs", "agents", "list"]).unwrap();
-        assert!(matches!(cli.command, Command::Agents(AgentsCommand::List)));
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Agents(AgentsCommand::List)
+        ));
     }
 
     #[test]
     fn test_parse_plan_harness_set() {
         let cli = Cli::try_parse_from(["ralph-rs", "plan", "harness", "set", "codex"]).unwrap();
         if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Set { harness, plan })) =
-            cli.command
+            cli.command.unwrap()
         {
             assert_eq!(harness, "codex");
             assert!(plan.is_none());
@@ -1491,7 +1606,7 @@ mod tests {
         let cli = Cli::try_parse_from(["ralph-rs", "plan", "harness", "set", "codex", "my-plan"])
             .unwrap();
         if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Set { harness, plan })) =
-            cli.command
+            cli.command.unwrap()
         {
             assert_eq!(harness, "codex");
             assert_eq!(plan.as_deref(), Some("my-plan"));
@@ -1512,7 +1627,8 @@ mod tests {
     #[test]
     fn test_parse_plan_harness_show() {
         let cli = Cli::try_parse_from(["ralph-rs", "plan", "harness", "show"]).unwrap();
-        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) = cli.command
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) =
+            cli.command.unwrap()
         {
             assert!(plan.is_none());
         } else {
@@ -1523,7 +1639,8 @@ mod tests {
     #[test]
     fn test_parse_plan_harness_show_with_positional_plan() {
         let cli = Cli::try_parse_from(["ralph-rs", "plan", "harness", "show", "my-plan"]).unwrap();
-        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) = cli.command
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) =
+            cli.command.unwrap()
         {
             assert_eq!(plan.as_deref(), Some("my-plan"));
         } else {
@@ -1546,7 +1663,7 @@ mod tests {
             description,
             plan,
             ..
-        })) = cli.command
+        })) = cli.command.unwrap()
         {
             assert_eq!(description.as_deref(), Some("Add feature X"));
             assert!(plan.is_none());
@@ -1570,7 +1687,7 @@ mod tests {
             description,
             plan,
             ..
-        })) = cli.command
+        })) = cli.command.unwrap()
         {
             assert_eq!(description.as_deref(), Some("Add feature X"));
             assert_eq!(plan.as_deref(), Some("my-plan"));
@@ -1607,6 +1724,26 @@ mod tests {
     }
 
     #[test]
+    fn test_global_non_interactive_flag() {
+        let cli = Cli::try_parse_from(["ralph-rs", "--non-interactive", "plan", "list"]).unwrap();
+        assert!(cli.non_interactive);
+
+        // Default is false.
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "list"]).unwrap();
+        assert!(!cli.non_interactive);
+    }
+
+    #[test]
+    fn test_global_jsonl_alias_for_json() {
+        // Both spellings populate the same `json` field.
+        let cli = Cli::try_parse_from(["ralph-rs", "--json", "run"]).unwrap();
+        assert!(cli.json);
+
+        let cli = Cli::try_parse_from(["ralph-rs", "--jsonl", "run"]).unwrap();
+        assert!(cli.json);
+    }
+
+    #[test]
     fn test_run_subcommand_captures_harness_flag() {
         // The Run subcommand must carry its own harness field so main.rs can
         // honor per-subcommand overrides. clap's `global = true` on the top
@@ -1624,7 +1761,7 @@ mod tests {
         if let Command::Run {
             harness: run_harness,
             ..
-        } = cli.command
+        } = cli.command.unwrap()
         {
             assert_eq!(run_harness.as_deref(), Some("claude"));
         } else {
@@ -1652,7 +1789,7 @@ mod tests {
     #[test]
     fn test_step_move() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "move", "3", "--to", "1"]).unwrap();
-        if let Command::Step(StepCommand::Move { step, to, .. }) = cli.command {
+        if let Command::Step(StepCommand::Move { step, to, .. }) = cli.command.unwrap() {
             assert_eq!(step, Some(3));
             assert_eq!(to, 1);
         } else {
@@ -1663,7 +1800,7 @@ mod tests {
     #[test]
     fn test_step_reset() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "reset", "2"]).unwrap();
-        if let Command::Step(StepCommand::Reset { step, .. }) = cli.command {
+        if let Command::Step(StepCommand::Reset { step, .. }) = cli.command.unwrap() {
             assert_eq!(step, Some(2));
         } else {
             panic!("Expected Step Reset");
@@ -1673,7 +1810,7 @@ mod tests {
     #[test]
     fn test_step_remove() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "remove", "1", "--force"]).unwrap();
-        if let Command::Step(StepCommand::Remove { step, force, .. }) = cli.command {
+        if let Command::Step(StepCommand::Remove { step, force, .. }) = cli.command.unwrap() {
             assert_eq!(step, Some(1));
             assert!(force);
         } else {
@@ -1685,7 +1822,7 @@ mod tests {
     fn test_plan_delete() {
         let cli =
             Cli::try_parse_from(["ralph-rs", "plan", "delete", "old-plan", "--force"]).unwrap();
-        if let Command::Plan(PlanCommand::Delete { slug, force }) = cli.command {
+        if let Command::Plan(PlanCommand::Delete { slug, force }) = cli.command.unwrap() {
             assert_eq!(slug, "old-plan");
             assert!(force);
         } else {
@@ -1696,7 +1833,7 @@ mod tests {
     #[test]
     fn test_plan_delete_yes_alias() {
         let cli = Cli::try_parse_from(["ralph-rs", "plan", "delete", "old-plan", "--yes"]).unwrap();
-        if let Command::Plan(PlanCommand::Delete { slug, force }) = cli.command {
+        if let Command::Plan(PlanCommand::Delete { slug, force }) = cli.command.unwrap() {
             assert_eq!(slug, "old-plan");
             assert!(force);
         } else {
@@ -1707,7 +1844,7 @@ mod tests {
     #[test]
     fn test_step_remove_yes_alias() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "remove", "1", "--yes"]).unwrap();
-        if let Command::Step(StepCommand::Remove { step, force, .. }) = cli.command {
+        if let Command::Step(StepCommand::Remove { step, force, .. }) = cli.command.unwrap() {
             assert_eq!(step, Some(1));
             assert!(force);
         } else {
@@ -1719,7 +1856,7 @@ mod tests {
     fn test_plan_list_status_value_enum() {
         let cli =
             Cli::try_parse_from(["ralph-rs", "plan", "list", "--status", "in_progress"]).unwrap();
-        if let Command::Plan(PlanCommand::List { status, .. }) = cli.command {
+        if let Command::Plan(PlanCommand::List { status, .. }) = cli.command.unwrap() {
             assert_eq!(status, Some(crate::plan::PlanStatus::InProgress));
         } else {
             panic!("Expected Plan List");
@@ -1745,7 +1882,7 @@ mod tests {
             "echo hello",
         ])
         .unwrap();
-        if let Command::Hooks(HooksCommand::Add { lifecycle, .. }) = cli.command {
+        if let Command::Hooks(HooksCommand::Add { lifecycle, .. }) = cli.command.unwrap() {
             assert_eq!(lifecycle, crate::hook_library::Lifecycle::PreStep);
         } else {
             panic!("Expected Hooks Add");
@@ -1781,7 +1918,7 @@ mod tests {
             "my-hook",
         ])
         .unwrap();
-        if let Command::Step(StepCommand::SetHook { lifecycle, .. }) = cli.command {
+        if let Command::Step(StepCommand::SetHook { lifecycle, .. }) = cli.command.unwrap() {
             assert_eq!(lifecycle, crate::hook_library::Lifecycle::PostTest);
         } else {
             panic!("Expected Step SetHook");
@@ -1815,7 +1952,7 @@ mod tests {
             "optional",
         ])
         .unwrap();
-        if let Command::Step(StepCommand::Add { change_policy, .. }) = cli.command {
+        if let Command::Step(StepCommand::Add { change_policy, .. }) = cli.command.unwrap() {
             assert_eq!(change_policy, Some(crate::plan::ChangePolicy::Optional));
         } else {
             panic!("Expected Step Add");
@@ -1827,7 +1964,7 @@ mod tests {
         // Without the flag, the parsed value is None (the handler treats this
         // as "use default" = Required).
         let cli = Cli::try_parse_from(["ralph-rs", "step", "add", "Implement"]).unwrap();
-        if let Command::Step(StepCommand::Add { change_policy, .. }) = cli.command {
+        if let Command::Step(StepCommand::Add { change_policy, .. }) = cli.command.unwrap() {
             assert!(change_policy.is_none());
         } else {
             panic!("Expected Step Add");
@@ -1858,11 +1995,143 @@ mod tests {
             "required",
         ])
         .unwrap();
-        if let Command::Step(StepCommand::Edit { change_policy, .. }) = cli.command {
+        if let Command::Step(StepCommand::Edit { change_policy, .. }) = cli.command.unwrap() {
             assert_eq!(change_policy, Some(crate::plan::ChangePolicy::Required));
         } else {
             panic!("Expected Step Edit");
         }
+    }
+
+    #[test]
+    fn test_parse_question_ask_positional() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "question",
+            "ask",
+            "Should I use Postgres or SQLite?",
+            "--suggest",
+            "PostgreSQL",
+            "-s",
+            "SQLite",
+        ])
+        .unwrap();
+        if let Command::Question(QuestionCommand::Ask { question, suggest }) = cli.command.unwrap()
+        {
+            assert_eq!(
+                question.as_deref(),
+                Some("Should I use Postgres or SQLite?")
+            );
+            assert_eq!(
+                suggest,
+                vec!["PostgreSQL".to_string(), "SQLite".to_string()]
+            );
+        } else {
+            panic!("Expected Question Ask");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_ask_no_positional_no_suggestions() {
+        // Both the positional and the `-s` flag must be optional so the
+        // stdin-only / open-ended cases parse cleanly.
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "ask"]).unwrap();
+        if let Command::Question(QuestionCommand::Ask { question, suggest }) = cli.command.unwrap()
+        {
+            assert!(question.is_none());
+            assert!(suggest.is_empty());
+        } else {
+            panic!("Expected Question Ask");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_list_no_plan() {
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "list"]).unwrap();
+        if let Command::Question(QuestionCommand::List { plan }) = cli.command.unwrap() {
+            assert!(plan.is_none());
+        } else {
+            panic!("Expected Question List");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_list_with_plan() {
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "list", "my-plan"]).unwrap();
+        if let Command::Question(QuestionCommand::List { plan }) = cli.command.unwrap() {
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+        } else {
+            panic!("Expected Question List");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_answer() {
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "question", "answer", "3", "use Postgres"]).unwrap();
+        if let Command::Question(QuestionCommand::Answer { num, text }) = cli.command.unwrap() {
+            assert_eq!(num, 3);
+            assert_eq!(text.as_deref(), Some("use Postgres"));
+        } else {
+            panic!("Expected Question Answer");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_answer_text_optional_for_stdin() {
+        // Omitting the text positional must still parse so the dispatcher can
+        // fall back to stdin (heredoc-friendly invocation).
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "answer", "1"]).unwrap();
+        if let Command::Question(QuestionCommand::Answer { num, text }) = cli.command.unwrap() {
+            assert_eq!(num, 1);
+            assert!(text.is_none());
+        } else {
+            panic!("Expected Question Answer");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_show() {
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "show", "2"]).unwrap();
+        if let Command::Question(QuestionCommand::Show { num }) = cli.command.unwrap() {
+            assert_eq!(num, 2);
+        } else {
+            panic!("Expected Question Show");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_questions_on() {
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "questions", "on", "my-plan"]).unwrap();
+        if let Command::Plan(PlanCommand::Questions { state, slug }) = cli.command.unwrap() {
+            assert_eq!(state, QuestionsState::On);
+            assert_eq!(slug, "my-plan");
+        } else {
+            panic!("Expected Plan Questions");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_questions_off() {
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "questions", "off", "my-plan"]).unwrap();
+        if let Command::Plan(PlanCommand::Questions { state, slug }) = cli.command.unwrap() {
+            assert_eq!(state, QuestionsState::Off);
+            assert_eq!(slug, "my-plan");
+        } else {
+            panic!("Expected Plan Questions");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_questions_invalid_state_rejected() {
+        // Only `on`/`off` are valid; anything else must be rejected by clap.
+        let result = Cli::try_parse_from(["ralph-rs", "plan", "questions", "maybe", "my-plan"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_plan_questions_requires_slug() {
+        let result = Cli::try_parse_from(["ralph-rs", "plan", "questions", "on"]);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1878,7 +2147,7 @@ mod tests {
             "my-hook",
         ])
         .unwrap();
-        if let Command::Plan(PlanCommand::SetHook { lifecycle, .. }) = cli.command {
+        if let Command::Plan(PlanCommand::SetHook { lifecycle, .. }) = cli.command.unwrap() {
             assert_eq!(lifecycle, crate::hook_library::Lifecycle::PreTest);
         } else {
             panic!("Expected Plan SetHook");

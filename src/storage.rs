@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 use crate::frac_index;
 use crate::plan::{
-    ChangePolicy, ExecutionLog, PLAN_COLUMNS, Phase, Plan, PlanStatus, Step, StepStatus,
+    AnsweredQuestion, ChangePolicy, ExecutionLog, PLAN_COLUMNS, Phase, Plan, PlanStatus, Step,
+    StepStatus,
 };
 use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 
@@ -142,6 +143,115 @@ pub fn list_plans(conn: &Connection, project: &str, all: bool) -> Result<Vec<Pla
     Ok(plans)
 }
 
+/// List non-archived plans for a project, sorted by recency.
+///
+/// "Recency" is `MAX(execution_logs.started_at)` joined through
+/// `steps.plan_id`, falling back to `plans.created_at` when the plan has no
+/// execution logs yet. Most recent first. Archived plans are excluded.
+///
+/// Drives the TUI plan-list view (TUI-plan.md §5).
+pub fn list_plans_sorted_by_recency(conn: &Connection, project: &str) -> Result<Vec<Plan>> {
+    // Project the plan columns through the LEFT-JOIN with an alias so the
+    // index positions seen by `Plan::from_row` line up with PLAN_COLUMNS.
+    let plan_cols = PLAN_COLUMNS
+        .split(", ")
+        .map(|c| format!("p.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT {plan_cols} \
+         FROM plans p \
+         LEFT JOIN ( \
+             SELECT s.plan_id AS plan_id, MAX(l.started_at) AS last_run \
+             FROM steps s JOIN execution_logs l ON l.step_id = s.id \
+             GROUP BY s.plan_id \
+         ) lr ON lr.plan_id = p.id \
+         WHERE p.project = ?1 AND p.status != ?2 \
+         ORDER BY COALESCE(lr.last_run, p.created_at) DESC, p.created_at DESC"
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let rows = stmt.query_map(
+        params![project, PlanStatus::Archived.as_str()],
+        Plan::from_row,
+    )?;
+    let mut plans = Vec::new();
+    for row in rows {
+        plans.push(row?);
+    }
+    Ok(plans)
+}
+
+/// List archived plans for a project, sorted by recency.
+///
+/// Mirror of [`list_plans_sorted_by_recency`] for the archived plan list view
+/// (TUI-plan.md §6): same recency ordering, but the `WHERE` clause keeps only
+/// plans whose `status = 'archived'`.
+pub fn list_archived_plans_sorted_by_recency(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<Plan>> {
+    let plan_cols = PLAN_COLUMNS
+        .split(", ")
+        .map(|c| format!("p.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT {plan_cols} \
+         FROM plans p \
+         LEFT JOIN ( \
+             SELECT s.plan_id AS plan_id, MAX(l.started_at) AS last_run \
+             FROM steps s JOIN execution_logs l ON l.step_id = s.id \
+             GROUP BY s.plan_id \
+         ) lr ON lr.plan_id = p.id \
+         WHERE p.project = ?1 AND p.status = ?2 \
+         ORDER BY COALESCE(lr.last_run, p.created_at) DESC, p.created_at DESC"
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let rows = stmt.query_map(
+        params![project, PlanStatus::Archived.as_str()],
+        Plan::from_row,
+    )?;
+    let mut plans = Vec::new();
+    for row in rows {
+        plans.push(row?);
+    }
+    Ok(plans)
+}
+
+/// Number of archived plans for a project. Drives the conditional "Archived
+/// (N)" tile rendered at the bottom of the plan-list view (TUI-plan.md §5).
+pub fn count_archived_plans(conn: &Connection, project: &str) -> Result<u32> {
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM plans WHERE project = ?1 AND status = ?2")?;
+    let n: i64 = stmt.query_row(params![project, PlanStatus::Archived.as_str()], |r| {
+        r.get(0)
+    })?;
+    Ok(n as u32)
+}
+
+/// Most recent `execution_logs.started_at` across every step of `plan_id`,
+/// or `None` when the plan has no logged attempts. Used to drive the
+/// "Ran <date>" / "Created <date>" prefix on plan-list tiles.
+pub fn last_log_started_at_for_plan(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let mut stmt = conn.prepare(
+        "SELECT MAX(el.started_at) FROM execution_logs el \
+         JOIN steps s ON s.id = el.step_id \
+         WHERE s.plan_id = ?1",
+    )?;
+    let row: Option<String> = stmt.query_row(params![plan_id], |r| r.get(0))?;
+    match row {
+        Some(s) => {
+            let parsed = s
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .with_context(|| format!("parse execution_logs.started_at: {s}"))?;
+            Ok(Some(parsed))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Update a plan's status and set updated_at to now.
 pub fn update_plan_status(conn: &Connection, plan_id: &str, status: PlanStatus) -> Result<()> {
     let affected = conn.execute(
@@ -153,6 +263,209 @@ pub fn update_plan_status(conn: &Connection, plan_id: &str, status: PlanStatus) 
         anyhow::bail!("Plan not found: {plan_id}");
     }
     Ok(())
+}
+
+/// Set the `plans.questions_enabled` flag and bump `updated_at`.
+///
+/// Drives the `Q` keybinding in the TUI plan list (TUI-plan.md §17) and the
+/// `ralph plan questions on|off` CLI commands. SQLite has no native bool, so
+/// the value is stored as INTEGER 0/1.
+pub fn set_plan_questions_enabled(conn: &Connection, plan_id: &str, enabled: bool) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET questions_enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![enabled as i64, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// One open (unanswered) `step_questions` row enriched with the plan + step
+/// context the CLI list/show commands need to render. Driven by
+/// [`list_open_questions`].
+///
+/// `step_id` and `plan_id` are exposed for upcoming runner + TUI consumers
+/// (TUI-plan.md §17 steps 42–43, which need to scope by plan id and locate
+/// the originating step row).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct OpenQuestion {
+    pub id: String,
+    pub step_id: String,
+    pub plan_id: String,
+    pub plan_slug: String,
+    /// 1-based position of the step within its plan (matches the numbering
+    /// shown by `ralph step list`).
+    pub step_num: usize,
+    pub step_title: String,
+    pub attempt: i32,
+    pub question: String,
+    pub suggestions: Vec<String>,
+    pub asked_at: String,
+}
+
+/// List unanswered questions for plans in `project`, optionally filtered to a
+/// single plan slug. Ordered by `asked_at` ASC then `id` ASC so the index of
+/// any given question is stable as new questions arrive.
+pub fn list_open_questions(
+    conn: &Connection,
+    project: &str,
+    plan_slug: Option<&str>,
+) -> Result<Vec<OpenQuestion>> {
+    // Compute each step's 1-based position via a window function so the result
+    // matches the numbering users see in `ralph step list`.
+    let base = "WITH step_pos AS (
+            SELECT id, plan_id,
+                   ROW_NUMBER() OVER (PARTITION BY plan_id ORDER BY sort_key) AS step_num
+            FROM steps
+        )
+        SELECT q.id, q.step_id, s.plan_id, p.slug, sp.step_num,
+               s.title, q.attempt, q.question, q.suggestions, q.asked_at
+        FROM step_questions q
+        JOIN steps s ON s.id = q.step_id
+        JOIN plans p ON p.id = s.plan_id
+        JOIN step_pos sp ON sp.id = q.step_id
+        WHERE q.answer IS NULL AND p.project = ?1";
+
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<OpenQuestion> {
+        let suggestions_json: String = row.get(8)?;
+        let suggestions: Vec<String> = serde_json::from_str(&suggestions_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+        let step_num: i64 = row.get(4)?;
+        Ok(OpenQuestion {
+            id: row.get(0)?,
+            step_id: row.get(1)?,
+            plan_id: row.get(2)?,
+            plan_slug: row.get(3)?,
+            step_num: step_num as usize,
+            step_title: row.get(5)?,
+            attempt: row.get(6)?,
+            question: row.get(7)?,
+            suggestions,
+            asked_at: row.get(9)?,
+        })
+    };
+
+    let mut out = Vec::new();
+    if let Some(slug) = plan_slug {
+        let sql = format!("{base} AND p.slug = ?2 ORDER BY q.asked_at ASC, q.id ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![project, slug], map_row)?;
+        for row in rows {
+            out.push(row?);
+        }
+    } else {
+        let sql = format!("{base} ORDER BY q.asked_at ASC, q.id ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![project], map_row)?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
+/// List answered questions for a step in chronological order (oldest first).
+///
+/// Drives the "Previously answered questions" section that the prompt builder
+/// injects between Plan context and Step details on the next attempt after a
+/// pause (TUI-plan.md §17). Rows where `answer IS NULL` are excluded — those
+/// are still pending and would be rendered in a different surface.
+///
+/// Ordering uses `asked_at ASC` then `id ASC` to match
+/// [`list_open_questions`], so the harness sees Q&A pairs in the same sequence
+/// it asked them.
+pub fn list_answered_questions_for_step(
+    conn: &Connection,
+    step_id: &str,
+) -> Result<Vec<AnsweredQuestion>> {
+    let mut stmt = conn.prepare(
+        "SELECT question, answer
+         FROM step_questions
+         WHERE step_id = ?1 AND answer IS NOT NULL
+         ORDER BY asked_at ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![step_id], |row| {
+        Ok(AnsweredQuestion {
+            question: row.get(0)?,
+            answer: row.get(1)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Write an answer to a `step_questions` row, stamping `answered_at` with
+/// the current SQLite UTC time. Errors if no row matches `question_id`.
+pub fn set_question_answer(conn: &Connection, question_id: &str, answer: &str) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE step_questions
+         SET answer = ?1, answered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ?2",
+        params![answer, question_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Question not found: {question_id}");
+    }
+    Ok(())
+}
+
+/// Count unanswered `step_questions` rows for a specific (step, attempt) pair.
+///
+/// Driven by [`crate::executor::execute_step`] after the harness exits to
+/// detect whether the harness called `ralph question ask` during this attempt
+/// (TUI-plan.md §17 "Runner integration"). A non-zero count means the runner
+/// must skip tests + commit, roll back any diff, and pause the plan.
+pub fn count_unanswered_questions_for_attempt(
+    conn: &Connection,
+    step_id: &str,
+    attempt: i32,
+) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM step_questions
+         WHERE step_id = ?1 AND attempt = ?2 AND answer IS NULL",
+        params![step_id, attempt],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Compute the *effective* status of a plan.
+///
+/// Per TUI-plan.md §17, [`PlanStatus::Question`] is a derived state — never
+/// written to the `plans.status` column. A plan reports `Question` whenever
+/// any unanswered `step_questions` row exists for one of its steps; the
+/// underlying lifecycle column un-shadows automatically once the user
+/// answers the last open question.
+///
+/// This helper is the single source of truth for that derivation: read the
+/// stored status, then upgrade to `Question` if any open question exists.
+/// Used by upcoming TUI question surfaces (TUI-plan §17 step 43).
+#[allow(dead_code)]
+pub fn plan_effective_status(conn: &Connection, plan_id: &str) -> Result<PlanStatus> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM step_questions q
+         JOIN steps s ON s.id = q.step_id
+         WHERE s.plan_id = ?1 AND q.answer IS NULL",
+        params![plan_id],
+        |row| row.get(0),
+    )?;
+    if count > 0 {
+        return Ok(PlanStatus::Question);
+    }
+    let status_str: String = conn.query_row(
+        "SELECT status FROM plans WHERE id = ?1",
+        params![plan_id],
+        |row| row.get(0),
+    )?;
+    use std::str::FromStr;
+    PlanStatus::from_str(&status_str)
+        .map_err(|e| anyhow::anyhow!("Invalid plan status '{status_str}' for plan {plan_id}: {e}"))
 }
 
 /// Delete a plan (cascades to steps and execution_logs via FK).
@@ -220,6 +533,25 @@ pub fn set_plan_context_prepend(
     let affected = conn.execute(
         "UPDATE plans SET context_prepend = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
         params![prepend, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// Replace the plan's deterministic test commands. The slice is JSON-encoded
+/// into the `deterministic_tests` column verbatim — empty slice clears the
+/// list (one row of `[]`).
+pub fn set_plan_deterministic_tests(
+    conn: &Connection,
+    plan_id: &str,
+    tests: &[String],
+) -> Result<()> {
+    let tests_json = serde_json::to_string(tests)?;
+    let affected = conn.execute(
+        "UPDATE plans SET deterministic_tests = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![tests_json, plan_id],
     )?;
     if affected == 0 {
         anyhow::bail!("Plan not found: {plan_id}");
@@ -1594,6 +1926,206 @@ mod tests {
     }
 
     #[test]
+    fn test_list_plans_sorted_by_recency_no_logs_uses_created_at() {
+        // With no execution_logs rows, the order should be `created_at DESC`.
+        let conn = setup();
+
+        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        // Force distinct created_at stamps so ordering is deterministic.
+        conn.execute(
+            "UPDATE plans SET created_at = ?1 WHERE id = ?2",
+            params!["2026-01-01T00:00:00.000Z", p1.id],
+        )
+        .unwrap();
+        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        conn.execute(
+            "UPDATE plans SET created_at = ?1 WHERE id = ?2",
+            params!["2026-03-01T00:00:00.000Z", p2.id],
+        )
+        .unwrap();
+        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        conn.execute(
+            "UPDATE plans SET created_at = ?1 WHERE id = ?2",
+            params!["2026-02-01T00:00:00.000Z", p3.id],
+        )
+        .unwrap();
+
+        let plans = list_plans_sorted_by_recency(&conn, "/proj").unwrap();
+        let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["p2", "p3", "p1"]);
+    }
+
+    #[test]
+    fn test_list_plans_sorted_by_recency_logs_win_over_created_at() {
+        // A plan with a recent execution log should sort above a plan that
+        // was created more recently but has never been run.
+        let conn = setup();
+
+        // p1 created earliest, but will get a recent log.
+        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        conn.execute(
+            "UPDATE plans SET created_at = ?1 WHERE id = ?2",
+            params!["2026-01-01T00:00:00.000Z", p1.id],
+        )
+        .unwrap();
+        // p2 created most recently, but never run.
+        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        conn.execute(
+            "UPDATE plans SET created_at = ?1 WHERE id = ?2",
+            params!["2026-04-01T00:00:00.000Z", p2.id],
+        )
+        .unwrap();
+
+        // Add a step + execution log to p1, dated after p2's created_at.
+        let (step, _) = create_step(
+            &conn,
+            &p1.id,
+            "s",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
+        conn.execute(
+            "UPDATE execution_logs SET started_at = ?1 WHERE id = ?2",
+            params!["2026-05-01T00:00:00.000Z", log.id],
+        )
+        .unwrap();
+
+        let plans = list_plans_sorted_by_recency(&conn, "/proj").unwrap();
+        let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["p1", "p2"]);
+    }
+
+    #[test]
+    fn test_list_plans_sorted_by_recency_uses_max_log() {
+        // When a plan has multiple logs, the MAX(started_at) wins.
+        let conn = setup();
+
+        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+
+        // p1 has an old log + a fresh log → MAX is fresh.
+        let (s1, _) = create_step(
+            &conn,
+            &p1.id,
+            "s1",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let l_old = create_execution_log(&conn, &s1.id, 1, None, None).unwrap();
+        conn.execute(
+            "UPDATE execution_logs SET started_at = ?1 WHERE id = ?2",
+            params!["2026-01-01T00:00:00.000Z", l_old.id],
+        )
+        .unwrap();
+        let l_new = create_execution_log(&conn, &s1.id, 2, None, None).unwrap();
+        conn.execute(
+            "UPDATE execution_logs SET started_at = ?1 WHERE id = ?2",
+            params!["2026-06-01T00:00:00.000Z", l_new.id],
+        )
+        .unwrap();
+
+        // p2 has one log between p1's old and new.
+        let (s2, _) = create_step(
+            &conn,
+            &p2.id,
+            "s2",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let l_p2 = create_execution_log(&conn, &s2.id, 1, None, None).unwrap();
+        conn.execute(
+            "UPDATE execution_logs SET started_at = ?1 WHERE id = ?2",
+            params!["2026-03-01T00:00:00.000Z", l_p2.id],
+        )
+        .unwrap();
+
+        let plans = list_plans_sorted_by_recency(&conn, "/proj").unwrap();
+        let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["p1", "p2"]);
+    }
+
+    #[test]
+    fn test_list_plans_sorted_by_recency_excludes_archived_and_other_projects() {
+        let conn = setup();
+
+        let _own = create_plan(&conn, "own", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let archived = create_plan(&conn, "archived", "/proj", "b2", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &archived.id, PlanStatus::Archived).unwrap();
+        let _other = create_plan(&conn, "other", "/elsewhere", "b3", "d", None, None, &[]).unwrap();
+
+        let plans = list_plans_sorted_by_recency(&conn, "/proj").unwrap();
+        let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["own"]);
+    }
+
+    #[test]
+    fn test_list_archived_plans_sorted_by_recency_only_returns_archived() {
+        let conn = setup();
+
+        let active = create_plan(&conn, "active", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let arch_a = create_plan(&conn, "arch-a", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let arch_b = create_plan(&conn, "arch-b", "/proj", "b3", "d", None, None, &[]).unwrap();
+        let other = create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &arch_a.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &arch_b.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &other.id, PlanStatus::Archived).unwrap();
+
+        let plans = list_archived_plans_sorted_by_recency(&conn, "/proj").unwrap();
+        let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
+        // Both /proj archived plans, but not the active one or the other-project one.
+        assert!(slugs.contains(&"arch-a"));
+        assert!(slugs.contains(&"arch-b"));
+        assert!(!slugs.contains(&"active"));
+        assert!(!slugs.contains(&"other"));
+        assert_eq!(slugs.len(), 2);
+        let _ = active;
+    }
+
+    #[test]
+    fn test_count_archived_plans() {
+        let conn = setup();
+
+        assert_eq!(count_archived_plans(&conn, "/proj").unwrap(), 0);
+
+        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        // Different project — must not count.
+        let other = create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
+
+        // p1 still planning; only p2 and p3 archived.
+        update_plan_status(&conn, &p2.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &p3.id, PlanStatus::Archived).unwrap();
+        update_plan_status(&conn, &other.id, PlanStatus::Archived).unwrap();
+        let _ = p1;
+
+        assert_eq!(count_archived_plans(&conn, "/proj").unwrap(), 2);
+        assert_eq!(count_archived_plans(&conn, "/elsewhere").unwrap(), 1);
+    }
+
+    #[test]
     fn test_find_active_plan_filters_by_status() {
         let conn = setup();
 
@@ -1661,6 +2193,232 @@ mod tests {
         assert_eq!(found.status, PlanStatus::InProgress);
         // updated_at should have changed
         assert!(found.updated_at >= plan.updated_at);
+    }
+
+    #[test]
+    fn test_set_plan_questions_enabled_flips_column() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        assert!(!plan.questions_enabled, "default should be off");
+
+        set_plan_questions_enabled(&conn, &plan.id, true).unwrap();
+        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert!(on.questions_enabled);
+        assert!(on.updated_at >= plan.updated_at);
+
+        set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
+        let off = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert!(!off.questions_enabled);
+    }
+
+    #[test]
+    fn test_list_answered_questions_for_step_returns_only_answered_in_order() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Three rows: one already-answered, one unanswered (must be excluded),
+        // and one answered later. Use explicit asked_at timestamps to verify
+        // chronological ordering rather than insertion order.
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
+             VALUES ('q1', ?1, 1, 'Q1?', '[]', 'A1.', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
+            params![&step.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at)
+             VALUES ('q2', ?1, 1, 'Q2-pending?', '[]', NULL, '2026-05-01T10:30:00.000Z')",
+            params![&step.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
+             VALUES ('q3', ?1, 2, 'Q3?', '[]', 'A3.', '2026-05-01T12:00:00.000Z', '2026-05-01T13:00:00.000Z')",
+            params![&step.id],
+        )
+        .unwrap();
+
+        let answered = list_answered_questions_for_step(&conn, &step.id).unwrap();
+        assert_eq!(answered.len(), 2, "unanswered row must be excluded");
+        assert_eq!(answered[0].question, "Q1?");
+        assert_eq!(answered[0].answer, "A1.");
+        assert_eq!(answered[1].question, "Q3?");
+        assert_eq!(answered[1].answer, "A3.");
+    }
+
+    #[test]
+    fn test_count_unanswered_questions_for_attempt_scopes_by_step_and_attempt() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Different combinations of (attempt, answer state) so we can verify
+        // the scoping. Only attempt=2 with answer=NULL should count.
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
+             VALUES ('q1', ?1, 1, 'a1', '[]', 'done', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
+            params![&step.id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
+             VALUES ('q2', ?1, 1, 'old open', '[]', '2026-05-01T10:00:00.000Z')",
+            params![&step.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
+             VALUES ('q3', ?1, 2, 'current open A', '[]', '2026-05-01T10:00:00.000Z')",
+            params![&step.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
+             VALUES ('q4', ?1, 2, 'current open B', '[]', '2026-05-01T10:00:00.000Z')",
+            params![&step.id],
+        )
+        .unwrap();
+
+        assert_eq!(
+            count_unanswered_questions_for_attempt(&conn, &step.id, 2).unwrap(),
+            2,
+            "two unanswered rows for attempt=2",
+        );
+        assert_eq!(
+            count_unanswered_questions_for_attempt(&conn, &step.id, 1).unwrap(),
+            1,
+            "one unanswered row for attempt=1 (the answered one is excluded)",
+        );
+        assert_eq!(
+            count_unanswered_questions_for_attempt(&conn, &step.id, 99).unwrap(),
+            0,
+            "no rows for an attempt that doesn't exist",
+        );
+    }
+
+    #[test]
+    fn test_plan_effective_status_returns_question_when_unanswered_exists() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Set the underlying lifecycle to in_progress so we can verify the
+        // derived status overrides it.
+        update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
+
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
+             VALUES ('q1', ?1, 1, 'open?', '[]', '2026-05-01T10:00:00.000Z')",
+            params![&step.id],
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_effective_status(&conn, &plan.id).unwrap(),
+            PlanStatus::Question,
+            "an unanswered row must shadow the underlying lifecycle"
+        );
+    }
+
+    #[test]
+    fn test_plan_effective_status_returns_underlying_when_no_open_questions() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        update_plan_status(&conn, &plan.id, PlanStatus::Complete).unwrap();
+
+        // Answered rows must not trigger the Question shadow.
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
+             VALUES ('q1', ?1, 1, 'old?', '[]', 'yes', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
+            params![&step.id],
+        ).unwrap();
+
+        assert_eq!(
+            plan_effective_status(&conn, &plan.id).unwrap(),
+            PlanStatus::Complete,
+        );
+    }
+
+    #[test]
+    fn test_list_answered_questions_for_step_empty_when_no_rows() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let answered = list_answered_questions_for_step(&conn, &step.id).unwrap();
+        assert!(answered.is_empty());
+    }
+
+    #[test]
+    fn test_set_plan_questions_enabled_missing_plan_errs() {
+        let conn = setup();
+        let err = set_plan_questions_enabled(&conn, "no-such-id", true).unwrap_err();
+        assert!(err.to_string().contains("Plan not found"));
     }
 
     #[test]
@@ -3589,5 +4347,49 @@ mod tests {
         set_plan_context_prepend(&conn, &plan.id, None).unwrap();
         let reloaded = get_plan_by_slug(&conn, "ctx", "/proj").unwrap().unwrap();
         assert_eq!(reloaded.context_prepend, None);
+    }
+
+    #[test]
+    fn test_set_plan_deterministic_tests_round_trip() {
+        let conn = setup();
+        let plan = create_plan(
+            &conn,
+            "tests-rt",
+            "/proj",
+            "b",
+            "d",
+            None,
+            None,
+            &["cargo build".to_string()],
+        )
+        .unwrap();
+
+        // Sanity: row was created with the seeded list.
+        assert_eq!(plan.deterministic_tests, vec!["cargo build".to_string()]);
+
+        // Replace with a multi-test list.
+        let new_tests = vec!["cargo test".to_string(), "cargo clippy".to_string()];
+        set_plan_deterministic_tests(&conn, &plan.id, &new_tests).unwrap();
+        let reloaded = get_plan_by_slug(&conn, "tests-rt", "/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.deterministic_tests, new_tests);
+
+        // Empty slice clears the list.
+        set_plan_deterministic_tests(&conn, &plan.id, &[]).unwrap();
+        let reloaded = get_plan_by_slug(&conn, "tests-rt", "/proj")
+            .unwrap()
+            .unwrap();
+        assert!(reloaded.deterministic_tests.is_empty());
+    }
+
+    #[test]
+    fn test_set_plan_deterministic_tests_unknown_plan_errors() {
+        let conn = setup();
+        let err = set_plan_deterministic_tests(&conn, "no-such-plan", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("Plan not found"),
+            "unexpected error: {err}"
+        );
     }
 }

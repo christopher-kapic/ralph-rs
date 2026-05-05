@@ -1,14 +1,2023 @@
 // Run-related CLI command implementations (status, log, cancel)
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+use crate::config::Config;
 use crate::output::{self, OutputContext, OutputFormat};
-use crate::plan::{ChangePolicy, ExecutionLog, StepStatus};
+use crate::plan::{self, ChangePolicy, ExecutionLog, StepStatus};
+use crate::preflight;
 use crate::run_lock::{self, LiveRun};
+use crate::runner::{self, RunOptions};
+use crate::signal;
 use crate::storage;
+
+// ---------------------------------------------------------------------------
+// Run dispatch
+// ---------------------------------------------------------------------------
+
+/// All inputs the `Run` subcommand needs to dispatch, gathered into one struct
+/// so the CLI surface, the routing decision, and the TUI placeholder can pass
+/// them around as a unit.
+#[derive(Debug, Clone, Default)]
+pub struct RunArgs {
+    pub plan_slug: Option<String>,
+    pub one: bool,
+    pub all: bool,
+    pub from: Option<usize>,
+    pub to: Option<usize>,
+    pub dry_run: bool,
+    pub skip_preflight: bool,
+    pub current_branch: bool,
+    pub no_auto_stash: bool,
+    pub run_harness: Option<String>,
+    pub force: bool,
+    pub verbose: bool,
+    /// The global `--harness` flag (root `Cli` field). Run-specific
+    /// `--harness` takes precedence; both being unset is the default case.
+    pub cli_harness: Option<String>,
+    /// The global `--non-interactive` flag.
+    pub non_interactive: bool,
+    /// The global `--json`/`--jsonl` flag.
+    pub json: bool,
+}
+
+/// Whether `ralph run` was invoked with all defaults — meaning the routing
+/// rule from TUI-plan.md §2 should drop the user into TUI mode.
+///
+/// "Default" means: no Run-specific flags set, no global `--non-interactive`,
+/// no `--json`/`--jsonl`, no `--harness` override at either scope, and stdout
+/// is a real TTY. A bare plan slug is allowed — `ralph run my-plan` is still
+/// considered default.
+///
+/// `stdout_is_tty` is passed in rather than detected internally so the
+/// routing decision is unit-testable without reaching the real terminal.
+pub fn is_default_run_invocation(args: &RunArgs, stdout_is_tty: bool) -> bool {
+    if !stdout_is_tty {
+        return false;
+    }
+    if args.non_interactive || args.json {
+        return false;
+    }
+    !args.one
+        && !args.all
+        && args.from.is_none()
+        && args.to.is_none()
+        && !args.dry_run
+        && !args.skip_preflight
+        && !args.current_branch
+        && !args.no_auto_stash
+        && !args.force
+        && !args.verbose
+        && args.run_harness.is_none()
+        && args.cli_harness.is_none()
+}
+
+/// Dispatch a `ralph run` invocation through today's runner — the
+/// non-interactive path used by scripts and meta-harnesses.
+///
+/// Both [`run_tui_mode`] and the direct-CLI path call this so they share a
+/// single source of truth for run-lock acquisition, preflight, and the
+/// chained-vs-single-plan branches.
+pub fn dispatch_run(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    args: RunArgs,
+    out: &OutputContext,
+) -> Result<()> {
+    let workdir = Path::new(project);
+
+    // Precedence: `ralph run --harness X` beats `ralph --harness Y run`,
+    // which in turn falls back to the plan's own harness and then the
+    // config default. The per-subcommand flag is the most specific, so it
+    // wins.
+    let harness_override = args.run_harness.or(args.cli_harness);
+
+    // `auto_stash` is default-on. `--no-auto-stash` forces it off for a
+    // single run; `config.auto_stash = false` sets a per-user default of
+    // "don't stash". The CLI flag always wins when set.
+    let auto_stash = if args.no_auto_stash {
+        false
+    } else {
+        config.auto_stash
+    };
+    let options = RunOptions {
+        all_plans: args.all,
+        one: args.one,
+        from: args.from,
+        to: args.to,
+        current_branch: args.current_branch,
+        auto_stash,
+        harness_override,
+        dry_run: args.dry_run,
+        verbose: args.verbose,
+    };
+
+    if args.all {
+        if args.from.is_some() || args.to.is_some() {
+            anyhow::bail!(
+                "--from/--to cannot be combined with --all (step numbers are per-plan and not comparable across plans)"
+            );
+        }
+        if args.plan_slug.is_some() {
+            eprintln!("Warning: plan slug argument is ignored when --all is set.");
+        }
+
+        // Acquire the per-project run lock so two concurrent `ralph run`
+        // invocations can't clobber each other. Dry runs skip the lock since
+        // they don't mutate state.
+        let _run_lock = if !args.dry_run {
+            Some(run_lock::acquire(conn, project, None, None, args.force)?)
+        } else {
+            None
+        };
+
+        // Preflight every runnable plan before starting the chain so we
+        // fail fast if anything is misconfigured.
+        if !args.skip_preflight && !args.dry_run {
+            let runnable: Vec<_> = storage::list_plans(conn, project, false)?
+                .into_iter()
+                .filter(|p| {
+                    matches!(
+                        p.status,
+                        plan::PlanStatus::Ready
+                            | plan::PlanStatus::InProgress
+                            | plan::PlanStatus::Failed
+                    )
+                })
+                .collect();
+
+            let mut any_errors = false;
+            for p in &runnable {
+                eprintln!("Running preflight checks for '{}'...", p.slug);
+                let results = preflight::run_preflight_checks(p, config, workdir)?;
+                results.print_report(out);
+                if !results.is_ok() {
+                    any_errors = true;
+                }
+            }
+            if any_errors {
+                anyhow::bail!(
+                    "Preflight checks failed for one or more plans. Use --skip-preflight to bypass."
+                );
+            }
+        }
+
+        let rt = tokio::runtime::Runtime::new()?;
+        let results = rt.block_on(async {
+            let abort_rx = signal::install_and_spawn();
+            runner::run_all_plans(conn, project, config, workdir, &options, abort_rx, out).await
+        })?;
+
+        let total = results.len();
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        for r in &results {
+            eprintln!(
+                "  - {}: {} ({}/{} steps succeeded)",
+                r.plan_slug, r.final_status, r.steps_succeeded, r.steps_executed
+            );
+            if r.final_status == plan::PlanStatus::Complete {
+                succeeded += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        eprintln!(
+            "Ran {} plan(s): {} succeeded, {} failed",
+            total, succeeded, failed
+        );
+        return Ok(());
+    }
+
+    // Single-plan run path.
+    let plan = super::resolve_plan(conn, args.plan_slug, project, false)?;
+    let slug = plan.slug.clone();
+
+    // Acquire the per-project run lock before doing any mutating work.
+    // Dry runs skip the lock.
+    let _run_lock = if !args.dry_run {
+        Some(run_lock::acquire(
+            conn,
+            project,
+            Some(&plan.slug),
+            Some(&plan.id),
+            args.force,
+        )?)
+    } else {
+        None
+    };
+
+    // Preflight checks
+    if !args.skip_preflight && !args.dry_run {
+        eprintln!("Running preflight checks...");
+        let preflight_results = preflight::run_preflight_checks(&plan, config, workdir)?;
+        preflight_results.print_report(out);
+
+        if !preflight_results.is_ok() {
+            anyhow::bail!("Preflight checks failed. Use --skip-preflight to bypass.");
+        }
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(async {
+        let abort_rx = signal::install_and_spawn();
+        runner::run_plan(conn, &plan, config, workdir, &options, abort_rx, out).await
+    })?;
+
+    if result.steps_failed > 0 {
+        eprintln!(
+            "Plan '{}' failed: {}/{} steps succeeded",
+            slug, result.steps_succeeded, result.steps_executed
+        );
+    } else {
+        eprintln!(
+            "Plan '{}' complete: {}/{} steps succeeded",
+            slug, result.steps_succeeded, result.steps_executed
+        );
+    }
+    Ok(())
+}
+
+/// TUI-mode dispatcher for `ralph run`. Step 22 of the tui-v1 plan wires this
+/// up to the real plan-detail view; for now it's a placeholder that produces
+/// today's output exactly. The routing decision in main.rs (via
+/// [`is_default_run_invocation`]) is what makes this function reachable on
+/// bare `ralph run` / `ralph run <slug>` invocations from a TTY.
+pub fn run_tui_mode(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    args: RunArgs,
+    out: &OutputContext,
+) -> Result<()> {
+    dispatch_run(conn, config, project, args, out)
+}
+
+// ---------------------------------------------------------------------------
+// Plan-list TUI dispatcher (TUI-plan.md §2 / §5)
+// ---------------------------------------------------------------------------
+
+/// Launch the plan-list view for a bare `ralph` invocation.
+///
+/// Loads tiles from the DB, sets up the alternate-screen + raw-mode terminal,
+/// runs the draw / event loop until the user quits, and tears the terminal
+/// down. Routing into plan-detail on `enter` lands in tui-v1 step 19; for now
+/// `enter` is a no-op so the read-only landing screen has no dangling actions.
+pub fn run_plan_list_tui(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    _out: &OutputContext,
+) -> Result<()> {
+    use crate::plan::PlanStatus;
+    use crate::tui::dialog;
+    use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::plan_list::{self, PlanListApp};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use crossterm::execute;
+    use crossterm::terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
+    use std::time::Instant;
+
+    let tiles = build_plan_tiles(conn, project)?;
+    let archived_count = storage::count_archived_plans(conn, project)?;
+    let mut app = PlanListApp::new(tiles, project, &config.display_timezone)
+        .with_archived_count(archived_count);
+
+    // §13.2: when an externally-spawned ralph runner already holds this
+    // project's run lock, the TUI starts in read-only mode and polls every
+    // 500ms for the runner to release. The plan-list view doesn't spawn
+    // child runners itself, so `spawned_child_pid` is always `None`.
+    let my_pid = std::process::id() as i64;
+    let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
+    if let Ok(initial) = read_only::detect(conn, project, my_pid, None) {
+        tracker.observe(initial, Instant::now());
+        app.set_read_only(tracker.state());
+    }
+
+    enable_raw_mode().context("enable raw mode")?;
+    let mut stdout = std::io::stdout();
+    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e).context("enter alternate screen");
+    }
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("create terminal")?;
+
+    let result: Result<()> = (|| {
+        loop {
+            // Re-poll the run-lock state on a 500ms cadence (TUI-plan.md
+            // §13.2). On Released, push the "edits enabled" toast so the
+            // user sees the transition; on Engaged, no toast (the banner
+            // alone is enough notice).
+            let now = Instant::now();
+            if tracker.should_poll(now)
+                && let Ok(observed) = read_only::detect(conn, project, my_pid, None)
+            {
+                let transition = tracker.observe(observed, now);
+                app.set_read_only(tracker.state());
+                if transition == Transition::Released {
+                    app.toasts
+                        .push(read_only::RELEASED_TOAST, ToastKind::Success, now);
+                }
+            }
+
+            terminal.draw(|f| plan_list::draw(f, &mut app))?;
+
+            // Use a polling read so the lock state stays current even when
+            // the user isn't pressing keys. The 250ms timeout balances UI
+            // smoothness against polling cost; the actual run-lock query
+            // still only fires once per `POLL_INTERVAL` thanks to
+            // `tracker.should_poll`.
+            if !event::poll(std::time::Duration::from_millis(250))? {
+                continue;
+            }
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                // §15 help overlay: `?` toggles, `<esc>`/`q`/Ctrl-C close. While
+                // the overlay is visible the dispatcher swallows every key
+                // (Consumed/Closed/Opened) so view bindings don't fire under
+                // it. Passthrough means the overlay is hidden and we proceed
+                // with the normal match below.
+                if app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough {
+                    continue;
+                }
+                let locked = app.read_only.is_locked();
+                match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => app.navigate_down(),
+                    KeyCode::Char('k') | KeyCode::Up => app.navigate_up(),
+                    KeyCode::Char('g') => app.jump_top(),
+                    KeyCode::Char('G') => app.jump_bottom(),
+                    KeyCode::Char(' ') => app.toggle_selection(),
+                    KeyCode::Char('d') if !locked => {
+                        let targets = app.archive_targets();
+                        if targets.is_empty() {
+                            continue;
+                        }
+                        let body = format!("Archive {} plan(s)?", targets.len());
+                        let confirm = dialog::Confirm {
+                            title: "Archive plans",
+                            body: &body,
+                            default: false,
+                        };
+                        if confirm_with_background(&mut terminal, &mut app, &confirm)? {
+                            for id in &targets {
+                                storage::update_plan_status(conn, id, PlanStatus::Archived)?;
+                            }
+                            refresh_plan_list_state(conn, project, &mut app)?;
+                            let n = targets.len();
+                            let msg = if n == 1 {
+                                "Archived 1 plan.".to_string()
+                            } else {
+                                format!("Archived {n} plans.")
+                            };
+                            app.toasts.push(msg, ToastKind::Success, Instant::now());
+                        }
+                    }
+                    KeyCode::Char('A') if !locked => {
+                        plan_list_approve_cursor(conn, project, &mut app)?;
+                    }
+                    KeyCode::Char('Q') if !locked => {
+                        plan_list_toggle_questions_cursor(conn, project, &mut app)?;
+                    }
+                    KeyCode::Char('i') | KeyCode::Char('a') if !locked => {
+                        plan_list_create_plan(conn, config, project, &mut terminal, &mut app)?;
+                    }
+                    KeyCode::Esc => {
+                        let _ = app.escape();
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        match app.request_open() {
+                            Some(crate::tui::views::plan_list::OpenRequest::Archived) => {
+                                run_archived_list_tui(
+                                    &mut terminal,
+                                    conn,
+                                    project,
+                                    &config.display_timezone,
+                                )?;
+                                refresh_plan_list_state(conn, project, &mut app)?;
+                            }
+                            Some(crate::tui::views::plan_list::OpenRequest::Plan(slug)) => {
+                                run_plan_detail_tui(&mut terminal, conn, config, project, &slug)?;
+                                // The plan-detail view can mutate step state
+                                // (skip / add) and counters; refresh tiles so
+                                // the user sees up-to-date totals on return.
+                                refresh_plan_list_state(conn, project, &mut app)?;
+                            }
+                            None => {}
+                        }
+                        // Reset so a future tick doesn't re-dispatch.
+                        app.open_request = None;
+                    }
+                    KeyCode::Char('q') => app.request_quit(),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.request_quit();
+                    }
+                    _ => {}
+                }
+            }
+            if app.should_quit {
+                return Ok(());
+            }
+        }
+    })();
+
+    let _ = disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen);
+
+    result
+}
+
+/// Render the plan-list view as the dialog's background and block on a
+/// yes/no decision. Mirrors `dialog::run` but composites the live view under
+/// the modal so the user keeps context (cursor, selection badges, tiles) while
+/// answering. Returns the user's choice.
+fn confirm_with_background<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+    c: &crate::tui::dialog::Confirm<'_>,
+) -> Result<bool> {
+    use crate::tui::dialog::{self, Decision};
+    use crate::tui::views::plan_list;
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    loop {
+        terminal.draw(|f| {
+            plan_list::draw(f, app);
+            let area = f.area();
+            dialog::render(f, area, c);
+        })?;
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match dialog::decide_key(key, c.default) {
+                Decision::Yes => return Ok(true),
+                Decision::No => return Ok(false),
+                Decision::Pending => continue,
+            }
+        }
+    }
+}
+
+/// `A` action in the plan-list view (TUI-plan.md §5): approve the cursor
+/// target. Flips `Planning` → `Ready` via `update_plan_status`, refreshes the
+/// in-memory tile in place (preserving selection / cursor), and toasts. Plans
+/// already past Planning surface an info toast instead — mirroring the CLI's
+/// `plan approve` rejection but without aborting the TUI session.
+pub(crate) fn plan_list_approve_cursor(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) -> Result<()> {
+    use crate::plan::PlanStatus;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let target = app
+        .cursor_plan()
+        .map(|p| (p.id.clone(), p.slug.clone(), p.status));
+    let Some((id, slug, status)) = target else {
+        return Ok(());
+    };
+    if status == PlanStatus::Planning {
+        storage::update_plan_status(conn, &id, PlanStatus::Ready)?;
+        if let Some(updated) = storage::get_plan_by_slug(conn, &slug, project)? {
+            app.update_plan_in_place(updated);
+        }
+        app.toasts
+            .push("Plan approved.", ToastKind::Success, Instant::now());
+    } else {
+        app.toasts.push(
+            format!("Plan is in {status} status; nothing to approve."),
+            ToastKind::Info,
+            Instant::now(),
+        );
+    }
+    Ok(())
+}
+
+/// `Q` action in the plan-list view (TUI-plan.md §17): flip
+/// `plans.questions_enabled` on the cursor target via
+/// `set_plan_questions_enabled`, refresh the tile in place, and toast the new
+/// state. Cursor-only — selection is ignored.
+pub(crate) fn plan_list_toggle_questions_cursor(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let target = app
+        .cursor_plan()
+        .map(|p| (p.id.clone(), p.slug.clone(), p.questions_enabled));
+    let Some((id, slug, current)) = target else {
+        return Ok(());
+    };
+    let next = !current;
+    storage::set_plan_questions_enabled(conn, &id, next)?;
+    if let Some(updated) = storage::get_plan_by_slug(conn, &slug, project)? {
+        app.update_plan_in_place(updated);
+    }
+    let msg = if next {
+        "Questions enabled."
+    } else {
+        "Questions disabled."
+    };
+    app.toasts.push(msg, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// `i` / `a` action in the plan-list view (TUI-plan.md §5): open the inline
+/// "New plan" modal, drive the slug → description → tests state machine,
+/// and on submit insert a row via `storage::create_plan`. Loops the draw +
+/// event-read locally so the modal renders over the live plan-list as a
+/// background. Cancellation (`Esc` / `Ctrl-C`) just returns; on submit the
+/// cursor jumps to the freshly-created plan via [`plan_list_apply_create`].
+fn plan_list_create_plan<B: ratatui::backend::Backend>(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) -> Result<()> {
+    use crate::tui::views::create_plan::{self, CreatePlanModal, Outcome};
+    use crate::tui::views::plan_list;
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let mut modal = CreatePlanModal::new();
+
+    loop {
+        terminal.draw(|f| {
+            plan_list::draw(f, app);
+            let area = f.area();
+            create_plan::render(f, area, &modal);
+        })?;
+
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+
+        match modal.handle_key(key) {
+            Outcome::Pending => continue,
+            Outcome::Cancelled => return Ok(()),
+            Outcome::Submit {
+                slug,
+                description,
+                tests,
+            } => {
+                plan_list_apply_create(conn, config, project, app, &slug, &description, &tests)?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Pure-storage half of the create-plan flow. Inserts the plan via
+/// `storage::create_plan`, refreshes the tile list, and re-positions the
+/// cursor on the new plan. Toasts a success or — on a storage failure (e.g.
+/// duplicate slug) — an error message. Factored apart from the event loop so
+/// it can be integration-tested without a terminal.
+pub(crate) fn plan_list_apply_create(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+    slug: &str,
+    description: &str,
+    tests: &[String],
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    // Branch name auto-defaults to the slug, matching the CLI's
+    // `plan create` behavior when `--branch` is omitted.
+    let branch_name = slug;
+    let harness = Some(config.default_harness.as_str());
+    let agent: Option<&str> = None;
+
+    match storage::create_plan(
+        conn,
+        slug,
+        project,
+        branch_name,
+        description,
+        harness,
+        agent,
+        tests,
+    ) {
+        Ok(plan) => {
+            let new_tiles = build_plan_tiles(conn, project)?;
+            let archived_count = storage::count_archived_plans(conn, project)?;
+            let new_index = new_tiles
+                .iter()
+                .position(|t| t.plan.id == plan.id)
+                .unwrap_or(0);
+            app.refresh_tiles(new_tiles, archived_count);
+            app.selected_index = new_index;
+            app.toasts.push(
+                format!("Created plan: {slug}"),
+                ToastKind::Success,
+                Instant::now(),
+            );
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to create plan: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Build the read-only tile rows the plan-list view renders. One tile per
+/// non-archived plan; recent first; counts come from `list_steps`; activity
+/// stamp comes from `last_log_started_at_for_plan`, falling back to
+/// `plan.created_at` so plans that have never run still show "Created …".
+fn build_plan_tiles(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<crate::tui::views::plan_list::PlanTile>> {
+    let plans = storage::list_plans_sorted_by_recency(conn, project)?;
+    plans_into_tiles(conn, plans)
+}
+
+/// Mirror of [`build_plan_tiles`] for the archived plan list view (§6).
+fn build_archived_tiles(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<crate::tui::views::plan_list::PlanTile>> {
+    let plans = storage::list_archived_plans_sorted_by_recency(conn, project)?;
+    plans_into_tiles(conn, plans)
+}
+
+fn plans_into_tiles(
+    conn: &Connection,
+    plans: Vec<crate::plan::Plan>,
+) -> Result<Vec<crate::tui::views::plan_list::PlanTile>> {
+    use crate::tui::views::plan_list::PlanTile;
+    let mut tiles = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let steps = storage::list_steps(conn, &plan.id)?;
+        let total = steps.len() as u32;
+        let completed = steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Complete)
+            .count() as u32;
+        let last_run = storage::last_log_started_at_for_plan(conn, &plan.id)?;
+        let (last_activity, had_run) = match last_run {
+            Some(t) => (t, true),
+            None => (plan.created_at, false),
+        };
+        // §17: derive the open-question count + oldest-question teaser for
+        // this plan so the tile can flip to the purple `STATUS_QUESTION` dot
+        // and surface a one-line preview.
+        let opens = storage::list_open_questions(conn, &plan.project, Some(&plan.slug))?;
+        let unanswered_questions = opens.len() as u32;
+        let oldest_question = opens.first().map(|q| q.question.clone());
+        tiles.push(PlanTile {
+            plan,
+            completed,
+            total,
+            last_activity,
+            had_run,
+            unanswered_questions,
+            oldest_question,
+        });
+    }
+    Ok(tiles)
+}
+
+/// Refresh the plan-list view's tile list AND archived-count from the DB.
+/// Used after every operation that can change either set: archive, create,
+/// or returning from the archived-list view.
+pub(crate) fn refresh_plan_list_state(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) -> Result<()> {
+    let tiles = build_plan_tiles(conn, project)?;
+    let archived_count = storage::count_archived_plans(conn, project)?;
+    app.refresh_tiles(tiles, archived_count);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Archived-list TUI dispatcher (TUI-plan.md §6)
+// ---------------------------------------------------------------------------
+
+/// Run the archived-list event loop until the user pops back. Reuses the
+/// already-open terminal and raw-mode session — the caller (`run_plan_list_tui`
+/// after `enter` on the Archived sentinel) owns terminal teardown.
+fn run_archived_list_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    project: &str,
+    display_timezone: &str,
+) -> Result<()> {
+    use crate::tui::dialog;
+    use crate::tui::views::archived_list::{self, ArchivedListApp};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    let tiles = build_archived_tiles(conn, project)?;
+    let mut app = ArchivedListApp::new(tiles, project, display_timezone);
+
+    loop {
+        terminal.draw(|f| archived_list::draw(f, &mut app))?;
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+        // §15 help overlay: see plan-list dispatcher for the routing rule.
+        if app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.navigate_down(),
+            KeyCode::Char('k') | KeyCode::Up => app.navigate_up(),
+            KeyCode::Char('g') => app.jump_top(),
+            KeyCode::Char('G') => app.jump_bottom(),
+            KeyCode::Char(' ') => app.toggle_selection(),
+            KeyCode::Char('d') => {
+                let targets = app.action_targets();
+                if targets.is_empty() {
+                    continue;
+                }
+                let body = format!(
+                    "Permanently delete {} plan(s)? This cannot be undone.",
+                    targets.len()
+                );
+                let confirm = dialog::Confirm {
+                    title: "Permanently delete plans",
+                    body: &body,
+                    default: false,
+                };
+                if confirm_with_archived_background(terminal, &mut app, &confirm)? {
+                    archived_list_apply_delete(conn, project, &mut app, &targets)?;
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let targets = app.action_targets();
+                if targets.is_empty() {
+                    continue;
+                }
+                archived_list_apply_unarchive(conn, project, &mut app, &targets)?;
+            }
+            KeyCode::Esc => {
+                let _ = app.escape();
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
+                app.request_pop();
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.request_pop();
+            }
+            _ => {}
+        }
+        if app.should_pop {
+            return Ok(());
+        }
+    }
+}
+
+/// Permanently delete the targeted plans via `storage::delete_plan`, refresh
+/// the in-memory tile list, and toast. Factored apart from the event loop so
+/// it can be integration-tested without a real terminal.
+pub(crate) fn archived_list_apply_delete(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::archived_list::ArchivedListApp,
+    targets: &[String],
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    for id in targets {
+        storage::delete_plan(conn, id)?;
+    }
+    let new_tiles = build_archived_tiles(conn, project)?;
+    app.refresh_tiles(new_tiles);
+    let n = targets.len();
+    let msg = if n == 1 {
+        "Permanently deleted 1 plan.".to_string()
+    } else {
+        format!("Permanently deleted {n} plans.")
+    };
+    app.toasts.push(msg, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// Unarchive the targeted plans (status → Ready), refresh the in-memory tile
+/// list, and toast. Factored apart for testing.
+pub(crate) fn archived_list_apply_unarchive(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::archived_list::ArchivedListApp,
+    targets: &[String],
+) -> Result<()> {
+    use crate::plan::PlanStatus;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    for id in targets {
+        storage::update_plan_status(conn, id, PlanStatus::Ready)?;
+    }
+    let new_tiles = build_archived_tiles(conn, project)?;
+    app.refresh_tiles(new_tiles);
+    let n = targets.len();
+    let msg = if n == 1 {
+        "Unarchived 1 plan.".to_string()
+    } else {
+        format!("Unarchived {n} plans.")
+    };
+    app.toasts.push(msg, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// Mirror of `confirm_with_background` for the archived-list view: composites
+/// a confirm dialog over the live archived view so the user keeps context
+/// (cursor, selection) while answering.
+fn confirm_with_archived_background<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut crate::tui::views::archived_list::ArchivedListApp,
+    c: &crate::tui::dialog::Confirm<'_>,
+) -> Result<bool> {
+    use crate::tui::dialog::{self, Decision};
+    use crate::tui::views::archived_list;
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    loop {
+        terminal.draw(|f| {
+            archived_list::draw(f, app);
+            let area = f.area();
+            dialog::render(f, area, c);
+        })?;
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match dialog::decide_key(key, c.default) {
+                Decision::Yes => return Ok(true),
+                Decision::No => return Ok(false),
+                Decision::Pending => continue,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan-detail TUI dispatcher (TUI-plan.md §7)
+// ---------------------------------------------------------------------------
+
+/// Run the plan-detail event loop until the user pops back. Reuses the
+/// already-open terminal and raw-mode session — the caller
+/// (`run_plan_list_tui` after `enter` on a plan tile) owns terminal
+/// teardown.
+///
+/// Step 21 of tui-v1 adds the run controls (`R`/`S`): the loop polls
+/// `run_locks` on each tick so the in-memory step list and "Running
+/// step N" banner reflect runner-subprocess progress. Pressing `R`
+/// spawns a `ralph run --non-interactive <slug>` child and `S` sends
+/// `ralph cancel` semantics (SIGTERM with timeout, then SIGKILL).
+fn run_plan_detail_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    slug: &str,
+) -> Result<()> {
+    use crate::tui::events::{self as tui_events, RunSubscription};
+    use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::plan_detail::{self, PlanDetailApp};
+    use crate::tui::views::plan_detail_input::{self, InputAction};
+    use crate::tui::views::plan_detail_ui;
+    use crossterm::event::{self, Event, KeyEventKind};
+    use std::time::Instant;
+
+    let plan = storage::get_plan_by_slug(conn, slug, project)?
+        .with_context(|| format!("Plan not found: {slug}"))?;
+    let steps = storage::list_steps(conn, &plan.id)?;
+    let mut app = PlanDetailApp::new(plan, steps, config);
+
+    let mut subscription: Option<RunSubscription> = None;
+
+    // §13.2: read-only attach. While the TUI does not own a streaming
+    // subscription, any `run_locks` row owned by an unrelated pid means
+    // someone else is driving the run; suppress edits until they release.
+    // When `subscription` is `Some`, we are the runner host and skip the
+    // detection — the child's lock row is "ours" even though the row's
+    // recorded pid is the subprocess.
+    let my_pid = std::process::id() as i64;
+    let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
+
+    loop {
+        // -- Refresh state from the active source of truth ----------------
+        //
+        // TUI-plan.md §13 splits this in two:
+        //   - Subscription active (TUI spawned the runner): drain the
+        //     NDJSON stream and dispatch each event into the App. The DB
+        //     `run_locks` snapshot is intentionally skipped because the
+        //     stream gives us strictly fresher data and avoids the
+        //     250ms polling round-trip.
+        //   - No subscription (read-only attach landing in step 38): fall
+        //     back to polling `run_locks` so the banner still surfaces
+        //     externally-spawned runs.
+        if let Some(sub) = subscription.as_mut() {
+            for evt in sub.drain() {
+                tui_events::dispatch_event(&mut app, &evt);
+            }
+            // When the producer hangs up (subprocess exited and stdout
+            // closed), tear the subscription down so the next `R` press
+            // can spawn a fresh one. The App's run-live state is already
+            // cleared by `dispatch_event(PlanComplete | Summary)`; this
+            // also handles the no-events-but-disconnected case (e.g. the
+            // child failed to spawn).
+            if sub.is_disconnected() {
+                subscription = None;
+                app.detach_subscription();
+            }
+        } else {
+            let live_snapshot = storage::get_live_run(conn, project)
+                .ok()
+                .flatten()
+                .filter(|l| l.plan_slug.as_deref() == Some(slug));
+            app.update_live_run(live_snapshot);
+        }
+        if let Ok(latest_steps) = storage::list_steps(conn, &app.plan.id) {
+            app.sync_steps_from_db(latest_steps);
+        }
+        // §17: refresh the cached open-question list each tick so the
+        // banner + `A` keybinding both stay current with answers applied
+        // by step-detail or any out-of-band CLI/runner activity.
+        if let Ok(opens) = storage::list_open_questions(conn, project, Some(slug)) {
+            app.set_open_questions(opens);
+        }
+
+        // -- §13.2 read-only attach poll -------------------------------
+        //
+        // Only relevant when we are NOT the runner host: a TUI-spawned
+        // subscription already implies the lock holder is our child, so
+        // skip detection and treat the App as editable. (The user sees
+        // the existing right-pane "Running step N" surface for the
+        // active run instead.)
+        let now = Instant::now();
+        if subscription.is_none() {
+            if tracker.should_poll(now)
+                && let Ok(observed) = read_only::detect(conn, project, my_pid, None)
+            {
+                let transition = tracker.observe(observed, now);
+                app.set_read_only(tracker.state());
+                if transition == Transition::Released {
+                    app.toasts
+                        .push(read_only::RELEASED_TOAST, ToastKind::Success, now);
+                }
+            }
+        } else if app.read_only.is_locked() {
+            // We just spawned a runner — clear any latched lockdown so
+            // the banner doesn't keep showing while our own child holds
+            // the row.
+            tracker.observe(ReadOnly::Editable, now);
+            app.set_read_only(ReadOnly::Editable);
+        }
+
+        terminal.draw(|f| plan_detail_ui::draw(f, &mut app))?;
+
+        // Poll with a short timeout so the live timer keeps ticking and
+        // any newly-arrived NDJSON chunks are drained on the next iteration
+        // even when the user isn't pressing keys. 250ms balances UI
+        // smoothness against polling cost.
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+        // §15 help overlay: route `?` toggle / dismissal through the help
+        // state before the per-view input handler so view bindings don't
+        // fire while the overlay is up. Add-mode is exempt — `?` is a valid
+        // text-input character there.
+        if matches!(app.input_mode, plan_detail::InputMode::Normal)
+            && app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough
+        {
+            continue;
+        }
+        let action = plan_detail_input::handle_key(&mut app, key);
+        match action {
+            InputAction::None | InputAction::Pop => {}
+            InputAction::AddStep(pos, title) => {
+                plan_detail_apply_add(conn, &mut app, pos, &title)?;
+            }
+            InputAction::SkipStep(step_id) => {
+                plan_detail_apply_skip(conn, &mut app, &step_id)?;
+            }
+            InputAction::Delete(targets) => {
+                plan_detail_apply_delete(terminal, conn, &mut app, &targets)?;
+            }
+            InputAction::Reset(step_id) => {
+                plan_detail_apply_reset(conn, &mut app, &step_id)?;
+            }
+            InputAction::MoveUp(step_id) => {
+                plan_detail_apply_move(conn, &mut app, &step_id, MoveDir::Up)?;
+            }
+            InputAction::MoveDown(step_id) => {
+                plan_detail_apply_move(conn, &mut app, &step_id, MoveDir::Down)?;
+            }
+            InputAction::Run => {
+                plan_detail_apply_run_streaming(conn, &mut app, project, slug, &mut subscription)?;
+            }
+            InputAction::Stop => {
+                plan_detail_apply_stop(conn, &mut app, project, slug)?;
+            }
+            InputAction::OpenDependencies => {
+                run_plan_dependencies_tui(terminal, conn, &mut app)?;
+            }
+            InputAction::OpenQuestion(step_id) => {
+                run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
+            }
+        }
+        if app.should_pop {
+            // Dropping the subscription tears down its tokio runtime and
+            // (via `kill_on_drop`) terminates the runner subprocess.
+            // Step 38 (read-only attach) will detach instead of kill.
+            drop(subscription);
+            return Ok(());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MoveDir {
+    Up,
+    Down,
+}
+
+/// Persist an `i` (insert above) / `a` (append below) action: compute the
+/// new sort_key from the cursor's neighbors, insert via `storage::create_step_at`,
+/// refresh the in-memory step list, and place the cursor on the new row so
+/// the user sees the result immediately.
+pub(crate) fn plan_detail_apply_add(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    position: crate::tui::views::plan_detail::AddPosition,
+    title: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::plan_detail::AddPosition;
+    use std::time::Instant;
+
+    let sort_key = match position {
+        AddPosition::Above => app.compute_insert_above_sort_key(),
+        AddPosition::Below => app.compute_append_below_sort_key(),
+    };
+    let sort_key = match sort_key {
+        Ok(k) => k,
+        Err(e) => {
+            app.toasts.push(
+                format!("Cannot insert step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return Ok(());
+        }
+    };
+
+    let plan_id = app.plan.id.clone();
+    let result = storage::create_step_at(
+        conn,
+        &plan_id,
+        &sort_key,
+        title,
+        "",
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+    );
+
+    match result {
+        Ok((new_step, _position_1based)) => {
+            let new_id = new_step.id.clone();
+            app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+            if let Some(idx) = app.steps.iter().position(|s| s.id == new_id) {
+                app.selected_index = idx;
+            }
+            app.toasts.push(
+                format!("Added step: {title}"),
+                ToastKind::Success,
+                Instant::now(),
+            );
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to add step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Persist an `s` skip action via `storage::mark_step_skipped`. The TUI's
+/// skip flow doesn't prompt for a reason — the operator can edit it later
+/// via the CLI (`ralph skip --reason`) if they want one.
+pub(crate) fn plan_detail_apply_skip(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    step_id: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    match storage::mark_step_skipped(conn, step_id, None) {
+        Ok(()) => {
+            let plan_id = app.plan.id.clone();
+            app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+            app.toasts
+                .push("Step skipped.", ToastKind::Success, Instant::now());
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to skip step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Persist an `R` run / resume action: spawn `ralph run --non-interactive
+/// <slug>` as a child process so the TUI can keep polling the DB while the
+/// runner advances the plan. Stdio is redirected to /dev/null so the
+/// subprocess output doesn't conflict with the TUI's raw-mode display.
+///
+/// Superseded by [`plan_detail_apply_run_streaming`] (TUI-plan.md §13) for
+/// the live plan-detail event loop, which forks via
+/// [`tui::events::spawn_streaming_runner`] and consumes the NDJSON event
+/// stream directly. Kept here because callers that don't need the right-pane
+/// tails — currently none in production but referenced from tests — can
+/// still spawn a fire-and-forget runner.
+///
+/// No-op (info toast) if a run is already live for this plan, matching the
+/// acceptance criteria in TUI-plan.md §7.
+#[allow(dead_code)]
+pub(crate) fn plan_detail_apply_run(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    project: &str,
+    slug: &str,
+    runner_child: &mut Option<std::process::Child>,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let already_live = storage::get_live_run(conn, project)?
+        .map(|l| l.plan_slug.as_deref() == Some(slug))
+        .unwrap_or(false);
+    if already_live {
+        app.toasts.push(
+            "Run already live for this plan.",
+            ToastKind::Info,
+            Instant::now(),
+        );
+        return Ok(());
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            app.toasts.push(
+                format!("Cannot locate ralph binary: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return Ok(());
+        }
+    };
+
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("-C")
+        .arg(project)
+        .arg("--non-interactive")
+        .arg("run")
+        .arg(slug)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    match cmd.spawn() {
+        Ok(child) => {
+            *runner_child = Some(child);
+            app.toasts.push(
+                format!("Started run for {slug}"),
+                ToastKind::Success,
+                Instant::now(),
+            );
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to start run: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// NDJSON-streaming variant of [`plan_detail_apply_run`] (TUI-plan.md §13).
+/// Forks `ralph run --json --non-interactive <slug>` via
+/// [`tui::events::spawn_streaming_runner`] and stashes the resulting
+/// [`RunSubscription`] on the dispatcher's stack so the next poll iteration
+/// can drain its events into the right-pane state.
+///
+/// On spawn failure the subscription stays `None` and the user gets a
+/// toast — same UX as the legacy [`plan_detail_apply_run`].
+pub(crate) fn plan_detail_apply_run_streaming(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    project: &str,
+    slug: &str,
+    subscription: &mut Option<crate::tui::events::RunSubscription>,
+) -> Result<()> {
+    use crate::tui::events::spawn_streaming_runner;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    if subscription.is_some() {
+        app.toasts.push(
+            "Run already live for this plan.",
+            ToastKind::Info,
+            Instant::now(),
+        );
+        return Ok(());
+    }
+    let already_live = storage::get_live_run(conn, project)?
+        .map(|l| l.plan_slug.as_deref() == Some(slug))
+        .unwrap_or(false);
+    if already_live {
+        app.toasts.push(
+            "Run already live for this plan.",
+            ToastKind::Info,
+            Instant::now(),
+        );
+        return Ok(());
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            app.toasts.push(
+                format!("Cannot locate ralph binary: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return Ok(());
+        }
+    };
+
+    match spawn_streaming_runner(exe, project.into(), slug.to_string(), false) {
+        Ok(sub) => {
+            *subscription = Some(sub);
+            app.attach_subscription();
+            app.toasts.push(
+                format!("Started run for {slug}"),
+                ToastKind::Success,
+                Instant::now(),
+            );
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to start run: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Persist an `S` stop action by routing through `cmd_cancel`, which
+/// implements the SIGTERM-with-timeout-then-SIGKILL semantics used by the
+/// `ralph cancel` CLI. The 15s default mirrors the CLI default and is long
+/// enough for a runner mid-phase to write its rollback / finalize records.
+pub(crate) fn plan_detail_apply_stop(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    project: &str,
+    slug: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let live =
+        storage::get_live_run(conn, project)?.filter(|l| l.plan_slug.as_deref() == Some(slug));
+    if live.is_none() {
+        app.toasts.push(
+            "No live run for this plan.",
+            ToastKind::Info,
+            Instant::now(),
+        );
+        return Ok(());
+    }
+
+    // Quiet plain-format context so cmd_cancel doesn't print progress dots
+    // through the alternate screen during the brief SIGTERM wait.
+    let cancel_out = OutputContext {
+        format: OutputFormat::Plain,
+        quiet: true,
+        color: false,
+    };
+    match cmd_cancel(
+        conn,
+        project,
+        Some(slug),
+        false,
+        Duration::from_secs(15),
+        &cancel_out,
+    ) {
+        Ok(()) => {
+            app.toasts
+                .push("Run cancelled.", ToastKind::Success, Instant::now());
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to cancel run: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Render the `Delete N step(s)?` confirm dialog over the live plan-detail
+/// view, and on Yes call `storage::delete_step` for each target. The dialog
+/// composites onto the same terminal — see `confirm_with_plan_detail_background`.
+pub(crate) fn plan_detail_apply_delete<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    targets: &[String],
+) -> Result<()> {
+    use crate::tui::dialog;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let body = format!("Delete {} step(s)?", targets.len());
+    let confirm = dialog::Confirm {
+        title: "Delete steps",
+        body: &body,
+        default: false,
+    };
+    if !confirm_with_plan_detail_background(terminal, app, &confirm)? {
+        return Ok(());
+    }
+
+    let mut errors = 0usize;
+    for id in targets {
+        if let Err(e) = storage::delete_step(conn, id) {
+            errors += 1;
+            app.toasts.push(
+                format!("Failed to delete step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    let plan_id = app.plan.id.clone();
+    app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+    if errors == 0 {
+        let n = targets.len();
+        let msg = if n == 1 {
+            "Deleted 1 step.".to_string()
+        } else {
+            format!("Deleted {n} steps.")
+        };
+        app.toasts.push(msg, ToastKind::Success, Instant::now());
+    }
+    Ok(())
+}
+
+/// Persist an `r` reset action via `storage::reset_step` and refresh.
+pub(crate) fn plan_detail_apply_reset(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    step_id: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    match storage::reset_step(conn, step_id) {
+        Ok(()) => {
+            let plan_id = app.plan.id.clone();
+            app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+            app.toasts
+                .push("Step reset.", ToastKind::Success, Instant::now());
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to reset step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Persist a `Shift-J` / `Shift-K` move via `storage::update_step_sort_key`.
+/// Recomputes the cursor index after the refresh so the moved step stays
+/// highlighted (its position in the list changes but its identity does not).
+pub(crate) fn plan_detail_apply_move(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    step_id: &str,
+    dir: MoveDir,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let new_key = match dir {
+        MoveDir::Up => app.compute_move_up_sort_key(),
+        MoveDir::Down => app.compute_move_down_sort_key(),
+    };
+    let new_key = match new_key {
+        Ok(Some(k)) => k,
+        Ok(None) => return Ok(()), // already at edge — silent no-op
+        Err(e) => {
+            app.toasts.push(
+                format!("Cannot move step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return Ok(());
+        }
+    };
+
+    if let Err(e) = storage::update_step_sort_key(conn, step_id, &new_key) {
+        app.toasts.push(
+            format!("Failed to move step: {e}"),
+            ToastKind::Error,
+            Instant::now(),
+        );
+        return Ok(());
+    }
+
+    let plan_id = app.plan.id.clone();
+    app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+    if let Some(idx) = app.steps.iter().position(|s| s.id == step_id) {
+        app.selected_index = idx;
+    }
+    let label = match dir {
+        MoveDir::Up => "Moved step up.",
+        MoveDir::Down => "Moved step down.",
+    };
+    app.toasts.push(label, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// Mirror of `confirm_with_background` for the plan-detail view: composites
+/// a confirm dialog over the live view so the user keeps context (cursor,
+/// selection, toasts) while answering.
+fn confirm_with_plan_detail_background<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    c: &crate::tui::dialog::Confirm<'_>,
+) -> Result<bool> {
+    use crate::tui::dialog::{self, Decision};
+    use crate::tui::views::plan_detail_ui;
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    loop {
+        terminal.draw(|f| {
+            plan_detail_ui::draw(f, app);
+            let area = f.area();
+            dialog::render(f, area, c);
+        })?;
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match dialog::decide_key(key, c.default) {
+                Decision::Yes => return Ok(true),
+                Decision::No => return Ok(false),
+                Decision::Pending => continue,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan-dependencies sub-view loop (TUI-plan.md §1, step 33)
+// ---------------------------------------------------------------------------
+
+/// Run the plan-dependencies sub-view loop until the user backs out. Reads
+/// the focused plan's deps from the DB, drives the sub-view's state machine
+/// for `a`/`d`/`q`/`<esc>`, and writes through to
+/// [`storage::add_plan_dependency`] / [`storage::remove_plan_dependency`] on
+/// each successful outcome. Cycles are caught with
+/// [`storage::would_create_cycle`] before the insert and surfaced as an
+/// error toast rather than letting the user wait on a storage error.
+fn run_plan_dependencies_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    plan_app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::plan_dependencies::{Mode, Outcome, PlanDependenciesApp, render};
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let plan_id = plan_app.plan.id.clone();
+    let plan_slug = plan_app.plan.slug.clone();
+    let project = plan_app.plan.project.clone();
+
+    let (deps, candidates) = load_dependencies_view_state(conn, &project, &plan_id)?;
+    let mut app = PlanDependenciesApp::new(plan_id.clone(), plan_slug, deps, candidates);
+
+    loop {
+        terminal.draw(|f| render(f, f.area(), &mut app))?;
+
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+        match app.handle_key(key) {
+            Outcome::Pending => {}
+            Outcome::Pop => return Ok(()),
+            Outcome::AddRequested { dep_plan_id } => {
+                // Pre-check the cycle so we can render a friendly toast
+                // instead of bubbling the storage error. `add_plan_dependency`
+                // also checks defensively, so a concurrent edit can't slip
+                // a cycle through.
+                if storage::would_create_cycle(conn, &plan_id, &dep_plan_id)? {
+                    app.push_toast(
+                        "Adding that dependency would create a cycle.",
+                        ToastKind::Error,
+                    );
+                    continue;
+                }
+                if let Err(e) = storage::add_plan_dependency(conn, &plan_id, &dep_plan_id) {
+                    app.push_toast(format!("Failed to add dependency: {e}"), ToastKind::Error);
+                    continue;
+                }
+                let (deps, candidates) = load_dependencies_view_state(conn, &project, &plan_id)?;
+                app.refresh(deps, candidates);
+                // Drop back to the list so the user sees the new row.
+                app.mode = Mode::List;
+                app.push_toast("Dependency added.", ToastKind::Success);
+            }
+            Outcome::RemoveRequested { dep_plan_id } => {
+                if let Err(e) = storage::remove_plan_dependency(conn, &plan_id, &dep_plan_id) {
+                    app.push_toast(
+                        format!("Failed to remove dependency: {e}"),
+                        ToastKind::Error,
+                    );
+                    continue;
+                }
+                let (deps, candidates) = load_dependencies_view_state(conn, &project, &plan_id)?;
+                app.refresh(deps, candidates);
+                app.push_toast("Dependency removed.", ToastKind::Success);
+            }
+        }
+    }
+}
+
+/// Read the dependency edges and the picker candidate list for `plan_id`.
+///
+/// Candidates are every other non-archived plan in the project that is not
+/// already a direct dependency. The cycle check still runs at add-time as
+/// defense-in-depth — pre-filtering by direct deps doesn't catch transitive
+/// cycles that would close once the new edge is inserted.
+fn load_dependencies_view_state(
+    conn: &Connection,
+    project: &str,
+    plan_id: &str,
+) -> Result<(
+    Vec<crate::tui::views::plan_dependencies::PlanRef>,
+    Vec<crate::tui::views::plan_dependencies::PlanRef>,
+)> {
+    use crate::tui::views::plan_dependencies::PlanRef;
+
+    let dep_ids = storage::list_plan_dependencies(conn, plan_id)?;
+    // `list_plans(_, _, false)` filters by project; archived plans are still
+    // included in the result set, which is fine — the cycle pre-check and
+    // candidate-list filter both run separately below.
+    let all_plans = storage::list_plans(conn, project, false)?;
+
+    let mut deps: Vec<PlanRef> = Vec::with_capacity(dep_ids.len());
+    for id in &dep_ids {
+        if let Some(plan) = all_plans.iter().find(|p| &p.id == id) {
+            deps.push(PlanRef {
+                id: plan.id.clone(),
+                slug: plan.slug.clone(),
+            });
+        }
+    }
+
+    let candidates: Vec<PlanRef> = all_plans
+        .iter()
+        .filter(|p| {
+            p.id != plan_id
+                && p.status != crate::plan::PlanStatus::Archived
+                && !dep_ids.contains(&p.id)
+        })
+        .map(|p| PlanRef {
+            id: p.id.clone(),
+            slug: p.slug.clone(),
+        })
+        .collect();
+
+    Ok((deps, candidates))
+}
+
+// ---------------------------------------------------------------------------
+// Step-detail dispatcher (TUI-plan.md §8 + §17)
+// ---------------------------------------------------------------------------
+
+/// Run the step-detail event loop until the user pops back. Reuses the
+/// already-open terminal and raw-mode session — the caller (`run_plan_detail_tui`
+/// after `A` on the open-questions banner) owns terminal teardown.
+///
+/// Currently scoped to the §17 question flow: rendering the open-question
+/// pane, driving the answer modal, persisting answers via storage, and
+/// popping the resume-implementation modal once the last question is
+/// cleared. Other step-detail keybindings (`c` editor handoffs, picker,
+/// step navigation) are handed off in subsequent tui-v1 steps.
+fn run_step_detail_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    plan_app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    target_step_id: &str,
+) -> Result<()> {
+    use crate::tui::editor::edit_in_editor;
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::answer_modal::ResumeModalAction;
+    use crate::tui::views::step_detail::{self, Pane, StepDetailApp};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use std::time::Instant;
+
+    let plan = plan_app.plan.clone();
+    let steps = storage::list_steps(conn, &plan.id)?;
+    let target_index = steps
+        .iter()
+        .position(|s| s.id == target_step_id)
+        .unwrap_or(0);
+    let project_settings = storage::get_project_settings(conn, project)?;
+    let exec_logs = if let Some(step) = steps.get(target_index) {
+        storage::list_execution_logs_for_step(conn, &step.id)?
+    } else {
+        Vec::new()
+    };
+
+    let mut app = StepDetailApp::new(
+        plan,
+        steps,
+        target_index,
+        config,
+        project_settings,
+        exec_logs,
+    );
+    // Focus on the OpenQuestions pane so the user can press `a` immediately.
+    app.focused_pane = Pane::OpenQuestions;
+    refresh_step_detail_questions(conn, project, &mut app)?;
+
+    loop {
+        terminal.draw(|f| step_detail::draw(f, &mut app))?;
+
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            // Re-poll the question state so concurrent answers (CLI or
+            // another TUI) are reflected without input.
+            refresh_step_detail_questions(conn, project, &mut app)?;
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+
+        // §15 help overlay: `?` toggles, `<esc>`/`q`/Ctrl-C close. Run before
+        // the modal handlers so a stuck overlay can always be dismissed; we
+        // skip interception while a modal is up so the modal owns the keymap.
+        if app.answer_modal.is_none()
+            && app.resume_modal.is_none()
+            && app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough
+        {
+            continue;
+        }
+
+        // Modals are exclusive: the resume modal is only opened when no
+        // answer modal is also open, and vice versa.
+        if app.answer_modal.is_some() {
+            handle_answer_modal_key(conn, project, &mut app, key, edit_in_editor)?;
+            if app.should_pop {
+                return Ok(());
+            }
+            continue;
+        }
+        if app.resume_modal.is_some() {
+            match handle_resume_modal_key(&mut app, key) {
+                ResumeModalAction::Accept => {
+                    let modal = app
+                        .resume_modal
+                        .take()
+                        .expect("resume_modal was Some moments ago");
+                    spawn_resume_run(&mut app, project, &modal);
+                    return Ok(());
+                }
+                ResumeModalAction::Decline => {
+                    app.close_resume_modal();
+                }
+                ResumeModalAction::Pending => {}
+            }
+            continue;
+        }
+
+        match key.code {
+            // Question-pane navigation (j/k) overrides pane navigation while
+            // the pane is focused.
+            KeyCode::Char('j') | KeyCode::Down
+                if app.focused_pane == Pane::OpenQuestions && app.has_open_questions_for_step() =>
+            {
+                app.select_question_next();
+            }
+            KeyCode::Char('k') | KeyCode::Up
+                if app.focused_pane == Pane::OpenQuestions && app.has_open_questions_for_step() =>
+            {
+                app.select_question_prev();
+            }
+            // Pane navigation (j/k outside the questions pane).
+            KeyCode::Char('j') | KeyCode::Down => app.focus_down(),
+            KeyCode::Char('k') | KeyCode::Up => app.focus_up(),
+            KeyCode::Char('a') if app.focused_pane == Pane::OpenQuestions => {
+                let opened = app.open_answer_modal();
+                if !opened && !app.has_open_questions_for_step() {
+                    app.toasts.push(
+                        "No open questions for this step.",
+                        ToastKind::Info,
+                        Instant::now(),
+                    );
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => app.handle_left(),
+            KeyCode::Char('l') | KeyCode::Right => app.handle_right(),
+            KeyCode::Char('q') => app.request_pop(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.request_pop();
+            }
+            KeyCode::Esc => app.request_pop(),
+            _ => {}
+        }
+        if app.should_pop {
+            return Ok(());
+        }
+    }
+}
+
+/// Drive one key event into the open answer modal. Persists the chosen
+/// answer (suggestion or `$EDITOR` round-trip) and refreshes the open
+/// question list. When the just-applied answer was the plan's last open
+/// question, opens the resume-implementation modal via
+/// [`StepDetailApp::note_answer_persisted`].
+fn handle_answer_modal_key<E>(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    key: crossterm::event::KeyEvent,
+    editor_fn: E,
+) -> Result<()>
+where
+    E: FnOnce(&str) -> Result<Option<String>>,
+{
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::answer_modal::AnswerModalAction;
+    use std::time::Instant;
+
+    let Some(modal) = app.answer_modal.as_ref() else {
+        return Ok(());
+    };
+    let action = modal.handle_key(key);
+    match action {
+        AnswerModalAction::Pending => {}
+        AnswerModalAction::Cancel => {
+            app.close_answer_modal();
+        }
+        AnswerModalAction::Submit { index } => {
+            let modal = app.answer_modal.as_ref().expect("modal still open");
+            let Some(answer) = modal.suggestion_text(index).map(|s| s.to_string()) else {
+                app.toasts.push(
+                    "No suggestion at that index.",
+                    ToastKind::Error,
+                    Instant::now(),
+                );
+                return Ok(());
+            };
+            let qid = modal.question_id.clone();
+            persist_answer_and_refresh(conn, project, app, &qid, &answer)?;
+        }
+        AnswerModalAction::EditCustom => {
+            let modal = app.answer_modal.as_ref().expect("modal still open");
+            let qid = modal.question_id.clone();
+            // Seed the editor with a short hint so the user knows what
+            // they're answering — stripped on persist.
+            let seed = format!(
+                "# Replace this with your answer to:\n# {q}\n\n",
+                q = modal.question
+            );
+            let edited = match editor_fn(&seed)? {
+                Some(s) => s,
+                None => {
+                    app.toasts.push(
+                        crate::tui::views::step_detail::NO_EDITOR_TOAST,
+                        ToastKind::Error,
+                        Instant::now(),
+                    );
+                    app.close_answer_modal();
+                    return Ok(());
+                }
+            };
+            let answer = strip_answer_comments(&edited);
+            if answer.trim().is_empty() {
+                app.toasts.push(
+                    "Empty answer — modal closed without writing.",
+                    ToastKind::Info,
+                    Instant::now(),
+                );
+                app.close_answer_modal();
+                return Ok(());
+            }
+            persist_answer_and_refresh(conn, project, app, &qid, &answer)?;
+        }
+    }
+    Ok(())
+}
+
+/// Drive one key event into the resume-implementation modal. Returns the
+/// outcome so the caller can decide whether to spawn the runner. Pure of
+/// I/O.
+fn handle_resume_modal_key(
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    key: crossterm::event::KeyEvent,
+) -> crate::tui::views::answer_modal::ResumeModalAction {
+    use crate::tui::views::answer_modal::ResumeModalAction;
+    let Some(modal) = app.resume_modal.as_ref() else {
+        return ResumeModalAction::Pending;
+    };
+    modal.handle_key(key)
+}
+
+/// Persist a question answer and refresh the App's question caches. When
+/// this answer was the plan's last open question, the App opens the
+/// resume-implementation modal automatically via `note_answer_persisted`.
+fn persist_answer_and_refresh(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    question_id: &str,
+    answer: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    if let Err(e) = storage::set_question_answer(conn, question_id, answer) {
+        app.toasts.push(
+            format!("Failed to save answer: {e}"),
+            ToastKind::Error,
+            Instant::now(),
+        );
+        app.close_answer_modal();
+        return Ok(());
+    }
+    refresh_step_detail_questions(conn, project, app)?;
+    let prev_current_branch = previous_run_current_branch(conn, project, &app.plan.slug)?;
+    app.note_answer_persisted(prev_current_branch);
+    app.toasts
+        .push("Answer saved.", ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// Refresh the App's open-question cache + plan-wide count from the DB.
+/// Called after every answer and on each idle tick so concurrent CLI /
+/// runner activity is reflected.
+fn refresh_step_detail_questions(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+) -> Result<()> {
+    let opens = storage::list_open_questions(conn, project, Some(&app.plan.slug))?;
+    let plan_total = opens.len();
+    let step_id = app.current_step().map(|s| s.id.clone());
+    let for_step: Vec<_> = match step_id {
+        Some(sid) => opens.into_iter().filter(|q| q.step_id == sid).collect(),
+        None => Vec::new(),
+    };
+    app.set_open_questions_for_step(for_step);
+    app.set_plan_open_questions_count(plan_total);
+    Ok(())
+}
+
+/// Best-effort lookup of the previous run's `--current-branch` flag for
+/// `plan_slug`. Returns `false` (the normal branch flow) when the previous
+/// branch mode can't be recovered — the schema doesn't currently persist
+/// this across runs once the run lock is released, so the safe default is
+/// the more common branch-stash flow. The user can decline the resume
+/// prompt and re-run with their preferred flag if needed.
+fn previous_run_current_branch(
+    _conn: &Connection,
+    _project: &str,
+    _plan_slug: &str,
+) -> Result<bool> {
+    Ok(false)
+}
+
+/// Spawn `ralph run` in response to the resume modal's Accept action.
+/// Mirrors [`plan_detail_apply_run_streaming`]'s spawn behavior but
+/// without the streaming subscription — the caller is about to pop back
+/// to plan-detail, which will pick up the run via its DB-poll path.
+fn spawn_resume_run(
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    project: &str,
+    modal: &crate::tui::views::answer_modal::ResumeModal,
+) {
+    use crate::tui::toast::ToastKind;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            app.toasts.push(
+                format!("Cannot locate ralph binary: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return;
+        }
+    };
+    let mut cmd = Command::new(&exe);
+    cmd.arg("-C")
+        .arg(project)
+        .arg("--non-interactive")
+        .arg("run");
+    if modal.current_branch {
+        cmd.arg("--current-branch");
+    }
+    cmd.arg(&modal.plan_slug)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(e) = cmd.spawn() {
+        app.toasts.push(
+            format!("Failed to start run: {e}"),
+            ToastKind::Error,
+            Instant::now(),
+        );
+    }
+    // Pop back to plan-detail so the user sees the live status.
+    app.request_pop();
+}
+
+/// Strip leading `#`-prefixed comment lines (and any trailing blank line)
+/// from a custom-answer editor blob, mirroring git commit-message
+/// conventions. The seed text the modal injects starts each hint line
+/// with `#` so this leaves only the user's actual answer.
+fn strip_answer_comments(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
 
 // ---------------------------------------------------------------------------
 // Status command
@@ -1561,5 +3570,573 @@ mod status_live_view_tests {
             !json.contains("child_pid"),
             "cleared child_pid must be absent from status JSON: {json}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Run dispatch routing tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod run_dispatch_tests {
+    use super::*;
+
+    fn defaults() -> RunArgs {
+        RunArgs::default()
+    }
+
+    #[test]
+    fn bare_invocation_on_tty_routes_to_tui() {
+        // `ralph run` from a TTY with no flags is the canonical TUI entry.
+        assert!(is_default_run_invocation(&defaults(), true));
+    }
+
+    #[test]
+    fn bare_invocation_with_plan_slug_routes_to_tui() {
+        // A plan-slug positional alone does not count as a "non-default flag";
+        // `ralph run my-plan` from a TTY still drops to the TUI.
+        let args = RunArgs {
+            plan_slug: Some("my-plan".to_string()),
+            ..defaults()
+        };
+        assert!(is_default_run_invocation(&args, true));
+    }
+
+    #[test]
+    fn non_tty_stdout_bypasses_tui() {
+        // Piping to `tee` (or any non-TTY) must keep today's runner path.
+        assert!(!is_default_run_invocation(&defaults(), false));
+    }
+
+    #[test]
+    fn non_interactive_flag_bypasses_tui() {
+        // `--non-interactive` is the explicit opt-out from the TUI even on
+        // a real TTY (e.g. user wants to capture scripted output via `tee`).
+        let args = RunArgs {
+            non_interactive: true,
+            ..defaults()
+        };
+        assert!(!is_default_run_invocation(&args, true));
+    }
+
+    #[test]
+    fn json_flag_bypasses_tui() {
+        // `--json` / `--jsonl` are scripted-output formats; they must keep
+        // today's NDJSON behavior regardless of TTY status.
+        let args = RunArgs {
+            json: true,
+            ..defaults()
+        };
+        assert!(!is_default_run_invocation(&args, true));
+    }
+
+    #[test]
+    fn run_specific_flags_each_bypass_tui() {
+        // Every Run-subcommand flag listed in TUI-plan.md §2 must drop
+        // today's runner path. Using a single per-flag sweep so adding a
+        // new flag forces an explicit decision in this test.
+        let cases: Vec<(&str, RunArgs)> = vec![
+            (
+                "--one",
+                RunArgs {
+                    one: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--all",
+                RunArgs {
+                    all: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--from",
+                RunArgs {
+                    from: Some(2),
+                    ..defaults()
+                },
+            ),
+            (
+                "--to",
+                RunArgs {
+                    to: Some(5),
+                    ..defaults()
+                },
+            ),
+            (
+                "--dry-run",
+                RunArgs {
+                    dry_run: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--skip-preflight",
+                RunArgs {
+                    skip_preflight: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--current-branch",
+                RunArgs {
+                    current_branch: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--no-auto-stash",
+                RunArgs {
+                    no_auto_stash: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--force",
+                RunArgs {
+                    force: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--verbose",
+                RunArgs {
+                    verbose: true,
+                    ..defaults()
+                },
+            ),
+        ];
+        for (label, args) in cases {
+            assert!(
+                !is_default_run_invocation(&args, true),
+                "{label} must bypass TUI mode"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_override_at_either_scope_bypasses_tui() {
+        // Per-subcommand and global `--harness` both count as a non-default
+        // override. Either alone is enough to take today's runner path.
+        let run_only = RunArgs {
+            run_harness: Some("codex".to_string()),
+            ..defaults()
+        };
+        assert!(!is_default_run_invocation(&run_only, true));
+
+        let global_only = RunArgs {
+            cli_harness: Some("codex".to_string()),
+            ..defaults()
+        };
+        assert!(!is_default_run_invocation(&global_only, true));
+    }
+}
+
+#[cfg(test)]
+mod plan_list_action_tests {
+    //! Integration tests for the `A` (approve) and `Q` (toggle questions)
+    //! keybinding handlers in the plan-list TUI view. Exercise the public
+    //! action helpers end-to-end against an in-memory DB so the tests cover
+    //! both the storage write and the in-place tile update.
+
+    use super::*;
+    use crate::db;
+    use crate::plan::PlanStatus;
+    use crate::tui::views::plan_list::PlanListApp;
+
+    fn seed_app(project: &str) -> (Connection, PlanListApp) {
+        let conn = db::open_memory().unwrap();
+        // Two plans so we can verify the cursor target is the one mutated.
+        storage::create_plan(&conn, "alpha", project, "b1", "d", None, None, &[]).unwrap();
+        storage::create_plan(&conn, "beta", project, "b2", "d", None, None, &[]).unwrap();
+        let tiles = build_plan_tiles(&conn, project).unwrap();
+        let app = PlanListApp::new(tiles, project, "UTC");
+        (conn, app)
+    }
+
+    #[test]
+    fn approve_cursor_flips_planning_to_ready() {
+        let project = "/tmp/approve-flow";
+        let (conn, mut app) = seed_app(project);
+        // Cursor on the first tile (most-recent first → "beta").
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+        assert_eq!(app.cursor_plan().unwrap().status, PlanStatus::Planning);
+
+        plan_list_approve_cursor(&conn, project, &mut app).unwrap();
+
+        // DB row was updated.
+        let from_db = storage::get_plan_by_slug(&conn, &target_slug, project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db.status, PlanStatus::Ready);
+
+        // In-memory tile is updated in-place; cursor / scroll preserved.
+        assert_eq!(app.cursor_plan().unwrap().status, PlanStatus::Ready);
+        assert_eq!(app.cursor_plan().unwrap().slug, target_slug);
+
+        // Toast confirms the action.
+        let toast = app.toasts.current().expect("toast should be present");
+        assert_eq!(toast.text, "Plan approved.");
+    }
+
+    #[test]
+    fn approve_cursor_on_non_planning_emits_info_toast_and_keeps_status() {
+        let project = "/tmp/approve-noop";
+        let (conn, mut app) = seed_app(project);
+        // Pre-flip the cursor target to Ready so A becomes a no-op write.
+        let id = app.cursor_plan().unwrap().id.clone();
+        storage::update_plan_status(&conn, &id, PlanStatus::Ready).unwrap();
+        // Refresh tiles so the in-memory state reflects the pre-flipped status.
+        app.refresh_tiles(build_plan_tiles(&conn, project).unwrap(), 0);
+
+        plan_list_approve_cursor(&conn, project, &mut app).unwrap();
+
+        let from_db = storage::get_plan_by_slug(&conn, &app.cursor_plan().unwrap().slug, project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db.status, PlanStatus::Ready);
+        let toast = app.toasts.current().expect("toast should be present");
+        assert!(
+            toast.text.contains("nothing to approve"),
+            "expected info toast, got: {toast:?}"
+        );
+    }
+
+    #[test]
+    fn approve_cursor_empty_app_is_noop() {
+        let conn = db::open_memory().unwrap();
+        let mut app = PlanListApp::new(vec![], "/proj", "UTC");
+        plan_list_approve_cursor(&conn, "/proj", &mut app).unwrap();
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn toggle_questions_flips_column_and_toasts_new_state() {
+        let project = "/tmp/questions-toggle";
+        let (conn, mut app) = seed_app(project);
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+        assert!(!app.cursor_plan().unwrap().questions_enabled);
+
+        // First press: off → on.
+        plan_list_toggle_questions_cursor(&conn, project, &mut app).unwrap();
+        let after_on = storage::get_plan_by_slug(&conn, &target_slug, project)
+            .unwrap()
+            .unwrap();
+        assert!(after_on.questions_enabled);
+        assert!(app.cursor_plan().unwrap().questions_enabled);
+        assert_eq!(app.toasts.current().unwrap().text, "Questions enabled.");
+
+        // Second press: on → off.
+        plan_list_toggle_questions_cursor(&conn, project, &mut app).unwrap();
+        let after_off = storage::get_plan_by_slug(&conn, &target_slug, project)
+            .unwrap()
+            .unwrap();
+        assert!(!after_off.questions_enabled);
+        assert!(!app.cursor_plan().unwrap().questions_enabled);
+        assert_eq!(app.toasts.current().unwrap().text, "Questions disabled.");
+    }
+
+    #[test]
+    fn toggle_questions_does_not_touch_non_cursor_tiles() {
+        let project = "/tmp/questions-cursor-only";
+        let (conn, mut app) = seed_app(project);
+        let cursor_slug = app.cursor_plan().unwrap().slug.clone();
+        // The other tile.
+        let other_slug = app
+            .tiles
+            .iter()
+            .map(|t| t.plan.slug.clone())
+            .find(|s| s != &cursor_slug)
+            .unwrap();
+
+        plan_list_toggle_questions_cursor(&conn, project, &mut app).unwrap();
+
+        let other = storage::get_plan_by_slug(&conn, &other_slug, project)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !other.questions_enabled,
+            "non-cursor plan must remain untouched"
+        );
+    }
+
+    #[test]
+    fn toggle_questions_empty_app_is_noop() {
+        let conn = db::open_memory().unwrap();
+        let mut app = PlanListApp::new(vec![], "/proj", "UTC");
+        plan_list_toggle_questions_cursor(&conn, "/proj", &mut app).unwrap();
+        assert!(app.toasts.is_empty());
+    }
+
+    // -- create-plan -----------------------------------------------------
+
+    #[test]
+    fn apply_create_inserts_plan_and_positions_cursor_on_it() {
+        let project = "/tmp/create-plan-flow";
+        let (conn, mut app) = seed_app(project);
+        let config = Config::default();
+        let initial_len = app.tiles.len();
+
+        plan_list_apply_create(
+            &conn,
+            &config,
+            project,
+            &mut app,
+            "gamma",
+            "A new plan",
+            &["cargo test".to_string()],
+        )
+        .unwrap();
+
+        // Tile list grew by one and the cursor lands on the new plan
+        // regardless of where it sorts.
+        assert_eq!(app.tiles.len(), initial_len + 1);
+        let cursor = app.cursor_plan().expect("cursor target");
+        assert_eq!(cursor.slug, "gamma");
+
+        // DB row exists with the expected fields.
+        let row = storage::get_plan_by_slug(&conn, "gamma", project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.description, "A new plan");
+        assert_eq!(row.deterministic_tests, vec!["cargo test".to_string()]);
+        // Default harness comes from `Config::default()`.
+        assert_eq!(row.harness.as_deref(), Some("claude"));
+        assert!(row.agent.is_none());
+        // Branch name defaults to the slug.
+        assert_eq!(row.branch_name, "gamma");
+
+        let toast = app.toasts.current().expect("success toast");
+        assert!(
+            toast.text.contains("gamma"),
+            "expected slug in toast, got: {toast:?}"
+        );
+    }
+
+    #[test]
+    fn apply_create_with_empty_tests_passes_empty_vec() {
+        let project = "/tmp/create-plan-no-tests";
+        let (conn, mut app) = seed_app(project);
+        let config = Config::default();
+
+        plan_list_apply_create(&conn, &config, project, &mut app, "delta", "d", &[]).unwrap();
+
+        let row = storage::get_plan_by_slug(&conn, "delta", project)
+            .unwrap()
+            .unwrap();
+        assert!(row.deterministic_tests.is_empty());
+    }
+
+    #[test]
+    fn apply_create_uses_configured_default_harness() {
+        let project = "/tmp/create-plan-harness";
+        let (conn, mut app) = seed_app(project);
+        // Default config defines a "codex" harness — rebind the global
+        // default to it so we exercise non-claude harness selection.
+        let config = Config {
+            default_harness: "codex".to_string(),
+            ..Config::default()
+        };
+
+        plan_list_apply_create(&conn, &config, project, &mut app, "epsilon", "", &[]).unwrap();
+
+        let row = storage::get_plan_by_slug(&conn, "epsilon", project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.harness.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn apply_create_duplicate_slug_emits_error_toast_and_leaves_tiles_untouched() {
+        let project = "/tmp/create-plan-dup";
+        let (conn, mut app) = seed_app(project);
+        let config = Config::default();
+        let before_len = app.tiles.len();
+
+        // "alpha" already exists from `seed_app`.
+        plan_list_apply_create(&conn, &config, project, &mut app, "alpha", "", &[]).unwrap();
+
+        assert_eq!(app.tiles.len(), before_len, "tile count unchanged");
+        let toast = app.toasts.current().expect("error toast");
+        assert!(
+            toast.text.starts_with("Failed to create plan"),
+            "unexpected toast text: {toast:?}"
+        );
+    }
+
+    #[test]
+    fn apply_create_clears_selection_via_refresh() {
+        let project = "/tmp/create-plan-clears-selection";
+        let (conn, mut app) = seed_app(project);
+        let config = Config::default();
+        // Select a tile; create-plan should wipe it via refresh_tiles.
+        app.toggle_selection();
+        assert_eq!(app.selection.len(), 1);
+
+        plan_list_apply_create(&conn, &config, project, &mut app, "zeta", "z", &[]).unwrap();
+
+        assert!(app.selection.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Archived-list dispatcher tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod archived_list_dispatcher_tests {
+    //! Integration tests for the archived-list view's `d` (permanently delete)
+    //! and `enter` (unarchive) actions. Drives the public action helpers
+    //! against an in-memory DB so we cover both the storage write and the
+    //! in-memory tile refresh.
+
+    use super::*;
+    use crate::db;
+    use crate::plan::PlanStatus;
+    use crate::tui::views::archived_list::ArchivedListApp;
+
+    fn seed_archived(project: &str) -> (Connection, ArchivedListApp) {
+        let conn = db::open_memory().unwrap();
+        let a = storage::create_plan(&conn, "alpha", project, "b1", "d", None, None, &[]).unwrap();
+        let b = storage::create_plan(&conn, "beta", project, "b2", "d", None, None, &[]).unwrap();
+        let g = storage::create_plan(&conn, "gamma", project, "b3", "d", None, None, &[]).unwrap();
+        // Archive every plan so the archived view sees three rows.
+        storage::update_plan_status(&conn, &a.id, PlanStatus::Archived).unwrap();
+        storage::update_plan_status(&conn, &b.id, PlanStatus::Archived).unwrap();
+        storage::update_plan_status(&conn, &g.id, PlanStatus::Archived).unwrap();
+        let tiles = build_archived_tiles(&conn, project).unwrap();
+        let app = ArchivedListApp::new(tiles, project, "UTC");
+        (conn, app)
+    }
+
+    #[test]
+    fn delete_targets_removes_from_db_and_tile_list() {
+        let project = "/tmp/archived-delete";
+        let (conn, mut app) = seed_archived(project);
+        // Cursor target by default: most recent (gamma) — capture its slug.
+        let target_id = app.cursor_plan().unwrap().id.clone();
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+
+        archived_list_apply_delete(&conn, project, &mut app, std::slice::from_ref(&target_id))
+            .unwrap();
+
+        // DB row gone.
+        assert!(
+            storage::get_plan_by_slug(&conn, &target_slug, project)
+                .unwrap()
+                .is_none()
+        );
+        // In-memory tile list shrunk by one and no longer contains it.
+        assert_eq!(app.tiles.len(), 2);
+        assert!(app.tiles.iter().all(|t| t.plan.id != target_id));
+        // Toast confirms the destructive action.
+        let toast = app.toasts.current().expect("toast should be present");
+        assert_eq!(toast.text, "Permanently deleted 1 plan.");
+    }
+
+    #[test]
+    fn delete_with_multi_selection_pluralizes_toast() {
+        let project = "/tmp/archived-delete-multi";
+        let (conn, mut app) = seed_archived(project);
+        // Select all three.
+        app.toggle_selection();
+        app.selected_index = 1;
+        app.toggle_selection();
+        app.selected_index = 2;
+        app.toggle_selection();
+        let targets = app.action_targets();
+        assert_eq!(targets.len(), 3);
+
+        archived_list_apply_delete(&conn, project, &mut app, &targets).unwrap();
+
+        // All three plans gone.
+        assert_eq!(app.tiles.len(), 0);
+        assert_eq!(storage::count_archived_plans(&conn, project).unwrap(), 0);
+        let toast = app.toasts.current().expect("toast should be present");
+        assert_eq!(toast.text, "Permanently deleted 3 plans.");
+    }
+
+    #[test]
+    fn unarchive_targets_flips_status_to_ready_and_drops_from_archived_view() {
+        let project = "/tmp/archived-unarchive";
+        let (conn, mut app) = seed_archived(project);
+        let target_id = app.cursor_plan().unwrap().id.clone();
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+
+        archived_list_apply_unarchive(&conn, project, &mut app, std::slice::from_ref(&target_id))
+            .unwrap();
+
+        // Status flipped to Ready in the DB.
+        let row = storage::get_plan_by_slug(&conn, &target_slug, project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, PlanStatus::Ready);
+        // The unarchived plan is gone from the archived view's tile list.
+        assert!(app.tiles.iter().all(|t| t.plan.id != target_id));
+        assert_eq!(app.tiles.len(), 2);
+        // Toast confirms.
+        let toast = app.toasts.current().expect("toast should be present");
+        assert_eq!(toast.text, "Unarchived 1 plan.");
+    }
+
+    #[test]
+    fn unarchive_with_multi_selection_pluralizes_toast() {
+        let project = "/tmp/archived-unarchive-multi";
+        let (conn, mut app) = seed_archived(project);
+        app.toggle_selection();
+        app.selected_index = 1;
+        app.toggle_selection();
+        let targets = app.action_targets();
+        assert_eq!(targets.len(), 2);
+
+        archived_list_apply_unarchive(&conn, project, &mut app, &targets).unwrap();
+
+        assert_eq!(app.tiles.len(), 1);
+        assert_eq!(storage::count_archived_plans(&conn, project).unwrap(), 1);
+        let toast = app.toasts.current().expect("toast should be present");
+        assert_eq!(toast.text, "Unarchived 2 plans.");
+    }
+
+    #[test]
+    fn unarchive_empties_view_when_last_archived_plan_returns() {
+        let project = "/tmp/archived-unarchive-last";
+        let conn = db::open_memory().unwrap();
+        let only = storage::create_plan(&conn, "only", project, "b", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &only.id, PlanStatus::Archived).unwrap();
+        let tiles = build_archived_tiles(&conn, project).unwrap();
+        let mut app = ArchivedListApp::new(tiles, project, "UTC");
+        assert_eq!(app.tiles.len(), 1);
+
+        archived_list_apply_unarchive(&conn, project, &mut app, std::slice::from_ref(&only.id))
+            .unwrap();
+
+        assert!(app.tiles.is_empty());
+        assert_eq!(app.selected_index, 0);
+        // archived count went to zero, so a subsequent plan-list refresh
+        // will hide the sentinel.
+        assert_eq!(storage::count_archived_plans(&conn, project).unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_clears_selection_via_refresh() {
+        let project = "/tmp/archived-delete-clears";
+        let (conn, mut app) = seed_archived(project);
+        app.toggle_selection();
+        let targets = app.action_targets();
+
+        archived_list_apply_delete(&conn, project, &mut app, &targets).unwrap();
+
+        assert!(app.selection.is_empty());
+    }
+
+    #[test]
+    fn enter_path_targets_cursor_when_no_selection() {
+        // The dispatcher uses `app.action_targets()` for both `d` and `enter`;
+        // when nothing is selected it should fall through to the cursor row.
+        let project = "/tmp/archived-cursor-fallback";
+        let (_conn, mut app) = seed_archived(project);
+        app.selected_index = 1;
+        let cursor_id = app.cursor_plan().unwrap().id.clone();
+        assert_eq!(app.action_targets(), vec![cursor_id]);
     }
 }
