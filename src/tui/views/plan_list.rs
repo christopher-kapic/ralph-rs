@@ -49,6 +49,15 @@ pub struct PlanTile {
     /// True if any `execution_logs` row exists for this plan. Drives the
     /// "Ran" vs. "Created" prefix on the timestamp line.
     pub had_run: bool,
+    /// Number of unanswered `step_questions` rows across this plan's steps.
+    /// When non-zero the tile draws the purple `STATUS_QUESTION` dot
+    /// (overriding the underlying plan status) and a teaser line per
+    /// TUI-plan.md §17.
+    pub unanswered_questions: u32,
+    /// Verbatim text of the oldest unanswered question for this plan,
+    /// truncated by the renderer to the tile width. Only populated when
+    /// `unanswered_questions > 0`.
+    pub oldest_question: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -613,13 +622,42 @@ pub(crate) fn render_tile(
             height: 1,
             ..inner
         };
-        let dot_color = status_dot_color(tile.plan.status);
+        // §17: derived `Question` status overrides the stored status whenever
+        // any unanswered question row exists for this plan.
+        let dot_color = if tile.unanswered_questions > 0 {
+            theme::STATUS_QUESTION
+        } else {
+            status_dot_color(tile.plan.status)
+        };
         let line = Line::from(vec![
             Span::styled("● ", Style::default().fg(dot_color)),
             Span::raw(format!("{}/{}", tile.completed, tile.total)),
         ]);
         let dot = Paragraph::new(line);
         dot.render(dot_area, buf);
+    }
+
+    // §17: when this plan has unanswered questions, render a one-line teaser
+    // of the oldest question on the date row (between title and status). The
+    // teaser is dim purple to keep the tile-wide `STATUS_QUESTION` association
+    // without overpowering the title.
+    if tile.unanswered_questions > 0
+        && let Some(q) = tile.oldest_question.as_deref()
+        && inner.height >= 3
+    {
+        let teaser_area = Rect {
+            y: inner.y + 2,
+            height: 1,
+            ..inner
+        };
+        // Overwrite the timestamp line: §17 says the teaser replaces the
+        // standard line on plans with open questions.
+        let label = format!("? {q}");
+        let para = Paragraph::new(Span::styled(
+            truncate(&label, inner.width as usize),
+            Style::default().fg(theme::STATUS_QUESTION),
+        ));
+        para.render(teaser_area, buf);
     }
 }
 
@@ -682,6 +720,8 @@ mod tests {
             completed: 0,
             total: 1,
             had_run: false,
+            unanswered_questions: 0,
+            oldest_question: None,
         }
     }
 
@@ -1399,6 +1439,49 @@ mod tests {
         assert_eq!(status_dot_color(PlanStatus::Failed), theme::STATUS_FAILED);
         assert_eq!(status_dot_color(PlanStatus::Aborted), theme::STATUS_FAILED);
         assert_eq!(status_dot_color(PlanStatus::Question), theme::STATUS_QUESTION);
+    }
+
+    // -- Question surfaces (TUI-plan.md §17) ---------------------------------
+
+    #[test]
+    fn render_tile_with_open_questions_uses_purple_dot() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 6));
+        let area = buf.area;
+        let mut tile = make_tile("with-q");
+        tile.unanswered_questions = 2;
+        tile.oldest_question = Some("Pick a logging crate".to_string());
+        render_tile(&mut buf, area, &tile, false, None, "UTC");
+        // Dot row: y=4. The dot is at inner.x = 1 (border).
+        assert_eq!(buf[(1, 4)].symbol(), "●");
+        assert_eq!(buf[(1, 4)].style().fg, Some(theme::STATUS_QUESTION));
+    }
+
+    #[test]
+    fn render_tile_with_open_questions_renders_teaser() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 6));
+        let area = buf.area;
+        let mut tile = make_tile("with-q");
+        tile.unanswered_questions = 1;
+        tile.oldest_question = Some("Pick a logging crate".to_string());
+        render_tile(&mut buf, area, &tile, false, None, "UTC");
+        // Teaser overwrites the date row at y=3.
+        let row3 = (0..40).map(|x| buf[(x, 3)].symbol()).collect::<String>();
+        assert!(
+            row3.contains("Pick a logging crate"),
+            "expected question teaser on date row: {row3:?}"
+        );
+    }
+
+    #[test]
+    fn render_tile_without_open_questions_keeps_status_color() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 6));
+        let area = buf.area;
+        let mut tile = make_tile("no-q");
+        tile.plan.status = PlanStatus::Complete;
+        render_tile(&mut buf, area, &tile, false, None, "UTC");
+        // Dot at (1, 4) should be STATUS_COMPLETE, not STATUS_QUESTION.
+        assert_eq!(buf[(1, 4)].symbol(), "●");
+        assert_eq!(buf[(1, 4)].style().fg, Some(theme::STATUS_COMPLETE));
     }
 
     // -- Read-only attach lockdown (TUI-plan.md §13.2) -------------------

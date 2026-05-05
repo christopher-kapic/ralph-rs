@@ -684,12 +684,20 @@ fn plans_into_tiles(
             Some(t) => (t, true),
             None => (plan.created_at, false),
         };
+        // §17: derive the open-question count + oldest-question teaser for
+        // this plan so the tile can flip to the purple `STATUS_QUESTION` dot
+        // and surface a one-line preview.
+        let opens = storage::list_open_questions(conn, &plan.project, Some(&plan.slug))?;
+        let unanswered_questions = opens.len() as u32;
+        let oldest_question = opens.first().map(|q| q.question.clone());
         tiles.push(PlanTile {
             plan,
             completed,
             total,
             last_activity,
             had_run,
+            unanswered_questions,
+            oldest_question,
         });
     }
     Ok(tiles)
@@ -949,6 +957,12 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
         if let Ok(latest_steps) = storage::list_steps(conn, &app.plan.id) {
             app.sync_steps_from_db(latest_steps);
         }
+        // §17: refresh the cached open-question list each tick so the
+        // banner + `A` keybinding both stay current with answers applied
+        // by step-detail or any out-of-band CLI/runner activity.
+        if let Ok(opens) = storage::list_open_questions(conn, project, Some(slug)) {
+            app.set_open_questions(opens);
+        }
 
         // -- §13.2 read-only attach poll -------------------------------
         //
@@ -1025,6 +1039,9 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
             }
             InputAction::OpenDependencies => {
                 run_plan_dependencies_tui(terminal, conn, &mut app)?;
+            }
+            InputAction::OpenQuestion(step_id) => {
+                run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
             }
         }
         if app.should_pop {
@@ -1636,6 +1653,362 @@ fn load_dependencies_view_state(
         .collect();
 
     Ok((deps, candidates))
+}
+
+// ---------------------------------------------------------------------------
+// Step-detail dispatcher (TUI-plan.md §8 + §17)
+// ---------------------------------------------------------------------------
+
+/// Run the step-detail event loop until the user pops back. Reuses the
+/// already-open terminal and raw-mode session — the caller (`run_plan_detail_tui`
+/// after `A` on the open-questions banner) owns terminal teardown.
+///
+/// Currently scoped to the §17 question flow: rendering the open-question
+/// pane, driving the answer modal, persisting answers via storage, and
+/// popping the resume-implementation modal once the last question is
+/// cleared. Other step-detail keybindings (`c` editor handoffs, picker,
+/// step navigation) are handed off in subsequent tui-v1 steps.
+fn run_step_detail_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    plan_app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    target_step_id: &str,
+) -> Result<()> {
+    use crate::tui::editor::edit_in_editor;
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::answer_modal::ResumeModalAction;
+    use crate::tui::views::step_detail::{self, Pane, StepDetailApp};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use std::time::Instant;
+
+    let plan = plan_app.plan.clone();
+    let steps = storage::list_steps(conn, &plan.id)?;
+    let target_index = steps
+        .iter()
+        .position(|s| s.id == target_step_id)
+        .unwrap_or(0);
+    let project_settings = storage::get_project_settings(conn, project)?;
+    let exec_logs = if let Some(step) = steps.get(target_index) {
+        storage::list_execution_logs_for_step(conn, &step.id)?
+    } else {
+        Vec::new()
+    };
+
+    let mut app = StepDetailApp::new(
+        plan,
+        steps,
+        target_index,
+        config,
+        project_settings,
+        exec_logs,
+    );
+    // Focus on the OpenQuestions pane so the user can press `a` immediately.
+    app.focused_pane = Pane::OpenQuestions;
+    refresh_step_detail_questions(conn, project, &mut app)?;
+
+    loop {
+        terminal.draw(|f| step_detail::draw(f, &mut app))?;
+
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            // Re-poll the question state so concurrent answers (CLI or
+            // another TUI) are reflected without input.
+            refresh_step_detail_questions(conn, project, &mut app)?;
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+
+        // Modals are exclusive: the resume modal is only opened when no
+        // answer modal is also open, and vice versa.
+        if app.answer_modal.is_some() {
+            handle_answer_modal_key(conn, project, &mut app, key, edit_in_editor)?;
+            if app.should_pop {
+                return Ok(());
+            }
+            continue;
+        }
+        if app.resume_modal.is_some() {
+            match handle_resume_modal_key(&mut app, key) {
+                ResumeModalAction::Accept => {
+                    let modal = app
+                        .resume_modal
+                        .take()
+                        .expect("resume_modal was Some moments ago");
+                    spawn_resume_run(&mut app, project, &modal);
+                    return Ok(());
+                }
+                ResumeModalAction::Decline => {
+                    app.close_resume_modal();
+                }
+                ResumeModalAction::Pending => {}
+            }
+            continue;
+        }
+
+        match key.code {
+            // Question-pane navigation (j/k) overrides pane navigation while
+            // the pane is focused.
+            KeyCode::Char('j') | KeyCode::Down
+                if app.focused_pane == Pane::OpenQuestions
+                    && app.has_open_questions_for_step() =>
+            {
+                app.select_question_next();
+            }
+            KeyCode::Char('k') | KeyCode::Up
+                if app.focused_pane == Pane::OpenQuestions
+                    && app.has_open_questions_for_step() =>
+            {
+                app.select_question_prev();
+            }
+            // Pane navigation (j/k outside the questions pane).
+            KeyCode::Char('j') | KeyCode::Down => app.focus_down(),
+            KeyCode::Char('k') | KeyCode::Up => app.focus_up(),
+            KeyCode::Char('a') if app.focused_pane == Pane::OpenQuestions => {
+                let opened = app.open_answer_modal();
+                if !opened && !app.has_open_questions_for_step() {
+                    app.toasts.push(
+                        "No open questions for this step.",
+                        ToastKind::Info,
+                        Instant::now(),
+                    );
+                }
+            }
+            KeyCode::Char('h') | KeyCode::Left => app.handle_left(),
+            KeyCode::Char('l') | KeyCode::Right => app.handle_right(),
+            KeyCode::Char('q') => app.request_pop(),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.request_pop();
+            }
+            KeyCode::Esc => app.request_pop(),
+            _ => {}
+        }
+        if app.should_pop {
+            return Ok(());
+        }
+    }
+}
+
+/// Drive one key event into the open answer modal. Persists the chosen
+/// answer (suggestion or `$EDITOR` round-trip) and refreshes the open
+/// question list. When the just-applied answer was the plan's last open
+/// question, opens the resume-implementation modal via
+/// [`StepDetailApp::note_answer_persisted`].
+fn handle_answer_modal_key<E>(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    key: crossterm::event::KeyEvent,
+    editor_fn: E,
+) -> Result<()>
+where
+    E: FnOnce(&str) -> Result<Option<String>>,
+{
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::answer_modal::AnswerModalAction;
+    use std::time::Instant;
+
+    let Some(modal) = app.answer_modal.as_ref() else {
+        return Ok(());
+    };
+    let action = modal.handle_key(key);
+    match action {
+        AnswerModalAction::Pending => {}
+        AnswerModalAction::Cancel => {
+            app.close_answer_modal();
+        }
+        AnswerModalAction::Submit { index } => {
+            let modal = app.answer_modal.as_ref().expect("modal still open");
+            let Some(answer) = modal.suggestion_text(index).map(|s| s.to_string()) else {
+                app.toasts.push(
+                    "No suggestion at that index.",
+                    ToastKind::Error,
+                    Instant::now(),
+                );
+                return Ok(());
+            };
+            let qid = modal.question_id.clone();
+            persist_answer_and_refresh(conn, project, app, &qid, &answer)?;
+        }
+        AnswerModalAction::EditCustom => {
+            let modal = app.answer_modal.as_ref().expect("modal still open");
+            let qid = modal.question_id.clone();
+            // Seed the editor with a short hint so the user knows what
+            // they're answering — stripped on persist.
+            let seed = format!(
+                "# Replace this with your answer to:\n# {q}\n\n",
+                q = modal.question
+            );
+            let edited = match editor_fn(&seed)? {
+                Some(s) => s,
+                None => {
+                    app.toasts.push(
+                        crate::tui::views::step_detail::NO_EDITOR_TOAST,
+                        ToastKind::Error,
+                        Instant::now(),
+                    );
+                    app.close_answer_modal();
+                    return Ok(());
+                }
+            };
+            let answer = strip_answer_comments(&edited);
+            if answer.trim().is_empty() {
+                app.toasts.push(
+                    "Empty answer — modal closed without writing.",
+                    ToastKind::Info,
+                    Instant::now(),
+                );
+                app.close_answer_modal();
+                return Ok(());
+            }
+            persist_answer_and_refresh(conn, project, app, &qid, &answer)?;
+        }
+    }
+    Ok(())
+}
+
+/// Drive one key event into the resume-implementation modal. Returns the
+/// outcome so the caller can decide whether to spawn the runner. Pure of
+/// I/O.
+fn handle_resume_modal_key(
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    key: crossterm::event::KeyEvent,
+) -> crate::tui::views::answer_modal::ResumeModalAction {
+    use crate::tui::views::answer_modal::ResumeModalAction;
+    let Some(modal) = app.resume_modal.as_ref() else {
+        return ResumeModalAction::Pending;
+    };
+    modal.handle_key(key)
+}
+
+/// Persist a question answer and refresh the App's question caches. When
+/// this answer was the plan's last open question, the App opens the
+/// resume-implementation modal automatically via `note_answer_persisted`.
+fn persist_answer_and_refresh(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    question_id: &str,
+    answer: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    if let Err(e) = storage::set_question_answer(conn, question_id, answer) {
+        app.toasts.push(
+            format!("Failed to save answer: {e}"),
+            ToastKind::Error,
+            Instant::now(),
+        );
+        app.close_answer_modal();
+        return Ok(());
+    }
+    refresh_step_detail_questions(conn, project, app)?;
+    let prev_current_branch = previous_run_current_branch(conn, project, &app.plan.slug)?;
+    app.note_answer_persisted(prev_current_branch);
+    app.toasts
+        .push("Answer saved.", ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// Refresh the App's open-question cache + plan-wide count from the DB.
+/// Called after every answer and on each idle tick so concurrent CLI /
+/// runner activity is reflected.
+fn refresh_step_detail_questions(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+) -> Result<()> {
+    let opens = storage::list_open_questions(conn, project, Some(&app.plan.slug))?;
+    let plan_total = opens.len();
+    let step_id = app.current_step().map(|s| s.id.clone());
+    let for_step: Vec<_> = match step_id {
+        Some(sid) => opens.into_iter().filter(|q| q.step_id == sid).collect(),
+        None => Vec::new(),
+    };
+    app.set_open_questions_for_step(for_step);
+    app.set_plan_open_questions_count(plan_total);
+    Ok(())
+}
+
+/// Best-effort lookup of the previous run's `--current-branch` flag for
+/// `plan_slug`. Returns `false` (the normal branch flow) when the previous
+/// branch mode can't be recovered — the schema doesn't currently persist
+/// this across runs once the run lock is released, so the safe default is
+/// the more common branch-stash flow. The user can decline the resume
+/// prompt and re-run with their preferred flag if needed.
+fn previous_run_current_branch(
+    _conn: &Connection,
+    _project: &str,
+    _plan_slug: &str,
+) -> Result<bool> {
+    Ok(false)
+}
+
+/// Spawn `ralph run` in response to the resume modal's Accept action.
+/// Mirrors [`plan_detail_apply_run_streaming`]'s spawn behavior but
+/// without the streaming subscription — the caller is about to pop back
+/// to plan-detail, which will pick up the run via its DB-poll path.
+fn spawn_resume_run(
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    project: &str,
+    modal: &crate::tui::views::answer_modal::ResumeModal,
+) {
+    use crate::tui::toast::ToastKind;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            app.toasts.push(
+                format!("Cannot locate ralph binary: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return;
+        }
+    };
+    let mut cmd = Command::new(&exe);
+    cmd.arg("-C")
+        .arg(project)
+        .arg("--non-interactive")
+        .arg("run");
+    if modal.current_branch {
+        cmd.arg("--current-branch");
+    }
+    cmd.arg(&modal.plan_slug)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(e) = cmd.spawn() {
+        app.toasts.push(
+            format!("Failed to start run: {e}"),
+            ToastKind::Error,
+            Instant::now(),
+        );
+    }
+    // Pop back to plan-detail so the user sees the live status.
+    app.request_pop();
+}
+
+/// Strip leading `#`-prefixed comment lines (and any trailing blank line)
+/// from a custom-answer editor blob, mirroring git commit-message
+/// conventions. The seed text the modal injects starts each hint line
+/// with `#` so this leaves only the user's actual answer.
+fn strip_answer_comments(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------

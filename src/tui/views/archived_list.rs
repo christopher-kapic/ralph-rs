@@ -309,6 +309,8 @@ mod tests {
             completed: 0,
             total: 1,
             had_run: false,
+            unanswered_questions: 0,
+            oldest_question: None,
         }
     }
 

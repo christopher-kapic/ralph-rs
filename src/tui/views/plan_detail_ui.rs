@@ -146,6 +146,20 @@ fn draw_step_list(frame: &mut Frame, app: &mut PlanDetailApp, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
+    // §17: when this plan has unanswered questions, carve a single-row banner
+    // off the top of the right panel. The remainder hosts the existing
+    // step-detail body so callers don't need to reflow everything.
+    let body_area = if !app.open_questions.is_empty() {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area);
+        draw_open_questions_banner(frame, app, split[0]);
+        split[1]
+    } else {
+        area
+    };
+
     if app.steps.is_empty() {
         let empty = Paragraph::new("No steps in this plan.").block(
             Block::default()
@@ -153,9 +167,10 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         );
-        frame.render_widget(empty, area);
+        frame.render_widget(empty, body_area);
         return;
     }
+    let area = body_area;
 
     let step = &app.steps[app.selected_index];
     let mut lines: Vec<Line> = Vec::new();
@@ -359,6 +374,28 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
         .block(block)
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+/// Render the open-questions banner above the right panel (TUI-plan.md §17).
+/// One bordered row reading `❓ <count> open question(s) — press [A] to answer`,
+/// styled with `STATUS_QUESTION` so the user can spot it at a glance.
+fn draw_open_questions_banner(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let count = app.open_questions.len();
+    let text = format!("❓ {count} open question(s) — press [A] to answer");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::STATUS_QUESTION));
+    let para = Paragraph::new(Span::styled(
+        text,
+        Style::default()
+            .fg(theme::STATUS_QUESTION)
+            .add_modifier(Modifier::BOLD),
+    ))
+    .block(block);
+    frame.render_widget(para, area);
 }
 
 // ---------------------------------------------------------------------------

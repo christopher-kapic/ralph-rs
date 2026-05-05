@@ -132,6 +132,12 @@ pub struct PlanDetailApp {
     /// and the persistent banner replaces the bottom hint line. The
     /// dispatcher updates this each poll tick via [`Self::set_read_only`].
     pub read_only: ReadOnly,
+
+    /// Open (unanswered) `step_questions` rows for this plan, ordered oldest
+    /// first per [`crate::storage::list_open_questions`]. Drives the §17
+    /// banner pane and the `A` keybinding that pushes step-detail focused on
+    /// the originating step. Refreshed by the dispatcher each poll tick.
+    pub open_questions: Vec<crate::storage::OpenQuestion>,
 }
 
 impl PlanDetailApp {
@@ -160,7 +166,22 @@ impl PlanDetailApp {
             harness_tail_scroll: 0,
             test_tail_scroll: 0,
             read_only: ReadOnly::Editable,
+            open_questions: Vec::new(),
         }
+    }
+
+    /// Replace the cached open-question list (after a DB poll). Drives the
+    /// §17 banner + the `A` keybinding's target. Empty input clears the list,
+    /// hiding the banner.
+    pub fn set_open_questions(&mut self, questions: Vec<crate::storage::OpenQuestion>) {
+        self.open_questions = questions;
+    }
+
+    /// Step ID containing the oldest unanswered question, or `None` when no
+    /// questions are open. Used by the `A` keybinding (TUI-plan.md §17) to
+    /// pick the step-detail target — pressing `A` focuses on that step.
+    pub fn oldest_question_step_id(&self) -> Option<String> {
+        self.open_questions.first().map(|q| q.step_id.clone())
     }
 
     /// Update the read-only state. Called by the dispatcher after each

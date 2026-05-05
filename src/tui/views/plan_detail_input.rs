@@ -38,6 +38,9 @@ pub enum InputAction {
     /// The user pressed `D` to open the plan-dependencies sub-view
     /// (TUI-plan.md §1, step 33).
     OpenDependencies,
+    /// The user pressed `A` to open step detail focused on the step that
+    /// owns the oldest unanswered question (TUI-plan.md §17).
+    OpenQuestion(String),
 }
 
 /// True when J/K should scroll the live-run tails (TUI-plan.md §13) instead
@@ -169,6 +172,14 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
 
         // Open the plan-dependencies sub-view (TUI-plan.md §1, step 33).
         KeyCode::Char('D') => InputAction::OpenDependencies,
+
+        // Answer the oldest unanswered question for this plan (TUI-plan.md §17).
+        // No-op when there are no open questions — the dispatcher checks the
+        // returned step id is `Some`.
+        KeyCode::Char('A') => match app.oldest_question_step_id() {
+            Some(step_id) => InputAction::OpenQuestion(step_id),
+            None => InputAction::None,
+        },
 
         // Esc clears selection if any; otherwise no-op (Esc does NOT pop the
         // view — `q`/`h`/`←` own that).

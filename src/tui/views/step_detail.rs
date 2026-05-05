@@ -116,6 +116,11 @@ pub enum Pane {
     PlanContextPrepend,
     PlanPrompt,
     StepPrompt,
+    /// Open (unanswered) `step_questions` rows for the focused step
+    /// (TUI-plan.md §17). Sits between [`Pane::StepPrompt`] and
+    /// [`Pane::Appended`] so the user sees the harness's pending blockers in
+    /// the same vertical region that holds the harness's own prompt.
+    OpenQuestions,
     Appended,
     Tests,
     BottomRow,
@@ -124,12 +129,13 @@ pub enum Pane {
 impl Pane {
     /// Display order — index into the pane stack from top to bottom. Drives
     /// the wrapping nav arithmetic below.
-    pub const ORDER: [Pane; 8] = [
+    pub const ORDER: [Pane; 9] = [
         Pane::UniversalPrompt,
         Pane::ProjectPrompt,
         Pane::PlanContextPrepend,
         Pane::PlanPrompt,
         Pane::StepPrompt,
+        Pane::OpenQuestions,
         Pane::Appended,
         Pane::Tests,
         Pane::BottomRow,
@@ -149,6 +155,7 @@ impl Pane {
             Pane::PlanContextPrepend => "Plan context prepend",
             Pane::PlanPrompt => "Plan prompt",
             Pane::StepPrompt => "Step prompt",
+            Pane::OpenQuestions => "Open question(s)",
             Pane::Appended => "Appended",
             Pane::Tests => "Tests",
             Pane::BottomRow => "Harness │ Model │ Agent │ Change policy",
@@ -584,6 +591,31 @@ pub struct StepDetailApp {
     /// persistent banner replaces the bottom hint line. The dispatcher
     /// updates this each poll tick via [`Self::set_read_only`].
     pub read_only: ReadOnly,
+
+    /// Open (unanswered) `step_questions` rows for the *focused* step,
+    /// ordered oldest first. Drives the [`Pane::OpenQuestions`] body.
+    /// Refreshed by the dispatcher each poll tick.
+    pub open_questions_for_step: Vec<storage::OpenQuestion>,
+
+    /// Cursor within the [`Pane::OpenQuestions`] pane (0-based). j/k moves
+    /// it while the pane is focused; out-of-range values are clamped on
+    /// every refresh.
+    pub selected_question_index: usize,
+
+    /// Total number of unanswered questions across the *whole plan* (every
+    /// step). Drives the resume-modal trigger: when the user answers the
+    /// last open question for the plan, the dispatcher pops the modal.
+    pub plan_open_questions_count: usize,
+
+    /// Active answer modal, or `None` when no question is being answered.
+    /// Set by [`Self::open_answer_modal`]; cleared by either a Cancel or a
+    /// successful Submit.
+    pub answer_modal: Option<crate::tui::views::answer_modal::AnswerModal>,
+
+    /// Active resume-implementation modal, or `None`. Spawned by
+    /// [`Self::note_answer_persisted`] when the just-applied answer was the
+    /// plan's last open question; cleared by either Accept or Decline.
+    pub resume_modal: Option<crate::tui::views::answer_modal::ResumeModal>,
 }
 
 impl StepDetailApp {
@@ -631,6 +663,11 @@ impl StepDetailApp {
             bottom_focus: BottomCell::Harness,
             picker: None,
             read_only: ReadOnly::Editable,
+            open_questions_for_step: Vec::new(),
+            selected_question_index: 0,
+            plan_open_questions_count: 0,
+            answer_modal: None,
+            resume_modal: None,
         }
     }
 
@@ -724,6 +761,118 @@ impl StepDetailApp {
     /// Signal the dispatcher to pop this view back to plan-detail.
     pub fn request_pop(&mut self) {
         self.should_pop = true;
+    }
+
+    // -- Open-question pane (TUI-plan.md §17) ----------------------------
+
+    /// Replace the open-question list for the focused step (after a DB
+    /// poll). Clamps `selected_question_index` into the new range so the
+    /// cursor never escapes the pane.
+    pub fn set_open_questions_for_step(&mut self, questions: Vec<storage::OpenQuestion>) {
+        self.open_questions_for_step = questions;
+        if self.selected_question_index >= self.open_questions_for_step.len() {
+            self.selected_question_index = self
+                .open_questions_for_step
+                .len()
+                .saturating_sub(1);
+        }
+    }
+
+    /// Update the cached plan-wide open-question count. Drives the
+    /// resume-modal trigger.
+    pub fn set_plan_open_questions_count(&mut self, count: usize) {
+        self.plan_open_questions_count = count;
+    }
+
+    /// True when the [`Pane::OpenQuestions`] pane has at least one row
+    /// to render — the renderer drops the placeholder body in that case
+    /// and the `a` keybinding has something to target.
+    pub fn has_open_questions_for_step(&self) -> bool {
+        !self.open_questions_for_step.is_empty()
+    }
+
+    /// Currently focused open question on the [`Pane::OpenQuestions`] pane,
+    /// or `None` when the step has no open questions.
+    pub fn focused_open_question(&self) -> Option<&storage::OpenQuestion> {
+        self.open_questions_for_step
+            .get(self.selected_question_index)
+    }
+
+    /// Move the question-pane cursor down one row, wrapping at the bottom.
+    /// No-op when there are zero or one open questions.
+    pub fn select_question_next(&mut self) {
+        let n = self.open_questions_for_step.len();
+        if n <= 1 {
+            return;
+        }
+        self.selected_question_index = (self.selected_question_index + 1) % n;
+    }
+
+    /// Move the question-pane cursor up one row, wrapping at the top.
+    pub fn select_question_prev(&mut self) {
+        let n = self.open_questions_for_step.len();
+        if n <= 1 {
+            return;
+        }
+        if self.selected_question_index == 0 {
+            self.selected_question_index = n - 1;
+        } else {
+            self.selected_question_index -= 1;
+        }
+    }
+
+    // -- Answer modal ----------------------------------------------------
+
+    /// Open the answer modal for the question currently focused in the
+    /// [`Pane::OpenQuestions`] pane. No-op when the pane is empty,
+    /// when the pane isn't focused, when read-only attach is active, or
+    /// when a modal is already open.
+    pub fn open_answer_modal(&mut self) -> bool {
+        if !self.can_edit_panes() || self.answer_modal.is_some() {
+            return false;
+        }
+        if self.focused_pane != Pane::OpenQuestions {
+            return false;
+        }
+        let Some(q) = self.focused_open_question() else {
+            return false;
+        };
+        self.answer_modal = Some(crate::tui::views::answer_modal::AnswerModal::new(
+            q.id.clone(),
+            q.question.clone(),
+            q.suggestions.clone(),
+        ));
+        true
+    }
+
+    /// Close the answer modal (Cancel path). Idempotent.
+    pub fn close_answer_modal(&mut self) {
+        self.answer_modal = None;
+    }
+
+    // -- Resume-implementation modal -------------------------------------
+
+    /// Inform the App that the dispatcher just persisted an answer.
+    /// `previous_run_current_branch` mirrors the previous run's
+    /// `--current-branch` flag so the resume modal carries it forward when
+    /// the user accepts.
+    ///
+    /// When the just-applied answer was the *last* open question for the
+    /// plan (i.e. `plan_open_questions_count` is now zero), this opens the
+    /// resume modal. Otherwise the modal stays closed.
+    pub fn note_answer_persisted(&mut self, previous_run_current_branch: bool) {
+        self.answer_modal = None;
+        if self.plan_open_questions_count == 0 && self.resume_modal.is_none() {
+            self.resume_modal = Some(crate::tui::views::answer_modal::ResumeModal::new(
+                self.plan.slug.clone(),
+                previous_run_current_branch,
+            ));
+        }
+    }
+
+    /// Close the resume modal without spawning a runner (Decline path).
+    pub fn close_resume_modal(&mut self) {
+        self.resume_modal = None;
     }
 
     // -- Appended pane pagination (TUI-plan.md §8 "Appended-prompt navigation")
@@ -1360,11 +1509,131 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
         super::step_detail_picker::render(frame, frame.area(), picker);
     }
 
+    // §17 modals are last so they composite over everything else.
+    if let Some(modal) = &app.answer_modal {
+        render_answer_modal(frame, frame.area(), modal);
+    } else if let Some(modal) = &app.resume_modal {
+        render_resume_modal(frame, frame.area(), modal);
+    }
+
     if let Some(toast) = app.toasts.current() {
         let area = frame.area();
         if area.height >= 1 && area.width > 0 {
             render_toast_overlay(frame, area, &toast.text, toast.color);
         }
+    }
+}
+
+/// Render the answer modal as a centered overlay. Layout mirrors the §17
+/// sketch: the question line, suggestions numbered from `[1]`, then `[c]
+/// Custom answer` and `[esc] Cancel` rows.
+fn render_answer_modal(
+    frame: &mut Frame,
+    area: Rect,
+    modal: &crate::tui::views::answer_modal::AnswerModal,
+) {
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "❓ ",
+            Style::default()
+                .fg(theme::STATUS_QUESTION)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            modal.question.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    for (i, sug) in modal.suggestions.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  [{}] ", i + 1),
+                Style::default()
+                    .fg(theme::SELECTION)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(sug.clone()),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  [c] ",
+            Style::default()
+                .fg(theme::CURSOR)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("Custom answer (opens $EDITOR)"),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  [esc] ",
+            Style::default()
+                .fg(theme::CHROME_DIM)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("Cancel"),
+    ]));
+
+    let dialog = centered_modal_rect(area, &lines, " Answer question ");
+    frame.render_widget(Clear, dialog);
+    let block = Block::default()
+        .title(" Answer question ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::STATUS_QUESTION));
+    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    frame.render_widget(para, dialog);
+}
+
+/// Render the resume-implementation prompt as a centered overlay. The text
+/// matches §17's "All questions answered. Resume implementation now? [Y/n]".
+fn render_resume_modal(
+    frame: &mut Frame,
+    area: Rect,
+    modal: &crate::tui::views::answer_modal::ResumeModal,
+) {
+    let body_lines = vec![
+        Line::from("All questions answered."),
+        Line::from(""),
+        Line::from(format!(
+            "Resume implementation for `{slug}`? [Y/n]",
+            slug = modal.plan_slug,
+        )),
+    ];
+    let dialog = centered_modal_rect(area, &body_lines, " Resume run ");
+    frame.render_widget(Clear, dialog);
+    let block = Block::default()
+        .title(" Resume run ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::CURSOR));
+    let para = Paragraph::new(body_lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, dialog);
+}
+
+/// Shared centering math for the §17 modals: pick a width that fits the
+/// longest line (capped at the available area), a height that fits the
+/// body plus borders, and center inside `area`.
+fn centered_modal_rect(area: Rect, body: &[Line], title: &str) -> Rect {
+    let body_w = body
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let title_w = title.chars().count();
+    let desired_w = body_w.max(title_w) as u16 + 4;
+    let width = desired_w.min(area.width).max(20.min(area.width));
+    let desired_h = (body.len() as u16) + 2; // borders top + bottom
+    let height = desired_h.min(area.height).max(5.min(area.height));
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
     }
 }
 
@@ -1573,10 +1842,66 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
             app.plan.prompt_suffix.as_deref(),
         ),
         Pane::StepPrompt => render_step_prompt(frame, app, inner),
+        Pane::OpenQuestions => render_open_questions(frame, app, inner),
         Pane::Appended => render_appended(frame, app, inner),
         Pane::Tests => render_tests(frame, app, inner),
         Pane::BottomRow => render_bottom_row(frame, app, inner),
     }
+}
+
+/// Render the [`Pane::OpenQuestions`] body. Each unanswered question is
+/// shown as a `❓ <text>` line followed by indented `[N] suggestion`
+/// rows. The currently focused question is bolded so j/k feedback is
+/// visible even when the pane itself isn't focused.
+fn render_open_questions(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+    if app.open_questions_for_step.is_empty() {
+        let para = Paragraph::new(Span::styled(
+            "(no open questions for this step)",
+            Style::default().fg(theme::CHROME_DIM),
+        ));
+        frame.render_widget(para, area);
+        return;
+    }
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(theme::CHROME_DIM);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, q) in app.open_questions_for_step.iter().enumerate() {
+        let focused = i == app.selected_question_index;
+        let header_style = if focused {
+            Style::default().fg(theme::STATUS_QUESTION).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::STATUS_QUESTION)
+        };
+        let mut header = vec![
+            Span::styled(if focused { "▶ " } else { "  " }, header_style),
+            Span::styled("❓ ", header_style),
+            Span::raw(q.question.clone()),
+        ];
+        if focused {
+            header.push(Span::styled("  [a]nswer", bold));
+        }
+        lines.push(Line::from(header));
+        for (sidx, sug) in q.suggestions.iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    [{}] ", sidx + 1),
+                    Style::default().fg(theme::SELECTION),
+                ),
+                Span::raw(sug.clone()),
+            ]));
+        }
+        if q.suggestions.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "    (no suggestions — use [c] for a custom answer)",
+                dim,
+            )));
+        }
+        if i + 1 < app.open_questions_for_step.len() {
+            lines.push(Line::from(""));
+        }
+    }
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(para, area);
 }
 
 /// Render a single text body (plan-context-prepend pane). `None` becomes the
@@ -1973,7 +2298,8 @@ mod tests {
 
     #[test]
     fn pane_order_matches_section_8_layout() {
-        // The §8 sketch lists exactly these eight panes top to bottom.
+        // The §8 sketch lists eight panes; §17 adds the OpenQuestions pane
+        // between StepPrompt and Appended.
         assert_eq!(
             Pane::ORDER,
             [
@@ -1982,6 +2308,7 @@ mod tests {
                 Pane::PlanContextPrepend,
                 Pane::PlanPrompt,
                 Pane::StepPrompt,
+                Pane::OpenQuestions,
                 Pane::Appended,
                 Pane::Tests,
                 Pane::BottomRow,
@@ -2053,12 +2380,213 @@ mod tests {
     }
 
     #[test]
-    fn focus_down_from_step_prompt_advances_to_appended() {
-        // Sanity check that the initial focus + one down-press lands on the
-        // Appended pane (where step 24 will add the `h`/`l` paginator).
+    fn focus_down_from_step_prompt_advances_to_open_questions() {
+        // §17 inserts OpenQuestions between StepPrompt and Appended, so the
+        // first down-press from the initial focus lands on OpenQuestions.
         let mut app = make_app(3, 0);
         app.focus_down();
-        assert_eq!(app.focused_pane, Pane::Appended);
+        assert_eq!(app.focused_pane, Pane::OpenQuestions);
+    }
+
+    // -- Open-question pane (TUI-plan.md §17) -------------------------------
+
+    fn make_question(step_id: &str, q: &str, suggestions: &[&str]) -> storage::OpenQuestion {
+        storage::OpenQuestion {
+            id: format!("q-{step_id}-{q}").chars().take(60).collect(),
+            step_id: step_id.to_string(),
+            plan_id: "p1".to_string(),
+            plan_slug: "tui-v1".to_string(),
+            step_num: 1,
+            step_title: "Step".to_string(),
+            attempt: 1,
+            question: q.to_string(),
+            suggestions: suggestions.iter().map(|s| s.to_string()).collect(),
+            asked_at: "2026-05-04T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn set_open_questions_for_step_clamps_cursor() {
+        let mut app = make_app(3, 0);
+        app.set_open_questions_for_step(vec![
+            make_question("s0", "q1", &["a", "b"]),
+            make_question("s0", "q2", &["c"]),
+            make_question("s0", "q3", &[]),
+        ]);
+        app.selected_question_index = 2;
+        // Refresh with two questions — cursor must clamp into the new range.
+        app.set_open_questions_for_step(vec![
+            make_question("s0", "q1", &["a"]),
+            make_question("s0", "q2", &["b"]),
+        ]);
+        assert_eq!(app.selected_question_index, 1);
+    }
+
+    #[test]
+    fn set_open_questions_for_step_resets_cursor_when_empty() {
+        let mut app = make_app(3, 0);
+        app.set_open_questions_for_step(vec![make_question("s0", "q1", &[])]);
+        app.selected_question_index = 0;
+        app.set_open_questions_for_step(vec![]);
+        assert_eq!(app.selected_question_index, 0);
+        assert!(!app.has_open_questions_for_step());
+    }
+
+    #[test]
+    fn select_question_next_wraps_around() {
+        let mut app = make_app(3, 0);
+        app.set_open_questions_for_step(vec![
+            make_question("s0", "q1", &[]),
+            make_question("s0", "q2", &[]),
+        ]);
+        assert_eq!(app.selected_question_index, 0);
+        app.select_question_next();
+        assert_eq!(app.selected_question_index, 1);
+        app.select_question_next();
+        assert_eq!(app.selected_question_index, 0);
+    }
+
+    #[test]
+    fn select_question_prev_wraps_around() {
+        let mut app = make_app(3, 0);
+        app.set_open_questions_for_step(vec![
+            make_question("s0", "q1", &[]),
+            make_question("s0", "q2", &[]),
+            make_question("s0", "q3", &[]),
+        ]);
+        app.select_question_prev();
+        assert_eq!(app.selected_question_index, 2);
+        app.select_question_prev();
+        assert_eq!(app.selected_question_index, 1);
+    }
+
+    #[test]
+    fn select_question_with_zero_or_one_is_noop() {
+        let mut app = make_app(3, 0);
+        // Zero questions: navigation is a no-op.
+        app.select_question_next();
+        assert_eq!(app.selected_question_index, 0);
+        app.select_question_prev();
+        assert_eq!(app.selected_question_index, 0);
+        // One question: cursor stays put.
+        app.set_open_questions_for_step(vec![make_question("s0", "q1", &[])]);
+        app.select_question_next();
+        assert_eq!(app.selected_question_index, 0);
+        app.select_question_prev();
+        assert_eq!(app.selected_question_index, 0);
+    }
+
+    #[test]
+    fn open_answer_modal_only_when_pane_focused_and_questions_present() {
+        let mut app = make_app(3, 0);
+        // No questions → no-op.
+        assert!(!app.open_answer_modal());
+        assert!(app.answer_modal.is_none());
+
+        // Questions present but pane not focused → no-op.
+        app.set_open_questions_for_step(vec![make_question(
+            "s0", "Pick crate", &["tracing", "log"],
+        )]);
+        app.focused_pane = Pane::StepPrompt;
+        assert!(!app.open_answer_modal());
+        assert!(app.answer_modal.is_none());
+
+        // Pane focused → modal opens with the focused question's data.
+        app.focused_pane = Pane::OpenQuestions;
+        assert!(app.open_answer_modal());
+        let modal = app.answer_modal.as_ref().expect("modal opened");
+        assert_eq!(modal.question, "Pick crate");
+        assert_eq!(modal.suggestions, vec!["tracing".to_string(), "log".to_string()]);
+    }
+
+    #[test]
+    fn open_answer_modal_idempotent_while_modal_open() {
+        let mut app = make_app(3, 0);
+        app.focused_pane = Pane::OpenQuestions;
+        app.set_open_questions_for_step(vec![make_question("s0", "Q", &["a"])]);
+        assert!(app.open_answer_modal());
+        // Second call returns false — the modal is already showing the
+        // first question; we don't replace it on a second `a` press.
+        assert!(!app.open_answer_modal());
+    }
+
+    #[test]
+    fn open_answer_modal_blocked_when_read_only() {
+        use crate::tui::read_only::ReadOnly;
+        let mut app = make_app(3, 0);
+        app.focused_pane = Pane::OpenQuestions;
+        app.set_open_questions_for_step(vec![make_question("s0", "Q", &["a"])]);
+        app.set_read_only(ReadOnly::Locked { pid: 4242 });
+        assert!(!app.open_answer_modal());
+        assert!(app.answer_modal.is_none());
+    }
+
+    #[test]
+    fn close_answer_modal_clears_state() {
+        let mut app = make_app(3, 0);
+        app.focused_pane = Pane::OpenQuestions;
+        app.set_open_questions_for_step(vec![make_question("s0", "Q", &["a"])]);
+        app.open_answer_modal();
+        app.close_answer_modal();
+        assert!(app.answer_modal.is_none());
+    }
+
+    // -- Resume modal logic (TUI-plan.md §17) -------------------------------
+
+    #[test]
+    fn note_answer_persisted_opens_resume_modal_when_plan_count_zero() {
+        let mut app = make_app(3, 0);
+        app.set_plan_open_questions_count(0);
+        app.note_answer_persisted(true);
+        let modal = app.resume_modal.as_ref().expect("resume modal opened");
+        assert_eq!(modal.plan_slug, "tui-v1");
+        assert!(modal.current_branch);
+    }
+
+    #[test]
+    fn note_answer_persisted_does_not_open_modal_when_questions_remain() {
+        let mut app = make_app(3, 0);
+        app.set_plan_open_questions_count(2);
+        app.note_answer_persisted(false);
+        assert!(app.resume_modal.is_none());
+    }
+
+    #[test]
+    fn note_answer_persisted_closes_answer_modal() {
+        let mut app = make_app(3, 0);
+        app.focused_pane = Pane::OpenQuestions;
+        app.set_open_questions_for_step(vec![make_question("s0", "Q", &["a"])]);
+        app.open_answer_modal();
+        app.set_plan_open_questions_count(1);
+        // Answer-modal state must clear regardless of whether the plan-wide
+        // count drops to zero.
+        app.note_answer_persisted(false);
+        assert!(app.answer_modal.is_none());
+        assert!(app.resume_modal.is_none());
+    }
+
+    #[test]
+    fn note_answer_persisted_idempotent_for_resume_modal() {
+        // Calling the helper twice in a row (e.g. polling re-detected the
+        // count is zero) must not stack two resume modals.
+        let mut app = make_app(3, 0);
+        app.set_plan_open_questions_count(0);
+        app.note_answer_persisted(false);
+        let first = app.resume_modal.clone();
+        app.note_answer_persisted(true);
+        // The second call is a no-op while the modal stays open — the
+        // current_branch flag from the first call is preserved.
+        assert_eq!(app.resume_modal, first);
+    }
+
+    #[test]
+    fn close_resume_modal_clears_state() {
+        let mut app = make_app(3, 0);
+        app.set_plan_open_questions_count(0);
+        app.note_answer_persisted(false);
+        assert!(app.resume_modal.is_some());
+        app.close_resume_modal();
+        assert!(app.resume_modal.is_none());
     }
 
     // -- Zen toggle ---------------------------------------------------------
