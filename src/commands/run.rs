@@ -4516,8 +4516,8 @@ pub(crate) fn step_detail_observe_read_only(
 ///
 /// Routes by `app.focused_pane`:
 /// - `UniversalPrompt` / `ProjectPrompt` / `PlanContextPrepend` /
-///   `PlanPrompt` / `StepPrompt` / `Tests` → the matching `edit_*_pane`
-///   method on `StepDetailApp`.
+///   `PlanPrefix` / `PlanSuffix` / `StepPrompt` / `Tests` → the matching
+///   `edit_*_pane` method on `StepDetailApp`.
 /// - `Appended` / `OpenQuestions` → no-op (those panes are read-only).
 /// - `BottomRow` → no-op here; the focused cell's picker is opened by
 ///   `step_detail_handle_bottom_row_c` instead.
@@ -4549,7 +4549,8 @@ where
         }
         Pane::ProjectPrompt => app.edit_project_pane(conn, edit_fn)?,
         Pane::PlanContextPrepend => app.edit_plan_context_prepend_pane(conn, edit_fn)?,
-        Pane::PlanPrompt => app.edit_plan_prompt_pane(conn, edit_fn)?,
+        Pane::PlanPrefix => app.edit_plan_prefix_pane(conn, edit_fn)?,
+        Pane::PlanSuffix => app.edit_plan_suffix_pane(conn, edit_fn)?,
         Pane::StepPrompt => app.edit_step_prompt_pane(conn, edit_fn)?,
         Pane::Tests => app.edit_tests_pane(conn, edit_fn)?,
         Pane::Appended | Pane::OpenQuestions | Pane::BottomRow => return Ok(()),
@@ -7566,23 +7567,41 @@ mod step_detail_dispatcher_tests {
     }
 
     #[test]
-    fn c_on_plan_prompt_persists_pair() {
+    fn c_on_plan_prefix_persists_value() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::PlanPrompt;
+        app.focused_pane = Pane::PlanPrefix;
 
-        let buffer = format_wrap_pane(Some("PRE"), Some("SUF"));
         let dir = tempfile::tempdir().unwrap();
         step_detail_handle_c(
             &mut app,
             &conn,
             &Config::default(),
             dir.path(),
-            fake_editor(Some(buffer)),
+            fake_editor(Some("PRE".to_string())),
         )
         .unwrap();
 
         assert_eq!(app.plan.prompt_prefix.as_deref(), Some("PRE"));
+        assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
+    }
+
+    #[test]
+    fn c_on_plan_suffix_persists_value() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = db_app(&conn, "/proj");
+        app.focused_pane = Pane::PlanSuffix;
+
+        let dir = tempfile::tempdir().unwrap();
+        step_detail_handle_c(
+            &mut app,
+            &conn,
+            &Config::default(),
+            dir.path(),
+            fake_editor(Some("SUF".to_string())),
+        )
+        .unwrap();
+
         assert_eq!(app.plan.prompt_suffix.as_deref(), Some("SUF"));
         assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
     }
@@ -7620,7 +7639,7 @@ mod step_detail_dispatcher_tests {
     fn c_with_no_editor_toasts_no_editor() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::PlanPrompt;
+        app.focused_pane = Pane::PlanPrefix;
 
         let dir = tempfile::tempdir().unwrap();
         step_detail_handle_c(
@@ -7639,13 +7658,10 @@ mod step_detail_dispatcher_tests {
     fn c_with_unchanged_buffer_toasts_no_changes() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::PlanPrompt;
+        app.focused_pane = Pane::PlanPrefix;
 
         let dir = tempfile::tempdir().unwrap();
-        let unchanged = format_wrap_pane(
-            app.plan.prompt_prefix.as_deref(),
-            app.plan.prompt_suffix.as_deref(),
-        );
+        let unchanged = app.plan.prompt_prefix.clone().unwrap_or_default();
         step_detail_handle_c(
             &mut app,
             &conn,

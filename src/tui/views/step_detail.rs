@@ -115,7 +115,8 @@ pub enum Pane {
     UniversalPrompt,
     ProjectPrompt,
     PlanContextPrepend,
-    PlanPrompt,
+    PlanPrefix,
+    PlanSuffix,
     StepPrompt,
     /// Open (unanswered) `step_questions` rows for the focused step
     /// (TUI-plan.md §17). Sits between [`Pane::StepPrompt`] and
@@ -130,11 +131,12 @@ pub enum Pane {
 impl Pane {
     /// Display order — index into the pane stack from top to bottom. Drives
     /// the wrapping nav arithmetic below.
-    pub const ORDER: [Pane; 9] = [
+    pub const ORDER: [Pane; 10] = [
         Pane::UniversalPrompt,
         Pane::ProjectPrompt,
         Pane::PlanContextPrepend,
-        Pane::PlanPrompt,
+        Pane::PlanPrefix,
+        Pane::PlanSuffix,
         Pane::StepPrompt,
         Pane::OpenQuestions,
         Pane::Appended,
@@ -157,7 +159,8 @@ impl Pane {
             Pane::UniversalPrompt => "Universal prompt",
             Pane::ProjectPrompt => "Project prompt",
             Pane::PlanContextPrepend => "Plan context prepend",
-            Pane::PlanPrompt => "Plan prompt",
+            Pane::PlanPrefix => "Plan prefix",
+            Pane::PlanSuffix => "Plan suffix",
             Pane::StepPrompt => "Step prompt",
             Pane::OpenQuestions => "Open question(s)",
             Pane::Appended => "Appended",
@@ -1409,34 +1412,46 @@ impl StepDetailApp {
         Ok(EditOutcome::Saved)
     }
 
-    /// `c` on the Plan-prompt pane: round-trip `plan.prompt_prefix` and
-    /// `plan.prompt_suffix` through `$EDITOR` using the same two-section
-    /// format as the universal/project panes. Each side is updated
-    /// independently so a no-op on one half doesn't churn `updated_at`.
-    pub fn edit_plan_prompt_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
+    /// `c` on the Plan-prefix pane: round-trip `plan.prompt_prefix` through
+    /// `$EDITOR` as a single text body. Whitespace-only input clears the
+    /// field (stored as `NULL`) so the user can drop the prefix entirely
+    /// without leaving an empty-string artifact.
+    pub fn edit_plan_prefix_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
     where
         E: FnOnce(&str) -> Result<Option<String>>,
     {
-        let initial = format_wrap_pane(
-            self.plan.prompt_prefix.as_deref(),
-            self.plan.prompt_suffix.as_deref(),
-        );
+        let initial = self.plan.prompt_prefix.clone().unwrap_or_default();
         let new_text = match edit_fn(&initial)? {
             None => return Ok(EditOutcome::NoEditor),
             Some(s) => s,
         };
-        let (new_prefix, new_suffix) = parse_wrap_pane(&new_text);
-        if new_prefix == self.plan.prompt_prefix && new_suffix == self.plan.prompt_suffix {
+        let new_value = trim_to_option(&new_text);
+        if new_value == self.plan.prompt_prefix {
             return Ok(EditOutcome::NoChanges);
         }
-        if new_prefix != self.plan.prompt_prefix {
-            storage::set_plan_prompt_prefix(conn, &self.plan.id, new_prefix.as_deref())?;
-            self.plan.prompt_prefix = new_prefix;
+        storage::set_plan_prompt_prefix(conn, &self.plan.id, new_value.as_deref())?;
+        self.plan.prompt_prefix = new_value;
+        Ok(EditOutcome::Saved)
+    }
+
+    /// `c` on the Plan-suffix pane: round-trip `plan.prompt_suffix` through
+    /// `$EDITOR` as a single text body. Whitespace-only input clears the
+    /// field — same semantics as [`Self::edit_plan_prefix_pane`].
+    pub fn edit_plan_suffix_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
+    where
+        E: FnOnce(&str) -> Result<Option<String>>,
+    {
+        let initial = self.plan.prompt_suffix.clone().unwrap_or_default();
+        let new_text = match edit_fn(&initial)? {
+            None => return Ok(EditOutcome::NoEditor),
+            Some(s) => s,
+        };
+        let new_value = trim_to_option(&new_text);
+        if new_value == self.plan.prompt_suffix {
+            return Ok(EditOutcome::NoChanges);
         }
-        if new_suffix != self.plan.prompt_suffix {
-            storage::set_plan_prompt_suffix(conn, &self.plan.id, new_suffix.as_deref())?;
-            self.plan.prompt_suffix = new_suffix;
-        }
+        storage::set_plan_prompt_suffix(conn, &self.plan.id, new_value.as_deref())?;
+        self.plan.prompt_suffix = new_value;
         Ok(EditOutcome::Saved)
     }
 
@@ -1951,12 +1966,8 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
                 None => Some(DEFAULT_CONTEXT_PREPEND),
             },
         ),
-        Pane::PlanPrompt => render_wrap_pane(
-            frame,
-            inner,
-            app.plan.prompt_prefix.as_deref(),
-            app.plan.prompt_suffix.as_deref(),
-        ),
+        Pane::PlanPrefix => render_text_pane(frame, inner, app.plan.prompt_prefix.as_deref()),
+        Pane::PlanSuffix => render_text_pane(frame, inner, app.plan.prompt_suffix.as_deref()),
         Pane::StepPrompt => render_step_prompt(frame, app, inner),
         Pane::OpenQuestions => render_open_questions(frame, app, inner),
         Pane::Appended => render_appended(frame, app, inner),
@@ -2036,10 +2047,10 @@ fn render_text_pane(frame: &mut Frame, area: Rect, text: Option<&str>) {
     frame.render_widget(para, area);
 }
 
-/// Render a prefix/suffix wrap pane (Universal, Project, Plan prompt). Both
-/// halves render with bolded labels so the operator can tell which is which
-/// even when one side is empty. When both are absent we collapse to a single
-/// `(none)` line to match the other read-only renders.
+/// Render a prefix/suffix wrap pane (Universal, Project). Both halves render
+/// with bolded labels so the operator can tell which is which even when one
+/// side is empty. When both are absent we collapse to a single `(none)` line
+/// to match the other read-only renders.
 fn render_wrap_pane(frame: &mut Frame, area: Rect, prefix: Option<&str>, suffix: Option<&str>) {
     let mut lines: Vec<Line> = Vec::new();
     let label_style = Style::default().add_modifier(Modifier::BOLD);
@@ -2270,7 +2281,18 @@ fn render_bottom_row(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD)
         };
         let value_span = match value {
-            Some(s) if !s.is_empty() => Span::raw(s.clone()),
+            Some(s) if !s.is_empty() => {
+                if *cell == BottomCell::Harness
+                    && let Some(color) = crate::output::harness_color(s)
+                {
+                    Span::styled(
+                        s.clone(),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw(s.clone())
+                }
+            }
             _ => Span::styled(
                 EMPTY_CELL.to_string(),
                 Style::default().fg(theme::CHROME_DIM),
@@ -2426,15 +2448,17 @@ mod tests {
 
     #[test]
     fn pane_order_matches_section_8_layout() {
-        // The §8 sketch lists eight panes; §17 adds the OpenQuestions pane
-        // between StepPrompt and Appended.
+        // The §8 sketch lists the prompt-wrapping panes; §17 adds the
+        // OpenQuestions pane between StepPrompt and Appended. The plan
+        // prefix/suffix are split so each is editable as a single body.
         assert_eq!(
             Pane::ORDER,
             [
                 Pane::UniversalPrompt,
                 Pane::ProjectPrompt,
                 Pane::PlanContextPrepend,
-                Pane::PlanPrompt,
+                Pane::PlanPrefix,
+                Pane::PlanSuffix,
                 Pane::StepPrompt,
                 Pane::OpenQuestions,
                 Pane::Appended,
@@ -2998,7 +3022,7 @@ mod tests {
             ProjectSettings::default(),
             Vec::new(),
         );
-        let screen = render_to_string(140, 60, &mut app);
+        let screen = render_to_string(160, 100, &mut app);
         assert!(screen.contains("Universal prompt"), "{screen}");
         assert!(screen.contains("CFG-PREFIX-MARKER"), "{screen}");
         assert!(screen.contains("CFG-SUFFIX-MARKER"), "{screen}");
@@ -3049,7 +3073,7 @@ mod tests {
             project_settings,
             Vec::new(),
         );
-        let screen = render_to_string(140, 60, &mut app);
+        let screen = render_to_string(160, 100, &mut app);
         assert!(screen.contains("Project prompt"), "{screen}");
         assert!(screen.contains("PROJ-PRE-MARK"), "{screen}");
         assert!(screen.contains("PROJ-SUF-MARK"), "{screen}");
@@ -3101,7 +3125,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_prompt_pane_renders_plan_wraps() {
+    fn plan_prefix_and_suffix_panes_render_independently() {
         let mut plan = make_plan();
         plan.prompt_prefix = Some("PLAN-PRE-MARK".to_string());
         plan.prompt_suffix = Some("PLAN-SUF-MARK".to_string());
@@ -3114,7 +3138,8 @@ mod tests {
             Vec::new(),
         );
         let screen = render_to_string(140, 60, &mut app);
-        assert!(screen.contains("Plan prompt"), "{screen}");
+        assert!(screen.contains("Plan prefix"), "{screen}");
+        assert!(screen.contains("Plan suffix"), "{screen}");
         assert!(screen.contains("PLAN-PRE-MARK"), "{screen}");
         assert!(screen.contains("PLAN-SUF-MARK"), "{screen}");
     }
@@ -3134,7 +3159,7 @@ mod tests {
             ProjectSettings::default(),
             Vec::new(),
         );
-        let screen = render_to_string(160, 80, &mut app);
+        let screen = render_to_string(160, 100, &mut app);
         assert!(screen.contains("STEP-TITLE-MARK"), "{screen}");
         assert!(screen.contains("STEP-DESC-MARK"), "{screen}");
         assert!(screen.contains("CRIT-A-MARK"), "{screen}");
@@ -4318,50 +4343,74 @@ cargo clippy
         assert!(parsed.is_empty());
     }
 
-    // -- edit_plan_prompt_pane --------------------------------------------
+    // -- edit_plan_prefix_pane / edit_plan_suffix_pane --------------------
 
     #[test]
-    fn edit_plan_prompt_no_editor_short_circuits() {
+    fn edit_plan_prefix_no_editor_short_circuits() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_project_app(&conn, "/proj");
-        let outcome = app.edit_plan_prompt_pane(&conn, fake_editor(None)).unwrap();
+        let outcome = app.edit_plan_prefix_pane(&conn, fake_editor(None)).unwrap();
         assert_eq!(outcome, EditOutcome::NoEditor);
     }
 
     #[test]
-    fn edit_plan_prompt_no_changes_skips_writes() {
+    fn edit_plan_prefix_no_changes_skips_writes() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_project_app(&conn, "/proj");
+        // Seed a value so we can verify the unchanged round-trip path.
+        storage::set_plan_prompt_prefix(&conn, &app.plan.id, Some("a")).unwrap();
         app.plan.prompt_prefix = Some("a".to_string());
-        let buffer = format_wrap_pane(Some("a"), None);
         let outcome = app
-            .edit_plan_prompt_pane(&conn, fake_editor(Some(buffer)))
+            .edit_plan_prefix_pane(&conn, fake_editor(Some("a".to_string())))
             .unwrap();
         assert_eq!(outcome, EditOutcome::NoChanges);
-        // DB row still reflects the absence of the suffix and the seeded prefix.
         let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
             .unwrap()
             .unwrap();
-        assert_eq!(reloaded.prompt_prefix, None);
-        assert_eq!(reloaded.prompt_suffix, None);
+        assert_eq!(reloaded.prompt_prefix.as_deref(), Some("a"));
     }
 
     #[test]
-    fn edit_plan_prompt_persists_changed_pair() {
+    fn edit_plan_prefix_persists_changed_value() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_project_app(&conn, "/proj");
-        let buffer = format_wrap_pane(Some("PLAN-PRE"), Some("PLAN-SUF"));
         let outcome = app
-            .edit_plan_prompt_pane(&conn, fake_editor(Some(buffer)))
+            .edit_plan_prefix_pane(&conn, fake_editor(Some("PLAN-PRE".to_string())))
             .unwrap();
         assert_eq!(outcome, EditOutcome::Saved);
         let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.prompt_prefix.as_deref(), Some("PLAN-PRE"));
-        assert_eq!(reloaded.prompt_suffix.as_deref(), Some("PLAN-SUF"));
         assert_eq!(app.plan.prompt_prefix.as_deref(), Some("PLAN-PRE"));
+    }
+
+    #[test]
+    fn edit_plan_suffix_persists_changed_value() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        let outcome = app
+            .edit_plan_suffix_pane(&conn, fake_editor(Some("PLAN-SUF".to_string())))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.prompt_suffix.as_deref(), Some("PLAN-SUF"));
         assert_eq!(app.plan.prompt_suffix.as_deref(), Some("PLAN-SUF"));
+    }
+
+    #[test]
+    fn edit_plan_prefix_whitespace_clears_field() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        storage::set_plan_prompt_prefix(&conn, &app.plan.id, Some("seed")).unwrap();
+        app.plan.prompt_prefix = Some("seed".to_string());
+        let outcome = app
+            .edit_plan_prefix_pane(&conn, fake_editor(Some("   \n".to_string())))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        assert_eq!(app.plan.prompt_prefix, None);
     }
 
     // -- edit_step_prompt_pane --------------------------------------------

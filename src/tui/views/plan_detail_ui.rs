@@ -254,9 +254,13 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
 
     // Harness
     if let Some(harness) = step.harness.as_deref().or(app.plan.harness.as_deref()) {
+        let mut harness_style = Style::default().add_modifier(Modifier::BOLD);
+        if let Some(color) = crate::output::harness_color(harness) {
+            harness_style = harness_style.fg(color);
+        }
         lines.push(Line::from(vec![
             Span::styled("Harness: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(harness),
+            Span::styled(harness.to_string(), harness_style),
         ]));
     }
 
