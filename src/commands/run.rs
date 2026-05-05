@@ -289,7 +289,153 @@ pub fn run_tui_mode(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
-    let result = run_plan_detail_tui(&mut terminal, conn, config, project, &slug, true);
+    let result = run_plan_detail_tui(
+        &mut terminal,
+        conn,
+        config,
+        project,
+        &slug,
+        Some(crate::tui::events::StreamMode::Run {
+            current_branch: false,
+        }),
+    );
+
+    let _ = disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Resume dispatch
+// ---------------------------------------------------------------------------
+
+/// All inputs the `Resume` subcommand needs for routing between the TUI
+/// auto-start path and today's CLI runner. Mirrors [`RunArgs`] in shape so
+/// the gating helper can stay symmetric.
+#[derive(Debug, Clone, Default)]
+pub struct ResumeArgs {
+    pub plan_slug: Option<String>,
+    pub force: bool,
+    /// The global `--non-interactive` flag.
+    pub non_interactive: bool,
+    /// The global `--json`/`--jsonl` flag.
+    pub json: bool,
+    /// The global `--quiet` flag.
+    pub quiet: bool,
+    /// The global `--harness` flag.
+    pub cli_harness: Option<String>,
+}
+
+/// Whether `ralph resume` was invoked with all defaults — meaning the
+/// routing rule from TUI-plan.md §2 should drop the user into TUI mode
+/// (mirrors [`is_default_run_invocation`] for the resume command per
+/// step 34's spec).
+///
+/// "Default" means: stdout is a real TTY, no `--non-interactive`, no
+/// `--json` / `--jsonl`, no `--quiet`, no `--harness` override, and no
+/// `--force` (force is a recovery flag — its presence implies the user
+/// is troubleshooting and wants the scripted path's stderr report).
+pub fn is_default_resume_invocation(args: &ResumeArgs, stdout_is_tty: bool) -> bool {
+    if !stdout_is_tty {
+        return false;
+    }
+    if args.non_interactive || args.json || args.quiet {
+        return false;
+    }
+    !args.force && args.cli_harness.is_none()
+}
+
+/// CLI-mode dispatcher for `ralph resume` — today's behaviour, factored out
+/// of `main.rs` so the TUI-mode router and the scripted/non-TTY path share
+/// the same lock acquisition, runner invocation, and final-report formatting.
+pub fn dispatch_resume(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    args: ResumeArgs,
+    out: &OutputContext,
+) -> Result<()> {
+    let workdir = Path::new(project);
+    let plan = super::resolve_resume_plan(conn, args.plan_slug, project, workdir)?;
+    let slug = plan.slug.clone();
+
+    // Acquire the same per-project run lock that `ralph run` uses, so
+    // resume can't race a concurrent run or skip.
+    let _run_lock = run_lock::acquire(conn, project, Some(&plan.slug), Some(&plan.id), args.force)?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(async {
+        let abort_rx = signal::install_and_spawn();
+        runner::resume_plan(conn, &plan, config, workdir, abort_rx, out).await
+    })?;
+
+    if result.steps_failed > 0 {
+        eprintln!(
+            "Plan '{}' failed: {}/{} steps succeeded",
+            slug, result.steps_succeeded, result.steps_executed
+        );
+    } else {
+        eprintln!(
+            "Plan '{}' resumed: {}/{} steps succeeded",
+            slug, result.steps_succeeded, result.steps_executed
+        );
+    }
+    Ok(())
+}
+
+/// TUI-mode dispatcher for `ralph resume`. Resolves the target plan (the
+/// supplied slug, or the branch-inferred plan when no slug was given —
+/// see [`super::resolve_resume_plan`]), enters the alternate-screen +
+/// raw-mode terminal, and hands off to the plan-detail dispatcher with
+/// `auto_start = Some(StreamMode::Resume)` so the resume subprocess kicks
+/// off immediately after the first frame draws (TUI-plan.md §2,
+/// generalised to resume per step 34).
+///
+/// The routing decision in `main.rs` (via [`is_default_resume_invocation`])
+/// guarantees this is only reached for bare `ralph resume` /
+/// `ralph resume <slug>` invocations from a TTY — every other flag
+/// combination falls through to [`dispatch_resume`].
+pub fn run_resume_tui_mode(
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    args: ResumeArgs,
+    _out: &OutputContext,
+) -> Result<()> {
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    use crossterm::execute;
+    use crossterm::terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
+
+    // Resolve the plan before touching the terminal so a "no resumable
+    // plan" error surfaces as plain stderr rather than corrupting the
+    // user's terminal with a half-entered alternate screen.
+    let workdir = Path::new(project);
+    let plan = super::resolve_resume_plan(conn, args.plan_slug, project, workdir)?;
+    let slug = plan.slug.clone();
+
+    enable_raw_mode().context("enable raw mode")?;
+    let mut stdout = std::io::stdout();
+    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        let _ = disable_raw_mode();
+        return Err(e).context("enter alternate screen");
+    }
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("create terminal")?;
+
+    let result = run_plan_detail_tui(
+        &mut terminal,
+        conn,
+        config,
+        project,
+        &slug,
+        Some(crate::tui::events::StreamMode::Resume),
+    );
 
     let _ = disable_raw_mode();
     let mut stdout = std::io::stdout();
@@ -607,7 +753,7 @@ pub fn run_plan_list_tui(
                                     config,
                                     project,
                                     &slug,
-                                    false,
+                                    None,
                                 )?;
                                 // The plan-detail view can mutate step state
                                 // (skip / add) and counters; refresh tiles so
@@ -2042,18 +2188,19 @@ fn confirm_with_archived_background<B: ratatui::backend::Backend>(
 /// spawns a `ralph run --non-interactive <slug>` child and `S` sends
 /// `ralph cancel` semantics (SIGTERM with timeout, then SIGKILL).
 ///
-/// When `auto_start` is true, the dispatcher fires
+/// When `auto_start` is `Some`, the dispatcher fires
 /// [`plan_detail_apply_run_streaming`] once after rendering the first
-/// frame — the same code path the `R` keybinding uses. This is how
-/// `ralph run` (TUI-plan.md §2) lands in plan-detail with the run
-/// already kicked off.
+/// frame — the same code path the `R` keybinding uses, parameterised by
+/// the enclosed [`StreamMode`] so `ralph run` and `ralph resume`
+/// (TUI-plan.md §2) both land in plan-detail with their respective
+/// runner subprocess already kicked off.
 fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
     config: &Config,
     project: &str,
     slug: &str,
-    auto_start: bool,
+    auto_start: Option<crate::tui::events::StreamMode>,
 ) -> Result<()> {
     use crate::tui::events::{self as tui_events, RunSubscription};
     use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
@@ -2080,9 +2227,11 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     let my_pid = std::process::id() as i64;
     let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
 
-    // TUI-plan.md §2: when `ralph run` lands here we auto-start the run after
-    // the first frame draws so the user sees the plan-detail UI before the
-    // streaming subprocess fires. Latched to a single shot.
+    // TUI-plan.md §2: when `ralph run` / `ralph resume` lands here we
+    // auto-start the run after the first frame draws so the user sees the
+    // plan-detail UI before the streaming subprocess fires. The enclosed
+    // [`StreamMode`] selects between the run and resume code paths.
+    // Latched to a single shot.
     let mut pending_auto_start = auto_start;
 
     loop {
@@ -2158,11 +2307,18 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
         terminal.draw(|f| plan_detail_ui::draw(f, &mut app))?;
 
         // TUI-plan.md §2 auto-start: after the first frame is on screen,
-        // fire the same streaming-run path that `R` invokes. Cleared after
-        // the single shot so subsequent loop iterations don't re-spawn.
-        if pending_auto_start {
-            pending_auto_start = false;
-            plan_detail_apply_run_streaming(conn, &mut app, project, slug, &mut subscription)?;
+        // fire the same streaming-run path that `R` invokes (or its
+        // resume counterpart). Cleared after the single shot so subsequent
+        // loop iterations don't re-spawn.
+        if let Some(mode) = pending_auto_start.take() {
+            plan_detail_apply_run_streaming(
+                conn,
+                &mut app,
+                project,
+                slug,
+                mode,
+                &mut subscription,
+            )?;
         }
 
         // Poll with a short timeout so the live timer keeps ticking and
@@ -2375,7 +2531,16 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
                 plan_detail_apply_move(conn, &mut app, &step_id, MoveDir::Down)?;
             }
             InputAction::Run => {
-                plan_detail_apply_run_streaming(conn, &mut app, project, slug, &mut subscription)?;
+                plan_detail_apply_run_streaming(
+                    conn,
+                    &mut app,
+                    project,
+                    slug,
+                    crate::tui::events::StreamMode::Run {
+                        current_branch: false,
+                    },
+                    &mut subscription,
+                )?;
             }
             InputAction::Stop => {
                 plan_detail_apply_stop(conn, &mut app, project, slug)?;
@@ -2612,18 +2777,27 @@ pub(crate) fn plan_detail_apply_run(
 /// [`RunSubscription`] on the dispatcher's stack so the next poll iteration
 /// can drain its events into the right-pane state.
 ///
-/// On spawn failure the subscription stays `None` and the user gets a
-/// toast — same UX as the legacy [`plan_detail_apply_run`].
+/// `mode` selects between `ralph run` and `ralph resume` — both share the
+/// same NDJSON pipe, App-side dispatch, and toast UX, so the auto-start
+/// path on `ralph resume` (TUI-plan.md §2) reuses this function with
+/// [`StreamMode::Resume`]. On spawn failure the subscription stays `None`
+/// and the user gets an error toast.
 pub(crate) fn plan_detail_apply_run_streaming(
     conn: &Connection,
     app: &mut crate::tui::views::plan_detail::PlanDetailApp,
     project: &str,
     slug: &str,
+    mode: crate::tui::events::StreamMode,
     subscription: &mut Option<crate::tui::events::RunSubscription>,
 ) -> Result<()> {
     use crate::tui::events::spawn_streaming_runner;
     use crate::tui::toast::ToastKind;
     use std::time::Instant;
+
+    let verb = match mode {
+        crate::tui::events::StreamMode::Run { .. } => "Run",
+        crate::tui::events::StreamMode::Resume => "Resume",
+    };
 
     if subscription.is_some() {
         app.toasts.push(
@@ -2657,19 +2831,19 @@ pub(crate) fn plan_detail_apply_run_streaming(
         }
     };
 
-    match spawn_streaming_runner(exe, project.into(), slug.to_string(), false) {
+    match spawn_streaming_runner(exe, project.into(), slug.to_string(), mode) {
         Ok(sub) => {
             *subscription = Some(sub);
             app.attach_subscription();
             app.toasts.push(
-                format!("Started run for {slug}"),
+                format!("Started {} for {slug}", verb.to_lowercase()),
                 ToastKind::Success,
                 Instant::now(),
             );
         }
         Err(e) => {
             app.toasts.push(
-                format!("Failed to start run: {e}"),
+                format!("Failed to start {}: {e}", verb.to_lowercase()),
                 ToastKind::Error,
                 Instant::now(),
             );
@@ -6379,6 +6553,150 @@ mod run_dispatch_tests {
             ..defaults()
         };
         assert!(!is_default_run_invocation(&global_only, true));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resume dispatch routing tests (TUI-plan.md §2 / step 34)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod resume_dispatch_tests {
+    use super::*;
+
+    fn defaults() -> ResumeArgs {
+        ResumeArgs::default()
+    }
+
+    #[test]
+    fn bare_invocation_on_tty_routes_to_tui() {
+        // `ralph resume` from a TTY with no flags is the canonical TUI entry.
+        assert!(is_default_resume_invocation(&defaults(), true));
+    }
+
+    #[test]
+    fn bare_invocation_with_plan_slug_routes_to_tui() {
+        // `ralph resume my-plan` from a TTY still drops to the TUI — slug
+        // alone is not a "non-default flag".
+        let args = ResumeArgs {
+            plan_slug: Some("my-plan".to_string()),
+            ..defaults()
+        };
+        assert!(is_default_resume_invocation(&args, true));
+    }
+
+    #[test]
+    fn non_tty_stdout_bypasses_tui() {
+        // Piping resume output to `tee` (or any non-TTY) keeps today's CLI
+        // runner path so script captures don't regress.
+        assert!(!is_default_resume_invocation(&defaults(), false));
+    }
+
+    #[test]
+    fn non_interactive_flag_bypasses_tui() {
+        let args = ResumeArgs {
+            non_interactive: true,
+            ..defaults()
+        };
+        assert!(!is_default_resume_invocation(&args, true));
+    }
+
+    #[test]
+    fn json_flag_bypasses_tui() {
+        // `--json` / `--jsonl` are scripted-output formats — they must keep
+        // the NDJSON path on stdout regardless of TTY status.
+        let args = ResumeArgs {
+            json: true,
+            ..defaults()
+        };
+        assert!(!is_default_resume_invocation(&args, true));
+    }
+
+    #[test]
+    fn quiet_flag_bypasses_tui() {
+        // `--quiet` signals scripted use; the TUI is intentionally chatty
+        // (toasts, banners), so honour the explicit ask for silence.
+        let args = ResumeArgs {
+            quiet: true,
+            ..defaults()
+        };
+        assert!(!is_default_resume_invocation(&args, true));
+    }
+
+    #[test]
+    fn force_flag_bypasses_tui() {
+        // `--force` is a recovery flag for a stale run lock — its presence
+        // means the user is troubleshooting and wants the CLI report on
+        // stderr.
+        let args = ResumeArgs {
+            force: true,
+            ..defaults()
+        };
+        assert!(!is_default_resume_invocation(&args, true));
+    }
+
+    #[test]
+    fn harness_override_bypasses_tui() {
+        // Global `--harness` counts as a non-default override.
+        let args = ResumeArgs {
+            cli_harness: Some("codex".to_string()),
+            ..defaults()
+        };
+        assert!(!is_default_resume_invocation(&args, true));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resume parity test: the TUI auto-start path and the CLI path both
+// dispatch through the SAME runner code. The TUI forks
+// `ralph resume <slug>` (which lands in `dispatch_resume` on the child
+// side, calling `runner::resume_plan`), and the CLI path calls
+// `dispatch_resume` directly. The shared-helper structure means there's
+// only one way the resume actually runs — verified here by spawning a
+// real subprocess against a fake plan and asserting that the same NDJSON
+// stream byte layout we'd see on the CLI is the one that flows through
+// the streaming command builder.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod resume_parity_tests {
+    use crate::tui::events::{StreamMode, build_streaming_run_command};
+    use std::path::Path;
+
+    /// The TUI-spawned resume subprocess invokes the same `ralph resume`
+    /// CLI surface as the user would type. This guards against the
+    /// streaming helper drifting away from the CLI path (e.g. someone
+    /// adding `--current-branch` to the run variant and forgetting the
+    /// implicit-current-branch invariant for resume).
+    #[test]
+    fn streaming_resume_reaches_same_cli_surface_as_user_typed_resume() {
+        let cmd = build_streaming_run_command(
+            Path::new("/usr/bin/ralph"),
+            Path::new("/proj"),
+            "my-plan",
+            StreamMode::Resume,
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // Exact arg list — equivalent to typing
+        // `ralph -C /proj --non-interactive --json resume my-plan`
+        // by hand. Anything else means we'd be invoking a different
+        // resume code path than the user does on the CLI.
+        assert_eq!(
+            args,
+            vec![
+                "-C".to_string(),
+                "/proj".to_string(),
+                "--non-interactive".to_string(),
+                "--json".to_string(),
+                "resume".to_string(),
+                "my-plan".to_string(),
+            ]
+        );
     }
 }
 

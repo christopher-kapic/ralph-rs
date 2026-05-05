@@ -34,7 +34,7 @@ use crate::cli::{
     StepCommand,
 };
 
-use crate::commands::{resolve_plan, resolve_project, resolve_resume_plan};
+use crate::commands::{resolve_plan, resolve_project};
 use crate::output::OutputContext;
 
 /// Read the body for `ralph plan prepend set` from exactly one of the three
@@ -474,33 +474,29 @@ fn main() -> Result<()> {
             plan: plan_slug,
             force,
         } => {
-            let plan =
-                resolve_resume_plan(&conn, plan_slug, &project, std::path::Path::new(&project))?;
-            let slug = plan.slug.clone();
+            let args = commands::ResumeArgs {
+                plan_slug,
+                force,
+                non_interactive: cli.non_interactive,
+                json: cli.json,
+                quiet: cli.quiet,
+                cli_harness: cli.harness,
+            };
 
-            // Acquire the same per-project run lock that `ralph run` uses, so
-            // resume can't race a concurrent run or skip.
-            let _run_lock =
-                run_lock::acquire(&conn, &project, Some(&plan.slug), Some(&plan.id), force)?;
-
-            let rt = tokio::runtime::Runtime::new()?;
-            let result = rt.block_on(async {
-                let abort_rx = signal::install_and_spawn();
-                runner::resume_plan(&conn, &plan, &config, project.as_ref(), abort_rx, &out).await
-            })?;
-
-            if result.steps_failed > 0 {
-                eprintln!(
-                    "Plan '{}' failed: {}/{} steps succeeded",
-                    slug, result.steps_succeeded, result.steps_executed
-                );
+            // TUI-plan.md §2 (extended to resume per step 34): bare
+            // `ralph resume` / `ralph resume <slug>` from a TTY drops into
+            // the same plan-detail TUI that `ralph run` uses, with the
+            // streaming subprocess started via `ralph resume` instead of
+            // `ralph run`. Every other invocation (--non-interactive,
+            // --json, --quiet, --harness, --force, or non-TTY stdout)
+            // takes today's CLI runner path unchanged so scripts see no
+            // regression.
+            let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+            if commands::is_default_resume_invocation(&args, stdout_is_tty) {
+                commands::run_resume_tui_mode(&conn, &config, &project, args, &out)
             } else {
-                eprintln!(
-                    "Plan '{}' resumed: {}/{} steps succeeded",
-                    slug, result.steps_succeeded, result.steps_executed
-                );
+                commands::dispatch_resume(&conn, &config, &project, args, &out)
             }
-            Ok(())
         }
 
         // -- Pause --
