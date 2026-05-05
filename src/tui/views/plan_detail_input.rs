@@ -38,6 +38,9 @@ pub enum InputAction {
     /// The user pressed `D` to open the plan-dependencies sub-view
     /// (TUI-plan.md §1, step 33).
     OpenDependencies,
+    /// The user pressed `H` to open the plan-hooks sub-view
+    /// (TUI-plan.md §1).
+    OpenHooks,
     /// The user pressed `A` to open step detail focused on the step that
     /// owns the oldest unanswered question (TUI-plan.md §17).
     OpenQuestion(String),
@@ -178,6 +181,9 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
 
         // Open the plan-dependencies sub-view (TUI-plan.md §1, step 33).
         KeyCode::Char('D') => InputAction::OpenDependencies,
+
+        // Open the plan-hooks sub-view (TUI-plan.md §1).
+        KeyCode::Char('H') => InputAction::OpenHooks,
 
         // Answer the oldest unanswered question for this plan (TUI-plan.md §17).
         // No-op when there are no open questions — the dispatcher checks the
@@ -517,6 +523,13 @@ mod tests {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Char('D')));
         assert_eq!(action, InputAction::OpenDependencies);
+    }
+
+    #[test]
+    fn test_shift_h_emits_open_hooks_action() {
+        let mut app = make_app(3);
+        let action = handle_key(&mut app, key(KeyCode::Char('H')));
+        assert_eq!(action, InputAction::OpenHooks);
     }
 
     #[test]

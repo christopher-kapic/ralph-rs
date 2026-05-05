@@ -1146,6 +1146,9 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
             InputAction::OpenDependencies => {
                 run_plan_dependencies_tui(terminal, conn, &mut app)?;
             }
+            InputAction::OpenHooks => {
+                run_plan_hooks_tui(terminal, conn, &mut app)?;
+            }
             InputAction::OpenQuestion(step_id) => {
                 run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
             }
@@ -1784,6 +1787,141 @@ fn load_dependencies_view_state(
         .collect();
 
     Ok((deps, candidates))
+}
+
+// ---------------------------------------------------------------------------
+// Plan-hooks dispatcher (TUI-plan.md §1)
+// ---------------------------------------------------------------------------
+
+/// Run the plan-hooks event loop until the user pops back. Mirrors
+/// [`run_plan_dependencies_tui`]: reuses the parent terminal and raw-mode
+/// session, owns the crossterm event loop, and performs the storage
+/// write-throughs requested by the [`PlanHooksApp`] state machine.
+///
+/// Help-overlay routing happens inside [`PlanHooksApp::handle_key`] (step
+/// 14), so a stuck `?` overlay can always be dismissed with `?`/`<esc>`/
+/// `q`/Ctrl-C without reaching the per-mode handlers. `<esc>`/`q`/Ctrl-C
+/// in `Mode::List` pop back to plan-detail.
+fn run_plan_hooks_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    plan_app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::plan_hooks::{Mode, Outcome, PlanHooksApp, render};
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let plan_id = plan_app.plan.id.clone();
+    let plan_slug = plan_app.plan.slug.clone();
+    let project = plan_app.plan.project.clone();
+
+    let (attachments, candidates) = load_plan_hooks_view_state(conn, &project, &plan_id)?;
+    let mut app = PlanHooksApp::new(plan_id.clone(), plan_slug, attachments, candidates);
+
+    loop {
+        terminal.draw(|f| render(f, f.area(), &mut app))?;
+
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+        match app.handle_key(key) {
+            Outcome::Pending => {}
+            Outcome::Pop => return Ok(()),
+            Outcome::AddRequested {
+                lifecycle,
+                hook_name,
+            } => {
+                if let Err(e) =
+                    storage::attach_hook_to_plan(conn, &plan_id, lifecycle.as_str(), &hook_name)
+                {
+                    app.push_toast(format!("Failed to attach hook: {e}"), ToastKind::Error);
+                    continue;
+                }
+                let (attachments, candidates) =
+                    load_plan_hooks_view_state(conn, &project, &plan_id)?;
+                app.refresh(attachments, candidates);
+                // Drop back to the list so the user sees the new row.
+                app.mode = Mode::List;
+                app.push_toast(
+                    format!("Hook '{hook_name}' attached at {lifecycle}."),
+                    ToastKind::Success,
+                );
+            }
+            Outcome::RemoveRequested {
+                lifecycle,
+                hook_name,
+            } => {
+                match storage::detach_hook(conn, &plan_id, None, lifecycle.as_str(), &hook_name) {
+                    Ok(0) => {
+                        app.push_toast(
+                            format!("No plan-wide hook '{hook_name}' at {lifecycle}."),
+                            ToastKind::Info,
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        app.push_toast(
+                            format!("Failed to detach hook: {e}"),
+                            ToastKind::Error,
+                        );
+                        continue;
+                    }
+                }
+                let (attachments, candidates) =
+                    load_plan_hooks_view_state(conn, &project, &plan_id)?;
+                app.refresh(attachments, candidates);
+                app.push_toast(
+                    format!("Hook '{hook_name}' detached from {lifecycle}."),
+                    ToastKind::Success,
+                );
+            }
+        }
+    }
+}
+
+/// Read the plan-wide hook attachments and the in-scope hook-library
+/// candidates for `plan_id`. Per-step rows are intentionally excluded —
+/// this sub-view only shows / edits plan-wide attachments (`step_id IS NULL`).
+fn load_plan_hooks_view_state(
+    conn: &Connection,
+    project: &str,
+    plan_id: &str,
+) -> Result<(
+    Vec<crate::tui::views::plan_hooks::PlanHookRef>,
+    Vec<crate::tui::views::plan_hooks::HookCandidate>,
+)> {
+    use crate::hook_library::{self, Lifecycle};
+    use crate::tui::views::plan_hooks::{HookCandidate, PlanHookRef};
+
+    let rows = storage::list_all_hooks_for_plan(conn, plan_id)?;
+    let mut attachments: Vec<PlanHookRef> = Vec::new();
+    for row in rows {
+        if row.step_id.is_some() {
+            continue;
+        }
+        let lifecycle = Lifecycle::parse(&row.lifecycle)?;
+        attachments.push(PlanHookRef {
+            lifecycle,
+            hook_name: row.hook_name,
+        });
+    }
+
+    let project_dir = std::path::PathBuf::from(project);
+    let all = hook_library::load_all().unwrap_or_default();
+    let candidates: Vec<HookCandidate> = hook_library::filter_by_project(all, &project_dir)
+        .into_iter()
+        .map(|h| HookCandidate {
+            name: h.name,
+            description: h.description,
+        })
+        .collect();
+
+    Ok((attachments, candidates))
 }
 
 // ---------------------------------------------------------------------------
