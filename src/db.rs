@@ -29,6 +29,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v17,
     migrate_v18,
     migrate_v19,
+    migrate_v20,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -618,6 +619,29 @@ fn migrate_v18(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         ALTER TABLE plans ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V20: last_run_started_at column on plans (resume-ordering anchor)
+// ---------------------------------------------------------------------------
+
+fn migrate_v20(conn: &Connection) -> Result<()> {
+    // `plans.last_run_started_at` records the wall-clock time at which the
+    // plan most recently *started* a run (written by the runner alongside
+    // `last_run_branch`). It exists so resume-resolver ordering can use a
+    // stable "last actually ran" timestamp instead of the easily-bumped
+    // `updated_at` (which is also touched by unrelated edits like toggling
+    // `questions_enabled` or `pause_requested`).
+    //
+    // Nullable with no backfill: pre-V20 plans report NULL until their next
+    // run. The resume resolver's `ORDER BY` lists this column first with
+    // `NULLS LAST` so never-run plans tiebreak via `updated_at`/`created_at`.
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN last_run_started_at TEXT;
         ",
     )?;
     Ok(())
@@ -1816,6 +1840,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lrb2.as_deref(), Some("master"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v20_adds_last_run_started_at_to_plans() {
+        // Seed a pre-V20 DB with a plans row, run V20, and verify that the
+        // existing row defaults to last_run_started_at = NULL (no backfill —
+        // the resolver's ORDER BY explicitly puts NULLs last so never-run
+        // plans tiebreak via updated_at/created_at).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v19.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v19 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(19) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V20 applies. Pre-V20 row must remain NULL (no backfill).
+        let conn = open_at(&path).unwrap();
+        let lrs: Option<String> = conn
+            .query_row(
+                "SELECT last_run_started_at FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            lrs.is_none(),
+            "pre-V20 plans must have NULL last_run_started_at (got {lrs:?})"
+        );
+
+        // Fresh inserts also default to NULL; explicit values round-trip.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, last_run_started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", "2026-05-05T00:00:00.000Z"],
+        )
+        .unwrap();
+        let lrs2: Option<String> = conn
+            .query_row(
+                "SELECT last_run_started_at FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lrs2.as_deref(), Some("2026-05-05T00:00:00.000Z"));
 
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))

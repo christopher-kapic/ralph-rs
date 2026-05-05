@@ -5340,6 +5340,69 @@ fn print_log_entry(step_title: &str, log: &ExecutionLog, output_mode: &LogOutput
 }
 
 // ---------------------------------------------------------------------------
+// Pause command
+// ---------------------------------------------------------------------------
+
+/// Implement `ralph pause [<slug>]`.
+///
+/// Sets `plans.pause_requested = 1` so the runner exits between steps with
+/// `TerminationReason::PausedByUser`. Gated on the project's run lock —
+/// the runner clears+consumes `pause_requested` at the *top* of its loop
+/// (see [`storage::take_plan_pause_requested`]), so arming it while no
+/// runner is alive would cause the next `ralph run` / `ralph resume` to
+/// exit after zero steps. This mirrors the TUI `[P]` keybinding's
+/// `is_run_live()` gate.
+///
+/// When `plan_slug` is passed, the live run's plan must match it; on
+/// mismatch we refuse rather than silently pausing the wrong plan.
+pub fn cmd_pause(
+    conn: &Connection,
+    project: &str,
+    plan_slug: Option<&str>,
+    quiet: bool,
+) -> Result<()> {
+    let live = storage::get_live_run(conn, project)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "No active run in this project. `ralph pause` only takes effect while a run is in progress."
+        )
+    })?;
+
+    if let Some(requested) = plan_slug
+        && live.plan_slug.as_deref() != Some(requested)
+    {
+        let live_label = live.plan_slug.as_deref().unwrap_or("<none>");
+        anyhow::bail!(
+            "Live run is for plan '{live_label}', not '{requested}'. Refusing to pause."
+        );
+    }
+
+    // Resolve the plan to flag. Prefer the slug the caller passed (already
+    // validated to match the live run) and fall back to the live run's
+    // recorded plan_id when the caller omitted the argument.
+    let plan = match plan_slug {
+        Some(s) => storage::get_plan_by_slug(conn, s, project)?
+            .with_context(|| format!("Plan not found: {s}"))?,
+        None => {
+            let plan_id = live.plan_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Live run has no associated plan_id. Pass a slug to `ralph pause` to disambiguate."
+                )
+            })?;
+            storage::get_plan_by_id(conn, plan_id)?
+        }
+    };
+
+    storage::set_plan_pause_requested(conn, &plan.id, true)?;
+    if !quiet {
+        eprintln!(
+            "Pause requested for plan '{}'. The runner will stop after the current step finishes.",
+            plan.slug,
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Cancel command
 // ---------------------------------------------------------------------------
 
@@ -7361,6 +7424,7 @@ mod step_detail_dispatcher_tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -8350,6 +8414,7 @@ mod sub_view_routing_tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         };
         let steps = vec![Step {
             id: "step-1".to_string(),
@@ -8800,6 +8865,7 @@ mod mouse_routing_tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         };
         PlanDetailApp::new(plan, Vec::new(), &Config::default())
     }
@@ -8824,6 +8890,7 @@ mod mouse_routing_tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         };
         let step = Step {
             id: "step-1".to_string(),
@@ -8953,5 +9020,106 @@ mod mouse_routing_tests {
         let before = app.selected_index;
         app.handle_mouse(sample_mouse_event());
         assert_eq!(app.selected_index, before);
+    }
+}
+
+#[cfg(test)]
+mod pause_tests {
+    //! Pin the run-lock gate on `ralph pause`. The runner consumes
+    //! `pause_requested` at the *top* of its loop (before listing or
+    //! executing any step), so arming the flag while no runner is alive
+    //! would cause the next `ralph run` / `ralph resume` to exit after
+    //! zero steps. `cmd_pause` therefore refuses unless a live run row
+    //! exists in `run_locks`, mirroring the TUI `[P]` keybinding's
+    //! `is_run_live()` gate.
+    use super::*;
+    use crate::db;
+    use rusqlite::params;
+
+    /// Bogus pid outside any real pid space — the test only inspects DB
+    /// state, never sends a signal, so the pid value is purely
+    /// bookkeeping.
+    const DEAD_PID: i64 = 0x7FFF_FFFE;
+
+    fn seed_plan(conn: &Connection, slug: &str, project: &str) -> String {
+        let plan =
+            storage::create_plan(conn, slug, project, "br", "desc", None, None, &[]).unwrap();
+        storage::update_plan_status(conn, &plan.id, crate::plan::PlanStatus::Ready).unwrap();
+        plan.id
+    }
+
+    fn insert_live_lock(conn: &Connection, project: &str, plan_id: &str, plan_slug: &str) {
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            params![project, DEAD_PID, plan_id, plan_slug],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pause_with_no_live_run_errors_and_does_not_arm_flag() {
+        let conn = db::open_memory().unwrap();
+        let project = "/tmp/pause-no-run";
+        let plan_id = seed_plan(&conn, "p", project);
+
+        let err = cmd_pause(&conn, project, None, /*quiet=*/ true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No active run"),
+            "expected 'No active run' guidance, got: {msg}"
+        );
+
+        // Flag must remain cleared so a subsequent `ralph run` is not
+        // poisoned into exiting after zero steps.
+        let pr = storage::get_plan_pause_requested(&conn, &plan_id).unwrap();
+        assert!(!pr, "pause_requested must not be armed when no run is live");
+    }
+
+    #[test]
+    fn pause_with_live_run_sets_flag_for_correct_plan() {
+        let conn = db::open_memory().unwrap();
+        let project = "/tmp/pause-live";
+        let plan_id = seed_plan(&conn, "p", project);
+        insert_live_lock(&conn, project, &plan_id, "p");
+
+        cmd_pause(&conn, project, None, /*quiet=*/ true).unwrap();
+
+        assert!(
+            storage::get_plan_pause_requested(&conn, &plan_id).unwrap(),
+            "pause_requested must be armed when a live run exists"
+        );
+    }
+
+    #[test]
+    fn pause_with_explicit_slug_matching_live_run_sets_flag() {
+        let conn = db::open_memory().unwrap();
+        let project = "/tmp/pause-explicit";
+        let plan_id = seed_plan(&conn, "deploy", project);
+        insert_live_lock(&conn, project, &plan_id, "deploy");
+
+        cmd_pause(&conn, project, Some("deploy"), /*quiet=*/ true).unwrap();
+
+        assert!(storage::get_plan_pause_requested(&conn, &plan_id).unwrap());
+    }
+
+    #[test]
+    fn pause_with_explicit_slug_mismatching_live_run_errors() {
+        let conn = db::open_memory().unwrap();
+        let project = "/tmp/pause-mismatch";
+        let plan_a = seed_plan(&conn, "plan-a", project);
+        let plan_b = seed_plan(&conn, "plan-b", project);
+        // Live run is on plan-a; user asks to pause plan-b.
+        insert_live_lock(&conn, project, &plan_a, "plan-a");
+
+        let err = cmd_pause(&conn, project, Some("plan-b"), /*quiet=*/ true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Refusing to pause"),
+            "expected 'Refusing to pause' guidance, got: {msg}"
+        );
+
+        // Neither plan's flag should be armed after a mismatch error.
+        assert!(!storage::get_plan_pause_requested(&conn, &plan_a).unwrap());
+        assert!(!storage::get_plan_pause_requested(&conn, &plan_b).unwrap());
     }
 }

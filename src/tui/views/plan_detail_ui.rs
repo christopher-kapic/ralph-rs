@@ -469,6 +469,7 @@ mod tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
@@ -566,6 +567,7 @@ mod tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -693,6 +695,7 @@ mod tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         };
         let steps = vec![Step {
             id: "s0".to_string(),

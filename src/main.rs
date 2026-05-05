@@ -501,15 +501,7 @@ fn main() -> Result<()> {
 
         // -- Pause --
         Command::Pause { plan: plan_slug } => {
-            let plan = resolve_plan(&conn, plan_slug, &project, false)?;
-            storage::set_plan_pause_requested(&conn, &plan.id, true)?;
-            if !cli.quiet {
-                eprintln!(
-                    "Pause requested for plan '{}'. The runner will stop after the current step finishes.",
-                    plan.slug,
-                );
-            }
-            Ok(())
+            commands::cmd_pause(&conn, &project, plan_slug.as_deref(), cli.quiet)
         }
 
         // -- Cancel --

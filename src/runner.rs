@@ -1691,6 +1691,7 @@ mod tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         }
     }
 
@@ -2683,6 +2684,7 @@ mod tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -2722,6 +2724,7 @@ mod tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -3165,6 +3168,7 @@ mod tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -3227,6 +3231,7 @@ mod tests {
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
+            last_run_started_at: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");

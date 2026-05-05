@@ -84,9 +84,13 @@ pub fn resolve_plan(
 ///    * 2+ hits: most recent (already DESC), warn on stderr listing the
 ///      others so the user knows to disambiguate next time.
 ///    * 0 hits: fall through.
-/// 2. [`storage::find_active_plan`] — preserves today's behavior so
-///    projects that haven't run a plan since upgrade keep working.
-/// 3. Still nothing: error with both the branch and the active-plan hint.
+/// 2. [`storage::find_resumable_plan`] — most-recent resumable plan in
+///    the project regardless of branch, covering non-git workdirs,
+///    detached HEAD, and branches that have never hosted a run.
+///    Importantly, this includes `Aborted` plans (the runner accepts
+///    them as resumable) — using `find_active_plan` here would silently
+///    refuse to resume an aborted plan whose branch context was lost.
+/// 3. Still nothing: error with both the branch and the resumable-plan hint.
 ///
 /// The slug-collision defence is in step 1's SQL: `last_run_branch IS
 /// NULL AND branch_name = ?` only fires when `last_run_branch` was never
@@ -111,12 +115,12 @@ pub fn resolve_resume_plan(
 
     // Branch-based resolution. `git::get_current_branch` shells out; if
     // it fails (no git, detached HEAD, …) we skip the branch hop and fall
-    // straight to `find_active_plan` so non-git contexts still work.
+    // straight to `find_resumable_plan` so non-git contexts still work.
     let branch_result = git::get_current_branch(workdir);
     if let Ok(branch) = branch_result.as_ref() {
         let candidates = storage::find_resumable_plans_for_branch(conn, project, branch)?;
         match candidates.len() {
-            0 => { /* fall through to find_active_plan */ }
+            0 => { /* fall through to find_resumable_plan */ }
             1 => return Ok(candidates.into_iter().next().unwrap()),
             _ => {
                 let chosen = candidates[0].clone();
@@ -132,15 +136,15 @@ pub fn resolve_resume_plan(
         }
     }
 
-    if let Some(p) = storage::find_active_plan(conn, project, false)? {
+    if let Some(p) = storage::find_resumable_plan(conn, project)? {
         return Ok(p);
     }
 
     match branch_result {
         Ok(branch) => bail!(
-            "No resumable plan found for branch '{branch}' or active plan. Specify a slug."
+            "No resumable plan found for branch '{branch}' or in this project. Specify a slug."
         ),
-        Err(_) => bail!("No active plan found. Specify a plan slug as a positional argument."),
+        Err(_) => bail!("No resumable plan found in this project. Specify a plan slug as a positional argument."),
     }
 }
 
@@ -1603,11 +1607,14 @@ mod tests {
         storage::set_plan_last_run_branch(&conn, &p2.id, &branch).unwrap();
 
         let p = resolve_resume_plan(&conn, None, &project, &dir).unwrap();
-        assert_eq!(p.slug, "newer", "DESC by updated_at picks the most recent");
+        assert_eq!(
+            p.slug, "newer",
+            "DESC by last_run_started_at picks the most recent"
+        );
     }
 
     #[test]
-    fn test_resolve_resume_plan_falls_back_to_active_plan_when_no_branch_match() {
+    fn test_resolve_resume_plan_falls_back_to_resumable_plan_when_no_branch_match() {
         let (_tmp, dir, project, branch) = git_repo_for_resume();
         let conn = db::open_memory().unwrap();
         // A plan whose last_run_branch is some OTHER branch — must not
@@ -1618,10 +1625,32 @@ mod tests {
         let bogus_branch = format!("not-{branch}");
         storage::set_plan_last_run_branch(&conn, &other.id, &bogus_branch).unwrap();
 
-        // ...but find_active_plan still returns it (any in_progress / ready
-        // / failed plan in the project counts).
+        // ...but find_resumable_plan still returns it (any in_progress /
+        // ready / failed / aborted plan in the project counts).
         let p = resolve_resume_plan(&conn, None, &project, &dir).unwrap();
         assert_eq!(p.slug, "elsewhere");
+    }
+
+    /// Regression for finding 2: an aborted plan must resume even when
+    /// branch inference misses (e.g. last_run_branch differs from the
+    /// current branch, no branch ever recorded, etc.). Under the old
+    /// `find_active_plan` fallback, Aborted was silently filtered out.
+    #[test]
+    fn test_resolve_resume_plan_falls_back_to_aborted_plan_when_no_branch_match() {
+        let (_tmp, dir, project, branch) = git_repo_for_resume();
+        let conn = db::open_memory().unwrap();
+        let p = storage::create_plan(&conn, "ab", &project, "x", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &p.id, PlanStatus::Aborted).unwrap();
+        // Last run executed on a branch that is NOT the current one, so
+        // the branch-based resolver finds nothing.
+        let other = format!("not-{branch}");
+        storage::set_plan_last_run_branch(&conn, &p.id, &other).unwrap();
+
+        let resolved = resolve_resume_plan(&conn, None, &project, &dir).unwrap();
+        assert_eq!(
+            resolved.slug, "ab",
+            "Aborted plans must be resumable via the branch-miss fallback"
+        );
     }
 
     #[test]
