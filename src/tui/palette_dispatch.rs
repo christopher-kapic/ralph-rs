@@ -17,7 +17,8 @@
 // * `/step move <num> --to <m>` — re-keys a step into a new position.
 //
 // The remaining v1-deferred commands route to `PaletteAction::ComingSoon`
-// with the actual sub-view step number from the tui-v1 plan map (33–36).
+// with the actual sub-view step number from the tui-v1 plan map (43 — the
+// help overlay is the last surface still pending).
 //
 // Step #32 wires `/cancel`, `/export`, `/import`, `/quit`, `/help`:
 // * `/cancel` — mirrors the `S` keybinding's "stop the live run" action.
@@ -245,8 +246,19 @@ pub enum PaletteAction {
         plan_slug: String,
         step_label: String,
     },
-    /// Recognized command stubbed for a later tui-v1 step (36, 43).
-    /// Caller renders a `Coming soon — landing in step <N>` info toast.
+    /// `/step edit --tags` — push the step-tags sub-view scoped to the
+    /// focused step (TUI-plan.md §1, step 36). The sub-view owns add
+    /// (`i`, then a text-input modal) and remove (`d`) interactively, so
+    /// the verb in the palette is just the entry door. Resolved against
+    /// `focused_slug` and `focused_step`; both must be present.
+    OpenStepTags {
+        step_id: String,
+        plan_slug: String,
+        step_label: String,
+    },
+    /// Recognized command stubbed for a later tui-v1 step (43 — help
+    /// overlay). Caller renders a `Coming soon — landing in step <N>`
+    /// info toast.
     ComingSoon {
         label: &'static str,
         target_step: u32,
@@ -323,11 +335,11 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
         // palette is just the entry door.
         PaletteCommand::StepSetHook | PaletteCommand::StepUnsetHook => dispatch_step_hooks(ctx),
 
-        // -- v1-deferred sub-view (step 36) -------------------------------
-        PaletteCommand::StepEditTags => PaletteAction::ComingSoon {
-            label: cmd.label(),
-            target_step: 36,
-        },
+        // -- /step edit --tags --------------------------------------------
+        // Pushes the step-tags sub-view (step 36). The sub-view owns add
+        // (`i`) / remove (`d`) interactively, so the palette verb is just
+        // the entry door.
+        PaletteCommand::StepEditTags => dispatch_step_tags(ctx),
 
         // -- /cancel ------------------------------------------------------
         PaletteCommand::Cancel => PaletteAction::CancelRun,
@@ -648,6 +660,32 @@ fn dispatch_step_hooks(ctx: &PaletteContext<'_>) -> PaletteAction {
     };
     PaletteAction::OpenStepHooks {
         plan_id: target.id,
+        step_id: step.id.clone(),
+        plan_slug: target.slug,
+        step_label: step.label.clone(),
+    }
+}
+
+fn dispatch_step_tags(ctx: &PaletteContext<'_>) -> PaletteAction {
+    // Same shape as `dispatch_step_hooks` — `/step edit --tags` resolves
+    // against both `focused_slug` (the parent plan, used only for the title
+    // bar) and `focused_step` (the step whose tags are being edited).
+    let target = match resolve_slug(None, ctx) {
+        ResolvedSlug::Some(target) => target,
+        ResolvedSlug::Missing | ResolvedSlug::Unknown(_) => {
+            return PaletteAction::Toast {
+                message: "Open a step first to edit tags.".to_string(),
+                kind: ToastKind::Info,
+            };
+        }
+    };
+    let Some(step) = ctx.focused_step else {
+        return PaletteAction::Toast {
+            message: "Open a step first to edit tags.".to_string(),
+            kind: ToastKind::Info,
+        };
+    };
+    PaletteAction::OpenStepTags {
         step_id: step.id.clone(),
         plan_slug: target.slug,
         step_label: step.label.clone(),
@@ -1659,15 +1697,63 @@ mod tests {
         );
     }
 
+    // -- /step edit --tags routes to OpenStepTags (step 36) --------------
+
     #[test]
-    fn step_edit_tags_routes_to_step_36() {
-        let c = Ctx::new();
+    fn step_edit_tags_routes_to_open_step_tags() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
+        c.focused_step = Some(FocusedStep {
+            id: "step-1".to_string(),
+            label: "#3 — Build the thing".to_string(),
+        });
+        match dispatch_str("/step edit --tags", &c) {
+            PaletteAction::OpenStepTags {
+                step_id,
+                plan_slug,
+                step_label,
+            } => {
+                assert_eq!(step_id, "step-1");
+                assert_eq!(plan_slug, "alpha");
+                assert_eq!(step_label, "#3 — Build the thing");
+            }
+            other => panic!("expected OpenStepTags, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_edit_tags_toasts_when_no_focused_step() {
+        // Plan focused but no step focused (e.g. invoked from plan-detail).
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
         let action = dispatch_str("/step edit --tags", &c);
         assert_eq!(
             action,
-            PaletteAction::ComingSoon {
-                label: "/step edit --tags",
-                target_step: 36,
+            PaletteAction::Toast {
+                message: "Open a step first to edit tags.".to_string(),
+                kind: ToastKind::Info,
+            }
+        );
+    }
+
+    #[test]
+    fn step_edit_tags_toasts_when_no_focused_plan() {
+        // Step focused without a plan focus is a programming error in the
+        // caller, but the dispatcher still falls back to a toast rather
+        // than panicking.
+        let mut c = Ctx::new();
+        c.focused_step = Some(FocusedStep {
+            id: "step-1".to_string(),
+            label: "#1 — Step".to_string(),
+        });
+        let action = dispatch_str("/step edit --tags", &c);
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "Open a step first to edit tags.".to_string(),
+                kind: ToastKind::Info,
             }
         );
     }
