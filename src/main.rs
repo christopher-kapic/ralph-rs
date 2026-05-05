@@ -34,7 +34,7 @@ use crate::cli::{
     StepCommand,
 };
 
-use crate::commands::{resolve_plan, resolve_project};
+use crate::commands::{resolve_plan, resolve_project, resolve_resume_plan};
 use crate::output::OutputContext;
 
 /// Read the body for `ralph plan prepend set` from exactly one of the three
@@ -474,7 +474,8 @@ fn main() -> Result<()> {
             plan: plan_slug,
             force,
         } => {
-            let plan = resolve_plan(&conn, plan_slug, &project, false)?;
+            let plan =
+                resolve_resume_plan(&conn, plan_slug, &project, std::path::Path::new(&project))?;
             let slug = plan.slug.clone();
 
             // Acquire the same per-project run lock that `ralph run` uses, so

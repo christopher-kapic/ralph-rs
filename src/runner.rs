@@ -245,6 +245,26 @@ async fn run_plan_inner(
         return dry_run_report(&effective_plan, &initial_steps, &steps_to_run);
     }
 
+    // Record the branch this run is physically executing on. This is the
+    // anchor `ralph resume` (no slug) uses to map the current git branch
+    // back to a paused/failed plan. We capture it AFTER any branch switch
+    // (`setup_branch` runs in `run_plan` above) and regardless of
+    // `--current-branch`, so the value always reflects the workdir's
+    // checked-out HEAD at the moment the runner began iterating steps.
+    // Best-effort: if `git rev-parse` fails (detached HEAD edge cases,
+    // missing git, …) we log and continue rather than aborting the run —
+    // resume falls back to slug/active-plan resolution when no row matches.
+    match git::get_current_branch(workdir) {
+        Ok(branch) => {
+            if let Err(e) = storage::set_plan_last_run_branch(conn, &effective_plan.id, &branch) {
+                eprintln!("Warning: failed to record last_run_branch: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: could not resolve current branch for last_run_branch: {e}");
+        }
+    }
+
     // 3. Mark plan as in_progress.
     if effective_plan.status != PlanStatus::InProgress {
         storage::update_plan_status(conn, &effective_plan.id, PlanStatus::InProgress)?;
@@ -1670,6 +1690,7 @@ mod tests {
             context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
+            last_run_branch: None,
         }
     }
 
@@ -2661,6 +2682,7 @@ mod tests {
             context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
+            last_run_branch: None,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -2699,6 +2721,7 @@ mod tests {
             context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
+            last_run_branch: None,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -2957,6 +2980,118 @@ mod tests {
         );
     }
 
+    /// The runner must record `plans.last_run_branch` at run-start in
+    /// `--current-branch` mode — that's the path resume's branch-based
+    /// resolver depends on for plans that ran without their own branch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_plan_records_last_run_branch_in_current_branch_mode() {
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+        let actual_branch = git::get_current_branch(&dir).unwrap();
+
+        let conn = setup();
+        // Plan's branch_name is intentionally different from the actual git
+        // branch so the assertion below catches a regression where the
+        // runner records `branch_name` instead of the workdir's HEAD.
+        let plan = storage::create_plan(
+            &conn,
+            "s",
+            &project,
+            "would-be-branch",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+        // One Complete step so the runner reaches run_plan_inner, writes
+        // last_run_branch, and exits cleanly (no executor needed).
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "Done", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "s", &project)
+            .unwrap()
+            .unwrap();
+        assert!(plan.last_run_branch.is_none());
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+        let _ = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        let after = storage::get_plan_by_slug(&conn, "s", &project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.last_run_branch.as_deref(),
+            Some(actual_branch.as_str()),
+            "runner must record the workdir's HEAD as last_run_branch"
+        );
+        // The pre-existing branch_name field is left untouched — it's the
+        // user's "where I want this plan to run" intent, not the record of
+        // where it physically ran.
+        assert_eq!(after.branch_name, "would-be-branch");
+    }
+
+    /// Default (non-`--current-branch`) mode: setup_branch switches to the
+    /// plan's branch first, so last_run_branch must reflect THAT branch,
+    /// not the source branch the user kicked the run off from.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_plan_records_plan_branch_when_not_current_branch_mode() {
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+        let source_branch = git::get_current_branch(&dir).unwrap();
+
+        let conn = setup();
+        let plan =
+            storage::create_plan(&conn, "s", &project, "feat/run-here", "d", None, None, &[])
+                .unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "Done", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "s", &project)
+            .unwrap()
+            .unwrap();
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: false,
+            auto_stash: true,
+            ..Default::default()
+        };
+        let _ = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        let after = storage::get_plan_by_slug(&conn, "s", &project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.last_run_branch.as_deref(),
+            Some("feat/run-here"),
+            "must record the branch setup_branch switched into, not the source branch ({source_branch})"
+        );
+    }
+
     // -- stash_if_dirty / setup_branch --
 
     /// With `--no-auto-stash`, a dirty tree must bail cleanly and list the
@@ -3029,6 +3164,7 @@ mod tests {
             context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
+            last_run_branch: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -3090,6 +3226,7 @@ mod tests {
             context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
+            last_run_branch: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");

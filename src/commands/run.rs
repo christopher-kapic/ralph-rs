@@ -6397,7 +6397,14 @@ mod plan_list_action_tests {
     fn seed_app(project: &str) -> (Connection, PlanListApp) {
         let conn = db::open_memory().unwrap();
         // Two plans so we can verify the cursor target is the one mutated.
+        // Sleep between creates so the millisecond-precision created_at
+        // values differ — `list_plans_sorted_by_recency` orders by
+        // `created_at DESC` and SQLite's tie-break on equal timestamps is
+        // undefined, so without this gap the test cursor could land on
+        // either plan depending on which side of the millisecond boundary
+        // both inserts fell on.
         storage::create_plan(&conn, "alpha", project, "b1", "d", None, None, &[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
         storage::create_plan(&conn, "beta", project, "b2", "d", None, None, &[]).unwrap();
         let tiles = build_plan_tiles(&conn, project).unwrap();
         let app = PlanListApp::new(tiles, project, "UTC");
@@ -7035,6 +7042,7 @@ mod step_detail_dispatcher_tests {
             context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
+            last_run_branch: None,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -7484,7 +7492,12 @@ mod palette_action_tests {
 
     fn seed_app(project: &str) -> (Connection, PlanListApp) {
         let conn = db::open_memory().unwrap();
+        // Sleep between creates so the millisecond-precision created_at
+        // values differ — list_plans_sorted_by_recency orders by
+        // created_at DESC and SQLite's tie-break on equal timestamps is
+        // undefined, which makes downstream tests fragile.
         storage::create_plan(&conn, "alpha", project, "b1", "d", None, None, &[]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
         storage::create_plan(&conn, "beta", project, "b2", "d", None, None, &[]).unwrap();
         let tiles = build_plan_tiles(&conn, project).unwrap();
         let app = PlanListApp::new(tiles, project, "UTC");
@@ -8018,6 +8031,7 @@ mod sub_view_routing_tests {
             context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
+            last_run_branch: None,
         };
         let steps = vec![Step {
             id: "step-1".to_string(),
@@ -8467,6 +8481,7 @@ mod mouse_routing_tests {
             context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
+            last_run_branch: None,
         };
         PlanDetailApp::new(plan, Vec::new(), &Config::default())
     }
@@ -8490,6 +8505,7 @@ mod mouse_routing_tests {
             context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
+            last_run_branch: None,
         };
         let step = Step {
             id: "step-1".to_string(),

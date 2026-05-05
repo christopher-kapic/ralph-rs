@@ -406,11 +406,12 @@ impl std::str::FromStr for TestStatus {
 ///
 /// Matches the physical table layout after all migrations: V1 defined every
 /// column through `updated_at`, V5 appended `plan_harness`, V10 appended
-/// `prompt_prefix` and `prompt_suffix`, V14 appended `context_prepend`, and
-/// V16 appended `questions_enabled` via `ALTER TABLE ... ADD COLUMN`. Every
+/// `prompt_prefix` and `prompt_suffix`, V14 appended `context_prepend`,
+/// V16 appended `questions_enabled`, V18 appended `pause_requested`, and
+/// V19 appended `last_run_branch` via `ALTER TABLE ... ADD COLUMN`. Every
 /// `Plan`-returning query MUST use this list so [`Plan::from_row`]'s indices
 /// line up — a raw `SELECT *` would otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, prompt_prefix, prompt_suffix, context_prepend, questions_enabled, pause_requested";
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, prompt_prefix, prompt_suffix, context_prepend, questions_enabled, pause_requested, last_run_branch";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -455,6 +456,14 @@ pub struct Plan {
     /// before the boundary fires.
     #[serde(default)]
     pub pause_requested: bool,
+    /// Git branch the plan most recently started a run on. Written by the
+    /// runner at run-start (both default and `--current-branch` modes), so
+    /// `ralph resume` (no slug) can match the plan whose last run executed
+    /// on the current branch — without false-matching via `branch_name`
+    /// when the user later creates a new branch sharing a paused plan's
+    /// slug. `None` for plans that have never been run.
+    #[serde(default)]
+    pub last_run_branch: Option<String>,
 }
 
 impl Plan {
@@ -464,7 +473,7 @@ impl Plan {
     /// id, slug, project, branch_name, description, status, harness, agent,
     /// deterministic_tests, created_at, updated_at, plan_harness,
     /// prompt_prefix, prompt_suffix, context_prepend, questions_enabled,
-    /// pause_requested
+    /// pause_requested, last_run_branch
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -510,6 +519,7 @@ impl Plan {
             context_prepend: row.get(14)?,
             questions_enabled: questions_enabled_int != 0,
             pause_requested: pause_requested_int != 0,
+            last_run_branch: row.get(17)?,
         })
     }
 }

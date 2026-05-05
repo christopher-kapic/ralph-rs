@@ -28,6 +28,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v16,
     migrate_v17,
     migrate_v18,
+    migrate_v19,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -570,6 +571,31 @@ fn migrate_v17(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         ALTER TABLE run_locks ADD COLUMN parent_tui_pid INTEGER;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V19: last_run_branch column on plans (branch-based resume resolver)
+// ---------------------------------------------------------------------------
+
+fn migrate_v19(conn: &Connection) -> Result<()> {
+    // `plans.last_run_branch` records the git branch that was checked out
+    // when the plan most recently started a run. The runner sets it on every
+    // run start (both default and `--current-branch` modes), giving
+    // `ralph resume` (no slug) a way to infer the active plan from the
+    // current branch — essential when multiple plans share a branch
+    // (e.g. several plans run on `master` with `--current-branch`) and the
+    // user later checks out a feature branch that happens to share its name
+    // with one of those plans' slugs.
+    //
+    // Nullable with no backfill: pre-V19 plans report NULL until their next
+    // run, and the resolver falls back to `branch_name` only when
+    // `last_run_branch IS NULL` (covers never-run plans).
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN last_run_branch TEXT;
         ",
     )?;
     Ok(())
@@ -1719,6 +1745,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pr2, 1);
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v19_adds_last_run_branch_to_plans() {
+        // Seed a pre-V19 DB with a plans row, run V19, and verify that the
+        // existing row defaults to last_run_branch = NULL (no backfill —
+        // the resolver explicitly relies on this to scope the
+        // `branch_name` fallback to never-run plans).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v18.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v18 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(18) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V19 applies. Pre-V19 row must remain NULL (no backfill).
+        let conn = open_at(&path).unwrap();
+        let lrb: Option<String> = conn
+            .query_row(
+                "SELECT last_run_branch FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            lrb.is_none(),
+            "pre-V19 plans must have NULL last_run_branch (got {lrb:?})"
+        );
+
+        // Fresh inserts also default to NULL; explicit values round-trip.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, last_run_branch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", "master"],
+        )
+        .unwrap();
+        let lrb2: Option<String> = conn
+            .query_row(
+                "SELECT last_run_branch FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lrb2.as_deref(), Some("master"));
 
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))

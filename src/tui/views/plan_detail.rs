@@ -864,6 +864,7 @@ mod tests {
             context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
+            last_run_branch: None,
         }
     }
 

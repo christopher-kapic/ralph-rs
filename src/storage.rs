@@ -281,6 +281,68 @@ pub fn set_plan_questions_enabled(conn: &Connection, plan_id: &str, enabled: boo
     Ok(())
 }
 
+/// Record the git branch the plan most recently started a run on.
+///
+/// Written by the runner at run-start (both default and `--current-branch`
+/// modes) so [`find_resumable_plans_for_branch`] can resolve `ralph resume`
+/// (no slug) by current git branch without false-matching against a plan
+/// whose `branch_name` happens to equal that branch but whose actual last
+/// run executed elsewhere (e.g. a `--current-branch` run on `master`).
+pub fn set_plan_last_run_branch(conn: &Connection, plan_id: &str, branch: &str) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET last_run_branch = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![branch, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// Find plans in this project that are resumable on `branch`.
+///
+/// "Resumable" = status in {in_progress, failed, aborted, ready}. A plan
+/// matches when its `last_run_branch == branch` (its most recent run
+/// physically executed on this branch) OR — only if `last_run_branch IS
+/// NULL` — its `branch_name == branch` (covers plans created but never
+/// run yet). The NULL fallback explicitly does NOT apply when
+/// `last_run_branch` is set, which is what defends against false-matching
+/// a paused plan whose slug a user later reused as a feature-branch name.
+///
+/// Ordered by `updated_at DESC` so callers can pick the most recent
+/// candidate when multiple plans match.
+pub fn find_resumable_plans_for_branch(
+    conn: &Connection,
+    project: &str,
+    branch: &str,
+) -> Result<Vec<Plan>> {
+    let query = format!(
+        "SELECT {PLAN_COLUMNS} FROM plans \
+         WHERE project = ?1 \
+           AND status IN (?2, ?3, ?4, ?5) \
+           AND (last_run_branch = ?6 \
+                OR (last_run_branch IS NULL AND branch_name = ?6)) \
+         ORDER BY updated_at DESC"
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let rows = stmt.query_map(
+        params![
+            project,
+            PlanStatus::InProgress.as_str(),
+            PlanStatus::Failed.as_str(),
+            PlanStatus::Aborted.as_str(),
+            PlanStatus::Ready.as_str(),
+            branch,
+        ],
+        Plan::from_row,
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Set the `plans.pause_requested` flag and bump `updated_at`.
 ///
 /// Drives the `P` keybinding in the TUI plan-detail view and the
@@ -2319,6 +2381,155 @@ mod tests {
         let conn = setup();
         let err = set_plan_pause_requested(&conn, "no-such-id", true).unwrap_err();
         assert!(err.to_string().contains("Plan not found"));
+    }
+
+    #[test]
+    fn test_set_plan_last_run_branch_round_trips() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        assert!(plan.last_run_branch.is_none());
+
+        set_plan_last_run_branch(&conn, &plan.id, "feature/x").unwrap();
+        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert_eq!(on.last_run_branch.as_deref(), Some("feature/x"));
+        assert!(on.updated_at >= plan.updated_at);
+
+        // Subsequent writes overwrite (records the most recent run's branch).
+        set_plan_last_run_branch(&conn, &plan.id, "master").unwrap();
+        let updated = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert_eq!(updated.last_run_branch.as_deref(), Some("master"));
+    }
+
+    #[test]
+    fn test_set_plan_last_run_branch_missing_plan_errs() {
+        let conn = setup();
+        let err = set_plan_last_run_branch(&conn, "no-such-id", "master").unwrap_err();
+        assert!(err.to_string().contains("Plan not found"));
+    }
+
+    #[test]
+    fn test_find_resumable_plans_for_branch_orders_by_updated_at_desc() {
+        let conn = setup();
+        // Three resumable plans on master; bump updated_at by setting
+        // last_run_branch in order so DESC reflects insertion order.
+        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &p1.id, PlanStatus::Failed).unwrap();
+        update_plan_status(&conn, &p2.id, PlanStatus::InProgress).unwrap();
+        update_plan_status(&conn, &p3.id, PlanStatus::Aborted).unwrap();
+        // Set last_run_branch in p1 → p2 → p3 order. SQLite's strftime
+        // truncates to milliseconds, so add a small sleep between writes
+        // to guarantee the timestamps differ.
+        set_plan_last_run_branch(&conn, &p1.id, "master").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        set_plan_last_run_branch(&conn, &p2.id, "master").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        set_plan_last_run_branch(&conn, &p3.id, "master").unwrap();
+
+        let candidates = find_resumable_plans_for_branch(&conn, "/proj", "master").unwrap();
+        let slugs: Vec<&str> = candidates.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["p3", "p2", "p1"], "DESC by updated_at");
+    }
+
+    #[test]
+    fn test_find_resumable_plans_for_branch_excludes_completed_and_planning() {
+        let conn = setup();
+        let resumable_statuses = [
+            PlanStatus::InProgress,
+            PlanStatus::Failed,
+            PlanStatus::Aborted,
+            PlanStatus::Ready,
+        ];
+        for (i, status) in resumable_statuses.iter().enumerate() {
+            let slug = format!("rp{i}");
+            let plan = create_plan(&conn, &slug, "/proj", "main", "d", None, None, &[]).unwrap();
+            update_plan_status(&conn, &plan.id, *status).unwrap();
+            set_plan_last_run_branch(&conn, &plan.id, "main").unwrap();
+        }
+        // Non-resumable: planning (default), complete, archived.
+        let _planning = create_plan(&conn, "pl", "/proj", "main", "d", None, None, &[]).unwrap();
+        let cp = create_plan(&conn, "cp", "/proj", "main", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &cp.id, PlanStatus::Complete).unwrap();
+        set_plan_last_run_branch(&conn, &cp.id, "main").unwrap();
+        let ar = create_plan(&conn, "ar", "/proj", "main", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &ar.id, PlanStatus::Archived).unwrap();
+        set_plan_last_run_branch(&conn, &ar.id, "main").unwrap();
+
+        let candidates = find_resumable_plans_for_branch(&conn, "/proj", "main").unwrap();
+        let slugs: std::collections::HashSet<&str> =
+            candidates.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            ["rp0", "rp1", "rp2", "rp3"].iter().copied().collect(),
+            "only InProgress/Failed/Aborted/Ready should match"
+        );
+    }
+
+    #[test]
+    fn test_find_resumable_plans_for_branch_scopes_to_project() {
+        let conn = setup();
+        let here = create_plan(&conn, "here", "/proj", "main", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &here.id, PlanStatus::Failed).unwrap();
+        set_plan_last_run_branch(&conn, &here.id, "main").unwrap();
+        let elsewhere =
+            create_plan(&conn, "elsewhere", "/other", "main", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &elsewhere.id, PlanStatus::Failed).unwrap();
+        set_plan_last_run_branch(&conn, &elsewhere.id, "main").unwrap();
+
+        let candidates = find_resumable_plans_for_branch(&conn, "/proj", "main").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].slug, "here");
+    }
+
+    #[test]
+    fn test_find_resumable_plans_never_run_uses_branch_name_fallback() {
+        // A plan that has never run (last_run_branch IS NULL) should still
+        // match when current_branch == branch_name.
+        let conn = setup();
+        let plan = create_plan(&conn, "fresh", "/proj", "feat-x", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+        assert!(plan.last_run_branch.is_none());
+
+        let on_match = find_resumable_plans_for_branch(&conn, "/proj", "feat-x").unwrap();
+        assert_eq!(on_match.len(), 1);
+        assert_eq!(on_match[0].slug, "fresh");
+
+        // ...but NOT when the current branch differs from branch_name.
+        let on_other = find_resumable_plans_for_branch(&conn, "/proj", "feat-y").unwrap();
+        assert!(on_other.is_empty());
+    }
+
+    #[test]
+    fn test_find_resumable_plans_no_false_match_when_last_run_branch_set() {
+        // Slug-collision hard test from the step description.
+        // Plan A: slug='deploy', branch_name='deploy'. Last run was on
+        // 'master' (--current-branch mode), captured in last_run_branch.
+        // After the user creates a new branch 'deploy', `ralph resume` on
+        // that branch must NOT match A — A's last_run_branch='master' is
+        // set, so the NULL+branch_name fallback is skipped.
+        let conn = setup();
+        let a = create_plan(&conn, "deploy", "/proj", "deploy", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &a.id, PlanStatus::Failed).unwrap();
+        set_plan_last_run_branch(&conn, &a.id, "master").unwrap();
+
+        // Sanity: A.branch_name == 'deploy' but last_run_branch == 'master'.
+        let reread = get_plan_by_slug(&conn, "deploy", "/proj").unwrap().unwrap();
+        assert_eq!(reread.branch_name, "deploy");
+        assert_eq!(reread.last_run_branch.as_deref(), Some("master"));
+
+        // On 'deploy': must NOT match A (the false-match the V19 column
+        // exists to prevent).
+        let on_deploy = find_resumable_plans_for_branch(&conn, "/proj", "deploy").unwrap();
+        assert!(
+            on_deploy.is_empty(),
+            "must NOT match plan whose last_run_branch differs from current branch even if branch_name collides"
+        );
+
+        // On 'master': matches A (the actual run home).
+        let on_master = find_resumable_plans_for_branch(&conn, "/proj", "master").unwrap();
+        let slugs: Vec<&str> = on_master.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["deploy"]);
     }
 
     #[test]
