@@ -202,9 +202,7 @@ impl PlanHooksApp {
         match key.code {
             // Navigation
             KeyCode::Char('j') | KeyCode::Down => {
-                if !self.attachments.is_empty()
-                    && self.list_cursor + 1 < self.attachments.len()
-                {
+                if !self.attachments.is_empty() && self.list_cursor + 1 < self.attachments.len() {
                     self.list_cursor += 1;
                 }
                 Outcome::Pending
@@ -255,9 +253,7 @@ impl PlanHooksApp {
             }
 
             // Pop the sub-view.
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
-                Outcome::Pop
-            }
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => Outcome::Pop,
 
             _ => Outcome::Pending,
         }
@@ -483,10 +479,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut PlanHooksApp) {
             Mode::LifecyclePicker => LIFECYCLE_HINT,
             Mode::HookPicker { .. } => HOOK_HINT,
         };
-        Line::from(Span::styled(
-            hint,
-            Style::default().fg(theme::CHROME_DIM),
-        ))
+        Line::from(Span::styled(hint, Style::default().fg(theme::CHROME_DIM)))
     };
     let hint = Paragraph::new(hint_line);
     frame.render_widget(hint, hint_area);
@@ -536,12 +529,7 @@ fn render_lifecycle_picker(frame: &mut Frame, area: Rect, app: &PlanHooksApp) {
     frame.render_widget(para, dialog);
 }
 
-fn render_hook_picker(
-    frame: &mut Frame,
-    area: Rect,
-    app: &PlanHooksApp,
-    lifecycle: Lifecycle,
-) {
+fn render_hook_picker(frame: &mut Frame, area: Rect, app: &PlanHooksApp, lifecycle: Lifecycle) {
     let candidates = app.candidates_for(lifecycle);
     let max_label = candidates
         .iter()
@@ -689,10 +677,7 @@ mod tests {
         let mut app = PlanHooksApp::new(
             "p1".into(),
             "parent".into(),
-            vec![
-                att(Lifecycle::PreStep, "a"),
-                att(Lifecycle::PostStep, "b"),
-            ],
+            vec![att(Lifecycle::PreStep, "a"), att(Lifecycle::PostStep, "b")],
             vec![],
         );
         assert_eq!(app.handle_key(key(KeyCode::Char('j'))), Outcome::Pending);
@@ -706,10 +691,7 @@ mod tests {
         let mut app = PlanHooksApp::new(
             "p1".into(),
             "parent".into(),
-            vec![
-                att(Lifecycle::PreStep, "a"),
-                att(Lifecycle::PostStep, "b"),
-            ],
+            vec![att(Lifecycle::PreStep, "a"), att(Lifecycle::PostStep, "b")],
             vec![],
         );
         app.list_cursor = 1;
@@ -739,12 +721,7 @@ mod tests {
 
     #[test]
     fn a_opens_lifecycle_picker_when_library_has_hooks() {
-        let mut app = PlanHooksApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![],
-            vec![cand("fmt")],
-        );
+        let mut app = PlanHooksApp::new("p1".into(), "parent".into(), vec![], vec![cand("fmt")]);
         assert_eq!(app.handle_key(key(KeyCode::Char('a'))), Outcome::Pending);
         assert_eq!(app.mode, Mode::LifecyclePicker);
         assert_eq!(app.lifecycle_cursor, 0);
@@ -752,8 +729,7 @@ mod tests {
 
     #[test]
     fn a_with_empty_library_toasts_and_stays_in_list() {
-        let mut app =
-            PlanHooksApp::new("p1".into(), "parent".into(), vec![], vec![]);
+        let mut app = PlanHooksApp::new("p1".into(), "parent".into(), vec![], vec![]);
         assert_eq!(app.handle_key(key(KeyCode::Char('a'))), Outcome::Pending);
         assert_eq!(app.mode, Mode::List);
         let toast = app.toasts.current().expect("toast pushed");
@@ -771,12 +747,8 @@ mod tests {
             att(Lifecycle::PostTest, "p4"),
         ];
         for (i, expected) in attachments.iter().enumerate() {
-            let mut app = PlanHooksApp::new(
-                "p1".into(),
-                "parent".into(),
-                attachments.clone(),
-                vec![],
-            );
+            let mut app =
+                PlanHooksApp::new("p1".into(), "parent".into(), attachments.clone(), vec![]);
             app.list_cursor = i;
             let outcome = app.handle_key(key(KeyCode::Char('d')));
             assert_eq!(
@@ -791,12 +763,7 @@ mod tests {
 
     #[test]
     fn d_with_empty_attachments_is_pending() {
-        let mut app = PlanHooksApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![],
-            vec![cand("fmt")],
-        );
+        let mut app = PlanHooksApp::new("p1".into(), "parent".into(), vec![], vec![cand("fmt")]);
         assert_eq!(app.handle_key(key(KeyCode::Char('d'))), Outcome::Pending);
     }
 
@@ -813,19 +780,13 @@ mod tests {
 
     #[test]
     fn esc_pops_in_list_mode() {
-        let mut app =
-            PlanHooksApp::new("p1".into(), "parent".into(), vec![], vec![]);
+        let mut app = PlanHooksApp::new("p1".into(), "parent".into(), vec![], vec![]);
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Outcome::Pop);
     }
 
     #[test]
     fn ctrl_c_pops_in_any_mode() {
-        let mut app = PlanHooksApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![],
-            vec![cand("fmt")],
-        );
+        let mut app = PlanHooksApp::new("p1".into(), "parent".into(), vec![], vec![cand("fmt")]);
         // List mode.
         assert_eq!(
             app.handle_key(key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL)),
@@ -850,12 +811,7 @@ mod tests {
 
     #[test]
     fn lifecycle_picker_navigates_clamped() {
-        let mut app = PlanHooksApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![],
-            vec![cand("fmt")],
-        );
+        let mut app = PlanHooksApp::new("p1".into(), "parent".into(), vec![], vec![cand("fmt")]);
         app.handle_key(key(KeyCode::Char('a')));
         assert_eq!(app.mode, Mode::LifecyclePicker);
 
@@ -913,12 +869,7 @@ mod tests {
 
     #[test]
     fn lifecycle_picker_esc_falls_back_to_list_mode() {
-        let mut app = PlanHooksApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![],
-            vec![cand("fmt")],
-        );
+        let mut app = PlanHooksApp::new("p1".into(), "parent".into(), vec![], vec![cand("fmt")]);
         app.handle_key(key(KeyCode::Char('a')));
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Outcome::Pending);
         assert_eq!(app.mode, Mode::List);
@@ -954,19 +905,20 @@ mod tests {
     #[test]
     fn hook_enter_emits_add_request_for_each_lifecycle() {
         for (i, lifecycle) in LIFECYCLES.iter().enumerate() {
-            let mut app = PlanHooksApp::new(
-                "p1".into(),
-                "parent".into(),
-                vec![],
-                vec![cand("fmt")],
-            );
+            let mut app =
+                PlanHooksApp::new("p1".into(), "parent".into(), vec![], vec![cand("fmt")]);
             app.handle_key(key(KeyCode::Char('a')));
             // Move to the i-th lifecycle.
             for _ in 0..i {
                 app.handle_key(key(KeyCode::Char('j')));
             }
             app.handle_key(key(KeyCode::Enter));
-            assert_eq!(app.mode, Mode::HookPicker { lifecycle: *lifecycle });
+            assert_eq!(
+                app.mode,
+                Mode::HookPicker {
+                    lifecycle: *lifecycle
+                }
+            );
             let outcome = app.handle_key(key(KeyCode::Enter));
             assert_eq!(
                 outcome,
@@ -980,12 +932,7 @@ mod tests {
 
     #[test]
     fn hook_picker_esc_falls_back_to_lifecycle_picker() {
-        let mut app = PlanHooksApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![],
-            vec![cand("fmt")],
-        );
+        let mut app = PlanHooksApp::new("p1".into(), "parent".into(), vec![], vec![cand("fmt")]);
         app.handle_key(key(KeyCode::Char('a')));
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.mode, Mode::HookPicker { .. }));
@@ -1071,9 +1018,7 @@ mod tests {
     fn render_to_string(app: &mut PlanHooksApp) -> String {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), app))
-            .unwrap();
+        terminal.draw(|f| render(f, f.area(), app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let mut out = String::new();
         for y in 0..buf.area.height {
@@ -1113,24 +1058,14 @@ mod tests {
 
     #[test]
     fn render_empty_list_shows_placeholder() {
-        let mut app = PlanHooksApp::new(
-            "p1".into(),
-            "demo".into(),
-            vec![],
-            vec![cand("fmt")],
-        );
+        let mut app = PlanHooksApp::new("p1".into(), "demo".into(), vec![], vec![cand("fmt")]);
         let s = render_to_string(&mut app);
         assert!(s.contains("no plan-wide hooks"), "got:\n{s}");
     }
 
     #[test]
     fn render_lifecycle_picker_lists_all_four_lifecycles() {
-        let mut app = PlanHooksApp::new(
-            "p1".into(),
-            "demo".into(),
-            vec![],
-            vec![cand("fmt")],
-        );
+        let mut app = PlanHooksApp::new("p1".into(), "demo".into(), vec![], vec![cand("fmt")]);
         app.handle_key(key(KeyCode::Char('a')));
         let s = render_to_string(&mut app);
         for lc in LIFECYCLES.iter() {
@@ -1183,12 +1118,7 @@ mod tests {
             let project = "/proj";
             let plan_id = make_plan(&conn, "p", project);
 
-            let mut app = PlanHooksApp::new(
-                plan_id.clone(),
-                "p".into(),
-                vec![],
-                vec![cand("fmt")],
-            );
+            let mut app = PlanHooksApp::new(plan_id.clone(), "p".into(), vec![], vec![cand("fmt")]);
             app.handle_key(key(KeyCode::Char('a')));
             // Move to the chosen lifecycle.
             let target_idx = lifecycle_index(lifecycle);
@@ -1207,13 +1137,8 @@ mod tests {
             assert_eq!(got_lifecycle, lifecycle);
             assert_eq!(got_name, "fmt");
 
-            storage::attach_hook_to_plan(
-                &conn,
-                &plan_id,
-                got_lifecycle.as_str(),
-                &got_name,
-            )
-            .unwrap();
+            storage::attach_hook_to_plan(&conn, &plan_id, got_lifecycle.as_str(), &got_name)
+                .unwrap();
             let rows = storage::list_all_hooks_for_plan(&conn, &plan_id).unwrap();
             assert_eq!(rows.len(), 1, "{lifecycle:?}");
             assert_eq!(rows[0].lifecycle, lifecycle.as_str());
@@ -1228,8 +1153,7 @@ mod tests {
             let conn = db::open_memory().unwrap();
             let project = "/proj";
             let plan_id = make_plan(&conn, "p", project);
-            storage::attach_hook_to_plan(&conn, &plan_id, lifecycle.as_str(), "fmt")
-                .unwrap();
+            storage::attach_hook_to_plan(&conn, &plan_id, lifecycle.as_str(), "fmt").unwrap();
 
             let mut app = PlanHooksApp::new(
                 plan_id.clone(),
@@ -1267,8 +1191,7 @@ mod tests {
         let plan_id = make_plan(&conn, "p", project);
         storage::attach_hook_to_plan(&conn, &plan_id, "pre-step", "fmt").unwrap();
 
-        let err =
-            storage::attach_hook_to_plan(&conn, &plan_id, "pre-step", "fmt").unwrap_err();
+        let err = storage::attach_hook_to_plan(&conn, &plan_id, "pre-step", "fmt").unwrap_err();
         assert!(format!("{err}").contains("already attached"));
     }
 }

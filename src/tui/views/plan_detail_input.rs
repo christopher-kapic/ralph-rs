@@ -364,10 +364,7 @@ mod tests {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Char('i')));
         assert_eq!(action, InputAction::None);
-        assert_eq!(
-            app.input_mode,
-            InputMode::AddStep(AddPosition::Above)
-        );
+        assert_eq!(app.input_mode, InputMode::AddStep(AddPosition::Above));
     }
 
     #[test]
@@ -375,10 +372,7 @@ mod tests {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Char('a')));
         assert_eq!(action, InputAction::None);
-        assert_eq!(
-            app.input_mode,
-            InputMode::AddStep(AddPosition::Below)
-        );
+        assert_eq!(app.input_mode, InputMode::AddStep(AddPosition::Below));
     }
 
     #[test]
@@ -708,8 +702,11 @@ mod tests {
         lock_app(&mut app);
         let action = handle_key(&mut app, key(KeyCode::Char('i')));
         assert_eq!(action, InputAction::None);
-        assert_eq!(app.input_mode, InputMode::Normal,
-            "i must NOT enter add mode while locked");
+        assert_eq!(
+            app.input_mode,
+            InputMode::Normal,
+            "i must NOT enter add mode while locked"
+        );
     }
 
     #[test]
@@ -817,7 +814,10 @@ mod tests {
         let before = app.harness_tail_scroll;
         let action = handle_key(&mut app, key(KeyCode::Char('J')));
         assert_eq!(action, InputAction::None);
-        assert!(app.harness_tail_scroll < before, "tail scroll should still work");
+        assert!(
+            app.harness_tail_scroll < before,
+            "tail scroll should still work"
+        );
     }
 
     // -- Help overlay (TUI-plan.md §15) ---------------------------------

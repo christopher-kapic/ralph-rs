@@ -110,11 +110,8 @@ fn render_bottom(frame: &mut Frame, area: Rect, hint: &str, cwd: &Path, banner: 
         chunks[0],
     );
     frame.render_widget(
-        Paragraph::new(Span::styled(
-            cwd_text,
-            Style::default().fg(Color::DarkGray),
-        ))
-        .alignment(Alignment::Right),
+        Paragraph::new(Span::styled(cwd_text, Style::default().fg(Color::DarkGray)))
+            .alignment(Alignment::Right),
         chunks[1],
     );
 }
@@ -214,9 +211,11 @@ mod tests {
     fn render_to_string(width: u16, height: u16, chrome: &Chrome<'_>) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| {
-            let _body = render(frame, chrome);
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let _body = render(frame, chrome);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area().height)
             .map(|y| {
@@ -376,14 +375,8 @@ mod tests {
             rendered.contains(&format!("ralph v{VERSION}")),
             "version missing:\n{rendered}"
         );
-        assert!(
-            rendered.contains("[j/k] nav"),
-            "hint missing:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("/tmp/proj"),
-            "cwd missing:\n{rendered}"
-        );
+        assert!(rendered.contains("[j/k] nav"), "hint missing:\n{rendered}");
+        assert!(rendered.contains("/tmp/proj"), "cwd missing:\n{rendered}");
     }
 
     #[test]
@@ -477,5 +470,4 @@ mod tests {
             },
         );
     }
-
 }

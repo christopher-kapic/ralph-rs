@@ -1582,7 +1582,10 @@ mod tests {
     #[test]
     fn test_parse_agents_list() {
         let cli = Cli::try_parse_from(["ralph-rs", "agents", "list"]).unwrap();
-        assert!(matches!(cli.command.unwrap(), Command::Agents(AgentsCommand::List)));
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Agents(AgentsCommand::List)
+        ));
     }
 
     #[test]
@@ -1624,7 +1627,8 @@ mod tests {
     #[test]
     fn test_parse_plan_harness_show() {
         let cli = Cli::try_parse_from(["ralph-rs", "plan", "harness", "show"]).unwrap();
-        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) = cli.command.unwrap()
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) =
+            cli.command.unwrap()
         {
             assert!(plan.is_none());
         } else {
@@ -1635,7 +1639,8 @@ mod tests {
     #[test]
     fn test_parse_plan_harness_show_with_positional_plan() {
         let cli = Cli::try_parse_from(["ralph-rs", "plan", "harness", "show", "my-plan"]).unwrap();
-        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) = cli.command.unwrap()
+        if let Command::Plan(PlanCommand::Harness(PlanHarnessCommand::Show { plan })) =
+            cli.command.unwrap()
         {
             assert_eq!(plan.as_deref(), Some("my-plan"));
         } else {
@@ -2012,8 +2017,14 @@ mod tests {
         .unwrap();
         if let Command::Question(QuestionCommand::Ask { question, suggest }) = cli.command.unwrap()
         {
-            assert_eq!(question.as_deref(), Some("Should I use Postgres or SQLite?"));
-            assert_eq!(suggest, vec!["PostgreSQL".to_string(), "SQLite".to_string()]);
+            assert_eq!(
+                question.as_deref(),
+                Some("Should I use Postgres or SQLite?")
+            );
+            assert_eq!(
+                suggest,
+                vec!["PostgreSQL".to_string(), "SQLite".to_string()]
+            );
         } else {
             panic!("Expected Question Ask");
         }

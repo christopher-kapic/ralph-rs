@@ -4143,9 +4143,7 @@ mod tests {
         // last stdout line is 50 bytes long so we can verify truncation
         // when max_bytes < 50.
         let long_line = "x".repeat(50);
-        let script = format!(
-            "echo line-one; echo line-two; echo {long_line}; echo err-one >&2"
-        );
+        let script = format!("echo line-one; echo line-two; echo {long_line}; echo err-one >&2");
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg(&script)
@@ -4212,7 +4210,9 @@ mod tests {
             "expected 'line-two' in events: {texts:?}"
         );
         assert!(
-            texts.iter().any(|t| t.starts_with('x') && t.len() == max_bytes),
+            texts
+                .iter()
+                .any(|t| t.starts_with('x') && t.len() == max_bytes),
             "expected truncated long line in events: {texts:?}"
         );
         assert!(
@@ -4573,10 +4573,7 @@ mod tests {
 
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
         assert_eq!(logs.len(), 1);
-        assert_eq!(
-            logs[0].termination_reason,
-            Some(TerminationReason::Success)
-        );
+        assert_eq!(logs[0].termination_reason, Some(TerminationReason::Success));
         assert!(logs[0].committed);
 
         // And the plan's effective status reflects the actual stored value

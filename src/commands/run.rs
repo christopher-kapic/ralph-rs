@@ -326,7 +326,8 @@ pub fn run_plan_list_tui(
                 let transition = tracker.observe(observed, now);
                 app.set_read_only(tracker.state());
                 if transition == Transition::Released {
-                    app.toasts.push(read_only::RELEASED_TOAST, ToastKind::Success, now);
+                    app.toasts
+                        .push(read_only::RELEASED_TOAST, ToastKind::Success, now);
                 }
             }
 
@@ -371,11 +372,7 @@ pub fn run_plan_list_tui(
                         };
                         if confirm_with_background(&mut terminal, &mut app, &confirm)? {
                             for id in &targets {
-                                storage::update_plan_status(
-                                    conn,
-                                    id,
-                                    PlanStatus::Archived,
-                                )?;
+                                storage::update_plan_status(conn, id, PlanStatus::Archived)?;
                             }
                             refresh_plan_list_state(conn, project, &mut app)?;
                             let n = targets.len();
@@ -411,13 +408,7 @@ pub fn run_plan_list_tui(
                                 refresh_plan_list_state(conn, project, &mut app)?;
                             }
                             Some(crate::tui::views::plan_list::OpenRequest::Plan(slug)) => {
-                                run_plan_detail_tui(
-                                    &mut terminal,
-                                    conn,
-                                    config,
-                                    project,
-                                    &slug,
-                                )?;
+                                run_plan_detail_tui(&mut terminal, conn, config, project, &slug)?;
                                 // The plan-detail view can mutate step state
                                 // (skip / add) and counters; refresh tiles so
                                 // the user sees up-to-date totals on return.
@@ -1047,13 +1038,7 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
                 plan_detail_apply_move(conn, &mut app, &step_id, MoveDir::Down)?;
             }
             InputAction::Run => {
-                plan_detail_apply_run_streaming(
-                    conn,
-                    &mut app,
-                    project,
-                    slug,
-                    &mut subscription,
-                )?;
+                plan_detail_apply_run_streaming(conn, &mut app, project, slug, &mut subscription)?;
             }
             InputAction::Stop => {
                 plan_detail_apply_stop(conn, &mut app, project, slug)?;
@@ -1344,8 +1329,8 @@ pub(crate) fn plan_detail_apply_stop(
     use crate::tui::toast::ToastKind;
     use std::time::Instant;
 
-    let live = storage::get_live_run(conn, project)?
-        .filter(|l| l.plan_slug.as_deref() == Some(slug));
+    let live =
+        storage::get_live_run(conn, project)?.filter(|l| l.plan_slug.as_deref() == Some(slug));
     if live.is_none() {
         app.toasts.push(
             "No live run for this plan.",
@@ -1510,8 +1495,7 @@ pub(crate) fn plan_detail_apply_move(
         MoveDir::Up => "Moved step up.",
         MoveDir::Down => "Moved step down.",
     };
-    app.toasts
-        .push(label, ToastKind::Success, Instant::now());
+    app.toasts.push(label, ToastKind::Success, Instant::now());
     Ok(())
 }
 
@@ -1598,14 +1582,10 @@ fn run_plan_dependencies_tui<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if let Err(e) = storage::add_plan_dependency(conn, &plan_id, &dep_plan_id) {
-                    app.push_toast(
-                        format!("Failed to add dependency: {e}"),
-                        ToastKind::Error,
-                    );
+                    app.push_toast(format!("Failed to add dependency: {e}"), ToastKind::Error);
                     continue;
                 }
-                let (deps, candidates) =
-                    load_dependencies_view_state(conn, &project, &plan_id)?;
+                let (deps, candidates) = load_dependencies_view_state(conn, &project, &plan_id)?;
                 app.refresh(deps, candidates);
                 // Drop back to the list so the user sees the new row.
                 app.mode = Mode::List;
@@ -1619,8 +1599,7 @@ fn run_plan_dependencies_tui<B: ratatui::backend::Backend>(
                     );
                     continue;
                 }
-                let (deps, candidates) =
-                    load_dependencies_view_state(conn, &project, &plan_id)?;
+                let (deps, candidates) = load_dependencies_view_state(conn, &project, &plan_id)?;
                 app.refresh(deps, candidates);
                 app.push_toast("Dependency removed.", ToastKind::Success);
             }
@@ -1784,14 +1763,12 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             // Question-pane navigation (j/k) overrides pane navigation while
             // the pane is focused.
             KeyCode::Char('j') | KeyCode::Down
-                if app.focused_pane == Pane::OpenQuestions
-                    && app.has_open_questions_for_step() =>
+                if app.focused_pane == Pane::OpenQuestions && app.has_open_questions_for_step() =>
             {
                 app.select_question_next();
             }
             KeyCode::Char('k') | KeyCode::Up
-                if app.focused_pane == Pane::OpenQuestions
-                    && app.has_open_questions_for_step() =>
+                if app.focused_pane == Pane::OpenQuestions && app.has_open_questions_for_step() =>
             {
                 app.select_question_prev();
             }
@@ -3848,10 +3825,7 @@ mod plan_list_action_tests {
             .unwrap();
         assert!(after_on.questions_enabled);
         assert!(app.cursor_plan().unwrap().questions_enabled);
-        assert_eq!(
-            app.toasts.current().unwrap().text,
-            "Questions enabled."
-        );
+        assert_eq!(app.toasts.current().unwrap().text, "Questions enabled.");
 
         // Second press: on → off.
         plan_list_toggle_questions_cursor(&conn, project, &mut app).unwrap();
@@ -3860,10 +3834,7 @@ mod plan_list_action_tests {
             .unwrap();
         assert!(!after_off.questions_enabled);
         assert!(!app.cursor_plan().unwrap().questions_enabled);
-        assert_eq!(
-            app.toasts.current().unwrap().text,
-            "Questions disabled."
-        );
+        assert_eq!(app.toasts.current().unwrap().text, "Questions disabled.");
     }
 
     #[test]
@@ -4046,7 +4017,8 @@ mod archived_list_dispatcher_tests {
         let target_id = app.cursor_plan().unwrap().id.clone();
         let target_slug = app.cursor_plan().unwrap().slug.clone();
 
-        archived_list_apply_delete(&conn, project, &mut app, std::slice::from_ref(&target_id)).unwrap();
+        archived_list_apply_delete(&conn, project, &mut app, std::slice::from_ref(&target_id))
+            .unwrap();
 
         // DB row gone.
         assert!(
@@ -4079,10 +4051,7 @@ mod archived_list_dispatcher_tests {
 
         // All three plans gone.
         assert_eq!(app.tiles.len(), 0);
-        assert_eq!(
-            storage::count_archived_plans(&conn, project).unwrap(),
-            0
-        );
+        assert_eq!(storage::count_archived_plans(&conn, project).unwrap(), 0);
         let toast = app.toasts.current().expect("toast should be present");
         assert_eq!(toast.text, "Permanently deleted 3 plans.");
     }
@@ -4094,7 +4063,8 @@ mod archived_list_dispatcher_tests {
         let target_id = app.cursor_plan().unwrap().id.clone();
         let target_slug = app.cursor_plan().unwrap().slug.clone();
 
-        archived_list_apply_unarchive(&conn, project, &mut app, std::slice::from_ref(&target_id)).unwrap();
+        archived_list_apply_unarchive(&conn, project, &mut app, std::slice::from_ref(&target_id))
+            .unwrap();
 
         // Status flipped to Ready in the DB.
         let row = storage::get_plan_by_slug(&conn, &target_slug, project)
@@ -4122,10 +4092,7 @@ mod archived_list_dispatcher_tests {
         archived_list_apply_unarchive(&conn, project, &mut app, &targets).unwrap();
 
         assert_eq!(app.tiles.len(), 1);
-        assert_eq!(
-            storage::count_archived_plans(&conn, project).unwrap(),
-            1
-        );
+        assert_eq!(storage::count_archived_plans(&conn, project).unwrap(), 1);
         let toast = app.toasts.current().expect("toast should be present");
         assert_eq!(toast.text, "Unarchived 2 plans.");
     }
@@ -4140,16 +4107,14 @@ mod archived_list_dispatcher_tests {
         let mut app = ArchivedListApp::new(tiles, project, "UTC");
         assert_eq!(app.tiles.len(), 1);
 
-        archived_list_apply_unarchive(&conn, project, &mut app, std::slice::from_ref(&only.id)).unwrap();
+        archived_list_apply_unarchive(&conn, project, &mut app, std::slice::from_ref(&only.id))
+            .unwrap();
 
         assert!(app.tiles.is_empty());
         assert_eq!(app.selected_index, 0);
         // archived count went to zero, so a subsequent plan-list refresh
         // will hide the sentinel.
-        assert_eq!(
-            storage::count_archived_plans(&conn, project).unwrap(),
-            0
-        );
+        assert_eq!(storage::count_archived_plans(&conn, project).unwrap(), 0);
     }
 
     #[test]

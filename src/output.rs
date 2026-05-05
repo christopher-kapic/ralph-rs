@@ -1598,8 +1598,8 @@ mod tests {
             (Phase::PostStepHook, "post_step_hook"),
         ] {
             let evt = RunEvent::PhaseChanged { phase };
-            let val: serde_json::Value = serde_json::from_str(&serde_json::to_string(&evt).unwrap())
-                .unwrap();
+            let val: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&evt).unwrap()).unwrap();
             assert_eq!(val["phase"], expected);
         }
     }

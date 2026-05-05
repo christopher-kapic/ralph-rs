@@ -577,11 +577,7 @@ impl PlanDetailApp {
     /// so the view stays anchored at whatever the user scrolled to (i.e. the
     /// addition doesn't yank the visible window forward).
     pub fn push_harness_line(&mut self, line: String) {
-        push_into_tail(
-            &mut self.harness_tail,
-            line,
-            &mut self.harness_tail_scroll,
-        );
+        push_into_tail(&mut self.harness_tail, line, &mut self.harness_tail_scroll);
     }
 
     /// Push a deterministic-test-output line onto the test tail. Mirrors
@@ -662,8 +658,8 @@ impl PlanDetailApp {
     /// `J`/`K` depending on the user's mental model — see `plan_detail_input`).
     /// Bumps both tails together so the user only has to remember one shortcut.
     pub fn scroll_tails_older(&mut self) {
-        self.harness_tail_scroll = (self.harness_tail_scroll + 1)
-            .min(self.harness_tail.len().saturating_sub(1));
+        self.harness_tail_scroll =
+            (self.harness_tail_scroll + 1).min(self.harness_tail.len().saturating_sub(1));
         self.test_tail_scroll =
             (self.test_tail_scroll + 1).min(self.test_tail.len().saturating_sub(1));
     }

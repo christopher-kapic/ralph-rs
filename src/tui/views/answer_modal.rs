@@ -53,7 +53,11 @@ impl AnswerModal {
     /// Build a modal targeting the given question row. `suggestions` may be
     /// empty; in that case only the `[c]` (custom) and `[esc]` (cancel)
     /// rows are interactable.
-    pub fn new(question_id: impl Into<String>, question: impl Into<String>, suggestions: Vec<String>) -> Self {
+    pub fn new(
+        question_id: impl Into<String>,
+        question: impl Into<String>,
+        suggestions: Vec<String>,
+    ) -> Self {
         Self {
             question_id: question_id.into(),
             question: question.into(),
@@ -296,10 +300,7 @@ mod tests {
     fn resume_enter_accepts_default() {
         // §17 default is Y, so Enter accepts.
         let m = ResumeModal::new("plan", false);
-        assert_eq!(
-            m.handle_key(key(KeyCode::Enter)),
-            ResumeModalAction::Accept
-        );
+        assert_eq!(m.handle_key(key(KeyCode::Enter)), ResumeModalAction::Accept);
     }
 
     #[test]

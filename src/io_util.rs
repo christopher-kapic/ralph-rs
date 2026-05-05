@@ -269,8 +269,7 @@ mod tests {
         seq: Arc<AtomicU64>,
         max_bytes: usize,
     ) -> (ChunkEmitter, CollectedChunks) {
-        let collected: CollectedChunks =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected: CollectedChunks = Arc::new(std::sync::Mutex::new(Vec::new()));
         let collected_for_sink = collected.clone();
         let sink: ChunkSink = Arc::new(move |s, t, n| {
             collected_for_sink.lock().unwrap().push((s, t, n));
@@ -295,7 +294,9 @@ mod tests {
         let (emitter, collected) = collecting_emitter(ChunkStream::Stdout, seq, 4096);
 
         let handle = drain_bounded_with_emitter(Some(r), 1024, Some(emitter));
-        w.write_all(b"line one\nline two\nline three\n").await.unwrap();
+        w.write_all(b"line one\nline two\nline three\n")
+            .await
+            .unwrap();
         drop(w);
         let _ = join_drain(handle).await;
 
@@ -316,8 +317,7 @@ mod tests {
         let (mut w, r) = tokio::io::duplex(64 * 1024);
         let seq = Arc::new(AtomicU64::new(0));
         let max_bytes = 10;
-        let (emitter, collected) =
-            collecting_emitter(ChunkStream::Stdout, seq, max_bytes);
+        let (emitter, collected) = collecting_emitter(ChunkStream::Stdout, seq, max_bytes);
 
         let handle = drain_bounded_with_emitter(Some(r), 64 * 1024, Some(emitter));
         // Write a 50-byte line; expect the emitted text to be at most 10 bytes.
@@ -365,10 +365,8 @@ mod tests {
         let seq = Arc::new(AtomicU64::new(0));
 
         // Both emitters share the same `seq` counter.
-        let (em_out, collected_out) =
-            collecting_emitter(ChunkStream::Stdout, seq.clone(), 4096);
-        let (em_err, collected_err) =
-            collecting_emitter(ChunkStream::Stderr, seq.clone(), 4096);
+        let (em_out, collected_out) = collecting_emitter(ChunkStream::Stdout, seq.clone(), 4096);
+        let (em_err, collected_err) = collecting_emitter(ChunkStream::Stderr, seq.clone(), 4096);
 
         let h_out = drain_bounded_with_emitter(Some(ro), 1024, Some(em_out));
         let h_err = drain_bounded_with_emitter(Some(re), 1024, Some(em_err));
@@ -434,7 +432,10 @@ mod tests {
 
         let events = collected.lock().unwrap().clone();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0], (ChunkStream::Stdout, "hello world".to_string(), 0));
+        assert_eq!(
+            events[0],
+            (ChunkStream::Stdout, "hello world".to_string(), 0)
+        );
     }
 
     /// When `emitter` is `None`, the new function behaves exactly like the

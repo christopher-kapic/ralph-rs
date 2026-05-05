@@ -86,11 +86,7 @@ fn rand_suffix() -> u32 {
 /// Internal: write `initial_text` to `path`, run the editor, and read back.
 /// Pure of terminal-suspension concerns so it can be exercised in tests
 /// that don't have a real TTY.
-pub(crate) fn edit_at(
-    editor: &str,
-    path: &Path,
-    initial_text: &str,
-) -> Result<Option<String>> {
+pub(crate) fn edit_at(editor: &str, path: &Path, initial_text: &str) -> Result<Option<String>> {
     fs::write(path, initial_text).with_context(|| format!("write {}", path.display()))?;
 
     let status = spawn_editor(editor, path)?;
@@ -147,19 +143,13 @@ mod tests {
     #[test]
     fn resolve_editor_prefers_editor_over_visual() {
         let env = HashMap::from([("EDITOR", "vim"), ("VISUAL", "nano")]);
-        assert_eq!(
-            resolve_editor_from(lookup(&env)),
-            Some("vim".to_string())
-        );
+        assert_eq!(resolve_editor_from(lookup(&env)), Some("vim".to_string()));
     }
 
     #[test]
     fn resolve_editor_falls_back_to_visual() {
         let env = HashMap::from([("VISUAL", "nano")]);
-        assert_eq!(
-            resolve_editor_from(lookup(&env)),
-            Some("nano".to_string())
-        );
+        assert_eq!(resolve_editor_from(lookup(&env)), Some("nano".to_string()));
     }
 
     #[test]

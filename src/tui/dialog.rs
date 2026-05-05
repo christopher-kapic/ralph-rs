@@ -83,7 +83,9 @@ pub fn render(frame: &mut Frame, area: Rect, c: &Confirm<'_>) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::CURSOR));
 
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, dialog);
 }
 
@@ -94,12 +96,7 @@ fn centered_rect(area: Rect, c: &Confirm<'_>) -> Rect {
     let desired_h = body_lines.saturating_add(4);
     let height = desired_h.min(area.height).max(5.min(area.height));
 
-    let body_w = c
-        .body
-        .lines()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(0);
+    let body_w = c.body.lines().map(|l| l.chars().count()).max().unwrap_or(0);
     let title_w = c.title.chars().count() + 2;
     let hint_w = " [y/N] confirm   [Esc] cancel ".chars().count();
     let desired_w = body_w.max(title_w).max(hint_w) as u16 + 4;
@@ -124,12 +121,13 @@ pub fn run<B: Backend>(terminal: &mut Terminal<B>, c: &Confirm<'_>) -> Result<bo
             render(f, area, c);
         })?;
         match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => match decide_key(key, c.default)
-            {
-                Decision::Yes => return Ok(true),
-                Decision::No => return Ok(false),
-                Decision::Pending => continue,
-            },
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                match decide_key(key, c.default) {
+                    Decision::Yes => return Ok(true),
+                    Decision::No => return Ok(false),
+                    Decision::Pending => continue,
+                }
+            }
             _ => continue,
         }
     }
@@ -200,9 +198,15 @@ mod tests {
 
     #[test]
     fn unrecognized_key_is_pending() {
-        assert_eq!(decide_key(key(KeyCode::Char('z')), false), Decision::Pending);
+        assert_eq!(
+            decide_key(key(KeyCode::Char('z')), false),
+            Decision::Pending
+        );
         assert_eq!(decide_key(key(KeyCode::Tab), false), Decision::Pending);
-        assert_eq!(decide_key(key(KeyCode::Char(' ')), false), Decision::Pending);
+        assert_eq!(
+            decide_key(key(KeyCode::Char(' ')), false),
+            Decision::Pending
+        );
     }
 
     // -- render -----------------------------------------------------------

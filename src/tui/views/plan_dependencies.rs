@@ -210,9 +210,7 @@ impl PlanDependenciesApp {
             }
 
             // Pop the sub-view.
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
-                Outcome::Pop
-            }
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => Outcome::Pop,
 
             _ => Outcome::Pending,
         }
@@ -362,10 +360,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut PlanDependenciesApp) {
             Mode::List => LIST_HINT,
             Mode::Picker => PICKER_HINT,
         };
-        Line::from(Span::styled(
-            hint,
-            Style::default().fg(theme::CHROME_DIM),
-        ))
+        Line::from(Span::styled(hint, Style::default().fg(theme::CHROME_DIM)))
     };
     let hint = Paragraph::new(hint_line);
     frame.render_widget(hint, hint_area);
@@ -545,12 +540,8 @@ mod tests {
 
     #[test]
     fn a_opens_picker_when_candidates_exist() {
-        let mut app = PlanDependenciesApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![],
-            vec![pref("c1", "x")],
-        );
+        let mut app =
+            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![pref("c1", "x")]);
         assert_eq!(app.handle_key(key(KeyCode::Char('a'))), Outcome::Pending);
         assert_eq!(app.mode, Mode::Picker);
         assert_eq!(app.picker_cursor, 0);
@@ -558,8 +549,7 @@ mod tests {
 
     #[test]
     fn a_with_no_candidates_toasts_and_stays_in_list() {
-        let mut app =
-            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![]);
+        let mut app = PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![]);
         assert_eq!(app.handle_key(key(KeyCode::Char('a'))), Outcome::Pending);
         assert_eq!(app.mode, Mode::List);
         let toast = app.toasts.current().expect("toast pushed");
@@ -586,41 +576,28 @@ mod tests {
 
     #[test]
     fn d_with_empty_deps_is_pending() {
-        let mut app = PlanDependenciesApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![],
-            vec![pref("c1", "x")],
-        );
+        let mut app =
+            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![pref("c1", "x")]);
         assert_eq!(app.handle_key(key(KeyCode::Char('d'))), Outcome::Pending);
     }
 
     #[test]
     fn q_pops_in_list_mode() {
-        let mut app = PlanDependenciesApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![pref("d1", "a")],
-            vec![],
-        );
+        let mut app =
+            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![pref("d1", "a")], vec![]);
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Outcome::Pop);
     }
 
     #[test]
     fn esc_pops_in_list_mode() {
-        let mut app =
-            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![]);
+        let mut app = PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![]);
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Outcome::Pop);
     }
 
     #[test]
     fn ctrl_c_pops_in_either_mode() {
-        let mut app = PlanDependenciesApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![],
-            vec![pref("c1", "x")],
-        );
+        let mut app =
+            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![pref("c1", "x")]);
         assert_eq!(
             app.handle_key(key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Outcome::Pop
@@ -675,12 +652,8 @@ mod tests {
 
     #[test]
     fn picker_esc_falls_back_to_list_mode() {
-        let mut app = PlanDependenciesApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![],
-            vec![pref("c1", "x")],
-        );
+        let mut app =
+            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![pref("c1", "x")]);
         app.handle_key(key(KeyCode::Char('a')));
         assert_eq!(app.mode, Mode::Picker);
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Outcome::Pending);
@@ -689,12 +662,8 @@ mod tests {
 
     #[test]
     fn picker_q_falls_back_to_list_mode() {
-        let mut app = PlanDependenciesApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![],
-            vec![pref("c1", "x")],
-        );
+        let mut app =
+            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![pref("c1", "x")]);
         app.handle_key(key(KeyCode::Char('a')));
         assert_eq!(app.handle_key(key(KeyCode::Char('q'))), Outcome::Pending);
         assert_eq!(app.mode, Mode::List);
@@ -733,12 +702,8 @@ mod tests {
 
     #[test]
     fn unknown_key_in_list_is_pending() {
-        let mut app = PlanDependenciesApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![pref("d1", "a")],
-            vec![],
-        );
+        let mut app =
+            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![pref("d1", "a")], vec![]);
         assert_eq!(app.handle_key(key(KeyCode::Char('x'))), Outcome::Pending);
     }
 
@@ -754,9 +719,7 @@ mod tests {
         );
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &mut app))
-            .unwrap();
+        terminal.draw(|f| render(f, f.area(), &mut app)).unwrap();
     }
 
     #[test]
@@ -769,9 +732,7 @@ mod tests {
         );
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &mut app))
-            .unwrap();
+        terminal.draw(|f| render(f, f.area(), &mut app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let mut found = false;
         for y in 0..buf.area.height {
@@ -798,28 +759,21 @@ mod tests {
         app.handle_key(key(KeyCode::Char('a')));
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), &mut app))
-            .unwrap();
+        terminal.draw(|f| render(f, f.area(), &mut app)).unwrap();
     }
 
     // -- Help overlay (TUI-plan.md §15) ---------------------------------
 
     #[test]
     fn help_state_default_hidden() {
-        let app =
-            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![]);
+        let app = PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![]);
         assert!(!app.help.is_visible());
     }
 
     #[test]
     fn handle_key_question_mark_opens_help_in_list_mode() {
-        let mut app = PlanDependenciesApp::new(
-            "p1".into(),
-            "parent".into(),
-            vec![pref("d1", "a")],
-            vec![],
-        );
+        let mut app =
+            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![pref("d1", "a")], vec![]);
         // `?` is consumed by the help routing — returns Pending and the
         // sub-view's per-mode handler doesn't fire.
         let r = app.handle_key(key(KeyCode::Char('?')));
@@ -829,8 +783,7 @@ mod tests {
 
     #[test]
     fn handle_key_esc_closes_help_without_popping() {
-        let mut app =
-            PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![]);
+        let mut app = PlanDependenciesApp::new("p1".into(), "parent".into(), vec![], vec![]);
         app.help.open();
         // Without the help intercept, `<esc>` in List mode would pop the
         // sub-view (Outcome::Pop). With the overlay open it must just close
@@ -861,9 +814,18 @@ mod tests {
     // -- End-to-end storage round-trip tests -----------------------------
 
     fn make_plan(conn: &rusqlite::Connection, slug: &str, project: &str) -> String {
-        storage::create_plan(conn, slug, project, &format!("br-{slug}"), "d", None, None, &[])
-            .expect("create_plan")
-            .id
+        storage::create_plan(
+            conn,
+            slug,
+            project,
+            &format!("br-{slug}"),
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .expect("create_plan")
+        .id
     }
 
     #[test]
@@ -875,12 +837,8 @@ mod tests {
         let b_id = make_plan(&conn, "dep-b", project);
 
         let candidates = vec![pref(&a_id, "dep-a"), pref(&b_id, "dep-b")];
-        let mut app = PlanDependenciesApp::new(
-            parent_id.clone(),
-            "parent".into(),
-            vec![],
-            candidates,
-        );
+        let mut app =
+            PlanDependenciesApp::new(parent_id.clone(), "parent".into(), vec![], candidates);
 
         // Drive: a → Enter on first candidate → AddRequested.
         app.handle_key(key(KeyCode::Char('a')));
@@ -936,12 +894,8 @@ mod tests {
         storage::add_plan_dependency(&conn, &a_id, &b_id).unwrap();
 
         // The candidate list for B would include A (no direct edge B->A yet).
-        let mut app = PlanDependenciesApp::new(
-            b_id.clone(),
-            "b".into(),
-            vec![],
-            vec![pref(&a_id, "a")],
-        );
+        let mut app =
+            PlanDependenciesApp::new(b_id.clone(), "b".into(), vec![], vec![pref(&a_id, "a")]);
         app.handle_key(key(KeyCode::Char('a')));
         let outcome = app.handle_key(key(KeyCode::Enter));
         let dep_id = match outcome {

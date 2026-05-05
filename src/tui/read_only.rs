@@ -164,9 +164,7 @@ pub fn detect(
         )
         .optional()?;
     Ok(match row {
-        Some(pid) if pid != my_pid && Some(pid) != spawned_child_pid => {
-            ReadOnly::Locked { pid }
-        }
+        Some(pid) if pid != my_pid && Some(pid) != spawned_child_pid => ReadOnly::Locked { pid },
         _ => ReadOnly::Editable,
     })
 }

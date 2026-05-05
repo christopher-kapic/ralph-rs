@@ -85,7 +85,9 @@ fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatu
     };
     frame.render_widget(Clear, toast_area);
     let para = Paragraph::new(Span::styled(
-        text.chars().take(toast_area.width as usize).collect::<String>(),
+        text.chars()
+            .take(toast_area.width as usize)
+            .collect::<String>(),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(para, toast_area);
@@ -306,9 +308,10 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
     // attempt; rendering them on the step summary lets the operator see what
     // gating commands are in play without leaving the view.
     if !app.plan.deterministic_tests.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Tests:", Style::default().add_modifier(Modifier::BOLD)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            "Tests:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]));
         for cmd in &app.plan.deterministic_tests {
             lines.push(Line::from(format!("  • {cmd}")));
         }
@@ -699,25 +702,18 @@ mod tests {
     fn right_pane_renders_full_summary_for_pending_step() {
         // Pending step: status row, attempt counter, harness fallback to plan,
         // tests list. No timer line (only InProgress).
-        let mut app = app_with_step(
-            StepStatus::Pending,
-            0,
-            Some(3),
-            None,
-            None,
-            None,
-        );
+        let mut app = app_with_step(StepStatus::Pending, 0, Some(3), None, None, None);
         let out = rendered(&mut app, 80, 24);
-        assert!(out.contains("Title: Write migration"), "title missing:\n{out}");
+        assert!(
+            out.contains("Title: Write migration"),
+            "title missing:\n{out}"
+        );
         assert!(out.contains("Status: pending"), "status missing:\n{out}");
         assert!(out.contains("Attempts: 0/4"), "attempts missing:\n{out}");
         assert!(out.contains("Harness: claude"), "harness missing:\n{out}");
         assert!(out.contains("Tests:"), "tests header missing:\n{out}");
         assert!(out.contains("• cargo test"), "test cmd missing:\n{out}");
-        assert!(
-            out.contains("• cargo clippy"),
-            "clippy cmd missing:\n{out}"
-        );
+        assert!(out.contains("• cargo clippy"), "clippy cmd missing:\n{out}");
         assert!(!out.contains("Elapsed:"), "no timer for pending:\n{out}");
     }
 
@@ -725,14 +721,7 @@ mod tests {
     fn right_pane_renders_in_progress_attempt_counter() {
         // 2/3 in the spec example means attempt 2 of 3 total attempts; the
         // implementation reports `<attempts>/(max_retries + 1)`.
-        let mut app = app_with_step(
-            StepStatus::InProgress,
-            2,
-            Some(2),
-            None,
-            None,
-            None,
-        );
+        let mut app = app_with_step(StepStatus::InProgress, 2, Some(2), None, None, None);
         let out = rendered(&mut app, 80, 24);
         assert!(
             out.contains("Status: in_progress"),
@@ -759,14 +748,7 @@ mod tests {
 
     #[test]
     fn right_pane_renders_complete_status() {
-        let mut app = app_with_step(
-            StepStatus::Complete,
-            1,
-            Some(3),
-            None,
-            None,
-            None,
-        );
+        let mut app = app_with_step(StepStatus::Complete, 1, Some(3), None, None, None);
         let out = rendered(&mut app, 80, 24);
         assert!(out.contains("Status: complete"), "status:\n{out}");
         assert!(out.contains("Attempts: 1/4"), "attempts:\n{out}");
@@ -774,14 +756,7 @@ mod tests {
 
     #[test]
     fn right_pane_renders_failed_status() {
-        let mut app = app_with_step(
-            StepStatus::Failed,
-            3,
-            Some(2),
-            None,
-            None,
-            None,
-        );
+        let mut app = app_with_step(StepStatus::Failed, 3, Some(2), None, None, None);
         let out = rendered(&mut app, 80, 24);
         assert!(out.contains("Status: failed"), "status:\n{out}");
         assert!(out.contains("Attempts: 3/3"), "attempts:\n{out}");
@@ -789,28 +764,14 @@ mod tests {
 
     #[test]
     fn right_pane_renders_skipped_status() {
-        let mut app = app_with_step(
-            StepStatus::Skipped,
-            0,
-            Some(3),
-            None,
-            None,
-            None,
-        );
+        let mut app = app_with_step(StepStatus::Skipped, 0, Some(3), None, None, None);
         let out = rendered(&mut app, 80, 24);
         assert!(out.contains("Status: skipped"), "status:\n{out}");
     }
 
     #[test]
     fn right_pane_renders_aborted_status() {
-        let mut app = app_with_step(
-            StepStatus::Aborted,
-            1,
-            Some(3),
-            None,
-            None,
-            None,
-        );
+        let mut app = app_with_step(StepStatus::Aborted, 1, Some(3), None, None, None);
         let out = rendered(&mut app, 80, 24);
         assert!(out.contains("Status: aborted"), "status:\n{out}");
     }

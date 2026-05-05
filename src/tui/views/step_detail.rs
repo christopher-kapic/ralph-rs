@@ -28,9 +28,7 @@ use crate::tui::help::{self, HelpState};
 use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
-use crate::tui::views::step_detail_picker::{
-    BottomCell, PickerKind, PickerOutcome, PickerState,
-};
+use crate::tui::views::step_detail_picker::{BottomCell, PickerKind, PickerOutcome, PickerState};
 
 /// Sentinel rendered in dim style when a pane's source-of-truth value is
 /// `None` or empty. Distinguishes "no value configured" from "configured to
@@ -144,7 +142,10 @@ impl Pane {
 
     /// Position in [`Self::ORDER`].
     fn index(self) -> usize {
-        Self::ORDER.iter().position(|p| *p == self).expect("pane in ORDER")
+        Self::ORDER
+            .iter()
+            .position(|p| *p == self)
+            .expect("pane in ORDER")
     }
 
     /// Title shown on the pane's bordered block. Kept here so renderers and
@@ -777,10 +778,7 @@ impl StepDetailApp {
     pub fn set_open_questions_for_step(&mut self, questions: Vec<storage::OpenQuestion>) {
         self.open_questions_for_step = questions;
         if self.selected_question_index >= self.open_questions_for_step.len() {
-            self.selected_question_index = self
-                .open_questions_for_step
-                .len()
-                .saturating_sub(1);
+            self.selected_question_index = self.open_questions_for_step.len().saturating_sub(1);
         }
     }
 
@@ -984,15 +982,11 @@ impl StepDetailApp {
         let current_policy = self.effective_change_policy();
 
         let picker = match self.bottom_focus {
-            BottomCell::Harness => {
-                PickerState::for_harness(&harnesses, Some(harness.as_str()))
-            }
+            BottomCell::Harness => PickerState::for_harness(&harnesses, Some(harness.as_str())),
             BottomCell::Model => {
                 PickerState::for_model(model_default.as_deref(), current_model.as_deref())
             }
-            BottomCell::Agent => {
-                PickerState::for_agent(agents, current_agent.as_deref())
-            }
+            BottomCell::Agent => PickerState::for_agent(agents, current_agent.as_deref()),
             BottomCell::ChangePolicy => PickerState::for_change_policy(current_policy),
         };
         self.picker = Some(picker);
@@ -1119,10 +1113,7 @@ impl StepDetailApp {
     /// the `kind` / `value` out of the borrow checker's way: returning
     /// `Some(Submit)` means the caller should call
     /// [`Self::apply_picker_submit`] and then `close_picker`.
-    pub fn picker_handle_key(
-        &mut self,
-        key: crossterm::event::KeyEvent,
-    ) -> Option<PickerOutcome> {
+    pub fn picker_handle_key(&mut self, key: crossterm::event::KeyEvent) -> Option<PickerOutcome> {
         let picker = self.picker.as_mut()?;
         let outcome = picker.handle_key(key);
         // The state machine reports Pending when the user confirms the
@@ -1197,10 +1188,7 @@ impl StepDetailApp {
             return Some(model);
         }
         let harness = self.effective_harness();
-        self.harness_default_models
-            .get(&harness)
-            .cloned()
-            .flatten()
+        self.harness_default_models.get(&harness).cloned().flatten()
     }
 
     /// Resolved agent for the current step: `step.agent ?? plan.agent`.
@@ -1265,11 +1253,7 @@ impl StepDetailApp {
     /// and suffix through `$EDITOR` and persist via the storage helpers.
     /// Each side updates independently so a no-op on one half doesn't churn
     /// its `updated_at` stamp.
-    pub fn edit_project_pane<E>(
-        &mut self,
-        conn: &Connection,
-        edit_fn: E,
-    ) -> Result<EditOutcome>
+    pub fn edit_project_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
     where
         E: FnOnce(&str) -> Result<Option<String>>,
     {
@@ -1340,11 +1324,7 @@ impl StepDetailApp {
     /// `plan.prompt_suffix` through `$EDITOR` using the same two-section
     /// format as the universal/project panes. Each side is updated
     /// independently so a no-op on one half doesn't churn `updated_at`.
-    pub fn edit_plan_prompt_pane<E>(
-        &mut self,
-        conn: &Connection,
-        edit_fn: E,
-    ) -> Result<EditOutcome>
+    pub fn edit_plan_prompt_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
     where
         E: FnOnce(&str) -> Result<Option<String>>,
     {
@@ -1382,11 +1362,7 @@ impl StepDetailApp {
     ///
     /// No-ops when the plan has no steps under the current selection (the
     /// pane already renders a `(no steps)` placeholder in that case).
-    pub fn edit_step_prompt_pane<E>(
-        &mut self,
-        conn: &Connection,
-        edit_fn: E,
-    ) -> Result<EditOutcome>
+    pub fn edit_step_prompt_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
     where
         E: FnOnce(&str) -> Result<Option<String>>,
     {
@@ -1442,11 +1418,7 @@ impl StepDetailApp {
     /// `c` on the Tests pane: round-trip `plan.deterministic_tests` through
     /// `$EDITOR` (one test per line, blank/`#`-prefixed lines ignored) and
     /// persist via [`storage::set_plan_deterministic_tests`].
-    pub fn edit_tests_pane<E>(
-        &mut self,
-        conn: &Connection,
-        edit_fn: E,
-    ) -> Result<EditOutcome>
+    pub fn edit_tests_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
     where
         E: FnOnce(&str) -> Result<Option<String>>,
     {
@@ -1594,7 +1566,9 @@ fn render_answer_modal(
         .title(" Answer question ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::STATUS_QUESTION));
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, dialog);
 }
 
@@ -1631,7 +1605,12 @@ fn render_resume_modal(
 fn centered_modal_rect(area: Rect, body: &[Line], title: &str) -> Rect {
     let body_w = body
         .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.chars().count()).sum::<usize>())
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|s| s.content.chars().count())
+                .sum::<usize>()
+        })
         .max()
         .unwrap_or(0);
     let title_w = title.chars().count();
@@ -1663,7 +1642,9 @@ fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatu
     };
     frame.render_widget(Clear, toast_area);
     let para = Paragraph::new(Span::styled(
-        text.chars().take(toast_area.width as usize).collect::<String>(),
+        text.chars()
+            .take(toast_area.width as usize)
+            .collect::<String>(),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(para, toast_area);
@@ -1880,7 +1861,9 @@ fn render_open_questions(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
     for (i, q) in app.open_questions_for_step.iter().enumerate() {
         let focused = i == app.selected_question_index;
         let header_style = if focused {
-            Style::default().fg(theme::STATUS_QUESTION).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::STATUS_QUESTION)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme::STATUS_QUESTION)
         };
@@ -2135,7 +2118,11 @@ fn render_bottom_row(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
         .split(area);
 
     let entries = [
-        (BottomCell::Harness, "Harness", Some(app.effective_harness())),
+        (
+            BottomCell::Harness,
+            "Harness",
+            Some(app.effective_harness()),
+        ),
         (BottomCell::Model, "Model", app.effective_model()),
         (BottomCell::Agent, "Agent", app.effective_agent()),
         (
@@ -2161,7 +2148,10 @@ fn render_bottom_row(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
         };
         let value_span = match value {
             Some(s) if !s.is_empty() => Span::raw(s.clone()),
-            _ => Span::styled(EMPTY_CELL.to_string(), Style::default().fg(theme::CHROME_DIM)),
+            _ => Span::styled(
+                EMPTY_CELL.to_string(),
+                Style::default().fg(theme::CHROME_DIM),
+            ),
         };
         let line = Line::from(vec![
             Span::styled(format!("{label}: "), label_style),
@@ -2497,7 +2487,9 @@ mod tests {
 
         // Questions present but pane not focused → no-op.
         app.set_open_questions_for_step(vec![make_question(
-            "s0", "Pick crate", &["tracing", "log"],
+            "s0",
+            "Pick crate",
+            &["tracing", "log"],
         )]);
         app.focused_pane = Pane::StepPrompt;
         assert!(!app.open_answer_modal());
@@ -2508,7 +2500,10 @@ mod tests {
         assert!(app.open_answer_modal());
         let modal = app.answer_modal.as_ref().expect("modal opened");
         assert_eq!(modal.question, "Pick crate");
-        assert_eq!(modal.suggestions, vec!["tracing".to_string(), "log".to_string()]);
+        assert_eq!(
+            modal.suggestions,
+            vec!["tracing".to_string(), "log".to_string()]
+        );
     }
 
     #[test]
@@ -2696,10 +2691,7 @@ mod tests {
         );
         // Grow back, shrink again — no second toast.
         assert_eq!(app.update_auto_zen(120), None);
-        assert_eq!(
-            app.update_auto_zen(AUTO_ZEN_WIDTH_THRESHOLD - 1),
-            None
-        );
+        assert_eq!(app.update_auto_zen(AUTO_ZEN_WIDTH_THRESHOLD - 1), None);
     }
 
     #[test]
@@ -2872,8 +2864,14 @@ mod tests {
             prompt_suffix: Some("CFG-SUFFIX-MARKER".to_string()),
             ..Config::default()
         };
-        let mut app =
-            StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default(), Vec::new());
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &config,
+            ProjectSettings::default(),
+            Vec::new(),
+        );
         let screen = render_to_string(140, 60, &mut app);
         assert!(screen.contains("Universal prompt"), "{screen}");
         assert!(screen.contains("CFG-PREFIX-MARKER"), "{screen}");
@@ -2891,8 +2889,14 @@ mod tests {
             prompt_suffix: None,
             ..Config::default()
         };
-        let mut app =
-            StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default(), Vec::new());
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &config,
+            ProjectSettings::default(),
+            Vec::new(),
+        );
         let screen = render_to_string(140, 60, &mut app);
         // The (none) placeholder must appear at least once — Universal is
         // the first pane in the stack, so confirming any (none) is present
@@ -3218,7 +3222,11 @@ mod tests {
 
     #[test]
     fn appended_default_index_is_most_recent_attempt() {
-        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let logs = vec![
+            make_log(1, None, None),
+            make_log(2, None, None),
+            make_log(3, None, None),
+        ];
         let app = make_app_with_logs(1, 0, logs);
         // Default is the last index (newest) per §8 "most recent attempt by default".
         assert_eq!(app.appended_attempt_index, 2);
@@ -3261,7 +3269,11 @@ mod tests {
 
     #[test]
     fn appended_prev_decrements_and_returns_true() {
-        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let logs = vec![
+            make_log(1, None, None),
+            make_log(2, None, None),
+            make_log(3, None, None),
+        ];
         let mut app = make_app_with_logs(1, 0, logs);
         assert_eq!(app.appended_attempt_index, 2);
         assert!(app.appended_prev());
@@ -3281,7 +3293,11 @@ mod tests {
 
     #[test]
     fn appended_next_increments_and_returns_true() {
-        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let logs = vec![
+            make_log(1, None, None),
+            make_log(2, None, None),
+            make_log(3, None, None),
+        ];
         let mut app = make_app_with_logs(1, 0, logs);
         // Walk back to attempt 1, then advance forward.
         app.appended_attempt_index = 0;
@@ -3312,7 +3328,11 @@ mod tests {
 
     #[test]
     fn handle_left_paginates_when_appended_focused_and_not_leftmost() {
-        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let logs = vec![
+            make_log(1, None, None),
+            make_log(2, None, None),
+            make_log(3, None, None),
+        ];
         let mut app = make_app_with_logs(1, 0, logs);
         app.focused_pane = Pane::Appended;
         // Default index is rightmost (2). h moves to 1 without popping.
@@ -3360,7 +3380,11 @@ mod tests {
 
     #[test]
     fn handle_right_paginates_when_appended_focused_and_not_rightmost() {
-        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let logs = vec![
+            make_log(1, None, None),
+            make_log(2, None, None),
+            make_log(3, None, None),
+        ];
         let mut app = make_app_with_logs(1, 0, logs);
         app.focused_pane = Pane::Appended;
         app.appended_attempt_index = 0;
@@ -3411,7 +3435,11 @@ mod tests {
 
     #[test]
     fn appended_pane_title_includes_attempt_count() {
-        let logs = vec![make_log(1, None, None), make_log(2, None, None), make_log(3, None, None)];
+        let logs = vec![
+            make_log(1, None, None),
+            make_log(2, None, None),
+            make_log(3, None, None),
+        ];
         let app = make_app_with_logs(1, 0, logs);
         // Default is rightmost ⇒ attempt 3/3.
         assert_eq!(app.appended_pane_title(), "Appended (attempt 3/3)");
@@ -3489,8 +3517,14 @@ mod tests {
         steps[0].agent = None;
         steps[0].model = None;
 
-        let mut app =
-            StepDetailApp::new(plan, steps, 0, &config, ProjectSettings::default(), Vec::new());
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &config,
+            ProjectSettings::default(),
+            Vec::new(),
+        );
         let screen = render_to_string(160, 80, &mut app);
         assert!(
             screen.contains(EMPTY_CELL),
@@ -3755,10 +3789,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome, EditOutcome::Saved);
-        let reloaded: Config = serde_json::from_str(
-            &std::fs::read_to_string(tmp.path().join("config.json")).unwrap(),
-        )
-        .unwrap();
+        let reloaded: Config =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path().join("config.json")).unwrap())
+                .unwrap();
         assert_eq!(reloaded.prompt_prefix.as_deref(), Some("MOCK-PRE"));
         assert_eq!(reloaded.prompt_suffix.as_deref(), Some("MOCK-SUF"));
     }
@@ -3770,17 +3803,9 @@ mod tests {
     /// match at construction time so writes can be verified by reading the
     /// row back.
     fn setup_project_app(conn: &Connection, project: &str) -> StepDetailApp {
-        let plan = crate::storage::create_plan(
-            conn,
-            "tui-v1",
-            project,
-            "tui-v1",
-            "desc",
-            None,
-            None,
-            &[],
-        )
-        .unwrap();
+        let plan =
+            crate::storage::create_plan(conn, "tui-v1", project, "tui-v1", "desc", None, None, &[])
+                .unwrap();
         StepDetailApp::new(
             plan,
             Vec::new(),
@@ -4003,7 +4028,10 @@ mod tests {
         );
         let parts = parse_step_pane(&formatted).unwrap();
         assert_eq!(parts.title, "My step title");
-        assert_eq!(parts.description, "First desc line\n\nSecond desc paragraph");
+        assert_eq!(
+            parts.description,
+            "First desc line\n\nSecond desc paragraph"
+        );
         assert_eq!(
             parts.acceptance_criteria,
             vec!["Criterion A".to_string(), "Criterion B".to_string()]
@@ -4084,40 +4112,28 @@ mod tests {
     fn parse_step_pane_rejects_empty_title() {
         let text = "# Title\n\n## Description\nbody\n## Acceptance criteria\n";
         let err = parse_step_pane(text).unwrap_err();
-        assert!(
-            err.to_string().contains("Title is empty"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("Title is empty"), "got: {err}");
     }
 
     #[test]
     fn parse_step_pane_rejects_multi_line_title() {
         let text = "# Title\nline-one\nline-two\n## Description\n## Acceptance criteria\n";
         let err = parse_step_pane(text).unwrap_err();
-        assert!(
-            err.to_string().contains("single line"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("single line"), "got: {err}");
     }
 
     #[test]
     fn parse_step_pane_rejects_non_bullet_in_criteria() {
         let text = "# Title\nT\n## Description\n## Acceptance criteria\nstray paragraph\n";
         let err = parse_step_pane(text).unwrap_err();
-        assert!(
-            err.to_string().contains("not a bullet"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("not a bullet"), "got: {err}");
     }
 
     // -- Tests pane format/parse round-trips -----------------------------
 
     #[test]
     fn parse_tests_pane_round_trips_simple_list() {
-        let formatted = format_tests_pane(&[
-            "cargo build".to_string(),
-            "cargo test".to_string(),
-        ]);
+        let formatted = format_tests_pane(&["cargo build".to_string(), "cargo test".to_string()]);
         let parsed = parse_tests_pane(&formatted).unwrap();
         assert_eq!(
             parsed,
@@ -4228,17 +4244,9 @@ cargo clippy
     /// so writes via `update_step_fields_ext` land on a real row that can
     /// then be reloaded.
     fn setup_step_app(conn: &Connection) -> StepDetailApp {
-        let plan = crate::storage::create_plan(
-            conn,
-            "tui-v1",
-            "/proj",
-            "tui-v1",
-            "desc",
-            None,
-            None,
-            &[],
-        )
-        .unwrap();
+        let plan =
+            crate::storage::create_plan(conn, "tui-v1", "/proj", "tui-v1", "desc", None, None, &[])
+                .unwrap();
         let (step, _pos) = crate::storage::create_step(
             conn,
             &plan.id,
@@ -4380,10 +4388,7 @@ cargo clippy
     fn edit_tests_pane_persists_changed_list() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_project_app(&conn, "/proj");
-        let buffer = format_tests_pane(&[
-            "cargo test".to_string(),
-            "cargo clippy".to_string(),
-        ]);
+        let buffer = format_tests_pane(&["cargo test".to_string(), "cargo clippy".to_string()]);
         let outcome = app
             .edit_tests_pane(&conn, fake_editor(Some(buffer)))
             .unwrap();
@@ -4455,7 +4460,10 @@ cargo clippy
             .unwrap();
         assert_eq!(
             reloaded.deterministic_tests,
-            vec!["cargo test".to_string(), "cargo clippy -- -D warnings".to_string()]
+            vec![
+                "cargo test".to_string(),
+                "cargo clippy -- -D warnings".to_string()
+            ]
         );
     }
 
@@ -4474,17 +4482,9 @@ cargo clippy
     /// submissions can be verified by reloading the row. Mirrors
     /// `setup_step_app` but used here for picker tests.
     fn setup_picker_app(conn: &Connection) -> StepDetailApp {
-        let plan = crate::storage::create_plan(
-            conn,
-            "tui-v1",
-            "/proj",
-            "tui-v1",
-            "desc",
-            None,
-            None,
-            &[],
-        )
-        .unwrap();
+        let plan =
+            crate::storage::create_plan(conn, "tui-v1", "/proj", "tui-v1", "desc", None, None, &[])
+                .unwrap();
         let (step, _pos) = crate::storage::create_step(
             conn,
             &plan.id,
@@ -4776,10 +4776,9 @@ cargo clippy
         // Empty plan ⇒ no step row to write to. The apply path silently
         // returns Ok rather than panicking on the missing index.
         let conn = crate::db::open_memory().unwrap();
-        let plan = crate::storage::create_plan(
-            &conn, "empty", "/proj2", "empty", "desc", None, None, &[],
-        )
-        .unwrap();
+        let plan =
+            crate::storage::create_plan(&conn, "empty", "/proj2", "empty", "desc", None, None, &[])
+                .unwrap();
         let mut app = StepDetailApp::new(
             plan,
             Vec::new(),
@@ -4880,8 +4879,10 @@ cargo clippy
         let mut app = make_app(3, 0);
         app.set_read_only(ReadOnly::Locked { pid: 4242 });
         assert!(app.read_only.is_locked());
-        assert!(!app.can_edit_panes(),
-            "c (every pane edit) and a (answer question) must be blocked");
+        assert!(
+            !app.can_edit_panes(),
+            "c (every pane edit) and a (answer question) must be blocked"
+        );
     }
 
     #[test]
@@ -4890,7 +4891,10 @@ cargo clippy
         app.set_read_only(ReadOnly::Locked { pid: 1 });
         assert!(!app.can_edit_panes());
         app.set_read_only(ReadOnly::Editable);
-        assert!(app.can_edit_panes(), "edits must come back when lock is released");
+        assert!(
+            app.can_edit_panes(),
+            "edits must come back when lock is released"
+        );
     }
 
     // -- Help overlay (TUI-plan.md §15) ---------------------------------

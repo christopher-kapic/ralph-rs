@@ -86,12 +86,7 @@ pub struct StepTagsApp {
 
 impl StepTagsApp {
     /// Build a new sub-view seeded with the step's current tag list.
-    pub fn new(
-        step_id: String,
-        plan_slug: String,
-        step_label: String,
-        tags: Vec<String>,
-    ) -> Self {
+    pub fn new(step_id: String, plan_slug: String, step_label: String, tags: Vec<String>) -> Self {
         Self {
             step_id,
             plan_slug,
@@ -334,7 +329,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut StepTagsApp) {
     let hint_line = if let Some(toast) = app.toasts.current() {
         Line::from(Span::styled(
             toast.text.clone(),
-            Style::default().fg(toast.color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(toast.color)
+                .add_modifier(Modifier::BOLD),
         ))
     } else {
         let hint = match app.mode {
@@ -560,7 +557,11 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Outcome::Pending);
         assert!(matches!(app.mode, Mode::Input { .. }));
         let toast = app.toasts.current().expect("toast pushed");
-        assert!(toast.text.contains("already attached"), "got: {}", toast.text);
+        assert!(
+            toast.text.contains("already attached"),
+            "got: {}",
+            toast.text
+        );
         assert_eq!(app.tags, vec!["FIX".to_string()]);
     }
 
@@ -673,10 +674,7 @@ mod tests {
         let mut app = app_with(vec!["FIX"]);
         // Mutate the working list so we can prove it isn't returned.
         app.tags.push("uncommitted".to_string());
-        assert_eq!(
-            app.handle_key(key(KeyCode::Esc)),
-            Outcome::DiscardAndPop
-        );
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Outcome::DiscardAndPop);
     }
 
     #[test]
@@ -806,7 +804,11 @@ mod tests {
         .expect("create_plan")
         .id;
         let tags: Vec<String> = initial_tags.into_iter().map(String::from).collect();
-        let tags_opt = if tags.is_empty() { None } else { Some(tags.as_slice()) };
+        let tags_opt = if tags.is_empty() {
+            None
+        } else {
+            Some(tags.as_slice())
+        };
         let (step, _) = storage::create_step(
             conn,
             &plan_id,

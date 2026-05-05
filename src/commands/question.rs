@@ -299,7 +299,6 @@ pub fn cmd_question_show(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,7 +312,17 @@ mod tests {
         let plan = storage::create_plan(conn, slug, project, "br", "desc", None, None, &[])
             .expect("create_plan");
         let (step, _) = storage::create_step(
-            conn, &plan.id, "title", "desc", None, None, &[], None, None, None, None,
+            conn,
+            &plan.id,
+            "title",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .expect("create_step");
         (plan.id, step.id)
@@ -357,8 +366,7 @@ mod tests {
         // Plan/step exist, but no run_locks row → "no active run".
         let _ = seed_plan_and_step(&conn, "p", "/proj-no-lock");
 
-        let outcome =
-            record_question_ask(&conn, "/proj-no-lock", "Q?", &["A".into()]).expect("ok");
+        let outcome = record_question_ask(&conn, "/proj-no-lock", "Q?", &["A".into()]).expect("ok");
         assert!(matches!(outcome, QuestionAskOutcome::NoActiveRun));
 
         let count: i64 = conn
@@ -423,14 +431,7 @@ mod tests {
             row_suggestions_json,
             row_answer,
             row_answered_at,
-        ): (
-            String,
-            i32,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-        ) = conn
+        ): (String, i32, String, String, Option<String>, Option<String>) = conn
             .query_row(
                 "SELECT step_id, attempt, question, suggestions, answer, answered_at
                  FROM step_questions WHERE id = ?1",
@@ -525,9 +526,13 @@ mod tests {
         suggestions: &[&str],
         asked_at: &str,
     ) {
-        let suggestions_json =
-            serde_json::to_string(&suggestions.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-                .unwrap();
+        let suggestions_json = serde_json::to_string(
+            &suggestions
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -673,11 +678,31 @@ mod tests {
         let plan = storage::create_plan(&conn, "p-multi", project, "br", "d", None, None, &[])
             .expect("create_plan");
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "first", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "first",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let (s2, _) = storage::create_step(
-            &conn, &plan.id, "second", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "second",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -832,8 +857,7 @@ mod tests {
             "2026-01-01T00:00:00.000Z",
         );
 
-        let err =
-            cmd_question_show(&conn, project, 5, &quiet_out()).expect_err("out of range");
+        let err = cmd_question_show(&conn, project, 5, &quiet_out()).expect_err("out of range");
         assert!(err.to_string().contains("out of range"));
     }
 

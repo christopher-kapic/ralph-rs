@@ -209,11 +209,7 @@ pub fn render(frame: &mut Frame, area: Rect, modal: &CreatePlanModal) {
             &modal.description,
             modal.focused == Field::Description,
         ),
-        field_line(
-            "Tests:       ",
-            &modal.tests,
-            modal.focused == Field::Tests,
-        ),
+        field_line("Tests:       ", &modal.tests, modal.focused == Field::Tests),
         Line::from(""),
         Line::from(Span::styled(
             "Tests are comma-separated shell commands (e.g. `cargo test, cargo clippy`).",
@@ -223,7 +219,9 @@ pub fn render(frame: &mut Frame, area: Rect, modal: &CreatePlanModal) {
         Line::styled(HINT, Style::default().add_modifier(Modifier::BOLD)),
     ];
 
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, dialog);
 }
 
@@ -364,8 +362,7 @@ mod tests {
         let mut modal = CreatePlanModal::new();
         // Ctrl-A should NOT insert "a"; only Ctrl-C should fire (and that's
         // covered by `cancelled_by_ctrl_c`).
-        let outcome =
-            modal.handle_key(key_with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        let outcome = modal.handle_key(key_with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert_eq!(outcome, Outcome::Pending);
         assert!(modal.slug.is_empty());
     }
@@ -476,8 +473,7 @@ mod tests {
     #[test]
     fn cancelled_by_ctrl_c() {
         let mut modal = CreatePlanModal::new();
-        let outcome =
-            modal.handle_key(key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let outcome = modal.handle_key(key_with_mod(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(outcome, Outcome::Cancelled);
     }
 

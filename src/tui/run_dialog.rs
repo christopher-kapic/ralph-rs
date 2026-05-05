@@ -87,9 +87,7 @@ impl RunDialog {
     /// Process one key event.
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
         // Ctrl-C cancels in any state.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c'))
-        {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return Outcome::Cancelled;
         }
 
@@ -182,14 +180,12 @@ pub struct RunTarget {
 /// The shape mirrors the existing `R`-keybinding spawner in
 /// `commands::run::plan_detail_apply_run` (TUI-plan.md §7) plus a flag for
 /// `--current-branch`.
-pub fn build_run_command(
-    exe: &Path,
-    project: &Path,
-    slug: &str,
-    current_branch: bool,
-) -> Command {
+pub fn build_run_command(exe: &Path, project: &Path, slug: &str, current_branch: bool) -> Command {
     let mut cmd = Command::new(exe);
-    cmd.arg("-C").arg(project).arg("--non-interactive").arg("run");
+    cmd.arg("-C")
+        .arg(project)
+        .arg("--non-interactive")
+        .arg("run");
     if current_branch {
         cmd.arg("--current-branch");
     }
@@ -207,12 +203,7 @@ pub fn build_run_command(
 /// holds a `&mut dyn RunSpawner`; tests inject [`StubRunSpawner`] to verify
 /// arg ordering without forking.
 pub trait RunSpawner {
-    fn spawn_run(
-        &mut self,
-        project: &Path,
-        slug: &str,
-        current_branch: bool,
-    ) -> Result<()>;
+    fn spawn_run(&mut self, project: &Path, slug: &str, current_branch: bool) -> Result<()>;
 }
 
 /// Production spawner — forks an actual `ralph` subprocess.
@@ -233,12 +224,7 @@ impl ProcessRunSpawner {
 }
 
 impl RunSpawner for ProcessRunSpawner {
-    fn spawn_run(
-        &mut self,
-        project: &Path,
-        slug: &str,
-        current_branch: bool,
-    ) -> Result<()> {
+    fn spawn_run(&mut self, project: &Path, slug: &str, current_branch: bool) -> Result<()> {
         let mut cmd = build_run_command(&self.exe, project, slug, current_branch);
         cmd.spawn()
             .with_context(|| format!("spawn ralph run for plan {slug}"))?;
@@ -314,9 +300,7 @@ fn render_choosing(frame: &mut Frame, area: Rect, title: &str) {
 }
 
 fn render_naming(frame: &mut Frame, area: Rect, title: &str, buffer: &str) {
-    let body = format!(
-        "Branch name:\n  {buffer}\n\n[Enter] confirm   [Esc] cancel"
-    );
+    let body = format!("Branch name:\n  {buffer}\n\n[Enter] confirm   [Esc] cancel");
     draw_box(frame, area, title, &body);
 }
 
@@ -348,7 +332,9 @@ fn draw_box(frame: &mut Frame, area: Rect, title: &str, body: &str) {
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::CURSOR));
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, horiz);
 }
 
@@ -486,7 +472,12 @@ mod tests {
         d.handle_key(key(KeyCode::Char('n'))); // → NamingBranch { "" }
         let out = d.handle_key(key(KeyCode::Enter));
         assert_eq!(out, Outcome::Pending);
-        assert_eq!(d.state, DialogState::NamingBranch { buffer: String::new() });
+        assert_eq!(
+            d.state,
+            DialogState::NamingBranch {
+                buffer: String::new()
+            }
+        );
     }
 
     #[test]
@@ -531,12 +522,7 @@ mod tests {
     }
 
     impl RunSpawner for StubRunSpawner {
-        fn spawn_run(
-            &mut self,
-            project: &Path,
-            slug: &str,
-            current_branch: bool,
-        ) -> Result<()> {
+        fn spawn_run(&mut self, project: &Path, slug: &str, current_branch: bool) -> Result<()> {
             self.calls
                 .borrow_mut()
                 .push((project.to_path_buf(), slug.to_string(), current_branch));
@@ -573,7 +559,10 @@ mod tests {
         assert_eq!(spawned, vec!["alpha".to_string(), "beta".to_string()]);
         let calls = s.calls.borrow();
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], (PathBuf::from("/proj"), "alpha".to_string(), true));
+        assert_eq!(
+            calls[0],
+            (PathBuf::from("/proj"), "alpha".to_string(), true)
+        );
         assert_eq!(calls[1], (PathBuf::from("/proj"), "beta".to_string(), true));
     }
 
@@ -596,7 +585,10 @@ mod tests {
         assert_eq!(spawned, vec!["alpha".to_string()]);
         let calls = s.calls.borrow();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0], (PathBuf::from("/proj"), "alpha".to_string(), false));
+        assert_eq!(
+            calls[0],
+            (PathBuf::from("/proj"), "alpha".to_string(), false)
+        );
     }
 
     #[test]
@@ -618,7 +610,10 @@ mod tests {
         assert_eq!(spawned, vec!["alpha".to_string()]);
         let calls = s.calls.borrow();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0], (PathBuf::from("/proj"), "alpha".to_string(), true));
+        assert_eq!(
+            calls[0],
+            (PathBuf::from("/proj"), "alpha".to_string(), true)
+        );
     }
 
     #[test]
@@ -773,7 +768,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(dump.contains("Run plan"), "title missing:\n{dump}");
-        assert!(dump.contains("Use current branch"), "current button:\n{dump}");
+        assert!(
+            dump.contains("Use current branch"),
+            "current button:\n{dump}"
+        );
         assert!(dump.contains("New branch"), "new button:\n{dump}");
         assert!(dump.contains("Cancel"), "cancel button:\n{dump}");
     }
@@ -831,6 +829,9 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(dump.contains("Run 3 plans"), "plural title missing:\n{dump}");
+        assert!(
+            dump.contains("Run 3 plans"),
+            "plural title missing:\n{dump}"
+        );
     }
 }

@@ -127,7 +127,11 @@ impl PlanListApp {
     /// Construct a new plan-list view with cursor on the first tile and no
     /// archived tile visible. Use [`Self::with_archived_count`] to attach the
     /// archived plan count if you have it at construction time.
-    pub fn new(tiles: Vec<PlanTile>, project: impl Into<String>, display_timezone: impl Into<String>) -> Self {
+    pub fn new(
+        tiles: Vec<PlanTile>,
+        project: impl Into<String>,
+        display_timezone: impl Into<String>,
+    ) -> Self {
         Self {
             tiles,
             archived_count: 0,
@@ -479,7 +483,14 @@ pub fn render_tiles(buf: &mut Buffer, area: Rect, app: &PlanListApp) {
         if idx < app.tiles.len() {
             let tile = &app.tiles[idx];
             let badge = app.selection.index_of(&tile.plan.id);
-            render_tile(buf, tile_area, tile, highlighted, badge, &app.display_timezone);
+            render_tile(
+                buf,
+                tile_area,
+                tile,
+                highlighted,
+                badge,
+                &app.display_timezone,
+            );
         } else {
             // Archived sentinel — last navigable slot when visible.
             render_archived_sentinel(buf, tile_area, app.archived_count, highlighted);
@@ -537,7 +548,11 @@ pub(crate) fn render_archived_sentinel(
     title_para.render(title_area, buf);
     if inner.height >= 2 {
         let hint = "Press → / l / enter to view";
-        let hint_area = Rect { y: inner.y + 1, height: 1, ..inner };
+        let hint_area = Rect {
+            y: inner.y + 1,
+            height: 1,
+            ..inner
+        };
         let hint_para = Paragraph::new(truncate(hint, inner.width as usize));
         hint_para.render(hint_area, buf);
     }
@@ -591,7 +606,10 @@ pub(crate) fn render_tile(
     // Reserve space at the right edge of the title row for the `[N]` badge
     // when this tile is selected. Badge format is `[<digits>]`, e.g. `[12]`.
     let badge_text = selection_badge.map(|n| format!("[{n}]"));
-    let badge_cols = badge_text.as_deref().map(|s| s.chars().count()).unwrap_or(0);
+    let badge_cols = badge_text
+        .as_deref()
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
     let title_max = (inner.width as usize).saturating_sub(badge_cols);
     let title = Paragraph::new(Line::from(Span::styled(
         truncate(tile.plan.slug.as_str(), title_max),
@@ -813,7 +831,10 @@ mod tests {
         app.selected_index = 1;
         let req = app.request_open();
         assert_eq!(req, Some(OpenRequest::Plan("plan-1".to_string())));
-        assert_eq!(app.open_request, Some(OpenRequest::Plan("plan-1".to_string())));
+        assert_eq!(
+            app.open_request,
+            Some(OpenRequest::Plan("plan-1".to_string()))
+        );
     }
 
     #[test]
@@ -907,23 +928,17 @@ mod tests {
         render_tile(&mut buf, area, &tile, true, None, "UTC");
 
         // Title row contains the slug.
-        let row1 = (0..40)
-            .map(|x| buf[(x, 1)].symbol())
-            .collect::<String>();
+        let row1 = (0..40).map(|x| buf[(x, 1)].symbol()).collect::<String>();
         assert!(row1.contains("my-plan"), "got row1: {row1:?}");
 
         // Timestamp row contains "Ran May 4".
-        let row3 = (0..40)
-            .map(|x| buf[(x, 3)].symbol())
-            .collect::<String>();
+        let row3 = (0..40).map(|x| buf[(x, 3)].symbol()).collect::<String>();
         assert!(row3.contains("Ran May 4"), "got row3: {row3:?}");
 
         // Status row contains the dot + counts. Inside a 6-row tile the
         // dot lives at y=4 (top border 0, title 1, blank 2, date 3, dot 4,
         // bottom border 5).
-        let row4 = (0..40)
-            .map(|x| buf[(x, 4)].symbol())
-            .collect::<String>();
+        let row4 = (0..40).map(|x| buf[(x, 4)].symbol()).collect::<String>();
         assert!(row4.contains("●"), "got row4: {row4:?}");
         assert!(row4.contains("3/7"), "got row4: {row4:?}");
     }
@@ -1281,10 +1296,7 @@ mod tests {
             "toast text missing on bottom row: {bottom_row:?}"
         );
         // Toast should be styled with TOAST_SUCCESS color.
-        assert_eq!(
-            buffer[(0, bottom_y)].style().fg,
-            Some(theme::TOAST_SUCCESS)
-        );
+        assert_eq!(buffer[(0, bottom_y)].style().fg, Some(theme::TOAST_SUCCESS));
     }
 
     // -- Archived sentinel --------------------------------------------------
@@ -1375,16 +1387,12 @@ mod tests {
         render_tiles(&mut buf, area, &app);
         // Sentinel sits at the bottom, after the two tiles (each 6 rows).
         // Top of sentinel border = row 12. Title row = row 13.
-        let sentinel_title = (0..40)
-            .map(|x| buf[(x, 13)].symbol())
-            .collect::<String>();
+        let sentinel_title = (0..40).map(|x| buf[(x, 13)].symbol()).collect::<String>();
         assert!(
             sentinel_title.contains("Archived (5)"),
             "expected 'Archived (5)' on row 13: {sentinel_title:?}"
         );
-        let sentinel_hint = (0..40)
-            .map(|x| buf[(x, 14)].symbol())
-            .collect::<String>();
+        let sentinel_hint = (0..40).map(|x| buf[(x, 14)].symbol()).collect::<String>();
         assert!(
             sentinel_hint.contains("enter"),
             "expected enter hint on row 14: {sentinel_hint:?}"
@@ -1444,13 +1452,25 @@ mod tests {
     #[test]
     fn test_status_dot_color_legend() {
         // Spot-check the §5 legend rather than re-listing every variant.
-        assert_eq!(status_dot_color(PlanStatus::Complete), theme::STATUS_COMPLETE);
-        assert_eq!(status_dot_color(PlanStatus::InProgress), theme::STATUS_IN_PROGRESS);
+        assert_eq!(
+            status_dot_color(PlanStatus::Complete),
+            theme::STATUS_COMPLETE
+        );
+        assert_eq!(
+            status_dot_color(PlanStatus::InProgress),
+            theme::STATUS_IN_PROGRESS
+        );
         assert_eq!(status_dot_color(PlanStatus::Ready), theme::STATUS_PENDING);
-        assert_eq!(status_dot_color(PlanStatus::Planning), theme::STATUS_PENDING);
+        assert_eq!(
+            status_dot_color(PlanStatus::Planning),
+            theme::STATUS_PENDING
+        );
         assert_eq!(status_dot_color(PlanStatus::Failed), theme::STATUS_FAILED);
         assert_eq!(status_dot_color(PlanStatus::Aborted), theme::STATUS_FAILED);
-        assert_eq!(status_dot_color(PlanStatus::Question), theme::STATUS_QUESTION);
+        assert_eq!(
+            status_dot_color(PlanStatus::Question),
+            theme::STATUS_QUESTION
+        );
     }
 
     // -- Question surfaces (TUI-plan.md §17) ---------------------------------

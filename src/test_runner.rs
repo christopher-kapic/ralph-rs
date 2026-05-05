@@ -563,8 +563,7 @@ mod tests {
     /// a shared `Mutex<Vec<_>>` so tests can inspect emission without going
     /// through `emit_ndjson` (which would write to stdout).
     fn collecting_chunk_cfg(max_bytes: usize) -> (TestChunkConfig, CollectedTestChunks) {
-        let collected: CollectedTestChunks =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected: CollectedTestChunks = Arc::new(std::sync::Mutex::new(Vec::new()));
         let collected_for_sink = collected.clone();
         let sink: TestChunkSink = Arc::new(move |idx, stream, text, seq| {
             collected_for_sink

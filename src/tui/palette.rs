@@ -340,32 +340,110 @@ struct VerbSpec {
 /// `/q` is intentionally absent — `quit` is the canonical label and
 /// completion shouldn't surface both. The parser still accepts `/q`.
 const VERB_SPECS: &[VerbSpec] = &[
-    VerbSpec { tokens: &["run"], arg: ArgSource::Branch },
-    VerbSpec { tokens: &["plan", "harness"], arg: ArgSource::Harness },
-    VerbSpec { tokens: &["plan", "show"], arg: ArgSource::PlanSlug },
-    VerbSpec { tokens: &["plan", "archive"], arg: ArgSource::PlanSlug },
-    VerbSpec { tokens: &["plan", "unarchive"], arg: ArgSource::PlanSlug },
-    VerbSpec { tokens: &["plan", "delete"], arg: ArgSource::PlanSlug },
-    VerbSpec { tokens: &["plan", "approve"], arg: ArgSource::PlanSlug },
-    VerbSpec { tokens: &["plan", "questions", "on"], arg: ArgSource::PlanSlug },
-    VerbSpec { tokens: &["plan", "questions", "off"], arg: ArgSource::PlanSlug },
-    VerbSpec { tokens: &["plan", "dependency", "add"], arg: ArgSource::None },
-    VerbSpec { tokens: &["plan", "dependency", "remove"], arg: ArgSource::None },
-    VerbSpec { tokens: &["plan", "dependency", "list"], arg: ArgSource::None },
-    VerbSpec { tokens: &["plan", "set-hook"], arg: ArgSource::None },
-    VerbSpec { tokens: &["plan", "unset-hook"], arg: ArgSource::None },
-    VerbSpec { tokens: &["plan", "hooks"], arg: ArgSource::None },
-    VerbSpec { tokens: &["step", "add"], arg: ArgSource::None },
-    VerbSpec { tokens: &["step", "skip"], arg: ArgSource::None },
-    VerbSpec { tokens: &["step", "move"], arg: ArgSource::None },
-    VerbSpec { tokens: &["step", "set-hook"], arg: ArgSource::None },
-    VerbSpec { tokens: &["step", "unset-hook"], arg: ArgSource::None },
-    VerbSpec { tokens: &["step", "edit", "--tags"], arg: ArgSource::None },
-    VerbSpec { tokens: &["cancel"], arg: ArgSource::None },
-    VerbSpec { tokens: &["export"], arg: ArgSource::PlanSlug },
-    VerbSpec { tokens: &["import"], arg: ArgSource::None },
-    VerbSpec { tokens: &["quit"], arg: ArgSource::None },
-    VerbSpec { tokens: &["help"], arg: ArgSource::None },
+    VerbSpec {
+        tokens: &["run"],
+        arg: ArgSource::Branch,
+    },
+    VerbSpec {
+        tokens: &["plan", "harness"],
+        arg: ArgSource::Harness,
+    },
+    VerbSpec {
+        tokens: &["plan", "show"],
+        arg: ArgSource::PlanSlug,
+    },
+    VerbSpec {
+        tokens: &["plan", "archive"],
+        arg: ArgSource::PlanSlug,
+    },
+    VerbSpec {
+        tokens: &["plan", "unarchive"],
+        arg: ArgSource::PlanSlug,
+    },
+    VerbSpec {
+        tokens: &["plan", "delete"],
+        arg: ArgSource::PlanSlug,
+    },
+    VerbSpec {
+        tokens: &["plan", "approve"],
+        arg: ArgSource::PlanSlug,
+    },
+    VerbSpec {
+        tokens: &["plan", "questions", "on"],
+        arg: ArgSource::PlanSlug,
+    },
+    VerbSpec {
+        tokens: &["plan", "questions", "off"],
+        arg: ArgSource::PlanSlug,
+    },
+    VerbSpec {
+        tokens: &["plan", "dependency", "add"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["plan", "dependency", "remove"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["plan", "dependency", "list"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["plan", "set-hook"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["plan", "unset-hook"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["plan", "hooks"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["step", "add"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["step", "skip"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["step", "move"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["step", "set-hook"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["step", "unset-hook"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["step", "edit", "--tags"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["cancel"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["export"],
+        arg: ArgSource::PlanSlug,
+    },
+    VerbSpec {
+        tokens: &["import"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["quit"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["help"],
+        arg: ArgSource::None,
+    },
 ];
 
 /// Argument-source data the completer reads from. The dispatcher refreshes
@@ -597,9 +675,7 @@ impl Palette {
     /// on (cancel = call `close`, submit = parse + dispatch + close).
     pub fn handle_key(&mut self, key: KeyEvent, ctx: &CompletionContext) -> KeyOutcome {
         // Ctrl-C cancels regardless of which key code rides on it.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c'))
-        {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return KeyOutcome::Cancel;
         }
 
@@ -795,7 +871,10 @@ mod tests {
 
     #[test]
     fn parses_plan_harness_optional() {
-        assert_eq!(parse("/plan harness"), Ok(PaletteCommand::PlanHarness(None)));
+        assert_eq!(
+            parse("/plan harness"),
+            Ok(PaletteCommand::PlanHarness(None))
+        );
         assert_eq!(
             parse("/plan harness claude"),
             Ok(PaletteCommand::PlanHarness(Some("claude".to_string())))
@@ -813,7 +892,10 @@ mod tests {
 
     #[test]
     fn parses_plan_archive() {
-        assert_eq!(parse("/plan archive"), Ok(PaletteCommand::PlanArchive(None)));
+        assert_eq!(
+            parse("/plan archive"),
+            Ok(PaletteCommand::PlanArchive(None))
+        );
         assert_eq!(
             parse("/plan archive p"),
             Ok(PaletteCommand::PlanArchive(Some("p".to_string())))
@@ -849,7 +931,10 @@ mod tests {
 
     #[test]
     fn parses_plan_approve() {
-        assert_eq!(parse("/plan approve"), Ok(PaletteCommand::PlanApprove(None)));
+        assert_eq!(
+            parse("/plan approve"),
+            Ok(PaletteCommand::PlanApprove(None))
+        );
         assert_eq!(
             parse("/plan approve p"),
             Ok(PaletteCommand::PlanApprove(Some("p".to_string())))
@@ -903,7 +988,10 @@ mod tests {
     fn parses_step_add_requires_title() {
         assert!(matches!(
             parse("/step add"),
-            Err(ParseError::MissingArgument { command: "/step add", .. })
+            Err(ParseError::MissingArgument {
+                command: "/step add",
+                ..
+            })
         ));
     }
 
@@ -917,7 +1005,10 @@ mod tests {
     fn parses_step_skip_rejects_non_integer() {
         assert!(matches!(
             parse("/step skip foo"),
-            Err(ParseError::InvalidArgument { command: "/step skip", .. })
+            Err(ParseError::InvalidArgument {
+                command: "/step skip",
+                ..
+            })
         ));
     }
 
@@ -939,7 +1030,10 @@ mod tests {
         ));
         assert!(matches!(
             parse("/step move foo --to 5"),
-            Err(ParseError::InvalidArgument { command: "/step move", .. })
+            Err(ParseError::InvalidArgument {
+                command: "/step move",
+                ..
+            })
         ));
     }
 
@@ -980,7 +1074,10 @@ mod tests {
         );
         assert!(matches!(
             parse("/export"),
-            Err(ParseError::MissingArgument { command: "/export", .. })
+            Err(ParseError::MissingArgument {
+                command: "/export",
+                ..
+            })
         ));
         assert_eq!(
             parse("/import /tmp/p.json"),
@@ -988,7 +1085,10 @@ mod tests {
         );
         assert!(matches!(
             parse("/import"),
-            Err(ParseError::MissingArgument { command: "/import", .. })
+            Err(ParseError::MissingArgument {
+                command: "/import",
+                ..
+            })
         ));
     }
 
@@ -1002,7 +1102,10 @@ mod tests {
 
     #[test]
     fn parser_collapses_extra_whitespace() {
-        assert_eq!(parse("  /plan   show  "), Ok(PaletteCommand::PlanShow(None)));
+        assert_eq!(
+            parse("  /plan   show  "),
+            Ok(PaletteCommand::PlanShow(None))
+        );
     }
 
     #[test]
@@ -1072,11 +1175,8 @@ mod tests {
 
     #[test]
     fn completion_after_run_lists_branches() {
-        let c = build_completion(
-            "/run ",
-            &ctx(&[], &[], &["main", "feature-x", "tui-v1"]),
-        )
-        .expect("candidates");
+        let c = build_completion("/run ", &ctx(&[], &[], &["main", "feature-x", "tui-v1"]))
+            .expect("candidates");
         assert_eq!(c.stem, "/run ");
         assert_eq!(
             c.candidates,
@@ -1090,11 +1190,8 @@ mod tests {
 
     #[test]
     fn completion_after_plan_harness_lists_harnesses() {
-        let c = build_completion(
-            "/plan harness ",
-            &ctx(&["claude", "codex", "pi"], &[], &[]),
-        )
-        .expect("candidates");
+        let c = build_completion("/plan harness ", &ctx(&["claude", "codex", "pi"], &[], &[]))
+            .expect("candidates");
         assert_eq!(c.stem, "/plan harness ");
         assert_eq!(c.candidates.len(), 3);
     }
@@ -1118,10 +1215,7 @@ mod tests {
         )
         .expect("candidates");
         assert_eq!(c.stem, "/plan archive ");
-        assert_eq!(
-            c.candidates,
-            vec!["beta".to_string(), "berlin".to_string()]
-        );
+        assert_eq!(c.candidates, vec!["beta".to_string(), "berlin".to_string()]);
     }
 
     #[test]
@@ -1141,11 +1235,8 @@ mod tests {
     fn completion_prefers_longer_verb_match() {
         // "/plan questions on " should complete plan slugs (the deeper
         // verb) — NOT cycle through verbs starting with "plan questions".
-        let c = build_completion(
-            "/plan questions on ",
-            &ctx(&[], &["alpha", "beta"], &[]),
-        )
-        .expect("candidates");
+        let c = build_completion("/plan questions on ", &ctx(&[], &["alpha", "beta"], &[]))
+            .expect("candidates");
         assert_eq!(c.stem, "/plan questions on ");
         assert_eq!(c.candidates.len(), 2);
     }
@@ -1409,7 +1500,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains(": "), "prefix missing:\n{rendered}");
-        assert!(rendered.contains("plan harness"), "buffer missing:\n{rendered}");
+        assert!(
+            rendered.contains("plan harness"),
+            "buffer missing:\n{rendered}"
+        );
     }
 
     #[test]

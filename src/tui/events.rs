@@ -299,10 +299,7 @@ mod tests {
             seq: 0,
         };
         dispatch_event(&mut app, &evt);
-        assert_eq!(
-            app.test_tail_lines(),
-            &["running tests...".to_string()]
-        );
+        assert_eq!(app.test_tail_lines(), &["running tests...".to_string()]);
     }
 
     #[test]

@@ -170,7 +170,10 @@ pub fn list_plans_sorted_by_recency(conn: &Connection, project: &str) -> Result<
          ORDER BY COALESCE(lr.last_run, p.created_at) DESC, p.created_at DESC"
     );
     let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map(params![project, PlanStatus::Archived.as_str()], Plan::from_row)?;
+    let rows = stmt.query_map(
+        params![project, PlanStatus::Archived.as_str()],
+        Plan::from_row,
+    )?;
     let mut plans = Vec::new();
     for row in rows {
         plans.push(row?);
@@ -204,7 +207,10 @@ pub fn list_archived_plans_sorted_by_recency(
          ORDER BY COALESCE(lr.last_run, p.created_at) DESC, p.created_at DESC"
     );
     let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map(params![project, PlanStatus::Archived.as_str()], Plan::from_row)?;
+    let rows = stmt.query_map(
+        params![project, PlanStatus::Archived.as_str()],
+        Plan::from_row,
+    )?;
     let mut plans = Vec::new();
     for row in rows {
         plans.push(row?);
@@ -215,13 +221,10 @@ pub fn list_archived_plans_sorted_by_recency(
 /// Number of archived plans for a project. Drives the conditional "Archived
 /// (N)" tile rendered at the bottom of the plan-list view (TUI-plan.md §5).
 pub fn count_archived_plans(conn: &Connection, project: &str) -> Result<u32> {
-    let mut stmt = conn.prepare(
-        "SELECT COUNT(*) FROM plans WHERE project = ?1 AND status = ?2",
-    )?;
-    let n: i64 = stmt.query_row(
-        params![project, PlanStatus::Archived.as_str()],
-        |r| r.get(0),
-    )?;
+    let mut stmt = conn.prepare("SELECT COUNT(*) FROM plans WHERE project = ?1 AND status = ?2")?;
+    let n: i64 = stmt.query_row(params![project, PlanStatus::Archived.as_str()], |r| {
+        r.get(0)
+    })?;
     Ok(n as u32)
 }
 
@@ -267,11 +270,7 @@ pub fn update_plan_status(conn: &Connection, plan_id: &str, status: PlanStatus) 
 /// Drives the `Q` keybinding in the TUI plan list (TUI-plan.md §17) and the
 /// `ralph plan questions on|off` CLI commands. SQLite has no native bool, so
 /// the value is stored as INTEGER 0/1.
-pub fn set_plan_questions_enabled(
-    conn: &Connection,
-    plan_id: &str,
-    enabled: bool,
-) -> Result<()> {
+pub fn set_plan_questions_enabled(conn: &Connection, plan_id: &str, enabled: bool) -> Result<()> {
     let affected = conn.execute(
         "UPDATE plans SET questions_enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
         params![enabled as i64, plan_id],
@@ -331,14 +330,9 @@ pub fn list_open_questions(
 
     let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<OpenQuestion> {
         let suggestions_json: String = row.get(8)?;
-        let suggestions: Vec<String> =
-            serde_json::from_str(&suggestions_json).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    8,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?;
+        let suggestions: Vec<String> = serde_json::from_str(&suggestions_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        })?;
         let step_num: i64 = row.get(4)?;
         Ok(OpenQuestion {
             id: row.get(0)?,
@@ -1984,7 +1978,17 @@ mod tests {
 
         // Add a step + execution log to p1, dated after p2's created_at.
         let (step, _) = create_step(
-            &conn, &p1.id, "s", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &p1.id,
+            "s",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -2009,7 +2013,17 @@ mod tests {
 
         // p1 has an old log + a fresh log → MAX is fresh.
         let (s1, _) = create_step(
-            &conn, &p1.id, "s1", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &p1.id,
+            "s1",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let l_old = create_execution_log(&conn, &s1.id, 1, None, None).unwrap();
@@ -2027,7 +2041,17 @@ mod tests {
 
         // p2 has one log between p1's old and new.
         let (s2, _) = create_step(
-            &conn, &p2.id, "s2", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &p2.id,
+            "s2",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let l_p2 = create_execution_log(&conn, &s2.id, 1, None, None).unwrap();
@@ -2047,8 +2071,7 @@ mod tests {
         let conn = setup();
 
         let _own = create_plan(&conn, "own", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let archived =
-            create_plan(&conn, "archived", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let archived = create_plan(&conn, "archived", "/proj", "b2", "d", None, None, &[]).unwrap();
         update_plan_status(&conn, &archived.id, PlanStatus::Archived).unwrap();
         let _other = create_plan(&conn, "other", "/elsewhere", "b3", "d", None, None, &[]).unwrap();
 
@@ -2062,12 +2085,9 @@ mod tests {
         let conn = setup();
 
         let active = create_plan(&conn, "active", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let arch_a =
-            create_plan(&conn, "arch-a", "/proj", "b2", "d", None, None, &[]).unwrap();
-        let arch_b =
-            create_plan(&conn, "arch-b", "/proj", "b3", "d", None, None, &[]).unwrap();
-        let other =
-            create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
+        let arch_a = create_plan(&conn, "arch-a", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let arch_b = create_plan(&conn, "arch-b", "/proj", "b3", "d", None, None, &[]).unwrap();
+        let other = create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
         update_plan_status(&conn, &arch_a.id, PlanStatus::Archived).unwrap();
         update_plan_status(&conn, &arch_b.id, PlanStatus::Archived).unwrap();
         update_plan_status(&conn, &other.id, PlanStatus::Archived).unwrap();
@@ -2093,8 +2113,7 @@ mod tests {
         let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
         let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
         // Different project — must not count.
-        let other =
-            create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
+        let other = create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
 
         // p1 still planning; only p2 and p3 archived.
         update_plan_status(&conn, &p2.id, PlanStatus::Archived).unwrap();
@@ -2271,17 +2290,20 @@ mod tests {
             "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
              VALUES ('q2', ?1, 1, 'old open', '[]', '2026-05-01T10:00:00.000Z')",
             params![&step.id],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
              VALUES ('q3', ?1, 2, 'current open A', '[]', '2026-05-01T10:00:00.000Z')",
             params![&step.id],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
              VALUES ('q4', ?1, 2, 'current open B', '[]', '2026-05-01T10:00:00.000Z')",
             params![&step.id],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(
             count_unanswered_questions_for_attempt(&conn, &step.id, 2).unwrap(),
@@ -4348,12 +4370,16 @@ mod tests {
         // Replace with a multi-test list.
         let new_tests = vec!["cargo test".to_string(), "cargo clippy".to_string()];
         set_plan_deterministic_tests(&conn, &plan.id, &new_tests).unwrap();
-        let reloaded = get_plan_by_slug(&conn, "tests-rt", "/proj").unwrap().unwrap();
+        let reloaded = get_plan_by_slug(&conn, "tests-rt", "/proj")
+            .unwrap()
+            .unwrap();
         assert_eq!(reloaded.deterministic_tests, new_tests);
 
         // Empty slice clears the list.
         set_plan_deterministic_tests(&conn, &plan.id, &[]).unwrap();
-        let reloaded = get_plan_by_slug(&conn, "tests-rt", "/proj").unwrap().unwrap();
+        let reloaded = get_plan_by_slug(&conn, "tests-rt", "/proj")
+            .unwrap()
+            .unwrap();
         assert!(reloaded.deterministic_tests.is_empty());
     }
 

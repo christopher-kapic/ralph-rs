@@ -214,9 +214,7 @@ impl StepHooksApp {
         match key.code {
             // Navigation
             KeyCode::Char('j') | KeyCode::Down => {
-                if !self.attachments.is_empty()
-                    && self.list_cursor + 1 < self.attachments.len()
-                {
+                if !self.attachments.is_empty() && self.list_cursor + 1 < self.attachments.len() {
                     self.list_cursor += 1;
                 }
                 Outcome::Pending
@@ -267,9 +265,7 @@ impl StepHooksApp {
             }
 
             // Pop the sub-view.
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
-                Outcome::Pop
-            }
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => Outcome::Pop,
 
             _ => Outcome::Pending,
         }
@@ -495,10 +491,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut StepHooksApp) {
             Mode::LifecyclePicker => LIFECYCLE_HINT,
             Mode::HookPicker { .. } => HOOK_HINT,
         };
-        Line::from(Span::styled(
-            hint,
-            Style::default().fg(theme::CHROME_DIM),
-        ))
+        Line::from(Span::styled(hint, Style::default().fg(theme::CHROME_DIM)))
     };
     let hint = Paragraph::new(hint_line);
     frame.render_widget(hint, hint_area);
@@ -548,12 +541,7 @@ fn render_lifecycle_picker(frame: &mut Frame, area: Rect, app: &StepHooksApp) {
     frame.render_widget(para, dialog);
 }
 
-fn render_hook_picker(
-    frame: &mut Frame,
-    area: Rect,
-    app: &StepHooksApp,
-    lifecycle: Lifecycle,
-) {
+fn render_hook_picker(frame: &mut Frame, area: Rect, app: &StepHooksApp, lifecycle: Lifecycle) {
     let candidates = app.candidates_for(lifecycle);
     let max_label = candidates
         .iter()
@@ -661,10 +649,7 @@ mod tests {
         }
     }
 
-    fn app_with(
-        attachments: Vec<StepHookRef>,
-        all_hooks: Vec<HookCandidate>,
-    ) -> StepHooksApp {
+    fn app_with(attachments: Vec<StepHookRef>, all_hooks: Vec<HookCandidate>) -> StepHooksApp {
         StepHooksApp::new(
             "p1".into(),
             "s1".into(),
@@ -709,10 +694,7 @@ mod tests {
     #[test]
     fn j_moves_list_cursor_down_clamped() {
         let mut app = app_with(
-            vec![
-                att(Lifecycle::PreStep, "a"),
-                att(Lifecycle::PostStep, "b"),
-            ],
+            vec![att(Lifecycle::PreStep, "a"), att(Lifecycle::PostStep, "b")],
             vec![],
         );
         assert_eq!(app.handle_key(key(KeyCode::Char('j'))), Outcome::Pending);
@@ -724,10 +706,7 @@ mod tests {
     #[test]
     fn k_moves_list_cursor_up_clamped() {
         let mut app = app_with(
-            vec![
-                att(Lifecycle::PreStep, "a"),
-                att(Lifecycle::PostStep, "b"),
-            ],
+            vec![att(Lifecycle::PreStep, "a"), att(Lifecycle::PostStep, "b")],
             vec![],
         );
         app.list_cursor = 1;
@@ -875,10 +854,7 @@ mod tests {
     #[test]
     fn lifecycle_enter_with_no_remaining_candidates_toasts() {
         // Library has only one hook ("fmt"), already attached at PreStep.
-        let mut app = app_with(
-            vec![att(Lifecycle::PreStep, "fmt")],
-            vec![cand("fmt")],
-        );
+        let mut app = app_with(vec![att(Lifecycle::PreStep, "fmt")], vec![cand("fmt")]);
         app.handle_key(key(KeyCode::Char('a')));
         assert_eq!(app.mode, Mode::LifecyclePicker);
         // PreStep cursor — Enter should toast since fmt is already attached.
@@ -898,10 +874,7 @@ mod tests {
 
     #[test]
     fn hook_picker_navigates_clamped() {
-        let mut app = app_with(
-            vec![],
-            vec![cand("a"), cand("b"), cand("c")],
-        );
+        let mut app = app_with(vec![], vec![cand("a"), cand("b"), cand("c")]);
         app.handle_key(key(KeyCode::Char('a')));
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.mode, Mode::HookPicker { .. }));
@@ -931,7 +904,12 @@ mod tests {
                 app.handle_key(key(KeyCode::Char('j')));
             }
             app.handle_key(key(KeyCode::Enter));
-            assert_eq!(app.mode, Mode::HookPicker { lifecycle: *lifecycle });
+            assert_eq!(
+                app.mode,
+                Mode::HookPicker {
+                    lifecycle: *lifecycle
+                }
+            );
             let outcome = app.handle_key(key(KeyCode::Enter));
             assert_eq!(
                 outcome,
@@ -998,10 +976,7 @@ mod tests {
 
     #[test]
     fn refresh_with_empty_lists_zeroes_cursors() {
-        let mut app = app_with(
-            vec![att(Lifecycle::PreStep, "a")],
-            vec![cand("a")],
-        );
+        let mut app = app_with(vec![att(Lifecycle::PreStep, "a")], vec![cand("a")]);
         app.refresh(vec![], vec![]);
         assert_eq!(app.list_cursor, 0);
         assert_eq!(app.hook_cursor, 0);
@@ -1020,9 +995,7 @@ mod tests {
     fn render_to_string(app: &mut StepHooksApp) -> String {
         let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), app))
-            .unwrap();
+        terminal.draw(|f| render(f, f.area(), app)).unwrap();
         let buf = terminal.backend().buffer().clone();
         let mut out = String::new();
         for y in 0..buf.area.height {
@@ -1114,7 +1087,17 @@ mod tests {
         .expect("create_plan")
         .id;
         let (step, _) = storage::create_step(
-            conn, &plan_id, "Step", "", None, None, &[], None, None, None, None,
+            conn,
+            &plan_id,
+            "Step",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .expect("create_step");
         (plan_id, step.id)
@@ -1177,14 +1160,8 @@ mod tests {
             let conn = db::open_memory().unwrap();
             let project = "/proj";
             let (plan_id, step_id) = make_plan_and_step(&conn, "p", project);
-            storage::attach_hook_to_step(
-                &conn,
-                &plan_id,
-                &step_id,
-                lifecycle.as_str(),
-                "fmt",
-            )
-            .unwrap();
+            storage::attach_hook_to_step(&conn, &plan_id, &step_id, lifecycle.as_str(), "fmt")
+                .unwrap();
 
             let mut app = StepHooksApp::new(
                 plan_id.clone(),
@@ -1230,8 +1207,7 @@ mod tests {
         storage::attach_hook_to_step(&conn, &plan_id, &step_id, "pre-step", "fmt").unwrap();
 
         let err =
-            storage::attach_hook_to_step(&conn, &plan_id, &step_id, "pre-step", "fmt")
-                .unwrap_err();
+            storage::attach_hook_to_step(&conn, &plan_id, &step_id, "pre-step", "fmt").unwrap_err();
         assert!(format!("{err}").contains("already attached"));
     }
 

@@ -156,7 +156,10 @@ pub enum PickerOutcome {
     Cancelled,
     /// User confirmed a value. The dispatcher wires this through one of the
     /// `apply_*` methods on [`super::step_detail::StepDetailApp`].
-    Submit { kind: PickerKind, value: String },
+    Submit {
+        kind: PickerKind,
+        value: String,
+    },
 }
 
 impl PickerState {
@@ -165,13 +168,13 @@ impl PickerState {
     /// pre-selected so Enter without movement is a no-op confirmation of
     /// the existing value.
     pub fn for_harness(harnesses: &[String], current: Option<&str>) -> Self {
-        let items: Vec<PickerItem> = harnesses
-            .iter()
-            .cloned()
-            .map(PickerItem::Value)
-            .collect();
+        let items: Vec<PickerItem> = harnesses.iter().cloned().map(PickerItem::Value).collect();
         let selected = current
-            .and_then(|c| items.iter().position(|i| matches!(i, PickerItem::Value(s) if s == c)))
+            .and_then(|c| {
+                items
+                    .iter()
+                    .position(|i| matches!(i, PickerItem::Value(s) if s == c))
+            })
             .unwrap_or(0);
         Self {
             kind: PickerKind::Harness,
@@ -203,7 +206,11 @@ impl PickerState {
         items.push(PickerItem::Custom);
 
         let selected = current
-            .and_then(|c| items.iter().position(|i| matches!(i, PickerItem::Value(s) if s == c)))
+            .and_then(|c| {
+                items
+                    .iter()
+                    .position(|i| matches!(i, PickerItem::Value(s) if s == c))
+            })
             .unwrap_or(0);
         Self {
             kind: PickerKind::Model,
@@ -222,7 +229,11 @@ impl PickerState {
     pub fn for_agent(agents: &[String], current: Option<&str>) -> Self {
         let items: Vec<PickerItem> = agents.iter().cloned().map(PickerItem::Value).collect();
         let selected = current
-            .and_then(|c| items.iter().position(|i| matches!(i, PickerItem::Value(s) if s == c)))
+            .and_then(|c| {
+                items
+                    .iter()
+                    .position(|i| matches!(i, PickerItem::Value(s) if s == c))
+            })
             .unwrap_or(0);
         Self {
             kind: PickerKind::Agent,
@@ -386,10 +397,7 @@ impl PickerState {
     /// callers use this to decide whether to call `enter_custom_input`
     /// before re-rendering.
     pub fn is_custom_row_selected(&self) -> bool {
-        matches!(
-            self.items.get(self.selected),
-            Some(PickerItem::Custom)
-        )
+        matches!(self.items.get(self.selected), Some(PickerItem::Custom))
     }
 }
 
@@ -436,7 +444,10 @@ pub fn render(frame: &mut Frame, area: Rect, picker: &PickerState) {
                     } else {
                         Style::default()
                     };
-                    lines.push(Line::from(Span::styled(format!(" {} ", item.label()), style)));
+                    lines.push(Line::from(Span::styled(
+                        format!(" {} ", item.label()),
+                        style,
+                    )));
                 }
             }
             lines.push(Line::from(""));
@@ -469,7 +480,9 @@ pub fn render(frame: &mut Frame, area: Rect, picker: &PickerState) {
         }
     }
 
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, dialog);
 }
 
@@ -557,7 +570,10 @@ mod tests {
 
     #[test]
     fn move_left_walks_to_previous_cell() {
-        assert_eq!(BottomCell::ChangePolicy.move_left(), Some(BottomCell::Agent));
+        assert_eq!(
+            BottomCell::ChangePolicy.move_left(),
+            Some(BottomCell::Agent)
+        );
         assert_eq!(BottomCell::Agent.move_left(), Some(BottomCell::Model));
         assert_eq!(BottomCell::Model.move_left(), Some(BottomCell::Harness));
     }
@@ -573,7 +589,10 @@ mod tests {
     fn move_right_walks_to_next_cell() {
         assert_eq!(BottomCell::Harness.move_right(), Some(BottomCell::Model));
         assert_eq!(BottomCell::Model.move_right(), Some(BottomCell::Agent));
-        assert_eq!(BottomCell::Agent.move_right(), Some(BottomCell::ChangePolicy));
+        assert_eq!(
+            BottomCell::Agent.move_right(),
+            Some(BottomCell::ChangePolicy)
+        );
     }
 
     #[test]
@@ -598,8 +617,7 @@ mod tests {
 
     #[test]
     fn for_harness_defaults_to_zero_when_current_unknown() {
-        let picker =
-            PickerState::for_harness(&["claude".into(), "codex".into()], Some("missing"));
+        let picker = PickerState::for_harness(&["claude".into(), "codex".into()], Some("missing"));
         assert_eq!(picker.selected, 0);
     }
 
@@ -677,7 +695,10 @@ mod tests {
     #[test]
     fn esc_in_list_mode_cancels() {
         let mut picker = PickerState::for_change_policy(ChangePolicy::Required);
-        assert_eq!(picker.handle_key(key(KeyCode::Esc)), PickerOutcome::Cancelled);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Esc)),
+            PickerOutcome::Cancelled
+        );
     }
 
     #[test]
@@ -707,21 +728,32 @@ mod tests {
             Some("claude"),
         );
         assert_eq!(picker.selected, 0);
-        assert_eq!(picker.handle_key(key(KeyCode::Char('j'))), PickerOutcome::Pending);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Char('j'))),
+            PickerOutcome::Pending
+        );
         assert_eq!(picker.selected, 1);
-        assert_eq!(picker.handle_key(key(KeyCode::Char('j'))), PickerOutcome::Pending);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Char('j'))),
+            PickerOutcome::Pending
+        );
         assert_eq!(picker.selected, 2);
         // At the bottom — j is a no-op.
-        assert_eq!(picker.handle_key(key(KeyCode::Char('j'))), PickerOutcome::Pending);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Char('j'))),
+            PickerOutcome::Pending
+        );
         assert_eq!(picker.selected, 2);
-        assert_eq!(picker.handle_key(key(KeyCode::Char('k'))), PickerOutcome::Pending);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Char('k'))),
+            PickerOutcome::Pending
+        );
         assert_eq!(picker.selected, 1);
     }
 
     #[test]
     fn arrows_navigate_selection() {
-        let mut picker =
-            PickerState::for_harness(&["a".into(), "b".into(), "c".into()], Some("a"));
+        let mut picker = PickerState::for_harness(&["a".into(), "b".into(), "c".into()], Some("a"));
         picker.handle_key(key(KeyCode::Down));
         assert_eq!(picker.selected, 1);
         picker.handle_key(key(KeyCode::Up));
@@ -730,8 +762,7 @@ mod tests {
 
     #[test]
     fn home_g_jumps_to_top_and_end_to_bottom() {
-        let mut picker =
-            PickerState::for_harness(&["a".into(), "b".into(), "c".into()], Some("c"));
+        let mut picker = PickerState::for_harness(&["a".into(), "b".into(), "c".into()], Some("c"));
         assert_eq!(picker.selected, 2);
         picker.handle_key(key(KeyCode::Char('g')));
         assert_eq!(picker.selected, 0);
@@ -741,10 +772,8 @@ mod tests {
 
     #[test]
     fn enter_on_value_row_submits() {
-        let mut picker = PickerState::for_harness(
-            &["claude".into(), "codex".into()],
-            Some("claude"),
-        );
+        let mut picker =
+            PickerState::for_harness(&["claude".into(), "codex".into()], Some("claude"));
         picker.handle_key(key(KeyCode::Char('j')));
         match picker.handle_key(key(KeyCode::Enter)) {
             PickerOutcome::Submit { kind, value } => {
@@ -764,7 +793,10 @@ mod tests {
         // [default, Custom…] — move to Custom.
         picker.handle_key(key(KeyCode::Char('j')));
         assert!(picker.is_custom_row_selected());
-        assert_eq!(picker.handle_key(key(KeyCode::Enter)), PickerOutcome::Pending);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Enter)),
+            PickerOutcome::Pending
+        );
     }
 
     #[test]
@@ -797,7 +829,10 @@ mod tests {
     #[test]
     fn enter_with_empty_list_is_noop() {
         let mut picker = PickerState::for_agent(&[], None);
-        assert_eq!(picker.handle_key(key(KeyCode::Enter)), PickerOutcome::Pending);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Enter)),
+            PickerOutcome::Pending
+        );
     }
 
     // -- CustomInput-mode key handling ------------------------------------
@@ -861,13 +896,19 @@ mod tests {
     #[test]
     fn enter_in_custom_input_with_empty_buffer_is_pending() {
         let mut picker = make_custom_input("");
-        assert_eq!(picker.handle_key(key(KeyCode::Enter)), PickerOutcome::Pending);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Enter)),
+            PickerOutcome::Pending
+        );
     }
 
     #[test]
     fn enter_in_custom_input_with_only_whitespace_is_pending() {
         let mut picker = make_custom_input("    ");
-        assert_eq!(picker.handle_key(key(KeyCode::Enter)), PickerOutcome::Pending);
+        assert_eq!(
+            picker.handle_key(key(KeyCode::Enter)),
+            PickerOutcome::Pending
+        );
     }
 
     #[test]
@@ -892,8 +933,7 @@ mod tests {
     #[test]
     fn ctrl_modified_chars_ignored_in_custom_input() {
         let mut picker = make_custom_input("");
-        let outcome =
-            picker.handle_key(key_with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        let outcome = picker.handle_key(key_with_mod(KeyCode::Char('a'), KeyModifiers::CONTROL));
         assert_eq!(outcome, PickerOutcome::Pending);
         match &picker.mode {
             PickerMode::CustomInput { buffer } => assert!(buffer.is_empty()),
@@ -906,9 +946,7 @@ mod tests {
     fn render_to_string(width: u16, height: u16, picker: &PickerState) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| render(f, f.area(), picker))
-            .unwrap();
+        terminal.draw(|f| render(f, f.area(), picker)).unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..buf.area().height)
             .map(|y| {

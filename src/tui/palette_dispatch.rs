@@ -35,7 +35,7 @@
 //   overlay) so the dispatcher loop can toast a placeholder until then.
 
 use crate::plan::PlanStatus;
-use crate::tui::palette::{ParseError, PaletteCommand};
+use crate::tui::palette::{PaletteCommand, ParseError};
 use crate::tui::run_dialog::RunTarget;
 use crate::tui::toast::ToastKind;
 
@@ -118,10 +118,7 @@ pub enum PaletteAction {
     /// Nothing to do (e.g. blank input).
     None,
     /// Show a toast in the surrounding view's queue.
-    Toast {
-        message: String,
-        kind: ToastKind,
-    },
+    Toast { message: String, kind: ToastKind },
     /// `/run` — open the branch-choice dialog seeded with `default_branch`
     /// for `plan_count` plans against `targets`.
     OpenRunDialog {
@@ -345,14 +342,10 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
         PaletteCommand::Cancel => PaletteAction::CancelRun,
 
         // -- /export <slug> [-o <path>] -----------------------------------
-        PaletteCommand::Export { slug, output } => {
-            dispatch_export(slug, output.as_deref(), ctx)
-        }
+        PaletteCommand::Export { slug, output } => dispatch_export(slug, output.as_deref(), ctx),
 
         // -- /import <path> -----------------------------------------------
-        PaletteCommand::Import(path) => PaletteAction::Import {
-            path: path.clone(),
-        },
+        PaletteCommand::Import(path) => PaletteAction::Import { path: path.clone() },
 
         // -- /quit / /q ---------------------------------------------------
         PaletteCommand::Quit => PaletteAction::Quit,
@@ -512,10 +505,7 @@ fn dispatch_plan_approve(slug: Option<&str>, ctx: &PaletteContext<'_>) -> Palett
                 // Mirror the `A` keybinding's info toast for non-Planning
                 // plans (TUI-plan.md §5).
                 PaletteAction::Toast {
-                    message: format!(
-                        "Plan is in {} status; nothing to approve.",
-                        target.status
-                    ),
+                    message: format!("Plan is in {} status; nothing to approve.", target.status),
                     kind: ToastKind::Info,
                 }
             }
@@ -586,11 +576,7 @@ fn dispatch_step_skip(num: Option<u32>, ctx: &PaletteContext<'_>) -> PaletteActi
     }
 }
 
-fn dispatch_export(
-    slug: &str,
-    output: Option<&str>,
-    ctx: &PaletteContext<'_>,
-) -> PaletteAction {
+fn dispatch_export(slug: &str, output: Option<&str>, ctx: &PaletteContext<'_>) -> PaletteAction {
     // /export looks up the slug against both active and archived plans.
     // Exporting an archived plan is intentional — the JSON snapshot is the
     // user's escape hatch before a `/plan delete`.
@@ -868,10 +854,7 @@ mod tests {
     #[test]
     fn run_with_multi_target_uses_first_branch_as_default() {
         let mut c = Ctx::new();
-        c.run_targets = vec![
-            target("alpha", "feat-a"),
-            target("beta", "feat-b"),
-        ];
+        c.run_targets = vec![target("alpha", "feat-a"), target("beta", "feat-b")];
         let action = dispatch_str("/run", &c);
         match action {
             PaletteAction::OpenRunDialog {
@@ -1553,10 +1536,7 @@ mod tests {
         let mut c = Ctx::new();
         c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
         c.focused_slug = Some("alpha".to_string());
-        let action = dispatch(
-            &PaletteCommand::StepMove { num: 0, to: 5 },
-            &c.as_ctx(),
-        );
+        let action = dispatch(&PaletteCommand::StepMove { num: 0, to: 5 }, &c.as_ctx());
         assert_eq!(
             action,
             PaletteAction::Toast {

@@ -181,8 +181,7 @@ pub fn draw(frame: &mut Frame, app: &mut ArchivedListApp) {
     app.toasts.prune(Instant::now());
 
     let crumbs: [&str; 2] = ["ralph", "Archived plans"];
-    let hint =
-        "[j/k] nav  [enter] unarchive  [space] select  [d] delete  [h/←/q] back";
+    let hint = "[j/k] nav  [enter] unarchive  [space] select  [d] delete  [h/←/q] back";
     let body = chrome::render(
         frame,
         &Chrome {

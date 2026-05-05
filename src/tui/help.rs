@@ -205,10 +205,7 @@ pub fn for_archived_list() -> HelpModel {
             ),
             Group::new(
                 "Other",
-                vec![
-                    ("?", "Toggle this help"),
-                    ("Ctrl-C", "Back to plan list"),
-                ],
+                vec![("?", "Toggle this help"), ("Ctrl-C", "Back to plan list")],
             ),
         ],
     )
@@ -294,10 +291,7 @@ pub fn for_step_detail() -> HelpModel {
                     ("a", "Answer focused open question"),
                 ],
             ),
-            Group::new(
-                "View",
-                vec![("z", "Toggle zen mode (collapse sidebar)")],
-            ),
+            Group::new("View", vec![("z", "Toggle zen mode (collapse sidebar)")]),
             Group::new(
                 "Other",
                 vec![
@@ -362,7 +356,9 @@ pub fn render(frame: &mut Frame, area: Rect, model: &HelpModel) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::CURSOR));
 
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, dialog);
 }
 
@@ -671,8 +667,14 @@ mod tests {
         // — the plan-list help is the densest of the per-view models.
         let out = render_to_string(80, 30, &m);
         assert!(out.contains("Plan list"), "title missing:\n{out}");
-        assert!(out.contains("Navigation"), "Navigation group missing:\n{out}");
-        assert!(out.contains("? or <esc> to close"), "footer missing:\n{out}");
+        assert!(
+            out.contains("Navigation"),
+            "Navigation group missing:\n{out}"
+        );
+        assert!(
+            out.contains("? or <esc> to close"),
+            "footer missing:\n{out}"
+        );
     }
 
     #[test]
@@ -692,10 +694,7 @@ mod tests {
     #[test]
     fn line_count_includes_separators_and_footer() {
         // 1 group with 2 bindings: 1 header + 2 rows + 2 footer = 5
-        let m = HelpModel::new(
-            "x",
-            vec![Group::new("G", vec![("k", "a"), ("j", "b")])],
-        );
+        let m = HelpModel::new("x", vec![Group::new("G", vec![("k", "a"), ("j", "b")])]);
         assert_eq!(line_count(&m), 5);
 
         // 2 groups: G1 header (1) + 1 row + blank + G2 header (1) + 2 rows

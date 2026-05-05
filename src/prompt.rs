@@ -339,7 +339,10 @@ fn format_plan_context(plan: &Plan) -> String {
 /// two markdown blockquote lines (`> Q: ...` / `> A: ...`) separated by a
 /// blank line, in chronological order. Verbatim shape from TUI-plan.md §17.
 fn format_answered_questions(answered: &[AnsweredQuestion]) -> String {
-    let mut lines = vec!["## Previously answered questions".to_string(), String::new()];
+    let mut lines = vec![
+        "## Previously answered questions".to_string(),
+        String::new(),
+    ];
     let last = answered.len().saturating_sub(1);
     for (i, qa) in answered.iter().enumerate() {
         lines.push(format!("> Q: {}", qa.question));
