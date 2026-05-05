@@ -243,19 +243,54 @@ pub fn dispatch_run(
     Ok(())
 }
 
-/// TUI-mode dispatcher for `ralph run`. Step 22 of the tui-v1 plan wires this
-/// up to the real plan-detail view; for now it's a placeholder that produces
-/// today's output exactly. The routing decision in main.rs (via
-/// [`is_default_run_invocation`]) is what makes this function reachable on
-/// bare `ralph run` / `ralph run <slug>` invocations from a TTY.
+/// TUI-mode dispatcher for `ralph run`. Resolves the target plan (the
+/// supplied slug, or the active plan when no slug was given), enters the
+/// alternate-screen + raw-mode terminal, and hands off to the plan-detail
+/// dispatcher with `auto_start=true` so the run kicks off immediately after
+/// the first frame draws (TUI-plan.md §2).
+///
+/// The routing decision in `main.rs` (via [`is_default_run_invocation`])
+/// guarantees this is only reached for bare `ralph run` / `ralph run <slug>`
+/// invocations from a TTY — every other flag combination falls through to
+/// [`dispatch_run`], so `args` other than `plan_slug` is ignored here. `out`
+/// is unused for the same reason: the TUI emits its own UI rather than the
+/// plain/json output paths.
 pub fn run_tui_mode(
     conn: &Connection,
     config: &Config,
     project: &str,
     args: RunArgs,
-    out: &OutputContext,
+    _out: &OutputContext,
 ) -> Result<()> {
-    dispatch_run(conn, config, project, args, out)
+    use crossterm::execute;
+    use crossterm::terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
+
+    // Resolve the plan before touching the terminal so a "no active plan" or
+    // "plan not found" error surfaces as plain stderr rather than corrupting
+    // the user's terminal with a half-entered alternate screen.
+    let plan = super::resolve_plan(conn, args.plan_slug, project, false)?;
+    let slug = plan.slug.clone();
+
+    enable_raw_mode().context("enable raw mode")?;
+    let mut stdout = std::io::stdout();
+    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(e).context("enter alternate screen");
+    }
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("create terminal")?;
+
+    let result = run_plan_detail_tui(&mut terminal, conn, config, project, &slug, true);
+
+    let _ = disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen);
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -550,7 +585,14 @@ pub fn run_plan_list_tui(
                                 refresh_plan_list_state(conn, project, &mut app)?;
                             }
                             Some(crate::tui::views::plan_list::OpenRequest::Plan(slug)) => {
-                                run_plan_detail_tui(&mut terminal, conn, config, project, &slug)?;
+                                run_plan_detail_tui(
+                                    &mut terminal,
+                                    conn,
+                                    config,
+                                    project,
+                                    &slug,
+                                    false,
+                                )?;
                                 // The plan-detail view can mutate step state
                                 // (skip / add) and counters; refresh tiles so
                                 // the user sees up-to-date totals on return.
@@ -1975,12 +2017,19 @@ fn confirm_with_archived_background<B: ratatui::backend::Backend>(
 /// step N" banner reflect runner-subprocess progress. Pressing `R`
 /// spawns a `ralph run --non-interactive <slug>` child and `S` sends
 /// `ralph cancel` semantics (SIGTERM with timeout, then SIGKILL).
+///
+/// When `auto_start` is true, the dispatcher fires
+/// [`plan_detail_apply_run_streaming`] once after rendering the first
+/// frame — the same code path the `R` keybinding uses. This is how
+/// `ralph run` (TUI-plan.md §2) lands in plan-detail with the run
+/// already kicked off.
 fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
     config: &Config,
     project: &str,
     slug: &str,
+    auto_start: bool,
 ) -> Result<()> {
     use crate::tui::events::{self as tui_events, RunSubscription};
     use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
@@ -2006,6 +2055,11 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     // recorded pid is the subprocess.
     let my_pid = std::process::id() as i64;
     let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
+
+    // TUI-plan.md §2: when `ralph run` lands here we auto-start the run after
+    // the first frame draws so the user sees the plan-detail UI before the
+    // streaming subprocess fires. Latched to a single shot.
+    let mut pending_auto_start = auto_start;
 
     loop {
         // -- Refresh state from the active source of truth ----------------
@@ -2078,6 +2132,14 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
         }
 
         terminal.draw(|f| plan_detail_ui::draw(f, &mut app))?;
+
+        // TUI-plan.md §2 auto-start: after the first frame is on screen,
+        // fire the same streaming-run path that `R` invokes. Cleared after
+        // the single shot so subsequent loop iterations don't re-spawn.
+        if pending_auto_start {
+            pending_auto_start = false;
+            plan_detail_apply_run_streaming(conn, &mut app, project, slug, &mut subscription)?;
+        }
 
         // Poll with a short timeout so the live timer keeps ticking and
         // any newly-arrived NDJSON chunks are drained on the next iteration
