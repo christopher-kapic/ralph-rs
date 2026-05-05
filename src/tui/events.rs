@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_step_started_marks_run_live_and_starts_timer() {
+    fn test_dispatch_step_started_marks_run_live() {
         let mut app = make_app();
         assert!(!app.is_run_live());
         let evt = RunEvent::StepStarted {
@@ -324,7 +324,7 @@ mod tests {
         };
         dispatch_event(&mut app, &evt);
         assert!(app.is_run_live());
-        assert!(app.step_start_time.is_some());
+        assert_eq!(app.subscribed_step_num, Some(1));
     }
 
     #[test]
@@ -351,7 +351,7 @@ mod tests {
             },
         );
         assert!(!app.is_run_live());
-        assert!(app.step_start_time.is_none());
+        assert_eq!(app.subscribed_step_num, None);
     }
 
     // -- consume_lines integration with an in-memory pipe --

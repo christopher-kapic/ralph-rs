@@ -6,8 +6,8 @@
 // without a terminal.
 
 use std::collections::VecDeque;
-use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use crossterm::event::MouseEvent;
 use ratatui::widgets::ListState;
 
@@ -69,9 +69,6 @@ pub struct PlanDetailApp {
     /// (`←`/`h`/`q`, or Ctrl-C). The dispatcher consumes this and exits the
     /// plan-detail event loop.
     pub should_pop: bool,
-
-    /// Start time of the current in-progress step (for the live timer).
-    pub step_start_time: Option<Instant>,
 
     /// Persistent list widget state so the viewport offset survives across frames.
     pub list_state: ListState,
@@ -180,7 +177,6 @@ impl PlanDetailApp {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             should_pop: false,
-            step_start_time: None,
             list_state,
             default_max_retries: config.max_retries_per_step,
             selection: Selection::new(),
@@ -588,21 +584,13 @@ impl PlanDetailApp {
 
     // -- Live-run snapshot ------------------------------------------------
 
-    /// Update the cached live-run snapshot. When the in-progress step
-    /// changes (or transitions in/out of the running state), the live timer
-    /// is reset so "Elapsed" reflects the *current* step rather than the
-    /// previous one.
+    /// Update the cached live-run snapshot. The elapsed timer is derived
+    /// from `LiveRun.phase_started_at` / `started_at` (see
+    /// [`Self::elapsed_secs`]), so a fresh snapshot here is enough to make
+    /// the "Elapsed" display reflect the current step without any
+    /// process-local Instant state.
     pub fn update_live_run(&mut self, live: Option<LiveRun>) {
-        let prev_step = self.live_run.as_ref().and_then(|l| l.step_id.clone());
-        let next_step = live.as_ref().and_then(|l| l.step_id.clone());
         self.live_run = live;
-        if prev_step != next_step {
-            if next_step.is_some() {
-                self.start_step_timer();
-            } else {
-                self.stop_step_timer();
-            }
-        }
     }
 
     /// 1-based step number reported by the live runner, or `None` when no
@@ -643,7 +631,6 @@ impl PlanDetailApp {
         self.test_tail.clear();
         self.harness_tail_scroll = 0;
         self.test_tail_scroll = 0;
-        self.start_step_timer();
     }
 
     /// Release a previously-attached subscription. Called by the dispatcher
@@ -653,7 +640,6 @@ impl PlanDetailApp {
         self.subscribed = false;
         self.subscribed_step_num = None;
         self.current_phase = None;
-        self.stop_step_timer();
     }
 
     /// Push a harness-output line onto the tail, evicting from the front
@@ -677,11 +663,11 @@ impl PlanDetailApp {
 
     /// Record that a `step_started` event just arrived: bring the run-live
     /// state online if the subscription's first event preceded the DB-side
-    /// row, latch the step number, and reset the elapsed timer for the
-    /// freshly-started step.
+    /// row, and latch the step number. The elapsed timer is derived from
+    /// the persisted `LiveRun` timestamps, so no process-local clock state
+    /// needs resetting here.
     pub fn note_step_started(&mut self, step_id: &str) {
         self.subscribed = true;
-        self.start_step_timer();
         self.subscribed_step_num = self
             .steps
             .iter()
@@ -765,20 +751,23 @@ impl PlanDetailApp {
 
     // -- Timer ------------------------------------------------------------
 
-    /// Start the live timer for the current step.
-    pub fn start_step_timer(&mut self) {
-        self.step_start_time = Some(Instant::now());
-    }
-
-    /// Stop the live timer.
-    pub fn stop_step_timer(&mut self) {
-        self.step_start_time = None;
-    }
-
-    /// Get elapsed seconds since the step timer started (0.0 if not running).
+    /// Seconds elapsed in the current run phase, derived from the persisted
+    /// `LiveRun` row so re-entry from the plan list (which constructs a
+    /// fresh `PlanDetailApp`) preserves the accumulated time. Prefers
+    /// `phase_started_at` (per-step granularity) and falls back to
+    /// `started_at` (whole run) when no phase timestamp has been written
+    /// yet. Returns `0.0` when no live run is bound or when the timestamp
+    /// fails to parse — both treated as "no useful elapsed to show".
+    /// Negative durations from clock skew are clamped to `0.0`.
     pub fn elapsed_secs(&self) -> f64 {
-        self.step_start_time
-            .map(|t| t.elapsed().as_secs_f64())
+        let Some(live) = self.live_run.as_ref() else {
+            return 0.0;
+        };
+        let timestamp = live.phase_started_at.as_deref().unwrap_or(&live.started_at);
+        timestamp
+            .parse::<DateTime<Utc>>()
+            .ok()
+            .map(|t| Utc::now().signed_duration_since(t).num_seconds().max(0) as f64)
             .unwrap_or(0.0)
     }
 
@@ -1196,27 +1185,100 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_timer() {
+    fn test_elapsed_secs_no_live_run_returns_zero() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let app = PlanDetailApp::new(plan, steps, &Config::default());
+
+        assert_eq!(app.elapsed_secs(), 0.0);
+    }
+
+    #[test]
+    fn test_elapsed_secs_uses_phase_started_at() {
+        // (a) Construct an App, push a LiveRun whose phase_started_at is
+        // 90 seconds in the past, and assert elapsed_secs ≈ 90 — derived
+        // from the persisted timestamp, not a process-local Instant.
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
 
-        assert!(app.step_start_time.is_none());
-        app.start_step_timer();
-        assert!(app.step_start_time.is_some());
+        let mut live = make_live_run("test-plan", Some("s1"), Some(2));
+        let started = Utc::now() - chrono::Duration::seconds(90);
+        live.phase_started_at = Some(started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        app.update_live_run(Some(live));
 
         let elapsed = app.elapsed_secs();
-        assert!(elapsed >= 0.0);
-
-        app.stop_step_timer();
-        assert!(app.step_start_time.is_none());
+        assert!(
+            (89.0..=92.0).contains(&elapsed),
+            "expected ~90s elapsed, got {elapsed}"
+        );
     }
 
     #[test]
-    fn test_elapsed_secs_no_timer() {
-        let plan = make_plan();
-        let steps = make_steps(3);
-        let app = PlanDetailApp::new(plan, steps, &Config::default());
+    fn test_elapsed_secs_survives_view_reentry() {
+        // (b) Re-entry preservation: navigating from plan-detail to root
+        // and back constructs a fresh PlanDetailApp. Two apps fed the same
+        // LiveRun (same phase_started_at) must report the same elapsed
+        // value — there is no per-instance Instant to reset.
+        let mut live = make_live_run("test-plan", Some("s1"), Some(2));
+        let started = Utc::now() - chrono::Duration::seconds(90);
+        live.phase_started_at = Some(started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+
+        let mut first = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        first.update_live_run(Some(live.clone()));
+        let first_elapsed = first.elapsed_secs();
+        assert!(
+            (89.0..=92.0).contains(&first_elapsed),
+            "first view should observe ~90s elapsed, got {first_elapsed}"
+        );
+
+        let mut second = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        second.update_live_run(Some(live));
+        let second_elapsed = second.elapsed_secs();
+        assert!(
+            (89.0..=92.0).contains(&second_elapsed),
+            "fresh view should observe the same ~90s elapsed, got {second_elapsed}"
+        );
+        // Crucially, the second instance must NOT have reset to ~0.
+        assert!(
+            second_elapsed > 60.0,
+            "re-entry must preserve elapsed time across instances"
+        );
+    }
+
+    #[test]
+    fn test_elapsed_secs_falls_back_to_started_at() {
+        // (c) When phase_started_at is None, fall back to started_at —
+        // covers the window between run start and the first phase
+        // transition (where the per-phase timestamp hasn't been written
+        // yet).
+        let mut live = make_live_run("test-plan", Some("s1"), Some(2));
+        let started = Utc::now() - chrono::Duration::seconds(45);
+        live.phase_started_at = None;
+        live.started_at = started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.update_live_run(Some(live));
+
+        let elapsed = app.elapsed_secs();
+        assert!(
+            (44.0..=47.0).contains(&elapsed),
+            "expected ~45s elapsed via started_at fallback, got {elapsed}"
+        );
+    }
+
+    #[test]
+    fn test_elapsed_secs_clamps_negative_duration_to_zero() {
+        // (d) Clock skew defense: a phase_started_at that is in the future
+        // (perhaps because the runner host's clock is ahead of ours) must
+        // not surface as a negative elapsed — the f64 cast would wrap and
+        // the renderer would print nonsense.
+        let mut live = make_live_run("test-plan", Some("s1"), Some(2));
+        let future = Utc::now() + chrono::Duration::seconds(120);
+        live.phase_started_at = Some(future.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.update_live_run(Some(live));
 
         assert_eq!(app.elapsed_secs(), 0.0);
     }
@@ -1649,48 +1711,59 @@ mod tests {
     }
 
     #[test]
-    fn test_update_live_run_starts_timer_when_step_appears() {
+    fn test_update_live_run_marks_run_live_when_step_appears() {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
         assert!(!app.is_run_live());
-        assert!(app.step_start_time.is_none());
 
         app.update_live_run(Some(make_live_run("test-plan", Some("s1"), Some(2))));
         assert!(app.is_run_live());
-        assert!(app.step_start_time.is_some());
         assert_eq!(app.live_step_num(), Some(2));
     }
 
     #[test]
-    fn test_update_live_run_stops_timer_when_run_ends() {
+    fn test_update_live_run_clears_run_state_when_run_ends() {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
         app.update_live_run(Some(make_live_run("test-plan", Some("s1"), Some(2))));
-        assert!(app.step_start_time.is_some());
+        assert!(app.is_run_live());
 
         app.update_live_run(None);
         assert!(!app.is_run_live());
-        assert!(app.step_start_time.is_none());
         assert_eq!(app.live_step_num(), None);
+        assert_eq!(app.elapsed_secs(), 0.0);
     }
 
     #[test]
-    fn test_update_live_run_resets_timer_on_step_change() {
+    fn test_update_live_run_reflects_new_phase_timestamp_on_step_change() {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
-        app.update_live_run(Some(make_live_run("test-plan", Some("s1"), Some(2))));
-        let first_start = app.step_start_time.unwrap();
 
-        // Pause briefly so Instant comparisons are unambiguous.
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        app.update_live_run(Some(make_live_run("test-plan", Some("s2"), Some(3))));
-        let second_start = app.step_start_time.unwrap();
+        let mut first = make_live_run("test-plan", Some("s1"), Some(2));
+        let first_phase = Utc::now() - chrono::Duration::seconds(120);
+        first.phase_started_at =
+            Some(first_phase.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        app.update_live_run(Some(first));
+        let elapsed_before = app.elapsed_secs();
         assert!(
-            second_start > first_start,
-            "timer should restart when in-progress step changes"
+            elapsed_before > 60.0,
+            "first phase should report >60s elapsed, got {elapsed_before}"
+        );
+
+        // A new step arrives with a fresh phase_started_at — elapsed should
+        // drop to roughly the new phase's age.
+        let mut second = make_live_run("test-plan", Some("s2"), Some(3));
+        let second_phase = Utc::now() - chrono::Duration::seconds(2);
+        second.phase_started_at =
+            Some(second_phase.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        app.update_live_run(Some(second));
+        let elapsed_after = app.elapsed_secs();
+        assert!(
+            elapsed_after < 10.0,
+            "fresh phase should reset elapsed to ~2s, got {elapsed_after}"
         );
         assert_eq!(app.live_step_num(), Some(3));
     }
@@ -1698,13 +1771,11 @@ mod tests {
     // -- NDJSON-stream-driven state (TUI-plan.md §13) ---------------------
 
     #[test]
-    fn test_attach_subscription_marks_run_live_and_starts_timer() {
+    fn test_attach_subscription_marks_run_live() {
         let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
         assert!(!app.is_run_live());
-        assert!(app.step_start_time.is_none());
         app.attach_subscription();
         assert!(app.is_run_live());
-        assert!(app.step_start_time.is_some());
         assert_eq!(app.current_phase(), None);
         assert!(app.harness_tail.is_empty());
         assert!(app.test_tail.is_empty());
@@ -1736,7 +1807,7 @@ mod tests {
         assert!(app.is_run_live());
         app.detach_subscription();
         assert!(!app.is_run_live());
-        assert!(app.step_start_time.is_none());
+        assert_eq!(app.elapsed_secs(), 0.0);
         assert_eq!(app.current_phase, None);
         assert_eq!(app.subscribed_step_num, None);
     }
