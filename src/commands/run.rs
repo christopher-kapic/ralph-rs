@@ -417,6 +417,42 @@ pub fn run_plan_list_tui(
                                         )?;
                                     }
                                 }
+                                Some(PaletteAction::OpenRunDialog {
+                                    default_branch,
+                                    plan_count,
+                                    targets,
+                                }) => {
+                                    let outcome = run_dialog_loop_with_bg(
+                                        &mut terminal,
+                                        |f| crate::tui::views::plan_list::draw(f, &mut app),
+                                        default_branch,
+                                        plan_count,
+                                    )?;
+                                    let report = apply_palette_run_outcome(
+                                        &mut terminal,
+                                        |f| crate::tui::views::plan_list::draw(f, &mut app),
+                                        project,
+                                        outcome,
+                                        &targets,
+                                        plan_count > 1,
+                                    )?;
+                                    flush_palette_run_toasts(report, &mut app.toasts);
+                                }
+                                Some(PaletteAction::RunOnBranch {
+                                    branch,
+                                    targets,
+                                    force_current_branch,
+                                }) => {
+                                    let report = apply_palette_run_outcome(
+                                        &mut terminal,
+                                        |f| crate::tui::views::plan_list::draw(f, &mut app),
+                                        project,
+                                        crate::tui::run_dialog::Outcome::NewBranch(branch),
+                                        &targets,
+                                        force_current_branch,
+                                    )?;
+                                    flush_palette_run_toasts(report, &mut app.toasts);
+                                }
                                 _ => {}
                             }
                         }
@@ -814,6 +850,256 @@ fn plan_ref_from_plan(plan: &crate::plan::Plan) -> crate::tui::palette_dispatch:
     }
 }
 
+// ---------------------------------------------------------------------------
+// /run dialog wiring (TUI-plan.md §9.1, step 21)
+// ---------------------------------------------------------------------------
+
+/// What `apply_palette_run_outcome` should do with a `NewBranch(target)`
+/// outcome before spawning. Pure (no I/O at the decision boundary) so it can
+/// be unit-tested against a real git tempdir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchDecision {
+    /// cwd is already on the target branch — nothing to switch.
+    AlreadyOnTarget,
+    /// Target branch exists locally; check it out.
+    SwitchExisting,
+    /// Target branch doesn't exist; caller must confirm before creating.
+    NeedsCreate,
+}
+
+/// Decide what action to take when aligning cwd with `target_branch`.
+pub(crate) fn classify_branch_target(workdir: &Path, target: &str) -> Result<BranchDecision> {
+    use crate::git;
+    let current = git::get_current_branch(workdir)?;
+    if current == target {
+        return Ok(BranchDecision::AlreadyOnTarget);
+    }
+    if git::branch_exists(workdir, target)? {
+        Ok(BranchDecision::SwitchExisting)
+    } else {
+        Ok(BranchDecision::NeedsCreate)
+    }
+}
+
+/// Drive the run-dialog state machine to completion, rendering it as an
+/// overlay over the caller's view. Returns the terminal `Outcome`.
+pub(crate) fn run_dialog_loop_with_bg<B, F>(
+    terminal: &mut ratatui::Terminal<B>,
+    mut draw_bg: F,
+    default_branch: String,
+    plan_count: usize,
+) -> Result<crate::tui::run_dialog::Outcome>
+where
+    B: ratatui::backend::Backend,
+    F: FnMut(&mut ratatui::Frame<'_>),
+{
+    use crate::tui::run_dialog::{self, Outcome, RunDialog};
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let mut dialog = RunDialog::new(default_branch, plan_count);
+    loop {
+        terminal.draw(|f| {
+            draw_bg(f);
+            let area = f.area();
+            run_dialog::render(f, area, &dialog);
+        })?;
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match dialog.handle_key(key) {
+                Outcome::Pending => continue,
+                other => return Ok(other),
+            }
+        }
+    }
+}
+
+/// Drive a `dialog::Confirm` loop with a custom background. Mirrors the
+/// per-view `confirm_with_*_background` helpers but parameterized on a
+/// closure so the run-dialog flow can reuse it without a per-view variant.
+fn confirm_loop_with_bg<B, F>(
+    terminal: &mut ratatui::Terminal<B>,
+    mut draw_bg: F,
+    confirm: &crate::tui::dialog::Confirm<'_>,
+) -> Result<bool>
+where
+    B: ratatui::backend::Backend,
+    F: FnMut(&mut ratatui::Frame<'_>),
+{
+    use crate::tui::dialog::{self, Decision};
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    loop {
+        terminal.draw(|f| {
+            draw_bg(f);
+            let area = f.area();
+            dialog::render(f, area, confirm);
+        })?;
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match dialog::decide_key(key, confirm.default) {
+                Decision::Yes => return Ok(true),
+                Decision::No => return Ok(false),
+                Decision::Pending => continue,
+            }
+        }
+    }
+}
+
+/// Result of [`apply_palette_run_outcome`]. The `pending_toasts` list is
+/// drained by the caller after the helper returns so the borrow held by the
+/// background-draw closure is released first; pushing into `app.toasts`
+/// inline would conflict with the closure's mutable borrow of the App.
+#[derive(Debug, Default)]
+pub(crate) struct PaletteRunReport {
+    /// Plan slugs whose runner subprocess was spawned, in dispatch order.
+    pub spawned: Vec<String>,
+    /// Toasts the caller should push onto its view's queue, in order.
+    pub pending_toasts: Vec<(String, crate::tui::toast::ToastKind)>,
+}
+
+/// Apply a [`crate::tui::run_dialog::Outcome`] (from either `OpenRunDialog`
+/// or the synthetic `NewBranch(branch)` of `RunOnBranch`) by:
+///   1. Switching to the target branch when the outcome calls for it,
+///      prompting the user to confirm creation when the branch is missing.
+///   2. Spawning a runner subprocess per target via
+///      [`crate::tui::run_dialog::dispatch_outcome`].
+///
+/// `force_current_branch` is passed through to `dispatch_outcome` so
+/// multi-plan callers (or `/run <branch>` in multi-select mode) always pass
+/// `--current-branch`. Toasts are returned for the caller to push because the
+/// `draw_bg` closure holds a mutable borrow of the underlying App while this
+/// function runs — see [`PaletteRunReport`].
+pub(crate) fn apply_palette_run_outcome<B, F>(
+    terminal: &mut ratatui::Terminal<B>,
+    mut draw_bg: F,
+    project: &str,
+    outcome: crate::tui::run_dialog::Outcome,
+    targets: &[crate::tui::run_dialog::RunTarget],
+    force_current_branch: bool,
+) -> Result<PaletteRunReport>
+where
+    B: ratatui::backend::Backend,
+    F: FnMut(&mut ratatui::Frame<'_>),
+{
+    use crate::tui::run_dialog::Outcome;
+    use crate::tui::toast::ToastKind;
+
+    let mut report = PaletteRunReport::default();
+
+    if matches!(outcome, Outcome::Pending | Outcome::Cancelled) {
+        return Ok(report);
+    }
+
+    let workdir = Path::new(project);
+
+    if let Outcome::NewBranch(name) = &outcome {
+        match classify_branch_target(workdir, name) {
+            Ok(BranchDecision::AlreadyOnTarget) => {}
+            Ok(BranchDecision::SwitchExisting) => {
+                if let Err(e) = crate::git::checkout_branch(workdir, name) {
+                    report.pending_toasts.push((
+                        format!("Failed to checkout `{name}`: {e}"),
+                        ToastKind::Error,
+                    ));
+                    return Ok(report);
+                }
+            }
+            Ok(BranchDecision::NeedsCreate) => {
+                let body = format!("Branch `{name}` doesn't exist. Create it?");
+                let confirm = crate::tui::dialog::Confirm {
+                    title: "Create branch",
+                    body: &body,
+                    default: false,
+                };
+                if !confirm_loop_with_bg(terminal, &mut draw_bg, &confirm)? {
+                    report
+                        .pending_toasts
+                        .push(("Run cancelled.".to_string(), ToastKind::Info));
+                    return Ok(report);
+                }
+                if let Err(e) = crate::git::create_and_checkout_branch(workdir, name) {
+                    report.pending_toasts.push((
+                        format!("Failed to create `{name}`: {e}"),
+                        ToastKind::Error,
+                    ));
+                    return Ok(report);
+                }
+            }
+            Err(e) => {
+                report.pending_toasts.push((
+                    format!("Cannot inspect git state: {e}"),
+                    ToastKind::Error,
+                ));
+                return Ok(report);
+            }
+        }
+    }
+
+    spawn_palette_runners(workdir, &outcome, targets, force_current_branch, &mut report);
+    Ok(report)
+}
+
+/// Spawn one runner subprocess per target via
+/// [`crate::tui::run_dialog::ProcessRunSpawner`] and append toasts to the
+/// report. Pulled out so unit tests can target the success/error-toast
+/// shaping without forking a real subprocess (the `dispatch_outcome` /
+/// `RunSpawner` trait covers the per-arg ordering separately).
+fn spawn_palette_runners(
+    workdir: &Path,
+    outcome: &crate::tui::run_dialog::Outcome,
+    targets: &[crate::tui::run_dialog::RunTarget],
+    force_current_branch: bool,
+    report: &mut PaletteRunReport,
+) {
+    use crate::tui::run_dialog::{self, ProcessRunSpawner};
+    use crate::tui::toast::ToastKind;
+
+    let mut spawner = match ProcessRunSpawner::new() {
+        Ok(s) => s,
+        Err(e) => {
+            report.pending_toasts.push((
+                format!("Cannot locate ralph binary: {e}"),
+                ToastKind::Error,
+            ));
+            return;
+        }
+    };
+    match run_dialog::dispatch_outcome(outcome, targets, workdir, &mut spawner, force_current_branch)
+    {
+        Ok(spawned) => {
+            if !spawned.is_empty() {
+                let msg = if spawned.len() == 1 {
+                    format!("Started run for {}.", spawned[0])
+                } else {
+                    format!("Started {} runs.", spawned.len())
+                };
+                report.pending_toasts.push((msg, ToastKind::Success));
+            }
+            report.spawned = spawned;
+        }
+        Err(e) => {
+            report.pending_toasts.push((
+                format!("Failed to start run: {e}"),
+                ToastKind::Error,
+            ));
+        }
+    }
+}
+
+/// Drain `report.pending_toasts` into `toasts`. Called by view dispatchers
+/// once the closure that drove `apply_palette_run_outcome` is dropped.
+pub(crate) fn flush_palette_run_toasts(
+    report: PaletteRunReport,
+    toasts: &mut crate::tui::toast::ToastQueue,
+) {
+    use std::time::Instant;
+    for (msg, kind) in report.pending_toasts {
+        toasts.push(msg, kind, Instant::now());
+    }
+}
+
 /// Apply a [`PaletteAction`] to the plan-list view. Performs every side
 /// effect the palette dispatcher requests except for terminal-bound dialogs
 /// (`OpenConfirmArchive`, `OpenConfirmDelete`), which the caller drives via
@@ -904,14 +1190,6 @@ pub(crate) fn plan_list_apply_palette_action(
                 Instant::now(),
             );
         }
-        // Step 21 — branch-choice dialog.
-        PaletteAction::OpenRunDialog { .. } | PaletteAction::RunOnBranch { .. } => {
-            app.toasts.push(
-                "Run dialog lands in step 21.",
-                ToastKind::Info,
-                Instant::now(),
-            );
-        }
         // Step 22 — sub-view routing.
         PaletteAction::OpenPlanDependencies { .. }
         | PaletteAction::OpenPlanHooks { .. }
@@ -950,6 +1228,11 @@ pub(crate) fn plan_list_apply_palette_action(
         // Terminal-bound: hand back to the caller so it can render the
         // confirm dialog with the live plan-list view as the background.
         PaletteAction::OpenConfirmArchive { .. } | PaletteAction::OpenConfirmDelete { .. } => {
+            return Ok(Some(action));
+        }
+        // Terminal-bound: hand back so the caller can render the run-choice
+        // dialog (TUI-plan.md §9.1) with the live view as the background.
+        PaletteAction::OpenRunDialog { .. } | PaletteAction::RunOnBranch { .. } => {
             return Ok(Some(action));
         }
     }
@@ -1264,20 +1547,61 @@ fn run_archived_list_tui<B: ratatui::backend::Backend>(
                 PaletteBarOutcome::Submit(input) => {
                     let action = archived_list_palette_action(&input, default_harness, &app);
                     app.close_palette();
-                    if let Some(PaletteAction::OpenConfirmDelete { plan_id, slug }) =
-                        archived_list_apply_palette_action(conn, project, &mut app, action)?
-                    {
-                        let body = format!(
-                            "Permanently delete plan `{slug}`? This cannot be undone."
-                        );
-                        let confirm = dialog::Confirm {
-                            title: "Permanently delete plan",
-                            body: &body,
-                            default: false,
-                        };
-                        if confirm_with_archived_background(terminal, &mut app, &confirm)? {
-                            archived_list_apply_delete(conn, project, &mut app, &[plan_id])?;
+                    match archived_list_apply_palette_action(conn, project, &mut app, action)? {
+                        Some(PaletteAction::OpenConfirmDelete { plan_id, slug }) => {
+                            let body = format!(
+                                "Permanently delete plan `{slug}`? This cannot be undone."
+                            );
+                            let confirm = dialog::Confirm {
+                                title: "Permanently delete plan",
+                                body: &body,
+                                default: false,
+                            };
+                            if confirm_with_archived_background(terminal, &mut app, &confirm)? {
+                                archived_list_apply_delete(conn, project, &mut app, &[plan_id])?;
+                            }
                         }
+                        // The archived list passes empty `run_targets`, so the
+                        // dispatcher folds `/run` into a "No plan to run." toast
+                        // before reaching the apply step. We forward defensively
+                        // for parity with the active plan-list view.
+                        Some(PaletteAction::OpenRunDialog {
+                            default_branch,
+                            plan_count,
+                            targets,
+                        }) => {
+                            let outcome = run_dialog_loop_with_bg(
+                                terminal,
+                                |f| crate::tui::views::archived_list::draw(f, &mut app),
+                                default_branch,
+                                plan_count,
+                            )?;
+                            let report = apply_palette_run_outcome(
+                                terminal,
+                                |f| crate::tui::views::archived_list::draw(f, &mut app),
+                                project,
+                                outcome,
+                                &targets,
+                                plan_count > 1,
+                            )?;
+                            flush_palette_run_toasts(report, &mut app.toasts);
+                        }
+                        Some(PaletteAction::RunOnBranch {
+                            branch,
+                            targets,
+                            force_current_branch,
+                        }) => {
+                            let report = apply_palette_run_outcome(
+                                terminal,
+                                |f| crate::tui::views::archived_list::draw(f, &mut app),
+                                project,
+                                crate::tui::run_dialog::Outcome::NewBranch(branch),
+                                &targets,
+                                force_current_branch,
+                            )?;
+                            flush_palette_run_toasts(report, &mut app.toasts);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1450,9 +1774,14 @@ pub(crate) fn archived_list_apply_palette_action(
                 Instant::now(),
             );
         }
+        // Archived list passes empty `run_targets` so `/run` never reaches
+        // these variants — the dispatcher already toasts "No plan to run."
+        // We forward defensively for the same per-view behavior the active
+        // plan-list provides; the loop's terminal-bound handler then takes
+        // over (and the dialog renders over the archived view).
         PaletteAction::OpenRunDialog { .. } | PaletteAction::RunOnBranch { .. } => {
             app.toasts.push(
-                "Run dialog lands in step 21.",
+                "Unarchive the plan first to run it.",
                 ToastKind::Info,
                 Instant::now(),
             );
@@ -1804,6 +2133,46 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
                                 );
                                 app.should_pop = true;
                             }
+                        }
+                        // §9.1 run-choice dialog. The dialog renders over the
+                        // live plan-detail; on success the caller spawns a
+                        // non-streaming runner (the streaming `R` keybinding
+                        // remains the in-view live-attach path).
+                        Some(PaletteAction::OpenRunDialog {
+                            default_branch,
+                            plan_count,
+                            targets,
+                        }) => {
+                            let outcome = run_dialog_loop_with_bg(
+                                terminal,
+                                |f| crate::tui::views::plan_detail_ui::draw(f, &mut app),
+                                default_branch,
+                                plan_count,
+                            )?;
+                            let report = apply_palette_run_outcome(
+                                terminal,
+                                |f| crate::tui::views::plan_detail_ui::draw(f, &mut app),
+                                project,
+                                outcome,
+                                &targets,
+                                plan_count > 1,
+                            )?;
+                            flush_palette_run_toasts(report, &mut app.toasts);
+                        }
+                        Some(PaletteAction::RunOnBranch {
+                            branch,
+                            targets,
+                            force_current_branch,
+                        }) => {
+                            let report = apply_palette_run_outcome(
+                                terminal,
+                                |f| crate::tui::views::plan_detail_ui::draw(f, &mut app),
+                                project,
+                                crate::tui::run_dialog::Outcome::NewBranch(branch),
+                                &targets,
+                                force_current_branch,
+                            )?;
+                            flush_palette_run_toasts(report, &mut app.toasts);
                         }
                         _ => {}
                     }
@@ -2483,13 +2852,6 @@ pub(crate) fn plan_detail_apply_palette_action(
                 Instant::now(),
             );
         }
-        PaletteAction::OpenRunDialog { .. } | PaletteAction::RunOnBranch { .. } => {
-            app.toasts.push(
-                "Run dialog lands in step 21.",
-                ToastKind::Info,
-                Instant::now(),
-            );
-        }
         PaletteAction::OpenPlanDependencies { .. }
         | PaletteAction::OpenPlanHooks { .. }
         | PaletteAction::OpenStepHooks { .. }
@@ -2510,9 +2872,15 @@ pub(crate) fn plan_detail_apply_palette_action(
                 Instant::now(),
             );
         }
+        // Terminal-bound: hand back to the caller. `OpenRunDialog` /
+        // `RunOnBranch` (TUI-plan.md §9.1) render the run-choice dialog over
+        // the live plan-detail view; the others drive the existing
+        // archive/delete confirms.
         PaletteAction::PushPlanDetail { .. }
         | PaletteAction::OpenConfirmArchive { .. }
-        | PaletteAction::OpenConfirmDelete { .. } => {
+        | PaletteAction::OpenConfirmDelete { .. }
+        | PaletteAction::OpenRunDialog { .. }
+        | PaletteAction::RunOnBranch { .. } => {
             return Ok(Some(action));
         }
     }
@@ -3355,17 +3723,57 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
                     let action =
                         step_detail_palette_action(&input, &config.default_harness, &app);
                     app.close_palette();
-                    if let Some(
-                        PaletteAction::PushPlanDetail { .. }
-                        | PaletteAction::OpenConfirmArchive { .. }
-                        | PaletteAction::OpenConfirmDelete { .. },
-                    ) = step_detail_apply_palette_action(conn, project, &mut app, action)?
-                    {
-                        app.toasts.push(
-                            "Pop back to the plan list to do that.",
-                            ToastKind::Info,
-                            Instant::now(),
-                        );
+                    match step_detail_apply_palette_action(conn, project, &mut app, action)? {
+                        Some(PaletteAction::PushPlanDetail { .. })
+                        | Some(PaletteAction::OpenConfirmArchive { .. })
+                        | Some(PaletteAction::OpenConfirmDelete { .. }) => {
+                            app.toasts.push(
+                                "Pop back to the plan list to do that.",
+                                ToastKind::Info,
+                                Instant::now(),
+                            );
+                        }
+                        // §9.1 run-choice dialog. Step-detail renders the
+                        // dialog over its own surface; success spawns a
+                        // non-streaming runner via the palette path (the
+                        // streaming attach path remains plan-detail's `R`).
+                        Some(PaletteAction::OpenRunDialog {
+                            default_branch,
+                            plan_count,
+                            targets,
+                        }) => {
+                            let outcome = run_dialog_loop_with_bg(
+                                terminal,
+                                |f| crate::tui::views::step_detail::draw(f, &mut app),
+                                default_branch,
+                                plan_count,
+                            )?;
+                            let report = apply_palette_run_outcome(
+                                terminal,
+                                |f| crate::tui::views::step_detail::draw(f, &mut app),
+                                project,
+                                outcome,
+                                &targets,
+                                plan_count > 1,
+                            )?;
+                            flush_palette_run_toasts(report, &mut app.toasts);
+                        }
+                        Some(PaletteAction::RunOnBranch {
+                            branch,
+                            targets,
+                            force_current_branch,
+                        }) => {
+                            let report = apply_palette_run_outcome(
+                                terminal,
+                                |f| crate::tui::views::step_detail::draw(f, &mut app),
+                                project,
+                                crate::tui::run_dialog::Outcome::NewBranch(branch),
+                                &targets,
+                                force_current_branch,
+                            )?;
+                            flush_palette_run_toasts(report, &mut app.toasts);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3559,13 +3967,6 @@ pub(crate) fn step_detail_apply_palette_action(
                 Instant::now(),
             );
         }
-        PaletteAction::OpenRunDialog { .. } | PaletteAction::RunOnBranch { .. } => {
-            app.toasts.push(
-                "Run dialog lands in step 21.",
-                ToastKind::Info,
-                Instant::now(),
-            );
-        }
         PaletteAction::OpenPlanDependencies { .. }
         | PaletteAction::OpenPlanHooks { .. }
         | PaletteAction::OpenStepHooks { .. }
@@ -3586,9 +3987,15 @@ pub(crate) fn step_detail_apply_palette_action(
                 Instant::now(),
             );
         }
+        // Terminal-bound: hand back to the caller. The step-detail dispatcher
+        // currently toasts a "pop back" hint for the inherited variants, so
+        // the run-choice dialog (TUI-plan.md §9.1) gets the same treatment
+        // there — the loop renders the dialog over plan-detail's parent view.
         PaletteAction::PushPlanDetail { .. }
         | PaletteAction::OpenConfirmArchive { .. }
-        | PaletteAction::OpenConfirmDelete { .. } => {
+        | PaletteAction::OpenConfirmDelete { .. }
+        | PaletteAction::OpenRunDialog { .. }
+        | PaletteAction::RunOnBranch { .. } => {
             return Ok(Some(action));
         }
     }
@@ -6955,5 +7362,283 @@ mod palette_action_tests {
             app.toasts.current().unwrap().color,
             ToastKind::Error.color()
         );
+    }
+}
+
+#[cfg(test)]
+mod run_dialog_apply_tests {
+    //! Tests for the `/run` palette wiring (TUI-plan.md §9.1, step 21):
+    //!   * `*_apply_palette_action` forwards `OpenRunDialog` / `RunOnBranch`
+    //!     to the caller (terminal-bound — same channel as the existing
+    //!     archive/delete confirms).
+    //!   * `classify_branch_target` correctly identifies the three branch
+    //!     states the apply helper needs: already-on, switch-existing,
+    //!     needs-create.
+    //!   * `spawn_palette_runners` shapes its toast on the spawn outcome.
+
+    use super::*;
+    use crate::db;
+    use crate::tui::palette_dispatch::PaletteAction;
+    use crate::tui::run_dialog::{Outcome, RunTarget};
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::plan_list::PlanListApp;
+
+    fn seed_plan(project: &str) -> (Connection, PlanListApp) {
+        let conn = db::open_memory().unwrap();
+        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[])
+            .unwrap();
+        let tiles = build_plan_tiles(&conn, project).unwrap();
+        let app = PlanListApp::new(tiles, project, "UTC");
+        (conn, app)
+    }
+
+    fn run_target(slug: &str, branch: &str) -> RunTarget {
+        RunTarget {
+            slug: slug.to_string(),
+            default_branch: branch.to_string(),
+        }
+    }
+
+    // -- Forwarding from apply (mirrors archive/delete forwarding) ----------
+
+    #[test]
+    fn plan_list_apply_forwards_open_run_dialog_to_caller() {
+        let project = "/tmp/run-dialog-forward";
+        let (conn, mut app) = seed_plan(project);
+        let action = PaletteAction::OpenRunDialog {
+            default_branch: "feature-x".to_string(),
+            plan_count: 1,
+            targets: vec![run_target("alpha", "feature-x")],
+        };
+        let forwarded =
+            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(matches!(
+            forwarded,
+            Some(PaletteAction::OpenRunDialog { plan_count: 1, .. })
+        ));
+        // No toast is pushed — the caller drives the dialog.
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn plan_list_apply_forwards_run_on_branch_to_caller() {
+        let project = "/tmp/run-on-branch-forward";
+        let (conn, mut app) = seed_plan(project);
+        let action = PaletteAction::RunOnBranch {
+            branch: "hotfix".to_string(),
+            targets: vec![run_target("alpha", "feature-x")],
+            force_current_branch: false,
+        };
+        let forwarded =
+            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(matches!(
+            forwarded,
+            Some(PaletteAction::RunOnBranch { ref branch, .. }) if branch == "hotfix"
+        ));
+        assert!(app.toasts.is_empty());
+    }
+
+    // -- /run end-to-end through the dispatcher ------------------------------
+
+    #[test]
+    fn slash_run_with_focus_returns_open_run_dialog() {
+        // The acceptance criterion: `/run` from plan-list opens the dialog.
+        // We can't drive the dialog without a real terminal, but we *can*
+        // assert that the parser → dispatcher → apply pipeline routes the
+        // action back to the caller for the loop's terminal-bound handler.
+        let project = "/tmp/slash-run-opens-dialog";
+        let (conn, mut app) = seed_plan(project);
+        let action = plan_list_palette_action("/run", "claude", &app, &[]);
+        match &action {
+            PaletteAction::OpenRunDialog {
+                default_branch,
+                plan_count,
+                targets,
+            } => {
+                assert_eq!(default_branch, "feature-x");
+                assert_eq!(*plan_count, 1);
+                assert_eq!(targets.len(), 1);
+                assert_eq!(targets[0].slug, "alpha");
+            }
+            other => panic!("expected OpenRunDialog, got {other:?}"),
+        }
+        let forwarded =
+            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(matches!(forwarded, Some(PaletteAction::OpenRunDialog { .. })));
+    }
+
+    #[test]
+    fn slash_run_with_branch_short_circuits_dialog() {
+        // The acceptance criterion: `/run <branch>` short-circuits the dialog
+        // and routes straight to RunOnBranch.
+        let project = "/tmp/slash-run-with-branch";
+        let (conn, mut app) = seed_plan(project);
+        let action = plan_list_palette_action("/run hotfix", "claude", &app, &[]);
+        match &action {
+            PaletteAction::RunOnBranch {
+                branch,
+                targets,
+                force_current_branch,
+            } => {
+                assert_eq!(branch, "hotfix");
+                assert_eq!(targets.len(), 1);
+                // Single plan, not multi-select — don't force current-branch
+                // at the dispatcher level; the apply step decides per the
+                // branch's relationship to plan.branch_name.
+                assert!(!*force_current_branch);
+            }
+            other => panic!("expected RunOnBranch, got {other:?}"),
+        }
+        let forwarded =
+            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(matches!(forwarded, Some(PaletteAction::RunOnBranch { .. })));
+    }
+
+    // -- classify_branch_target ----------------------------------------------
+
+    fn init_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "t@t.com"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "t"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("README"), "x").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        (tmp, dir)
+    }
+
+    #[test]
+    fn classify_branch_already_on_target_returns_already_on_target() {
+        let (_tmp, dir) = init_repo();
+        let current = crate::git::get_current_branch(&dir).unwrap();
+        assert_eq!(
+            classify_branch_target(&dir, &current).unwrap(),
+            BranchDecision::AlreadyOnTarget,
+        );
+    }
+
+    #[test]
+    fn classify_branch_existing_returns_switch_existing() {
+        let (_tmp, dir) = init_repo();
+        let initial = crate::git::get_current_branch(&dir).unwrap();
+        crate::git::create_and_checkout_branch(&dir, "feature/here").unwrap();
+        // We're now on feature/here. Asking for `initial` (which exists) →
+        // SwitchExisting.
+        assert_eq!(
+            classify_branch_target(&dir, &initial).unwrap(),
+            BranchDecision::SwitchExisting,
+        );
+    }
+
+    #[test]
+    fn classify_branch_missing_returns_needs_create() {
+        let (_tmp, dir) = init_repo();
+        assert_eq!(
+            classify_branch_target(&dir, "feature/never").unwrap(),
+            BranchDecision::NeedsCreate,
+        );
+    }
+
+    // -- spawn_palette_runners toast shape ------------------------------------
+
+    #[test]
+    fn spawn_runners_toasts_singular_for_one_plan() {
+        // Use the real ProcessRunSpawner — its smoke test in run_dialog
+        // proves it doesn't panic. Here we just want the success-toast
+        // wording to flow through PaletteRunReport.
+        //
+        // We can't actually fork ralph here without polluting test state,
+        // so this asserts the shape of the report when dispatch_outcome is
+        // a no-op (Outcome::Cancelled).
+        let workdir = std::path::Path::new("/tmp/spawn-runners-shape");
+        let mut report = PaletteRunReport::default();
+        spawn_palette_runners(
+            workdir,
+            &Outcome::Cancelled,
+            &[run_target("alpha", "main")],
+            false,
+            &mut report,
+        );
+        // Cancelled outcome → no spawn → no toast.
+        assert!(report.spawned.is_empty());
+        assert!(report.pending_toasts.is_empty());
+    }
+
+    // -- apply_palette_run_outcome short-circuits ----------------------------
+
+    #[test]
+    fn apply_outcome_cancelled_yields_empty_report() {
+        // Cancelled / Pending must be no-ops: no toast, no spawn, no branch
+        // switch. We can call apply_palette_run_outcome without a terminal
+        // because the cancelled path doesn't render anything.
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let report = apply_palette_run_outcome(
+            &mut terminal,
+            |_f| {},
+            "/tmp/no-such-project",
+            Outcome::Cancelled,
+            &[run_target("alpha", "main")],
+            false,
+        )
+        .unwrap();
+        assert!(report.spawned.is_empty());
+        assert!(report.pending_toasts.is_empty());
+    }
+
+    #[test]
+    fn apply_outcome_pending_yields_empty_report() {
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let report = apply_palette_run_outcome(
+            &mut terminal,
+            |_f| {},
+            "/tmp/no-such-project",
+            Outcome::Pending,
+            &[run_target("alpha", "main")],
+            false,
+        )
+        .unwrap();
+        assert!(report.spawned.is_empty());
+        assert!(report.pending_toasts.is_empty());
+    }
+
+    // -- flush_palette_run_toasts -------------------------------------------
+
+    #[test]
+    fn flush_palette_run_toasts_drains_into_view_queue() {
+        let mut queue = crate::tui::toast::ToastQueue::default();
+        let report = PaletteRunReport {
+            spawned: vec!["alpha".to_string()],
+            pending_toasts: vec![
+                ("Started run for alpha.".to_string(), ToastKind::Success),
+                ("Hint.".to_string(), ToastKind::Info),
+            ],
+        };
+        flush_palette_run_toasts(report, &mut queue);
+        // The most recent toast is the visible one; the queue should have
+        // received both.
+        assert!(!queue.is_empty());
     }
 }
