@@ -613,6 +613,21 @@ impl Step {
 }
 
 // ---------------------------------------------------------------------------
+// AnsweredQuestion struct
+// ---------------------------------------------------------------------------
+
+/// A question that the harness asked via `ralph question ask` and the user
+/// has since answered. Returned by
+/// [`crate::storage::list_answered_questions_for_step`] in chronological order
+/// and rendered into the prompt's "Previously answered questions" section on
+/// the next attempt of the step (TUI-plan.md §17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnsweredQuestion {
+    pub question: String,
+    pub answer: String,
+}
+
+// ---------------------------------------------------------------------------
 // ExecutionLog struct
 // ---------------------------------------------------------------------------
 

@@ -634,6 +634,13 @@ pub async fn execute_step(
             plan: PromptWrap::from_opts(plan.prompt_prefix.as_ref(), plan.prompt_suffix.as_ref()),
         };
 
+        // Fetch any answered questions for this step so the next-attempt
+        // prompt re-injects the user's clarifications between Plan context
+        // and Step details (TUI-plan.md §17 "Retry context after answering").
+        // First attempts on un-paused steps return an empty slice — the call
+        // is one indexed lookup, no need to gate it on attempt > 1.
+        let answered_questions = storage::list_answered_questions_for_step(conn, &step.id)?;
+
         // Build prompt.
         let prompt_text = prompt::build_step_prompt(
             plan,
@@ -643,6 +650,7 @@ pub async fn execute_step(
             retry_context.as_ref(),
             harness_config.supports_agent_file,
             &wraps,
+            &answered_questions,
         );
 
         // Create execution log entry.

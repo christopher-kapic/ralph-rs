@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 use crate::frac_index;
 use crate::plan::{
-    ChangePolicy, ExecutionLog, PLAN_COLUMNS, Phase, Plan, PlanStatus, Step, StepStatus,
+    AnsweredQuestion, ChangePolicy, ExecutionLog, PLAN_COLUMNS, Phase, Plan, PlanStatus, Step,
+    StepStatus,
 };
 use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 
@@ -368,6 +369,39 @@ pub fn list_open_questions(
         for row in rows {
             out.push(row?);
         }
+    }
+    Ok(out)
+}
+
+/// List answered questions for a step in chronological order (oldest first).
+///
+/// Drives the "Previously answered questions" section that the prompt builder
+/// injects between Plan context and Step details on the next attempt after a
+/// pause (TUI-plan.md §17). Rows where `answer IS NULL` are excluded — those
+/// are still pending and would be rendered in a different surface.
+///
+/// Ordering uses `asked_at ASC` then `id ASC` to match
+/// [`list_open_questions`], so the harness sees Q&A pairs in the same sequence
+/// it asked them.
+pub fn list_answered_questions_for_step(
+    conn: &Connection,
+    step_id: &str,
+) -> Result<Vec<AnsweredQuestion>> {
+    let mut stmt = conn.prepare(
+        "SELECT question, answer
+         FROM step_questions
+         WHERE step_id = ?1 AND answer IS NOT NULL
+         ORDER BY asked_at ASC, id ASC",
+    )?;
+    let rows = stmt.query_map(params![step_id], |row| {
+        Ok(AnsweredQuestion {
+            question: row.get(0)?,
+            answer: row.get(1)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
     }
     Ok(out)
 }
@@ -2103,6 +2137,78 @@ mod tests {
         set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
         let off = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
         assert!(!off.questions_enabled);
+    }
+
+    #[test]
+    fn test_list_answered_questions_for_step_returns_only_answered_in_order() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Three rows: one already-answered, one unanswered (must be excluded),
+        // and one answered later. Use explicit asked_at timestamps to verify
+        // chronological ordering rather than insertion order.
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
+             VALUES ('q1', ?1, 1, 'Q1?', '[]', 'A1.', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
+            params![&step.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at)
+             VALUES ('q2', ?1, 1, 'Q2-pending?', '[]', NULL, '2026-05-01T10:30:00.000Z')",
+            params![&step.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
+             VALUES ('q3', ?1, 2, 'Q3?', '[]', 'A3.', '2026-05-01T12:00:00.000Z', '2026-05-01T13:00:00.000Z')",
+            params![&step.id],
+        )
+        .unwrap();
+
+        let answered = list_answered_questions_for_step(&conn, &step.id).unwrap();
+        assert_eq!(answered.len(), 2, "unanswered row must be excluded");
+        assert_eq!(answered[0].question, "Q1?");
+        assert_eq!(answered[0].answer, "A1.");
+        assert_eq!(answered[1].question, "Q3?");
+        assert_eq!(answered[1].answer, "A3.");
+    }
+
+    #[test]
+    fn test_list_answered_questions_for_step_empty_when_no_rows() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "step",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let answered = list_answered_questions_for_step(&conn, &step.id).unwrap();
+        assert!(answered.is_empty());
     }
 
     #[test]
