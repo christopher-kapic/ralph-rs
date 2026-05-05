@@ -13,6 +13,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 
+use crate::tui::theme;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ELLIPSIS: char = '…';
 const CRUMB_SEP: &str = " › ";
@@ -102,7 +104,7 @@ fn render_bottom(frame: &mut Frame, area: Rect, hint: &str, cwd: &Path, banner: 
         ),
         None => (
             right_truncate(hint, left_max),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::CHROME_DIM),
         ),
     };
     frame.render_widget(
@@ -110,8 +112,11 @@ fn render_bottom(frame: &mut Frame, area: Rect, hint: &str, cwd: &Path, banner: 
         chunks[0],
     );
     frame.render_widget(
-        Paragraph::new(Span::styled(cwd_text, Style::default().fg(Color::DarkGray)))
-            .alignment(Alignment::Right),
+        Paragraph::new(Span::styled(
+            cwd_text,
+            Style::default().fg(theme::CHROME_DIM),
+        ))
+        .alignment(Alignment::Right),
         chunks[1],
     );
 }
