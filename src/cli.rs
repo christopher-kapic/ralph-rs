@@ -261,6 +261,14 @@ pub enum Command {
         lines: Option<usize>,
     },
 
+    /// Ask the user a question or list/answer outstanding questions on a plan.
+    ///
+    /// `ralph question ask` is invoked by the harness mid-step to pause for
+    /// clarification on a per-plan opt-in question feature. See TUI-plan.md
+    /// §17 for the full design.
+    #[command(subcommand)]
+    Question(QuestionCommand),
+
     /// List and manage agent file templates.
     #[command(subcommand)]
     Agents(AgentsCommand),
@@ -828,6 +836,29 @@ pub enum PlanPrependCommand {
     Clear {
         /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Question subcommands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum QuestionCommand {
+    /// Record a harness-asked question against the currently-executing step.
+    ///
+    /// Designed to be invoked by the harness mid-step. Binds to the live
+    /// `ralph run` for this project via the run lock; if no run is active,
+    /// or the plan does not have questions enabled, exits non-zero with an
+    /// explanatory message and writes nothing to the database.
+    Ask {
+        /// The question text. If omitted, read from stdin.
+        question: Option<String>,
+
+        /// A suggested answer. Repeatable. The user can always type a custom
+        /// answer; suggestions are hints, not a closed set.
+        #[arg(long = "suggest", short = 's', value_name = "ANSWER")]
+        suggest: Vec<String>,
     },
 }
 
@@ -1913,6 +1944,42 @@ mod tests {
             assert_eq!(change_policy, Some(crate::plan::ChangePolicy::Required));
         } else {
             panic!("Expected Step Edit");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_ask_positional() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "question",
+            "ask",
+            "Should I use Postgres or SQLite?",
+            "--suggest",
+            "PostgreSQL",
+            "-s",
+            "SQLite",
+        ])
+        .unwrap();
+        if let Command::Question(QuestionCommand::Ask { question, suggest }) = cli.command.unwrap()
+        {
+            assert_eq!(question.as_deref(), Some("Should I use Postgres or SQLite?"));
+            assert_eq!(suggest, vec!["PostgreSQL".to_string(), "SQLite".to_string()]);
+        } else {
+            panic!("Expected Question Ask");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_ask_no_positional_no_suggestions() {
+        // Both the positional and the `-s` flag must be optional so the
+        // stdin-only / open-ended cases parse cleanly.
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "ask"]).unwrap();
+        if let Command::Question(QuestionCommand::Ask { question, suggest }) = cli.command.unwrap()
+        {
+            assert!(question.is_none());
+            assert!(suggest.is_empty());
+        } else {
+            panic!("Expected Question Ask");
         }
     }
 

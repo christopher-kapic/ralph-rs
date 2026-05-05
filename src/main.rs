@@ -30,7 +30,7 @@ use clap::Parser;
 
 use crate::cli::{
     AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
-    PlanHarnessCommand, PlanPrependCommand, PromptCommand, StepCommand,
+    PlanHarnessCommand, PlanPrependCommand, PromptCommand, QuestionCommand, StepCommand,
 };
 
 use crate::commands::{resolve_plan, resolve_project};
@@ -585,6 +585,43 @@ fn main() -> Result<()> {
                 &out,
             )
         }
+
+        // -- Question --
+        Command::Question(subcmd) => match subcmd {
+            QuestionCommand::Ask { question, suggest } => {
+                use crate::commands::question::{
+                    DISABLED_MESSAGE, NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome,
+                    record_question_ask,
+                };
+                use std::io::Read;
+
+                // Spec: positional arg if present, else stdin. Trim trailing
+                // whitespace (heredoc invocations always include a final
+                // newline) but leave embedded whitespace alone.
+                let q = match question {
+                    Some(t) => t,
+                    None => {
+                        let mut buf = String::new();
+                        std::io::stdin()
+                            .read_to_string(&mut buf)
+                            .context("Failed to read question text from stdin")?;
+                        buf.trim_end().to_string()
+                    }
+                };
+
+                match record_question_ask(&conn, &project, &q, &suggest)? {
+                    QuestionAskOutcome::NoActiveRun => {
+                        eprintln!("{NO_ACTIVE_RUN_MESSAGE}");
+                        std::process::exit(1);
+                    }
+                    QuestionAskOutcome::Disabled => {
+                        eprintln!("{DISABLED_MESSAGE}");
+                        std::process::exit(1);
+                    }
+                    QuestionAskOutcome::Recorded { .. } => Ok(()),
+                }
+            }
+        },
 
         // -- Agents --
         Command::Agents(subcmd) => match subcmd {

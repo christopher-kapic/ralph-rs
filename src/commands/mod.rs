@@ -8,6 +8,7 @@ pub mod config_cmd;
 mod hooks;
 mod plan;
 mod prompt;
+pub mod question;
 mod run;
 mod step;
 
