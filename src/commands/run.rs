@@ -359,17 +359,66 @@ pub fn run_plan_list_tui(
                     continue;
                 }
                 // §9 palette: while open, route every key through the palette
-                // bar first. Submit / cancel both close it; step 20 wires the
-                // parsed command into `palette_dispatch::dispatch`. <Enter>
-                // submits via `crate::tui::palette::parse(input)`.
+                // bar first. Submit dispatches via [`palette_list_palette_action`]
+                // and applies the resulting [`PaletteAction`] in-view. The
+                // archive/delete confirms render over the live tile list using
+                // the existing `confirm_with_background` helper.
                 if let Some(bar) = app.palette_bar.as_mut() {
+                    use crate::tui::palette_dispatch::PaletteAction;
                     use crate::tui::widgets::palette_bar::PaletteBarOutcome;
                     match bar.on_key(key) {
                         PaletteBarOutcome::Pending => {}
                         PaletteBarOutcome::Cancel => app.close_palette(),
                         PaletteBarOutcome::Submit(input) => {
-                            let _parsed = crate::tui::palette::parse(&input);
+                            let archived_refs = plan_refs_from_archived(conn, project)
+                                .unwrap_or_default();
+                            let action = plan_list_palette_action(
+                                &input,
+                                &config.default_harness,
+                                &app,
+                                &archived_refs,
+                            );
                             app.close_palette();
+                            match plan_list_apply_palette_action(conn, project, &mut app, action)?
+                            {
+                                Some(PaletteAction::OpenConfirmArchive { plan_id, slug }) => {
+                                    let body = format!("Archive plan `{slug}`?");
+                                    let confirm = dialog::Confirm {
+                                        title: "Archive plan",
+                                        body: &body,
+                                        default: false,
+                                    };
+                                    if confirm_with_background(
+                                        &mut terminal,
+                                        &mut app,
+                                        &confirm,
+                                    )? {
+                                        plan_list_apply_archive(
+                                            conn, project, &mut app, &plan_id,
+                                        )?;
+                                    }
+                                }
+                                Some(PaletteAction::OpenConfirmDelete { plan_id, slug }) => {
+                                    let body = format!(
+                                        "Permanently delete plan `{slug}`? This cannot be undone."
+                                    );
+                                    let confirm = dialog::Confirm {
+                                        title: "Permanently delete plan",
+                                        body: &body,
+                                        default: false,
+                                    };
+                                    if confirm_with_background(
+                                        &mut terminal,
+                                        &mut app,
+                                        &confirm,
+                                    )? {
+                                        plan_list_apply_delete(
+                                            conn, project, &mut app, &plan_id,
+                                        )?;
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     continue;
@@ -436,6 +485,7 @@ pub fn run_plan_list_tui(
                                     conn,
                                     project,
                                     &config.display_timezone,
+                                    &config.default_harness,
                                 )?;
                                 refresh_plan_list_state(conn, project, &mut app)?;
                             }
@@ -712,6 +762,374 @@ pub(crate) fn plan_list_apply_create(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Palette helpers shared across view dispatchers (TUI-plan.md §9, step 20)
+// ---------------------------------------------------------------------------
+
+/// Build [`PlanRef`]s from the `Plan`s embedded in plan-list / archived-list
+/// tiles. Used by the palette dispatchers to resolve `[<slug>]` arguments
+/// against the visible plan pool.
+fn plan_refs_from_tiles(
+    tiles: &[crate::tui::views::plan_list::PlanTile],
+) -> Vec<crate::tui::palette_dispatch::PlanRef> {
+    tiles
+        .iter()
+        .map(|t| crate::tui::palette_dispatch::PlanRef {
+            id: t.plan.id.clone(),
+            slug: t.plan.slug.clone(),
+            branch_name: t.plan.branch_name.clone(),
+            status: t.plan.status,
+        })
+        .collect()
+}
+
+/// Fetch archived plans from the DB and project them into [`PlanRef`]s. Used
+/// by plan-list to support `/plan unarchive <slug>` without keeping a second
+/// in-memory cache (the archived list isn't loaded until the user pushes
+/// into it).
+fn plan_refs_from_archived(
+    conn: &Connection,
+    project: &str,
+) -> Result<Vec<crate::tui::palette_dispatch::PlanRef>> {
+    let plans = storage::list_archived_plans_sorted_by_recency(conn, project)?;
+    Ok(plans
+        .into_iter()
+        .map(|p| crate::tui::palette_dispatch::PlanRef {
+            id: p.id,
+            slug: p.slug,
+            branch_name: p.branch_name,
+            status: p.status,
+        })
+        .collect())
+}
+
+/// Build a single [`PlanRef`] from a fully-loaded `Plan` (used by plan-detail
+/// and step-detail, which have one focused plan rather than a tile list).
+fn plan_ref_from_plan(plan: &crate::plan::Plan) -> crate::tui::palette_dispatch::PlanRef {
+    crate::tui::palette_dispatch::PlanRef {
+        id: plan.id.clone(),
+        slug: plan.slug.clone(),
+        branch_name: plan.branch_name.clone(),
+        status: plan.status,
+    }
+}
+
+/// Apply a [`PaletteAction`] to the plan-list view. Performs every side
+/// effect the palette dispatcher requests except for terminal-bound dialogs
+/// (`OpenConfirmArchive`, `OpenConfirmDelete`), which the caller drives via
+/// `confirm_with_background`. Returns `Some(action)` for those terminal-bound
+/// variants so the dispatcher loop can run the confirm step itself.
+///
+/// Sub-view actions that land in step 22 (`OpenPlan{Dependencies,Hooks}`,
+/// `OpenStep{Hooks,Tags}`) toast a "coming in step 22" placeholder; the run
+/// dialog actions (`OpenRunDialog`, `RunOnBranch`) defer to step 21.
+pub(crate) fn plan_list_apply_palette_action(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+    action: crate::tui::palette_dispatch::PaletteAction,
+) -> Result<Option<crate::tui::palette_dispatch::PaletteAction>> {
+    use crate::tui::palette_dispatch::PaletteAction;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    match action {
+        PaletteAction::None => {}
+        PaletteAction::Toast { message, kind } => {
+            app.toasts.push(message, kind, Instant::now());
+        }
+        PaletteAction::Quit => {
+            app.request_quit();
+        }
+        PaletteAction::PushPlanDetail { slug } => {
+            // Plan-list's dispatcher pushes plan-detail directly for `enter`,
+            // so route the palette command through the same `open_request`
+            // channel — keeps the view's transition logic in one place.
+            app.open_request = Some(crate::tui::views::plan_list::OpenRequest::Plan(slug));
+        }
+        PaletteAction::Approve { plan_id, slug } => {
+            storage::update_plan_status(conn, &plan_id, crate::plan::PlanStatus::Ready)?;
+            if let Some(updated) = storage::get_plan_by_slug(conn, &slug, project)? {
+                app.update_plan_in_place(updated);
+            }
+            app.toasts
+                .push("Plan approved.", ToastKind::Success, Instant::now());
+        }
+        PaletteAction::Unarchive { plan_id, slug: _ } => {
+            storage::update_plan_status(conn, &plan_id, crate::plan::PlanStatus::Ready)?;
+            refresh_plan_list_state(conn, project, app)?;
+            app.toasts
+                .push("Unarchived.", ToastKind::Success, Instant::now());
+        }
+        PaletteAction::SetQuestionsEnabled {
+            plan_id,
+            slug,
+            enabled,
+        } => {
+            storage::set_plan_questions_enabled(conn, &plan_id, enabled)?;
+            if let Some(updated) = storage::get_plan_by_slug(conn, &slug, project)? {
+                app.update_plan_in_place(updated);
+            }
+            let msg = if enabled {
+                "Questions enabled."
+            } else {
+                "Questions disabled."
+            };
+            app.toasts.push(msg, ToastKind::Success, Instant::now());
+        }
+        PaletteAction::Export { slug, output } => {
+            apply_palette_export(&slug, output.as_deref(), conn, project, &mut app.toasts);
+        }
+        PaletteAction::Import { path } => {
+            apply_palette_import(&path, conn, project, &mut app.toasts);
+            refresh_plan_list_state(conn, project, app)?;
+        }
+        PaletteAction::SpawnPlanHarness { harness, slug: _ } => {
+            // The plan-harness flow is interactive (calls into
+            // plan_harness::run_plan_harness which expects a real terminal).
+            // Surface a "not yet from palette" toast — operators can still
+            // run it from the CLI.
+            app.toasts.push(
+                format!(
+                    "/plan harness {harness}: not yet wired from palette; use the CLI for now."
+                ),
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::CancelRun => {
+            app.toasts.push(
+                "No live run from this view.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        // Step 21 — branch-choice dialog.
+        PaletteAction::OpenRunDialog { .. } | PaletteAction::RunOnBranch { .. } => {
+            app.toasts.push(
+                "Run dialog lands in step 21.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        // Step 22 — sub-view routing.
+        PaletteAction::OpenPlanDependencies { .. }
+        | PaletteAction::OpenPlanHooks { .. }
+        | PaletteAction::OpenStepHooks { .. }
+        | PaletteAction::OpenStepTags { .. } => {
+            app.toasts.push(
+                "Sub-view routing lands in step 22.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::ComingSoon {
+            label,
+            target_step,
+        } => {
+            app.toasts.push(
+                format!("{label}: coming soon — landing in step {target_step}."),
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        // Plan-list does not host a focused plan for /step add|skip|move — the
+        // dispatcher's `resolve_slug(None, …)` already routed those to a toast
+        // when the cursor isn't on a plan. If they reach us here it's because
+        // the cursor is on a plan; route via `open_request` to plan-detail and
+        // toast a hint instead of mutating storage from this view.
+        PaletteAction::AddStep { .. }
+        | PaletteAction::SkipStep { .. }
+        | PaletteAction::MoveStep { .. } => {
+            app.toasts.push(
+                "Open the plan first to edit steps.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        // Terminal-bound: hand back to the caller so it can render the
+        // confirm dialog with the live plan-list view as the background.
+        PaletteAction::OpenConfirmArchive { .. } | PaletteAction::OpenConfirmDelete { .. } => {
+            return Ok(Some(action));
+        }
+    }
+    Ok(None)
+}
+
+/// Post-confirm half of the `OpenConfirmArchive` flow for plan-list. Sets
+/// the plan to `Archived` and refreshes the tile list. Factored apart so
+/// the dispatcher loop can drive the confirm dialog while keeping this
+/// path unit-testable.
+pub(crate) fn plan_list_apply_archive(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+    plan_id: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    storage::update_plan_status(conn, plan_id, crate::plan::PlanStatus::Archived)?;
+    refresh_plan_list_state(conn, project, app)?;
+    app.toasts
+        .push("Archived 1 plan.", ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// Post-confirm half of the `OpenConfirmDelete` flow for plan-list. Deletes
+/// the plan and refreshes the tile list.
+pub(crate) fn plan_list_apply_delete(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+    plan_id: &str,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    storage::delete_plan(conn, plan_id)?;
+    refresh_plan_list_state(conn, project, app)?;
+    app.toasts
+        .push("Deleted 1 plan.", ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// Resolve a parsed-or-error palette input into a [`PaletteAction`] for the
+/// plan-list view. Pure — no side effects, no DB writes. Tests target this
+/// directly to verify command routing without a terminal.
+pub(crate) fn plan_list_palette_action(
+    input: &str,
+    default_harness: &str,
+    app: &crate::tui::views::plan_list::PlanListApp,
+    archived_refs: &[crate::tui::palette_dispatch::PlanRef],
+) -> crate::tui::palette_dispatch::PaletteAction {
+    use crate::tui::palette;
+    use crate::tui::palette_dispatch;
+
+    let plans = plan_refs_from_tiles(&app.tiles);
+    let focused_slug = app.cursor_plan().map(|p| p.slug.as_str());
+    // Run targets: selection wins, otherwise the highlighted plan.
+    let run_targets: Vec<crate::tui::run_dialog::RunTarget> = if !app.selection.is_empty() {
+        let by_id: std::collections::HashMap<&str, &crate::plan::Plan> =
+            app.tiles.iter().map(|t| (t.plan.id.as_str(), &t.plan)).collect();
+        app.selection
+            .as_slice()
+            .iter()
+            .filter_map(|id| by_id.get(id.as_str()).map(|p| crate::tui::run_dialog::RunTarget {
+                slug: p.slug.clone(),
+                default_branch: p.branch_name.clone(),
+            }))
+            .collect()
+    } else if let Some(plan) = app.cursor_plan() {
+        vec![crate::tui::run_dialog::RunTarget {
+            slug: plan.slug.clone(),
+            default_branch: plan.branch_name.clone(),
+        }]
+    } else {
+        Vec::new()
+    };
+
+    let ctx = palette_dispatch::PaletteContext {
+        default_harness,
+        focused_slug,
+        focused_step: None,
+        run_targets: &run_targets,
+        plans: &plans,
+        archived: archived_refs,
+    };
+
+    match palette::parse(input) {
+        Ok(cmd) => palette_dispatch::dispatch(&cmd, &ctx),
+        Err(err) => palette_dispatch::dispatch_parse_error(&err),
+    }
+}
+
+/// Helper for `PaletteAction::Export`: writes `<slug>.ralph.json` (or `output`
+/// when given) and toasts. Uses `eprintln` redirected to nowhere — `export_plan`
+/// prints to stderr on success.
+fn apply_palette_export(
+    slug: &str,
+    output: Option<&str>,
+    conn: &Connection,
+    project: &str,
+    toasts: &mut crate::tui::toast::ToastQueue,
+) {
+    use crate::tui::toast::ToastKind;
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    let target_path: PathBuf = match output {
+        Some(p) => PathBuf::from(p),
+        None => PathBuf::from(format!("{slug}.ralph.json")),
+    };
+    match crate::export::export_plan(conn, slug, project, Some(&target_path)) {
+        Ok(()) => {
+            toasts.push(
+                format!("Exported {slug} to {}", target_path.display()),
+                ToastKind::Success,
+                Instant::now(),
+            );
+        }
+        Err(e) => {
+            toasts.push(
+                format!("Export failed: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+}
+
+/// Helper for `PaletteAction::Import`: reads the file, imports with no slug
+/// override, and toasts. Slug-conflict resolution will land alongside the
+/// import sub-view in step 22; for now duplicates surface as an error toast.
+fn apply_palette_import(
+    path: &str,
+    conn: &Connection,
+    project: &str,
+    toasts: &mut crate::tui::toast::ToastQueue,
+) {
+    use crate::tui::toast::ToastKind;
+    use std::path::Path;
+    use std::time::Instant;
+
+    let path_buf = Path::new(path);
+    let imported = match crate::import::read_plan_file(path_buf) {
+        Ok(p) => p,
+        Err(e) => {
+            toasts.push(
+                format!("Import failed: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return;
+        }
+    };
+    let options = crate::import::ImportOptions {
+        slug: None,
+        branch: None,
+        harness: None,
+        project,
+        strict: false,
+    };
+    match crate::import::import_plan_from_data(conn, &imported, &options) {
+        Ok(slug) => {
+            toasts.push(
+                format!("Imported plan: {slug}"),
+                ToastKind::Success,
+                Instant::now(),
+            );
+        }
+        Err(e) => {
+            toasts.push(
+                format!("Import failed: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+}
+
 /// Build the read-only tile rows the plan-list view renders. One tile per
 /// non-archived plan; recent first; counts come from `list_steps`; activity
 /// stamp comes from `last_log_started_at_for_plan`, falling back to
@@ -814,6 +1232,7 @@ fn run_archived_list_tui<B: ratatui::backend::Backend>(
     conn: &Connection,
     project: &str,
     display_timezone: &str,
+    default_harness: &str,
 ) -> Result<()> {
     use crate::tui::dialog;
     use crate::tui::views::archived_list::{self, ArchivedListApp};
@@ -832,15 +1251,34 @@ fn run_archived_list_tui<B: ratatui::backend::Backend>(
         if app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough {
             continue;
         }
-        // §9 palette: see plan-list dispatcher for the routing rule.
+        // §9 palette: see plan-list dispatcher for the routing rule. Step 20
+        // wires submit through `archived_list_palette_action` and applies the
+        // resulting `PaletteAction`; the `OpenConfirmDelete` variant runs the
+        // confirm modal over the live archived view.
         if let Some(bar) = app.palette_bar.as_mut() {
+            use crate::tui::palette_dispatch::PaletteAction;
             use crate::tui::widgets::palette_bar::PaletteBarOutcome;
             match bar.on_key(key) {
                 PaletteBarOutcome::Pending => {}
                 PaletteBarOutcome::Cancel => app.close_palette(),
                 PaletteBarOutcome::Submit(input) => {
-                    let _parsed = crate::tui::palette::parse(&input);
+                    let action = archived_list_palette_action(&input, default_harness, &app);
                     app.close_palette();
+                    if let Some(PaletteAction::OpenConfirmDelete { plan_id, slug }) =
+                        archived_list_apply_palette_action(conn, project, &mut app, action)?
+                    {
+                        let body = format!(
+                            "Permanently delete plan `{slug}`? This cannot be undone."
+                        );
+                        let confirm = dialog::Confirm {
+                            title: "Permanently delete plan",
+                            body: &body,
+                            default: false,
+                        };
+                        if confirm_with_archived_background(terminal, &mut app, &confirm)? {
+                            archived_list_apply_delete(conn, project, &mut app, &[plan_id])?;
+                        }
+                    }
                 }
             }
             continue;
@@ -955,6 +1393,142 @@ pub(crate) fn archived_list_apply_unarchive(
     };
     app.toasts.push(msg, ToastKind::Success, Instant::now());
     Ok(())
+}
+
+/// Apply a [`PaletteAction`] inside the archived-list view. Returns
+/// `Some(action)` for terminal-bound dialogs (`OpenConfirmDelete`) so the
+/// dispatcher loop can render the confirm modal over the live tile list.
+pub(crate) fn archived_list_apply_palette_action(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::archived_list::ArchivedListApp,
+    action: crate::tui::palette_dispatch::PaletteAction,
+) -> Result<Option<crate::tui::palette_dispatch::PaletteAction>> {
+    use crate::tui::palette_dispatch::PaletteAction;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    match action {
+        PaletteAction::None => {}
+        PaletteAction::Toast { message, kind } => {
+            app.toasts.push(message, kind, Instant::now());
+        }
+        PaletteAction::Quit => {
+            app.request_pop();
+        }
+        PaletteAction::Unarchive { plan_id, .. } => {
+            archived_list_apply_unarchive(conn, project, app, &[plan_id])?;
+        }
+        PaletteAction::Approve { .. } | PaletteAction::SetQuestionsEnabled { .. } => {
+            app.toasts.push(
+                "Unarchive the plan first to edit it.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::Export { slug, output } => {
+            apply_palette_export(&slug, output.as_deref(), conn, project, &mut app.toasts);
+        }
+        PaletteAction::Import { path } => {
+            apply_palette_import(&path, conn, project, &mut app.toasts);
+        }
+        PaletteAction::PushPlanDetail { .. }
+        | PaletteAction::SpawnPlanHarness { .. }
+        | PaletteAction::AddStep { .. }
+        | PaletteAction::SkipStep { .. }
+        | PaletteAction::MoveStep { .. } => {
+            app.toasts.push(
+                "Open the plan first to do that.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::CancelRun => {
+            app.toasts.push(
+                "No live run from this view.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::OpenRunDialog { .. } | PaletteAction::RunOnBranch { .. } => {
+            app.toasts.push(
+                "Run dialog lands in step 21.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::OpenPlanDependencies { .. }
+        | PaletteAction::OpenPlanHooks { .. }
+        | PaletteAction::OpenStepHooks { .. }
+        | PaletteAction::OpenStepTags { .. } => {
+            app.toasts.push(
+                "Sub-view routing lands in step 22.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::ComingSoon {
+            label,
+            target_step,
+        } => {
+            app.toasts.push(
+                format!("{label}: coming soon — landing in step {target_step}."),
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        // Archive of an already-archived plan is a no-op the parser routes
+        // away via the `Already archived` toast — but keep the variant
+        // covered defensively.
+        PaletteAction::OpenConfirmArchive { .. } => {
+            app.toasts.push(
+                "Plan is already archived.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::OpenConfirmDelete { .. } => {
+            return Ok(Some(action));
+        }
+    }
+    Ok(None)
+}
+
+/// Pure dispatch for the archived-list view: build the context from `app`,
+/// parse the input, and run [`palette_dispatch::dispatch`]. Mirrors
+/// [`plan_list_palette_action`].
+pub(crate) fn archived_list_palette_action(
+    input: &str,
+    default_harness: &str,
+    app: &crate::tui::views::archived_list::ArchivedListApp,
+) -> crate::tui::palette_dispatch::PaletteAction {
+    use crate::tui::palette;
+    use crate::tui::palette_dispatch;
+
+    // Archived list's tile pool *is* the archived pool; `plans` is empty so
+    // commands like `/plan show <foo>` against an active plan get the
+    // expected "unknown" toast rather than confusing the resolver.
+    let archived = plan_refs_from_tiles(&app.tiles);
+    let focused_slug = app.cursor_plan().map(|p| p.slug.as_str());
+
+    // Run from the archived list isn't supported yet — pass empty targets
+    // so `/run` toasts "No plan to run." instead of trying to spawn a run
+    // for an archived plan.
+    let run_targets: Vec<crate::tui::run_dialog::RunTarget> = Vec::new();
+
+    let ctx = palette_dispatch::PaletteContext {
+        default_harness,
+        focused_slug,
+        focused_step: None,
+        run_targets: &run_targets,
+        plans: &[],
+        archived: &archived,
+    };
+
+    match palette::parse(input) {
+        Ok(cmd) => palette_dispatch::dispatch(&cmd, &ctx),
+        Err(err) => palette_dispatch::dispatch_parse_error(&err),
+    }
 }
 
 /// `r` action in the archived-list view (TUI-plan.md §6 inherits §5): re-query
@@ -1160,17 +1734,79 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
             continue;
         }
         // §9 palette: while open, route every key through the palette bar
-        // and skip the per-view input handler. Submit / cancel both close
-        // it; step 20 wires the parsed command into
-        // `palette_dispatch::dispatch`.
+        // and skip the per-view input handler. Submit dispatches via
+        // `plan_detail_palette_action` and applies the resulting
+        // `PaletteAction`. Terminal-bound variants (confirm dialogs,
+        // PushPlanDetail) are returned for the loop to handle.
         if let Some(bar) = app.palette_bar.as_mut() {
+            use crate::tui::palette_dispatch::PaletteAction;
             use crate::tui::widgets::palette_bar::PaletteBarOutcome;
             match bar.on_key(key) {
                 PaletteBarOutcome::Pending => {}
                 PaletteBarOutcome::Cancel => app.close_palette(),
                 PaletteBarOutcome::Submit(input) => {
-                    let _parsed = crate::tui::palette::parse(&input);
+                    let action =
+                        plan_detail_palette_action(&input, &config.default_harness, &app);
                     app.close_palette();
+                    match plan_detail_apply_palette_action(conn, project, &mut app, action)? {
+                        Some(PaletteAction::PushPlanDetail { slug: target_slug })
+                            if target_slug != app.plan.slug =>
+                        {
+                            // Switching plans = pop and let plan-list push the
+                            // new plan-detail. Keeps the navigation stack
+                            // honest (no recursion).
+                            app.toasts.push(
+                                "Pop back to the plan list to switch plans.",
+                                crate::tui::toast::ToastKind::Info,
+                                Instant::now(),
+                            );
+                        }
+                        Some(PaletteAction::OpenConfirmArchive { plan_id, slug }) => {
+                            let body = format!("Archive plan `{slug}`?");
+                            let confirm = crate::tui::dialog::Confirm {
+                                title: "Archive plan",
+                                body: &body,
+                                default: false,
+                            };
+                            if confirm_with_plan_detail_background(
+                                terminal, &mut app, &confirm,
+                            )? {
+                                storage::update_plan_status(
+                                    conn,
+                                    &plan_id,
+                                    crate::plan::PlanStatus::Archived,
+                                )?;
+                                app.toasts.push(
+                                    "Plan archived.",
+                                    crate::tui::toast::ToastKind::Success,
+                                    Instant::now(),
+                                );
+                                app.should_pop = true;
+                            }
+                        }
+                        Some(PaletteAction::OpenConfirmDelete { plan_id, slug }) => {
+                            let body = format!(
+                                "Permanently delete plan `{slug}`? This cannot be undone."
+                            );
+                            let confirm = crate::tui::dialog::Confirm {
+                                title: "Permanently delete plan",
+                                body: &body,
+                                default: false,
+                            };
+                            if confirm_with_plan_detail_background(
+                                terminal, &mut app, &confirm,
+                            )? {
+                                storage::delete_plan(conn, &plan_id)?;
+                                app.toasts.push(
+                                    "Plan deleted.",
+                                    crate::tui::toast::ToastKind::Success,
+                                    Instant::now(),
+                                );
+                                app.should_pop = true;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             continue;
@@ -1699,6 +2335,299 @@ pub(crate) fn plan_detail_apply_toggle_questions(
     };
     app.toasts.push(msg, ToastKind::Success, Instant::now());
     Ok(())
+}
+
+/// Apply a [`PaletteAction`] inside the plan-detail view. Returns
+/// `Some(action)` for terminal-bound dialogs (`OpenConfirmArchive`,
+/// `OpenConfirmDelete`) so the dispatcher loop can render the confirm modal
+/// over the live plan-detail view, and for `PushPlanDetail` so the loop can
+/// push a fresh plan-detail view (it can't recurse from inside the helper).
+pub(crate) fn plan_detail_apply_palette_action(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    action: crate::tui::palette_dispatch::PaletteAction,
+) -> Result<Option<crate::tui::palette_dispatch::PaletteAction>> {
+    use crate::tui::palette_dispatch::PaletteAction;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    match action {
+        PaletteAction::None => {}
+        PaletteAction::Toast { message, kind } => {
+            app.toasts.push(message, kind, Instant::now());
+        }
+        PaletteAction::Quit => {
+            app.should_pop = true;
+        }
+        PaletteAction::Approve { plan_id, slug } => {
+            storage::update_plan_status(conn, &plan_id, crate::plan::PlanStatus::Ready)?;
+            if let Some(updated) = storage::get_plan_by_slug(conn, &slug, project)? {
+                app.plan = updated;
+            }
+            app.toasts
+                .push("Plan approved.", ToastKind::Success, Instant::now());
+        }
+        PaletteAction::SetQuestionsEnabled { plan_id, enabled, .. } => {
+            storage::set_plan_questions_enabled(conn, &plan_id, enabled)?;
+            if let Some(updated) =
+                storage::get_plan_by_slug(conn, &app.plan.slug, &app.plan.project)?
+            {
+                app.plan = updated;
+            }
+            let msg = if enabled {
+                "Questions enabled."
+            } else {
+                "Questions disabled."
+            };
+            app.toasts.push(msg, ToastKind::Success, Instant::now());
+        }
+        PaletteAction::Unarchive { plan_id, .. } => {
+            storage::update_plan_status(conn, &plan_id, crate::plan::PlanStatus::Ready)?;
+            if let Some(updated) =
+                storage::get_plan_by_slug(conn, &app.plan.slug, &app.plan.project)?
+            {
+                app.plan = updated;
+            }
+            app.toasts
+                .push("Unarchived.", ToastKind::Success, Instant::now());
+        }
+        PaletteAction::AddStep {
+            plan_id: _,
+            slug: _,
+            title,
+        } => {
+            // Append a step at the bottom — `compute_append_below_sort_key` is
+            // the same path the `a` keybinding uses on the last row.
+            let sort_key = match app.compute_append_below_sort_key() {
+                Ok(k) => k,
+                Err(e) => {
+                    app.toasts.push(
+                        format!("Cannot insert step: {e}"),
+                        ToastKind::Error,
+                        Instant::now(),
+                    );
+                    return Ok(None);
+                }
+            };
+            let plan_id = app.plan.id.clone();
+            match storage::create_step_at(
+                conn, &plan_id, &sort_key, &title, "", None, None, &[], None, None, None, None,
+            ) {
+                Ok((new_step, _)) => {
+                    let new_id = new_step.id.clone();
+                    app.refresh_steps(storage::list_steps(conn, &plan_id)?);
+                    if let Some(idx) = app.steps.iter().position(|s| s.id == new_id) {
+                        app.selected_index = idx;
+                    }
+                    app.toasts.push(
+                        format!("Added step: {title}"),
+                        ToastKind::Success,
+                        Instant::now(),
+                    );
+                }
+                Err(e) => {
+                    app.toasts.push(
+                        format!("Failed to add step: {e}"),
+                        ToastKind::Error,
+                        Instant::now(),
+                    );
+                }
+            }
+        }
+        PaletteAction::SkipStep { step_num, .. } => {
+            // `runner::skip_step` matches the `s` keybinding's behavior — it
+            // resolves the step number, validates status, and writes the
+            // skipped row. None means "skip the current step".
+            let plan = app.plan.clone();
+            match crate::runner::skip_step(conn, &plan, step_num.map(|n| n as usize), None) {
+                Ok(actual_num) => {
+                    app.refresh_steps(storage::list_steps(conn, &app.plan.id)?);
+                    app.toasts.push(
+                        format!("Skipped step {actual_num}."),
+                        ToastKind::Success,
+                        Instant::now(),
+                    );
+                }
+                Err(e) => {
+                    app.toasts.push(
+                        format!("Failed to skip step: {e}"),
+                        ToastKind::Error,
+                        Instant::now(),
+                    );
+                }
+            }
+        }
+        PaletteAction::MoveStep { from, to, .. } => {
+            apply_palette_move_step(conn, app, from, to);
+        }
+        PaletteAction::Export { slug, output } => {
+            apply_palette_export(&slug, output.as_deref(), conn, project, &mut app.toasts);
+        }
+        PaletteAction::Import { path } => {
+            apply_palette_import(&path, conn, project, &mut app.toasts);
+        }
+        PaletteAction::CancelRun => {
+            // Mirror `S`: only fire when there's actually a live run for this
+            // plan. `plan_detail_apply_stop` already toasts "No live run for
+            // this plan" when nothing is bound, so let it do the work.
+            let slug = app.plan.slug.clone();
+            plan_detail_apply_stop(conn, app, project, &slug)?;
+        }
+        PaletteAction::SpawnPlanHarness { harness, .. } => {
+            app.toasts.push(
+                format!(
+                    "/plan harness {harness}: not yet wired from palette; use the CLI for now."
+                ),
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::OpenRunDialog { .. } | PaletteAction::RunOnBranch { .. } => {
+            app.toasts.push(
+                "Run dialog lands in step 21.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::OpenPlanDependencies { .. }
+        | PaletteAction::OpenPlanHooks { .. }
+        | PaletteAction::OpenStepHooks { .. }
+        | PaletteAction::OpenStepTags { .. } => {
+            app.toasts.push(
+                "Sub-view routing lands in step 22.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::ComingSoon {
+            label,
+            target_step,
+        } => {
+            app.toasts.push(
+                format!("{label}: coming soon — landing in step {target_step}."),
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::PushPlanDetail { .. }
+        | PaletteAction::OpenConfirmArchive { .. }
+        | PaletteAction::OpenConfirmDelete { .. } => {
+            return Ok(Some(action));
+        }
+    }
+    Ok(None)
+}
+
+/// Pure dispatch for plan-detail. Builds the [`PaletteContext`] from the
+/// focused plan and parses the input.
+pub(crate) fn plan_detail_palette_action(
+    input: &str,
+    default_harness: &str,
+    app: &crate::tui::views::plan_detail::PlanDetailApp,
+) -> crate::tui::palette_dispatch::PaletteAction {
+    use crate::tui::palette;
+    use crate::tui::palette_dispatch;
+
+    let plans = vec![plan_ref_from_plan(&app.plan)];
+    let focused_slug = Some(app.plan.slug.as_str());
+    let run_targets = vec![crate::tui::run_dialog::RunTarget {
+        slug: app.plan.slug.clone(),
+        default_branch: app.plan.branch_name.clone(),
+    }];
+    // No focused step in plan-detail; `/step set-hook` etc. correctly toast
+    // "Open a step first" via the dispatcher's resolver.
+    let ctx = palette_dispatch::PaletteContext {
+        default_harness,
+        focused_slug,
+        focused_step: None,
+        run_targets: &run_targets,
+        plans: &plans,
+        archived: &[],
+    };
+    match palette::parse(input) {
+        Ok(cmd) => palette_dispatch::dispatch(&cmd, &ctx),
+        Err(err) => palette_dispatch::dispatch_parse_error(&err),
+    }
+}
+
+/// Resolve a 1-based `from`/`to` move into a fractional sort_key and persist
+/// it. Factored out of [`plan_detail_apply_palette_action`] so the move-step
+/// path stays readable.
+fn apply_palette_move_step(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    from: u32,
+    to: u32,
+) {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let from_idx = (from as usize).saturating_sub(1);
+    let to_idx = (to as usize).saturating_sub(1);
+    if from_idx >= app.steps.len() || to_idx >= app.steps.len() {
+        app.toasts.push(
+            format!(
+                "/step move: out of range (plan has {} steps).",
+                app.steps.len()
+            ),
+            ToastKind::Error,
+            Instant::now(),
+        );
+        return;
+    }
+    // Find neighbour sort keys at the destination *after* removing the
+    // moving step from the list.
+    let moving_id = app.steps[from_idx].id.clone();
+    let others: Vec<&crate::plan::Step> = app
+        .steps
+        .iter()
+        .filter(|s| s.id != moving_id)
+        .collect();
+    let dest = to_idx.min(others.len());
+    let prev = if dest == 0 { None } else { others.get(dest - 1) };
+    let next = others.get(dest);
+    let new_key = match (prev, next) {
+        (Some(p), Some(n)) => crate::frac_index::key_between(&p.sort_key, &n.sort_key)
+            .map_err(|e| anyhow::anyhow!("{e}")),
+        (None, Some(n)) => crate::frac_index::key_between("", &n.sort_key)
+            .map_err(|e| anyhow::anyhow!("{e}")),
+        (Some(p), None) => crate::frac_index::key_after(&p.sort_key)
+            .map_err(|e| anyhow::anyhow!("{e}")),
+        (None, None) => Ok(crate::frac_index::initial_key()),
+    };
+    let new_key = match new_key {
+        Ok(k) => k,
+        Err(e) => {
+            app.toasts.push(
+                format!("Cannot move step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+            return;
+        }
+    };
+    if let Err(e) = storage::update_step_sort_key(conn, &moving_id, &new_key) {
+        app.toasts.push(
+            format!("Failed to move step: {e}"),
+            ToastKind::Error,
+            Instant::now(),
+        );
+        return;
+    }
+    drop(others);
+    let plan_id = app.plan.id.clone();
+    if let Ok(steps) = storage::list_steps(conn, &plan_id) {
+        app.refresh_steps(steps);
+        if let Some(idx) = app.steps.iter().position(|s| s.id == moving_id) {
+            app.selected_index = idx;
+        }
+    }
+    app.toasts.push(
+        format!("Moved step {from} → {to}."),
+        ToastKind::Success,
+        Instant::now(),
+    );
 }
 
 /// Mirror of `confirm_with_background` for the plan-detail view: composites
@@ -2412,17 +3341,32 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
         }
 
         // §9 palette: while open, route every key through the palette bar
-        // and skip the per-view input handler. Submit / cancel both close
-        // it; step 20 wires the parsed command into
-        // `palette_dispatch::dispatch`.
+        // and skip the per-view input handler. Submit dispatches via
+        // `step_detail_palette_action`. Step-detail can't easily host a
+        // confirm dialog (its layered panes / pickers), so terminal-bound
+        // actions toast a redirect instead.
         if let Some(bar) = app.palette_bar.as_mut() {
+            use crate::tui::palette_dispatch::PaletteAction;
             use crate::tui::widgets::palette_bar::PaletteBarOutcome;
             match bar.on_key(key) {
                 PaletteBarOutcome::Pending => {}
                 PaletteBarOutcome::Cancel => app.close_palette(),
                 PaletteBarOutcome::Submit(input) => {
-                    let _parsed = crate::tui::palette::parse(&input);
+                    let action =
+                        step_detail_palette_action(&input, &config.default_harness, &app);
                     app.close_palette();
+                    if let Some(
+                        PaletteAction::PushPlanDetail { .. }
+                        | PaletteAction::OpenConfirmArchive { .. }
+                        | PaletteAction::OpenConfirmDelete { .. },
+                    ) = step_detail_apply_palette_action(conn, project, &mut app, action)?
+                    {
+                        app.toasts.push(
+                            "Pop back to the plan list to do that.",
+                            ToastKind::Info,
+                            Instant::now(),
+                        );
+                    }
                 }
             }
             continue;
@@ -2508,6 +3452,185 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
         if app.should_pop {
             return Ok(());
         }
+    }
+}
+
+/// Apply a [`PaletteAction`] inside the step-detail view. Returns
+/// `Some(action)` for variants the dispatcher loop must drive itself
+/// (`PushPlanDetail`, `OpenConfirmArchive`, `OpenConfirmDelete` — none of
+/// which fit the step-detail context cleanly, but are forwarded for
+/// completeness).
+pub(crate) fn step_detail_apply_palette_action(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    action: crate::tui::palette_dispatch::PaletteAction,
+) -> Result<Option<crate::tui::palette_dispatch::PaletteAction>> {
+    use crate::tui::palette_dispatch::PaletteAction;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    match action {
+        PaletteAction::None => {}
+        PaletteAction::Toast { message, kind } => {
+            app.toasts.push(message, kind, Instant::now());
+        }
+        PaletteAction::Quit => {
+            app.should_pop = true;
+        }
+        PaletteAction::Approve { plan_id, slug } => {
+            storage::update_plan_status(conn, &plan_id, crate::plan::PlanStatus::Ready)?;
+            if let Some(updated) = storage::get_plan_by_slug(conn, &slug, project)? {
+                app.plan = updated;
+            }
+            app.toasts
+                .push("Plan approved.", ToastKind::Success, Instant::now());
+        }
+        PaletteAction::SetQuestionsEnabled { plan_id, enabled, .. } => {
+            storage::set_plan_questions_enabled(conn, &plan_id, enabled)?;
+            if let Some(updated) =
+                storage::get_plan_by_slug(conn, &app.plan.slug, &app.plan.project)?
+            {
+                app.plan = updated;
+            }
+            let msg = if enabled {
+                "Questions enabled."
+            } else {
+                "Questions disabled."
+            };
+            app.toasts.push(msg, ToastKind::Success, Instant::now());
+        }
+        PaletteAction::Unarchive { plan_id, .. } => {
+            storage::update_plan_status(conn, &plan_id, crate::plan::PlanStatus::Ready)?;
+            if let Some(updated) =
+                storage::get_plan_by_slug(conn, &app.plan.slug, &app.plan.project)?
+            {
+                app.plan = updated;
+            }
+            app.toasts
+                .push("Unarchived.", ToastKind::Success, Instant::now());
+        }
+        PaletteAction::SkipStep { step_num, .. } => {
+            let plan = app.plan.clone();
+            match crate::runner::skip_step(conn, &plan, step_num.map(|n| n as usize), None) {
+                Ok(actual_num) => {
+                    app.steps = storage::list_steps(conn, &app.plan.id)?;
+                    app.toasts.push(
+                        format!("Skipped step {actual_num}."),
+                        ToastKind::Success,
+                        Instant::now(),
+                    );
+                }
+                Err(e) => {
+                    app.toasts.push(
+                        format!("Failed to skip step: {e}"),
+                        ToastKind::Error,
+                        Instant::now(),
+                    );
+                }
+            }
+        }
+        PaletteAction::Export { slug, output } => {
+            apply_palette_export(&slug, output.as_deref(), conn, project, &mut app.toasts);
+        }
+        PaletteAction::Import { path } => {
+            apply_palette_import(&path, conn, project, &mut app.toasts);
+        }
+        PaletteAction::CancelRun => {
+            app.toasts.push(
+                "Pop back to plan-detail to cancel a live run.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::SpawnPlanHarness { harness, .. } => {
+            app.toasts.push(
+                format!(
+                    "/plan harness {harness}: not yet wired from palette; use the CLI for now."
+                ),
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::AddStep { .. } | PaletteAction::MoveStep { .. } => {
+            app.toasts.push(
+                "Pop back to plan-detail to add or move steps.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::OpenRunDialog { .. } | PaletteAction::RunOnBranch { .. } => {
+            app.toasts.push(
+                "Run dialog lands in step 21.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::OpenPlanDependencies { .. }
+        | PaletteAction::OpenPlanHooks { .. }
+        | PaletteAction::OpenStepHooks { .. }
+        | PaletteAction::OpenStepTags { .. } => {
+            app.toasts.push(
+                "Sub-view routing lands in step 22.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::ComingSoon {
+            label,
+            target_step,
+        } => {
+            app.toasts.push(
+                format!("{label}: coming soon — landing in step {target_step}."),
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::PushPlanDetail { .. }
+        | PaletteAction::OpenConfirmArchive { .. }
+        | PaletteAction::OpenConfirmDelete { .. } => {
+            return Ok(Some(action));
+        }
+    }
+    Ok(None)
+}
+
+/// Pure dispatch for step-detail. Builds the [`PaletteContext`] from the
+/// focused plan + focused step.
+pub(crate) fn step_detail_palette_action(
+    input: &str,
+    default_harness: &str,
+    app: &crate::tui::views::step_detail::StepDetailApp,
+) -> crate::tui::palette_dispatch::PaletteAction {
+    use crate::tui::palette;
+    use crate::tui::palette_dispatch::{self, FocusedStep};
+
+    let plans = vec![plan_ref_from_plan(&app.plan)];
+    let focused_slug = Some(app.plan.slug.as_str());
+    let run_targets = vec![crate::tui::run_dialog::RunTarget {
+        slug: app.plan.slug.clone(),
+        default_branch: app.plan.branch_name.clone(),
+    }];
+    let focused_step = app.current_step().map(|s| FocusedStep {
+        id: s.id.clone(),
+        label: format!(
+            "#{} — {}",
+            app.selected_step_index + 1,
+            s.title
+        ),
+    });
+
+    let ctx = palette_dispatch::PaletteContext {
+        default_harness,
+        focused_slug,
+        focused_step: focused_step.as_ref(),
+        run_targets: &run_targets,
+        plans: &plans,
+        archived: &[],
+    };
+    match palette::parse(input) {
+        Ok(cmd) => palette_dispatch::dispatch(&cmd, &ctx),
+        Err(err) => palette_dispatch::dispatch_parse_error(&err),
     }
 }
 
@@ -5632,6 +6755,205 @@ mod step_detail_dispatcher_tests {
         assert!(
             app.picker.is_none(),
             "an open picker must be torn down when an external lock engages"
+        );
+    }
+}
+
+#[cfg(test)]
+mod palette_action_tests {
+    //! Integration tests for the per-view palette dispatch consumption added
+    //! in step 20 of `tui-gap-fixes`. We exercise the public
+    //! `<view>_palette_action` + `<view>_apply_palette_action` halves
+    //! end-to-end against an in-memory DB so we cover the parse → dispatch →
+    //! storage write → toast pipeline. Per the step spec, the focus is the
+    //! toast + refresh + archive paths.
+    use super::*;
+    use crate::db;
+    use crate::plan::PlanStatus;
+    use crate::tui::palette_dispatch::PaletteAction;
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::plan_list::PlanListApp;
+
+    fn seed_app(project: &str) -> (Connection, PlanListApp) {
+        let conn = db::open_memory().unwrap();
+        storage::create_plan(&conn, "alpha", project, "b1", "d", None, None, &[]).unwrap();
+        storage::create_plan(&conn, "beta", project, "b2", "d", None, None, &[]).unwrap();
+        let tiles = build_plan_tiles(&conn, project).unwrap();
+        let app = PlanListApp::new(tiles, project, "UTC");
+        (conn, app)
+    }
+
+    // -- Toast path -----------------------------------------------------
+
+    #[test]
+    fn parse_error_for_unknown_command_yields_toast_action() {
+        // Driving an unknown verb through the palette dispatcher should
+        // produce an error-kind Toast action that the consuming view
+        // surfaces verbatim.
+        let (_conn, app) = seed_app("/tmp/palette-unknown");
+        let action = plan_list_palette_action("/nope-not-a-cmd", "claude", &app, &[]);
+        match action {
+            PaletteAction::Toast { message, kind } => {
+                assert!(
+                    message.contains("Unknown command"),
+                    "expected 'Unknown command' in toast: {message}"
+                );
+                assert_eq!(kind, ToastKind::Error);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn applying_toast_action_pushes_onto_view_queue() {
+        // Wiring the dispatcher's Toast action through the apply helper must
+        // end up on the view's toast queue verbatim.
+        let project = "/tmp/palette-toast-apply";
+        let (conn, mut app) = seed_app(project);
+        let action = PaletteAction::Toast {
+            message: "hello there".to_string(),
+            kind: ToastKind::Info,
+        };
+        plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let toast = app.toasts.current().expect("toast was pushed");
+        assert_eq!(toast.text, "hello there");
+        assert_eq!(toast.color, ToastKind::Info.color());
+    }
+
+    #[test]
+    fn empty_palette_input_is_a_silent_close() {
+        // The parser's `Empty` error maps to `PaletteAction::None` — applying
+        // it must leave the toast queue alone.
+        let project = "/tmp/palette-empty";
+        let (conn, mut app) = seed_app(project);
+        let action = plan_list_palette_action("/", "claude", &app, &[]);
+        assert_eq!(action, PaletteAction::None);
+        plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(app.toasts.is_empty());
+    }
+
+    // -- Refresh path (after a mutation) --------------------------------
+
+    #[test]
+    fn approve_refreshes_in_place_tile_and_toasts_success() {
+        // /plan approve <slug> on a Planning plan must flip status, refresh
+        // the in-memory tile, and push the success toast.
+        let project = "/tmp/palette-approve";
+        let (conn, mut app) = seed_app(project);
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+        let action = plan_list_palette_action(
+            &format!("/plan approve {target_slug}"),
+            "claude",
+            &app,
+            &[],
+        );
+        plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+
+        let from_db = storage::get_plan_by_slug(&conn, &target_slug, project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(from_db.status, PlanStatus::Ready);
+
+        let tile = app.tiles.iter().find(|t| t.plan.slug == target_slug).unwrap();
+        assert_eq!(tile.plan.status, PlanStatus::Ready);
+        assert_eq!(app.toasts.current().unwrap().text, "Plan approved.");
+    }
+
+    #[test]
+    fn questions_toggle_via_palette_persists_and_refreshes_in_place() {
+        // The /plan questions on|off pair flips `questions_enabled` and
+        // updates the in-memory tile so the next render reflects the new
+        // state without a full refresh.
+        let project = "/tmp/palette-questions";
+        let (conn, mut app) = seed_app(project);
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+        assert!(!app.cursor_plan().unwrap().questions_enabled);
+
+        let on_action = plan_list_palette_action(
+            &format!("/plan questions on {target_slug}"),
+            "claude",
+            &app,
+            &[],
+        );
+        plan_list_apply_palette_action(&conn, project, &mut app, on_action).unwrap();
+        let row = storage::get_plan_by_slug(&conn, &target_slug, project)
+            .unwrap()
+            .unwrap();
+        assert!(row.questions_enabled);
+        let tile = app.tiles.iter().find(|t| t.plan.slug == target_slug).unwrap();
+        assert!(tile.plan.questions_enabled);
+        assert_eq!(app.toasts.current().unwrap().text, "Questions enabled.");
+    }
+
+    // -- Archive path ---------------------------------------------------
+
+    #[test]
+    fn archive_command_returns_confirm_action_then_apply_archives_and_refreshes() {
+        // /plan archive <slug> goes through a confirm dialog at the
+        // dispatcher level. We assert:
+        //   1. The dispatcher returns OpenConfirmArchive (handed back from
+        //      apply for the loop to drive).
+        //   2. plan_list_apply_archive — the post-confirm path — flips the
+        //      DB row, refreshes tiles, and toasts.
+        let project = "/tmp/palette-archive";
+        let (conn, mut app) = seed_app(project);
+        let target_id = app.cursor_plan().unwrap().id.clone();
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+        let initial_len = app.tiles.len();
+
+        let action = plan_list_palette_action(
+            &format!("/plan archive {target_slug}"),
+            "claude",
+            &app,
+            &[],
+        );
+        match &action {
+            PaletteAction::OpenConfirmArchive { plan_id, slug } => {
+                assert_eq!(plan_id, &target_id);
+                assert_eq!(slug, &target_slug);
+            }
+            other => panic!("expected OpenConfirmArchive, got {other:?}"),
+        }
+        // Apply returns the action back so the caller renders the confirm.
+        let forwarded =
+            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(matches!(
+            forwarded,
+            Some(PaletteAction::OpenConfirmArchive { .. })
+        ));
+
+        // Simulate a confirmed yes by running the post-confirm helper.
+        plan_list_apply_archive(&conn, project, &mut app, &target_id).unwrap();
+
+        let row = storage::get_plan_by_slug(&conn, &target_slug, project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, PlanStatus::Archived);
+        // The archived plan should no longer appear among non-archived tiles.
+        assert_eq!(app.tiles.len(), initial_len - 1);
+        assert!(!app.tiles.iter().any(|t| t.plan.slug == target_slug));
+        assert_eq!(app.toasts.current().unwrap().text, "Archived 1 plan.");
+    }
+
+    #[test]
+    fn archive_unknown_slug_toasts_error() {
+        // A `/plan archive <bogus>` should land on `Toast { kind: Error }`.
+        let project = "/tmp/palette-archive-unknown";
+        let (conn, mut app) = seed_app(project);
+        let action = plan_list_palette_action(
+            "/plan archive does-not-exist",
+            "claude",
+            &app,
+            &[],
+        );
+        match &action {
+            PaletteAction::Toast { kind, .. } => assert_eq!(*kind, ToastKind::Error),
+            other => panic!("expected Toast(Error), got {other:?}"),
+        }
+        plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert_eq!(
+            app.toasts.current().unwrap().color,
+            ToastKind::Error.color()
         );
     }
 }
