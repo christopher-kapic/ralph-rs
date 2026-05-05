@@ -453,6 +453,30 @@ pub fn run_plan_list_tui(
                                     )?;
                                     flush_palette_run_toasts(report, &mut app.toasts);
                                 }
+                                // §9 sub-view routing — push plan-dependencies
+                                // / plan-hooks against the resolved plan. The
+                                // dispatcher already substituted the focused
+                                // slug, so the action carries the IDs we need.
+                                Some(PaletteAction::OpenPlanDependencies { plan_id, slug }) => {
+                                    run_plan_dependencies_tui(
+                                        &mut terminal,
+                                        conn,
+                                        project,
+                                        &plan_id,
+                                        &slug,
+                                    )?;
+                                    refresh_plan_list_state(conn, project, &mut app)?;
+                                }
+                                Some(PaletteAction::OpenPlanHooks { plan_id, slug }) => {
+                                    run_plan_hooks_tui(
+                                        &mut terminal,
+                                        conn,
+                                        project,
+                                        &plan_id,
+                                        &slug,
+                                    )?;
+                                    refresh_plan_list_state(conn, project, &mut app)?;
+                                }
                                 _ => {}
                             }
                         }
@@ -1190,13 +1214,19 @@ pub(crate) fn plan_list_apply_palette_action(
                 Instant::now(),
             );
         }
-        // Step 22 — sub-view routing.
-        PaletteAction::OpenPlanDependencies { .. }
-        | PaletteAction::OpenPlanHooks { .. }
-        | PaletteAction::OpenStepHooks { .. }
-        | PaletteAction::OpenStepTags { .. } => {
+        // §9 sub-view routing — `/step set-hook|unset-hook` and
+        // `/step edit --tags` only resolve in step-detail (the dispatcher
+        // already toasted "Open a step first…" if focus wasn't a step), so
+        // when they land here we explicitly route to a plan-list-shaped
+        // hint. Plan-level entries (`OpenPlanDependencies`, `OpenPlanHooks`)
+        // are forwarded so the dispatcher loop can push the corresponding
+        // sub-view dispatcher against the focused plan.
+        PaletteAction::OpenPlanDependencies { .. } | PaletteAction::OpenPlanHooks { .. } => {
+            return Ok(Some(action));
+        }
+        PaletteAction::OpenStepHooks { .. } | PaletteAction::OpenStepTags { .. } => {
             app.toasts.push(
-                "Sub-view routing lands in step 22.",
+                "Open a step first to edit per-step hooks or tags.",
                 ToastKind::Info,
                 Instant::now(),
             );
@@ -1786,12 +1816,19 @@ pub(crate) fn archived_list_apply_palette_action(
                 Instant::now(),
             );
         }
-        PaletteAction::OpenPlanDependencies { .. }
-        | PaletteAction::OpenPlanHooks { .. }
-        | PaletteAction::OpenStepHooks { .. }
-        | PaletteAction::OpenStepTags { .. } => {
+        // Archived plans aren't usable hosts for sub-views — the user has
+        // to unarchive first to edit deps / hooks / tags. Stay silent on the
+        // step-level variants for parity with the active plan-list view.
+        PaletteAction::OpenPlanDependencies { .. } | PaletteAction::OpenPlanHooks { .. } => {
             app.toasts.push(
-                "Sub-view routing lands in step 22.",
+                "Unarchive the plan first to edit it.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        PaletteAction::OpenStepHooks { .. } | PaletteAction::OpenStepTags { .. } => {
+            app.toasts.push(
+                "Open a step first to edit per-step hooks or tags.",
                 ToastKind::Info,
                 Instant::now(),
             );
@@ -2174,6 +2211,43 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
                             )?;
                             flush_palette_run_toasts(report, &mut app.toasts);
                         }
+                        // §9 sub-view routing — push the corresponding
+                        // sub-view dispatcher against the resolved plan /
+                        // step. The action carries the IDs the dispatcher
+                        // already substituted from focus context, so we can
+                        // hand them through without another lookup.
+                        Some(PaletteAction::OpenPlanDependencies { plan_id, slug }) => {
+                            let project_path = app.plan.project.clone();
+                            run_plan_dependencies_tui(
+                                terminal,
+                                conn,
+                                &project_path,
+                                &plan_id,
+                                &slug,
+                            )?;
+                        }
+                        Some(PaletteAction::OpenPlanHooks { plan_id, slug }) => {
+                            let project_path = app.plan.project.clone();
+                            run_plan_hooks_tui(
+                                terminal,
+                                conn,
+                                &project_path,
+                                &plan_id,
+                                &slug,
+                            )?;
+                        }
+                        // Plan-detail's palette context doesn't set
+                        // `focused_step`, so the dispatcher already toasted
+                        // "Open a step first…" before reaching apply. The
+                        // forwarded variant is defensive: if a future
+                        // change adds a focused-step pointer, the sub-view
+                        // pushes correctly without another wiring pass.
+                        Some(PaletteAction::OpenStepHooks { step_id, .. }) => {
+                            run_step_hooks_tui(terminal, conn, project, &step_id)?;
+                        }
+                        Some(PaletteAction::OpenStepTags { step_id, .. }) => {
+                            run_step_tags_tui(terminal, conn, &step_id)?;
+                        }
                         _ => {}
                     }
                 }
@@ -2217,10 +2291,22 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
                 plan_detail_apply_stop(conn, &mut app, project, slug)?;
             }
             InputAction::OpenDependencies => {
-                run_plan_dependencies_tui(terminal, conn, &mut app)?;
+                let project_path = app.plan.project.clone();
+                let plan_id = app.plan.id.clone();
+                let plan_slug = app.plan.slug.clone();
+                run_plan_dependencies_tui(
+                    terminal,
+                    conn,
+                    &project_path,
+                    &plan_id,
+                    &plan_slug,
+                )?;
             }
             InputAction::OpenHooks => {
-                run_plan_hooks_tui(terminal, conn, &mut app)?;
+                let project_path = app.plan.project.clone();
+                let plan_id = app.plan.id.clone();
+                let plan_slug = app.plan.slug.clone();
+                run_plan_hooks_tui(terminal, conn, &project_path, &plan_id, &plan_slug)?;
             }
             InputAction::OpenQuestion(step_id) => {
                 run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
@@ -2852,15 +2938,18 @@ pub(crate) fn plan_detail_apply_palette_action(
                 Instant::now(),
             );
         }
+        // §9 sub-view routing — plan-detail is the host for plan-level
+        // sub-views (`OpenPlanDependencies`, `OpenPlanHooks`) and for
+        // step-level sub-views when a step is highlighted in the sidebar.
+        // Step-level variants don't reach here today (the plan-detail
+        // palette context doesn't set `focused_step`), but we still forward
+        // defensively so adding a focused-step pointer later doesn't quietly
+        // route to the wrong place.
         PaletteAction::OpenPlanDependencies { .. }
         | PaletteAction::OpenPlanHooks { .. }
         | PaletteAction::OpenStepHooks { .. }
         | PaletteAction::OpenStepTags { .. } => {
-            app.toasts.push(
-                "Sub-view routing lands in step 22.",
-                ToastKind::Info,
-                Instant::now(),
-            );
+            return Ok(Some(action));
         }
         PaletteAction::ComingSoon {
             label,
@@ -3039,18 +3128,25 @@ fn confirm_with_plan_detail_background<B: ratatui::backend::Backend>(
 /// each successful outcome. Cycles are caught with
 /// [`storage::would_create_cycle`] before the insert and surfaced as an
 /// error toast rather than letting the user wait on a storage error.
+///
+/// Parameterized on `(project, plan_id, plan_slug)` rather than a
+/// `&mut PlanDetailApp` so the palette path (TUI-plan.md §9, step 22) can
+/// invoke the sub-view from plan-list / step-detail without first
+/// reconstructing a `PlanDetailApp`.
 fn run_plan_dependencies_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
-    plan_app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    project: &str,
+    plan_id: &str,
+    plan_slug: &str,
 ) -> Result<()> {
     use crate::tui::toast::ToastKind;
     use crate::tui::views::plan_dependencies::{Mode, Outcome, PlanDependenciesApp, render};
     use crossterm::event::{self, Event, KeyEventKind};
 
-    let plan_id = plan_app.plan.id.clone();
-    let plan_slug = plan_app.plan.slug.clone();
-    let project = plan_app.plan.project.clone();
+    let plan_id = plan_id.to_string();
+    let plan_slug = plan_slug.to_string();
+    let project = project.to_string();
 
     let (deps, candidates) = load_dependencies_view_state(conn, &project, &plan_id)?;
     let mut app = PlanDependenciesApp::new(plan_id.clone(), plan_slug, deps, candidates);
@@ -3167,18 +3263,25 @@ fn load_dependencies_view_state(
 /// 14), so a stuck `?` overlay can always be dismissed with `?`/`<esc>`/
 /// `q`/Ctrl-C without reaching the per-mode handlers. `<esc>`/`q`/Ctrl-C
 /// in `Mode::List` pop back to plan-detail.
+///
+/// Parameterized on `(project, plan_id, plan_slug)` rather than a
+/// `&mut PlanDetailApp` so the palette path (TUI-plan.md §9, step 22) can
+/// invoke the sub-view from plan-list / step-detail without first
+/// reconstructing a `PlanDetailApp`.
 fn run_plan_hooks_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
-    plan_app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    project: &str,
+    plan_id: &str,
+    plan_slug: &str,
 ) -> Result<()> {
     use crate::tui::toast::ToastKind;
     use crate::tui::views::plan_hooks::{Mode, Outcome, PlanHooksApp, render};
     use crossterm::event::{self, Event, KeyEventKind};
 
-    let plan_id = plan_app.plan.id.clone();
-    let plan_slug = plan_app.plan.slug.clone();
-    let project = plan_app.plan.project.clone();
+    let plan_id = plan_id.to_string();
+    let plan_slug = plan_slug.to_string();
+    let project = project.to_string();
 
     let (attachments, candidates) = load_plan_hooks_view_state(conn, &project, &plan_id)?;
     let mut app = PlanHooksApp::new(plan_id.clone(), plan_slug, attachments, candidates);
@@ -3773,6 +3876,37 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
                             )?;
                             flush_palette_run_toasts(report, &mut app.toasts);
                         }
+                        // §9 sub-view routing — step-detail is the host for
+                        // step-level sub-views (`H`/`T` keybindings already
+                        // open these), and is the only view that resolves
+                        // `focused_step`. Plan-level entries route to the
+                        // same dispatchers as plan-detail's keybindings.
+                        Some(PaletteAction::OpenPlanDependencies { plan_id, slug }) => {
+                            let project_path = app.plan.project.clone();
+                            run_plan_dependencies_tui(
+                                terminal,
+                                conn,
+                                &project_path,
+                                &plan_id,
+                                &slug,
+                            )?;
+                        }
+                        Some(PaletteAction::OpenPlanHooks { plan_id, slug }) => {
+                            let project_path = app.plan.project.clone();
+                            run_plan_hooks_tui(
+                                terminal,
+                                conn,
+                                &project_path,
+                                &plan_id,
+                                &slug,
+                            )?;
+                        }
+                        Some(PaletteAction::OpenStepHooks { step_id, .. }) => {
+                            run_step_hooks_tui(terminal, conn, project, &step_id)?;
+                        }
+                        Some(PaletteAction::OpenStepTags { step_id, .. }) => {
+                            run_step_tags_tui(terminal, conn, &step_id)?;
+                        }
                         _ => {}
                     }
                 }
@@ -3967,15 +4101,17 @@ pub(crate) fn step_detail_apply_palette_action(
                 Instant::now(),
             );
         }
+        // §9 sub-view routing — step-detail is the host for step-level
+        // sub-views (`OpenStepHooks`, `OpenStepTags`) since it's the only
+        // view that sets `focused_step` in the palette context. Plan-level
+        // entries are forwarded too (the dispatcher can resolve the focused
+        // plan from `app.plan`) so `/plan dependency` / `/plan hooks` from
+        // step-detail still lands in the right sub-view.
         PaletteAction::OpenPlanDependencies { .. }
         | PaletteAction::OpenPlanHooks { .. }
         | PaletteAction::OpenStepHooks { .. }
         | PaletteAction::OpenStepTags { .. } => {
-            app.toasts.push(
-                "Sub-view routing lands in step 22.",
-                ToastKind::Info,
-                Instant::now(),
-            );
+            return Ok(Some(action));
         }
         PaletteAction::ComingSoon {
             label,
@@ -7640,5 +7776,329 @@ mod run_dialog_apply_tests {
         // The most recent toast is the visible one; the queue should have
         // received both.
         assert!(!queue.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod sub_view_routing_tests {
+    //! Tests for the `/plan dependency`, `/plan set-hook|unset-hook|hooks`,
+    //! `/step set-hook|unset-hook`, and `/step edit --tags` palette wiring
+    //! (TUI-plan.md §9, step 22).
+    //!
+    //! We can't drive the actual sub-view dispatchers from a unit test (they
+    //! own a crossterm event loop), so the tests prove two halves instead:
+    //!   * `<view>_palette_action` routes the parsed verb to the right
+    //!     `PaletteAction::Open*` variant with the IDs the dispatcher will
+    //!     consume.
+    //!   * `<view>_apply_palette_action` forwards each variant to the
+    //!     caller (returns `Some(action)`), the same channel the existing
+    //!     archive/delete confirms use, so the dispatcher loop's terminal-
+    //!     bound match arm is what actually invokes
+    //!     `run_plan_dependencies_tui` / `run_plan_hooks_tui` /
+    //!     `run_step_hooks_tui` / `run_step_tags_tui`.
+    //!
+    //! The forwarding half is what makes "the command lands in the right
+    //! dispatcher" a falsifiable property: a regression that toasted "lands
+    //! in step 22" again would return `Ok(None)` here and fail the assert.
+
+    use super::*;
+    use crate::config::Config;
+    use crate::db;
+    use crate::plan::{ChangePolicy, Plan, PlanStatus, Step, StepStatus};
+    use crate::tui::palette_dispatch::PaletteAction;
+    use crate::tui::views::plan_detail::PlanDetailApp;
+    use crate::tui::views::plan_list::PlanListApp;
+    use crate::tui::views::step_detail::StepDetailApp;
+    use chrono::Utc;
+
+    // -- Fixtures ---------------------------------------------------------
+
+    fn seed_plan_list(project: &str) -> (Connection, PlanListApp) {
+        let conn = db::open_memory().unwrap();
+        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[])
+            .unwrap();
+        let tiles = build_plan_tiles(&conn, project).unwrap();
+        let app = PlanListApp::new(tiles, project, "UTC");
+        (conn, app)
+    }
+
+    fn seed_plan_detail(project: &str) -> (Connection, PlanDetailApp) {
+        let conn = db::open_memory().unwrap();
+        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[])
+            .unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "alpha", project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let app = PlanDetailApp::new(plan, steps, &Config::default());
+        (conn, app)
+    }
+
+    fn make_step_detail_app(slug: &str, project: &str) -> StepDetailApp {
+        let plan = Plan {
+            id: format!("plan-{slug}"),
+            slug: slug.to_string(),
+            project: project.to_string(),
+            branch_name: "feature-x".to_string(),
+            description: "d".to_string(),
+            status: PlanStatus::InProgress,
+            harness: Some("claude".to_string()),
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
+            context_prepend: None,
+            questions_enabled: false,
+        };
+        let steps = vec![Step {
+            id: "step-1".to_string(),
+            plan_id: plan.id.clone(),
+            sort_key: "a0".to_string(),
+            title: "First step".to_string(),
+            description: "d".to_string(),
+            agent: None,
+            harness: None,
+            acceptance_criteria: vec![],
+            status: StepStatus::Pending,
+            attempts: 0,
+            max_retries: Some(3),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: None,
+            skipped_reason: None,
+            change_policy: ChangePolicy::Required,
+            tags: vec![],
+        }];
+        StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &Config::default(),
+            storage::ProjectSettings::default(),
+            Vec::new(),
+        )
+    }
+
+    // -- /plan dependency add|remove|list ---------------------------------
+
+    #[test]
+    fn slash_plan_dependency_from_plan_list_routes_to_dependencies_dispatcher() {
+        let project = "/tmp/plan-dep-from-list";
+        let (conn, mut app) = seed_plan_list(project);
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+        let target_id = app.cursor_plan().unwrap().id.clone();
+
+        for verb in ["dependency add", "dependency remove", "dependency list"] {
+            let action = plan_list_palette_action(
+                &format!("/plan {verb}"),
+                "claude",
+                &app,
+                &[],
+            );
+            match &action {
+                PaletteAction::OpenPlanDependencies { plan_id, slug } => {
+                    assert_eq!(plan_id, &target_id, "/plan {verb}: plan_id");
+                    assert_eq!(slug, &target_slug, "/plan {verb}: slug");
+                }
+                other => panic!("/plan {verb}: expected OpenPlanDependencies, got {other:?}"),
+            }
+            let forwarded = plan_list_apply_palette_action(
+                &conn, project, &mut app, action,
+            )
+            .unwrap();
+            assert!(
+                matches!(forwarded, Some(PaletteAction::OpenPlanDependencies { .. })),
+                "/plan {verb}: apply must forward to caller, got {forwarded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_plan_dependency_from_plan_detail_routes_to_dependencies_dispatcher() {
+        let project = "/tmp/plan-dep-from-detail";
+        let (conn, mut app) = seed_plan_detail(project);
+        let action = plan_detail_palette_action("/plan dependency add", "claude", &app);
+        assert!(matches!(action, PaletteAction::OpenPlanDependencies { .. }));
+        let forwarded =
+            plan_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(matches!(
+            forwarded,
+            Some(PaletteAction::OpenPlanDependencies { .. })
+        ));
+    }
+
+    #[test]
+    fn slash_plan_dependency_from_step_detail_routes_to_dependencies_dispatcher() {
+        let project = "/tmp/plan-dep-from-step";
+        let conn = db::open_memory().unwrap();
+        let mut app = make_step_detail_app("alpha", project);
+        let action = step_detail_palette_action("/plan dependency add", "claude", &app);
+        assert!(matches!(action, PaletteAction::OpenPlanDependencies { .. }));
+        let forwarded =
+            step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(matches!(
+            forwarded,
+            Some(PaletteAction::OpenPlanDependencies { .. })
+        ));
+    }
+
+    // -- /plan set-hook|unset-hook|hooks ----------------------------------
+
+    #[test]
+    fn slash_plan_hook_verbs_from_plan_list_route_to_hooks_dispatcher() {
+        let project = "/tmp/plan-hooks-from-list";
+        let (conn, mut app) = seed_plan_list(project);
+        let target_slug = app.cursor_plan().unwrap().slug.clone();
+        let target_id = app.cursor_plan().unwrap().id.clone();
+
+        for verb in ["set-hook", "unset-hook", "hooks"] {
+            let action = plan_list_palette_action(
+                &format!("/plan {verb}"),
+                "claude",
+                &app,
+                &[],
+            );
+            match &action {
+                PaletteAction::OpenPlanHooks { plan_id, slug } => {
+                    assert_eq!(plan_id, &target_id, "/plan {verb}: plan_id");
+                    assert_eq!(slug, &target_slug, "/plan {verb}: slug");
+                }
+                other => panic!("/plan {verb}: expected OpenPlanHooks, got {other:?}"),
+            }
+            let forwarded = plan_list_apply_palette_action(
+                &conn, project, &mut app, action,
+            )
+            .unwrap();
+            assert!(
+                matches!(forwarded, Some(PaletteAction::OpenPlanHooks { .. })),
+                "/plan {verb}: apply must forward to caller, got {forwarded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_plan_hooks_from_plan_detail_routes_to_hooks_dispatcher() {
+        let project = "/tmp/plan-hooks-from-detail";
+        let (conn, mut app) = seed_plan_detail(project);
+        let action = plan_detail_palette_action("/plan hooks", "claude", &app);
+        assert!(matches!(action, PaletteAction::OpenPlanHooks { .. }));
+        let forwarded =
+            plan_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(matches!(
+            forwarded,
+            Some(PaletteAction::OpenPlanHooks { .. })
+        ));
+    }
+
+    #[test]
+    fn slash_plan_hooks_from_step_detail_routes_to_hooks_dispatcher() {
+        let project = "/tmp/plan-hooks-from-step";
+        let conn = db::open_memory().unwrap();
+        let mut app = make_step_detail_app("alpha", project);
+        let action = step_detail_palette_action("/plan hooks", "claude", &app);
+        assert!(matches!(action, PaletteAction::OpenPlanHooks { .. }));
+        let forwarded =
+            step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(matches!(
+            forwarded,
+            Some(PaletteAction::OpenPlanHooks { .. })
+        ));
+    }
+
+    // -- /step set-hook|unset-hook ----------------------------------------
+
+    #[test]
+    fn slash_step_hooks_from_step_detail_routes_to_step_hooks_dispatcher() {
+        let project = "/tmp/step-hooks-from-step";
+        let conn = db::open_memory().unwrap();
+        let mut app = make_step_detail_app("alpha", project);
+        let expected_step_id = app.current_step().unwrap().id.clone();
+
+        for verb in ["set-hook", "unset-hook"] {
+            let action = step_detail_palette_action(
+                &format!("/step {verb}"),
+                "claude",
+                &app,
+            );
+            match &action {
+                PaletteAction::OpenStepHooks { step_id, .. } => {
+                    assert_eq!(step_id, &expected_step_id, "/step {verb}: step_id");
+                }
+                other => panic!("/step {verb}: expected OpenStepHooks, got {other:?}"),
+            }
+            let forwarded = step_detail_apply_palette_action(
+                &conn, project, &mut app, action,
+            )
+            .unwrap();
+            assert!(
+                matches!(forwarded, Some(PaletteAction::OpenStepHooks { .. })),
+                "/step {verb}: apply must forward to caller, got {forwarded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_step_hooks_from_plan_list_toasts_open_a_step_first() {
+        // No `focused_step` in plan-list context → dispatcher folds the
+        // command into a toast and apply consumes it (toast queue receives
+        // the hint, no action is forwarded for the loop to route).
+        let project = "/tmp/step-hooks-from-list";
+        let (conn, mut app) = seed_plan_list(project);
+        let action = plan_list_palette_action("/step set-hook", "claude", &app, &[]);
+        match &action {
+            PaletteAction::Toast { message, .. } => {
+                assert!(message.contains("Open a step first"), "got: {message}");
+            }
+            other => panic!("expected Toast, got {other:?}"),
+        }
+        let forwarded =
+            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(
+            forwarded.is_none(),
+            "Toast must not forward to caller: {forwarded:?}"
+        );
+    }
+
+    // -- /step edit --tags ------------------------------------------------
+
+    #[test]
+    fn slash_step_tags_from_step_detail_routes_to_step_tags_dispatcher() {
+        let project = "/tmp/step-tags-from-step";
+        let conn = db::open_memory().unwrap();
+        let mut app = make_step_detail_app("alpha", project);
+        let expected_step_id = app.current_step().unwrap().id.clone();
+
+        let action = step_detail_palette_action("/step edit --tags", "claude", &app);
+        match &action {
+            PaletteAction::OpenStepTags { step_id, .. } => {
+                assert_eq!(step_id, &expected_step_id);
+            }
+            other => panic!("expected OpenStepTags, got {other:?}"),
+        }
+        let forwarded =
+            step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(matches!(
+            forwarded,
+            Some(PaletteAction::OpenStepTags { .. })
+        ));
+    }
+
+    #[test]
+    fn slash_step_tags_from_plan_list_toasts_open_a_step_first() {
+        let project = "/tmp/step-tags-from-list";
+        let (conn, mut app) = seed_plan_list(project);
+        let action = plan_list_palette_action("/step edit --tags", "claude", &app, &[]);
+        match &action {
+            PaletteAction::Toast { message, .. } => {
+                assert!(message.contains("Open a step first"), "got: {message}");
+            }
+            other => panic!("expected Toast, got {other:?}"),
+        }
+        let forwarded =
+            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(forwarded.is_none(), "Toast must not forward: {forwarded:?}");
     }
 }
