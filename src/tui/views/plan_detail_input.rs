@@ -41,6 +41,9 @@ pub enum InputAction {
     /// The user pressed `A` to open step detail focused on the step that
     /// owns the oldest unanswered question (TUI-plan.md §17).
     OpenQuestion(String),
+    /// The user pressed `enter` / `→` / `l` to open the step-detail view for
+    /// the step under the cursor (TUI-plan.md §7).
+    OpenStepDetail(String),
 }
 
 /// True when J/K should scroll the live-run tails (TUI-plan.md §13) instead
@@ -180,6 +183,16 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             Some(step_id) => InputAction::OpenQuestion(step_id),
             None => InputAction::None,
         },
+
+        // Open step detail for the highlighted step (TUI-plan.md §7).
+        // Read-only navigation, so allowed even while locked.
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            if app.steps.is_empty() {
+                InputAction::None
+            } else {
+                InputAction::OpenStepDetail(app.steps[app.selected_index].id.clone())
+            }
+        }
 
         // Esc clears selection if any; otherwise no-op (Esc does NOT pop the
         // view — `q`/`h`/`←` own that).
@@ -478,6 +491,36 @@ mod tests {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Char('D')));
         assert_eq!(action, InputAction::OpenDependencies);
+    }
+
+    #[test]
+    fn test_enter_emits_open_step_detail_for_cursor() {
+        let mut app = make_app(3);
+        app.selected_index = 1;
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(action, InputAction::OpenStepDetail("s1".to_string()));
+    }
+
+    #[test]
+    fn test_right_arrow_emits_open_step_detail() {
+        let mut app = make_app(3);
+        app.selected_index = 2;
+        let action = handle_key(&mut app, key(KeyCode::Right));
+        assert_eq!(action, InputAction::OpenStepDetail("s2".to_string()));
+    }
+
+    #[test]
+    fn test_l_emits_open_step_detail() {
+        let mut app = make_app(3);
+        let action = handle_key(&mut app, key(KeyCode::Char('l')));
+        assert_eq!(action, InputAction::OpenStepDetail("s0".to_string()));
+    }
+
+    #[test]
+    fn test_enter_with_no_steps_is_noop() {
+        let mut app = make_app(0);
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(action, InputAction::None);
     }
 
     #[test]

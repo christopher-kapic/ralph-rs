@@ -65,7 +65,7 @@ pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
 fn hint_for(app: &PlanDetailApp) -> String {
     match app.input_mode {
         InputMode::Normal => {
-            "[j/k] nav  [space] sel  [i/a] add  [d] del  [r] reset  [J/K] move  [s] skip  [R] run  [S] stop  [q] back"
+            "[j/k] nav  [enter] open  [space] sel  [i/a] add  [d] del  [s] skip  [R] run  [S] stop  [q] back"
                 .to_string()
         }
         InputMode::AddStep(_) => "[Enter] confirm  [Esc] cancel".to_string(),

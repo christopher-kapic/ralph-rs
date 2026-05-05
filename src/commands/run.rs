@@ -1073,6 +1073,9 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
             InputAction::OpenQuestion(step_id) => {
                 run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
             }
+            InputAction::OpenStepDetail(step_id) => {
+                run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
+            }
         }
         if app.should_pop {
             // Dropping the subscription tears down its tokio runtime and
