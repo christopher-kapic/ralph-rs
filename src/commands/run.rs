@@ -403,7 +403,7 @@ pub fn run_plan_list_tui(
                         plan_list_create_plan(conn, config, project, &mut terminal, &mut app)?;
                     }
                     KeyCode::Esc => {
-                        let _ = app.escape();
+                        plan_list_handle_esc(&mut app);
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                         match app.request_open() {
@@ -565,6 +565,23 @@ pub(crate) fn plan_list_refresh(
     app.toasts
         .push("Refreshed.", ToastKind::Info, Instant::now());
     Ok(())
+}
+
+/// `<esc>` precedence in the plan-list view (TUI-plan.md §4): dismiss the
+/// current toast when one is showing and consume the keypress; otherwise
+/// fall through to the view's existing Esc binding (`app.escape()` —
+/// clear-selection-or-quit). Returns `true` when a toast was dismissed.
+/// Extracted so the precedence is unit testable without driving the full
+/// event loop.
+pub(crate) fn plan_list_handle_esc(
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) -> bool {
+    if app.toasts.dismiss() {
+        true
+    } else {
+        let _ = app.escape();
+        false
+    }
 }
 
 /// `i` / `a` action in the plan-list view (TUI-plan.md §5): open the inline
@@ -827,7 +844,7 @@ fn run_archived_list_tui<B: ratatui::backend::Backend>(
                 archived_list_refresh(conn, project, &mut app)?;
             }
             KeyCode::Esc => {
-                let _ = app.escape();
+                archived_list_handle_esc(&mut app);
             }
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
                 app.request_pop();
@@ -914,6 +931,21 @@ pub(crate) fn archived_list_refresh(
     app.toasts
         .push("Refreshed.", ToastKind::Info, Instant::now());
     Ok(())
+}
+
+/// `<esc>` precedence in the archived-list view (TUI-plan.md §4): dismiss
+/// the current toast when one is showing and consume the keypress;
+/// otherwise fall through to `app.escape()` (clear-selection-or-pop).
+/// Returns `true` when a toast was dismissed.
+pub(crate) fn archived_list_handle_esc(
+    app: &mut crate::tui::views::archived_list::ArchivedListApp,
+) -> bool {
+    if app.toasts.dismiss() {
+        true
+    } else {
+        let _ = app.escape();
+        false
+    }
 }
 
 /// Mirror of `confirm_with_background` for the archived-list view: composites
@@ -1890,12 +1922,29 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.request_pop();
             }
-            KeyCode::Esc => app.request_pop(),
+            KeyCode::Esc => {
+                step_detail_handle_esc(&mut app);
+            }
             _ => {}
         }
         if app.should_pop {
             return Ok(());
         }
+    }
+}
+
+/// `<esc>` precedence in the step-detail view (TUI-plan.md §4): dismiss the
+/// current toast when one is showing and consume the keypress; otherwise
+/// fall through to the view's existing Esc binding (`request_pop`).
+/// Returns `true` when a toast was dismissed.
+pub(crate) fn step_detail_handle_esc(
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+) -> bool {
+    if app.toasts.dismiss() {
+        true
+    } else {
+        app.request_pop();
+        false
     }
 }
 
@@ -4120,6 +4169,68 @@ mod plan_list_action_tests {
 
         assert!(app.selection.is_empty());
     }
+
+    // -- Esc precedence (toast dismiss) ----------------------------------
+
+    #[test]
+    fn esc_dismisses_toast_when_one_is_present_and_preserves_selection() {
+        // Toast precedence (TUI-plan.md §4): Esc consumes the toast first.
+        // The view's normal Esc handler (clear-selection) must NOT fire when
+        // a toast is dismissed, otherwise a single Esc would do two things.
+        use crate::tui::toast::ToastKind;
+        use std::time::Instant;
+
+        let project = "/tmp/plan-list-esc-toast";
+        let (_conn, mut app) = seed_app(project);
+        app.toggle_selection();
+        assert_eq!(app.selection.len(), 1);
+        app.toasts
+            .push("Saved.", ToastKind::Success, Instant::now());
+        assert!(app.toasts.current().is_some());
+
+        let dismissed = plan_list_handle_esc(&mut app);
+
+        assert!(dismissed, "Esc must report toast was consumed");
+        assert!(app.toasts.is_empty(), "toast must be popped");
+        assert_eq!(
+            app.selection.len(),
+            1,
+            "selection must be untouched when Esc consumed the toast"
+        );
+        assert!(!app.should_quit, "Esc must not quit when consuming a toast");
+    }
+
+    #[test]
+    fn esc_falls_through_to_clear_selection_when_no_toast() {
+        // Without a toast, Esc retains its original §5 behavior:
+        // clear-selection-or-quit. With a selection present, it clears.
+        let project = "/tmp/plan-list-esc-no-toast";
+        let (_conn, mut app) = seed_app(project);
+        app.toggle_selection();
+        assert_eq!(app.selection.len(), 1);
+        assert!(app.toasts.is_empty());
+
+        let dismissed = plan_list_handle_esc(&mut app);
+
+        assert!(!dismissed, "no toast was present");
+        assert!(app.selection.is_empty(), "selection must be cleared");
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn esc_falls_through_to_quit_when_no_toast_and_no_selection() {
+        // Empty-selection fallthrough still mirrors `app.escape()`'s second
+        // arm (set should_quit), so behavior matches the pre-precedence view.
+        let project = "/tmp/plan-list-esc-quit";
+        let (_conn, mut app) = seed_app(project);
+        assert!(app.toasts.is_empty());
+        assert!(app.selection.is_empty());
+
+        let dismissed = plan_list_handle_esc(&mut app);
+
+        assert!(!dismissed);
+        assert!(app.should_quit, "escape on empty selection still quits");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4327,5 +4438,181 @@ mod archived_list_dispatcher_tests {
 
         assert!(app.tiles.is_empty());
         assert_eq!(app.toasts.current().unwrap().text, "Refreshed.");
+    }
+
+    // -- Esc precedence (toast dismiss) ----------------------------------
+
+    #[test]
+    fn esc_dismisses_toast_when_one_is_present_and_preserves_selection() {
+        // Same precedence rule as plan-list (TUI-plan.md §4): Esc consumes
+        // the toast first. The view's `escape()` (clear-selection-or-pop)
+        // must NOT fire when a toast is dismissed.
+        use crate::tui::toast::ToastKind;
+        use std::time::Instant;
+
+        let project = "/tmp/archived-list-esc-toast";
+        let (_conn, mut app) = seed_archived(project);
+        app.toggle_selection();
+        assert_eq!(app.selection.len(), 1);
+        app.toasts
+            .push("Saved.", ToastKind::Success, Instant::now());
+
+        let dismissed = archived_list_handle_esc(&mut app);
+
+        assert!(dismissed);
+        assert!(app.toasts.is_empty());
+        assert_eq!(
+            app.selection.len(),
+            1,
+            "selection must be untouched when Esc consumed the toast"
+        );
+        assert!(!app.should_pop, "Esc must not pop when consuming a toast");
+    }
+
+    #[test]
+    fn esc_falls_through_to_clear_selection_when_no_toast() {
+        let project = "/tmp/archived-list-esc-no-toast";
+        let (_conn, mut app) = seed_archived(project);
+        app.toggle_selection();
+        assert_eq!(app.selection.len(), 1);
+        assert!(app.toasts.is_empty());
+
+        let dismissed = archived_list_handle_esc(&mut app);
+
+        assert!(!dismissed);
+        assert!(app.selection.is_empty());
+        assert!(!app.should_pop);
+    }
+
+    #[test]
+    fn esc_falls_through_to_pop_when_no_toast_and_no_selection() {
+        let project = "/tmp/archived-list-esc-pop";
+        let (_conn, mut app) = seed_archived(project);
+        assert!(app.toasts.is_empty());
+        assert!(app.selection.is_empty());
+
+        let dismissed = archived_list_handle_esc(&mut app);
+
+        assert!(!dismissed);
+        assert!(app.should_pop, "escape on empty selection still pops");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Step-detail dispatcher tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod step_detail_dispatcher_tests {
+    //! Verify the `<esc>` toast-dismiss precedence (TUI-plan.md §4) for the
+    //! step-detail dispatcher: when a toast is showing it is consumed
+    //! without popping the view; otherwise Esc behaves as before
+    //! (`request_pop`).
+
+    use super::*;
+    use crate::plan::{ChangePolicy, Plan, PlanStatus, Step, StepStatus};
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::step_detail::StepDetailApp;
+    use chrono::Utc;
+    use std::time::Instant;
+
+    fn make_app() -> StepDetailApp {
+        let plan = Plan {
+            id: "p1".to_string(),
+            slug: "test".to_string(),
+            project: "/tmp".to_string(),
+            branch_name: "b".to_string(),
+            description: "d".to_string(),
+            status: PlanStatus::InProgress,
+            harness: Some("claude".to_string()),
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
+            context_prepend: None,
+            questions_enabled: false,
+        };
+        let steps = vec![Step {
+            id: "s0".to_string(),
+            plan_id: "p1".to_string(),
+            sort_key: "a0".to_string(),
+            title: "Step".to_string(),
+            description: "Desc".to_string(),
+            agent: None,
+            harness: None,
+            acceptance_criteria: vec![],
+            status: StepStatus::InProgress,
+            attempts: 0,
+            max_retries: Some(3),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: None,
+            skipped_reason: None,
+            change_policy: ChangePolicy::Required,
+            tags: vec![],
+        }];
+        StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &Config::default(),
+            storage::ProjectSettings::default(),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn esc_dismisses_toast_without_popping() {
+        let mut app = make_app();
+        app.toasts
+            .push("Saved.", ToastKind::Success, Instant::now());
+
+        let dismissed = step_detail_handle_esc(&mut app);
+
+        assert!(dismissed);
+        assert!(app.toasts.is_empty(), "toast must be popped");
+        assert!(
+            !app.should_pop,
+            "Esc must not pop the view when consuming a toast"
+        );
+    }
+
+    #[test]
+    fn esc_falls_through_to_request_pop_when_no_toast() {
+        let mut app = make_app();
+        assert!(app.toasts.is_empty());
+        assert!(!app.should_pop);
+
+        let dismissed = step_detail_handle_esc(&mut app);
+
+        assert!(!dismissed);
+        assert!(
+            app.should_pop,
+            "without a toast Esc retains its original pop behavior"
+        );
+    }
+
+    #[test]
+    fn esc_dismisses_only_one_toast_at_a_time() {
+        // Stacked toasts: the first Esc pops the most-recent (current) one;
+        // a follow-up Esc still has a toast to consume rather than popping
+        // the view.
+        let mut app = make_app();
+        app.toasts.push("first", ToastKind::Info, Instant::now());
+        app.toasts.push("second", ToastKind::Info, Instant::now());
+
+        assert!(step_detail_handle_esc(&mut app));
+        assert_eq!(app.toasts.current().unwrap().text, "first");
+        assert!(!app.should_pop);
+
+        assert!(step_detail_handle_esc(&mut app));
+        assert!(app.toasts.is_empty());
+        assert!(!app.should_pop);
+
+        // A third Esc with no toasts left finally falls through to pop.
+        assert!(!step_detail_handle_esc(&mut app));
+        assert!(app.should_pop);
     }
 }

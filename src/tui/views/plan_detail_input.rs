@@ -202,10 +202,13 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             }
         }
 
-        // Esc clears selection if any; otherwise no-op (Esc does NOT pop the
-        // view — `q`/`h`/`←` own that).
+        // Esc precedence (TUI-plan.md §4): dismiss the current toast first
+        // when one is showing; otherwise clear the selection. Esc does NOT
+        // pop the view — `q`/`h`/`←` own that.
         KeyCode::Esc => {
-            let _ = app.escape_selection();
+            if !app.toasts.dismiss() {
+                let _ = app.escape_selection();
+            }
             InputAction::None
         }
 
@@ -597,6 +600,49 @@ mod tests {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Esc));
         assert_eq!(action, InputAction::None);
+        assert!(!app.should_pop);
+    }
+
+    #[test]
+    fn test_esc_dismisses_toast_first_and_preserves_selection() {
+        // TUI-plan.md §4: Esc dismisses the current toast before falling
+        // through to the view's own Esc behavior. The selection must remain
+        // intact when the toast was the consumer.
+        use crate::tui::toast::ToastKind;
+        use std::time::Instant;
+
+        let mut app = make_app(3);
+        app.selected_index = 1;
+        app.toggle_selection();
+        assert!(!app.selection.is_empty());
+        app.toasts
+            .push("Saved.", ToastKind::Success, Instant::now());
+
+        let action = handle_key(&mut app, key(KeyCode::Esc));
+
+        assert_eq!(action, InputAction::None);
+        assert!(app.toasts.is_empty(), "toast must be popped");
+        assert!(
+            !app.selection.is_empty(),
+            "selection must be untouched when Esc consumed the toast"
+        );
+        assert!(!app.should_pop);
+    }
+
+    #[test]
+    fn test_esc_with_no_toast_falls_through_to_clear_selection() {
+        // Without a toast, Esc retains its existing §7 behavior: clear the
+        // selection without popping the view.
+        let mut app = make_app(3);
+        app.selected_index = 1;
+        app.toggle_selection();
+        assert!(!app.selection.is_empty());
+        assert!(app.toasts.is_empty());
+
+        let action = handle_key(&mut app, key(KeyCode::Esc));
+
+        assert_eq!(action, InputAction::None);
+        assert!(app.selection.is_empty(), "selection must be cleared");
         assert!(!app.should_pop);
     }
 
