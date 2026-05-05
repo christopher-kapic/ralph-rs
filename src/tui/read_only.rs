@@ -144,27 +144,38 @@ pub fn banner(state: ReadOnly) -> Option<String> {
 
 /// Detect read-only state by querying `run_locks` for the project. Returns
 /// [`ReadOnly::Locked`] when a row exists owned by neither the TUI process
-/// (`my_pid`) nor any TUI-spawned runner subprocess (`spawned_child_pid`).
+/// (`my_pid`) nor any TUI-spawned runner subprocess (`spawned_child_pid`)
+/// nor by a runner whose recorded `parent_tui_pid` is this TUI.
 ///
 /// The TUI's own pid is excluded so unit tests that share a process with a
 /// real runner do not falsely trigger lockdown; the spawned child pid
 /// covers the §13 streaming-runner case where the TUI itself launched
-/// `ralph run --json` and is consuming its NDJSON.
+/// `ralph run --json` and is consuming its NDJSON; the `parent_tui_pid`
+/// match covers the case where the user starts a run from this TUI,
+/// navigates away (so the `spawned_child_pid` plumbing is gone), and
+/// returns to plan-detail in the same session — without it, a
+/// re-detection would falsely lock down the user's own UI.
 pub fn detect(
     conn: &Connection,
     project: &str,
     my_pid: i64,
     spawned_child_pid: Option<i64>,
 ) -> Result<ReadOnly> {
-    let row: Option<i64> = conn
+    let row: Option<(i64, Option<i64>)> = conn
         .query_row(
-            "SELECT pid FROM run_locks WHERE project = ?1",
+            "SELECT pid, parent_tui_pid FROM run_locks WHERE project = ?1",
             params![project],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
     Ok(match row {
-        Some(pid) if pid != my_pid && Some(pid) != spawned_child_pid => ReadOnly::Locked { pid },
+        Some((pid, parent_tui_pid))
+            if pid != my_pid
+                && Some(pid) != spawned_child_pid
+                && parent_tui_pid != Some(my_pid) =>
+        {
+            ReadOnly::Locked { pid }
+        }
         _ => ReadOnly::Editable,
     })
 }
@@ -363,6 +374,63 @@ mod tests {
         .unwrap();
         let observed = detect(&conn, "/proj-mix", 1, Some(99)).unwrap();
         assert_eq!(observed, ReadOnly::Locked { pid: y });
+    }
+
+    #[test]
+    fn detect_returns_editable_when_parent_tui_pid_matches_us() {
+        // §13.2: when a runner subprocess wrote our pid into
+        // `parent_tui_pid` (i.e. the run was launched from this same TUI
+        // session), navigating away and back must NOT engage read-only —
+        // even though the lock-holder pid is the runner subprocess and
+        // we no longer have a `spawned_child_pid` to short-circuit on.
+        let conn = mem_db();
+        let my_pid: i64 = 4242;
+        let runner_pid: i64 = 9999;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug, parent_tui_pid)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["/proj-parent", runner_pid, "p1", "feat", my_pid],
+        )
+        .unwrap();
+        let observed = detect(&conn, "/proj-parent", my_pid, None).unwrap();
+        assert_eq!(observed, ReadOnly::Editable);
+    }
+
+    #[test]
+    fn detect_returns_locked_when_parent_tui_pid_is_a_different_tui() {
+        // Negative case: a different TUI (a different shell session)
+        // launched the runner, so `parent_tui_pid` matches that other
+        // TUI's pid — not ours. We must lock down even though there's
+        // a `parent_tui_pid` recorded.
+        let conn = mem_db();
+        let my_pid: i64 = 1;
+        let other_tui: i64 = 2000;
+        let runner_pid: i64 = 88;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug, parent_tui_pid)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["/proj-other-tui", runner_pid, "p1", "feat", other_tui],
+        )
+        .unwrap();
+        let observed = detect(&conn, "/proj-other-tui", my_pid, None).unwrap();
+        assert_eq!(observed, ReadOnly::Locked { pid: runner_pid });
+    }
+
+    #[test]
+    fn detect_locks_when_parent_tui_pid_is_null_and_pid_is_external() {
+        // Pre-V17 rows (no parent_tui_pid recorded) and runs spawned
+        // outside any TUI both produce NULL `parent_tui_pid`. With no
+        // matching child pid either, the lock is treated as external.
+        let conn = mem_db();
+        let runner_pid: i64 = 77;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug)
+             VALUES (?1, ?2, ?3, ?4)",
+            params!["/proj-null-parent", runner_pid, "p1", "feat"],
+        )
+        .unwrap();
+        let observed = detect(&conn, "/proj-null-parent", 1, None).unwrap();
+        assert_eq!(observed, ReadOnly::Locked { pid: runner_pid });
     }
 
     #[test]

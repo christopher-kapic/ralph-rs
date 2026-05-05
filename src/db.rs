@@ -26,6 +26,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v14,
     migrate_v15,
     migrate_v16,
+    migrate_v17,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -545,6 +546,29 @@ fn migrate_v16(conn: &Connection) -> Result<()> {
         CREATE INDEX idx_step_questions_step ON step_questions(step_id);
         CREATE INDEX idx_step_questions_unanswered
             ON step_questions(answer) WHERE answer IS NULL;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V17: parent_tui_pid on run_locks (read-only detection ownership)
+// ---------------------------------------------------------------------------
+
+fn migrate_v17(conn: &Connection) -> Result<()> {
+    // `parent_tui_pid` records the pid of the TUI process that spawned this
+    // runner subprocess. When the same TUI later re-enters the plan-detail
+    // view, `read_only::detect` treats `parent_tui_pid == my_pid` as
+    // "lock owned by self" so the user is not falsely forced into read-only
+    // mode in the same shell session that started the run.
+    //
+    // NULL for pre-V17 rows and for runs where the parent pid is unknown
+    // (e.g. non-Unix platforms where we cannot resolve `getppid`). Rows
+    // predating this column degrade to today's read-only behavior, which
+    // is acceptable for in-flight runs at upgrade time.
+    conn.execute_batch(
+        "
+        ALTER TABLE run_locks ADD COLUMN parent_tui_pid INTEGER;
         ",
     )?;
     Ok(())
@@ -1544,6 +1568,74 @@ mod tests {
 
         // Second open is a no-op (re-running V16 would fail on duplicate
         // column / duplicate table).
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v17_adds_parent_tui_pid_to_run_locks() {
+        // Seed a pre-V17 DB with a run_locks row and verify that V17 leaves
+        // it intact with NULL parent_tui_pid, while new inserts can populate
+        // the column.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v16.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v16 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(16) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        // Seed a pre-V17 run_locks row.
+        conn.execute(
+            "INSERT INTO run_locks (project, pid) VALUES (?1, ?2)",
+            rusqlite::params!["/proj-v17", 1i64],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V17 applies. Pre-V17 row must have NULL parent_tui_pid.
+        let conn = open_at(&path).unwrap();
+        let parent: Option<i64> = conn
+            .query_row(
+                "SELECT parent_tui_pid FROM run_locks WHERE project = ?1",
+                ["/proj-v17"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, None);
+
+        // New inserts with explicit values round-trip.
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, parent_tui_pid)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params!["/proj-v17b", 2i64, 4242i64],
+        )
+        .unwrap();
+        let parent2: Option<i64> = conn
+            .query_row(
+                "SELECT parent_tui_pid FROM run_locks WHERE project = ?1",
+                ["/proj-v17b"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent2, Some(4242));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Second open is a no-op.
         let conn = open_at(&path).expect("re-open must not reapply migrations");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))

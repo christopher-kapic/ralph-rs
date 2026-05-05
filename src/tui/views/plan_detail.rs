@@ -1707,6 +1707,7 @@ mod tests {
             updated_at: None,
             source_branch: None,
             stash_sha: None,
+            parent_tui_pid: None,
         }
     }
 

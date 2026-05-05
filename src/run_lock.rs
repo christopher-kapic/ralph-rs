@@ -22,7 +22,8 @@ use crate::plan::Phase;
 #[allow(dead_code)]
 pub const LIVE_RUN_COLUMNS: &str = "project, pid, pid_start_token, plan_id, plan_slug, started_at, \
      step_id, step_num, attempt, max_attempts, phase, phase_started_at, current_command, \
-     execution_log_id, child_pid, child_start_token, updated_at, source_branch, stash_sha";
+     execution_log_id, child_pid, child_start_token, updated_at, source_branch, stash_sha, \
+     parent_tui_pid";
 
 /// Snapshot of the currently-held run lock for a project, including every
 /// observability column added in migration V11. Timestamps are kept as raw
@@ -56,6 +57,13 @@ pub struct LiveRun {
     /// Commit SHA of the ralph-owned stash created at run start (NULL
     /// when the tree was clean or auto-stash was disabled).
     pub stash_sha: Option<String>,
+    /// PID of the TUI process that spawned this runner subprocess, when
+    /// known. Used by [`crate::tui::read_only::detect`] to recognize a
+    /// run as "owned by the same TUI session" so re-entering plan-detail
+    /// after popping to root does not falsely engage read-only mode.
+    /// NULL for pre-V17 rows, for non-TUI invocations, and for platforms
+    /// where we cannot resolve `getppid`.
+    pub parent_tui_pid: Option<i64>,
 }
 
 impl LiveRun {
@@ -101,6 +109,7 @@ impl LiveRun {
             updated_at: row.get(16)?,
             source_branch: row.get(17)?,
             stash_sha: row.get(18)?,
+            parent_tui_pid: row.get(19)?,
         })
     }
 }
@@ -315,6 +324,7 @@ fn acquire_txn(
 ) -> Result<()> {
     let my_pid = std::process::id() as i64;
     let my_start_token = process_start_token(my_pid);
+    let parent_tui_pid = parent_tui_pid();
 
     if force {
         conn.execute("DELETE FROM run_locks WHERE project = ?1", params![project])
@@ -347,8 +357,16 @@ fn acquire_txn(
     }
 
     conn.execute(
-        "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![project, my_pid, my_start_token, plan_id, plan_slug],
+        "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug, parent_tui_pid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            project,
+            my_pid,
+            my_start_token,
+            plan_id,
+            plan_slug,
+            parent_tui_pid,
+        ],
     )
     .context("inserting run_locks row")?;
 
@@ -400,6 +418,29 @@ fn is_same_live_process(pid: i64, stored_start_token: Option<&str>) -> bool {
     match process_start_token(pid) {
         Some(current) => current == expected,
         None => true,
+    }
+}
+
+/// Returns the parent process's pid on Unix, or `None` on platforms where
+/// `getppid` is not available. The runner subprocess writes this into
+/// `run_locks.parent_tui_pid` so a TUI that spawned the runner can later
+/// recognize the lock as belonging to the same session — without it, the
+/// TUI process pid (different from the runner's pid) would look external
+/// to [`crate::tui::read_only::detect`] and force read-only mode.
+///
+/// When the runner is launched directly from a shell (not from a TUI),
+/// this returns the shell's pid; that's harmless because no live TUI
+/// will share the shell's pid, so `detect` won't false-match.
+fn parent_tui_pid() -> Option<i64> {
+    #[cfg(unix)]
+    {
+        // SAFETY: `getppid` is async-signal-safe and always succeeds; it
+        // takes no arguments and reads only the current process's parent.
+        Some(unsafe { libc::getppid() } as i64)
+    }
+    #[cfg(not(unix))]
+    {
+        None
     }
 }
 
@@ -465,6 +506,44 @@ mod tests {
     /// when the guard drops.
     fn noop_release() -> ReleaseFn {
         Box::new(|_| Ok(()))
+    }
+
+    #[test]
+    fn acquire_records_parent_tui_pid_on_unix() {
+        // The runner subprocess writes its parent's pid (the spawning
+        // TUI on Unix) so `read_only::detect` can recognize the run as
+        // belonging to the same session. On Unix we expect Some(_); on
+        // other platforms `parent_tui_pid()` returns None and we accept
+        // a NULL column.
+        let conn = mem_db();
+        let _lock = acquire_inner(
+            &conn,
+            "/tmp/proj-parent-stamp",
+            Some("feat"),
+            Some("p1"),
+            false,
+            noop_release(),
+        )
+        .expect("acquire");
+        let parent: Option<i64> = conn
+            .query_row(
+                "SELECT parent_tui_pid FROM run_locks WHERE project = ?1",
+                params!["/tmp/proj-parent-stamp"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        #[cfg(unix)]
+        {
+            let p = parent.expect("acquire must record parent_tui_pid on Unix");
+            assert!(p > 0, "parent_tui_pid should be a positive pid, got {p}");
+            assert_ne!(
+                p,
+                std::process::id() as i64,
+                "parent_tui_pid must be the parent's pid, not our own"
+            );
+        }
+        #[cfg(not(unix))]
+        assert_eq!(parent, None);
     }
 
     #[test]
@@ -837,7 +916,7 @@ mod tests {
 
     /// Opens a file-backed connection with just the `run_locks` table so the
     /// concurrent-acquire test can drive multiple connections against the same
-    /// underlying database. Mirrors migrations v4 + v9.
+    /// underlying database. Mirrors migrations v4 + v9 + v17.
     fn open_file_db(path: &std::path::Path) -> Connection {
         let conn = Connection::open(path).expect("open file db");
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
@@ -849,7 +928,8 @@ mod tests {
                 plan_id TEXT,
                 plan_slug TEXT,
                 started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                pid_start_token TEXT
+                pid_start_token TEXT,
+                parent_tui_pid INTEGER
             );
             ",
         )
@@ -1015,9 +1095,9 @@ mod tests {
                                     started_at, step_id, step_num, attempt, max_attempts,
                                     phase, phase_started_at, current_command, execution_log_id,
                                     child_pid, child_start_token, updated_at,
-                                    source_branch, stash_sha)
+                                    source_branch, stash_sha, parent_tui_pid)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 "/proj-roundtrip",
                 4242i64,
@@ -1038,6 +1118,7 @@ mod tests {
                 "2026-04-21T00:02:00.000Z",
                 "master",
                 "deadbeefcafe",
+                7777i64,
             ],
         )
         .unwrap();
@@ -1069,6 +1150,7 @@ mod tests {
         assert_eq!(live.updated_at.as_deref(), Some("2026-04-21T00:02:00.000Z"));
         assert_eq!(live.source_branch.as_deref(), Some("master"));
         assert_eq!(live.stash_sha.as_deref(), Some("deadbeefcafe"));
+        assert_eq!(live.parent_tui_pid, Some(7777));
     }
 
     #[test]
