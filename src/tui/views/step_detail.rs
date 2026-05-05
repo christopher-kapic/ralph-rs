@@ -29,8 +29,8 @@ use crate::tui::help::{self, HelpState};
 use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
-use crate::tui::widgets::palette_bar::{self, PaletteBarState};
 use crate::tui::views::step_detail_picker::{BottomCell, PickerKind, PickerOutcome, PickerState};
+use crate::tui::widgets::palette_bar::{self, PaletteBarState};
 
 /// Sentinel rendered in dim style when a pane's source-of-truth value is
 /// `None` or empty. Distinguishes "no value configured" from "configured to
@@ -5075,10 +5075,11 @@ cargo clippy
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = make_app(3, 0);
         app.open_palette('/');
-        let _ = app.palette_bar.as_mut().unwrap().on_key(KeyEvent::new(
-            KeyCode::Char('r'),
-            KeyModifiers::NONE,
-        ));
+        let _ = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         assert_eq!(app.palette_bar.as_ref().unwrap().input, "r");
         app.close_palette();
         assert!(!app.palette_active());
@@ -5238,11 +5239,7 @@ cargo clippy
             let mut app = make_app(3, 0);
             app.last_body_width = 120;
             app.last_sidebar_w = 25;
-            app.handle_mouse(mouse_event(
-                col,
-                5,
-                MouseEventKind::Down(MouseButton::Left),
-            ));
+            app.handle_mouse(mouse_event(col, 5, MouseEventKind::Down(MouseButton::Left)));
             assert!(
                 app.dragging_sidebar,
                 "press at col {col} (divider 25) should arm drag",

@@ -144,7 +144,9 @@ pub fn resolve_resume_plan(
         Ok(branch) => bail!(
             "No resumable plan found for branch '{branch}' or in this project. Specify a slug."
         ),
-        Err(_) => bail!("No resumable plan found in this project. Specify a plan slug as a positional argument."),
+        Err(_) => bail!(
+            "No resumable plan found in this project. Specify a plan slug as a positional argument."
+        ),
     }
 }
 
@@ -1577,8 +1579,7 @@ mod tests {
             storage::create_plan(&conn, "exact", &project, "any", "d", None, None, &[]).unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Failed).unwrap();
 
-        let p =
-            resolve_resume_plan(&conn, Some("exact".to_string()), &project, &dir).unwrap();
+        let p = resolve_resume_plan(&conn, Some("exact".to_string()), &project, &dir).unwrap();
         assert_eq!(p.slug, "exact");
     }
 
@@ -1586,7 +1587,8 @@ mod tests {
     fn test_resolve_resume_plan_no_slug_single_branch_match() {
         let (_tmp, dir, project, branch) = git_repo_for_resume();
         let conn = db::open_memory().unwrap();
-        let plan = storage::create_plan(&conn, "only", &project, "x", "d", None, None, &[]).unwrap();
+        let plan =
+            storage::create_plan(&conn, "only", &project, "x", "d", None, None, &[]).unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Failed).unwrap();
         storage::set_plan_last_run_branch(&conn, &plan.id, &branch).unwrap();
 

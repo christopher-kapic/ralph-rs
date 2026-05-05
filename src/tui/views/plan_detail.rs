@@ -1963,10 +1963,11 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
         app.open_palette(':');
-        let _ = app.palette_bar.as_mut().unwrap().on_key(KeyEvent::new(
-            KeyCode::Char('r'),
-            KeyModifiers::NONE,
-        ));
+        let _ = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         assert_eq!(app.palette_bar.as_ref().unwrap().input, "r");
         app.close_palette();
         assert!(!app.palette_active());

@@ -567,8 +567,8 @@ pub fn run_plan_list_tui(
                         PaletteBarOutcome::Pending => {}
                         PaletteBarOutcome::Cancel => app.close_palette(),
                         PaletteBarOutcome::Submit(input) => {
-                            let archived_refs = plan_refs_from_archived(conn, project)
-                                .unwrap_or_default();
+                            let archived_refs =
+                                plan_refs_from_archived(conn, project).unwrap_or_default();
                             let action = plan_list_palette_action(
                                 &input,
                                 &config.default_harness,
@@ -576,8 +576,7 @@ pub fn run_plan_list_tui(
                                 &archived_refs,
                             );
                             app.close_palette();
-                            match plan_list_apply_palette_action(conn, project, &mut app, action)?
-                            {
+                            match plan_list_apply_palette_action(conn, project, &mut app, action)? {
                                 Some(PaletteAction::OpenConfirmArchive { plan_id, slug }) => {
                                     let body = format!("Archive plan `{slug}`?");
                                     let confirm = dialog::Confirm {
@@ -585,14 +584,8 @@ pub fn run_plan_list_tui(
                                         body: &body,
                                         default: false,
                                     };
-                                    if confirm_with_background(
-                                        &mut terminal,
-                                        &mut app,
-                                        &confirm,
-                                    )? {
-                                        plan_list_apply_archive(
-                                            conn, project, &mut app, &plan_id,
-                                        )?;
+                                    if confirm_with_background(&mut terminal, &mut app, &confirm)? {
+                                        plan_list_apply_archive(conn, project, &mut app, &plan_id)?;
                                     }
                                 }
                                 Some(PaletteAction::OpenConfirmDelete { plan_id, slug }) => {
@@ -604,14 +597,8 @@ pub fn run_plan_list_tui(
                                         body: &body,
                                         default: false,
                                     };
-                                    if confirm_with_background(
-                                        &mut terminal,
-                                        &mut app,
-                                        &confirm,
-                                    )? {
-                                        plan_list_apply_delete(
-                                            conn, project, &mut app, &plan_id,
-                                        )?;
+                                    if confirm_with_background(&mut terminal, &mut app, &confirm)? {
+                                        plan_list_apply_delete(conn, project, &mut app, &plan_id)?;
                                     }
                                 }
                                 Some(PaletteAction::OpenRunDialog {
@@ -910,9 +897,7 @@ pub(crate) fn plan_list_refresh(
 /// clear-selection-or-quit). Returns `true` when a toast was dismissed.
 /// Extracted so the precedence is unit testable without driving the full
 /// event loop.
-pub(crate) fn plan_list_handle_esc(
-    app: &mut crate::tui::views::plan_list::PlanListApp,
-) -> bool {
+pub(crate) fn plan_list_handle_esc(app: &mut crate::tui::views::plan_list::PlanListApp) -> bool {
     if app.toasts.dismiss() {
         true
     } else {
@@ -1248,24 +1233,28 @@ where
                     return Ok(report);
                 }
                 if let Err(e) = crate::git::create_and_checkout_branch(workdir, name) {
-                    report.pending_toasts.push((
-                        format!("Failed to create `{name}`: {e}"),
-                        ToastKind::Error,
-                    ));
+                    report
+                        .pending_toasts
+                        .push((format!("Failed to create `{name}`: {e}"), ToastKind::Error));
                     return Ok(report);
                 }
             }
             Err(e) => {
-                report.pending_toasts.push((
-                    format!("Cannot inspect git state: {e}"),
-                    ToastKind::Error,
-                ));
+                report
+                    .pending_toasts
+                    .push((format!("Cannot inspect git state: {e}"), ToastKind::Error));
                 return Ok(report);
             }
         }
     }
 
-    spawn_palette_runners(workdir, &outcome, targets, force_current_branch, &mut report);
+    spawn_palette_runners(
+        workdir,
+        &outcome,
+        targets,
+        force_current_branch,
+        &mut report,
+    );
     Ok(report)
 }
 
@@ -1287,15 +1276,19 @@ fn spawn_palette_runners(
     let mut spawner = match ProcessRunSpawner::new() {
         Ok(s) => s,
         Err(e) => {
-            report.pending_toasts.push((
-                format!("Cannot locate ralph binary: {e}"),
-                ToastKind::Error,
-            ));
+            report
+                .pending_toasts
+                .push((format!("Cannot locate ralph binary: {e}"), ToastKind::Error));
             return;
         }
     };
-    match run_dialog::dispatch_outcome(outcome, targets, workdir, &mut spawner, force_current_branch)
-    {
+    match run_dialog::dispatch_outcome(
+        outcome,
+        targets,
+        workdir,
+        &mut spawner,
+        force_current_branch,
+    ) {
         Ok(spawned) => {
             if !spawned.is_empty() {
                 let msg = if spawned.len() == 1 {
@@ -1308,10 +1301,9 @@ fn spawn_palette_runners(
             report.spawned = spawned;
         }
         Err(e) => {
-            report.pending_toasts.push((
-                format!("Failed to start run: {e}"),
-                ToastKind::Error,
-            ));
+            report
+                .pending_toasts
+                .push((format!("Failed to start run: {e}"), ToastKind::Error));
         }
     }
 }
@@ -1530,15 +1522,22 @@ pub(crate) fn plan_list_palette_action(
     let focused_slug = app.cursor_plan().map(|p| p.slug.as_str());
     // Run targets: selection wins, otherwise the highlighted plan.
     let run_targets: Vec<crate::tui::run_dialog::RunTarget> = if !app.selection.is_empty() {
-        let by_id: std::collections::HashMap<&str, &crate::plan::Plan> =
-            app.tiles.iter().map(|t| (t.plan.id.as_str(), &t.plan)).collect();
+        let by_id: std::collections::HashMap<&str, &crate::plan::Plan> = app
+            .tiles
+            .iter()
+            .map(|t| (t.plan.id.as_str(), &t.plan))
+            .collect();
         app.selection
             .as_slice()
             .iter()
-            .filter_map(|id| by_id.get(id.as_str()).map(|p| crate::tui::run_dialog::RunTarget {
-                slug: p.slug.clone(),
-                default_branch: p.branch_name.clone(),
-            }))
+            .filter_map(|id| {
+                by_id
+                    .get(id.as_str())
+                    .map(|p| crate::tui::run_dialog::RunTarget {
+                        slug: p.slug.clone(),
+                        default_branch: p.branch_name.clone(),
+                    })
+            })
             .collect()
     } else if let Some(plan) = app.cursor_plan() {
         vec![crate::tui::run_dialog::RunTarget {
@@ -1791,9 +1790,8 @@ fn run_archived_list_tui<B: ratatui::backend::Backend>(
                     app.close_palette();
                     match archived_list_apply_palette_action(conn, project, &mut app, action)? {
                         Some(PaletteAction::OpenConfirmDelete { plan_id, slug }) => {
-                            let body = format!(
-                                "Permanently delete plan `{slug}`? This cannot be undone."
-                            );
+                            let body =
+                                format!("Permanently delete plan `{slug}`? This cannot be undone.");
                             let confirm = dialog::Confirm {
                                 title: "Permanently delete plan",
                                 body: &body,
@@ -2059,11 +2057,8 @@ pub(crate) fn archived_list_apply_palette_action(
         // away via the `Already archived` toast — but keep the variant
         // covered defensively.
         PaletteAction::OpenConfirmArchive { .. } => {
-            app.toasts.push(
-                "Plan is already archived.",
-                ToastKind::Info,
-                Instant::now(),
-            );
+            app.toasts
+                .push("Plan is already archived.", ToastKind::Info, Instant::now());
         }
         PaletteAction::OpenConfirmDelete { .. } => {
             return Ok(Some(action));
@@ -2357,8 +2352,7 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
                 PaletteBarOutcome::Pending => {}
                 PaletteBarOutcome::Cancel => app.close_palette(),
                 PaletteBarOutcome::Submit(input) => {
-                    let action =
-                        plan_detail_palette_action(&input, &config.default_harness, &app);
+                    let action = plan_detail_palette_action(&input, &config.default_harness, &app);
                     app.close_palette();
                     match plan_detail_apply_palette_action(conn, project, &mut app, action)? {
                         Some(PaletteAction::PushPlanDetail { slug: target_slug })
@@ -2380,9 +2374,7 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
                                 body: &body,
                                 default: false,
                             };
-                            if confirm_with_plan_detail_background(
-                                terminal, &mut app, &confirm,
-                            )? {
+                            if confirm_with_plan_detail_background(terminal, &mut app, &confirm)? {
                                 storage::update_plan_status(
                                     conn,
                                     &plan_id,
@@ -2397,17 +2389,14 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
                             }
                         }
                         Some(PaletteAction::OpenConfirmDelete { plan_id, slug }) => {
-                            let body = format!(
-                                "Permanently delete plan `{slug}`? This cannot be undone."
-                            );
+                            let body =
+                                format!("Permanently delete plan `{slug}`? This cannot be undone.");
                             let confirm = crate::tui::dialog::Confirm {
                                 title: "Permanently delete plan",
                                 body: &body,
                                 default: false,
                             };
-                            if confirm_with_plan_detail_background(
-                                terminal, &mut app, &confirm,
-                            )? {
+                            if confirm_with_plan_detail_background(terminal, &mut app, &confirm)? {
                                 storage::delete_plan(conn, &plan_id)?;
                                 app.toasts.push(
                                     "Plan deleted.",
@@ -2474,13 +2463,7 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
                         }
                         Some(PaletteAction::OpenPlanHooks { plan_id, slug }) => {
                             let project_path = app.plan.project.clone();
-                            run_plan_hooks_tui(
-                                terminal,
-                                conn,
-                                &project_path,
-                                &plan_id,
-                                &slug,
-                            )?;
+                            run_plan_hooks_tui(terminal, conn, &project_path, &plan_id, &slug)?;
                         }
                         // Plan-detail's palette context doesn't set
                         // `focused_step`, so the dispatcher already toasted
@@ -2549,13 +2532,7 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
                 let project_path = app.plan.project.clone();
                 let plan_id = app.plan.id.clone();
                 let plan_slug = app.plan.slug.clone();
-                run_plan_dependencies_tui(
-                    terminal,
-                    conn,
-                    &project_path,
-                    &plan_id,
-                    &plan_slug,
-                )?;
+                run_plan_dependencies_tui(terminal, conn, &project_path, &plan_id, &plan_slug)?;
             }
             InputAction::OpenHooks => {
                 let project_path = app.plan.project.clone();
@@ -3136,7 +3113,9 @@ pub(crate) fn plan_detail_apply_palette_action(
             app.toasts
                 .push("Plan approved.", ToastKind::Success, Instant::now());
         }
-        PaletteAction::SetQuestionsEnabled { plan_id, enabled, .. } => {
+        PaletteAction::SetQuestionsEnabled {
+            plan_id, enabled, ..
+        } => {
             storage::set_plan_questions_enabled(conn, &plan_id, enabled)?;
             if let Some(updated) =
                 storage::get_plan_by_slug(conn, &app.plan.slug, &app.plan.project)?
@@ -3180,7 +3159,18 @@ pub(crate) fn plan_detail_apply_palette_action(
             };
             let plan_id = app.plan.id.clone();
             match storage::create_step_at(
-                conn, &plan_id, &sort_key, &title, "", None, None, &[], None, None, None, None,
+                conn,
+                &plan_id,
+                &sort_key,
+                &title,
+                "",
+                None,
+                None,
+                &[],
+                None,
+                None,
+                None,
+                None,
             ) {
                 Ok((new_step, _)) => {
                     let new_id = new_step.id.clone();
@@ -3349,21 +3339,23 @@ fn apply_palette_move_step(
     // Find neighbour sort keys at the destination *after* removing the
     // moving step from the list.
     let moving_id = app.steps[from_idx].id.clone();
-    let others: Vec<&crate::plan::Step> = app
-        .steps
-        .iter()
-        .filter(|s| s.id != moving_id)
-        .collect();
+    let others: Vec<&crate::plan::Step> = app.steps.iter().filter(|s| s.id != moving_id).collect();
     let dest = to_idx.min(others.len());
-    let prev = if dest == 0 { None } else { others.get(dest - 1) };
+    let prev = if dest == 0 {
+        None
+    } else {
+        others.get(dest - 1)
+    };
     let next = others.get(dest);
     let new_key = match (prev, next) {
         (Some(p), Some(n)) => crate::frac_index::key_between(&p.sort_key, &n.sort_key)
             .map_err(|e| anyhow::anyhow!("{e}")),
-        (None, Some(n)) => crate::frac_index::key_between("", &n.sort_key)
-            .map_err(|e| anyhow::anyhow!("{e}")),
-        (Some(p), None) => crate::frac_index::key_after(&p.sort_key)
-            .map_err(|e| anyhow::anyhow!("{e}")),
+        (None, Some(n)) => {
+            crate::frac_index::key_between("", &n.sort_key).map_err(|e| anyhow::anyhow!("{e}"))
+        }
+        (Some(p), None) => {
+            crate::frac_index::key_after(&p.sort_key).map_err(|e| anyhow::anyhow!("{e}"))
+        }
         (None, None) => Ok(crate::frac_index::initial_key()),
     };
     let new_key = match new_key {
@@ -3654,10 +3646,7 @@ fn run_plan_hooks_tui<B: ratatui::backend::Backend>(
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        app.push_toast(
-                            format!("Failed to detach hook: {e}"),
-                            ToastKind::Error,
-                        );
+                        app.push_toast(format!("Failed to detach hook: {e}"), ToastKind::Error);
                         continue;
                     }
                 }
@@ -3748,8 +3737,7 @@ fn run_step_hooks_tui<B: ratatui::backend::Backend>(
         .unwrap_or(0);
     let step_label = format!("#{step_num} — {}", step.title);
 
-    let (attachments, candidates) =
-        load_step_hooks_view_state(conn, project, &plan_id, step_id)?;
+    let (attachments, candidates) = load_step_hooks_view_state(conn, project, &plan_id, step_id)?;
     let mut app = StepHooksApp::new(
         plan_id.clone(),
         step_id.to_string(),
@@ -3820,10 +3808,7 @@ fn run_step_hooks_tui<B: ratatui::backend::Backend>(
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        app.push_toast(
-                            format!("Failed to detach hook: {e}"),
-                            ToastKind::Error,
-                        );
+                        app.push_toast(format!("Failed to detach hook: {e}"), ToastKind::Error);
                         continue;
                     }
                 }
@@ -4156,8 +4141,7 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
                 PaletteBarOutcome::Pending => {}
                 PaletteBarOutcome::Cancel => app.close_palette(),
                 PaletteBarOutcome::Submit(input) => {
-                    let action =
-                        step_detail_palette_action(&input, &config.default_harness, &app);
+                    let action = step_detail_palette_action(&input, &config.default_harness, &app);
                     app.close_palette();
                     match step_detail_apply_palette_action(conn, project, &mut app, action)? {
                         Some(PaletteAction::PushPlanDetail { .. })
@@ -4226,13 +4210,7 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
                         }
                         Some(PaletteAction::OpenPlanHooks { plan_id, slug }) => {
                             let project_path = app.plan.project.clone();
-                            run_plan_hooks_tui(
-                                terminal,
-                                conn,
-                                &project_path,
-                                &plan_id,
-                                &slug,
-                            )?;
+                            run_plan_hooks_tui(terminal, conn, &project_path, &plan_id, &slug)?;
                         }
                         Some(PaletteAction::OpenStepHooks { step_id, .. }) => {
                             run_step_hooks_tui(terminal, conn, project, &step_id)?;
@@ -4291,9 +4269,7 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.request_pop();
             }
-            KeyCode::Char('c')
-                if app.focused_pane == Pane::BottomRow && app.can_edit_panes() =>
-            {
+            KeyCode::Char('c') if app.focused_pane == Pane::BottomRow && app.can_edit_panes() => {
                 let agents = list_agent_names();
                 app.open_picker_for_focused_cell(&agents);
             }
@@ -4361,7 +4337,9 @@ pub(crate) fn step_detail_apply_palette_action(
             app.toasts
                 .push("Plan approved.", ToastKind::Success, Instant::now());
         }
-        PaletteAction::SetQuestionsEnabled { plan_id, enabled, .. } => {
+        PaletteAction::SetQuestionsEnabled {
+            plan_id, enabled, ..
+        } => {
             storage::set_plan_questions_enabled(conn, &plan_id, enabled)?;
             if let Some(updated) =
                 storage::get_plan_by_slug(conn, &app.plan.slug, &app.plan.project)?
@@ -4489,11 +4467,7 @@ pub(crate) fn step_detail_palette_action(
     }];
     let focused_step = app.current_step().map(|s| FocusedStep {
         id: s.id.clone(),
-        label: format!(
-            "#{} — {}",
-            app.selected_step_index + 1,
-            s.title
-        ),
+        label: format!("#{} — {}", app.selected_step_index + 1, s.title),
     });
 
     let ctx = palette_dispatch::PaletteContext {
@@ -5371,9 +5345,7 @@ pub fn cmd_pause(
         && live.plan_slug.as_deref() != Some(requested)
     {
         let live_label = live.plan_slug.as_deref().unwrap_or("<none>");
-        anyhow::bail!(
-            "Live run is for plan '{live_label}', not '{requested}'. Refusing to pause."
-        );
+        anyhow::bail!("Live run is for plan '{live_label}', not '{requested}'. Refusing to pause.");
     }
 
     // Resolve the plan to flag. Prefer the slug the caller passed (already
@@ -7518,17 +7490,9 @@ mod step_detail_dispatcher_tests {
     /// Build a step-detail app whose plan + first step are materialized in
     /// `conn`, so dispatcher edits land on real rows we can read back.
     fn db_app(conn: &Connection, project: &str) -> StepDetailApp {
-        let plan = storage::create_plan(
-            conn,
-            "tui-c",
-            project,
-            "branch-c",
-            "desc",
-            None,
-            None,
-            &[],
-        )
-        .unwrap();
+        let plan =
+            storage::create_plan(conn, "tui-c", project, "branch-c", "desc", None, None, &[])
+                .unwrap();
         let (step, _pos) = storage::create_step(
             conn,
             &plan.id,
@@ -7812,11 +7776,8 @@ mod step_detail_dispatcher_tests {
         assert!(!app.can_edit_panes());
 
         // Now release the lock and run another poll cycle: Locked → Editable.
-        conn.execute(
-            "DELETE FROM run_locks WHERE project = ?1",
-            params![project],
-        )
-        .unwrap();
+        conn.execute("DELETE FROM run_locks WHERE project = ?1", params![project])
+            .unwrap();
         let later = now + read_only::POLL_INTERVAL;
         let observed = read_only::detect(&conn, project, my_pid, None).unwrap();
         let transition = step_detail_observe_read_only(&mut tracker, &mut app, observed, later);
@@ -7843,12 +7804,7 @@ mod step_detail_dispatcher_tests {
 
         let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
         let now = Instant::now();
-        step_detail_observe_read_only(
-            &mut tracker,
-            &mut app,
-            ReadOnly::Locked { pid: 4242 },
-            now,
-        );
+        step_detail_observe_read_only(&mut tracker, &mut app, ReadOnly::Locked { pid: 4242 }, now);
 
         assert!(
             app.picker.is_none(),
@@ -7944,12 +7900,8 @@ mod palette_action_tests {
         let project = "/tmp/palette-approve";
         let (conn, mut app) = seed_app(project);
         let target_slug = app.cursor_plan().unwrap().slug.clone();
-        let action = plan_list_palette_action(
-            &format!("/plan approve {target_slug}"),
-            "claude",
-            &app,
-            &[],
-        );
+        let action =
+            plan_list_palette_action(&format!("/plan approve {target_slug}"), "claude", &app, &[]);
         plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
 
         let from_db = storage::get_plan_by_slug(&conn, &target_slug, project)
@@ -7957,7 +7909,11 @@ mod palette_action_tests {
             .unwrap();
         assert_eq!(from_db.status, PlanStatus::Ready);
 
-        let tile = app.tiles.iter().find(|t| t.plan.slug == target_slug).unwrap();
+        let tile = app
+            .tiles
+            .iter()
+            .find(|t| t.plan.slug == target_slug)
+            .unwrap();
         assert_eq!(tile.plan.status, PlanStatus::Ready);
         assert_eq!(app.toasts.current().unwrap().text, "Plan approved.");
     }
@@ -7983,7 +7939,11 @@ mod palette_action_tests {
             .unwrap()
             .unwrap();
         assert!(row.questions_enabled);
-        let tile = app.tiles.iter().find(|t| t.plan.slug == target_slug).unwrap();
+        let tile = app
+            .tiles
+            .iter()
+            .find(|t| t.plan.slug == target_slug)
+            .unwrap();
         assert!(tile.plan.questions_enabled);
         assert_eq!(app.toasts.current().unwrap().text, "Questions enabled.");
     }
@@ -8004,12 +7964,8 @@ mod palette_action_tests {
         let target_slug = app.cursor_plan().unwrap().slug.clone();
         let initial_len = app.tiles.len();
 
-        let action = plan_list_palette_action(
-            &format!("/plan archive {target_slug}"),
-            "claude",
-            &app,
-            &[],
-        );
+        let action =
+            plan_list_palette_action(&format!("/plan archive {target_slug}"), "claude", &app, &[]);
         match &action {
             PaletteAction::OpenConfirmArchive { plan_id, slug } => {
                 assert_eq!(plan_id, &target_id);
@@ -8018,8 +7974,7 @@ mod palette_action_tests {
             other => panic!("expected OpenConfirmArchive, got {other:?}"),
         }
         // Apply returns the action back so the caller renders the confirm.
-        let forwarded =
-            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let forwarded = plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(matches!(
             forwarded,
             Some(PaletteAction::OpenConfirmArchive { .. })
@@ -8043,12 +7998,7 @@ mod palette_action_tests {
         // A `/plan archive <bogus>` should land on `Toast { kind: Error }`.
         let project = "/tmp/palette-archive-unknown";
         let (conn, mut app) = seed_app(project);
-        let action = plan_list_palette_action(
-            "/plan archive does-not-exist",
-            "claude",
-            &app,
-            &[],
-        );
+        let action = plan_list_palette_action("/plan archive does-not-exist", "claude", &app, &[]);
         match &action {
             PaletteAction::Toast { kind, .. } => assert_eq!(*kind, ToastKind::Error),
             other => panic!("expected Toast(Error), got {other:?}"),
@@ -8081,8 +8031,7 @@ mod run_dialog_apply_tests {
 
     fn seed_plan(project: &str) -> (Connection, PlanListApp) {
         let conn = db::open_memory().unwrap();
-        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[])
-            .unwrap();
+        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[]).unwrap();
         let tiles = build_plan_tiles(&conn, project).unwrap();
         let app = PlanListApp::new(tiles, project, "UTC");
         (conn, app)
@@ -8106,8 +8055,7 @@ mod run_dialog_apply_tests {
             plan_count: 1,
             targets: vec![run_target("alpha", "feature-x")],
         };
-        let forwarded =
-            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let forwarded = plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(matches!(
             forwarded,
             Some(PaletteAction::OpenRunDialog { plan_count: 1, .. })
@@ -8125,8 +8073,7 @@ mod run_dialog_apply_tests {
             targets: vec![run_target("alpha", "feature-x")],
             force_current_branch: false,
         };
-        let forwarded =
-            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let forwarded = plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(matches!(
             forwarded,
             Some(PaletteAction::RunOnBranch { ref branch, .. }) if branch == "hotfix"
@@ -8158,9 +8105,11 @@ mod run_dialog_apply_tests {
             }
             other => panic!("expected OpenRunDialog, got {other:?}"),
         }
-        let forwarded =
-            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
-        assert!(matches!(forwarded, Some(PaletteAction::OpenRunDialog { .. })));
+        let forwarded = plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        assert!(matches!(
+            forwarded,
+            Some(PaletteAction::OpenRunDialog { .. })
+        ));
     }
 
     #[test]
@@ -8185,8 +8134,7 @@ mod run_dialog_apply_tests {
             }
             other => panic!("expected RunOnBranch, got {other:?}"),
         }
-        let forwarded =
-            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let forwarded = plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(matches!(forwarded, Some(PaletteAction::RunOnBranch { .. })));
     }
 
@@ -8375,8 +8323,7 @@ mod sub_view_routing_tests {
 
     fn seed_plan_list(project: &str) -> (Connection, PlanListApp) {
         let conn = db::open_memory().unwrap();
-        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[])
-            .unwrap();
+        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[]).unwrap();
         let tiles = build_plan_tiles(&conn, project).unwrap();
         let app = PlanListApp::new(tiles, project, "UTC");
         (conn, app)
@@ -8384,8 +8331,7 @@ mod sub_view_routing_tests {
 
     fn seed_plan_detail(project: &str) -> (Connection, PlanDetailApp) {
         let conn = db::open_memory().unwrap();
-        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[])
-            .unwrap();
+        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[]).unwrap();
         let plan = storage::get_plan_by_slug(&conn, "alpha", project)
             .unwrap()
             .unwrap();
@@ -8455,12 +8401,7 @@ mod sub_view_routing_tests {
         let target_id = app.cursor_plan().unwrap().id.clone();
 
         for verb in ["dependency add", "dependency remove", "dependency list"] {
-            let action = plan_list_palette_action(
-                &format!("/plan {verb}"),
-                "claude",
-                &app,
-                &[],
-            );
+            let action = plan_list_palette_action(&format!("/plan {verb}"), "claude", &app, &[]);
             match &action {
                 PaletteAction::OpenPlanDependencies { plan_id, slug } => {
                     assert_eq!(plan_id, &target_id, "/plan {verb}: plan_id");
@@ -8468,10 +8409,8 @@ mod sub_view_routing_tests {
                 }
                 other => panic!("/plan {verb}: expected OpenPlanDependencies, got {other:?}"),
             }
-            let forwarded = plan_list_apply_palette_action(
-                &conn, project, &mut app, action,
-            )
-            .unwrap();
+            let forwarded =
+                plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
             assert!(
                 matches!(forwarded, Some(PaletteAction::OpenPlanDependencies { .. })),
                 "/plan {verb}: apply must forward to caller, got {forwarded:?}"
@@ -8485,8 +8424,7 @@ mod sub_view_routing_tests {
         let (conn, mut app) = seed_plan_detail(project);
         let action = plan_detail_palette_action("/plan dependency add", "claude", &app);
         assert!(matches!(action, PaletteAction::OpenPlanDependencies { .. }));
-        let forwarded =
-            plan_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let forwarded = plan_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(matches!(
             forwarded,
             Some(PaletteAction::OpenPlanDependencies { .. })
@@ -8500,8 +8438,7 @@ mod sub_view_routing_tests {
         let mut app = make_step_detail_app("alpha", project);
         let action = step_detail_palette_action("/plan dependency add", "claude", &app);
         assert!(matches!(action, PaletteAction::OpenPlanDependencies { .. }));
-        let forwarded =
-            step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let forwarded = step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(matches!(
             forwarded,
             Some(PaletteAction::OpenPlanDependencies { .. })
@@ -8518,12 +8455,7 @@ mod sub_view_routing_tests {
         let target_id = app.cursor_plan().unwrap().id.clone();
 
         for verb in ["set-hook", "unset-hook", "hooks"] {
-            let action = plan_list_palette_action(
-                &format!("/plan {verb}"),
-                "claude",
-                &app,
-                &[],
-            );
+            let action = plan_list_palette_action(&format!("/plan {verb}"), "claude", &app, &[]);
             match &action {
                 PaletteAction::OpenPlanHooks { plan_id, slug } => {
                     assert_eq!(plan_id, &target_id, "/plan {verb}: plan_id");
@@ -8531,10 +8463,8 @@ mod sub_view_routing_tests {
                 }
                 other => panic!("/plan {verb}: expected OpenPlanHooks, got {other:?}"),
             }
-            let forwarded = plan_list_apply_palette_action(
-                &conn, project, &mut app, action,
-            )
-            .unwrap();
+            let forwarded =
+                plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
             assert!(
                 matches!(forwarded, Some(PaletteAction::OpenPlanHooks { .. })),
                 "/plan {verb}: apply must forward to caller, got {forwarded:?}"
@@ -8548,8 +8478,7 @@ mod sub_view_routing_tests {
         let (conn, mut app) = seed_plan_detail(project);
         let action = plan_detail_palette_action("/plan hooks", "claude", &app);
         assert!(matches!(action, PaletteAction::OpenPlanHooks { .. }));
-        let forwarded =
-            plan_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let forwarded = plan_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(matches!(
             forwarded,
             Some(PaletteAction::OpenPlanHooks { .. })
@@ -8563,8 +8492,7 @@ mod sub_view_routing_tests {
         let mut app = make_step_detail_app("alpha", project);
         let action = step_detail_palette_action("/plan hooks", "claude", &app);
         assert!(matches!(action, PaletteAction::OpenPlanHooks { .. }));
-        let forwarded =
-            step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let forwarded = step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(matches!(
             forwarded,
             Some(PaletteAction::OpenPlanHooks { .. })
@@ -8581,21 +8509,15 @@ mod sub_view_routing_tests {
         let expected_step_id = app.current_step().unwrap().id.clone();
 
         for verb in ["set-hook", "unset-hook"] {
-            let action = step_detail_palette_action(
-                &format!("/step {verb}"),
-                "claude",
-                &app,
-            );
+            let action = step_detail_palette_action(&format!("/step {verb}"), "claude", &app);
             match &action {
                 PaletteAction::OpenStepHooks { step_id, .. } => {
                     assert_eq!(step_id, &expected_step_id, "/step {verb}: step_id");
                 }
                 other => panic!("/step {verb}: expected OpenStepHooks, got {other:?}"),
             }
-            let forwarded = step_detail_apply_palette_action(
-                &conn, project, &mut app, action,
-            )
-            .unwrap();
+            let forwarded =
+                step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
             assert!(
                 matches!(forwarded, Some(PaletteAction::OpenStepHooks { .. })),
                 "/step {verb}: apply must forward to caller, got {forwarded:?}"
@@ -8617,8 +8539,7 @@ mod sub_view_routing_tests {
             }
             other => panic!("expected Toast, got {other:?}"),
         }
-        let forwarded =
-            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let forwarded = plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(
             forwarded.is_none(),
             "Toast must not forward to caller: {forwarded:?}"
@@ -8641,8 +8562,7 @@ mod sub_view_routing_tests {
             }
             other => panic!("expected OpenStepTags, got {other:?}"),
         }
-        let forwarded =
-            step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let forwarded = step_detail_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(matches!(
             forwarded,
             Some(PaletteAction::OpenStepTags { .. })
@@ -8660,8 +8580,7 @@ mod sub_view_routing_tests {
             }
             other => panic!("expected Toast, got {other:?}"),
         }
-        let forwarded =
-            plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
+        let forwarded = plan_list_apply_palette_action(&conn, project, &mut app, action).unwrap();
         assert!(forwarded.is_none(), "Toast must not forward: {forwarded:?}");
     }
 
@@ -8700,8 +8619,8 @@ mod sub_view_routing_tests {
 
         // Pre-set the flag — simulates "user pressed P once already".
         storage::set_plan_pause_requested(&conn, &app.plan.id, true).unwrap();
-        if let Some(updated) = storage::get_plan_by_slug(&conn, &app.plan.slug, &app.plan.project)
-            .unwrap()
+        if let Some(updated) =
+            storage::get_plan_by_slug(&conn, &app.plan.slug, &app.plan.project).unwrap()
         {
             app.plan = updated;
         }
@@ -8713,10 +8632,7 @@ mod sub_view_routing_tests {
         assert!(!storage::get_plan_pause_requested(&conn, &app.plan.id).unwrap());
         assert!(!app.plan.pause_requested);
 
-        let active = app
-            .toasts
-            .current()
-            .expect("cancel toast must surface");
+        let active = app.toasts.current().expect("cancel toast must surface");
         assert!(
             active.text.contains("cancelled"),
             "second press toast should mention cancel, got {:?}",
@@ -8832,7 +8748,10 @@ mod mouse_routing_tests {
         // routing helper should report `false` so we can be sure the helper
         // isn't accidentally swallowing every event.
         let routed_other = route_mouse_event(Event::FocusGained, app);
-        assert!(!routed_other, "Non-mouse events must not route to handle_mouse");
+        assert!(
+            !routed_other,
+            "Non-mouse events must not route to handle_mouse"
+        );
     }
 
     // -- Per-view fixtures ---------------------------------------------------

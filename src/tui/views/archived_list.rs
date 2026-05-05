@@ -209,7 +209,8 @@ pub fn draw(frame: &mut Frame, app: &mut ArchivedListApp) {
     app.toasts.prune(Instant::now());
 
     let crumbs: [&str; 2] = ["ralph", "Archived plans"];
-    let normal_hint = "[j/k] nav  [enter] unarchive  [space] select  [d] delete  [/:] cmd  [h/←/q] back";
+    let normal_hint =
+        "[j/k] nav  [enter] unarchive  [space] select  [d] delete  [/:] cmd  [h/←/q] back";
     let palette_hint = "[tab] complete  [enter] submit  [esc] cancel";
     let hint = if app.palette_active() {
         palette_hint
@@ -619,10 +620,11 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = ArchivedListApp::new(make_tiles(1), "/proj", "UTC");
         app.open_palette('/');
-        let _ = app.palette_bar.as_mut().unwrap().on_key(KeyEvent::new(
-            KeyCode::Char('r'),
-            KeyModifiers::NONE,
-        ));
+        let _ = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         assert_eq!(app.palette_bar.as_ref().unwrap().input, "r");
         app.close_palette();
         assert!(!app.palette_active());

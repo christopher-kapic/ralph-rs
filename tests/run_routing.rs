@@ -65,9 +65,7 @@ fn setup_project() -> (tempfile::TempDir, std::path::PathBuf) {
     );
     std::fs::write(proj.join("README"), "test").unwrap();
     run_check(
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(&proj),
+        Command::new("git").args(["add", "."]).current_dir(&proj),
         "git add",
     );
     run_check(
@@ -131,7 +129,9 @@ fn env_xdg_data(proj: &Path) -> std::path::PathBuf {
 }
 
 fn run_check(cmd: &mut Command, label: &str) {
-    let out = cmd.output().unwrap_or_else(|e| panic!("{label}: spawn: {e}"));
+    let out = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("{label}: spawn: {e}"));
     assert!(
         out.status.success(),
         "{label} failed: status={:?}\nstdout: {}\nstderr: {}",
@@ -165,7 +165,9 @@ fn json_flag_takes_noninteractive_path() {
         .copied()
         .collect();
     assert!(
-        !combined.windows(ALT_SCREEN_ENTER.len()).any(|w| w == ALT_SCREEN_ENTER),
+        !combined
+            .windows(ALT_SCREEN_ENTER.len())
+            .any(|w| w == ALT_SCREEN_ENTER),
         "--json must take the non-interactive path; alt-screen escape leaked.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
@@ -198,7 +200,9 @@ fn bare_run_with_piped_stdout_takes_noninteractive_path() {
         .copied()
         .collect();
     assert!(
-        !combined.windows(ALT_SCREEN_ENTER.len()).any(|w| w == ALT_SCREEN_ENTER),
+        !combined
+            .windows(ALT_SCREEN_ENTER.len())
+            .any(|w| w == ALT_SCREEN_ENTER),
         "non-TTY stdout must skip the TUI; alt-screen escape leaked.\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),

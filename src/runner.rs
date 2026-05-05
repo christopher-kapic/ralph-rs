@@ -3013,7 +3013,17 @@ mod tests {
         // One Complete step so the runner reaches run_plan_inner, writes
         // last_run_branch, and exits cleanly (no executor needed).
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "Done", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Done",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -3065,7 +3075,17 @@ mod tests {
                 .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "Done", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Done",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();

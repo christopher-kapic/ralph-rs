@@ -894,10 +894,7 @@ mod tests {
             out.contains("Test output"),
             "test tail header missing:\n{out}"
         );
-        assert!(
-            out.contains("42 passed"),
-            "test tail line missing:\n{out}"
-        );
+        assert!(out.contains("42 passed"), "test tail line missing:\n{out}");
     }
 
     #[test]
@@ -934,7 +931,10 @@ mod tests {
             out.contains("Title: Step 3"),
             "cursor's step title missing on non-live step:\n{out}"
         );
-        assert!(out.contains("Status: pending"), "cursor's step status missing:\n{out}");
+        assert!(
+            out.contains("Status: pending"),
+            "cursor's step status missing:\n{out}"
+        );
     }
 
     #[test]

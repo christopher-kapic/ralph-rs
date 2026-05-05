@@ -1876,13 +1876,7 @@ mod tests {
     /// Render a slice of `area` rows as a single newline-joined string for
     /// substring-based assertions. Used by the two-pane preview tests below
     /// so they can be expressive about what region they're inspecting.
-    fn region_text(
-        buffer: &ratatui::buffer::Buffer,
-        x: u16,
-        y: u16,
-        w: u16,
-        h: u16,
-    ) -> String {
+    fn region_text(buffer: &ratatui::buffer::Buffer, x: u16, y: u16, w: u16, h: u16) -> String {
         let mut out = String::new();
         for row in y..(y + h) {
             for col in x..(x + w) {
@@ -2126,10 +2120,11 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
         app.open_palette('/');
-        let _ = app.palette_bar.as_mut().unwrap().on_key(KeyEvent::new(
-            KeyCode::Char('r'),
-            KeyModifiers::NONE,
-        ));
+        let _ = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         assert_eq!(app.palette_bar.as_ref().unwrap().input, "r");
         app.close_palette();
         assert!(!app.palette_active());

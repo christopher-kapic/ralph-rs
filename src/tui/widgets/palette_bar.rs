@@ -92,16 +92,12 @@ impl PaletteBarState {
     pub fn on_key(&mut self, key: KeyEvent) -> PaletteBarOutcome {
         // Ctrl-W: word erase (handled before the generic Char branch so
         // it isn't treated as a literal 'w' insert).
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('w'))
-        {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
             self.word_erase();
             return PaletteBarOutcome::Pending;
         }
         // Ctrl-C cancels regardless of which key code rides on it.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c'))
-        {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             return PaletteBarOutcome::Cancel;
         }
 

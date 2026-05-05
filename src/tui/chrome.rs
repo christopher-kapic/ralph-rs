@@ -117,13 +117,12 @@ fn render_bottom(
     } else {
         0
     };
-    let running_slot_width = if running_width > 0
-        && (area.width as usize) > cwd_width + running_width + 3
-    {
-        running_width as u16 + 2
-    } else {
-        0
-    };
+    let running_slot_width =
+        if running_width > 0 && (area.width as usize) > cwd_width + running_width + 3 {
+            running_width as u16 + 2
+        } else {
+            0
+        };
 
     // Reserve the right side for cwd/version (and optionally the running
     // indicator); the left side gets whatever's left after a 1-column gap.
