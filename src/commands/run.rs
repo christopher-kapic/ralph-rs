@@ -358,8 +358,31 @@ pub fn run_plan_list_tui(
                 if app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough {
                     continue;
                 }
+                // §9 palette: while open, route every key through the palette
+                // bar first. Submit / cancel both close it; step 20 wires the
+                // parsed command into `palette_dispatch::dispatch`. <Enter>
+                // submits via `crate::tui::palette::parse(input)`.
+                if let Some(bar) = app.palette_bar.as_mut() {
+                    use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+                    match bar.on_key(key) {
+                        PaletteBarOutcome::Pending => {}
+                        PaletteBarOutcome::Cancel => app.close_palette(),
+                        PaletteBarOutcome::Submit(input) => {
+                            let _parsed = crate::tui::palette::parse(&input);
+                            app.close_palette();
+                        }
+                    }
+                    continue;
+                }
                 let locked = app.read_only.is_locked();
                 match key.code {
+                    KeyCode::Char('/') | KeyCode::Char(':') => {
+                        let prefix = match key.code {
+                            KeyCode::Char(c) => c,
+                            _ => '/',
+                        };
+                        app.open_palette(prefix);
+                    }
                     KeyCode::Char('j') | KeyCode::Down => app.navigate_down(),
                     KeyCode::Char('k') | KeyCode::Up => app.navigate_up(),
                     KeyCode::Char('g') => app.jump_top(),
@@ -809,7 +832,27 @@ fn run_archived_list_tui<B: ratatui::backend::Backend>(
         if app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough {
             continue;
         }
+        // §9 palette: see plan-list dispatcher for the routing rule.
+        if let Some(bar) = app.palette_bar.as_mut() {
+            use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+            match bar.on_key(key) {
+                PaletteBarOutcome::Pending => {}
+                PaletteBarOutcome::Cancel => app.close_palette(),
+                PaletteBarOutcome::Submit(input) => {
+                    let _parsed = crate::tui::palette::parse(&input);
+                    app.close_palette();
+                }
+            }
+            continue;
+        }
         match key.code {
+            KeyCode::Char('/') | KeyCode::Char(':') => {
+                let prefix = match key.code {
+                    KeyCode::Char(c) => c,
+                    _ => '/',
+                };
+                app.open_palette(prefix);
+            }
             KeyCode::Char('j') | KeyCode::Down => app.navigate_down(),
             KeyCode::Char('k') | KeyCode::Up => app.navigate_up(),
             KeyCode::Char('g') => app.jump_top(),
@@ -1005,7 +1048,7 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     use crate::tui::views::plan_detail::{self, PlanDetailApp};
     use crate::tui::views::plan_detail_input::{self, InputAction};
     use crate::tui::views::plan_detail_ui;
-    use crossterm::event::{self, Event, KeyEventKind};
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
     use std::time::Instant;
 
     let plan = storage::get_plan_by_slug(conn, slug, project)?
@@ -1114,6 +1157,31 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
         if matches!(app.input_mode, plan_detail::InputMode::Normal)
             && app.help.intercept_key(key) != crate::tui::help::InterceptResult::Passthrough
         {
+            continue;
+        }
+        // §9 palette: while open, route every key through the palette bar
+        // and skip the per-view input handler. Submit / cancel both close
+        // it; step 20 wires the parsed command into
+        // `palette_dispatch::dispatch`.
+        if let Some(bar) = app.palette_bar.as_mut() {
+            use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+            match bar.on_key(key) {
+                PaletteBarOutcome::Pending => {}
+                PaletteBarOutcome::Cancel => app.close_palette(),
+                PaletteBarOutcome::Submit(input) => {
+                    let _parsed = crate::tui::palette::parse(&input);
+                    app.close_palette();
+                }
+            }
+            continue;
+        }
+        // §9 palette open: `/` and `:` enter palette mode in Normal mode
+        // only. Add-mode treats them as literal text input characters.
+        if matches!(app.input_mode, plan_detail::InputMode::Normal)
+            && let KeyCode::Char(c) = key.code
+            && (c == '/' || c == ':')
+        {
+            app.open_palette(c);
             continue;
         }
         let action = plan_detail_input::handle_key(&mut app, key);
@@ -2343,7 +2411,31 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             continue;
         }
 
+        // §9 palette: while open, route every key through the palette bar
+        // and skip the per-view input handler. Submit / cancel both close
+        // it; step 20 wires the parsed command into
+        // `palette_dispatch::dispatch`.
+        if let Some(bar) = app.palette_bar.as_mut() {
+            use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+            match bar.on_key(key) {
+                PaletteBarOutcome::Pending => {}
+                PaletteBarOutcome::Cancel => app.close_palette(),
+                PaletteBarOutcome::Submit(input) => {
+                    let _parsed = crate::tui::palette::parse(&input);
+                    app.close_palette();
+                }
+            }
+            continue;
+        }
+
         match key.code {
+            KeyCode::Char('/') | KeyCode::Char(':') => {
+                let prefix = match key.code {
+                    KeyCode::Char(c) => c,
+                    _ => '/',
+                };
+                app.open_palette(prefix);
+            }
             // Question-pane navigation (j/k) overrides pane navigation while
             // the pane is focused.
             KeyCode::Char('j') | KeyCode::Down

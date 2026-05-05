@@ -20,6 +20,7 @@ use crate::tui::events::TAIL_VISIBLE_LINES;
 use crate::tui::help;
 use crate::tui::read_only;
 use crate::tui::theme;
+use crate::tui::widgets::palette_bar;
 use crate::tui::widgets::step_list;
 
 /// Render the entire plan-detail view.
@@ -60,12 +61,30 @@ pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
         let area = frame.area();
         help::render(frame, area, &help::for_plan_detail());
     }
+
+    // Palette bar overlays the bottom chrome row when active. TUI-plan.md §9.
+    if let Some(state) = app.palette_bar.as_ref() {
+        let area = frame.area();
+        let strip_height = 4.min(area.height);
+        if strip_height > 0 {
+            let palette_area = Rect {
+                x: area.x,
+                y: area.y + area.height - strip_height,
+                width: area.width,
+                height: strip_height,
+            };
+            palette_bar::render(frame, palette_area, state);
+        }
+    }
 }
 
 fn hint_for(app: &PlanDetailApp) -> String {
+    if app.palette_active() {
+        return "[tab] complete  [enter] submit  [esc] cancel".to_string();
+    }
     match app.input_mode {
         InputMode::Normal => {
-            "[j/k] nav  [enter] open  [space] sel  [i/a] add  [d] del  [s] skip  [R] run  [S] stop  [q] back"
+            "[j/k] nav  [enter] open  [space] sel  [i/a] add  [d] del  [s] skip  [R] run  [S] stop  [/:] cmd  [q] back"
                 .to_string()
         }
         InputMode::AddStep(_) => "[Enter] confirm  [Esc] cancel".to_string(),

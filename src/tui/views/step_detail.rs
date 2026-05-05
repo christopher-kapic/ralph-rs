@@ -28,6 +28,7 @@ use crate::tui::help::{self, HelpState};
 use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
+use crate::tui::widgets::palette_bar::{self, PaletteBarState};
 use crate::tui::views::step_detail_picker::{BottomCell, PickerKind, PickerOutcome, PickerState};
 
 /// Sentinel rendered in dim style when a pane's source-of-truth value is
@@ -622,6 +623,11 @@ pub struct StepDetailApp {
     /// dispatcher routes input through [`HelpState::intercept_key`] before
     /// touching pane navigation or modal handlers (TUI-plan.md §15).
     pub help: HelpState,
+    /// Slash/colon command palette state (TUI-plan.md §9). `Some` while the
+    /// bar is open; the dispatcher routes every key through
+    /// [`PaletteBarState::on_key`] before any view bindings fire. `/` and
+    /// `:` open it.
+    pub palette_bar: Option<PaletteBarState>,
 }
 
 impl StepDetailApp {
@@ -675,7 +681,24 @@ impl StepDetailApp {
             answer_modal: None,
             resume_modal: None,
             help: HelpState::new(),
+            palette_bar: None,
         }
+    }
+
+    /// Open the palette with `prefix` as the trigger key (`/` or `:`).
+    /// TUI-plan.md §9.
+    pub fn open_palette(&mut self, prefix: char) {
+        self.palette_bar = Some(PaletteBarState::new(prefix));
+    }
+
+    /// Close the palette without dispatching. TUI-plan.md §9.
+    pub fn close_palette(&mut self) {
+        self.palette_bar = None;
+    }
+
+    /// Whether the palette bar is currently open and consuming keys.
+    pub fn palette_active(&self) -> bool {
+        self.palette_bar.is_some()
     }
 
     /// Update the read-only state. Called by the dispatcher after each
@@ -1452,7 +1475,13 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
 
     let step_segment = app.breadcrumb_step_segment();
     let crumbs: [&str; 3] = ["ralph", app.plan.slug.as_str(), step_segment.as_str()];
-    let hint = "[j/k] pane  [h/←] back  [z] zen  [q] back";
+    let normal_hint = "[j/k] pane  [h/←] back  [z] zen  [/:] cmd  [q] back";
+    let palette_hint = "[tab] complete  [enter] submit  [esc] cancel";
+    let hint = if app.palette_active() {
+        palette_hint
+    } else {
+        normal_hint
+    };
     let banner = read_only::banner(app.read_only);
     let body = chrome::render(
         frame,
@@ -1505,6 +1534,21 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
     if app.help.is_visible() {
         let area = frame.area();
         help::render(frame, area, &help::for_step_detail());
+    }
+
+    // Palette bar overlays the bottom chrome row when active. TUI-plan.md §9.
+    if let Some(state) = app.palette_bar.as_ref() {
+        let area = frame.area();
+        let strip_height = 4.min(area.height);
+        if strip_height > 0 {
+            let palette_area = Rect {
+                x: area.x,
+                y: area.y + area.height - strip_height,
+                width: area.width,
+                height: strip_height,
+            };
+            palette_bar::render(frame, palette_area, state);
+        }
     }
 }
 
@@ -4922,5 +4966,75 @@ cargo clippy
             crate::tui::help::InterceptResult::Closed
         );
         assert!(!app.help.is_visible());
+    }
+
+    // -- Palette (TUI-plan.md §9) ---------------------------------------
+
+    #[test]
+    fn step_detail_palette_default_inactive() {
+        let app = make_app(3, 0);
+        assert!(!app.palette_active());
+        assert!(app.palette_bar.is_none());
+    }
+
+    #[test]
+    fn step_detail_palette_open_records_prefix() {
+        let mut app = make_app(3, 0);
+        app.open_palette('/');
+        assert!(app.palette_active());
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, '/');
+        app.close_palette();
+        app.open_palette(':');
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, ':');
+    }
+
+    #[test]
+    fn step_detail_palette_close_drops_state() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app(3, 0);
+        app.open_palette('/');
+        let _ = app.palette_bar.as_mut().unwrap().on_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.palette_bar.as_ref().unwrap().input, "r");
+        app.close_palette();
+        assert!(!app.palette_active());
+    }
+
+    #[test]
+    fn step_detail_palette_esc_yields_cancel_outcome() {
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app(3, 0);
+        app.open_palette('/');
+        let out = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(out, PaletteBarOutcome::Cancel);
+    }
+
+    #[test]
+    fn step_detail_palette_enter_yields_submit_outcome_and_parses() {
+        use crate::tui::palette::PaletteCommand;
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app(3, 0);
+        app.open_palette('/');
+        let bar = app.palette_bar.as_mut().unwrap();
+        for c in "step edit --tags".chars() {
+            let _ = bar.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let out = bar.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let input = match out {
+            PaletteBarOutcome::Submit(s) => s,
+            other => panic!("expected Submit, got {other:?}"),
+        };
+        assert_eq!(
+            crate::tui::palette::parse(&input),
+            Ok(PaletteCommand::StepEditTags)
+        );
     }
 }

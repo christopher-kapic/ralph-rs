@@ -21,6 +21,7 @@ use crate::tui::help::{self, HelpState};
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
 use crate::tui::views::plan_list::{self, PlanTile, TILE_HEIGHT};
+use crate::tui::widgets::palette_bar::{self, PaletteBarState};
 
 /// Archived-list view state. Mirrors `PlanListApp` minus the archived
 /// sentinel — every tile here is itself an archived plan.
@@ -45,6 +46,10 @@ pub struct ArchivedListApp {
     /// dispatcher routes input through [`HelpState::intercept_key`] before
     /// touching any view bindings (TUI-plan.md §15).
     pub help: HelpState,
+    /// Slash/colon command palette state (TUI-plan.md §9). `Some` while the
+    /// bar is open; the dispatcher routes every key through
+    /// [`PaletteBarState::on_key`] before any view bindings fire.
+    pub palette_bar: Option<PaletteBarState>,
 }
 
 impl ArchivedListApp {
@@ -64,7 +69,24 @@ impl ArchivedListApp {
             toasts: ToastQueue::new(),
             should_pop: false,
             help: HelpState::new(),
+            palette_bar: None,
         }
+    }
+
+    /// Open the palette with `prefix` as the trigger key (`/` or `:`).
+    /// TUI-plan.md §9.
+    pub fn open_palette(&mut self, prefix: char) {
+        self.palette_bar = Some(PaletteBarState::new(prefix));
+    }
+
+    /// Close the palette without dispatching. TUI-plan.md §9.
+    pub fn close_palette(&mut self) {
+        self.palette_bar = None;
+    }
+
+    /// Whether the palette bar is currently open and consuming keys.
+    pub fn palette_active(&self) -> bool {
+        self.palette_bar.is_some()
     }
 
     // -- Navigation -------------------------------------------------------
@@ -181,7 +203,13 @@ pub fn draw(frame: &mut Frame, app: &mut ArchivedListApp) {
     app.toasts.prune(Instant::now());
 
     let crumbs: [&str; 2] = ["ralph", "Archived plans"];
-    let hint = "[j/k] nav  [enter] unarchive  [space] select  [d] delete  [h/←/q] back";
+    let normal_hint = "[j/k] nav  [enter] unarchive  [space] select  [d] delete  [/:] cmd  [h/←/q] back";
+    let palette_hint = "[tab] complete  [enter] submit  [esc] cancel";
+    let hint = if app.palette_active() {
+        palette_hint
+    } else {
+        normal_hint
+    };
     let body = chrome::render(
         frame,
         &Chrome {
@@ -205,6 +233,21 @@ pub fn draw(frame: &mut Frame, app: &mut ArchivedListApp) {
     if app.help.is_visible() {
         let area = frame.area();
         help::render(frame, area, &help::for_archived_list());
+    }
+
+    // Palette bar overlays the bottom chrome row when active. TUI-plan.md §9.
+    if let Some(state) = app.palette_bar.as_ref() {
+        let area = frame.area();
+        let strip_height = 4.min(area.height);
+        if strip_height > 0 {
+            let palette_area = Rect {
+                x: area.x,
+                y: area.y + area.height - strip_height,
+                width: area.width,
+                height: strip_height,
+            };
+            palette_bar::render(frame, palette_area, state);
+        }
     }
 }
 
@@ -539,5 +582,75 @@ mod tests {
             crate::tui::help::InterceptResult::Closed
         );
         assert!(!app.help.is_visible());
+    }
+
+    // -- Palette (TUI-plan.md §9) ---------------------------------------
+
+    #[test]
+    fn palette_default_inactive() {
+        let app = ArchivedListApp::new(make_tiles(1), "/proj", "UTC");
+        assert!(!app.palette_active());
+        assert!(app.palette_bar.is_none());
+    }
+
+    #[test]
+    fn palette_open_records_prefix() {
+        let mut app = ArchivedListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        assert!(app.palette_active());
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, '/');
+        app.close_palette();
+        app.open_palette(':');
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, ':');
+    }
+
+    #[test]
+    fn palette_close_drops_state() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = ArchivedListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        let _ = app.palette_bar.as_mut().unwrap().on_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.palette_bar.as_ref().unwrap().input, "r");
+        app.close_palette();
+        assert!(!app.palette_active());
+    }
+
+    #[test]
+    fn palette_esc_yields_cancel_outcome() {
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = ArchivedListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        let out = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(out, PaletteBarOutcome::Cancel);
+    }
+
+    #[test]
+    fn palette_enter_yields_submit_outcome_and_parses() {
+        use crate::tui::palette::PaletteCommand;
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = ArchivedListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        let bar = app.palette_bar.as_mut().unwrap();
+        for c in "plan unarchive foo".chars() {
+            let _ = bar.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let out = bar.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let input = match out {
+            PaletteBarOutcome::Submit(s) => s,
+            other => panic!("expected Submit, got {other:?}"),
+        };
+        assert_eq!(
+            crate::tui::palette::parse(&input),
+            Ok(PaletteCommand::PlanUnarchive("foo".to_string()))
+        );
     }
 }

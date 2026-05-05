@@ -26,6 +26,7 @@ use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::selection::Selection;
 use crate::tui::theme;
 use crate::tui::toast::ToastQueue;
+use crate::tui::widgets::palette_bar::{self, PaletteBarState};
 use crate::tui::widgets::step_list;
 
 /// Height of a single plan tile (including its top + bottom border rows).
@@ -141,6 +142,11 @@ pub struct PlanListApp {
     /// `preview_list_state` when they differ, so a freshly-shown plan
     /// always starts at the top of its step list.
     pub preview_keyed_plan: Option<String>,
+    /// Slash/colon command palette state (TUI-plan.md §9). `Some` while the
+    /// bar is open; the dispatcher routes every key through
+    /// [`PaletteBarState::on_key`] before any view bindings fire. `/` and
+    /// `:` open it.
+    pub palette_bar: Option<PaletteBarState>,
 }
 
 impl PlanListApp {
@@ -169,7 +175,24 @@ impl PlanListApp {
             preview_selection: Selection::new(),
             preview_list_state: ListState::default(),
             preview_keyed_plan: None,
+            palette_bar: None,
         }
+    }
+
+    /// Open the palette with `prefix` as the trigger key (`/` or `:`). Resets
+    /// any in-flight buffer. TUI-plan.md §9.
+    pub fn open_palette(&mut self, prefix: char) {
+        self.palette_bar = Some(PaletteBarState::new(prefix));
+    }
+
+    /// Close the palette without dispatching. TUI-plan.md §9.
+    pub fn close_palette(&mut self) {
+        self.palette_bar = None;
+    }
+
+    /// Whether the palette bar is currently open and consuming keys.
+    pub fn palette_active(&self) -> bool {
+        self.palette_bar.is_some()
     }
 
     /// Update the read-only state (called by the dispatcher each
@@ -456,7 +479,13 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
     app.toasts.prune(Instant::now());
 
     let crumbs: [&str; 1] = ["ralph"];
-    let hint = "[j/k] nav  [enter] open  [space] select  [i] new  [A] approve  [Q] questions  [d] archive  [q] quit";
+    let normal_hint = "[j/k] nav  [enter] open  [space] select  [i] new  [A] approve  [Q] questions  [d] archive  [/:] cmd  [q] quit";
+    let palette_hint = "[tab] complete  [enter] submit  [esc] cancel";
+    let hint = if app.palette_active() {
+        palette_hint
+    } else {
+        normal_hint
+    };
     let banner = read_only::banner(app.read_only);
     let body = chrome::render(
         frame,
@@ -496,6 +525,25 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
     if app.help.is_visible() {
         let area = frame.area();
         help::render(frame, area, &help::for_plan_list());
+    }
+
+    // Palette bar overlays the bottom chrome row when active. Drawn after
+    // the help overlay so a visible palette is the topmost layer when
+    // both happen to be open (the dispatcher prevents this in practice
+    // by routing keys to the palette first, but the layering here is
+    // defensive). TUI-plan.md §9.
+    if let Some(state) = app.palette_bar.as_ref() {
+        let area = frame.area();
+        let strip_height = 4.min(area.height);
+        if strip_height > 0 {
+            let palette_area = Rect {
+                x: area.x,
+                y: area.y + area.height - strip_height,
+                width: area.width,
+                height: strip_height,
+            };
+            palette_bar::render(frame, palette_area, state);
+        }
     }
 }
 
@@ -1986,5 +2034,75 @@ mod tests {
     fn highlighted_plan_id_none_for_empty_tiles() {
         let app = PlanListApp::new(vec![], "/proj", "UTC");
         assert!(app.highlighted_plan_id().is_none());
+    }
+
+    // -- Palette (TUI-plan.md §9) ---------------------------------------
+
+    #[test]
+    fn palette_default_inactive() {
+        let app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        assert!(!app.palette_active());
+        assert!(app.palette_bar.is_none());
+    }
+
+    #[test]
+    fn palette_open_records_prefix() {
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        assert!(app.palette_active());
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, '/');
+        app.close_palette();
+        app.open_palette(':');
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, ':');
+    }
+
+    #[test]
+    fn palette_close_drops_state() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        let _ = app.palette_bar.as_mut().unwrap().on_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.palette_bar.as_ref().unwrap().input, "r");
+        app.close_palette();
+        assert!(!app.palette_active());
+    }
+
+    #[test]
+    fn palette_esc_yields_cancel_outcome() {
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        let out = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(out, PaletteBarOutcome::Cancel);
+    }
+
+    #[test]
+    fn palette_enter_yields_submit_outcome_and_parses() {
+        use crate::tui::palette::PaletteCommand;
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        let bar = app.palette_bar.as_mut().unwrap();
+        for c in "run".chars() {
+            let _ = bar.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let out = bar.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let input = match out {
+            PaletteBarOutcome::Submit(s) => s,
+            other => panic!("expected Submit, got {other:?}"),
+        };
+        assert_eq!(
+            crate::tui::palette::parse(&input),
+            Ok(PaletteCommand::Run(None))
+        );
     }
 }

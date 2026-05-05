@@ -19,6 +19,7 @@ use crate::tui::help::HelpState;
 use crate::tui::read_only::ReadOnly;
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
+use crate::tui::widgets::palette_bar::PaletteBarState;
 
 // ---------------------------------------------------------------------------
 // Input mode
@@ -143,6 +144,11 @@ pub struct PlanDetailApp {
     /// dispatcher routes input through [`HelpState::intercept_key`] before
     /// passing keys to the per-view input handler (TUI-plan.md §15).
     pub help: HelpState,
+    /// Slash/colon command palette state (TUI-plan.md §9). `Some` while the
+    /// bar is open; the dispatcher routes every key through
+    /// [`PaletteBarState::on_key`] before any view bindings fire. `/` and
+    /// `:` open it.
+    pub palette_bar: Option<PaletteBarState>,
 }
 
 impl PlanDetailApp {
@@ -173,7 +179,24 @@ impl PlanDetailApp {
             read_only: ReadOnly::Editable,
             open_questions: Vec::new(),
             help: HelpState::new(),
+            palette_bar: None,
         }
+    }
+
+    /// Open the palette with `prefix` as the trigger key (`/` or `:`).
+    /// TUI-plan.md §9.
+    pub fn open_palette(&mut self, prefix: char) {
+        self.palette_bar = Some(PaletteBarState::new(prefix));
+    }
+
+    /// Close the palette without dispatching. TUI-plan.md §9.
+    pub fn close_palette(&mut self) {
+        self.palette_bar = None;
+    }
+
+    /// Whether the palette bar is currently open and consuming keys.
+    pub fn palette_active(&self) -> bool {
+        self.palette_bar.is_some()
     }
 
     /// Replace the cached open-question list (after a DB poll). Drives the
@@ -1777,5 +1800,75 @@ mod tests {
         assert_eq!(app.read_only.pid(), Some(4242));
         app.set_read_only(ReadOnly::Editable);
         assert!(!app.read_only.is_locked());
+    }
+
+    // -- Palette (TUI-plan.md §9) ---------------------------------------
+
+    #[test]
+    fn palette_default_inactive() {
+        let app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        assert!(!app.palette_active());
+        assert!(app.palette_bar.is_none());
+    }
+
+    #[test]
+    fn palette_open_records_prefix() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        app.open_palette('/');
+        assert!(app.palette_active());
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, '/');
+        app.close_palette();
+        app.open_palette(':');
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, ':');
+    }
+
+    #[test]
+    fn palette_close_drops_state() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        app.open_palette(':');
+        let _ = app.palette_bar.as_mut().unwrap().on_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.palette_bar.as_ref().unwrap().input, "r");
+        app.close_palette();
+        assert!(!app.palette_active());
+    }
+
+    #[test]
+    fn palette_esc_yields_cancel_outcome() {
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        app.open_palette('/');
+        let out = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(out, PaletteBarOutcome::Cancel);
+    }
+
+    #[test]
+    fn palette_enter_yields_submit_outcome_and_parses() {
+        use crate::tui::palette::PaletteCommand;
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        app.open_palette('/');
+        let bar = app.palette_bar.as_mut().unwrap();
+        for c in "step skip 3".chars() {
+            let _ = bar.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let out = bar.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let input = match out {
+            PaletteBarOutcome::Submit(s) => s,
+            other => panic!("expected Submit, got {other:?}"),
+        };
+        assert_eq!(
+            crate::tui::palette::parse(&input),
+            Ok(PaletteCommand::StepSkip(Some(3)))
+        );
     }
 }
