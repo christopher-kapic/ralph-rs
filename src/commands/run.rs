@@ -331,6 +331,12 @@ pub fn run_plan_list_tui(
                 }
             }
 
+            // §5: lazily fetch the highlighted plan's step list so the
+            // right-pane preview has data on the next draw. The cache is
+            // dropped on `refresh_tiles`, so this re-fires after archive,
+            // create, or returning from plan-detail.
+            ensure_preview_cached(conn, &mut app)?;
+
             terminal.draw(|f| plan_list::draw(f, &mut app))?;
 
             // Use a polling read so the lock state stays current even when
@@ -713,6 +719,24 @@ pub(crate) fn refresh_plan_list_state(
     let tiles = build_plan_tiles(conn, project)?;
     let archived_count = storage::count_archived_plans(conn, project)?;
     app.refresh_tiles(tiles, archived_count);
+    Ok(())
+}
+
+/// Ensure the right-pane step preview has cached steps for the highlighted
+/// plan (TUI-plan.md §5). No-op when the cursor is on the archived sentinel
+/// or the cache already has an entry for the current plan.
+fn ensure_preview_cached(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) -> Result<()> {
+    let Some(plan_id) = app.highlighted_plan_id().map(str::to_string) else {
+        return Ok(());
+    };
+    if app.preview_cache_contains(&plan_id) {
+        return Ok(());
+    }
+    let steps = storage::list_steps(conn, &plan_id)?;
+    app.cache_preview_steps(plan_id, steps);
     Ok(())
 }
 

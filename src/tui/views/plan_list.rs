@@ -6,6 +6,7 @@
 // state + rendering surface for the read-only plan list; multi-select,
 // archive, and create-plan flows land in later steps of the tui-v1 plan.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
@@ -13,18 +14,19 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, ListState, Paragraph, Widget};
 
-use crate::plan::{Plan, PlanStatus};
+use crate::plan::{Plan, PlanStatus, Step};
 use crate::tui::chrome::{self, Chrome};
 use crate::tui::help::{self, HelpState};
 use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::selection::Selection;
 use crate::tui::theme;
 use crate::tui::toast::ToastQueue;
+use crate::tui::widgets::step_list;
 
 /// Height of a single plan tile (including its top + bottom border rows).
 /// Matches the layout sketch in TUI-plan.md §5.
@@ -121,6 +123,24 @@ pub struct PlanListApp {
     /// dispatcher routes input through [`HelpState::intercept_key`] before
     /// touching any view bindings (TUI-plan.md §15).
     pub help: HelpState,
+    /// Per-plan cache of step lists for the right-pane preview
+    /// (TUI-plan.md §5). Populated lazily by the dispatcher when the
+    /// cursor moves to a plan whose steps haven't been fetched yet, and
+    /// cleared by [`Self::refresh_tiles`] so a refresh re-loads counts.
+    pub step_preview_cache: HashMap<String, Vec<Step>>,
+    /// Always-empty selection passed to `step_list::render` for the
+    /// read-only preview pane — the widget API requires one even though the
+    /// preview never participates in multi-select.
+    pub preview_selection: Selection<String>,
+    /// Persistent `ListState` for the right preview pane so its scroll
+    /// offset survives across frames. Reset to default whenever the
+    /// highlighted plan changes (see [`Self::preview_keyed_plan`]).
+    pub preview_list_state: ListState,
+    /// The plan_id whose steps the preview pane is currently keyed to.
+    /// `draw` compares this to the cursor target each frame and resets
+    /// `preview_list_state` when they differ, so a freshly-shown plan
+    /// always starts at the top of its step list.
+    pub preview_keyed_plan: Option<String>,
 }
 
 impl PlanListApp {
@@ -145,6 +165,10 @@ impl PlanListApp {
             toasts: ToastQueue::new(),
             read_only: ReadOnly::Editable,
             help: HelpState::new(),
+            step_preview_cache: HashMap::new(),
+            preview_selection: Selection::new(),
+            preview_list_state: ListState::default(),
+            preview_keyed_plan: None,
         }
     }
 
@@ -329,6 +353,12 @@ impl PlanListApp {
         self.tiles = tiles;
         self.archived_count = archived_count;
         self.selection.clear();
+        // Drop the preview cache: step counts may have changed underneath,
+        // and the keyed-plan check would otherwise keep stale step rows on
+        // screen even after the underlying tile re-rendered fresh totals.
+        self.step_preview_cache.clear();
+        self.preview_keyed_plan = None;
+        self.preview_list_state = ListState::default();
         let nav = self.navigable_count();
         if nav == 0 {
             self.selected_index = 0;
@@ -336,6 +366,30 @@ impl PlanListApp {
         } else if self.selected_index >= nav {
             self.selected_index = nav - 1;
         }
+    }
+
+    // -- Preview cache (right pane, TUI-plan.md §5) -----------------------
+
+    /// `plan_id` currently under the cursor, or `None` when the cursor is
+    /// on the archived sentinel or the tile list is empty. Used by the
+    /// dispatcher to decide which plan's steps to fetch for the preview.
+    pub fn highlighted_plan_id(&self) -> Option<&str> {
+        if self.is_archived_cursor() {
+            return None;
+        }
+        self.tiles
+            .get(self.selected_index)
+            .map(|t| t.plan.id.as_str())
+    }
+
+    /// Insert (or overwrite) the cached step list for `plan_id`.
+    pub fn cache_preview_steps(&mut self, plan_id: String, steps: Vec<Step>) {
+        self.step_preview_cache.insert(plan_id, steps);
+    }
+
+    /// Whether the preview cache already has steps for `plan_id`.
+    pub fn preview_cache_contains(&self, plan_id: &str) -> bool {
+        self.step_preview_cache.contains_key(plan_id)
     }
 }
 
@@ -413,8 +467,21 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
             banner: banner.as_deref(),
         },
     );
-    update_scroll(app, body.height);
-    render_tiles(frame.buffer_mut(), body, app);
+
+    // §5: split the body horizontally — 40% for the tile column on the
+    // left, 60% for the step-list preview of the highlighted plan on the
+    // right. The preview is read-only and drawn via the shared
+    // `step_list` widget so its rows stay pixel-identical to plan-detail.
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(body);
+    let left = panes[0];
+    let right = panes[1];
+
+    update_scroll(app, left.height);
+    render_tiles(frame.buffer_mut(), left, app);
+    render_step_preview(frame, right, app);
 
     // Toast slot lives over the bottom chrome row — overwrites the hint while
     // a toast is current, leaves cwd/version on the right alone.
@@ -430,6 +497,42 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
         let area = frame.area();
         help::render(frame, area, &help::for_plan_list());
     }
+}
+
+/// Render the right-pane step-list preview of the highlighted plan.
+///
+/// Blank when the cursor is on the archived sentinel or the tile list is
+/// empty (TUI-plan.md §5). Re-keys [`PlanListApp::preview_list_state`] on
+/// cursor moves so the new pane starts at the top instead of carrying the
+/// previous plan's scroll offset.
+fn render_step_preview(frame: &mut Frame, area: Rect, app: &mut PlanListApp) {
+    if app.is_archived_cursor() {
+        return;
+    }
+    let Some(tile) = app.tiles.get(app.selected_index) else {
+        return;
+    };
+    let plan_id = tile.plan.id.clone();
+    let plan_slug = tile.plan.slug.clone();
+
+    if app.preview_keyed_plan.as_deref() != Some(plan_id.as_str()) {
+        app.preview_list_state = ListState::default();
+        app.preview_keyed_plan = Some(plan_id.clone());
+    }
+
+    let Some(steps) = app.step_preview_cache.get(&plan_id) else {
+        return;
+    };
+    step_list::render(
+        frame,
+        area,
+        steps,
+        &app.preview_selection,
+        None,
+        false,
+        plan_slug.as_str(),
+        &mut app.preview_list_state,
+    );
 }
 
 fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatui::style::Color) {
@@ -1553,5 +1656,258 @@ mod tests {
         let r = app.help.intercept_key(esc);
         assert_eq!(r, crate::tui::help::InterceptResult::Closed);
         assert!(!app.help.is_visible());
+    }
+
+    // -- Two-pane layout (TUI-plan.md §5) -----------------------------------
+
+    fn make_step(plan_id: &str, idx: usize, title: &str) -> Step {
+        use crate::plan::{ChangePolicy, StepStatus};
+        Step {
+            id: format!("{plan_id}-step-{idx}"),
+            plan_id: plan_id.to_string(),
+            sort_key: format!("a{idx}"),
+            title: title.to_string(),
+            description: String::new(),
+            agent: None,
+            harness: None,
+            acceptance_criteria: vec![],
+            status: StepStatus::Pending,
+            attempts: 0,
+            max_retries: Some(3),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: None,
+            skipped_reason: None,
+            change_policy: ChangePolicy::Required,
+            tags: vec![],
+        }
+    }
+
+    /// Render a slice of `area` rows as a single newline-joined string for
+    /// substring-based assertions. Used by the two-pane preview tests below
+    /// so they can be expressive about what region they're inspecting.
+    fn region_text(
+        buffer: &ratatui::buffer::Buffer,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+    ) -> String {
+        let mut out = String::new();
+        for row in y..(y + h) {
+            for col in x..(x + w) {
+                out.push_str(buffer[(col, row)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn draw_splits_body_into_left_and_right_panes() {
+        // The body should be split 40/60 horizontally — both halves carry
+        // visible chrome (left tiles, right step-list block) and neither is
+        // empty when there's a highlighted plan with cached steps.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.cache_preview_steps(
+            "id-plan-0".to_string(),
+            vec![make_step("id-plan-0", 0, "alpha-task")],
+        );
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // Left pane is 40% of 80 = 32 cols; the tile border `┌` sits at
+        // column 0 of the body row (y=1 because chrome reserves y=0).
+        assert_eq!(buffer[(0, 1)].symbol(), "┌", "left tile border missing");
+
+        // Right pane is the remaining 48 cols starting at x=32. The step
+        // list widget renders its own bordered block, so the top-left
+        // corner of that block sits at (32, 1).
+        assert_eq!(
+            buffer[(32, 1)].symbol(),
+            "┌",
+            "right pane border missing at split boundary"
+        );
+    }
+
+    #[test]
+    fn draw_right_pane_renders_highlighted_plans_steps() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
+        app.cache_preview_steps(
+            "id-plan-0".to_string(),
+            vec![
+                make_step("id-plan-0", 0, "alpha-task"),
+                make_step("id-plan-0", 1, "beta-task"),
+            ],
+        );
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // Right pane occupies cols 32..80, body rows 1..13.
+        let right = region_text(&buffer, 32, 1, 48, 12);
+        assert!(
+            right.contains("alpha-task"),
+            "expected alpha-task in right pane:\n{right}"
+        );
+        assert!(
+            right.contains("beta-task"),
+            "expected beta-task in right pane:\n{right}"
+        );
+        // Title of the bordered block is the plan slug.
+        assert!(
+            right.contains("plan-0"),
+            "expected plan-0 title in right pane:\n{right}"
+        );
+    }
+
+    #[test]
+    fn draw_right_pane_blank_for_archived_tile_cursor() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC").with_archived_count(2);
+        // Even with steps cached for the regular plan, parking the cursor
+        // on the archived sentinel must leave the right pane blank.
+        app.cache_preview_steps(
+            "id-plan-0".to_string(),
+            vec![make_step("id-plan-0", 0, "alpha-task")],
+        );
+        app.selected_index = 1;
+        assert!(app.is_archived_cursor());
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let right = region_text(&buffer, 32, 1, 48, 12);
+        // No bordered block, no step titles, no plan slug — the right
+        // pane should be entirely whitespace.
+        assert!(
+            right.chars().all(|c| c == ' ' || c == '\n'),
+            "expected blank right pane when cursor is on archived sentinel:\n{right}"
+        );
+    }
+
+    #[test]
+    fn draw_right_pane_blank_when_no_plans() {
+        // No tiles → no preview either. The "No plans" placeholder still
+        // renders on the left, but the right pane stays empty.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(vec![], "/proj", "UTC");
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let right = region_text(&buffer, 32, 1, 48, 12);
+        assert!(
+            right.chars().all(|c| c == ' ' || c == '\n'),
+            "expected blank right pane when there are no plans:\n{right}"
+        );
+    }
+
+    #[test]
+    fn draw_re_keys_right_pane_when_cursor_moves_to_a_different_plan() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
+        app.cache_preview_steps(
+            "id-plan-0".to_string(),
+            vec![make_step("id-plan-0", 0, "alpha-task")],
+        );
+        app.cache_preview_steps(
+            "id-plan-1".to_string(),
+            vec![make_step("id-plan-1", 0, "zeta-task")],
+        );
+
+        // First draw: cursor on plan-0 — right pane shows alpha-task and
+        // the keyed plan tracks plan-0.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let right = region_text(&buffer, 32, 1, 48, 12);
+        assert!(
+            right.contains("alpha-task"),
+            "expected alpha-task before nav:\n{right}"
+        );
+        assert!(
+            !right.contains("zeta-task"),
+            "zeta-task should not appear before nav:\n{right}"
+        );
+        assert_eq!(
+            app.preview_keyed_plan.as_deref(),
+            Some("id-plan-0"),
+            "preview_keyed_plan should track plan-0 after first draw"
+        );
+
+        // Move cursor to plan-1 and re-draw.
+        app.navigate_down();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let right = region_text(&buffer, 32, 1, 48, 12);
+        assert!(
+            right.contains("zeta-task"),
+            "expected zeta-task after nav:\n{right}"
+        );
+        assert!(
+            !right.contains("alpha-task"),
+            "alpha-task should be gone after nav:\n{right}"
+        );
+        assert_eq!(
+            app.preview_keyed_plan.as_deref(),
+            Some("id-plan-1"),
+            "preview_keyed_plan should re-key to plan-1 after navigation"
+        );
+    }
+
+    #[test]
+    fn refresh_tiles_clears_preview_cache_and_keying() {
+        let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
+        app.cache_preview_steps(
+            "id-plan-0".to_string(),
+            vec![make_step("id-plan-0", 0, "alpha")],
+        );
+        app.preview_keyed_plan = Some("id-plan-0".to_string());
+        app.refresh_tiles(make_tiles(2), 0);
+        assert!(app.step_preview_cache.is_empty());
+        assert!(app.preview_keyed_plan.is_none());
+    }
+
+    #[test]
+    fn highlighted_plan_id_returns_cursor_target() {
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.selected_index = 2;
+        assert_eq!(app.highlighted_plan_id(), Some("id-plan-2"));
+    }
+
+    #[test]
+    fn highlighted_plan_id_none_for_archived_sentinel() {
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC").with_archived_count(1);
+        app.selected_index = 1;
+        assert!(app.highlighted_plan_id().is_none());
+    }
+
+    #[test]
+    fn highlighted_plan_id_none_for_empty_tiles() {
+        let app = PlanListApp::new(vec![], "/proj", "UTC");
+        assert!(app.highlighted_plan_id().is_none());
     }
 }
