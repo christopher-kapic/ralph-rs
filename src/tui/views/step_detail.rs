@@ -629,6 +629,27 @@ pub struct StepDetailApp {
     /// [`PaletteBarState::on_key`] before any view bindings fire. `/` and
     /// `:` open it.
     pub palette_bar: Option<PaletteBarState>,
+
+    /// User-driven sidebar width override. When `Some(w)`, the layout uses
+    /// `w` (clamped 4..=80) instead of the zen-derived constant — set by a
+    /// mouse drag on the divider. Cleared by `z` so zen toggling stays
+    /// predictable. Session-only — never persisted.
+    pub sidebar_w_override: Option<u16>,
+
+    /// Body width recorded during the most recent `draw()`. Used by
+    /// [`Self::handle_mouse`] to clamp the cursor's column when computing a
+    /// new override; zero before the first frame, in which case mouse
+    /// handling no-ops.
+    pub last_body_width: u16,
+
+    /// Sidebar column width recorded during the most recent `draw()`. Acts
+    /// as the divider column for hit-testing the start-of-drag click in
+    /// [`Self::handle_mouse`]. Zero before the first frame.
+    pub last_sidebar_w: u16,
+
+    /// True while a left-mouse drag started on the divider column is
+    /// active. Cleared on `MouseEventKind::Up(Left)`.
+    pub dragging_sidebar: bool,
 }
 
 impl StepDetailApp {
@@ -683,6 +704,10 @@ impl StepDetailApp {
             resume_modal: None,
             help: HelpState::new(),
             palette_bar: None,
+            sidebar_w_override: None,
+            last_body_width: 0,
+            last_sidebar_w: 0,
+            dragging_sidebar: false,
         }
     }
 
@@ -703,9 +728,41 @@ impl StepDetailApp {
     }
 
     /// Mouse-event entry point routed from the dispatcher's event loop.
-    /// No-op by default — see [`super::plan_list::PlanListApp::handle_mouse`]
-    /// for the rationale. Per-view drag handling is added in later steps.
-    pub fn handle_mouse(&mut self, _event: MouseEvent) {}
+    /// Implements draggable resize of the sidebar via mouse drag on the
+    /// divider column: a left-button press within ±1 column of the current
+    /// `last_sidebar_w` arms a drag (and disables `user_zen` so the override
+    /// takes precedence), subsequent drags update `sidebar_w_override`
+    /// directly to the cursor's column (clamped 4..=80), and release clears
+    /// the drag flag. No-op before the first frame (`last_body_width == 0`).
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        if self.last_body_width == 0 {
+            return;
+        }
+        let divider_col = self.last_sidebar_w as i32;
+
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let col = event.column as i32;
+                if (col - divider_col).abs() <= 1 {
+                    self.dragging_sidebar = true;
+                    // Drag explicitly opts out of zen — the override should
+                    // win regardless of zen toggle state. `auto_zen` is
+                    // recomputed each frame so we leave it alone.
+                    self.user_zen = false;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_sidebar => {
+                let w = event.column.clamp(4, 80);
+                self.sidebar_w_override = Some(w);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging_sidebar = false;
+            }
+            _ => {}
+        }
+    }
 
     /// Update the read-only state. Called by the dispatcher after each
     /// `run_locks` poll. While `Locked`, the `c` editor handoff and the
@@ -746,8 +803,11 @@ impl StepDetailApp {
 
     /// Toggle the user-driven zen state. No-op while auto-zen is forcing zen
     /// mode (the spec disables `z` in that state — TUI-plan.md §18 Q5).
-    /// Returns `true` when the toggle was applied.
+    /// Returns `true` when the toggle was applied. Always clears any active
+    /// `sidebar_w_override` (even when the toggle is suppressed by auto-zen)
+    /// so zen behavior remains predictable after a mouse-drag resize.
     pub fn toggle_zen(&mut self) -> bool {
+        self.sidebar_w_override = None;
         if self.auto_zen {
             return false;
         }
@@ -1503,12 +1563,24 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
         return;
     }
 
-    let sidebar_w = if app.is_zen_mode() {
-        SIDEBAR_ZEN_WIDTH
-    } else {
-        SIDEBAR_FULL_WIDTH
+    // The user-driven mouse-drag override wins over the zen-derived width,
+    // so a deliberate resize survives subsequent re-renders. `z` clears the
+    // override, restoring zen-driven behavior. TUI-plan.md, step 27.
+    let sidebar_w = match app.sidebar_w_override {
+        Some(w) => w,
+        None => {
+            if app.is_zen_mode() {
+                SIDEBAR_ZEN_WIDTH
+            } else {
+                SIDEBAR_FULL_WIDTH
+            }
+        }
     };
     let sidebar_w = sidebar_w.min(body.width.saturating_sub(1).max(1));
+
+    // Cache the dimensions for `handle_mouse` — see `Self::handle_mouse`.
+    app.last_body_width = body.width;
+    app.last_sidebar_w = sidebar_w;
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
@@ -5041,6 +5113,213 @@ cargo clippy
         assert_eq!(
             crate::tui::palette::parse(&input),
             Ok(PaletteCommand::StepEditTags)
+        );
+    }
+
+    // -- Sidebar mouse-drag override (TUI-plan.md, step 27) ---------------
+
+    /// Construct a [`MouseEvent`] at `(column, row)` with the given kind.
+    /// Mirrors the helper in plan_detail's tests.
+    fn mouse_event(
+        column: u16,
+        row: u16,
+        kind: crossterm::event::MouseEventKind,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn sidebar_w_override_defaults_to_none() {
+        let app = make_app(3, 0);
+        assert!(app.sidebar_w_override.is_none());
+        assert_eq!(app.last_body_width, 0);
+        assert_eq!(app.last_sidebar_w, 0);
+        assert!(!app.dragging_sidebar);
+    }
+
+    #[test]
+    fn sidebar_w_override_set_and_clear() {
+        // (a) State-machine test: set → clamp → clear.
+        let mut app = make_app(3, 0);
+        app.sidebar_w_override = Some(30);
+        assert_eq!(app.sidebar_w_override, Some(30));
+
+        // The clamp is applied at the call site in `handle_mouse`; assert the
+        // post-clamp values cover both bounds.
+        let clamped_low = 1u16.clamp(4, 80);
+        let clamped_high = 200u16.clamp(4, 80);
+        assert_eq!(clamped_low, 4);
+        assert_eq!(clamped_high, 80);
+
+        app.sidebar_w_override = None;
+        assert!(app.sidebar_w_override.is_none());
+    }
+
+    #[test]
+    fn sidebar_drag_down_drag_up_sets_override() {
+        // (b) Dispatcher-style: Down at the divider arms the drag, Drag
+        //     updates `sidebar_w_override` to the cursor column, Up clears
+        //     the drag flag.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = make_app(3, 0);
+        app.last_body_width = 120;
+        app.last_sidebar_w = 25;
+
+        assert!(app.sidebar_w_override.is_none());
+        assert!(!app.dragging_sidebar);
+
+        // Press at column 25 (the divider): drag is armed.
+        app.handle_mouse(mouse_event(25, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(app.dragging_sidebar);
+
+        // Drag to column 40: override matches the cursor column.
+        app.handle_mouse(mouse_event(40, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.sidebar_w_override, Some(40));
+
+        app.handle_mouse(mouse_event(40, 5, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_sidebar);
+    }
+
+    #[test]
+    fn sidebar_drag_press_off_divider_does_not_arm() {
+        // ±1 column tolerance: pressing far from the divider should not
+        // arm a drag, so subsequent drag events leave the override alone.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = make_app(3, 0);
+        app.last_body_width = 120;
+        app.last_sidebar_w = 25;
+
+        // Divider at column 25; press at column 10.
+        app.handle_mouse(mouse_event(10, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(!app.dragging_sidebar);
+
+        app.handle_mouse(mouse_event(60, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert!(
+            app.sidebar_w_override.is_none(),
+            "drag without arming must not set override"
+        );
+    }
+
+    #[test]
+    fn sidebar_drag_clamps_to_4_and_80() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = make_app(3, 0);
+        app.last_body_width = 200;
+        app.last_sidebar_w = 25;
+
+        app.handle_mouse(mouse_event(25, 5, MouseEventKind::Down(MouseButton::Left)));
+        // Drag far left — clamped to 4.
+        app.handle_mouse(mouse_event(0, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.sidebar_w_override, Some(4));
+
+        // Drag far right — clamped to 80.
+        app.handle_mouse(mouse_event(150, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.sidebar_w_override, Some(80));
+
+        app.handle_mouse(mouse_event(150, 5, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_sidebar);
+    }
+
+    #[test]
+    fn sidebar_drag_within_one_column_arms() {
+        // ±1 column hit-test: pressing one column either side of the
+        // divider should still arm the drag.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        for col in [24u16, 25, 26] {
+            let mut app = make_app(3, 0);
+            app.last_body_width = 120;
+            app.last_sidebar_w = 25;
+            app.handle_mouse(mouse_event(
+                col,
+                5,
+                MouseEventKind::Down(MouseButton::Left),
+            ));
+            assert!(
+                app.dragging_sidebar,
+                "press at col {col} (divider 25) should arm drag",
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_drag_starts_clears_user_zen() {
+        // Dragging takes priority over zen — user_zen is dropped on Down so
+        // the override path drives rendering.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = make_app(3, 0);
+        app.last_body_width = 120;
+        app.last_sidebar_w = 4;
+        // User had toggled zen on (sidebar_w would be SIDEBAR_ZEN_WIDTH=4).
+        let _ = app.toggle_zen();
+        assert!(app.is_zen_mode());
+
+        app.handle_mouse(mouse_event(4, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(app.dragging_sidebar);
+        assert!(
+            !app.is_zen_mode(),
+            "starting a drag must drop user-driven zen so the override wins",
+        );
+    }
+
+    #[test]
+    fn handle_mouse_no_op_before_first_draw() {
+        // Before the first frame `last_body_width` is zero; mouse events
+        // must not panic and must not arm a drag.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = make_app(3, 0);
+        assert_eq!(app.last_body_width, 0);
+
+        app.handle_mouse(mouse_event(0, 0, MouseEventKind::Down(MouseButton::Left)));
+        assert!(!app.dragging_sidebar);
+        assert!(app.sidebar_w_override.is_none());
+    }
+
+    #[test]
+    fn toggle_zen_clears_sidebar_override() {
+        // (c) Pressing `z` resets the override so rendering falls back to
+        //     the zen-derived constant. Verified both directions: the
+        //     override is cleared, and `is_zen_mode` flips as before.
+        let mut app = make_app(3, 0);
+        app.sidebar_w_override = Some(50);
+        assert_eq!(app.sidebar_w_override, Some(50));
+        assert!(!app.is_zen_mode());
+
+        let applied = app.toggle_zen();
+        assert!(applied);
+        assert!(app.is_zen_mode(), "z toggles zen on as before");
+        assert!(
+            app.sidebar_w_override.is_none(),
+            "z must clear the override so the zen-derived constant applies",
+        );
+
+        // Toggling back off also keeps the override cleared.
+        app.sidebar_w_override = Some(40);
+        let applied = app.toggle_zen();
+        assert!(applied);
+        assert!(!app.is_zen_mode());
+        assert!(app.sidebar_w_override.is_none());
+    }
+
+    #[test]
+    fn toggle_zen_clears_override_even_when_auto_zen_forces() {
+        // Auto-zen suppresses the user toggle, but the override clear still
+        // happens so a subsequent terminal grow-back doesn't leave a stale
+        // override behind.
+        let mut app = make_app(3, 0);
+        app.update_auto_zen(80);
+        assert!(app.is_zen_forced());
+        app.sidebar_w_override = Some(60);
+
+        let applied = app.toggle_zen();
+        assert!(!applied, "z is suppressed under auto-zen");
+        assert!(
+            app.sidebar_w_override.is_none(),
+            "auto-zen-suppressed `z` still clears the override",
         );
     }
 }
