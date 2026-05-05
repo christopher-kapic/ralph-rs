@@ -241,6 +241,7 @@ pub fn for_plan_detail() -> HelpModel {
                     ("r", "Reset highlighted step"),
                     ("Shift-J", "Move step down"),
                     ("Shift-K", "Move step up"),
+                    ("Q", "Toggle questions for this plan"),
                 ],
             ),
             Group::new(

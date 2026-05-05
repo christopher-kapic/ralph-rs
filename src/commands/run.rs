@@ -1076,6 +1076,9 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
             InputAction::OpenStepDetail(step_id) => {
                 run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
             }
+            InputAction::ToggleQuestionsEnabled => {
+                plan_detail_apply_toggle_questions(conn, &mut app)?;
+            }
         }
         if app.should_pop {
             // Dropping the subscription tears down its tokio runtime and
@@ -1523,6 +1526,31 @@ pub(crate) fn plan_detail_apply_move(
         MoveDir::Down => "Moved step down.",
     };
     app.toasts.push(label, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// `Q` action in the plan-detail view (TUI-plan.md §17 'Toggle surfaces'):
+/// flip `plans.questions_enabled` for the focused plan via
+/// `set_plan_questions_enabled`, refresh `app.plan` in place from the DB, and
+/// toast the new state. Mirrors plan-list's Q binding.
+pub(crate) fn plan_detail_apply_toggle_questions(
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let next = !app.plan.questions_enabled;
+    storage::set_plan_questions_enabled(conn, &app.plan.id, next)?;
+    if let Some(updated) = storage::get_plan_by_slug(conn, &app.plan.slug, &app.plan.project)? {
+        app.plan = updated;
+    }
+    let msg = if next {
+        "Questions enabled."
+    } else {
+        "Questions disabled."
+    };
+    app.toasts.push(msg, ToastKind::Success, Instant::now());
     Ok(())
 }
 

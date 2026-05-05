@@ -44,6 +44,9 @@ pub enum InputAction {
     /// The user pressed `enter` / `→` / `l` to open the step-detail view for
     /// the step under the cursor (TUI-plan.md §7).
     OpenStepDetail(String),
+    /// The user pressed `Q` to flip the plan's `questions_enabled` column
+    /// (TUI-plan.md §17 'Toggle surfaces').
+    ToggleQuestionsEnabled,
 }
 
 /// True when J/K should scroll the live-run tails (TUI-plan.md §13) instead
@@ -183,6 +186,11 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             Some(step_id) => InputAction::OpenQuestion(step_id),
             None => InputAction::None,
         },
+
+        // Flip `plans.questions_enabled` for this plan (TUI-plan.md §17
+        // 'Toggle surfaces'). Mirrors plan-list's Q binding. Edit — suppressed
+        // when locked.
+        KeyCode::Char('Q') if !locked => InputAction::ToggleQuestionsEnabled,
 
         // Open step detail for the highlighted step (TUI-plan.md §7).
         // Read-only navigation, so allowed even while locked.
@@ -484,6 +492,21 @@ mod tests {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Char('S')));
         assert_eq!(action, InputAction::Stop);
+    }
+
+    #[test]
+    fn test_shift_q_emits_toggle_questions_enabled() {
+        let mut app = make_app(3);
+        let action = handle_key(&mut app, key(KeyCode::Char('Q')));
+        assert_eq!(action, InputAction::ToggleQuestionsEnabled);
+    }
+
+    #[test]
+    fn test_locked_suppresses_shift_q_toggle_questions() {
+        let mut app = make_app(3);
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('Q')));
+        assert_eq!(action, InputAction::None);
     }
 
     #[test]
