@@ -6,8 +6,9 @@
 // without a terminal.
 
 use std::collections::VecDeque;
-use std::time::Instant;
 
+use chrono::{DateTime, Utc};
+use crossterm::event::MouseEvent;
 use ratatui::widgets::ListState;
 
 use crate::config::Config;
@@ -19,6 +20,7 @@ use crate::tui::help::HelpState;
 use crate::tui::read_only::ReadOnly;
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
+use crate::tui::widgets::palette_bar::PaletteBarState;
 
 // ---------------------------------------------------------------------------
 // Input mode
@@ -67,9 +69,6 @@ pub struct PlanDetailApp {
     /// (`←`/`h`/`q`, or Ctrl-C). The dispatcher consumes this and exits the
     /// plan-detail event loop.
     pub should_pop: bool,
-
-    /// Start time of the current in-progress step (for the live timer).
-    pub step_start_time: Option<Instant>,
 
     /// Persistent list widget state so the viewport offset survives across frames.
     pub list_state: ListState,
@@ -143,6 +142,27 @@ pub struct PlanDetailApp {
     /// dispatcher routes input through [`HelpState::intercept_key`] before
     /// passing keys to the per-view input handler (TUI-plan.md §15).
     pub help: HelpState,
+    /// Slash/colon command palette state (TUI-plan.md §9). `Some` while the
+    /// bar is open; the dispatcher routes every key through
+    /// [`PaletteBarState::on_key`] before any view bindings fire. `/` and
+    /// `:` open it.
+    pub palette_bar: Option<PaletteBarState>,
+
+    /// Horizontal split between the step list (left) and detail pane
+    /// (right) as a percent of the body width given to the left pane.
+    /// Default 40, clamped to 20..=80 by the mouse-drag handler so neither
+    /// pane can collapse. Session-only — never persisted to the DB.
+    pub split_pct: u16,
+
+    /// Body width recorded during the most recent `draw()`. Used by
+    /// [`Self::handle_mouse`] to convert the cursor's absolute column into
+    /// a percent of the body's horizontal extent. Zero before the first
+    /// frame; mouse handling no-ops while it's zero.
+    pub last_body_width: u16,
+
+    /// True while a left-mouse drag started on the divider column is
+    /// active. Cleared on `MouseEventKind::Up(Left)`.
+    pub dragging_split: bool,
 }
 
 impl PlanDetailApp {
@@ -157,7 +177,6 @@ impl PlanDetailApp {
             input_mode: InputMode::Normal,
             input_buffer: String::new(),
             should_pop: false,
-            step_start_time: None,
             list_state,
             default_max_retries: config.max_retries_per_step,
             selection: Selection::new(),
@@ -173,6 +192,59 @@ impl PlanDetailApp {
             read_only: ReadOnly::Editable,
             open_questions: Vec::new(),
             help: HelpState::new(),
+            palette_bar: None,
+            split_pct: 40,
+            last_body_width: 0,
+            dragging_split: false,
+        }
+    }
+
+    /// Open the palette with `prefix` as the trigger key (`/` or `:`).
+    /// TUI-plan.md §9.
+    pub fn open_palette(&mut self, prefix: char) {
+        self.palette_bar = Some(PaletteBarState::new(prefix));
+    }
+
+    /// Close the palette without dispatching. TUI-plan.md §9.
+    pub fn close_palette(&mut self) {
+        self.palette_bar = None;
+    }
+
+    /// Whether the palette bar is currently open and consuming keys.
+    pub fn palette_active(&self) -> bool {
+        self.palette_bar.is_some()
+    }
+
+    /// Mouse-event entry point routed from the dispatcher's event loop.
+    /// Implements draggable resize of the horizontal split between the step
+    /// list and the right pane: a left-button press within ±1 column of the
+    /// current divider arms a drag, subsequent drags recompute `split_pct`
+    /// from `cursor_column / last_body_width` (clamped 20..=80), and
+    /// release clears the drag flag.
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        if self.last_body_width == 0 {
+            return;
+        }
+        let body_width = self.last_body_width as u32;
+        let divider_col = (body_width * self.split_pct as u32 / 100) as i32;
+
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let col = event.column as i32;
+                if (col - divider_col).abs() <= 1 {
+                    self.dragging_split = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_split => {
+                let pct = (event.column as u32 * 100) / body_width.max(1);
+                self.split_pct = pct.clamp(20, 80) as u16;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging_split = false;
+            }
+            _ => {}
         }
     }
 
@@ -512,21 +584,13 @@ impl PlanDetailApp {
 
     // -- Live-run snapshot ------------------------------------------------
 
-    /// Update the cached live-run snapshot. When the in-progress step
-    /// changes (or transitions in/out of the running state), the live timer
-    /// is reset so "Elapsed" reflects the *current* step rather than the
-    /// previous one.
+    /// Update the cached live-run snapshot. The elapsed timer is derived
+    /// from `LiveRun.phase_started_at` / `started_at` (see
+    /// [`Self::elapsed_secs`]), so a fresh snapshot here is enough to make
+    /// the "Elapsed" display reflect the current step without any
+    /// process-local Instant state.
     pub fn update_live_run(&mut self, live: Option<LiveRun>) {
-        let prev_step = self.live_run.as_ref().and_then(|l| l.step_id.clone());
-        let next_step = live.as_ref().and_then(|l| l.step_id.clone());
         self.live_run = live;
-        if prev_step != next_step {
-            if next_step.is_some() {
-                self.start_step_timer();
-            } else {
-                self.stop_step_timer();
-            }
-        }
     }
 
     /// 1-based step number reported by the live runner, or `None` when no
@@ -537,6 +601,14 @@ impl PlanDetailApp {
     pub fn live_step_num(&self) -> Option<i32> {
         self.subscribed_step_num
             .or_else(|| self.live_run.as_ref().and_then(|l| l.step_num))
+    }
+
+    /// Step ID currently executing under the live runner, or `None` when no
+    /// run is active for this plan. Used by `draw_step_detail` to gate the
+    /// harness/test output tails on whether the cursor is parked on the
+    /// running step (step #29).
+    pub fn live_step_id(&self) -> Option<String> {
+        self.live_run.as_ref().and_then(|l| l.step_id.clone())
     }
 
     /// True iff a runner is currently bound to this plan — either via an
@@ -559,7 +631,6 @@ impl PlanDetailApp {
         self.test_tail.clear();
         self.harness_tail_scroll = 0;
         self.test_tail_scroll = 0;
-        self.start_step_timer();
     }
 
     /// Release a previously-attached subscription. Called by the dispatcher
@@ -569,7 +640,6 @@ impl PlanDetailApp {
         self.subscribed = false;
         self.subscribed_step_num = None;
         self.current_phase = None;
-        self.stop_step_timer();
     }
 
     /// Push a harness-output line onto the tail, evicting from the front
@@ -593,11 +663,11 @@ impl PlanDetailApp {
 
     /// Record that a `step_started` event just arrived: bring the run-live
     /// state online if the subscription's first event preceded the DB-side
-    /// row, latch the step number, and reset the elapsed timer for the
-    /// freshly-started step.
+    /// row, and latch the step number. The elapsed timer is derived from
+    /// the persisted `LiveRun` timestamps, so no process-local clock state
+    /// needs resetting here.
     pub fn note_step_started(&mut self, step_id: &str) {
         self.subscribed = true;
-        self.start_step_timer();
         self.subscribed_step_num = self
             .steps
             .iter()
@@ -681,20 +751,23 @@ impl PlanDetailApp {
 
     // -- Timer ------------------------------------------------------------
 
-    /// Start the live timer for the current step.
-    pub fn start_step_timer(&mut self) {
-        self.step_start_time = Some(Instant::now());
-    }
-
-    /// Stop the live timer.
-    pub fn stop_step_timer(&mut self) {
-        self.step_start_time = None;
-    }
-
-    /// Get elapsed seconds since the step timer started (0.0 if not running).
+    /// Seconds elapsed in the current run phase, derived from the persisted
+    /// `LiveRun` row so re-entry from the plan list (which constructs a
+    /// fresh `PlanDetailApp`) preserves the accumulated time. Prefers
+    /// `phase_started_at` (per-step granularity) and falls back to
+    /// `started_at` (whole run) when no phase timestamp has been written
+    /// yet. Returns `0.0` when no live run is bound or when the timestamp
+    /// fails to parse — both treated as "no useful elapsed to show".
+    /// Negative durations from clock skew are clamped to `0.0`.
     pub fn elapsed_secs(&self) -> f64 {
-        self.step_start_time
-            .map(|t| t.elapsed().as_secs_f64())
+        let Some(live) = self.live_run.as_ref() else {
+            return 0.0;
+        };
+        let timestamp = live.phase_started_at.as_deref().unwrap_or(&live.started_at);
+        timestamp
+            .parse::<DateTime<Utc>>()
+            .ok()
+            .map(|t| Utc::now().signed_duration_since(t).num_seconds().max(0) as f64)
             .unwrap_or(0.0)
     }
 
@@ -790,6 +863,9 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
         }
     }
 
@@ -1112,27 +1188,100 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_timer() {
+    fn test_elapsed_secs_no_live_run_returns_zero() {
+        let plan = make_plan();
+        let steps = make_steps(3);
+        let app = PlanDetailApp::new(plan, steps, &Config::default());
+
+        assert_eq!(app.elapsed_secs(), 0.0);
+    }
+
+    #[test]
+    fn test_elapsed_secs_uses_phase_started_at() {
+        // (a) Construct an App, push a LiveRun whose phase_started_at is
+        // 90 seconds in the past, and assert elapsed_secs ≈ 90 — derived
+        // from the persisted timestamp, not a process-local Instant.
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
 
-        assert!(app.step_start_time.is_none());
-        app.start_step_timer();
-        assert!(app.step_start_time.is_some());
+        let mut live = make_live_run("test-plan", Some("s1"), Some(2));
+        let started = Utc::now() - chrono::Duration::seconds(90);
+        live.phase_started_at = Some(started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        app.update_live_run(Some(live));
 
         let elapsed = app.elapsed_secs();
-        assert!(elapsed >= 0.0);
-
-        app.stop_step_timer();
-        assert!(app.step_start_time.is_none());
+        assert!(
+            (89.0..=92.0).contains(&elapsed),
+            "expected ~90s elapsed, got {elapsed}"
+        );
     }
 
     #[test]
-    fn test_elapsed_secs_no_timer() {
-        let plan = make_plan();
-        let steps = make_steps(3);
-        let app = PlanDetailApp::new(plan, steps, &Config::default());
+    fn test_elapsed_secs_survives_view_reentry() {
+        // (b) Re-entry preservation: navigating from plan-detail to root
+        // and back constructs a fresh PlanDetailApp. Two apps fed the same
+        // LiveRun (same phase_started_at) must report the same elapsed
+        // value — there is no per-instance Instant to reset.
+        let mut live = make_live_run("test-plan", Some("s1"), Some(2));
+        let started = Utc::now() - chrono::Duration::seconds(90);
+        live.phase_started_at = Some(started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+
+        let mut first = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        first.update_live_run(Some(live.clone()));
+        let first_elapsed = first.elapsed_secs();
+        assert!(
+            (89.0..=92.0).contains(&first_elapsed),
+            "first view should observe ~90s elapsed, got {first_elapsed}"
+        );
+
+        let mut second = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        second.update_live_run(Some(live));
+        let second_elapsed = second.elapsed_secs();
+        assert!(
+            (89.0..=92.0).contains(&second_elapsed),
+            "fresh view should observe the same ~90s elapsed, got {second_elapsed}"
+        );
+        // Crucially, the second instance must NOT have reset to ~0.
+        assert!(
+            second_elapsed > 60.0,
+            "re-entry must preserve elapsed time across instances"
+        );
+    }
+
+    #[test]
+    fn test_elapsed_secs_falls_back_to_started_at() {
+        // (c) When phase_started_at is None, fall back to started_at —
+        // covers the window between run start and the first phase
+        // transition (where the per-phase timestamp hasn't been written
+        // yet).
+        let mut live = make_live_run("test-plan", Some("s1"), Some(2));
+        let started = Utc::now() - chrono::Duration::seconds(45);
+        live.phase_started_at = None;
+        live.started_at = started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.update_live_run(Some(live));
+
+        let elapsed = app.elapsed_secs();
+        assert!(
+            (44.0..=47.0).contains(&elapsed),
+            "expected ~45s elapsed via started_at fallback, got {elapsed}"
+        );
+    }
+
+    #[test]
+    fn test_elapsed_secs_clamps_negative_duration_to_zero() {
+        // (d) Clock skew defense: a phase_started_at that is in the future
+        // (perhaps because the runner host's clock is ahead of ours) must
+        // not surface as a negative elapsed — the f64 cast would wrap and
+        // the renderer would print nonsense.
+        let mut live = make_live_run("test-plan", Some("s1"), Some(2));
+        let future = Utc::now() + chrono::Duration::seconds(120);
+        live.phase_started_at = Some(future.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.update_live_run(Some(live));
 
         assert_eq!(app.elapsed_secs(), 0.0);
     }
@@ -1561,52 +1710,64 @@ mod tests {
             updated_at: None,
             source_branch: None,
             stash_sha: None,
+            parent_tui_pid: None,
         }
     }
 
     #[test]
-    fn test_update_live_run_starts_timer_when_step_appears() {
+    fn test_update_live_run_marks_run_live_when_step_appears() {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
         assert!(!app.is_run_live());
-        assert!(app.step_start_time.is_none());
 
         app.update_live_run(Some(make_live_run("test-plan", Some("s1"), Some(2))));
         assert!(app.is_run_live());
-        assert!(app.step_start_time.is_some());
         assert_eq!(app.live_step_num(), Some(2));
     }
 
     #[test]
-    fn test_update_live_run_stops_timer_when_run_ends() {
+    fn test_update_live_run_clears_run_state_when_run_ends() {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
         app.update_live_run(Some(make_live_run("test-plan", Some("s1"), Some(2))));
-        assert!(app.step_start_time.is_some());
+        assert!(app.is_run_live());
 
         app.update_live_run(None);
         assert!(!app.is_run_live());
-        assert!(app.step_start_time.is_none());
         assert_eq!(app.live_step_num(), None);
+        assert_eq!(app.elapsed_secs(), 0.0);
     }
 
     #[test]
-    fn test_update_live_run_resets_timer_on_step_change() {
+    fn test_update_live_run_reflects_new_phase_timestamp_on_step_change() {
         let plan = make_plan();
         let steps = make_steps(3);
         let mut app = PlanDetailApp::new(plan, steps, &Config::default());
-        app.update_live_run(Some(make_live_run("test-plan", Some("s1"), Some(2))));
-        let first_start = app.step_start_time.unwrap();
 
-        // Pause briefly so Instant comparisons are unambiguous.
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        app.update_live_run(Some(make_live_run("test-plan", Some("s2"), Some(3))));
-        let second_start = app.step_start_time.unwrap();
+        let mut first = make_live_run("test-plan", Some("s1"), Some(2));
+        let first_phase = Utc::now() - chrono::Duration::seconds(120);
+        first.phase_started_at =
+            Some(first_phase.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        app.update_live_run(Some(first));
+        let elapsed_before = app.elapsed_secs();
         assert!(
-            second_start > first_start,
-            "timer should restart when in-progress step changes"
+            elapsed_before > 60.0,
+            "first phase should report >60s elapsed, got {elapsed_before}"
+        );
+
+        // A new step arrives with a fresh phase_started_at — elapsed should
+        // drop to roughly the new phase's age.
+        let mut second = make_live_run("test-plan", Some("s2"), Some(3));
+        let second_phase = Utc::now() - chrono::Duration::seconds(2);
+        second.phase_started_at =
+            Some(second_phase.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        app.update_live_run(Some(second));
+        let elapsed_after = app.elapsed_secs();
+        assert!(
+            elapsed_after < 10.0,
+            "fresh phase should reset elapsed to ~2s, got {elapsed_after}"
         );
         assert_eq!(app.live_step_num(), Some(3));
     }
@@ -1614,13 +1775,11 @@ mod tests {
     // -- NDJSON-stream-driven state (TUI-plan.md §13) ---------------------
 
     #[test]
-    fn test_attach_subscription_marks_run_live_and_starts_timer() {
+    fn test_attach_subscription_marks_run_live() {
         let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
         assert!(!app.is_run_live());
-        assert!(app.step_start_time.is_none());
         app.attach_subscription();
         assert!(app.is_run_live());
-        assert!(app.step_start_time.is_some());
         assert_eq!(app.current_phase(), None);
         assert!(app.harness_tail.is_empty());
         assert!(app.test_tail.is_empty());
@@ -1652,7 +1811,7 @@ mod tests {
         assert!(app.is_run_live());
         app.detach_subscription();
         assert!(!app.is_run_live());
-        assert!(app.step_start_time.is_none());
+        assert_eq!(app.elapsed_secs(), 0.0);
         assert_eq!(app.current_phase, None);
         assert_eq!(app.subscribed_step_num, None);
     }
@@ -1777,5 +1936,184 @@ mod tests {
         assert_eq!(app.read_only.pid(), Some(4242));
         app.set_read_only(ReadOnly::Editable);
         assert!(!app.read_only.is_locked());
+    }
+
+    // -- Palette (TUI-plan.md §9) ---------------------------------------
+
+    #[test]
+    fn palette_default_inactive() {
+        let app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        assert!(!app.palette_active());
+        assert!(app.palette_bar.is_none());
+    }
+
+    #[test]
+    fn palette_open_records_prefix() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        app.open_palette('/');
+        assert!(app.palette_active());
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, '/');
+        app.close_palette();
+        app.open_palette(':');
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, ':');
+    }
+
+    #[test]
+    fn palette_close_drops_state() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        app.open_palette(':');
+        let _ = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.palette_bar.as_ref().unwrap().input, "r");
+        app.close_palette();
+        assert!(!app.palette_active());
+    }
+
+    #[test]
+    fn palette_esc_yields_cancel_outcome() {
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        app.open_palette('/');
+        let out = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(out, PaletteBarOutcome::Cancel);
+    }
+
+    #[test]
+    fn palette_enter_yields_submit_outcome_and_parses() {
+        use crate::tui::palette::PaletteCommand;
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        app.open_palette('/');
+        let bar = app.palette_bar.as_mut().unwrap();
+        for c in "step skip 3".chars() {
+            let _ = bar.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let out = bar.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let input = match out {
+            PaletteBarOutcome::Submit(s) => s,
+            other => panic!("expected Submit, got {other:?}"),
+        };
+        assert_eq!(
+            crate::tui::palette::parse(&input),
+            Ok(PaletteCommand::StepSkip(Some(3)))
+        );
+    }
+
+    // -- Mouse-drag split (step 26) ---------------------------------------
+
+    /// Construct a [`MouseEvent`] at `(column, row)` with the given kind.
+    /// Helper for the divider-drag tests below — the modifiers field is
+    /// always empty since the drag bindings ignore them.
+    fn mouse_event(
+        column: u16,
+        row: u16,
+        kind: crossterm::event::MouseEventKind,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn split_drag_updates_split_pct() {
+        // Down on the divider, drag right by ~10 columns, release.
+        // Body width 100 with default split_pct 40 puts the divider at
+        // column 40; dragging the cursor to column 60 should land at 60%.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.last_body_width = 100;
+
+        assert_eq!(app.split_pct, 40);
+        assert!(!app.dragging_split);
+
+        app.handle_mouse(mouse_event(40, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(
+            app.dragging_split,
+            "Down at the divider column should arm the drag"
+        );
+
+        app.handle_mouse(mouse_event(60, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 60, "drag to col 60 / 100 → 60%");
+
+        app.handle_mouse(mouse_event(60, 5, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_split, "Up should clear the drag flag");
+    }
+
+    #[test]
+    fn split_drag_press_off_divider_does_not_arm() {
+        // ±1 column tolerance: pressing far from the divider should not
+        // arm a drag, so subsequent drag events leave split_pct alone.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.last_body_width = 100;
+
+        // Divider is at column 40; press at column 10.
+        app.handle_mouse(mouse_event(10, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(!app.dragging_split);
+
+        app.handle_mouse(mouse_event(70, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 40, "drag without arming should not resize");
+    }
+
+    #[test]
+    fn split_drag_clamps_to_20_and_80() {
+        // Past column 0 still yields 20%; past column 80% still yields 80%.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        app.last_body_width = 100;
+
+        app.handle_mouse(mouse_event(40, 5, MouseEventKind::Down(MouseButton::Left)));
+        // Drag to column 0 (and slightly past via underflow-safe path).
+        app.handle_mouse(mouse_event(0, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 20, "left clamp at 20%");
+
+        // Drag far right; with body_width 100, column 95 maps to 95%, but
+        // the clamp pins the percent at 80.
+        app.handle_mouse(mouse_event(95, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 80, "right clamp at 80%");
+
+        app.handle_mouse(mouse_event(95, 5, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_split);
+    }
+
+    #[test]
+    fn keyboard_navigation_works_during_drag() {
+        // j/k must continue to function regardless of dragging_split — the
+        // drag flag only affects which mouse-drag events update the split.
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(5), &Config::default());
+        app.dragging_split = true;
+
+        assert_eq!(app.selected_index, 0);
+        app.navigate_down();
+        assert_eq!(app.selected_index, 1);
+        app.navigate_down();
+        assert_eq!(app.selected_index, 2);
+        app.navigate_up();
+        assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn handle_mouse_no_op_before_first_draw() {
+        // Before the first frame `last_body_width` is zero; mouse events
+        // must not panic and must not arm a drag (divider would be at 0).
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        assert_eq!(app.last_body_width, 0);
+
+        app.handle_mouse(mouse_event(0, 0, MouseEventKind::Down(MouseButton::Left)));
+        assert!(!app.dragging_split);
     }
 }

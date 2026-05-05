@@ -26,6 +26,10 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v14,
     migrate_v15,
     migrate_v16,
+    migrate_v17,
+    migrate_v18,
+    migrate_v19,
+    migrate_v20,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -545,6 +549,99 @@ fn migrate_v16(conn: &Connection) -> Result<()> {
         CREATE INDEX idx_step_questions_step ON step_questions(step_id);
         CREATE INDEX idx_step_questions_unanswered
             ON step_questions(answer) WHERE answer IS NULL;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V17: parent_tui_pid on run_locks (read-only detection ownership)
+// ---------------------------------------------------------------------------
+
+fn migrate_v17(conn: &Connection) -> Result<()> {
+    // `parent_tui_pid` records the pid of the TUI process that spawned this
+    // runner subprocess. When the same TUI later re-enters the plan-detail
+    // view, `read_only::detect` treats `parent_tui_pid == my_pid` as
+    // "lock owned by self" so the user is not falsely forced into read-only
+    // mode in the same shell session that started the run.
+    //
+    // NULL for pre-V17 rows and for runs where the parent pid is unknown
+    // (e.g. non-Unix platforms where we cannot resolve `getppid`). Rows
+    // predating this column degrade to today's read-only behavior, which
+    // is acceptable for in-flight runs at upgrade time.
+    conn.execute_batch(
+        "
+        ALTER TABLE run_locks ADD COLUMN parent_tui_pid INTEGER;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V19: last_run_branch column on plans (branch-based resume resolver)
+// ---------------------------------------------------------------------------
+
+fn migrate_v19(conn: &Connection) -> Result<()> {
+    // `plans.last_run_branch` records the git branch that was checked out
+    // when the plan most recently started a run. The runner sets it on every
+    // run start (both default and `--current-branch` modes), giving
+    // `ralph resume` (no slug) a way to infer the active plan from the
+    // current branch — essential when multiple plans share a branch
+    // (e.g. several plans run on `master` with `--current-branch`) and the
+    // user later checks out a feature branch that happens to share its name
+    // with one of those plans' slugs.
+    //
+    // Nullable with no backfill: pre-V19 plans report NULL until their next
+    // run, and the resolver falls back to `branch_name` only when
+    // `last_run_branch IS NULL` (covers never-run plans).
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN last_run_branch TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V18: pause_requested column on plans (graceful between-step pause)
+// ---------------------------------------------------------------------------
+
+fn migrate_v18(conn: &Connection) -> Result<()> {
+    // `plans.pause_requested` lets the user (via the TUI `P` keybinding or
+    // `ralph pause` CLI) ask the runner to stop after the currently-executing
+    // step finishes — distinct from the immediate SIGTERM-on-`S` path. The
+    // runner inspects it between steps and exits with
+    // `TerminationReason::PausedByUser`, clearing the flag in the same
+    // transaction so a subsequent `ralph resume` doesn't immediately re-pause.
+    //
+    // Stored as INTEGER (0/1) because SQLite has no native bool. NOT NULL
+    // with DEFAULT 0 keeps every pre-V18 row explicitly opted-out.
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V20: last_run_started_at column on plans (resume-ordering anchor)
+// ---------------------------------------------------------------------------
+
+fn migrate_v20(conn: &Connection) -> Result<()> {
+    // `plans.last_run_started_at` records the wall-clock time at which the
+    // plan most recently *started* a run (written by the runner alongside
+    // `last_run_branch`). It exists so resume-resolver ordering can use a
+    // stable "last actually ran" timestamp instead of the easily-bumped
+    // `updated_at` (which is also touched by unrelated edits like toggling
+    // `questions_enabled` or `pause_requested`).
+    //
+    // Nullable with no backfill: pre-V20 plans report NULL until their next
+    // run. The resume resolver's `ORDER BY` lists this column first with
+    // `NULLS LAST` so never-run plans tiebreak via `updated_at`/`created_at`.
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN last_run_started_at TEXT;
         ",
     )?;
     Ok(())
@@ -1544,6 +1641,283 @@ mod tests {
 
         // Second open is a no-op (re-running V16 would fail on duplicate
         // column / duplicate table).
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v17_adds_parent_tui_pid_to_run_locks() {
+        // Seed a pre-V17 DB with a run_locks row and verify that V17 leaves
+        // it intact with NULL parent_tui_pid, while new inserts can populate
+        // the column.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v16.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v16 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(16) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        // Seed a pre-V17 run_locks row.
+        conn.execute(
+            "INSERT INTO run_locks (project, pid) VALUES (?1, ?2)",
+            rusqlite::params!["/proj-v17", 1i64],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V17 applies. Pre-V17 row must have NULL parent_tui_pid.
+        let conn = open_at(&path).unwrap();
+        let parent: Option<i64> = conn
+            .query_row(
+                "SELECT parent_tui_pid FROM run_locks WHERE project = ?1",
+                ["/proj-v17"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, None);
+
+        // New inserts with explicit values round-trip.
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, parent_tui_pid)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params!["/proj-v17b", 2i64, 4242i64],
+        )
+        .unwrap();
+        let parent2: Option<i64> = conn
+            .query_row(
+                "SELECT parent_tui_pid FROM run_locks WHERE project = ?1",
+                ["/proj-v17b"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent2, Some(4242));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Second open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v18_adds_pause_requested_to_plans() {
+        // Seed a pre-V18 DB with a plans row, run V18, and verify that the
+        // existing row defaults to pause_requested = 0 (preserves prior
+        // behavior on upgrade).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v17.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v17 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(17) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V18 applies. Pre-V18 row must default to 0.
+        let conn = open_at(&path).unwrap();
+        let pr: i64 = conn
+            .query_row(
+                "SELECT pause_requested FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pr, 0, "pre-V18 plans must default pause_requested to 0");
+
+        // Fresh inserts also default to 0; explicit 1 round-trips.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, pause_requested)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", 1i64],
+        )
+        .unwrap();
+        let pr2: i64 = conn
+            .query_row(
+                "SELECT pause_requested FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pr2, 1);
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v19_adds_last_run_branch_to_plans() {
+        // Seed a pre-V19 DB with a plans row, run V19, and verify that the
+        // existing row defaults to last_run_branch = NULL (no backfill —
+        // the resolver explicitly relies on this to scope the
+        // `branch_name` fallback to never-run plans).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v18.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v18 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(18) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V19 applies. Pre-V19 row must remain NULL (no backfill).
+        let conn = open_at(&path).unwrap();
+        let lrb: Option<String> = conn
+            .query_row(
+                "SELECT last_run_branch FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            lrb.is_none(),
+            "pre-V19 plans must have NULL last_run_branch (got {lrb:?})"
+        );
+
+        // Fresh inserts also default to NULL; explicit values round-trip.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, last_run_branch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", "master"],
+        )
+        .unwrap();
+        let lrb2: Option<String> = conn
+            .query_row(
+                "SELECT last_run_branch FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lrb2.as_deref(), Some("master"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v20_adds_last_run_started_at_to_plans() {
+        // Seed a pre-V20 DB with a plans row, run V20, and verify that the
+        // existing row defaults to last_run_started_at = NULL (no backfill —
+        // the resolver's ORDER BY explicitly puts NULLs last so never-run
+        // plans tiebreak via updated_at/created_at).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v19.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v19 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(19) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V20 applies. Pre-V20 row must remain NULL (no backfill).
+        let conn = open_at(&path).unwrap();
+        let lrs: Option<String> = conn
+            .query_row(
+                "SELECT last_run_started_at FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            lrs.is_none(),
+            "pre-V20 plans must have NULL last_run_started_at (got {lrs:?})"
+        );
+
+        // Fresh inserts also default to NULL; explicit values round-trip.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, last_run_started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", "2026-05-05T00:00:00.000Z"],
+        )
+        .unwrap();
+        let lrs2: Option<String> = conn
+            .query_row(
+                "SELECT last_run_started_at FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lrs2.as_deref(), Some("2026-05-05T00:00:00.000Z"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
         let conn = open_at(&path).expect("re-open must not reapply migrations");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))

@@ -111,6 +111,10 @@ fn spawn_editor(editor: &str, path: &Path) -> Result<std::process::ExitStatus> {
         .with_context(|| format!("spawn editor: {editor}"))
 }
 
+// Mouse capture is toggled in lock-step with the alternate screen so the user's
+// editor sees a normal terminal (with native click-drag selection) and the TUI
+// resumes with capture re-enabled — matching the dispatcher's setup so view
+// `handle_mouse` routing keeps working after the round-trip.
 fn suspend_terminal() -> Result<()> {
     disable_raw_mode().context("disable raw mode")?;
     let mut stdout = std::io::stdout();

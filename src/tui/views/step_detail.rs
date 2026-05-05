@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::Result;
+use crossterm::event::MouseEvent;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -29,6 +30,7 @@ use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
 use crate::tui::views::step_detail_picker::{BottomCell, PickerKind, PickerOutcome, PickerState};
+use crate::tui::widgets::palette_bar::{self, PaletteBarState};
 
 /// Sentinel rendered in dim style when a pane's source-of-truth value is
 /// `None` or empty. Distinguishes "no value configured" from "configured to
@@ -113,7 +115,8 @@ pub enum Pane {
     UniversalPrompt,
     ProjectPrompt,
     PlanContextPrepend,
-    PlanPrompt,
+    PlanPrefix,
+    PlanSuffix,
     StepPrompt,
     /// Open (unanswered) `step_questions` rows for the focused step
     /// (TUI-plan.md §17). Sits between [`Pane::StepPrompt`] and
@@ -128,11 +131,12 @@ pub enum Pane {
 impl Pane {
     /// Display order — index into the pane stack from top to bottom. Drives
     /// the wrapping nav arithmetic below.
-    pub const ORDER: [Pane; 9] = [
+    pub const ORDER: [Pane; 10] = [
         Pane::UniversalPrompt,
         Pane::ProjectPrompt,
         Pane::PlanContextPrepend,
-        Pane::PlanPrompt,
+        Pane::PlanPrefix,
+        Pane::PlanSuffix,
         Pane::StepPrompt,
         Pane::OpenQuestions,
         Pane::Appended,
@@ -155,7 +159,8 @@ impl Pane {
             Pane::UniversalPrompt => "Universal prompt",
             Pane::ProjectPrompt => "Project prompt",
             Pane::PlanContextPrepend => "Plan context prepend",
-            Pane::PlanPrompt => "Plan prompt",
+            Pane::PlanPrefix => "Plan prefix",
+            Pane::PlanSuffix => "Plan suffix",
             Pane::StepPrompt => "Step prompt",
             Pane::OpenQuestions => "Open question(s)",
             Pane::Appended => "Appended",
@@ -622,6 +627,32 @@ pub struct StepDetailApp {
     /// dispatcher routes input through [`HelpState::intercept_key`] before
     /// touching pane navigation or modal handlers (TUI-plan.md §15).
     pub help: HelpState,
+    /// Slash/colon command palette state (TUI-plan.md §9). `Some` while the
+    /// bar is open; the dispatcher routes every key through
+    /// [`PaletteBarState::on_key`] before any view bindings fire. `/` and
+    /// `:` open it.
+    pub palette_bar: Option<PaletteBarState>,
+
+    /// User-driven sidebar width override. When `Some(w)`, the layout uses
+    /// `w` (clamped 4..=80) instead of the zen-derived constant — set by a
+    /// mouse drag on the divider. Cleared by `z` so zen toggling stays
+    /// predictable. Session-only — never persisted.
+    pub sidebar_w_override: Option<u16>,
+
+    /// Body width recorded during the most recent `draw()`. Used by
+    /// [`Self::handle_mouse`] to clamp the cursor's column when computing a
+    /// new override; zero before the first frame, in which case mouse
+    /// handling no-ops.
+    pub last_body_width: u16,
+
+    /// Sidebar column width recorded during the most recent `draw()`. Acts
+    /// as the divider column for hit-testing the start-of-drag click in
+    /// [`Self::handle_mouse`]. Zero before the first frame.
+    pub last_sidebar_w: u16,
+
+    /// True while a left-mouse drag started on the divider column is
+    /// active. Cleared on `MouseEventKind::Up(Left)`.
+    pub dragging_sidebar: bool,
 }
 
 impl StepDetailApp {
@@ -675,6 +706,64 @@ impl StepDetailApp {
             answer_modal: None,
             resume_modal: None,
             help: HelpState::new(),
+            palette_bar: None,
+            sidebar_w_override: None,
+            last_body_width: 0,
+            last_sidebar_w: 0,
+            dragging_sidebar: false,
+        }
+    }
+
+    /// Open the palette with `prefix` as the trigger key (`/` or `:`).
+    /// TUI-plan.md §9.
+    pub fn open_palette(&mut self, prefix: char) {
+        self.palette_bar = Some(PaletteBarState::new(prefix));
+    }
+
+    /// Close the palette without dispatching. TUI-plan.md §9.
+    pub fn close_palette(&mut self) {
+        self.palette_bar = None;
+    }
+
+    /// Whether the palette bar is currently open and consuming keys.
+    pub fn palette_active(&self) -> bool {
+        self.palette_bar.is_some()
+    }
+
+    /// Mouse-event entry point routed from the dispatcher's event loop.
+    /// Implements draggable resize of the sidebar via mouse drag on the
+    /// divider column: a left-button press within ±1 column of the current
+    /// `last_sidebar_w` arms a drag (and disables `user_zen` so the override
+    /// takes precedence), subsequent drags update `sidebar_w_override`
+    /// directly to the cursor's column (clamped 4..=80), and release clears
+    /// the drag flag. No-op before the first frame (`last_body_width == 0`).
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        if self.last_body_width == 0 {
+            return;
+        }
+        let divider_col = self.last_sidebar_w as i32;
+
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let col = event.column as i32;
+                if (col - divider_col).abs() <= 1 {
+                    self.dragging_sidebar = true;
+                    // Drag explicitly opts out of zen — the override should
+                    // win regardless of zen toggle state. `auto_zen` is
+                    // recomputed each frame so we leave it alone.
+                    self.user_zen = false;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_sidebar => {
+                let w = event.column.clamp(4, 80);
+                self.sidebar_w_override = Some(w);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging_sidebar = false;
+            }
+            _ => {}
         }
     }
 
@@ -717,8 +806,11 @@ impl StepDetailApp {
 
     /// Toggle the user-driven zen state. No-op while auto-zen is forcing zen
     /// mode (the spec disables `z` in that state — TUI-plan.md §18 Q5).
-    /// Returns `true` when the toggle was applied.
+    /// Returns `true` when the toggle was applied. Always clears any active
+    /// `sidebar_w_override` (even when the toggle is suppressed by auto-zen)
+    /// so zen behavior remains predictable after a mouse-drag resize.
     pub fn toggle_zen(&mut self) -> bool {
+        self.sidebar_w_override = None;
         if self.auto_zen {
             return false;
         }
@@ -1320,34 +1412,46 @@ impl StepDetailApp {
         Ok(EditOutcome::Saved)
     }
 
-    /// `c` on the Plan-prompt pane: round-trip `plan.prompt_prefix` and
-    /// `plan.prompt_suffix` through `$EDITOR` using the same two-section
-    /// format as the universal/project panes. Each side is updated
-    /// independently so a no-op on one half doesn't churn `updated_at`.
-    pub fn edit_plan_prompt_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
+    /// `c` on the Plan-prefix pane: round-trip `plan.prompt_prefix` through
+    /// `$EDITOR` as a single text body. Whitespace-only input clears the
+    /// field (stored as `NULL`) so the user can drop the prefix entirely
+    /// without leaving an empty-string artifact.
+    pub fn edit_plan_prefix_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
     where
         E: FnOnce(&str) -> Result<Option<String>>,
     {
-        let initial = format_wrap_pane(
-            self.plan.prompt_prefix.as_deref(),
-            self.plan.prompt_suffix.as_deref(),
-        );
+        let initial = self.plan.prompt_prefix.clone().unwrap_or_default();
         let new_text = match edit_fn(&initial)? {
             None => return Ok(EditOutcome::NoEditor),
             Some(s) => s,
         };
-        let (new_prefix, new_suffix) = parse_wrap_pane(&new_text);
-        if new_prefix == self.plan.prompt_prefix && new_suffix == self.plan.prompt_suffix {
+        let new_value = trim_to_option(&new_text);
+        if new_value == self.plan.prompt_prefix {
             return Ok(EditOutcome::NoChanges);
         }
-        if new_prefix != self.plan.prompt_prefix {
-            storage::set_plan_prompt_prefix(conn, &self.plan.id, new_prefix.as_deref())?;
-            self.plan.prompt_prefix = new_prefix;
+        storage::set_plan_prompt_prefix(conn, &self.plan.id, new_value.as_deref())?;
+        self.plan.prompt_prefix = new_value;
+        Ok(EditOutcome::Saved)
+    }
+
+    /// `c` on the Plan-suffix pane: round-trip `plan.prompt_suffix` through
+    /// `$EDITOR` as a single text body. Whitespace-only input clears the
+    /// field — same semantics as [`Self::edit_plan_prefix_pane`].
+    pub fn edit_plan_suffix_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
+    where
+        E: FnOnce(&str) -> Result<Option<String>>,
+    {
+        let initial = self.plan.prompt_suffix.clone().unwrap_or_default();
+        let new_text = match edit_fn(&initial)? {
+            None => return Ok(EditOutcome::NoEditor),
+            Some(s) => s,
+        };
+        let new_value = trim_to_option(&new_text);
+        if new_value == self.plan.prompt_suffix {
+            return Ok(EditOutcome::NoChanges);
         }
-        if new_suffix != self.plan.prompt_suffix {
-            storage::set_plan_prompt_suffix(conn, &self.plan.id, new_suffix.as_deref())?;
-            self.plan.prompt_suffix = new_suffix;
-        }
+        storage::set_plan_prompt_suffix(conn, &self.plan.id, new_value.as_deref())?;
+        self.plan.prompt_suffix = new_value;
         Ok(EditOutcome::Saved)
     }
 
@@ -1452,7 +1556,13 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
 
     let step_segment = app.breadcrumb_step_segment();
     let crumbs: [&str; 3] = ["ralph", app.plan.slug.as_str(), step_segment.as_str()];
-    let hint = "[j/k] pane  [h/←] back  [z] zen  [q] back";
+    let normal_hint = "[j/k] pane  [h/←] back  [z] zen  [/:] cmd  [q] back";
+    let palette_hint = "[tab] complete  [enter] submit  [esc] cancel";
+    let hint = if app.palette_active() {
+        palette_hint
+    } else {
+        normal_hint
+    };
     let banner = read_only::banner(app.read_only);
     let body = chrome::render(
         frame,
@@ -1461,6 +1571,7 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
             hint,
             cwd: Path::new(&app.plan.project),
             banner: banner.as_deref(),
+            running_indicator: None,
         },
     );
 
@@ -1468,12 +1579,24 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
         return;
     }
 
-    let sidebar_w = if app.is_zen_mode() {
-        SIDEBAR_ZEN_WIDTH
-    } else {
-        SIDEBAR_FULL_WIDTH
+    // The user-driven mouse-drag override wins over the zen-derived width,
+    // so a deliberate resize survives subsequent re-renders. `z` clears the
+    // override, restoring zen-driven behavior. TUI-plan.md, step 27.
+    let sidebar_w = match app.sidebar_w_override {
+        Some(w) => w,
+        None => {
+            if app.is_zen_mode() {
+                SIDEBAR_ZEN_WIDTH
+            } else {
+                SIDEBAR_FULL_WIDTH
+            }
+        }
     };
     let sidebar_w = sidebar_w.min(body.width.saturating_sub(1).max(1));
+
+    // Cache the dimensions for `handle_mouse` — see `Self::handle_mouse`.
+    app.last_body_width = body.width;
+    app.last_sidebar_w = sidebar_w;
 
     let main = Layout::default()
         .direction(Direction::Horizontal)
@@ -1505,6 +1628,21 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
     if app.help.is_visible() {
         let area = frame.area();
         help::render(frame, area, &help::for_step_detail());
+    }
+
+    // Palette bar overlays the bottom chrome row when active. TUI-plan.md §9.
+    if let Some(state) = app.palette_bar.as_ref() {
+        let area = frame.area();
+        let strip_height = 4.min(area.height);
+        if strip_height > 0 {
+            let palette_area = Rect {
+                x: area.x,
+                y: area.y + area.height - strip_height,
+                width: area.width,
+                height: strip_height,
+            };
+            palette_bar::render(frame, palette_area, state);
+        }
     }
 }
 
@@ -1828,12 +1966,8 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
                 None => Some(DEFAULT_CONTEXT_PREPEND),
             },
         ),
-        Pane::PlanPrompt => render_wrap_pane(
-            frame,
-            inner,
-            app.plan.prompt_prefix.as_deref(),
-            app.plan.prompt_suffix.as_deref(),
-        ),
+        Pane::PlanPrefix => render_text_pane(frame, inner, app.plan.prompt_prefix.as_deref()),
+        Pane::PlanSuffix => render_text_pane(frame, inner, app.plan.prompt_suffix.as_deref()),
         Pane::StepPrompt => render_step_prompt(frame, app, inner),
         Pane::OpenQuestions => render_open_questions(frame, app, inner),
         Pane::Appended => render_appended(frame, app, inner),
@@ -1913,10 +2047,10 @@ fn render_text_pane(frame: &mut Frame, area: Rect, text: Option<&str>) {
     frame.render_widget(para, area);
 }
 
-/// Render a prefix/suffix wrap pane (Universal, Project, Plan prompt). Both
-/// halves render with bolded labels so the operator can tell which is which
-/// even when one side is empty. When both are absent we collapse to a single
-/// `(none)` line to match the other read-only renders.
+/// Render a prefix/suffix wrap pane (Universal, Project). Both halves render
+/// with bolded labels so the operator can tell which is which even when one
+/// side is empty. When both are absent we collapse to a single `(none)` line
+/// to match the other read-only renders.
 fn render_wrap_pane(frame: &mut Frame, area: Rect, prefix: Option<&str>, suffix: Option<&str>) {
     let mut lines: Vec<Line> = Vec::new();
     let label_style = Style::default().add_modifier(Modifier::BOLD);
@@ -2147,7 +2281,18 @@ fn render_bottom_row(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
             Style::default().add_modifier(Modifier::BOLD)
         };
         let value_span = match value {
-            Some(s) if !s.is_empty() => Span::raw(s.clone()),
+            Some(s) if !s.is_empty() => {
+                if *cell == BottomCell::Harness
+                    && let Some(color) = crate::output::harness_color(s)
+                {
+                    Span::styled(
+                        s.clone(),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Span::raw(s.clone())
+                }
+            }
             _ => Span::styled(
                 EMPTY_CELL.to_string(),
                 Style::default().fg(theme::CHROME_DIM),
@@ -2214,6 +2359,9 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
         }
     }
 
@@ -2300,15 +2448,17 @@ mod tests {
 
     #[test]
     fn pane_order_matches_section_8_layout() {
-        // The §8 sketch lists eight panes; §17 adds the OpenQuestions pane
-        // between StepPrompt and Appended.
+        // The §8 sketch lists the prompt-wrapping panes; §17 adds the
+        // OpenQuestions pane between StepPrompt and Appended. The plan
+        // prefix/suffix are split so each is editable as a single body.
         assert_eq!(
             Pane::ORDER,
             [
                 Pane::UniversalPrompt,
                 Pane::ProjectPrompt,
                 Pane::PlanContextPrepend,
-                Pane::PlanPrompt,
+                Pane::PlanPrefix,
+                Pane::PlanSuffix,
                 Pane::StepPrompt,
                 Pane::OpenQuestions,
                 Pane::Appended,
@@ -2872,7 +3022,7 @@ mod tests {
             ProjectSettings::default(),
             Vec::new(),
         );
-        let screen = render_to_string(140, 60, &mut app);
+        let screen = render_to_string(160, 100, &mut app);
         assert!(screen.contains("Universal prompt"), "{screen}");
         assert!(screen.contains("CFG-PREFIX-MARKER"), "{screen}");
         assert!(screen.contains("CFG-SUFFIX-MARKER"), "{screen}");
@@ -2923,7 +3073,7 @@ mod tests {
             project_settings,
             Vec::new(),
         );
-        let screen = render_to_string(140, 60, &mut app);
+        let screen = render_to_string(160, 100, &mut app);
         assert!(screen.contains("Project prompt"), "{screen}");
         assert!(screen.contains("PROJ-PRE-MARK"), "{screen}");
         assert!(screen.contains("PROJ-SUF-MARK"), "{screen}");
@@ -2975,7 +3125,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_prompt_pane_renders_plan_wraps() {
+    fn plan_prefix_and_suffix_panes_render_independently() {
         let mut plan = make_plan();
         plan.prompt_prefix = Some("PLAN-PRE-MARK".to_string());
         plan.prompt_suffix = Some("PLAN-SUF-MARK".to_string());
@@ -2988,7 +3138,8 @@ mod tests {
             Vec::new(),
         );
         let screen = render_to_string(140, 60, &mut app);
-        assert!(screen.contains("Plan prompt"), "{screen}");
+        assert!(screen.contains("Plan prefix"), "{screen}");
+        assert!(screen.contains("Plan suffix"), "{screen}");
         assert!(screen.contains("PLAN-PRE-MARK"), "{screen}");
         assert!(screen.contains("PLAN-SUF-MARK"), "{screen}");
     }
@@ -3008,7 +3159,7 @@ mod tests {
             ProjectSettings::default(),
             Vec::new(),
         );
-        let screen = render_to_string(160, 80, &mut app);
+        let screen = render_to_string(160, 100, &mut app);
         assert!(screen.contains("STEP-TITLE-MARK"), "{screen}");
         assert!(screen.contains("STEP-DESC-MARK"), "{screen}");
         assert!(screen.contains("CRIT-A-MARK"), "{screen}");
@@ -4192,50 +4343,74 @@ cargo clippy
         assert!(parsed.is_empty());
     }
 
-    // -- edit_plan_prompt_pane --------------------------------------------
+    // -- edit_plan_prefix_pane / edit_plan_suffix_pane --------------------
 
     #[test]
-    fn edit_plan_prompt_no_editor_short_circuits() {
+    fn edit_plan_prefix_no_editor_short_circuits() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_project_app(&conn, "/proj");
-        let outcome = app.edit_plan_prompt_pane(&conn, fake_editor(None)).unwrap();
+        let outcome = app.edit_plan_prefix_pane(&conn, fake_editor(None)).unwrap();
         assert_eq!(outcome, EditOutcome::NoEditor);
     }
 
     #[test]
-    fn edit_plan_prompt_no_changes_skips_writes() {
+    fn edit_plan_prefix_no_changes_skips_writes() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_project_app(&conn, "/proj");
+        // Seed a value so we can verify the unchanged round-trip path.
+        storage::set_plan_prompt_prefix(&conn, &app.plan.id, Some("a")).unwrap();
         app.plan.prompt_prefix = Some("a".to_string());
-        let buffer = format_wrap_pane(Some("a"), None);
         let outcome = app
-            .edit_plan_prompt_pane(&conn, fake_editor(Some(buffer)))
+            .edit_plan_prefix_pane(&conn, fake_editor(Some("a".to_string())))
             .unwrap();
         assert_eq!(outcome, EditOutcome::NoChanges);
-        // DB row still reflects the absence of the suffix and the seeded prefix.
         let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
             .unwrap()
             .unwrap();
-        assert_eq!(reloaded.prompt_prefix, None);
-        assert_eq!(reloaded.prompt_suffix, None);
+        assert_eq!(reloaded.prompt_prefix.as_deref(), Some("a"));
     }
 
     #[test]
-    fn edit_plan_prompt_persists_changed_pair() {
+    fn edit_plan_prefix_persists_changed_value() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_project_app(&conn, "/proj");
-        let buffer = format_wrap_pane(Some("PLAN-PRE"), Some("PLAN-SUF"));
         let outcome = app
-            .edit_plan_prompt_pane(&conn, fake_editor(Some(buffer)))
+            .edit_plan_prefix_pane(&conn, fake_editor(Some("PLAN-PRE".to_string())))
             .unwrap();
         assert_eq!(outcome, EditOutcome::Saved);
         let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.prompt_prefix.as_deref(), Some("PLAN-PRE"));
-        assert_eq!(reloaded.prompt_suffix.as_deref(), Some("PLAN-SUF"));
         assert_eq!(app.plan.prompt_prefix.as_deref(), Some("PLAN-PRE"));
+    }
+
+    #[test]
+    fn edit_plan_suffix_persists_changed_value() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        let outcome = app
+            .edit_plan_suffix_pane(&conn, fake_editor(Some("PLAN-SUF".to_string())))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.prompt_suffix.as_deref(), Some("PLAN-SUF"));
         assert_eq!(app.plan.prompt_suffix.as_deref(), Some("PLAN-SUF"));
+    }
+
+    #[test]
+    fn edit_plan_prefix_whitespace_clears_field() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        storage::set_plan_prompt_prefix(&conn, &app.plan.id, Some("seed")).unwrap();
+        app.plan.prompt_prefix = Some("seed".to_string());
+        let outcome = app
+            .edit_plan_prefix_pane(&conn, fake_editor(Some("   \n".to_string())))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        assert_eq!(app.plan.prompt_prefix, None);
     }
 
     // -- edit_step_prompt_pane --------------------------------------------
@@ -4922,5 +5097,279 @@ cargo clippy
             crate::tui::help::InterceptResult::Closed
         );
         assert!(!app.help.is_visible());
+    }
+
+    // -- Palette (TUI-plan.md §9) ---------------------------------------
+
+    #[test]
+    fn step_detail_palette_default_inactive() {
+        let app = make_app(3, 0);
+        assert!(!app.palette_active());
+        assert!(app.palette_bar.is_none());
+    }
+
+    #[test]
+    fn step_detail_palette_open_records_prefix() {
+        let mut app = make_app(3, 0);
+        app.open_palette('/');
+        assert!(app.palette_active());
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, '/');
+        app.close_palette();
+        app.open_palette(':');
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, ':');
+    }
+
+    #[test]
+    fn step_detail_palette_close_drops_state() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app(3, 0);
+        app.open_palette('/');
+        let _ = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.palette_bar.as_ref().unwrap().input, "r");
+        app.close_palette();
+        assert!(!app.palette_active());
+    }
+
+    #[test]
+    fn step_detail_palette_esc_yields_cancel_outcome() {
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app(3, 0);
+        app.open_palette('/');
+        let out = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(out, PaletteBarOutcome::Cancel);
+    }
+
+    #[test]
+    fn step_detail_palette_enter_yields_submit_outcome_and_parses() {
+        use crate::tui::palette::PaletteCommand;
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app(3, 0);
+        app.open_palette('/');
+        let bar = app.palette_bar.as_mut().unwrap();
+        for c in "step edit --tags".chars() {
+            let _ = bar.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let out = bar.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let input = match out {
+            PaletteBarOutcome::Submit(s) => s,
+            other => panic!("expected Submit, got {other:?}"),
+        };
+        assert_eq!(
+            crate::tui::palette::parse(&input),
+            Ok(PaletteCommand::StepEditTags)
+        );
+    }
+
+    // -- Sidebar mouse-drag override (TUI-plan.md, step 27) ---------------
+
+    /// Construct a [`MouseEvent`] at `(column, row)` with the given kind.
+    /// Mirrors the helper in plan_detail's tests.
+    fn mouse_event(
+        column: u16,
+        row: u16,
+        kind: crossterm::event::MouseEventKind,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn sidebar_w_override_defaults_to_none() {
+        let app = make_app(3, 0);
+        assert!(app.sidebar_w_override.is_none());
+        assert_eq!(app.last_body_width, 0);
+        assert_eq!(app.last_sidebar_w, 0);
+        assert!(!app.dragging_sidebar);
+    }
+
+    #[test]
+    fn sidebar_w_override_set_and_clear() {
+        // (a) State-machine test: set → clamp → clear.
+        let mut app = make_app(3, 0);
+        app.sidebar_w_override = Some(30);
+        assert_eq!(app.sidebar_w_override, Some(30));
+
+        // The clamp is applied at the call site in `handle_mouse`; assert the
+        // post-clamp values cover both bounds.
+        let clamped_low = 1u16.clamp(4, 80);
+        let clamped_high = 200u16.clamp(4, 80);
+        assert_eq!(clamped_low, 4);
+        assert_eq!(clamped_high, 80);
+
+        app.sidebar_w_override = None;
+        assert!(app.sidebar_w_override.is_none());
+    }
+
+    #[test]
+    fn sidebar_drag_down_drag_up_sets_override() {
+        // (b) Dispatcher-style: Down at the divider arms the drag, Drag
+        //     updates `sidebar_w_override` to the cursor column, Up clears
+        //     the drag flag.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = make_app(3, 0);
+        app.last_body_width = 120;
+        app.last_sidebar_w = 25;
+
+        assert!(app.sidebar_w_override.is_none());
+        assert!(!app.dragging_sidebar);
+
+        // Press at column 25 (the divider): drag is armed.
+        app.handle_mouse(mouse_event(25, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(app.dragging_sidebar);
+
+        // Drag to column 40: override matches the cursor column.
+        app.handle_mouse(mouse_event(40, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.sidebar_w_override, Some(40));
+
+        app.handle_mouse(mouse_event(40, 5, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_sidebar);
+    }
+
+    #[test]
+    fn sidebar_drag_press_off_divider_does_not_arm() {
+        // ±1 column tolerance: pressing far from the divider should not
+        // arm a drag, so subsequent drag events leave the override alone.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = make_app(3, 0);
+        app.last_body_width = 120;
+        app.last_sidebar_w = 25;
+
+        // Divider at column 25; press at column 10.
+        app.handle_mouse(mouse_event(10, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(!app.dragging_sidebar);
+
+        app.handle_mouse(mouse_event(60, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert!(
+            app.sidebar_w_override.is_none(),
+            "drag without arming must not set override"
+        );
+    }
+
+    #[test]
+    fn sidebar_drag_clamps_to_4_and_80() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = make_app(3, 0);
+        app.last_body_width = 200;
+        app.last_sidebar_w = 25;
+
+        app.handle_mouse(mouse_event(25, 5, MouseEventKind::Down(MouseButton::Left)));
+        // Drag far left — clamped to 4.
+        app.handle_mouse(mouse_event(0, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.sidebar_w_override, Some(4));
+
+        // Drag far right — clamped to 80.
+        app.handle_mouse(mouse_event(150, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.sidebar_w_override, Some(80));
+
+        app.handle_mouse(mouse_event(150, 5, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_sidebar);
+    }
+
+    #[test]
+    fn sidebar_drag_within_one_column_arms() {
+        // ±1 column hit-test: pressing one column either side of the
+        // divider should still arm the drag.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        for col in [24u16, 25, 26] {
+            let mut app = make_app(3, 0);
+            app.last_body_width = 120;
+            app.last_sidebar_w = 25;
+            app.handle_mouse(mouse_event(col, 5, MouseEventKind::Down(MouseButton::Left)));
+            assert!(
+                app.dragging_sidebar,
+                "press at col {col} (divider 25) should arm drag",
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_drag_starts_clears_user_zen() {
+        // Dragging takes priority over zen — user_zen is dropped on Down so
+        // the override path drives rendering.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = make_app(3, 0);
+        app.last_body_width = 120;
+        app.last_sidebar_w = 4;
+        // User had toggled zen on (sidebar_w would be SIDEBAR_ZEN_WIDTH=4).
+        let _ = app.toggle_zen();
+        assert!(app.is_zen_mode());
+
+        app.handle_mouse(mouse_event(4, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(app.dragging_sidebar);
+        assert!(
+            !app.is_zen_mode(),
+            "starting a drag must drop user-driven zen so the override wins",
+        );
+    }
+
+    #[test]
+    fn handle_mouse_no_op_before_first_draw() {
+        // Before the first frame `last_body_width` is zero; mouse events
+        // must not panic and must not arm a drag.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = make_app(3, 0);
+        assert_eq!(app.last_body_width, 0);
+
+        app.handle_mouse(mouse_event(0, 0, MouseEventKind::Down(MouseButton::Left)));
+        assert!(!app.dragging_sidebar);
+        assert!(app.sidebar_w_override.is_none());
+    }
+
+    #[test]
+    fn toggle_zen_clears_sidebar_override() {
+        // (c) Pressing `z` resets the override so rendering falls back to
+        //     the zen-derived constant. Verified both directions: the
+        //     override is cleared, and `is_zen_mode` flips as before.
+        let mut app = make_app(3, 0);
+        app.sidebar_w_override = Some(50);
+        assert_eq!(app.sidebar_w_override, Some(50));
+        assert!(!app.is_zen_mode());
+
+        let applied = app.toggle_zen();
+        assert!(applied);
+        assert!(app.is_zen_mode(), "z toggles zen on as before");
+        assert!(
+            app.sidebar_w_override.is_none(),
+            "z must clear the override so the zen-derived constant applies",
+        );
+
+        // Toggling back off also keeps the override cleared.
+        app.sidebar_w_override = Some(40);
+        let applied = app.toggle_zen();
+        assert!(applied);
+        assert!(!app.is_zen_mode());
+        assert!(app.sidebar_w_override.is_none());
+    }
+
+    #[test]
+    fn toggle_zen_clears_override_even_when_auto_zen_forces() {
+        // Auto-zen suppresses the user toggle, but the override clear still
+        // happens so a subsequent terminal grow-back doesn't leave a stale
+        // override behind.
+        let mut app = make_app(3, 0);
+        app.update_auto_zen(80);
+        assert!(app.is_zen_forced());
+        app.sidebar_w_override = Some(60);
+
+        let applied = app.toggle_zen();
+        assert!(!applied, "z is suppressed under auto-zen");
+        assert!(
+            app.sidebar_w_override.is_none(),
+            "auto-zen-suppressed `z` still clears the override",
+        );
     }
 }

@@ -91,6 +91,12 @@ pub enum RunEvent {
     /// Emitted on every transition recorded into `run_locks.phase`. Lets the
     /// TUI redraw the phase indicator without polling.
     PhaseChanged { phase: Phase },
+    /// Emitted when the runner exits cleanly because the operator set
+    /// `plans.pause_requested` (TUI `[P]` keybinding or `ralph pause`).
+    /// Distinct from `plan_complete`/`summary` so the TUI can surface the
+    /// "Paused. Use `ralph resume` to continue." toast and so machine
+    /// consumers can distinguish a deliberate pause from completion.
+    PausedByUser { plan_slug: String },
     /// Final event for `ralph run`, replacing the role of `plan_complete` for
     /// human-readable summary consumers. `plan_complete` is **kept** for one
     /// release as a compat shim (still emitted alongside `summary`) so
@@ -285,7 +291,9 @@ pub fn colored_termination_reason(reason: TerminationReason, color: bool) -> Str
         | TerminationReason::CommitFailed
         | TerminationReason::RollbackFailed
         | TerminationReason::InsufficientDiskSpace => "\x1b[31m",
-        TerminationReason::NoChanges | TerminationReason::PausedForQuestion => "\x1b[33m",
+        TerminationReason::NoChanges
+        | TerminationReason::PausedForQuestion
+        | TerminationReason::PausedByUser => "\x1b[33m",
         TerminationReason::Unknown => "\x1b[90m",
     };
     format!("{code}{}\x1b[0m", reason.as_str())
@@ -739,6 +747,10 @@ pub struct StatusSummary {
     /// is for a different plan than the one being queried.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live: Option<LiveRunDisplay>,
+    /// `plans.pause_requested`. Only emitted (in JSON) and only printed (in
+    /// plain text) when set, so a normal status report stays compact.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub pause_requested: bool,
 }
 
 /// Serializable projection of a [`LiveRun`] for the `status` command.
@@ -1284,6 +1296,7 @@ mod tests {
             updated_at: None,
             source_branch: None,
             stash_sha: None,
+            parent_tui_pid: None,
         }
     }
 
@@ -1329,6 +1342,7 @@ mod tests {
                 in_progress: 0,
             },
             live: None,
+            pause_requested: false,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(
@@ -1352,6 +1366,7 @@ mod tests {
                 in_progress: 1,
             },
             live: Some(LiveRunDisplay::from_live_run(&sample_live_run())),
+            pause_requested: false,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"live\":{"));

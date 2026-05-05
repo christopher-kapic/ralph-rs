@@ -62,7 +62,7 @@ pub fn get_plan_by_slug(conn: &Connection, slug: &str, project: &str) -> Result<
 }
 
 /// Fetch a plan by its primary key.
-fn get_plan_by_id(conn: &Connection, id: &str) -> Result<Plan> {
+pub fn get_plan_by_id(conn: &Connection, id: &str) -> Result<Plan> {
     let query = format!("SELECT {PLAN_COLUMNS} FROM plans WHERE id = ?1");
     conn.query_row(&query, params![id], Plan::from_row)
         .with_context(|| format!("Plan not found: {id}"))
@@ -279,6 +279,185 @@ pub fn set_plan_questions_enabled(conn: &Connection, plan_id: &str, enabled: boo
         anyhow::bail!("Plan not found: {plan_id}");
     }
     Ok(())
+}
+
+/// Record the git branch the plan most recently started a run on AND the
+/// wall-clock timestamp at which that run started.
+///
+/// Written by the runner at run-start (both default and `--current-branch`
+/// modes) so [`find_resumable_plans_for_branch`] can resolve `ralph resume`
+/// (no slug) by current git branch without false-matching against a plan
+/// whose `branch_name` happens to equal that branch but whose actual last
+/// run executed elsewhere (e.g. a `--current-branch` run on `master`).
+///
+/// The same UPDATE also stamps `last_run_started_at` so the resume
+/// resolver's `ORDER BY` can sort by "when did this plan last actually run"
+/// rather than `updated_at` (which is bumped by unrelated edits like
+/// toggling `questions_enabled` or `pause_requested`).
+pub fn set_plan_last_run_branch(conn: &Connection, plan_id: &str, branch: &str) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET last_run_branch = ?1, \
+                          last_run_started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+                          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ?2",
+        params![branch, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// Find plans in this project that are resumable on `branch`.
+///
+/// "Resumable" = status in {in_progress, failed, aborted, ready}. A plan
+/// matches when its `last_run_branch == branch` (its most recent run
+/// physically executed on this branch) OR — only if `last_run_branch IS
+/// NULL` — its `branch_name == branch` (covers plans created but never
+/// run yet). The NULL fallback explicitly does NOT apply when
+/// `last_run_branch` is set, which is what defends against false-matching
+/// a paused plan whose slug a user later reused as a feature-branch name.
+///
+/// Ordered by `last_run_started_at DESC` (NULLS LAST) — the runner's
+/// authoritative "when did this plan last actually start" stamp — falling
+/// back to `updated_at DESC` for plans that have never run, then
+/// `created_at DESC` defensively. Sorting on `last_run_started_at` rather
+/// than `updated_at` defends against unrelated edits (e.g. `Q`/`P` flag
+/// toggles, hook attachments) bumping `updated_at` and reordering recent
+/// resumable plans.
+pub fn find_resumable_plans_for_branch(
+    conn: &Connection,
+    project: &str,
+    branch: &str,
+) -> Result<Vec<Plan>> {
+    let query = format!(
+        "SELECT {PLAN_COLUMNS} FROM plans \
+         WHERE project = ?1 \
+           AND status IN (?2, ?3, ?4, ?5) \
+           AND (last_run_branch = ?6 \
+                OR (last_run_branch IS NULL AND branch_name = ?6)) \
+         ORDER BY (last_run_started_at IS NULL), last_run_started_at DESC, \
+                  updated_at DESC, created_at DESC"
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let rows = stmt.query_map(
+        params![
+            project,
+            PlanStatus::InProgress.as_str(),
+            PlanStatus::Failed.as_str(),
+            PlanStatus::Aborted.as_str(),
+            PlanStatus::Ready.as_str(),
+            branch,
+        ],
+        Plan::from_row,
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Find the most recent resumable plan in this project, ignoring branch.
+///
+/// Resumable status set matches [`find_resumable_plans_for_branch`]
+/// ({in_progress, failed, aborted, ready}). Used by `ralph resume` (no
+/// slug) as the fallback when the branch-based resolver finds no
+/// candidates — e.g. running outside a git workdir, on a detached HEAD,
+/// or on a branch that no plan has ever executed on. Ordered the same way
+/// as [`find_resumable_plans_for_branch`] so the two resolvers agree on
+/// "most recent" semantics.
+///
+/// Distinct from [`find_active_plan`] specifically because that helper
+/// excludes `Aborted` — its callers (status / hint surfaces) treat
+/// "active" more strictly than "resumable".
+pub fn find_resumable_plan(conn: &Connection, project: &str) -> Result<Option<Plan>> {
+    let query = format!(
+        "SELECT {PLAN_COLUMNS} FROM plans \
+         WHERE project = ?1 \
+           AND status IN (?2, ?3, ?4, ?5) \
+         ORDER BY (last_run_started_at IS NULL), last_run_started_at DESC, \
+                  updated_at DESC, created_at DESC \
+         LIMIT 1"
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let mut rows = stmt.query_map(
+        params![
+            project,
+            PlanStatus::InProgress.as_str(),
+            PlanStatus::Failed.as_str(),
+            PlanStatus::Aborted.as_str(),
+            PlanStatus::Ready.as_str(),
+        ],
+        Plan::from_row,
+    )?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+/// Set the `plans.pause_requested` flag and bump `updated_at`.
+///
+/// Drives the `P` keybinding in the TUI plan-detail view and the
+/// `ralph pause` CLI. The runner reads this between step boundaries (see
+/// [`get_plan_pause_requested`]) and exits with
+/// `TerminationReason::PausedByUser` when set, clearing the flag in the
+/// same transaction. SQLite has no native bool, so the value is stored as
+/// INTEGER 0/1.
+pub fn set_plan_pause_requested(conn: &Connection, plan_id: &str, requested: bool) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET pause_requested = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![requested as i64, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// Read the `plans.pause_requested` flag for a plan.
+pub fn get_plan_pause_requested(conn: &Connection, plan_id: &str) -> Result<bool> {
+    let value: i64 = match conn.query_row(
+        "SELECT pause_requested FROM plans WHERE id = ?1",
+        params![plan_id],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            anyhow::bail!("Plan not found: {plan_id}");
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok(value != 0)
+}
+
+/// Atomically read `plans.pause_requested` and, if set, clear it in the
+/// same transaction. Returns `true` when the flag was set on entry (and
+/// has now been cleared), `false` otherwise. Used by the runner at step
+/// boundaries so a subsequent `ralph resume` doesn't immediately re-pause.
+pub fn take_plan_pause_requested(conn: &Connection, plan_id: &str) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let value: i64 = match tx.query_row(
+        "SELECT pause_requested FROM plans WHERE id = ?1",
+        params![plan_id],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            anyhow::bail!("Plan not found: {plan_id}");
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let was_set = value != 0;
+    if was_set {
+        tx.execute(
+            "UPDATE plans SET pause_requested = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![plan_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(was_set)
 }
 
 /// One open (unanswered) `step_questions` row enriched with the plan + step
@@ -2209,6 +2388,295 @@ mod tests {
         set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
         let off = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
         assert!(!off.questions_enabled);
+    }
+
+    #[test]
+    fn test_set_plan_pause_requested_round_trips() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        assert!(!plan.pause_requested, "default should be false");
+        assert!(!get_plan_pause_requested(&conn, &plan.id).unwrap());
+
+        set_plan_pause_requested(&conn, &plan.id, true).unwrap();
+        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert!(on.pause_requested);
+        assert!(get_plan_pause_requested(&conn, &plan.id).unwrap());
+        assert!(on.updated_at >= plan.updated_at);
+
+        set_plan_pause_requested(&conn, &plan.id, false).unwrap();
+        let off = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert!(!off.pause_requested);
+        assert!(!get_plan_pause_requested(&conn, &plan.id).unwrap());
+    }
+
+    #[test]
+    fn test_take_plan_pause_requested_clears_flag_atomically() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+
+        // Unset → take returns false, flag stays cleared.
+        assert!(!take_plan_pause_requested(&conn, &plan.id).unwrap());
+        assert!(!get_plan_pause_requested(&conn, &plan.id).unwrap());
+
+        // Set, then take → returns true and clears the flag in one shot so
+        // the runner's between-step check is one-shot per request.
+        set_plan_pause_requested(&conn, &plan.id, true).unwrap();
+        assert!(take_plan_pause_requested(&conn, &plan.id).unwrap());
+        assert!(
+            !get_plan_pause_requested(&conn, &plan.id).unwrap(),
+            "take must clear the flag",
+        );
+        // Subsequent take returns false (idempotent on a cleared flag).
+        assert!(!take_plan_pause_requested(&conn, &plan.id).unwrap());
+    }
+
+    #[test]
+    fn test_set_plan_pause_requested_missing_plan_errs() {
+        let conn = setup();
+        let err = set_plan_pause_requested(&conn, "no-such-id", true).unwrap_err();
+        assert!(err.to_string().contains("Plan not found"));
+    }
+
+    #[test]
+    fn test_set_plan_last_run_branch_round_trips() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        assert!(plan.last_run_branch.is_none());
+
+        set_plan_last_run_branch(&conn, &plan.id, "feature/x").unwrap();
+        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert_eq!(on.last_run_branch.as_deref(), Some("feature/x"));
+        assert!(on.updated_at >= plan.updated_at);
+
+        // Subsequent writes overwrite (records the most recent run's branch).
+        set_plan_last_run_branch(&conn, &plan.id, "master").unwrap();
+        let updated = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert_eq!(updated.last_run_branch.as_deref(), Some("master"));
+    }
+
+    #[test]
+    fn test_set_plan_last_run_branch_missing_plan_errs() {
+        let conn = setup();
+        let err = set_plan_last_run_branch(&conn, "no-such-id", "master").unwrap_err();
+        assert!(err.to_string().contains("Plan not found"));
+    }
+
+    #[test]
+    fn test_find_resumable_plans_for_branch_orders_by_last_run_started_at_desc() {
+        let conn = setup();
+        // Three resumable plans on master; stamp last_run_started_at via
+        // set_plan_last_run_branch in p1 → p2 → p3 order so DESC reflects
+        // insertion order.
+        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &p1.id, PlanStatus::Failed).unwrap();
+        update_plan_status(&conn, &p2.id, PlanStatus::InProgress).unwrap();
+        update_plan_status(&conn, &p3.id, PlanStatus::Aborted).unwrap();
+        // Set last_run_branch in p1 → p2 → p3 order. SQLite's strftime
+        // truncates to milliseconds, so add a small sleep between writes
+        // to guarantee the timestamps differ.
+        set_plan_last_run_branch(&conn, &p1.id, "master").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        set_plan_last_run_branch(&conn, &p2.id, "master").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        set_plan_last_run_branch(&conn, &p3.id, "master").unwrap();
+
+        let candidates = find_resumable_plans_for_branch(&conn, "/proj", "master").unwrap();
+        let slugs: Vec<&str> = candidates.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["p3", "p2", "p1"], "DESC by last_run_started_at");
+    }
+
+    /// Regression for finding 3: an unrelated edit that bumps
+    /// `updated_at` (e.g. toggling a flag) on an older plan must NOT
+    /// re-rank it above a more recently *run* plan. The order is
+    /// anchored on `last_run_started_at`, which only the runner writes.
+    #[test]
+    fn test_find_resumable_plans_orders_by_run_time_not_updated_at() {
+        let conn = setup();
+        let stale = create_plan(&conn, "stale", "/proj", "b", "d", None, None, &[]).unwrap();
+        let fresh = create_plan(&conn, "fresh", "/proj", "b", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &stale.id, PlanStatus::Failed).unwrap();
+        update_plan_status(&conn, &fresh.id, PlanStatus::Failed).unwrap();
+
+        // Real run order: stale ran first, fresh ran second.
+        set_plan_last_run_branch(&conn, &stale.id, "master").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        set_plan_last_run_branch(&conn, &fresh.id, "master").unwrap();
+
+        // Now bump `stale.updated_at` via an unrelated flag toggle. Under
+        // the OLD `ORDER BY updated_at DESC`, this would put `stale`
+        // first; under the new ordering anchored on
+        // `last_run_started_at`, `fresh` still wins.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        set_plan_questions_enabled(&conn, &stale.id, true).unwrap();
+
+        let candidates = find_resumable_plans_for_branch(&conn, "/proj", "master").unwrap();
+        let slugs: Vec<&str> = candidates.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            vec!["fresh", "stale"],
+            "ordering must follow last_run_started_at, not updated_at"
+        );
+    }
+
+    #[test]
+    fn test_set_plan_last_run_branch_stamps_last_run_started_at() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/proj", "b", "d", None, None, &[]).unwrap();
+        assert!(plan.last_run_started_at.is_none());
+
+        set_plan_last_run_branch(&conn, &plan.id, "master").unwrap();
+        let after = get_plan_by_slug(&conn, "s", "/proj").unwrap().unwrap();
+        assert!(
+            after.last_run_started_at.is_some(),
+            "set_plan_last_run_branch must also stamp last_run_started_at"
+        );
+    }
+
+    #[test]
+    fn test_find_resumable_plan_returns_aborted_in_any_branch_context() {
+        let conn = setup();
+        // No matching branch row, but Aborted plan must still come back.
+        let plan = create_plan(&conn, "ab", "/proj", "any", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &plan.id, PlanStatus::Aborted).unwrap();
+
+        let p = find_resumable_plan(&conn, "/proj").unwrap();
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().slug, "ab");
+    }
+
+    #[test]
+    fn test_find_resumable_plan_excludes_complete_and_planning() {
+        let conn = setup();
+        // Planning (default), complete, archived must not be returned.
+        let _planning = create_plan(&conn, "pl", "/proj", "b", "d", None, None, &[]).unwrap();
+        let cp = create_plan(&conn, "cp", "/proj", "b", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &cp.id, PlanStatus::Complete).unwrap();
+        let ar = create_plan(&conn, "ar", "/proj", "b", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &ar.id, PlanStatus::Archived).unwrap();
+
+        let p = find_resumable_plan(&conn, "/proj").unwrap();
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn test_find_resumable_plan_orders_by_run_time_not_updated_at() {
+        let conn = setup();
+        let stale = create_plan(&conn, "stale", "/proj", "b", "d", None, None, &[]).unwrap();
+        let fresh = create_plan(&conn, "fresh", "/proj", "b", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &stale.id, PlanStatus::Failed).unwrap();
+        update_plan_status(&conn, &fresh.id, PlanStatus::Aborted).unwrap();
+
+        set_plan_last_run_branch(&conn, &stale.id, "main").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        set_plan_last_run_branch(&conn, &fresh.id, "main").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Bumping unrelated flag on the older plan must not change ranking.
+        set_plan_questions_enabled(&conn, &stale.id, true).unwrap();
+
+        let p = find_resumable_plan(&conn, "/proj").unwrap().unwrap();
+        assert_eq!(p.slug, "fresh");
+    }
+
+    #[test]
+    fn test_find_resumable_plans_for_branch_excludes_completed_and_planning() {
+        let conn = setup();
+        let resumable_statuses = [
+            PlanStatus::InProgress,
+            PlanStatus::Failed,
+            PlanStatus::Aborted,
+            PlanStatus::Ready,
+        ];
+        for (i, status) in resumable_statuses.iter().enumerate() {
+            let slug = format!("rp{i}");
+            let plan = create_plan(&conn, &slug, "/proj", "main", "d", None, None, &[]).unwrap();
+            update_plan_status(&conn, &plan.id, *status).unwrap();
+            set_plan_last_run_branch(&conn, &plan.id, "main").unwrap();
+        }
+        // Non-resumable: planning (default), complete, archived.
+        let _planning = create_plan(&conn, "pl", "/proj", "main", "d", None, None, &[]).unwrap();
+        let cp = create_plan(&conn, "cp", "/proj", "main", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &cp.id, PlanStatus::Complete).unwrap();
+        set_plan_last_run_branch(&conn, &cp.id, "main").unwrap();
+        let ar = create_plan(&conn, "ar", "/proj", "main", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &ar.id, PlanStatus::Archived).unwrap();
+        set_plan_last_run_branch(&conn, &ar.id, "main").unwrap();
+
+        let candidates = find_resumable_plans_for_branch(&conn, "/proj", "main").unwrap();
+        let slugs: std::collections::HashSet<&str> =
+            candidates.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(
+            slugs,
+            ["rp0", "rp1", "rp2", "rp3"].iter().copied().collect(),
+            "only InProgress/Failed/Aborted/Ready should match"
+        );
+    }
+
+    #[test]
+    fn test_find_resumable_plans_for_branch_scopes_to_project() {
+        let conn = setup();
+        let here = create_plan(&conn, "here", "/proj", "main", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &here.id, PlanStatus::Failed).unwrap();
+        set_plan_last_run_branch(&conn, &here.id, "main").unwrap();
+        let elsewhere =
+            create_plan(&conn, "elsewhere", "/other", "main", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &elsewhere.id, PlanStatus::Failed).unwrap();
+        set_plan_last_run_branch(&conn, &elsewhere.id, "main").unwrap();
+
+        let candidates = find_resumable_plans_for_branch(&conn, "/proj", "main").unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].slug, "here");
+    }
+
+    #[test]
+    fn test_find_resumable_plans_never_run_uses_branch_name_fallback() {
+        // A plan that has never run (last_run_branch IS NULL) should still
+        // match when current_branch == branch_name.
+        let conn = setup();
+        let plan = create_plan(&conn, "fresh", "/proj", "feat-x", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+        assert!(plan.last_run_branch.is_none());
+
+        let on_match = find_resumable_plans_for_branch(&conn, "/proj", "feat-x").unwrap();
+        assert_eq!(on_match.len(), 1);
+        assert_eq!(on_match[0].slug, "fresh");
+
+        // ...but NOT when the current branch differs from branch_name.
+        let on_other = find_resumable_plans_for_branch(&conn, "/proj", "feat-y").unwrap();
+        assert!(on_other.is_empty());
+    }
+
+    #[test]
+    fn test_find_resumable_plans_no_false_match_when_last_run_branch_set() {
+        // Slug-collision hard test from the step description.
+        // Plan A: slug='deploy', branch_name='deploy'. Last run was on
+        // 'master' (--current-branch mode), captured in last_run_branch.
+        // After the user creates a new branch 'deploy', `ralph resume` on
+        // that branch must NOT match A — A's last_run_branch='master' is
+        // set, so the NULL+branch_name fallback is skipped.
+        let conn = setup();
+        let a = create_plan(&conn, "deploy", "/proj", "deploy", "d", None, None, &[]).unwrap();
+        update_plan_status(&conn, &a.id, PlanStatus::Failed).unwrap();
+        set_plan_last_run_branch(&conn, &a.id, "master").unwrap();
+
+        // Sanity: A.branch_name == 'deploy' but last_run_branch == 'master'.
+        let reread = get_plan_by_slug(&conn, "deploy", "/proj").unwrap().unwrap();
+        assert_eq!(reread.branch_name, "deploy");
+        assert_eq!(reread.last_run_branch.as_deref(), Some("master"));
+
+        // On 'deploy': must NOT match A (the false-match the V19 column
+        // exists to prevent).
+        let on_deploy = find_resumable_plans_for_branch(&conn, "/proj", "deploy").unwrap();
+        assert!(
+            on_deploy.is_empty(),
+            "must NOT match plan whose last_run_branch differs from current branch even if branch_name collides"
+        );
+
+        // On 'master': matches A (the actual run home).
+        let on_master = find_resumable_plans_for_branch(&conn, "/proj", "master").unwrap();
+        let slugs: Vec<&str> = on_master.iter().map(|p| p.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["deploy"]);
     }
 
     #[test]

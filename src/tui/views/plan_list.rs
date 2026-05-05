@@ -6,25 +6,29 @@
 // state + rendering surface for the read-only plan list; multi-select,
 // archive, and create-plan flows land in later steps of the tui-v1 plan.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use crossterm::event::MouseEvent;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, ListState, Paragraph, Widget};
 
-use crate::plan::{Plan, PlanStatus};
+use crate::plan::{Plan, PlanStatus, Step};
 use crate::tui::chrome::{self, Chrome};
 use crate::tui::help::{self, HelpState};
 use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::selection::Selection;
 use crate::tui::theme;
 use crate::tui::toast::ToastQueue;
+use crate::tui::widgets::palette_bar::{self, PaletteBarState};
+use crate::tui::widgets::step_list;
 
 /// Height of a single plan tile (including its top + bottom border rows).
 /// Matches the layout sketch in TUI-plan.md §5.
@@ -121,6 +125,45 @@ pub struct PlanListApp {
     /// dispatcher routes input through [`HelpState::intercept_key`] before
     /// touching any view bindings (TUI-plan.md §15).
     pub help: HelpState,
+    /// Per-plan cache of step lists for the right-pane preview
+    /// (TUI-plan.md §5). Populated lazily by the dispatcher when the
+    /// cursor moves to a plan whose steps haven't been fetched yet, and
+    /// cleared by [`Self::refresh_tiles`] so a refresh re-loads counts.
+    pub step_preview_cache: HashMap<String, Vec<Step>>,
+    /// Always-empty selection passed to `step_list::render` for the
+    /// read-only preview pane — the widget API requires one even though the
+    /// preview never participates in multi-select.
+    pub preview_selection: Selection<String>,
+    /// Persistent `ListState` for the right preview pane so its scroll
+    /// offset survives across frames. Reset to default whenever the
+    /// highlighted plan changes (see [`Self::preview_keyed_plan`]).
+    pub preview_list_state: ListState,
+    /// The plan_id whose steps the preview pane is currently keyed to.
+    /// `draw` compares this to the cursor target each frame and resets
+    /// `preview_list_state` when they differ, so a freshly-shown plan
+    /// always starts at the top of its step list.
+    pub preview_keyed_plan: Option<String>,
+    /// Slash/colon command palette state (TUI-plan.md §9). `Some` while the
+    /// bar is open; the dispatcher routes every key through
+    /// [`PaletteBarState::on_key`] before any view bindings fire. `/` and
+    /// `:` open it.
+    pub palette_bar: Option<PaletteBarState>,
+
+    /// Horizontal split between the tile column (left) and the step-list
+    /// preview pane (right) as a percent of the body width given to the
+    /// left pane. Default 40, clamped to 20..=80 by the mouse-drag handler
+    /// so neither pane can collapse. Session-only — never persisted.
+    pub split_pct: u16,
+
+    /// Body width recorded during the most recent `draw()`. Used by
+    /// [`Self::handle_mouse`] to convert the cursor's absolute column into
+    /// a percent of the body's horizontal extent. Zero before the first
+    /// frame; mouse handling no-ops while it's zero.
+    pub last_body_width: u16,
+
+    /// True while a left-mouse drag started on the divider column is
+    /// active. Cleared on `MouseEventKind::Up(Left)`.
+    pub dragging_split: bool,
 }
 
 impl PlanListApp {
@@ -145,6 +188,63 @@ impl PlanListApp {
             toasts: ToastQueue::new(),
             read_only: ReadOnly::Editable,
             help: HelpState::new(),
+            step_preview_cache: HashMap::new(),
+            preview_selection: Selection::new(),
+            preview_list_state: ListState::default(),
+            preview_keyed_plan: None,
+            palette_bar: None,
+            split_pct: 40,
+            last_body_width: 0,
+            dragging_split: false,
+        }
+    }
+
+    /// Open the palette with `prefix` as the trigger key (`/` or `:`). Resets
+    /// any in-flight buffer. TUI-plan.md §9.
+    pub fn open_palette(&mut self, prefix: char) {
+        self.palette_bar = Some(PaletteBarState::new(prefix));
+    }
+
+    /// Close the palette without dispatching. TUI-plan.md §9.
+    pub fn close_palette(&mut self) {
+        self.palette_bar = None;
+    }
+
+    /// Whether the palette bar is currently open and consuming keys.
+    pub fn palette_active(&self) -> bool {
+        self.palette_bar.is_some()
+    }
+
+    /// Mouse-event entry point routed from the dispatcher's event loop.
+    /// Implements draggable resize of the horizontal split between the tile
+    /// column and the step-list preview pane: a left-button press within ±1
+    /// column of the current divider arms a drag, subsequent drags recompute
+    /// `split_pct` from `cursor_column / last_body_width` (clamped 20..=80),
+    /// and release clears the drag flag.
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        if self.last_body_width == 0 {
+            return;
+        }
+        let body_width = self.last_body_width as u32;
+        let divider_col = (body_width * self.split_pct as u32 / 100) as i32;
+
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let col = event.column as i32;
+                if (col - divider_col).abs() <= 1 {
+                    self.dragging_split = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_split => {
+                let pct = (event.column as u32 * 100) / body_width.max(1);
+                self.split_pct = pct.clamp(20, 80) as u16;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.dragging_split = false;
+            }
+            _ => {}
         }
     }
 
@@ -329,6 +429,12 @@ impl PlanListApp {
         self.tiles = tiles;
         self.archived_count = archived_count;
         self.selection.clear();
+        // Drop the preview cache: step counts may have changed underneath,
+        // and the keyed-plan check would otherwise keep stale step rows on
+        // screen even after the underlying tile re-rendered fresh totals.
+        self.step_preview_cache.clear();
+        self.preview_keyed_plan = None;
+        self.preview_list_state = ListState::default();
         let nav = self.navigable_count();
         if nav == 0 {
             self.selected_index = 0;
@@ -336,6 +442,30 @@ impl PlanListApp {
         } else if self.selected_index >= nav {
             self.selected_index = nav - 1;
         }
+    }
+
+    // -- Preview cache (right pane, TUI-plan.md §5) -----------------------
+
+    /// `plan_id` currently under the cursor, or `None` when the cursor is
+    /// on the archived sentinel or the tile list is empty. Used by the
+    /// dispatcher to decide which plan's steps to fetch for the preview.
+    pub fn highlighted_plan_id(&self) -> Option<&str> {
+        if self.is_archived_cursor() {
+            return None;
+        }
+        self.tiles
+            .get(self.selected_index)
+            .map(|t| t.plan.id.as_str())
+    }
+
+    /// Insert (or overwrite) the cached step list for `plan_id`.
+    pub fn cache_preview_steps(&mut self, plan_id: String, steps: Vec<Step>) {
+        self.step_preview_cache.insert(plan_id, steps);
+    }
+
+    /// Whether the preview cache already has steps for `plan_id`.
+    pub fn preview_cache_contains(&self, plan_id: &str) -> bool {
+        self.step_preview_cache.contains_key(plan_id)
     }
 }
 
@@ -402,7 +532,13 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
     app.toasts.prune(Instant::now());
 
     let crumbs: [&str; 1] = ["ralph"];
-    let hint = "[j/k] nav  [enter] open  [space] select  [i] new  [A] approve  [Q] questions  [d] archive  [q] quit";
+    let normal_hint = "[j/k] nav  [enter] open  [space] select  [i] new  [A] approve  [Q] questions  [d] archive  [/:] cmd  [q] quit";
+    let palette_hint = "[tab] complete  [enter] submit  [esc] cancel";
+    let hint = if app.palette_active() {
+        palette_hint
+    } else {
+        normal_hint
+    };
     let banner = read_only::banner(app.read_only);
     let body = chrome::render(
         frame,
@@ -411,10 +547,32 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
             hint,
             cwd: Path::new(&app.project),
             banner: banner.as_deref(),
+            running_indicator: None,
         },
     );
-    update_scroll(app, body.height);
-    render_tiles(frame.buffer_mut(), body, app);
+
+    // §5: split the body horizontally — `app.split_pct` percent for the
+    // tile column on the left, the remainder for the step-list preview of
+    // the highlighted plan on the right. The preview is read-only and
+    // drawn via the shared `step_list` widget so its rows stay
+    // pixel-identical to plan-detail. `split_pct` defaults to 40 and is
+    // moved by mouse drag on the divider; `last_body_width` is captured
+    // here so `handle_mouse` can convert cursor column → percent.
+    app.last_body_width = body.width;
+    let split_pct = app.split_pct;
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(split_pct),
+            Constraint::Percentage(100 - split_pct),
+        ])
+        .split(body);
+    let left = panes[0];
+    let right = panes[1];
+
+    update_scroll(app, left.height);
+    render_tiles(frame.buffer_mut(), left, app);
+    render_step_preview(frame, right, app);
 
     // Toast slot lives over the bottom chrome row — overwrites the hint while
     // a toast is current, leaves cwd/version on the right alone.
@@ -430,6 +588,61 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
         let area = frame.area();
         help::render(frame, area, &help::for_plan_list());
     }
+
+    // Palette bar overlays the bottom chrome row when active. Drawn after
+    // the help overlay so a visible palette is the topmost layer when
+    // both happen to be open (the dispatcher prevents this in practice
+    // by routing keys to the palette first, but the layering here is
+    // defensive). TUI-plan.md §9.
+    if let Some(state) = app.palette_bar.as_ref() {
+        let area = frame.area();
+        let strip_height = 4.min(area.height);
+        if strip_height > 0 {
+            let palette_area = Rect {
+                x: area.x,
+                y: area.y + area.height - strip_height,
+                width: area.width,
+                height: strip_height,
+            };
+            palette_bar::render(frame, palette_area, state);
+        }
+    }
+}
+
+/// Render the right-pane step-list preview of the highlighted plan.
+///
+/// Blank when the cursor is on the archived sentinel or the tile list is
+/// empty (TUI-plan.md §5). Re-keys [`PlanListApp::preview_list_state`] on
+/// cursor moves so the new pane starts at the top instead of carrying the
+/// previous plan's scroll offset.
+fn render_step_preview(frame: &mut Frame, area: Rect, app: &mut PlanListApp) {
+    if app.is_archived_cursor() {
+        return;
+    }
+    let Some(tile) = app.tiles.get(app.selected_index) else {
+        return;
+    };
+    let plan_id = tile.plan.id.clone();
+    let plan_slug = tile.plan.slug.clone();
+
+    if app.preview_keyed_plan.as_deref() != Some(plan_id.as_str()) {
+        app.preview_list_state = ListState::default();
+        app.preview_keyed_plan = Some(plan_id.clone());
+    }
+
+    let Some(steps) = app.step_preview_cache.get(&plan_id) else {
+        return;
+    };
+    step_list::render(
+        frame,
+        area,
+        steps,
+        &app.preview_selection,
+        None,
+        false,
+        plan_slug.as_str(),
+        &mut app.preview_list_state,
+    );
 }
 
 fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatui::style::Color) {
@@ -610,13 +823,36 @@ pub(crate) fn render_tile(
         .as_deref()
         .map(|s| s.chars().count())
         .unwrap_or(0);
-    let title_max = (inner.width as usize).saturating_sub(badge_cols);
+    // §5: when `questions_enabled` is on, reserve 2 cols at the left of the
+    // title row for a `?` glyph + space separator (top-left corner badge).
+    let q_cols: usize = if tile.plan.questions_enabled { 2 } else { 0 };
+    let title_max = (inner.width as usize).saturating_sub(badge_cols + q_cols);
     let title = Paragraph::new(Line::from(Span::styled(
         truncate(tile.plan.slug.as_str(), title_max),
         title_style,
     )));
-    let title_area = Rect { height: 1, ..inner };
+    let title_area = Rect {
+        x: inner.x.saturating_add(q_cols as u16),
+        y: inner.y,
+        width: inner.width.saturating_sub(q_cols as u16),
+        height: 1,
+    };
     title.render(title_area, buf);
+    if tile.plan.questions_enabled && inner.width > 0 {
+        let q_para = Paragraph::new(Span::styled(
+            "?",
+            Style::default()
+                .fg(theme::STATUS_QUESTION)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let q_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: 1,
+            height: 1,
+        };
+        q_para.render(q_area, buf);
+    }
     if let Some(text) = badge_text
         && (inner.width as usize) >= badge_cols
     {
@@ -739,6 +975,9 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
         }
     }
 
@@ -1118,6 +1357,60 @@ mod tests {
         render_tiles(&mut buf, area, &app);
         let row1 = (0..30).map(|x| buf[(x, 1)].symbol()).collect::<String>();
         assert!(row1.contains("[1]"), "expected [1] badge: {row1:?}");
+    }
+
+    // -- `?` corner badge for questions_enabled (TUI-plan.md §5) -----------
+
+    #[test]
+    fn render_tile_with_questions_enabled_renders_corner_question_glyph() {
+        // §5: when `questions_enabled` is true, the tile shows a `?` glyph
+        // in the top-LEFT corner of the title row (inner.x, inner.y).
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
+        let area = buf.area;
+        let mut tile = make_tile("plan");
+        tile.plan.questions_enabled = true;
+        render_tile(&mut buf, area, &tile, false, None, "UTC");
+        // Title row is row 1 (inner.y = 1 with single-cell border).
+        // First inner column (x=1) should hold the `?`.
+        assert_eq!(buf[(1, 1)].symbol(), "?");
+        assert_eq!(buf[(1, 1)].style().fg, Some(theme::STATUS_QUESTION));
+    }
+
+    #[test]
+    fn render_tile_without_questions_enabled_omits_corner_question_glyph() {
+        // questions_enabled = false → no `?` in the top-left, and the title
+        // starts flush at inner.x as before.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
+        let area = buf.area;
+        let tile = make_tile("plan");
+        assert!(!tile.plan.questions_enabled);
+        render_tile(&mut buf, area, &tile, false, None, "UTC");
+        // No `?` at the top-left inner cell.
+        assert_ne!(buf[(1, 1)].symbol(), "?");
+        // Title still anchored at inner.x — first slug char "p" sits at x=1.
+        assert_eq!(buf[(1, 1)].symbol(), "p");
+    }
+
+    #[test]
+    fn render_tile_selected_with_questions_enabled_renders_both_badges() {
+        // §5: a selected, questions-enabled tile shows BOTH the `?` glyph
+        // (top-left) and the `[N]` selection-order badge (top-right). The
+        // two badges live on opposite sides of the title row and don't
+        // collide.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
+        let area = buf.area;
+        let mut tile = make_tile("plan");
+        tile.plan.questions_enabled = true;
+        render_tile(&mut buf, area, &tile, false, Some(2), "UTC");
+        // Top-left: `?` glyph.
+        assert_eq!(buf[(1, 1)].symbol(), "?");
+        assert_eq!(buf[(1, 1)].style().fg, Some(theme::STATUS_QUESTION));
+        // Top-right: `[2]` badge somewhere on the title row.
+        let row1 = (0..30).map(|x| buf[(x, 1)].symbol()).collect::<String>();
+        assert!(row1.contains("[2]"), "expected [2] badge: {row1:?}");
+        // Title slug shifts right by 2 cols to leave room for `?` + space.
+        // First slug char "p" now sits at x = inner.x + 2 = 3.
+        assert_eq!(buf[(3, 1)].symbol(), "p");
     }
 
     // -- Cursor target ------------------------------------------------------
@@ -1553,5 +1846,467 @@ mod tests {
         let r = app.help.intercept_key(esc);
         assert_eq!(r, crate::tui::help::InterceptResult::Closed);
         assert!(!app.help.is_visible());
+    }
+
+    // -- Two-pane layout (TUI-plan.md §5) -----------------------------------
+
+    fn make_step(plan_id: &str, idx: usize, title: &str) -> Step {
+        use crate::plan::{ChangePolicy, StepStatus};
+        Step {
+            id: format!("{plan_id}-step-{idx}"),
+            plan_id: plan_id.to_string(),
+            sort_key: format!("a{idx}"),
+            title: title.to_string(),
+            description: String::new(),
+            agent: None,
+            harness: None,
+            acceptance_criteria: vec![],
+            status: StepStatus::Pending,
+            attempts: 0,
+            max_retries: Some(3),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            model: None,
+            skipped_reason: None,
+            change_policy: ChangePolicy::Required,
+            tags: vec![],
+        }
+    }
+
+    /// Render a slice of `area` rows as a single newline-joined string for
+    /// substring-based assertions. Used by the two-pane preview tests below
+    /// so they can be expressive about what region they're inspecting.
+    fn region_text(buffer: &ratatui::buffer::Buffer, x: u16, y: u16, w: u16, h: u16) -> String {
+        let mut out = String::new();
+        for row in y..(y + h) {
+            for col in x..(x + w) {
+                out.push_str(buffer[(col, row)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn draw_splits_body_into_left_and_right_panes() {
+        // The body should be split 40/60 horizontally — both halves carry
+        // visible chrome (left tiles, right step-list block) and neither is
+        // empty when there's a highlighted plan with cached steps.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.cache_preview_steps(
+            "id-plan-0".to_string(),
+            vec![make_step("id-plan-0", 0, "alpha-task")],
+        );
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // Left pane is 40% of 80 = 32 cols; the tile border `┌` sits at
+        // column 0 of the body row (y=1 because chrome reserves y=0).
+        assert_eq!(buffer[(0, 1)].symbol(), "┌", "left tile border missing");
+
+        // Right pane is the remaining 48 cols starting at x=32. The step
+        // list widget renders its own bordered block, so the top-left
+        // corner of that block sits at (32, 1).
+        assert_eq!(
+            buffer[(32, 1)].symbol(),
+            "┌",
+            "right pane border missing at split boundary"
+        );
+    }
+
+    #[test]
+    fn draw_right_pane_renders_highlighted_plans_steps() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
+        app.cache_preview_steps(
+            "id-plan-0".to_string(),
+            vec![
+                make_step("id-plan-0", 0, "alpha-task"),
+                make_step("id-plan-0", 1, "beta-task"),
+            ],
+        );
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // Right pane occupies cols 32..80, body rows 1..13.
+        let right = region_text(&buffer, 32, 1, 48, 12);
+        assert!(
+            right.contains("alpha-task"),
+            "expected alpha-task in right pane:\n{right}"
+        );
+        assert!(
+            right.contains("beta-task"),
+            "expected beta-task in right pane:\n{right}"
+        );
+        // Title of the bordered block is the plan slug.
+        assert!(
+            right.contains("plan-0"),
+            "expected plan-0 title in right pane:\n{right}"
+        );
+    }
+
+    #[test]
+    fn draw_right_pane_blank_for_archived_tile_cursor() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC").with_archived_count(2);
+        // Even with steps cached for the regular plan, parking the cursor
+        // on the archived sentinel must leave the right pane blank.
+        app.cache_preview_steps(
+            "id-plan-0".to_string(),
+            vec![make_step("id-plan-0", 0, "alpha-task")],
+        );
+        app.selected_index = 1;
+        assert!(app.is_archived_cursor());
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let right = region_text(&buffer, 32, 1, 48, 12);
+        // No bordered block, no step titles, no plan slug — the right
+        // pane should be entirely whitespace.
+        assert!(
+            right.chars().all(|c| c == ' ' || c == '\n'),
+            "expected blank right pane when cursor is on archived sentinel:\n{right}"
+        );
+    }
+
+    #[test]
+    fn draw_right_pane_blank_when_no_plans() {
+        // No tiles → no preview either. The "No plans" placeholder still
+        // renders on the left, but the right pane stays empty.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(vec![], "/proj", "UTC");
+
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        let right = region_text(&buffer, 32, 1, 48, 12);
+        assert!(
+            right.chars().all(|c| c == ' ' || c == '\n'),
+            "expected blank right pane when there are no plans:\n{right}"
+        );
+    }
+
+    #[test]
+    fn draw_re_keys_right_pane_when_cursor_moves_to_a_different_plan() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
+        app.cache_preview_steps(
+            "id-plan-0".to_string(),
+            vec![make_step("id-plan-0", 0, "alpha-task")],
+        );
+        app.cache_preview_steps(
+            "id-plan-1".to_string(),
+            vec![make_step("id-plan-1", 0, "zeta-task")],
+        );
+
+        // First draw: cursor on plan-0 — right pane shows alpha-task and
+        // the keyed plan tracks plan-0.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let right = region_text(&buffer, 32, 1, 48, 12);
+        assert!(
+            right.contains("alpha-task"),
+            "expected alpha-task before nav:\n{right}"
+        );
+        assert!(
+            !right.contains("zeta-task"),
+            "zeta-task should not appear before nav:\n{right}"
+        );
+        assert_eq!(
+            app.preview_keyed_plan.as_deref(),
+            Some("id-plan-0"),
+            "preview_keyed_plan should track plan-0 after first draw"
+        );
+
+        // Move cursor to plan-1 and re-draw.
+        app.navigate_down();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let right = region_text(&buffer, 32, 1, 48, 12);
+        assert!(
+            right.contains("zeta-task"),
+            "expected zeta-task after nav:\n{right}"
+        );
+        assert!(
+            !right.contains("alpha-task"),
+            "alpha-task should be gone after nav:\n{right}"
+        );
+        assert_eq!(
+            app.preview_keyed_plan.as_deref(),
+            Some("id-plan-1"),
+            "preview_keyed_plan should re-key to plan-1 after navigation"
+        );
+    }
+
+    #[test]
+    fn refresh_tiles_clears_preview_cache_and_keying() {
+        let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC");
+        app.cache_preview_steps(
+            "id-plan-0".to_string(),
+            vec![make_step("id-plan-0", 0, "alpha")],
+        );
+        app.preview_keyed_plan = Some("id-plan-0".to_string());
+        app.refresh_tiles(make_tiles(2), 0);
+        assert!(app.step_preview_cache.is_empty());
+        assert!(app.preview_keyed_plan.is_none());
+    }
+
+    #[test]
+    fn highlighted_plan_id_returns_cursor_target() {
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.selected_index = 2;
+        assert_eq!(app.highlighted_plan_id(), Some("id-plan-2"));
+    }
+
+    #[test]
+    fn highlighted_plan_id_none_for_archived_sentinel() {
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC").with_archived_count(1);
+        app.selected_index = 1;
+        assert!(app.highlighted_plan_id().is_none());
+    }
+
+    #[test]
+    fn highlighted_plan_id_none_for_empty_tiles() {
+        let app = PlanListApp::new(vec![], "/proj", "UTC");
+        assert!(app.highlighted_plan_id().is_none());
+    }
+
+    // -- Palette (TUI-plan.md §9) ---------------------------------------
+
+    #[test]
+    fn palette_default_inactive() {
+        let app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        assert!(!app.palette_active());
+        assert!(app.palette_bar.is_none());
+    }
+
+    #[test]
+    fn palette_open_records_prefix() {
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        assert!(app.palette_active());
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, '/');
+        app.close_palette();
+        app.open_palette(':');
+        assert_eq!(app.palette_bar.as_ref().unwrap().prefix, ':');
+    }
+
+    #[test]
+    fn palette_close_drops_state() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        let _ = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.palette_bar.as_ref().unwrap().input, "r");
+        app.close_palette();
+        assert!(!app.palette_active());
+    }
+
+    #[test]
+    fn palette_esc_yields_cancel_outcome() {
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        let out = app
+            .palette_bar
+            .as_mut()
+            .unwrap()
+            .on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(out, PaletteBarOutcome::Cancel);
+    }
+
+    #[test]
+    fn palette_enter_yields_submit_outcome_and_parses() {
+        use crate::tui::palette::PaletteCommand;
+        use crate::tui::widgets::palette_bar::PaletteBarOutcome;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.open_palette('/');
+        let bar = app.palette_bar.as_mut().unwrap();
+        for c in "run".chars() {
+            let _ = bar.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let out = bar.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let input = match out {
+            PaletteBarOutcome::Submit(s) => s,
+            other => panic!("expected Submit, got {other:?}"),
+        };
+        assert_eq!(
+            crate::tui::palette::parse(&input),
+            Ok(PaletteCommand::Run(None))
+        );
+    }
+
+    // -- Mouse-drag split (step 28) ---------------------------------------
+
+    /// Construct a [`MouseEvent`] at `(column, row)` with the given kind.
+    /// Helper for the divider-drag tests below — the modifiers field is
+    /// always empty since the drag bindings ignore them.
+    fn mouse_event(
+        column: u16,
+        row: u16,
+        kind: crossterm::event::MouseEventKind,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn split_drag_updates_split_pct_in_plan_list() {
+        // Down on the divider, drag right by ~20 columns, release.
+        // Body width 100 with default split_pct 40 puts the divider at
+        // column 40; dragging the cursor to column 60 should land at 60%.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.last_body_width = 100;
+
+        assert_eq!(app.split_pct, 40);
+        assert!(!app.dragging_split);
+
+        app.handle_mouse(mouse_event(40, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(
+            app.dragging_split,
+            "Down at the divider column should arm the drag"
+        );
+
+        app.handle_mouse(mouse_event(60, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 60, "drag to col 60 / 100 → 60%");
+
+        app.handle_mouse(mouse_event(60, 5, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_split, "Up should clear the drag flag");
+    }
+
+    #[test]
+    fn split_drag_press_off_divider_does_not_arm_in_plan_list() {
+        // ±1 column tolerance: pressing far from the divider should not
+        // arm a drag, so subsequent drag events leave split_pct alone.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.last_body_width = 100;
+
+        // Divider is at column 40; press at column 10.
+        app.handle_mouse(mouse_event(10, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(!app.dragging_split);
+
+        app.handle_mouse(mouse_event(70, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 40, "drag without arming should not resize");
+    }
+
+    #[test]
+    fn split_drag_clamps_to_20_and_80_in_plan_list() {
+        // Past column 0 still yields 20%; past column 80% still yields 80%.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        app.last_body_width = 100;
+
+        app.handle_mouse(mouse_event(40, 5, MouseEventKind::Down(MouseButton::Left)));
+        // Drag to column 0 (and slightly past via underflow-safe path).
+        app.handle_mouse(mouse_event(0, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 20, "left clamp at 20%");
+
+        // Drag far right; with body_width 100, column 95 maps to 95%, but
+        // the clamp pins the percent at 80.
+        app.handle_mouse(mouse_event(95, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 80, "right clamp at 80%");
+
+        app.handle_mouse(mouse_event(95, 5, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_split);
+    }
+
+    #[test]
+    fn handle_mouse_no_op_before_first_draw_in_plan_list() {
+        // Before the first frame `last_body_width` is zero; mouse events
+        // must not panic and must not arm a drag (divider would be at 0).
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        assert_eq!(app.last_body_width, 0);
+
+        app.handle_mouse(mouse_event(0, 0, MouseEventKind::Down(MouseButton::Left)));
+        assert!(!app.dragging_split);
+    }
+
+    #[test]
+    fn draw_re_renders_after_drag_with_new_split_geometry() {
+        // After a mouse drag updates split_pct from 40 → 60, the next draw
+        // must place the right pane's bordered block at the new split
+        // boundary (column 48 of an 80-wide terminal) instead of the
+        // default column 32.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.cache_preview_steps(
+            "id-plan-0".to_string(),
+            vec![make_step("id-plan-0", 0, "alpha-task")],
+        );
+
+        // First draw to populate `last_body_width` and prove the default
+        // 40/60 layout puts the right pane border at column 32.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        assert_eq!(
+            buffer[(32, 1)].symbol(),
+            "┌",
+            "default split should put right pane border at col 32"
+        );
+        assert_eq!(app.last_body_width, 80);
+
+        // Arm and execute a drag from divider col 32 → col 48 (60% of 80).
+        app.handle_mouse(mouse_event(32, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(app.dragging_split);
+        app.handle_mouse(mouse_event(48, 5, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 60);
+        app.handle_mouse(mouse_event(48, 5, MouseEventKind::Up(MouseButton::Left)));
+
+        // Re-draw with the new split. The right pane's bordered block now
+        // starts at column 48; column 32 is back inside the left tile area.
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        assert_eq!(
+            buffer[(48, 1)].symbol(),
+            "┌",
+            "after drag → 60%, right pane border should sit at col 48"
+        );
+        assert_ne!(
+            buffer[(32, 1)].symbol(),
+            "┌",
+            "col 32 should no longer hold a pane border after the drag"
+        );
     }
 }

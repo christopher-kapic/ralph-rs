@@ -17,7 +17,7 @@
 // module only exposes the user's intent through `Outcome` and surfaces toasts
 // for feedback.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Modifier, Style};
@@ -136,6 +136,11 @@ impl PlanDependenciesApp {
     pub fn push_toast(&mut self, msg: impl Into<String>, kind: ToastKind) {
         self.toasts.push(msg, kind, std::time::Instant::now());
     }
+
+    /// Mouse-event entry point routed from the dispatcher's event loop.
+    /// No-op by default — see [`super::plan_list::PlanListApp::handle_mouse`]
+    /// for the rationale. Per-view drag handling is added in later steps.
+    pub fn handle_mouse(&mut self, _event: MouseEvent) {}
 
     /// Pure key handler. Routes to the per-mode handler so tests can drive
     /// arbitrary key sequences without crossterm.

@@ -26,6 +26,7 @@ use std::path::Path;
 
 use crate::config;
 use crate::db;
+use crate::git;
 use crate::output::{self, OutputContext};
 use crate::plan::{Plan, Step};
 use crate::preflight;
@@ -66,6 +67,86 @@ pub fn resolve_plan(
             .with_context(|| format!("Plan not found: {s}")),
         None => storage::find_active_plan(conn, project, include_complete)?
             .context("No active plan found. Specify a plan slug as a positional argument."),
+    }
+}
+
+/// Resolve the plan to resume.
+///
+/// When `slug` is provided, behaves like [`resolve_plan`] (exact lookup).
+/// When `slug` is absent, picks the resumable plan for the current git
+/// branch:
+///
+/// 1. `storage::find_resumable_plans_for_branch(current_branch)` —
+///    matches plans whose recorded `last_run_branch` equals the current
+///    branch (or whose `branch_name` equals it AND `last_run_branch IS
+///    NULL`, covering never-run plans).
+///    * 1 hit: use it.
+///    * 2+ hits: most recent (already DESC), warn on stderr listing the
+///      others so the user knows to disambiguate next time.
+///    * 0 hits: fall through.
+/// 2. [`storage::find_resumable_plan`] — most-recent resumable plan in
+///    the project regardless of branch, covering non-git workdirs,
+///    detached HEAD, and branches that have never hosted a run.
+///    Importantly, this includes `Aborted` plans (the runner accepts
+///    them as resumable) — using `find_active_plan` here would silently
+///    refuse to resume an aborted plan whose branch context was lost.
+/// 3. Still nothing: error with both the branch and the resumable-plan hint.
+///
+/// The slug-collision defence is in step 1's SQL: `last_run_branch IS
+/// NULL AND branch_name = ?` only fires when `last_run_branch` was never
+/// written — so a plan whose last run physically executed on `master`
+/// will NOT match a freshly-checked-out feature branch that happens to
+/// share its slug as a name.
+pub fn resolve_resume_plan(
+    conn: &Connection,
+    slug: Option<String>,
+    project: &str,
+    workdir: &Path,
+) -> Result<Plan> {
+    if let Some(s) = slug {
+        if s.is_empty() {
+            bail!(
+                "Plan slug cannot be empty. Specify a non-empty slug or omit the argument to use the active plan."
+            );
+        }
+        return storage::get_plan_by_slug(conn, &s, project)?
+            .with_context(|| format!("Plan not found: {s}"));
+    }
+
+    // Branch-based resolution. `git::get_current_branch` shells out; if
+    // it fails (no git, detached HEAD, …) we skip the branch hop and fall
+    // straight to `find_resumable_plan` so non-git contexts still work.
+    let branch_result = git::get_current_branch(workdir);
+    if let Ok(branch) = branch_result.as_ref() {
+        let candidates = storage::find_resumable_plans_for_branch(conn, project, branch)?;
+        match candidates.len() {
+            0 => { /* fall through to find_resumable_plan */ }
+            1 => return Ok(candidates.into_iter().next().unwrap()),
+            _ => {
+                let chosen = candidates[0].clone();
+                let other_slugs: Vec<&str> = candidates.iter().map(|p| p.slug.as_str()).collect();
+                eprintln!(
+                    "Multiple resumable plans on '{}': {}. Resuming '{}'. Pass a slug to disambiguate.",
+                    branch,
+                    other_slugs.join(", "),
+                    chosen.slug,
+                );
+                return Ok(chosen);
+            }
+        }
+    }
+
+    if let Some(p) = storage::find_resumable_plan(conn, project)? {
+        return Ok(p);
+    }
+
+    match branch_result {
+        Ok(branch) => bail!(
+            "No resumable plan found for branch '{branch}' or in this project. Specify a slug."
+        ),
+        Err(_) => bail!(
+            "No resumable plan found in this project. Specify a plan slug as a positional argument."
+        ),
     }
 }
 
@@ -1452,5 +1533,214 @@ mod tests {
 
         let result = step_remove(&conn, "my-plan", &project, Some(5), None, true, &test_out());
         assert!(result.is_err());
+    }
+
+    // -- resolve_resume_plan --
+
+    /// Initialize a throwaway git repo with a single commit so
+    /// `git::get_current_branch` succeeds. Returns (TempDir, path,
+    /// canonical-project-string, current-branch-name).
+    fn git_repo_for_resume() -> (tempfile::TempDir, std::path::PathBuf, String, String) {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        }
+        fs::write(dir.join("README.md"), "# hi").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let canonical = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+        let branch = crate::git::get_current_branch(&dir).unwrap();
+        (tmp, dir, canonical, branch)
+    }
+
+    #[test]
+    fn test_resolve_resume_plan_with_slug_uses_exact_lookup() {
+        let (_tmp, dir, project, _branch) = git_repo_for_resume();
+        let conn = db::open_memory().unwrap();
+        let plan =
+            storage::create_plan(&conn, "exact", &project, "any", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Failed).unwrap();
+
+        let p = resolve_resume_plan(&conn, Some("exact".to_string()), &project, &dir).unwrap();
+        assert_eq!(p.slug, "exact");
+    }
+
+    #[test]
+    fn test_resolve_resume_plan_no_slug_single_branch_match() {
+        let (_tmp, dir, project, branch) = git_repo_for_resume();
+        let conn = db::open_memory().unwrap();
+        let plan =
+            storage::create_plan(&conn, "only", &project, "x", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Failed).unwrap();
+        storage::set_plan_last_run_branch(&conn, &plan.id, &branch).unwrap();
+
+        let p = resolve_resume_plan(&conn, None, &project, &dir).unwrap();
+        assert_eq!(p.slug, "only");
+    }
+
+    #[test]
+    fn test_resolve_resume_plan_no_slug_picks_most_recent_when_ambiguous() {
+        let (_tmp, dir, project, branch) = git_repo_for_resume();
+        let conn = db::open_memory().unwrap();
+        let p1 = storage::create_plan(&conn, "older", &project, "x", "d", None, None, &[]).unwrap();
+        let p2 = storage::create_plan(&conn, "newer", &project, "x", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &p1.id, PlanStatus::Failed).unwrap();
+        storage::update_plan_status(&conn, &p2.id, PlanStatus::Failed).unwrap();
+        storage::set_plan_last_run_branch(&conn, &p1.id, &branch).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        storage::set_plan_last_run_branch(&conn, &p2.id, &branch).unwrap();
+
+        let p = resolve_resume_plan(&conn, None, &project, &dir).unwrap();
+        assert_eq!(
+            p.slug, "newer",
+            "DESC by last_run_started_at picks the most recent"
+        );
+    }
+
+    #[test]
+    fn test_resolve_resume_plan_falls_back_to_resumable_plan_when_no_branch_match() {
+        let (_tmp, dir, project, branch) = git_repo_for_resume();
+        let conn = db::open_memory().unwrap();
+        // A plan whose last_run_branch is some OTHER branch — must not
+        // match by branch.
+        let other =
+            storage::create_plan(&conn, "elsewhere", &project, "x", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &other.id, PlanStatus::Failed).unwrap();
+        let bogus_branch = format!("not-{branch}");
+        storage::set_plan_last_run_branch(&conn, &other.id, &bogus_branch).unwrap();
+
+        // ...but find_resumable_plan still returns it (any in_progress /
+        // ready / failed / aborted plan in the project counts).
+        let p = resolve_resume_plan(&conn, None, &project, &dir).unwrap();
+        assert_eq!(p.slug, "elsewhere");
+    }
+
+    /// Regression for finding 2: an aborted plan must resume even when
+    /// branch inference misses (e.g. last_run_branch differs from the
+    /// current branch, no branch ever recorded, etc.). Under the old
+    /// `find_active_plan` fallback, Aborted was silently filtered out.
+    #[test]
+    fn test_resolve_resume_plan_falls_back_to_aborted_plan_when_no_branch_match() {
+        let (_tmp, dir, project, branch) = git_repo_for_resume();
+        let conn = db::open_memory().unwrap();
+        let p = storage::create_plan(&conn, "ab", &project, "x", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &p.id, PlanStatus::Aborted).unwrap();
+        // Last run executed on a branch that is NOT the current one, so
+        // the branch-based resolver finds nothing.
+        let other = format!("not-{branch}");
+        storage::set_plan_last_run_branch(&conn, &p.id, &other).unwrap();
+
+        let resolved = resolve_resume_plan(&conn, None, &project, &dir).unwrap();
+        assert_eq!(
+            resolved.slug, "ab",
+            "Aborted plans must be resumable via the branch-miss fallback"
+        );
+    }
+
+    #[test]
+    fn test_resolve_resume_plan_errors_when_nothing_matches() {
+        let (_tmp, dir, project, _branch) = git_repo_for_resume();
+        let conn = db::open_memory().unwrap();
+        // No plans at all — neither branch resolution nor active-plan
+        // fallback turns up a candidate.
+        let err = resolve_resume_plan(&conn, None, &project, &dir).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("No resumable plan") || msg.contains("No active plan"),
+            "expected branch-aware error message, got: {msg}"
+        );
+    }
+
+    /// Slug-collision regression covering the spec's hard test:
+    /// plan whose last_run_branch is recorded as 'master' must NOT match
+    /// against a freshly-checked-out feature branch that happens to share
+    /// its slug as its name.
+    #[test]
+    fn test_resolve_resume_plan_no_false_match_for_slug_named_branch() {
+        let (_tmp, dir, project, current_branch) = git_repo_for_resume();
+        let conn = db::open_memory().unwrap();
+
+        // Plan A: slug='deploy', branch_name='deploy'. Last run on
+        // 'old-master' (some branch that is NOT the current one).
+        let a = storage::create_plan(&conn, "deploy", &project, "deploy", "d", None, None, &[])
+            .unwrap();
+        storage::update_plan_status(&conn, &a.id, PlanStatus::Failed).unwrap();
+        let unrelated = format!("unrelated-{current_branch}");
+        storage::set_plan_last_run_branch(&conn, &a.id, &unrelated).unwrap();
+
+        // Switch the workdir to a NEW branch named exactly 'deploy' (the
+        // slug-collision shape).
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "deploy"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(crate::git::get_current_branch(&dir).unwrap(), "deploy");
+
+        // Branch-based resolver must NOT match A. Active-plan fallback
+        // does match A (it's the only Failed plan in the project), so the
+        // resolver returns it via the fallback path — but this is fine,
+        // because the *false-match defence* is the absence of a
+        // branch-based hit. The user gets A only because A is the only
+        // active plan in this project; if there were another active plan
+        // somewhere, the active-plan resolver would pick whichever it
+        // normally picks. The point of the test is: A.last_run_branch
+        // 'unrelated-…' ≠ 'deploy', so the branch-based resolver never
+        // false-matches.
+        let candidates =
+            storage::find_resumable_plans_for_branch(&conn, &project, "deploy").unwrap();
+        assert!(
+            candidates.is_empty(),
+            "branch-based resolver MUST NOT match a plan whose last_run_branch is set to a different branch (got {:?})",
+            candidates.iter().map(|p| &p.slug).collect::<Vec<_>>()
+        );
+    }
+
+    /// Never-run plan (last_run_branch IS NULL) must still match by
+    /// branch_name when the current branch equals it.
+    #[test]
+    fn test_resolve_resume_plan_never_run_uses_branch_name_fallback() {
+        let (_tmp, dir, project, current_branch) = git_repo_for_resume();
+        let conn = db::open_memory().unwrap();
+        // Create a plan whose branch_name matches the current branch and
+        // mark it Ready so it's resumable. Don't call run, so
+        // last_run_branch stays NULL.
+        let p = storage::create_plan(
+            &conn,
+            "fresh",
+            &project,
+            &current_branch,
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::update_plan_status(&conn, &p.id, PlanStatus::Ready).unwrap();
+        let reread = storage::get_plan_by_slug(&conn, "fresh", &project)
+            .unwrap()
+            .unwrap();
+        assert!(reread.last_run_branch.is_none());
+
+        let resolved = resolve_resume_plan(&conn, None, &project, &dir).unwrap();
+        assert_eq!(resolved.slug, "fresh");
     }
 }

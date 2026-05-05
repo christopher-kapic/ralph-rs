@@ -245,6 +245,26 @@ async fn run_plan_inner(
         return dry_run_report(&effective_plan, &initial_steps, &steps_to_run);
     }
 
+    // Record the branch this run is physically executing on. This is the
+    // anchor `ralph resume` (no slug) uses to map the current git branch
+    // back to a paused/failed plan. We capture it AFTER any branch switch
+    // (`setup_branch` runs in `run_plan` above) and regardless of
+    // `--current-branch`, so the value always reflects the workdir's
+    // checked-out HEAD at the moment the runner began iterating steps.
+    // Best-effort: if `git rev-parse` fails (detached HEAD edge cases,
+    // missing git, …) we log and continue rather than aborting the run —
+    // resume falls back to slug/active-plan resolution when no row matches.
+    match git::get_current_branch(workdir) {
+        Ok(branch) => {
+            if let Err(e) = storage::set_plan_last_run_branch(conn, &effective_plan.id, &branch) {
+                eprintln!("Warning: failed to record last_run_branch: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: could not resolve current branch for last_run_branch: {e}");
+        }
+    }
+
     // 3. Mark plan as in_progress.
     if effective_plan.status != PlanStatus::InProgress {
         storage::update_plan_status(conn, &effective_plan.id, PlanStatus::InProgress)?;
@@ -299,6 +319,26 @@ async fn run_plan_inner(
             eprintln!("Aborted");
             storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
             result.final_status = PlanStatus::Aborted;
+            return Ok(result);
+        }
+
+        // Check the operator's graceful-pause flag between steps. The read +
+        // clear is atomic so a subsequent `ralph resume` doesn't immediately
+        // re-pause. We leave `plans.status` as-is (InProgress) — pause is a
+        // transient runner-control signal, not a status transition — so
+        // resume's normal "find earliest non-complete step" path Just Works.
+        if storage::take_plan_pause_requested(conn, &effective_plan.id)? {
+            if out.format == OutputFormat::Json {
+                output::emit_ndjson(&RunEvent::PausedByUser {
+                    plan_slug: effective_plan.slug.clone(),
+                })?;
+            } else {
+                eprintln!(
+                    "> Paused by user request after {} step(s). Use `ralph resume` to continue.",
+                    result.steps_executed,
+                );
+            }
+            result.final_status = PlanStatus::InProgress;
             return Ok(result);
         }
 
@@ -1649,6 +1689,9 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
         }
     }
 
@@ -2639,6 +2682,9 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -2676,6 +2722,9 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -2773,6 +2822,299 @@ mod tests {
         assert_eq!(result.final_status, PlanStatus::Complete);
     }
 
+    /// Regression: when `plans.pause_requested` is set, the runner's between-
+    /// steps check must exit cleanly before executing the next step, clear
+    /// the flag in the same transaction so a subsequent `ralph resume`
+    /// doesn't immediately re-pause, and report InProgress (not Complete /
+    /// Failed) so the live-run summary reflects the pause.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_pause_requested_stops_between_steps_and_clears_flag() {
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+
+        let conn = setup();
+        let plan =
+            storage::create_plan(&conn, "p", &project, "feat/p", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
+
+        // Three steps. Mark step 1 Complete so the runner enters the loop
+        // with a real "next step" candidate. The pause check at the top of
+        // the loop fires before that candidate ever gets executed, exercising
+        // exactly the between-steps boundary the spec describes.
+        for (i, title) in ["s1", "s2", "s3"].iter().enumerate() {
+            let (s, _) = storage::create_step(
+                &conn,
+                &plan.id,
+                title,
+                "d",
+                None,
+                None,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            if i == 0 {
+                storage::update_step_status(&conn, &s.id, StepStatus::Complete).unwrap();
+            }
+        }
+
+        // Operator requests pause before the runner ever reaches step 2.
+        storage::set_plan_pause_requested(&conn, &plan.id, true).unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let result = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        // No new step should have run — the pause check fires before the
+        // executor is invoked.
+        assert_eq!(result.steps_executed, 0);
+        assert_eq!(result.steps_succeeded, 0);
+        // Final status stays InProgress (deliberate pause, not failure).
+        assert_eq!(result.final_status, PlanStatus::InProgress);
+
+        // Flag must be cleared so a subsequent run/resume isn't immediately
+        // re-paused.
+        assert!(
+            !storage::get_plan_pause_requested(&conn, &plan.id).unwrap(),
+            "pause_requested must be cleared on entry-to-pause",
+        );
+
+        // Steps 2 and 3 stayed pending — neither was started or skipped.
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[1].status, StepStatus::Pending);
+        assert_eq!(steps[2].status, StepStatus::Pending);
+    }
+
+    /// Regression: after a paused run, `resume_plan` must continue from the
+    /// next pending step normally — no additional pause logic, since the
+    /// runner cleared the flag on entry-to-pause.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_resume_after_pause_does_not_re_pause() {
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+
+        let conn = setup();
+        let plan =
+            storage::create_plan(&conn, "p", &project, "feat/p", "d", None, None, &[]).unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
+
+        // Two steps — step 1 already complete, step 2 pending.
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "first",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        let (_s2, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "second",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Pause-then-resume: set the flag, run (which clears it via the
+        // between-steps check), then call resume_plan — the flag stays clear
+        // and the runner enters the executor for step 2 (which fails because
+        // there's no harness configured, but only AFTER passing the pause
+        // check, which is what we're verifying).
+        storage::set_plan_pause_requested(&conn, &plan.id, true).unwrap();
+        let plan_obj = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let _paused = run_plan(&conn, &plan_obj, &config, &dir, &options, rx.clone(), &out)
+            .await
+            .unwrap();
+        assert!(!storage::get_plan_pause_requested(&conn, &plan_obj.id).unwrap());
+
+        // Re-running with the flag clear MUST NOT short-circuit the loop —
+        // the runner gets to the "find next actionable step" path. We don't
+        // assert success here because there's no real harness; what we
+        // assert is that pause_requested is still false after the second
+        // call (so a future resume keeps progressing).
+        let _second = run_plan(&conn, &plan_obj, &config, &dir, &options, rx, &out).await;
+        assert!(
+            !storage::get_plan_pause_requested(&conn, &plan_obj.id).unwrap(),
+            "pause_requested stays clear across the boundary",
+        );
+    }
+
+    /// The runner must record `plans.last_run_branch` at run-start in
+    /// `--current-branch` mode — that's the path resume's branch-based
+    /// resolver depends on for plans that ran without their own branch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_plan_records_last_run_branch_in_current_branch_mode() {
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+        let actual_branch = git::get_current_branch(&dir).unwrap();
+
+        let conn = setup();
+        // Plan's branch_name is intentionally different from the actual git
+        // branch so the assertion below catches a regression where the
+        // runner records `branch_name` instead of the workdir's HEAD.
+        let plan = storage::create_plan(
+            &conn,
+            "s",
+            &project,
+            "would-be-branch",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+        // One Complete step so the runner reaches run_plan_inner, writes
+        // last_run_branch, and exits cleanly (no executor needed).
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Done",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "s", &project)
+            .unwrap()
+            .unwrap();
+        assert!(plan.last_run_branch.is_none());
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+        let _ = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        let after = storage::get_plan_by_slug(&conn, "s", &project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.last_run_branch.as_deref(),
+            Some(actual_branch.as_str()),
+            "runner must record the workdir's HEAD as last_run_branch"
+        );
+        // The pre-existing branch_name field is left untouched — it's the
+        // user's "where I want this plan to run" intent, not the record of
+        // where it physically ran.
+        assert_eq!(after.branch_name, "would-be-branch");
+    }
+
+    /// Default (non-`--current-branch`) mode: setup_branch switches to the
+    /// plan's branch first, so last_run_branch must reflect THAT branch,
+    /// not the source branch the user kicked the run off from.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_plan_records_plan_branch_when_not_current_branch_mode() {
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+        let source_branch = git::get_current_branch(&dir).unwrap();
+
+        let conn = setup();
+        let plan =
+            storage::create_plan(&conn, "s", &project, "feat/run-here", "d", None, None, &[])
+                .unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Done",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "s", &project)
+            .unwrap()
+            .unwrap();
+
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: false,
+            auto_stash: true,
+            ..Default::default()
+        };
+        let _ = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        let after = storage::get_plan_by_slug(&conn, "s", &project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.last_run_branch.as_deref(),
+            Some("feat/run-here"),
+            "must record the branch setup_branch switched into, not the source branch ({source_branch})"
+        );
+    }
+
     // -- stash_if_dirty / setup_branch --
 
     /// With `--no-auto-stash`, a dirty tree must bail cleanly and list the
@@ -2844,6 +3186,9 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -2904,6 +3249,9 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");

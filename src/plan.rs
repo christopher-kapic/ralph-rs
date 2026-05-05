@@ -286,6 +286,13 @@ pub enum TerminationReason {
     /// answers. Distinct from `HarnessFailed` so paused-for-clarification
     /// history doesn't pollute real-failure metrics.
     PausedForQuestion,
+    /// Operator pressed `P` (or ran `ralph pause`) to request a graceful
+    /// stop after the current step. The runner observed `pause_requested`
+    /// between step boundaries and exited cleanly. Distinct from
+    /// `UserInterrupted` (mid-step SIGTERM) and `PausedForQuestion`
+    /// (harness-driven pause) so the history reflects exactly which
+    /// pause path triggered.
+    PausedByUser,
     Unknown,
 }
 
@@ -303,6 +310,7 @@ impl TerminationReason {
             Self::RollbackFailed => "rollback_failed",
             Self::InsufficientDiskSpace => "insufficient_disk_space",
             Self::PausedForQuestion => "paused_for_question",
+            Self::PausedByUser => "paused_by_user",
             Self::Unknown => "unknown",
         }
     }
@@ -330,6 +338,7 @@ impl std::str::FromStr for TerminationReason {
             "rollback_failed" => Ok(Self::RollbackFailed),
             "insufficient_disk_space" => Ok(Self::InsufficientDiskSpace),
             "paused_for_question" => Ok(Self::PausedForQuestion),
+            "paused_by_user" => Ok(Self::PausedByUser),
             "unknown" => Ok(Self::Unknown),
             other => Err(ParseStatusError(other.to_string())),
         }
@@ -397,11 +406,13 @@ impl std::str::FromStr for TestStatus {
 ///
 /// Matches the physical table layout after all migrations: V1 defined every
 /// column through `updated_at`, V5 appended `plan_harness`, V10 appended
-/// `prompt_prefix` and `prompt_suffix`, V14 appended `context_prepend`, and
-/// V16 appended `questions_enabled` via `ALTER TABLE ... ADD COLUMN`. Every
-/// `Plan`-returning query MUST use this list so [`Plan::from_row`]'s indices
-/// line up — a raw `SELECT *` would otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, prompt_prefix, prompt_suffix, context_prepend, questions_enabled";
+/// `prompt_prefix` and `prompt_suffix`, V14 appended `context_prepend`,
+/// V16 appended `questions_enabled`, V18 appended `pause_requested`,
+/// V19 appended `last_run_branch`, and V20 appended `last_run_started_at`
+/// via `ALTER TABLE ... ADD COLUMN`. Every `Plan`-returning query MUST use
+/// this list so [`Plan::from_row`]'s indices line up — a raw `SELECT *`
+/// would otherwise swap columns.
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, prompt_prefix, prompt_suffix, context_prepend, questions_enabled, pause_requested, last_run_branch, last_run_started_at";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,6 +448,30 @@ pub struct Plan {
     /// plan list.
     #[serde(default)]
     pub questions_enabled: bool,
+    /// Operator-requested graceful pause flag. When `true`, the runner
+    /// finishes the currently-executing step, then exits with
+    /// `TerminationReason::PausedByUser` between steps and clears the flag
+    /// in the same transaction so a subsequent `ralph resume` doesn't
+    /// immediately re-pause. Set via the TUI `P` keybinding or `ralph pause`;
+    /// cleared by the runner on entry-to-pause or by pressing `P` again
+    /// before the boundary fires.
+    #[serde(default)]
+    pub pause_requested: bool,
+    /// Git branch the plan most recently started a run on. Written by the
+    /// runner at run-start (both default and `--current-branch` modes), so
+    /// `ralph resume` (no slug) can match the plan whose last run executed
+    /// on the current branch — without false-matching via `branch_name`
+    /// when the user later creates a new branch sharing a paused plan's
+    /// slug. `None` for plans that have never been run.
+    #[serde(default)]
+    pub last_run_branch: Option<String>,
+    /// Wall-clock timestamp at which the plan most recently started a run
+    /// (written by the runner alongside `last_run_branch`). Provides the
+    /// resume resolver with a stable "last actually ran" anchor, so its
+    /// `ORDER BY` can ignore unrelated bumps to `updated_at` (e.g. toggling
+    /// `questions_enabled` or `pause_requested`). `None` for never-run plans.
+    #[serde(default)]
+    pub last_run_started_at: Option<String>,
 }
 
 impl Plan {
@@ -445,7 +480,8 @@ impl Plan {
     /// Expected column order matches [`PLAN_COLUMNS`]:
     /// id, slug, project, branch_name, description, status, harness, agent,
     /// deterministic_tests, created_at, updated_at, plan_harness,
-    /// prompt_prefix, prompt_suffix, context_prepend, questions_enabled
+    /// prompt_prefix, prompt_suffix, context_prepend, questions_enabled,
+    /// pause_requested, last_run_branch, last_run_started_at
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -467,9 +503,11 @@ impl Plan {
             rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
-        // `questions_enabled` is INTEGER NOT NULL DEFAULT 0 on disk; SQLite
-        // has no native bool, so read as i64 and coerce.
+        // `questions_enabled` and `pause_requested` are INTEGER NOT NULL
+        // DEFAULT 0 on disk; SQLite has no native bool, so read as i64 and
+        // coerce.
         let questions_enabled_int: i64 = row.get(15)?;
+        let pause_requested_int: i64 = row.get(16)?;
 
         Ok(Plan {
             id: row.get(0)?,
@@ -488,6 +526,9 @@ impl Plan {
             prompt_suffix: row.get(13)?,
             context_prepend: row.get(14)?,
             questions_enabled: questions_enabled_int != 0,
+            pause_requested: pause_requested_int != 0,
+            last_run_branch: row.get(17)?,
+            last_run_started_at: row.get(18)?,
         })
     }
 }
@@ -1099,6 +1140,7 @@ mod tests {
             TerminationReason::RollbackFailed,
             TerminationReason::InsufficientDiskSpace,
             TerminationReason::PausedForQuestion,
+            TerminationReason::PausedByUser,
             TerminationReason::Unknown,
         ];
         for r in &reasons {

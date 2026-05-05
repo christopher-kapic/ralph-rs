@@ -156,6 +156,17 @@ pub enum Command {
         force: bool,
     },
 
+    /// Request a graceful pause: the active runner finishes the current step,
+    /// then exits before starting the next one.
+    ///
+    /// Sets `plans.pause_requested = true` on the resolved plan. The runner
+    /// reads + clears this flag between step boundaries; idempotent if no run
+    /// is active. Use `ralph resume` to continue from the next pending step.
+    Pause {
+        /// Plan slug to pause. Defaults to the active plan.
+        plan: Option<String>,
+    },
+
     /// Cancel the live `ralph run` for this project.
     ///
     /// Sends SIGTERM to the active runner so it can finish its current phase,

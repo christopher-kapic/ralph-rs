@@ -16,9 +16,10 @@
 // * `/step skip [<num>]` — mirrors the `s` keybinding's `runner::skip_step`.
 // * `/step move <num> --to <m>` — re-keys a step into a new position.
 //
-// The remaining v1-deferred commands route to `PaletteAction::ComingSoon`
-// with the actual sub-view step number from the tui-v1 plan map (43 — the
-// help overlay is the last surface still pending).
+// The remaining v1-deferred commands route to `PaletteAction::ComingSoon`.
+// As of tui-gap-fixes only `/help` still uses this fallback (the overlay
+// itself is fully wired via `?` per §15; the palette wiring is the
+// remaining surface — see TUI-plan.md §9 NOT IMPLEMENTED note).
 //
 // Step #32 wires `/cancel`, `/export`, `/import`, `/quit`, `/help`:
 // * `/cancel` — mirrors the `S` keybinding's "stop the live run" action.
@@ -31,8 +32,10 @@
 //   the file and prompts for a fresh slug if it conflicts with an existing
 //   plan.
 // * `/quit` (and `/q`) — emits `Quit`; the consuming view exits the TUI.
-// * `/help` — surfaces a `ComingSoon` action targeting step 43 (the help
-//   overlay) so the dispatcher loop can toast a placeholder until then.
+// * `/help` — surfaces a `ComingSoon` action so the dispatcher loop can
+//   toast a placeholder. The overlay itself is fully wired via `?` per
+//   §15; routing `/help` directly into it is still pending (TUI-plan.md
+//   §9 NOT IMPLEMENTED note).
 
 use crate::plan::PlanStatus;
 use crate::tui::palette::{PaletteCommand, ParseError};
@@ -109,10 +112,10 @@ pub struct PaletteContext<'a> {
 /// TUI event loop matches on the variant and runs the corresponding side
 /// effect (open a dialog, spawn a subprocess, push a view, or toast).
 ///
-/// Commands whose sub-views haven't landed yet collapse into
-/// [`PaletteAction::ComingSoon`] with the target tui-v1 step number, so the
-/// dispatcher loop can render a uniform "coming soon" toast until the
-/// real implementation lands.
+/// Commands whose surface hasn't been plumbed through yet collapse into
+/// [`PaletteAction::ComingSoon`] so the dispatcher loop can render a
+/// uniform info toast. Only `/help` currently uses this fallback (see the
+/// module note above).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteAction {
     /// Nothing to do (e.g. blank input).
@@ -253,9 +256,10 @@ pub enum PaletteAction {
         plan_slug: String,
         step_label: String,
     },
-    /// Recognized command stubbed for a later tui-v1 step (43 — help
-    /// overlay). Caller renders a `Coming soon — landing in step <N>`
-    /// info toast.
+    /// Recognized command whose palette surface isn't wired yet. Caller
+    /// renders a `Coming soon — landing in step <N>` info toast. Only
+    /// `/help` currently emits this — the overlay itself is reachable via
+    /// `?` per §15.
     ComingSoon {
         label: &'static str,
         target_step: u32,
@@ -350,7 +354,8 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
         // -- /quit / /q ---------------------------------------------------
         PaletteCommand::Quit => PaletteAction::Quit,
 
-        // -- /help (overlay lands in step 43) -----------------------------
+        // -- /help — palette wiring is still pending; `?` opens the overlay
+        // directly per §15. See the module note at the top of this file.
         PaletteCommand::Help => PaletteAction::ComingSoon {
             label: cmd.label(),
             target_step: 43,
@@ -1236,8 +1241,9 @@ mod tests {
 
     #[test]
     fn help_routes_to_step_43() {
-        // Help overlay itself lands in step 43; until then the dispatcher
-        // returns ComingSoon so the loop can toast a placeholder.
+        // The help overlay is reachable via `?` per §15, but routing
+        // `/help` from the palette into the overlay isn't wired yet —
+        // dispatcher returns ComingSoon so the loop can toast a placeholder.
         let c = Ctx::new();
         assert_eq!(
             dispatch_str("/help", &c),

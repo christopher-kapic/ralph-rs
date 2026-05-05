@@ -85,6 +85,19 @@ impl RunSubscription {
 // Command construction
 // ---------------------------------------------------------------------------
 
+/// Whether the streaming subprocess should drive the plan via `ralph run`
+/// or `ralph resume`. Threaded through so the TUI's auto-start path can
+/// fork either subcommand without duplicating the rest of the streaming
+/// scaffolding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamMode {
+    /// `ralph run <slug>`, optionally with `--current-branch`.
+    Run { current_branch: bool },
+    /// `ralph resume <slug>`. The resume code path always operates on the
+    /// current branch internally, so no flag is needed.
+    Resume,
+}
+
 /// Build the streaming runner [`Command`] without spawning. Mirrors the
 /// non-streaming variant in `tui::run_dialog::build_run_command` but with
 /// `--json` added and stdout piped so the TUI can parse NDJSON.
@@ -92,16 +105,23 @@ pub fn build_streaming_run_command(
     exe: &Path,
     project: &Path,
     slug: &str,
-    current_branch: bool,
+    mode: StreamMode,
 ) -> Command {
     let mut cmd = Command::new(exe);
     cmd.arg("-C")
         .arg(project)
         .arg("--non-interactive")
-        .arg("--json")
-        .arg("run");
-    if current_branch {
-        cmd.arg("--current-branch");
+        .arg("--json");
+    match mode {
+        StreamMode::Run { current_branch } => {
+            cmd.arg("run");
+            if current_branch {
+                cmd.arg("--current-branch");
+            }
+        }
+        StreamMode::Resume => {
+            cmd.arg("resume");
+        }
     }
     cmd.arg(slug);
     cmd.stdin(Stdio::null())
@@ -123,7 +143,7 @@ pub fn spawn_streaming_runner(
     exe: PathBuf,
     project: PathBuf,
     slug: String,
-    current_branch: bool,
+    mode: StreamMode,
 ) -> Result<RunSubscription> {
     let runtime = Arc::new(
         tokio::runtime::Runtime::new().context("create tokio runtime for run subscription")?,
@@ -131,7 +151,7 @@ pub fn spawn_streaming_runner(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     runtime.spawn(async move {
-        let mut cmd = build_streaming_run_command(&exe, &project, &slug, current_branch);
+        let mut cmd = build_streaming_run_command(&exe, &project, &slug, mode);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(_) => return,
@@ -208,6 +228,14 @@ pub fn dispatch_event(app: &mut PlanDetailApp, event: &RunEvent) {
         RunEvent::PlanComplete { .. } | RunEvent::Summary { .. } => {
             app.note_run_finished();
         }
+        RunEvent::PausedByUser { .. } => {
+            app.note_run_finished();
+            app.toasts.push(
+                "Paused. Use `ralph resume` to continue.",
+                crate::tui::toast::ToastKind::Success,
+                std::time::Instant::now(),
+            );
+        }
         // Other events (PromptPrepared, StaleStepsSwept, PlanGrew) update
         // book-keeping handled by the DB-side sync; the right pane has no
         // dedicated rendering for them.
@@ -246,6 +274,9 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
         }
     }
 
@@ -313,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_step_started_marks_run_live_and_starts_timer() {
+    fn test_dispatch_step_started_marks_run_live() {
         let mut app = make_app();
         assert!(!app.is_run_live());
         let evt = RunEvent::StepStarted {
@@ -324,7 +355,7 @@ mod tests {
         };
         dispatch_event(&mut app, &evt);
         assert!(app.is_run_live());
-        assert!(app.step_start_time.is_some());
+        assert_eq!(app.subscribed_step_num, Some(1));
     }
 
     #[test]
@@ -351,7 +382,7 @@ mod tests {
             },
         );
         assert!(!app.is_run_live());
-        assert!(app.step_start_time.is_none());
+        assert_eq!(app.subscribed_step_num, None);
     }
 
     // -- consume_lines integration with an in-memory pipe --
@@ -472,7 +503,9 @@ mod tests {
             Path::new("/usr/bin/ralph"),
             Path::new("/proj"),
             "my-plan",
-            true,
+            StreamMode::Run {
+                current_branch: true,
+            },
         );
         let std_cmd = cmd.as_std();
         let args: Vec<&std::ffi::OsStr> = std_cmd.get_args().collect();
@@ -500,7 +533,9 @@ mod tests {
             Path::new("/usr/bin/ralph"),
             Path::new("/proj"),
             "my-plan",
-            false,
+            StreamMode::Run {
+                current_branch: false,
+            },
         );
         let std_cmd = cmd.as_std();
         let args: Vec<String> = std_cmd
@@ -510,5 +545,38 @@ mod tests {
         assert!(!args.contains(&"--current-branch".to_string()));
         // slug is still the final arg
         assert_eq!(args.last().map(String::as_str), Some("my-plan"));
+    }
+
+    /// Resume streaming spawns `ralph resume <slug>` with `--non-interactive
+    /// --json`. The auto-start path on `ralph resume` (TUI-plan.md §2)
+    /// reuses the same NDJSON wiring as `run`, so the only on-the-wire
+    /// difference is the subcommand itself.
+    #[test]
+    fn test_build_streaming_run_command_resume_subcommand() {
+        let cmd = build_streaming_run_command(
+            Path::new("/usr/bin/ralph"),
+            Path::new("/proj"),
+            "my-plan",
+            StreamMode::Resume,
+        );
+        let std_cmd = cmd.as_std();
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-C".to_string(),
+                "/proj".to_string(),
+                "--non-interactive".to_string(),
+                "--json".to_string(),
+                "resume".to_string(),
+                "my-plan".to_string(),
+            ]
+        );
+        // `--current-branch` is implicit in resume — must NOT appear as a
+        // CLI flag (resume::resume_plan sets it on RunOptions itself).
+        assert!(!args.contains(&"--current-branch".to_string()));
     }
 }

@@ -45,6 +45,28 @@ pub fn create_and_checkout_branch(workdir: &Path, branch_name: &str) -> Result<(
     Ok(())
 }
 
+/// Check out an existing branch. Fails if the branch doesn't exist.
+pub fn checkout_branch(workdir: &Path, branch_name: &str) -> Result<()> {
+    git(workdir, &["checkout", branch_name])
+        .with_context(|| format!("could not checkout branch '{branch_name}'"))?;
+    Ok(())
+}
+
+/// Return `true` if a local branch with the given name exists.
+pub fn branch_exists(workdir: &Path, branch_name: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch_name}"),
+        ])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git show-ref for '{branch_name}'"))?;
+    Ok(output.status.success())
+}
+
 /// Return the name of the currently checked-out branch.
 pub fn get_current_branch(workdir: &Path) -> Result<String> {
     let out = git(workdir, &["rev-parse", "--abbrev-ref", "HEAD"])
@@ -494,6 +516,36 @@ mod tests {
         let (_tmp, dir) = init_repo();
         create_and_checkout_branch(&dir, "feature/test").unwrap();
         assert_eq!(get_current_branch(&dir).unwrap(), "feature/test");
+    }
+
+    #[test]
+    fn test_checkout_branch_existing() {
+        let (_tmp, dir) = init_repo();
+        let initial = get_current_branch(&dir).unwrap();
+        create_and_checkout_branch(&dir, "feature/exists").unwrap();
+        // Switch back via the plain checkout helper.
+        checkout_branch(&dir, &initial).unwrap();
+        assert_eq!(get_current_branch(&dir).unwrap(), initial);
+    }
+
+    #[test]
+    fn test_checkout_branch_missing_errors() {
+        let (_tmp, dir) = init_repo();
+        let result = checkout_branch(&dir, "feature/never-created");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_branch_exists_reports_true_for_existing() {
+        let (_tmp, dir) = init_repo();
+        create_and_checkout_branch(&dir, "feature/here").unwrap();
+        assert!(branch_exists(&dir, "feature/here").unwrap());
+    }
+
+    #[test]
+    fn test_branch_exists_reports_false_for_missing() {
+        let (_tmp, dir) = init_repo();
+        assert!(!branch_exists(&dir, "feature/never").unwrap());
     }
 
     #[test]

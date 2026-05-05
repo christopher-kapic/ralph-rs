@@ -21,13 +21,14 @@
 // alternative termination, [`Outcome::DiscardAndPop`], skips the storage
 // write entirely and matches the user's `<esc>`-to-cancel mental model.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 
+use crate::tui::help::{self, HelpState};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
 
@@ -82,6 +83,10 @@ pub struct StepTagsApp {
     pub mode: Mode,
     /// Toast queue rendered over the bottom hint row.
     pub toasts: ToastQueue,
+    /// Help-overlay state. `?` toggles visibility; while visible the
+    /// dispatcher routes input through [`HelpState::intercept_key`] before
+    /// passing keys to the per-mode handler (TUI-plan.md §15).
+    pub help: HelpState,
 }
 
 impl StepTagsApp {
@@ -95,6 +100,7 @@ impl StepTagsApp {
             list_cursor: 0,
             mode: Mode::List,
             toasts: ToastQueue::new(),
+            help: HelpState::new(),
         }
     }
 
@@ -103,9 +109,20 @@ impl StepTagsApp {
         self.toasts.push(msg, kind, std::time::Instant::now());
     }
 
+    /// Mouse-event entry point routed from the dispatcher's event loop.
+    /// No-op by default — see [`super::plan_list::PlanListApp::handle_mouse`]
+    /// for the rationale. Per-view drag handling is added in later steps.
+    pub fn handle_mouse(&mut self, _event: MouseEvent) {}
+
     /// Pure key handler. Routes to the per-mode handler so tests can drive
     /// arbitrary key sequences without crossterm.
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+        // §15 help overlay: route `?` toggle / dismissal first. While the
+        // overlay is up the sub-view's per-mode handlers are skipped.
+        if self.help.intercept_key(key) != help::InterceptResult::Passthrough {
+            return Outcome::Pending;
+        }
+
         // Ctrl-C always discards and pops — matches the convention in
         // plan_hooks/step_hooks where Ctrl-C is the universal escape hatch.
         if let KeyCode::Char('c') = key.code
@@ -346,6 +363,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut StepTagsApp) {
     // -- Input overlay ----------------------------------------------------
     if let Mode::Input { buffer } = &app.mode {
         render_input_modal(frame, area, buffer);
+    }
+
+    // -- Help overlay -----------------------------------------------------
+    if app.help.is_visible() {
+        help::render(frame, area, &help::for_step_tags());
     }
 }
 

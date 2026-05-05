@@ -38,9 +38,23 @@ pub enum InputAction {
     /// The user pressed `D` to open the plan-dependencies sub-view
     /// (TUI-plan.md §1, step 33).
     OpenDependencies,
+    /// The user pressed `H` to open the plan-hooks sub-view
+    /// (TUI-plan.md §1).
+    OpenHooks,
     /// The user pressed `A` to open step detail focused on the step that
     /// owns the oldest unanswered question (TUI-plan.md §17).
     OpenQuestion(String),
+    /// The user pressed `enter` / `→` / `l` to open the step-detail view for
+    /// the step under the cursor (TUI-plan.md §7).
+    OpenStepDetail(String),
+    /// The user pressed `Q` to flip the plan's `questions_enabled` column
+    /// (TUI-plan.md §17 'Toggle surfaces').
+    ToggleQuestionsEnabled,
+    /// The user pressed `P` while a run is live to toggle the operator's
+    /// graceful-pause request. The dispatcher flips `plans.pause_requested`
+    /// — first press sets it (runner stops after the current step), second
+    /// press clears it (cancels the request before the boundary fires).
+    TogglePauseRequested,
 }
 
 /// True when J/K should scroll the live-run tails (TUI-plan.md §13) instead
@@ -173,6 +187,9 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
         // Open the plan-dependencies sub-view (TUI-plan.md §1, step 33).
         KeyCode::Char('D') => InputAction::OpenDependencies,
 
+        // Open the plan-hooks sub-view (TUI-plan.md §1).
+        KeyCode::Char('H') => InputAction::OpenHooks,
+
         // Answer the oldest unanswered question for this plan (TUI-plan.md §17).
         // No-op when there are no open questions — the dispatcher checks the
         // returned step id is `Some`.
@@ -181,10 +198,35 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             None => InputAction::None,
         },
 
-        // Esc clears selection if any; otherwise no-op (Esc does NOT pop the
-        // view — `q`/`h`/`←` own that).
+        // Flip `plans.questions_enabled` for this plan (TUI-plan.md §17
+        // 'Toggle surfaces'). Mirrors plan-list's Q binding. Edit — suppressed
+        // when locked.
+        KeyCode::Char('Q') if !locked => InputAction::ToggleQuestionsEnabled,
+
+        // Graceful pause: toggle `plans.pause_requested` while a run is live.
+        // The runner reads + clears the flag between step boundaries, so the
+        // first press signals "stop after current step" and the second press
+        // (before the boundary fires) cancels that request. Only meaningful
+        // while a run is in flight, hence the `is_run_live()` gate.
+        KeyCode::Char('P') if app.is_run_live() => InputAction::TogglePauseRequested,
+
+        // Open step detail for the highlighted step (TUI-plan.md §7).
+        // Read-only navigation, so allowed even while locked.
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            if app.steps.is_empty() {
+                InputAction::None
+            } else {
+                InputAction::OpenStepDetail(app.steps[app.selected_index].id.clone())
+            }
+        }
+
+        // Esc precedence (TUI-plan.md §4): dismiss the current toast first
+        // when one is showing; otherwise clear the selection. Esc does NOT
+        // pop the view — `q`/`h`/`←` own that.
         KeyCode::Esc => {
-            let _ = app.escape_selection();
+            if !app.toasts.dismiss() {
+                let _ = app.escape_selection();
+            }
             InputAction::None
         }
 
@@ -276,6 +318,9 @@ mod tests {
             prompt_suffix: None,
             context_prepend: None,
             questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
@@ -474,10 +519,82 @@ mod tests {
     }
 
     #[test]
+    fn test_shift_q_emits_toggle_questions_enabled() {
+        let mut app = make_app(3);
+        let action = handle_key(&mut app, key(KeyCode::Char('Q')));
+        assert_eq!(action, InputAction::ToggleQuestionsEnabled);
+    }
+
+    #[test]
+    fn test_shift_p_emits_toggle_pause_when_run_live() {
+        // P is gated on `is_run_live()`, which is true once a subscription
+        // is wired (TUI-spawned runner) or a LiveRun row is observed.
+        let mut app = make_app(3);
+        app.subscribed = true;
+        assert!(app.is_run_live());
+        let action = handle_key(&mut app, key(KeyCode::Char('P')));
+        assert_eq!(action, InputAction::TogglePauseRequested);
+    }
+
+    #[test]
+    fn test_shift_p_is_noop_when_no_run_live() {
+        // No subscription, no live_run row → P should fall through silently.
+        let mut app = make_app(3);
+        assert!(!app.is_run_live());
+        let action = handle_key(&mut app, key(KeyCode::Char('P')));
+        assert_eq!(action, InputAction::None);
+    }
+
+    #[test]
+    fn test_locked_suppresses_shift_q_toggle_questions() {
+        let mut app = make_app(3);
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('Q')));
+        assert_eq!(action, InputAction::None);
+    }
+
+    #[test]
     fn test_shift_d_emits_open_dependencies_action() {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Char('D')));
         assert_eq!(action, InputAction::OpenDependencies);
+    }
+
+    #[test]
+    fn test_shift_h_emits_open_hooks_action() {
+        let mut app = make_app(3);
+        let action = handle_key(&mut app, key(KeyCode::Char('H')));
+        assert_eq!(action, InputAction::OpenHooks);
+    }
+
+    #[test]
+    fn test_enter_emits_open_step_detail_for_cursor() {
+        let mut app = make_app(3);
+        app.selected_index = 1;
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(action, InputAction::OpenStepDetail("s1".to_string()));
+    }
+
+    #[test]
+    fn test_right_arrow_emits_open_step_detail() {
+        let mut app = make_app(3);
+        app.selected_index = 2;
+        let action = handle_key(&mut app, key(KeyCode::Right));
+        assert_eq!(action, InputAction::OpenStepDetail("s2".to_string()));
+    }
+
+    #[test]
+    fn test_l_emits_open_step_detail() {
+        let mut app = make_app(3);
+        let action = handle_key(&mut app, key(KeyCode::Char('l')));
+        assert_eq!(action, InputAction::OpenStepDetail("s0".to_string()));
+    }
+
+    #[test]
+    fn test_enter_with_no_steps_is_noop() {
+        let mut app = make_app(0);
+        let action = handle_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(action, InputAction::None);
     }
 
     #[test]
@@ -531,6 +648,49 @@ mod tests {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Esc));
         assert_eq!(action, InputAction::None);
+        assert!(!app.should_pop);
+    }
+
+    #[test]
+    fn test_esc_dismisses_toast_first_and_preserves_selection() {
+        // TUI-plan.md §4: Esc dismisses the current toast before falling
+        // through to the view's own Esc behavior. The selection must remain
+        // intact when the toast was the consumer.
+        use crate::tui::toast::ToastKind;
+        use std::time::Instant;
+
+        let mut app = make_app(3);
+        app.selected_index = 1;
+        app.toggle_selection();
+        assert!(!app.selection.is_empty());
+        app.toasts
+            .push("Saved.", ToastKind::Success, Instant::now());
+
+        let action = handle_key(&mut app, key(KeyCode::Esc));
+
+        assert_eq!(action, InputAction::None);
+        assert!(app.toasts.is_empty(), "toast must be popped");
+        assert!(
+            !app.selection.is_empty(),
+            "selection must be untouched when Esc consumed the toast"
+        );
+        assert!(!app.should_pop);
+    }
+
+    #[test]
+    fn test_esc_with_no_toast_falls_through_to_clear_selection() {
+        // Without a toast, Esc retains its existing §7 behavior: clear the
+        // selection without popping the view.
+        let mut app = make_app(3);
+        app.selected_index = 1;
+        app.toggle_selection();
+        assert!(!app.selection.is_empty());
+        assert!(app.toasts.is_empty());
+
+        let action = handle_key(&mut app, key(KeyCode::Esc));
+
+        assert_eq!(action, InputAction::None);
+        assert!(app.selection.is_empty(), "selection must be cleared");
         assert!(!app.should_pop);
     }
 
