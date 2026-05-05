@@ -481,8 +481,8 @@ Initial set (extensible; missing commands fall back to "unknown command"):
 | -------------------------------- | ----------------------------------------------------------------------------------------- |
 | `/run`                           | See §9.1 below                                                                            |
 | `/run <branch>`                  | Run with `--current-branch` on `<branch>`; if branch doesn't exist, prompt to create it   |
-| `/plan harness`                  | Open default plan harness in plan-creation mode (existing `plan harness generate`)        |
-| `/plan harness <name>`           | As above with explicit harness                                                            |
+| `/plan harness`                  | Open default plan harness in plan-creation mode (existing `plan harness generate`) — **NOT IMPLEMENTED**: the palette consumer toasts a "use the CLI for now" hint because the harness flow is interactive and not yet plumbed through the TUI subprocess hand-off. |
+| `/plan harness <name>`           | As above with explicit harness — **NOT IMPLEMENTED** (same reason)                         |
 | `/plan show [<slug>]`            | Push read-only plan summary view                                                          |
 | `/plan archive [<slug>]`         | Equivalent to pressing `d` on the slug                                                    |
 | `/plan unarchive <slug>`         | Move from archived list back                                                              |
@@ -498,9 +498,9 @@ Initial set (extensible; missing commands fall back to "unknown command"):
 | `/step edit --tags`              | Routes to step tag editor sub-view                                                        |
 | `/cancel`                        | `ralph cancel` for the live run                                                           |
 | `/export <slug>`                 | Write to `<slug>.ralph.json` in cwd                                                       |
-| `/import <path>`                 | Read JSON, prompt for slug if conflict                                                    |
+| `/import <path>`                 | Read JSON, prompt for slug if conflict — **PARTIALLY IMPLEMENTED**: imports succeed but a slug collision surfaces as an error toast instead of an inline rename prompt. |
 | `/quit` / `/q`                   | Exit TUI                                                                                  |
-| `/help`                          | Open help overlay                                                                         |
+| `/help`                          | Open help overlay — **NOT IMPLEMENTED** from the palette: `?` opens the overlay, but `/help` currently surfaces a "coming soon" info toast routed through `PaletteAction::ComingSoon`. The overlay itself is fully wired per §15. |
 
 `:` and `/` are interchangeable; both submit through the same parser. (No
 distinction between vim-style `:wq` and claude-style `/foo` — pick whichever

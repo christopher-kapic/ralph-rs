@@ -461,8 +461,6 @@ fn main() -> Result<()> {
             // from a TTY drops into TUI mode. Every other invocation (any
             // non-default flag, `--non-interactive`, or non-TTY stdout) takes
             // today's runner path unchanged so scripts see no regression.
-            // The TUI-mode dispatcher is a placeholder today — step 22 of the
-            // tui-v1 plan wires it to the real plan-detail view.
             let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
             if commands::is_default_run_invocation(&args, stdout_is_tty) {
                 commands::run_tui_mode(&conn, &config, &project, args, &out)

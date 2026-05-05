@@ -301,8 +301,9 @@ pub fn run_tui_mode(
 ///
 /// Loads tiles from the DB, sets up the alternate-screen + raw-mode terminal,
 /// runs the draw / event loop until the user quits, and tears the terminal
-/// down. Routing into plan-detail on `enter` lands in tui-v1 step 19; for now
-/// `enter` is a no-op so the read-only landing screen has no dangling actions.
+/// down. `enter` / `→` / `l` push the plan-detail view for the highlighted
+/// tile; the dispatcher reuses the same terminal session so the user can
+/// pop back here when they exit plan-detail.
 pub fn run_plan_list_tui(
     conn: &Connection,
     config: &Config,
@@ -1172,9 +1173,12 @@ pub(crate) fn flush_palette_run_toasts(
 /// `confirm_with_background`. Returns `Some(action)` for those terminal-bound
 /// variants so the dispatcher loop can run the confirm step itself.
 ///
-/// Sub-view actions that land in step 22 (`OpenPlan{Dependencies,Hooks}`,
-/// `OpenStep{Hooks,Tags}`) toast a "coming in step 22" placeholder; the run
-/// dialog actions (`OpenRunDialog`, `RunOnBranch`) defer to step 21.
+/// Sub-view actions (`OpenPlan{Dependencies,Hooks}`, `OpenStep{Hooks,Tags}`)
+/// are forwarded as `Some(action)` so the dispatcher loop can push the
+/// matching sub-view; `OpenStep*` variants on the plan-list view (which
+/// has no focused step) toast a "Open a step first…" hint instead. The
+/// run-dialog actions (`OpenRunDialog`, `RunOnBranch`) are likewise
+/// forwarded so the caller can drive the modal over the live view.
 pub(crate) fn plan_list_apply_palette_action(
     conn: &Connection,
     project: &str,
@@ -1275,10 +1279,10 @@ pub(crate) fn plan_list_apply_palette_action(
         }
         PaletteAction::ComingSoon {
             label,
-            target_step,
+            target_step: _,
         } => {
             app.toasts.push(
-                format!("{label}: coming soon — landing in step {target_step}."),
+                format!("{label}: palette wiring pending — see TUI-plan.md §9."),
                 ToastKind::Info,
                 Instant::now(),
             );
@@ -1436,8 +1440,9 @@ fn apply_palette_export(
 }
 
 /// Helper for `PaletteAction::Import`: reads the file, imports with no slug
-/// override, and toasts. Slug-conflict resolution will land alongside the
-/// import sub-view in step 22; for now duplicates surface as an error toast.
+/// override, and toasts. Slug-conflict resolution (an inline rename prompt)
+/// is **not implemented**; duplicates surface as an error toast. See the
+/// `/import` row in TUI-plan.md §9 (PARTIALLY IMPLEMENTED).
 fn apply_palette_import(
     path: &str,
     conn: &Connection,
@@ -1877,10 +1882,10 @@ pub(crate) fn archived_list_apply_palette_action(
         }
         PaletteAction::ComingSoon {
             label,
-            target_step,
+            target_step: _,
         } => {
             app.toasts.push(
-                format!("{label}: coming soon — landing in step {target_step}."),
+                format!("{label}: palette wiring pending — see TUI-plan.md §9."),
                 ToastKind::Info,
                 Instant::now(),
             );
@@ -2070,9 +2075,9 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
         //     `run_locks` snapshot is intentionally skipped because the
         //     stream gives us strictly fresher data and avoids the
         //     250ms polling round-trip.
-        //   - No subscription (read-only attach landing in step 38): fall
-        //     back to polling `run_locks` so the banner still surfaces
-        //     externally-spawned runs.
+        //   - No subscription (read-only attach to an externally spawned
+        //     runner): fall back to polling `run_locks` so the banner
+        //     still surfaces externally-spawned runs.
         if let Some(sub) = subscription.as_mut() {
             for evt in sub.drain() {
                 tui_events::dispatch_event(&mut app, &evt);
@@ -2382,8 +2387,9 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
         }
         if app.should_pop {
             // Dropping the subscription tears down its tokio runtime and
-            // (via `kill_on_drop`) terminates the runner subprocess.
-            // Step 38 (read-only attach) will detach instead of kill.
+            // (via `kill_on_drop`) terminates the runner subprocess. The
+            // read-only attach path holds no subscription, so this drop is
+            // a no-op there — the external runner is left to finish.
             drop(subscription);
             return Ok(());
         }
@@ -3015,10 +3021,10 @@ pub(crate) fn plan_detail_apply_palette_action(
         }
         PaletteAction::ComingSoon {
             label,
-            target_step,
+            target_step: _,
         } => {
             app.toasts.push(
-                format!("{label}: coming soon — landing in step {target_step}."),
+                format!("{label}: palette wiring pending — see TUI-plan.md §9."),
                 ToastKind::Info,
                 Instant::now(),
             );
@@ -3699,11 +3705,11 @@ fn run_step_tags_tui<B: ratatui::backend::Backend>(
 /// already-open terminal and raw-mode session — the caller (`run_plan_detail_tui`
 /// after `A` on the open-questions banner) owns terminal teardown.
 ///
-/// Currently scoped to the §17 question flow: rendering the open-question
-/// pane, driving the answer modal, persisting answers via storage, and
-/// popping the resume-implementation modal once the last question is
-/// cleared. Other step-detail keybindings (`c` editor handoffs, picker,
-/// step navigation) are handed off in subsequent tui-v1 steps.
+/// Drives every step-detail interaction: pane navigation (`j`/`k`), `c`
+/// editor handoffs for editable text panes, bottom-row picker (Harness /
+/// Model / Agent / Change policy), the §17 question flow (open-question
+/// pane, answer modal, resume-implementation modal), zen-mode toggle,
+/// palette and help overlay routing.
 /// Sorted, deduplicated list of agent stems (filenames in
 /// `Config::agents_dir()` with the `.md` suffix stripped). Used to populate
 /// the bottom-row Agent picker — failures (missing dir, unreadable entries)
@@ -4177,10 +4183,10 @@ pub(crate) fn step_detail_apply_palette_action(
         }
         PaletteAction::ComingSoon {
             label,
-            target_step,
+            target_step: _,
         } => {
             app.toasts.push(
-                format!("{label}: coming soon — landing in step {target_step}."),
+                format!("{label}: palette wiring pending — see TUI-plan.md §9."),
                 ToastKind::Info,
                 Instant::now(),
             );
@@ -4274,8 +4280,8 @@ pub(crate) fn step_detail_observe_read_only(
 ///   `PlanPrompt` / `StepPrompt` / `Tests` → the matching `edit_*_pane`
 ///   method on `StepDetailApp`.
 /// - `Appended` / `OpenQuestions` → no-op (those panes are read-only).
-/// - `BottomRow` → no-op here; opening the focused cell's picker is
-///   wired in step 12 of this plan.
+/// - `BottomRow` → no-op here; the focused cell's picker is opened by
+///   `step_detail_handle_bottom_row_c` instead.
 ///
 /// `config` is cloned locally so the pane's `&mut Config` can be persisted
 /// via `save_at`; the on-disk file is the source of truth, and the app's
@@ -7234,7 +7240,7 @@ mod step_detail_dispatcher_tests {
     fn c_on_read_only_panes_is_a_noop() {
         // Appended / OpenQuestions / BottomRow shouldn't run the edit handoff
         // or toast — bare `c` is reserved for the editable text panes
-        // (BottomRow gets its own picker behavior in step 12 of this plan).
+        // (BottomRow has its own picker handler that runs separately).
         let dir = tempfile::tempdir().unwrap();
         for pane in [Pane::Appended, Pane::OpenQuestions, Pane::BottomRow] {
             let conn = crate::db::open_memory().unwrap();
