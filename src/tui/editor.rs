@@ -206,6 +206,17 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    // Invoke scripts via `/bin/sh <path>` rather than exec'ing them directly:
+    // when cargo runs tests in parallel, another thread's freshly-forked child
+    // can inherit a writable fd to our script across its fork→exec window,
+    // and Linux returns ETXTBSY on execve while any process holds the file
+    // open for write. `sh` opens the script as a regular file, so it sidesteps
+    // the race.
+    #[cfg(unix)]
+    fn sh_editor(script: &Path) -> String {
+        format!("/bin/sh {}", script.display())
+    }
+
     #[cfg(unix)]
     #[test]
     fn edit_at_returns_modified_contents() {
@@ -214,7 +225,7 @@ mod tests {
         write_script(&script, "#!/bin/sh\necho MODIFIED > \"$1\"\n");
 
         let target = tmp.path().join("file.md");
-        let result = edit_at(script.to_str().unwrap(), &target, "initial").unwrap();
+        let result = edit_at(&sh_editor(&script), &target, "initial").unwrap();
         assert_eq!(result, Some("MODIFIED\n".to_string()));
         assert!(!target.exists(), "tempfile should be deleted on success");
     }
@@ -227,7 +238,7 @@ mod tests {
         write_script(&script, "#!/bin/sh\nexit 1\n");
 
         let target = tmp.path().join("file.md");
-        let result = edit_at(script.to_str().unwrap(), &target, "initial").unwrap();
+        let result = edit_at(&sh_editor(&script), &target, "initial").unwrap();
         assert_eq!(result, None);
         assert!(
             target.exists(),
@@ -249,7 +260,7 @@ mod tests {
         );
 
         let target = tmp.path().join("file.md");
-        let _ = edit_at(script.to_str().unwrap(), &target, "INITIAL CONTENT").unwrap();
+        let _ = edit_at(&sh_editor(&script), &target, "INITIAL CONTENT").unwrap();
         let seen = fs::read_to_string(&copy).unwrap();
         assert_eq!(seen, "INITIAL CONTENT");
     }
@@ -266,7 +277,7 @@ mod tests {
         );
 
         let target = tmp.path().join("file.md");
-        let editor = format!("{} --flag", script.to_str().unwrap());
+        let editor = format!("/bin/sh {} --flag", script.display());
         let result = edit_at(&editor, &target, "initial").unwrap();
         assert_eq!(result, Some("OK\n".to_string()));
     }
@@ -281,7 +292,7 @@ mod tests {
         write_script(&script, "#!/bin/sh\nexit 0\n");
 
         let target = tmp.path().join("file.md");
-        let result = edit_at(script.to_str().unwrap(), &target, "untouched").unwrap();
+        let result = edit_at(&sh_editor(&script), &target, "untouched").unwrap();
         assert_eq!(result, Some("untouched".to_string()));
     }
 }

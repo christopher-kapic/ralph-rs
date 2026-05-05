@@ -185,6 +185,8 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
+**Test footgun — ETXTBSY on freshly-written scripts:** Tests that write a shell script to a tempdir and then `Command::new(script).status()` it can intermittently fail in CI with `Text file busy (os error 26)`. Cause: cargo runs tests in parallel; another thread's spawned child can inherit a writable fd to the script across its fork→exec window, and Linux refuses `execve()` while any process holds the file open for write. **Fix:** invoke via `/bin/sh <path>` instead of exec'ing the script directly — `sh` opens it as a regular file and sidesteps the kernel's writer-check. See `sh_editor()` in `src/tui/editor.rs` for the pattern.
+
 ## Related Projects
 
 - **kctx-local** (sibling at `../kctx-local/`) — Local-first Q&A CLI for codebases. Uses same Rust patterns.
