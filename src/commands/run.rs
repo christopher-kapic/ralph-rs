@@ -396,6 +396,9 @@ pub fn run_plan_list_tui(
                     KeyCode::Char('Q') if !locked => {
                         plan_list_toggle_questions_cursor(conn, project, &mut app)?;
                     }
+                    KeyCode::Char('r') => {
+                        plan_list_refresh(conn, project, &mut app)?;
+                    }
                     KeyCode::Char('i') | KeyCode::Char('a') if !locked => {
                         plan_list_create_plan(conn, config, project, &mut terminal, &mut app)?;
                     }
@@ -542,6 +545,25 @@ pub(crate) fn plan_list_toggle_questions_cursor(
         "Questions disabled."
     };
     app.toasts.push(msg, ToastKind::Success, Instant::now());
+    Ok(())
+}
+
+/// `r` action in the plan-list view (TUI-plan.md §5): re-query plans from the
+/// DB and toast the user. Re-uses `refresh_plan_list_state` (the same fetch
+/// path used at view entry and on focus return), so the cursor is clamped
+/// into the new range and the preview cache is dropped. Permitted in
+/// read-only mode — refresh is purely a read operation.
+pub(crate) fn plan_list_refresh(
+    conn: &Connection,
+    project: &str,
+    app: &mut crate::tui::views::plan_list::PlanListApp,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    refresh_plan_list_state(conn, project, app)?;
+    app.toasts
+        .push("Refreshed.", ToastKind::Info, Instant::now());
     Ok(())
 }
 
@@ -3922,6 +3944,49 @@ mod plan_list_action_tests {
         let mut app = PlanListApp::new(vec![], "/proj", "UTC");
         plan_list_toggle_questions_cursor(&conn, "/proj", &mut app).unwrap();
         assert!(app.toasts.is_empty());
+    }
+
+    // -- refresh ---------------------------------------------------------
+
+    #[test]
+    fn refresh_picks_up_externally_inserted_plan_and_toasts() {
+        let project = "/tmp/refresh-pickup";
+        let (conn, mut app) = seed_app(project);
+        let initial_len = app.tiles.len();
+
+        // Simulate an external mutation: another process inserts a plan
+        // while the TUI is open. Without `r`, the in-memory tile list would
+        // remain stale.
+        storage::create_plan(&conn, "gamma", project, "b3", "d", None, None, &[]).unwrap();
+        assert_eq!(app.tiles.len(), initial_len);
+
+        plan_list_refresh(&conn, project, &mut app).unwrap();
+
+        assert_eq!(app.tiles.len(), initial_len + 1);
+        assert!(app.tiles.iter().any(|t| t.plan.slug == "gamma"));
+        assert_eq!(app.toasts.current().unwrap().text, "Refreshed.");
+    }
+
+    #[test]
+    fn refresh_drops_externally_archived_plan() {
+        let project = "/tmp/refresh-archive";
+        let (conn, mut app) = seed_app(project);
+        let id = app.tiles[0].plan.id.clone();
+
+        storage::update_plan_status(&conn, &id, crate::plan::PlanStatus::Archived).unwrap();
+        plan_list_refresh(&conn, project, &mut app).unwrap();
+
+        assert_eq!(app.tiles.len(), 1);
+        assert!(!app.tiles.iter().any(|t| t.plan.id == id));
+    }
+
+    #[test]
+    fn refresh_on_empty_project_still_toasts() {
+        let conn = db::open_memory().unwrap();
+        let mut app = PlanListApp::new(vec![], "/proj", "UTC");
+        plan_list_refresh(&conn, "/proj", &mut app).unwrap();
+        assert!(app.tiles.is_empty());
+        assert_eq!(app.toasts.current().unwrap().text, "Refreshed.");
     }
 
     // -- create-plan -----------------------------------------------------

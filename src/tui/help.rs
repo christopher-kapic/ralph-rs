@@ -165,6 +165,7 @@ pub fn for_plan_list() -> HelpModel {
             Group::new(
                 "Other",
                 vec![
+                    ("r", "Refresh from DB"),
                     ("?", "Toggle this help"),
                     ("/ or :", "Open command palette"),
                     ("q / Ctrl-C", "Quit TUI"),
