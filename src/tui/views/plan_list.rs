@@ -713,13 +713,36 @@ pub(crate) fn render_tile(
         .as_deref()
         .map(|s| s.chars().count())
         .unwrap_or(0);
-    let title_max = (inner.width as usize).saturating_sub(badge_cols);
+    // §5: when `questions_enabled` is on, reserve 2 cols at the left of the
+    // title row for a `?` glyph + space separator (top-left corner badge).
+    let q_cols: usize = if tile.plan.questions_enabled { 2 } else { 0 };
+    let title_max = (inner.width as usize).saturating_sub(badge_cols + q_cols);
     let title = Paragraph::new(Line::from(Span::styled(
         truncate(tile.plan.slug.as_str(), title_max),
         title_style,
     )));
-    let title_area = Rect { height: 1, ..inner };
+    let title_area = Rect {
+        x: inner.x.saturating_add(q_cols as u16),
+        y: inner.y,
+        width: inner.width.saturating_sub(q_cols as u16),
+        height: 1,
+    };
     title.render(title_area, buf);
+    if tile.plan.questions_enabled && inner.width > 0 {
+        let q_para = Paragraph::new(Span::styled(
+            "?",
+            Style::default()
+                .fg(theme::STATUS_QUESTION)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let q_area = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: 1,
+            height: 1,
+        };
+        q_para.render(q_area, buf);
+    }
     if let Some(text) = badge_text
         && (inner.width as usize) >= badge_cols
     {
@@ -1221,6 +1244,60 @@ mod tests {
         render_tiles(&mut buf, area, &app);
         let row1 = (0..30).map(|x| buf[(x, 1)].symbol()).collect::<String>();
         assert!(row1.contains("[1]"), "expected [1] badge: {row1:?}");
+    }
+
+    // -- `?` corner badge for questions_enabled (TUI-plan.md §5) -----------
+
+    #[test]
+    fn render_tile_with_questions_enabled_renders_corner_question_glyph() {
+        // §5: when `questions_enabled` is true, the tile shows a `?` glyph
+        // in the top-LEFT corner of the title row (inner.x, inner.y).
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
+        let area = buf.area;
+        let mut tile = make_tile("plan");
+        tile.plan.questions_enabled = true;
+        render_tile(&mut buf, area, &tile, false, None, "UTC");
+        // Title row is row 1 (inner.y = 1 with single-cell border).
+        // First inner column (x=1) should hold the `?`.
+        assert_eq!(buf[(1, 1)].symbol(), "?");
+        assert_eq!(buf[(1, 1)].style().fg, Some(theme::STATUS_QUESTION));
+    }
+
+    #[test]
+    fn render_tile_without_questions_enabled_omits_corner_question_glyph() {
+        // questions_enabled = false → no `?` in the top-left, and the title
+        // starts flush at inner.x as before.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
+        let area = buf.area;
+        let tile = make_tile("plan");
+        assert!(!tile.plan.questions_enabled);
+        render_tile(&mut buf, area, &tile, false, None, "UTC");
+        // No `?` at the top-left inner cell.
+        assert_ne!(buf[(1, 1)].symbol(), "?");
+        // Title still anchored at inner.x — first slug char "p" sits at x=1.
+        assert_eq!(buf[(1, 1)].symbol(), "p");
+    }
+
+    #[test]
+    fn render_tile_selected_with_questions_enabled_renders_both_badges() {
+        // §5: a selected, questions-enabled tile shows BOTH the `?` glyph
+        // (top-left) and the `[N]` selection-order badge (top-right). The
+        // two badges live on opposite sides of the title row and don't
+        // collide.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
+        let area = buf.area;
+        let mut tile = make_tile("plan");
+        tile.plan.questions_enabled = true;
+        render_tile(&mut buf, area, &tile, false, Some(2), "UTC");
+        // Top-left: `?` glyph.
+        assert_eq!(buf[(1, 1)].symbol(), "?");
+        assert_eq!(buf[(1, 1)].style().fg, Some(theme::STATUS_QUESTION));
+        // Top-right: `[2]` badge somewhere on the title row.
+        let row1 = (0..30).map(|x| buf[(x, 1)].symbol()).collect::<String>();
+        assert!(row1.contains("[2]"), "expected [2] badge: {row1:?}");
+        // Title slug shifts right by 2 cols to leave room for `?` + space.
+        // First slug char "p" now sits at x = inner.x + 2 = 3.
+        assert_eq!(buf[(3, 1)].symbol(), "p");
     }
 
     // -- Cursor target ------------------------------------------------------
