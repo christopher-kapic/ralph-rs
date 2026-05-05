@@ -924,6 +924,9 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
             InputAction::Stop => {
                 plan_detail_apply_stop(conn, &mut app, project, slug)?;
             }
+            InputAction::OpenDependencies => {
+                run_plan_dependencies_tui(terminal, conn, &mut app)?;
+            }
         }
         if app.should_pop {
             // The spawned runner is its own process; popping the view
@@ -1326,6 +1329,137 @@ fn confirm_with_plan_detail_background<B: ratatui::backend::Backend>(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Plan-dependencies sub-view loop (TUI-plan.md §1, step 33)
+// ---------------------------------------------------------------------------
+
+/// Run the plan-dependencies sub-view loop until the user backs out. Reads
+/// the focused plan's deps from the DB, drives the sub-view's state machine
+/// for `a`/`d`/`q`/`<esc>`, and writes through to
+/// [`storage::add_plan_dependency`] / [`storage::remove_plan_dependency`] on
+/// each successful outcome. Cycles are caught with
+/// [`storage::would_create_cycle`] before the insert and surfaced as an
+/// error toast rather than letting the user wait on a storage error.
+fn run_plan_dependencies_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    plan_app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+) -> Result<()> {
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::plan_dependencies::{Mode, Outcome, PlanDependenciesApp, render};
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let plan_id = plan_app.plan.id.clone();
+    let plan_slug = plan_app.plan.slug.clone();
+    let project = plan_app.plan.project.clone();
+
+    let (deps, candidates) = load_dependencies_view_state(conn, &project, &plan_id)?;
+    let mut app = PlanDependenciesApp::new(plan_id.clone(), plan_slug, deps, candidates);
+
+    loop {
+        terminal.draw(|f| render(f, f.area(), &mut app))?;
+
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+        match app.handle_key(key) {
+            Outcome::Pending => {}
+            Outcome::Pop => return Ok(()),
+            Outcome::AddRequested { dep_plan_id } => {
+                // Pre-check the cycle so we can render a friendly toast
+                // instead of bubbling the storage error. `add_plan_dependency`
+                // also checks defensively, so a concurrent edit can't slip
+                // a cycle through.
+                if storage::would_create_cycle(conn, &plan_id, &dep_plan_id)? {
+                    app.push_toast(
+                        "Adding that dependency would create a cycle.",
+                        ToastKind::Error,
+                    );
+                    continue;
+                }
+                if let Err(e) = storage::add_plan_dependency(conn, &plan_id, &dep_plan_id) {
+                    app.push_toast(
+                        format!("Failed to add dependency: {e}"),
+                        ToastKind::Error,
+                    );
+                    continue;
+                }
+                let (deps, candidates) =
+                    load_dependencies_view_state(conn, &project, &plan_id)?;
+                app.refresh(deps, candidates);
+                // Drop back to the list so the user sees the new row.
+                app.mode = Mode::List;
+                app.push_toast("Dependency added.", ToastKind::Success);
+            }
+            Outcome::RemoveRequested { dep_plan_id } => {
+                if let Err(e) = storage::remove_plan_dependency(conn, &plan_id, &dep_plan_id) {
+                    app.push_toast(
+                        format!("Failed to remove dependency: {e}"),
+                        ToastKind::Error,
+                    );
+                    continue;
+                }
+                let (deps, candidates) =
+                    load_dependencies_view_state(conn, &project, &plan_id)?;
+                app.refresh(deps, candidates);
+                app.push_toast("Dependency removed.", ToastKind::Success);
+            }
+        }
+    }
+}
+
+/// Read the dependency edges and the picker candidate list for `plan_id`.
+///
+/// Candidates are every other non-archived plan in the project that is not
+/// already a direct dependency. The cycle check still runs at add-time as
+/// defense-in-depth — pre-filtering by direct deps doesn't catch transitive
+/// cycles that would close once the new edge is inserted.
+fn load_dependencies_view_state(
+    conn: &Connection,
+    project: &str,
+    plan_id: &str,
+) -> Result<(
+    Vec<crate::tui::views::plan_dependencies::PlanRef>,
+    Vec<crate::tui::views::plan_dependencies::PlanRef>,
+)> {
+    use crate::tui::views::plan_dependencies::PlanRef;
+
+    let dep_ids = storage::list_plan_dependencies(conn, plan_id)?;
+    // `list_plans(_, _, false)` filters by project; archived plans are still
+    // included in the result set, which is fine — the cycle pre-check and
+    // candidate-list filter both run separately below.
+    let all_plans = storage::list_plans(conn, project, false)?;
+
+    let mut deps: Vec<PlanRef> = Vec::with_capacity(dep_ids.len());
+    for id in &dep_ids {
+        if let Some(plan) = all_plans.iter().find(|p| &p.id == id) {
+            deps.push(PlanRef {
+                id: plan.id.clone(),
+                slug: plan.slug.clone(),
+            });
+        }
+    }
+
+    let candidates: Vec<PlanRef> = all_plans
+        .iter()
+        .filter(|p| {
+            p.id != plan_id
+                && p.status != crate::plan::PlanStatus::Archived
+                && !dep_ids.contains(&p.id)
+        })
+        .map(|p| PlanRef {
+            id: p.id.clone(),
+            slug: p.slug.clone(),
+        })
+        .collect();
+
+    Ok((deps, candidates))
 }
 
 // ---------------------------------------------------------------------------

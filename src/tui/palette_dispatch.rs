@@ -199,7 +199,15 @@ pub enum PaletteAction {
     Import { path: String },
     /// `/quit` or `/q` — exit the TUI cleanly.
     Quit,
-    /// Recognized command stubbed for a later tui-v1 step (33–36, 43).
+    /// `/plan dependency add|remove|list [<slug>]` — push the
+    /// plan-dependencies sub-view for `plan_id` (TUI-plan.md §1, step 33).
+    /// All three subcommands route here because the sub-view itself owns
+    /// add/remove via `a`/`d` keybindings; the verb in the palette is just
+    /// the entry door. The orchestrator resolves `slug` (explicit if given,
+    /// else focus) and the consuming view loads dep / candidate snapshots
+    /// from storage on entry.
+    OpenPlanDependencies { plan_id: String, slug: String },
+    /// Recognized command stubbed for a later tui-v1 step (34–36, 43).
     /// Caller renders a `Coming soon — landing in step <N>` info toast.
     ComingSoon {
         label: &'static str,
@@ -255,15 +263,17 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
         // -- /step move <num> --to <m> ------------------------------------
         PaletteCommand::StepMove { num, to } => dispatch_step_move(*num, *to, ctx),
 
-        // -- v1-deferred sub-views (steps 33–36) --------------------------
-        // The toast text is rendered by the dispatcher loop from the
-        // `target_step`. Sub-view step numbers come from the tui-v1 plan map.
+        // -- /plan dependency add|remove|list -----------------------------
+        // All three subcommands push the same sub-view (step 33). The
+        // sub-view owns add (`a`) / remove (`d`) interactively, so the
+        // verb in the palette is just the entry door.
         PaletteCommand::PlanDependencyAdd
         | PaletteCommand::PlanDependencyRemove
-        | PaletteCommand::PlanDependencyList => PaletteAction::ComingSoon {
-            label: cmd.label(),
-            target_step: 33,
-        },
+        | PaletteCommand::PlanDependencyList => dispatch_plan_dependencies(ctx),
+
+        // -- v1-deferred sub-views (steps 34–36) --------------------------
+        // The toast text is rendered by the dispatcher loop from the
+        // `target_step`. Sub-view step numbers come from the tui-v1 plan map.
         PaletteCommand::PlanSetHook | PaletteCommand::PlanUnsetHook | PaletteCommand::PlanHooks => {
             PaletteAction::ComingSoon {
                 label: cmd.label(),
@@ -542,6 +552,23 @@ fn dispatch_export(
         }
     } else {
         unknown_plan_toast(slug)
+    }
+}
+
+fn dispatch_plan_dependencies(ctx: &PaletteContext<'_>) -> PaletteAction {
+    // The sub-view always opens against the focused plan; the palette verb
+    // doesn't take an explicit slug. Plan-list / archived-list don't have a
+    // single "open" plan, but the focus pointer always identifies one when
+    // the user is sitting on a plan tile.
+    match resolve_slug(None, ctx) {
+        ResolvedSlug::Some(target) => PaletteAction::OpenPlanDependencies {
+            plan_id: target.id,
+            slug: target.slug,
+        },
+        ResolvedSlug::Missing | ResolvedSlug::Unknown(_) => PaletteAction::Toast {
+            message: "Open a plan first to edit dependencies.".to_string(),
+            kind: ToastKind::Info,
+        },
     }
 }
 
@@ -1416,24 +1443,39 @@ mod tests {
         );
     }
 
-    // -- v1-deferred sub-views become ComingSoon --------------------------
+    // -- /plan dependency routes to OpenPlanDependencies (step 33) --------
 
     #[test]
-    fn plan_dependency_subcommands_route_to_step_33() {
-        let c = Ctx::new();
+    fn plan_dependency_subcommands_open_sub_view_with_focused_plan() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
         for input in [
             "/plan dependency add",
             "/plan dependency remove",
             "/plan dependency list",
         ] {
             match dispatch_str(input, &c) {
-                PaletteAction::ComingSoon { label, target_step } => {
-                    assert!(label.starts_with("/plan dependency"), "label: {label}");
-                    assert_eq!(target_step, 33);
+                PaletteAction::OpenPlanDependencies { plan_id, slug } => {
+                    assert_eq!(plan_id, "id-alpha");
+                    assert_eq!(slug, "alpha");
                 }
-                other => panic!("expected ComingSoon for {input}, got {other:?}"),
+                other => panic!("expected OpenPlanDependencies for {input}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn plan_dependency_subcommands_toast_when_no_focused_plan() {
+        let c = Ctx::new();
+        let action = dispatch_str("/plan dependency add", &c);
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "Open a plan first to edit dependencies.".to_string(),
+                kind: ToastKind::Info,
+            }
+        );
     }
 
     #[test]

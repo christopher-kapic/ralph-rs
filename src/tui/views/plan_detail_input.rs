@@ -35,6 +35,9 @@ pub enum InputAction {
     /// The user pressed `S` to stop the live run via `ralph cancel` semantics
     /// (SIGTERM with timeout, fall back to SIGKILL).
     Stop,
+    /// The user pressed `D` to open the plan-dependencies sub-view
+    /// (TUI-plan.md §1, step 33).
+    OpenDependencies,
 }
 
 /// Handle a key event and return the resulting action.
@@ -130,6 +133,9 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
 
         // Stop the live run (TUI-plan.md §7).
         KeyCode::Char('S') => InputAction::Stop,
+
+        // Open the plan-dependencies sub-view (TUI-plan.md §1, step 33).
+        KeyCode::Char('D') => InputAction::OpenDependencies,
 
         // Esc clears selection if any; otherwise no-op (Esc does NOT pop the
         // view — `q`/`h`/`←` own that).
@@ -427,6 +433,13 @@ mod tests {
         let mut app = make_app(3);
         let action = handle_key(&mut app, key(KeyCode::Char('S')));
         assert_eq!(action, InputAction::Stop);
+    }
+
+    #[test]
+    fn test_shift_d_emits_open_dependencies_action() {
+        let mut app = make_app(3);
+        let action = handle_key(&mut app, key(KeyCode::Char('D')));
+        assert_eq!(action, InputAction::OpenDependencies);
     }
 
     #[test]

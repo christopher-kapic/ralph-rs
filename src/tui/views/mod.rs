@@ -6,6 +6,7 @@
 
 pub mod archived_list;
 pub mod create_plan;
+pub mod plan_dependencies;
 pub mod plan_detail;
 pub mod plan_detail_input;
 pub mod plan_detail_ui;
