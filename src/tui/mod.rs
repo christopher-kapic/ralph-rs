@@ -19,3 +19,4 @@ pub mod theme;
 pub mod toast;
 pub mod view;
 pub mod views;
+pub mod widgets;

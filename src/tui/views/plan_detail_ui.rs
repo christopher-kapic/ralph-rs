@@ -11,7 +11,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use super::plan_detail::{AddPosition, InputMode, PlanDetailApp};
 use crate::plan::{Phase, StepStatus};
@@ -20,6 +20,7 @@ use crate::tui::events::TAIL_VISIBLE_LINES;
 use crate::tui::help;
 use crate::tui::read_only;
 use crate::tui::theme;
+use crate::tui::widgets::step_list;
 
 /// Render the entire plan-detail view.
 pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
@@ -98,56 +99,21 @@ fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatu
 // ---------------------------------------------------------------------------
 
 fn draw_step_list(frame: &mut Frame, app: &mut PlanDetailApp, area: Rect) {
-    let items: Vec<ListItem> = app
-        .steps
-        .iter()
-        .enumerate()
-        .map(|(i, step)| {
-            let indicator = PlanDetailApp::status_indicator(step.status);
-            let label = format!("{indicator} {}. {}", i + 1, step.title);
-            let style = match step.status {
-                StepStatus::Complete => Style::default().fg(theme::STATUS_COMPLETE),
-                StepStatus::InProgress => Style::default()
-                    .fg(theme::STATUS_IN_PROGRESS)
-                    .add_modifier(Modifier::BOLD),
-                StepStatus::Failed => Style::default().fg(theme::STATUS_FAILED),
-                StepStatus::Skipped => Style::default().fg(theme::CHROME_DIM),
-                StepStatus::Aborted => Style::default().fg(theme::STATUS_FAILED),
-                StepStatus::Pending => Style::default().fg(theme::STATUS_PENDING),
-            };
-            // Selection badge ([N]) appended after the title when selected.
-            // §7 multi-select rendering — pick order drives N (1-based).
-            let mut spans = vec![Span::styled(label, style)];
-            if let Some(n) = app.selection.index_of(&step.id) {
-                spans.push(Span::raw(" "));
-                spans.push(Span::styled(
-                    format!("[{n}]"),
-                    Style::default()
-                        .fg(theme::SELECTION)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-
-    let title = format!(" {} ", app.plan.slug);
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(
-            Style::default()
-                .add_modifier(Modifier::REVERSED)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-
-    app.list_state.select(Some(app.selected_index));
-    frame.render_stateful_widget(list, area, &mut app.list_state);
+    let cursor = if app.steps.is_empty() {
+        None
+    } else {
+        Some(app.selected_index)
+    };
+    step_list::render(
+        frame,
+        area,
+        &app.steps,
+        &app.selection,
+        cursor,
+        app.is_run_live(),
+        app.plan.slug.as_str(),
+        &mut app.list_state,
+    );
 }
 
 // ---------------------------------------------------------------------------
