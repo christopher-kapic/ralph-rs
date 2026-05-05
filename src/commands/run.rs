@@ -1799,6 +1799,34 @@ fn load_dependencies_view_state(
 /// popping the resume-implementation modal once the last question is
 /// cleared. Other step-detail keybindings (`c` editor handoffs, picker,
 /// step navigation) are handed off in subsequent tui-v1 steps.
+/// Sorted, deduplicated list of agent stems (filenames in
+/// `Config::agents_dir()` with the `.md` suffix stripped). Used to populate
+/// the bottom-row Agent picker — failures (missing dir, unreadable entries)
+/// fall through to an empty list so the picker shows its empty placeholder
+/// rather than panicking.
+fn list_agent_names() -> Vec<String> {
+    let Ok(dir) = crate::config::agents_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().is_some_and(|ext| ext == "md") {
+                path.file_stem().map(|s| s.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 fn run_step_detail_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
@@ -1811,6 +1839,7 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
     use crate::tui::toast::ToastKind;
     use crate::tui::views::answer_modal::ResumeModalAction;
     use crate::tui::views::step_detail::{self, Pane, StepDetailApp};
+    use crate::tui::views::step_detail_picker::PickerOutcome;
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
     use std::time::Instant;
 
@@ -1852,6 +1881,29 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             _ => continue,
         };
+
+        // Bottom-row picker (TUI-plan.md §8) takes priority over every other
+        // handler — j/k/Enter/Esc/typed-char must drive the picker rather
+        // than the underlying view.
+        if app.picker.is_some() {
+            if let Some(outcome) = app.picker_handle_key(key) {
+                match outcome {
+                    PickerOutcome::Pending => {}
+                    PickerOutcome::Cancelled => app.close_picker(),
+                    PickerOutcome::Submit { kind, value } => {
+                        if let Err(e) = app.apply_picker_submit(conn, kind, &value) {
+                            app.toasts.push(
+                                format!("Failed to apply: {e}"),
+                                ToastKind::Error,
+                                Instant::now(),
+                            );
+                        }
+                        app.close_picker();
+                    }
+                }
+            }
+            continue;
+        }
 
         // §15 help overlay: `?` toggles, `<esc>`/`q`/Ctrl-C close. Run before
         // the modal handlers so a stuck overlay can always be dismissed; we
@@ -1924,6 +1976,10 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             KeyCode::Char('q') => app.request_pop(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.request_pop();
+            }
+            KeyCode::Char('c') if app.focused_pane == Pane::BottomRow => {
+                let agents = list_agent_names();
+                app.open_picker_for_focused_cell(&agents);
             }
             KeyCode::Char('c') => {
                 let dir = crate::config::config_dir()?;
