@@ -14,3 +14,4 @@ pub mod plan_hooks;
 pub mod plan_list;
 pub mod step_detail;
 pub mod step_detail_picker;
+pub mod step_hooks;

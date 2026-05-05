@@ -56,6 +56,22 @@ pub struct PlanRef {
     pub status: PlanStatus,
 }
 
+/// Lightweight projection of the focused step inside step-detail, used by
+/// `/step set-hook|unset-hook` to resolve the per-step sub-view target.
+///
+/// Only views that actually have a focused step (currently step-detail) set
+/// this; other views leave it `None` and `/step set-hook` falls through to a
+/// "Open a step first…" toast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusedStep {
+    /// `steps.id` for the focused step.
+    pub id: String,
+    /// Display label for the step (e.g. `#3 — Step title`), forwarded into
+    /// the step-hook sub-view's title bar so the user always knows which
+    /// step they're scoped to.
+    pub label: String,
+}
+
 /// Read-only context the pure dispatcher reads while resolving a command.
 ///
 /// Slices borrow from the calling view's state so we don't have to clone the
@@ -70,6 +86,9 @@ pub struct PaletteContext<'a> {
     /// surrounding view has no inferable target (e.g. archived list with
     /// nothing under the cursor).
     pub focused_slug: Option<&'a str>,
+    /// Step under the cursor (step-detail only). Used to resolve
+    /// `/step set-hook|unset-hook`. Other views leave this `None`.
+    pub focused_step: Option<&'a FocusedStep>,
     /// Selection-aware run targets resolved by the caller (selection in
     /// pick order, or just the cursor's plan when no selection). Empty
     /// means the surrounding view has nothing to run.
@@ -215,7 +234,18 @@ pub enum PaletteAction {
     /// consuming view loads the attachment / library snapshots from storage
     /// and the hook library on entry.
     OpenPlanHooks { plan_id: String, slug: String },
-    /// Recognized command stubbed for a later tui-v1 step (35–36, 43).
+    /// `/step set-hook|unset-hook` — push the step-hooks sub-view scoped to
+    /// the focused step (TUI-plan.md §1, step 35). The sub-view owns
+    /// add/remove via `a`/`d` keybindings and the same two-step
+    /// lifecycle/hook picker as `OpenPlanHooks`. Resolved against
+    /// `focused_slug` + `focused_step`; both must be present.
+    OpenStepHooks {
+        plan_id: String,
+        step_id: String,
+        plan_slug: String,
+        step_label: String,
+    },
+    /// Recognized command stubbed for a later tui-v1 step (36, 43).
     /// Caller renders a `Coming soon — landing in step <N>` info toast.
     ComingSoon {
         label: &'static str,
@@ -287,13 +317,13 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
             dispatch_plan_hooks(ctx)
         }
 
-        // -- v1-deferred sub-views (steps 35–36) --------------------------
-        // The toast text is rendered by the dispatcher loop from the
-        // `target_step`. Sub-view step numbers come from the tui-v1 plan map.
-        PaletteCommand::StepSetHook | PaletteCommand::StepUnsetHook => PaletteAction::ComingSoon {
-            label: cmd.label(),
-            target_step: 35,
-        },
+        // -- /step set-hook|unset-hook -------------------------------------
+        // Both subcommands push the same sub-view (step 35). The sub-view
+        // owns add (`a`) / remove (`d`) interactively, so the verb in the
+        // palette is just the entry door.
+        PaletteCommand::StepSetHook | PaletteCommand::StepUnsetHook => dispatch_step_hooks(ctx),
+
+        // -- v1-deferred sub-view (step 36) -------------------------------
         PaletteCommand::StepEditTags => PaletteAction::ComingSoon {
             label: cmd.label(),
             target_step: 36,
@@ -597,6 +627,33 @@ fn dispatch_plan_hooks(ctx: &PaletteContext<'_>) -> PaletteAction {
     }
 }
 
+fn dispatch_step_hooks(ctx: &PaletteContext<'_>) -> PaletteAction {
+    // `/step set-hook|unset-hook` resolves against both `focused_slug` (the
+    // parent plan) and `focused_step` (the highlighted step). Only step-detail
+    // sets the latter today; other views collapse to a toast.
+    let target = match resolve_slug(None, ctx) {
+        ResolvedSlug::Some(target) => target,
+        ResolvedSlug::Missing | ResolvedSlug::Unknown(_) => {
+            return PaletteAction::Toast {
+                message: "Open a step first to edit hooks.".to_string(),
+                kind: ToastKind::Info,
+            };
+        }
+    };
+    let Some(step) = ctx.focused_step else {
+        return PaletteAction::Toast {
+            message: "Open a step first to edit hooks.".to_string(),
+            kind: ToastKind::Info,
+        };
+    };
+    PaletteAction::OpenStepHooks {
+        plan_id: target.id,
+        step_id: step.id.clone(),
+        plan_slug: target.slug,
+        step_label: step.label.clone(),
+    }
+}
+
 fn dispatch_step_move(from: u32, to: u32, ctx: &PaletteContext<'_>) -> PaletteAction {
     if from == 0 || to == 0 {
         return PaletteAction::Toast {
@@ -706,6 +763,7 @@ mod tests {
     struct Ctx {
         default_harness: String,
         focused_slug: Option<String>,
+        focused_step: Option<FocusedStep>,
         run_targets: Vec<RunTarget>,
         plans: Vec<PlanRef>,
         archived: Vec<PlanRef>,
@@ -716,6 +774,7 @@ mod tests {
             Self {
                 default_harness: "claude".to_string(),
                 focused_slug: None,
+                focused_step: None,
                 run_targets: vec![],
                 plans: vec![],
                 archived: vec![],
@@ -725,6 +784,7 @@ mod tests {
             PaletteContext {
                 default_harness: &self.default_harness,
                 focused_slug: self.focused_slug.as_deref(),
+                focused_step: self.focused_step.as_ref(),
                 run_targets: &self.run_targets,
                 plans: &self.plans,
                 archived: &self.archived,
@@ -1534,18 +1594,69 @@ mod tests {
         );
     }
 
+    // -- /step set-hook|unset-hook routes to OpenStepHooks (step 35) -----
+
     #[test]
-    fn step_hook_subcommands_route_to_step_35() {
-        let c = Ctx::new();
+    fn step_hook_subcommands_route_to_open_step_hooks() {
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
+        c.focused_step = Some(FocusedStep {
+            id: "step-1".to_string(),
+            label: "#3 — Build the thing".to_string(),
+        });
         for input in ["/step set-hook", "/step unset-hook"] {
             match dispatch_str(input, &c) {
-                PaletteAction::ComingSoon { label, target_step } => {
-                    assert!(label.starts_with("/step "), "label: {label}");
-                    assert_eq!(target_step, 35);
+                PaletteAction::OpenStepHooks {
+                    plan_id,
+                    step_id,
+                    plan_slug,
+                    step_label,
+                } => {
+                    assert_eq!(plan_id, "id-alpha");
+                    assert_eq!(step_id, "step-1");
+                    assert_eq!(plan_slug, "alpha");
+                    assert_eq!(step_label, "#3 — Build the thing");
                 }
-                other => panic!("expected ComingSoon for {input}, got {other:?}"),
+                other => panic!("expected OpenStepHooks for {input}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn step_hook_subcommands_toast_when_no_focused_step() {
+        // Plan focused but no step focused (e.g. invoked from plan-detail).
+        let mut c = Ctx::new();
+        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
+        c.focused_slug = Some("alpha".to_string());
+        let action = dispatch_str("/step set-hook", &c);
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "Open a step first to edit hooks.".to_string(),
+                kind: ToastKind::Info,
+            }
+        );
+    }
+
+    #[test]
+    fn step_hook_subcommands_toast_when_no_focused_plan() {
+        // Step focused without a plan focus is a programming error in the
+        // caller, but the dispatcher still falls back to a toast rather
+        // than panicking.
+        let mut c = Ctx::new();
+        c.focused_step = Some(FocusedStep {
+            id: "step-1".to_string(),
+            label: "#1 — Step".to_string(),
+        });
+        let action = dispatch_str("/step set-hook", &c);
+        assert_eq!(
+            action,
+            PaletteAction::Toast {
+                message: "Open a step first to edit hooks.".to_string(),
+                kind: ToastKind::Info,
+            }
+        );
     }
 
     #[test]
