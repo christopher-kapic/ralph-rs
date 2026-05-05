@@ -1925,6 +1925,10 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.request_pop();
             }
+            KeyCode::Char('c') => {
+                let dir = crate::config::config_dir()?;
+                step_detail_handle_c(&mut app, conn, config, &dir, edit_in_editor)?;
+            }
             KeyCode::Esc => {
                 step_detail_handle_esc(&mut app);
             }
@@ -1934,6 +1938,72 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
             return Ok(());
         }
     }
+}
+
+/// Bare `c` on the step-detail view (TUI-plan.md §8 "Editing — `c`"):
+/// dispatch the editor handoff for the focused pane and toast the result.
+///
+/// Routes by `app.focused_pane`:
+/// - `UniversalPrompt` / `ProjectPrompt` / `PlanContextPrepend` /
+///   `PlanPrompt` / `StepPrompt` / `Tests` → the matching `edit_*_pane`
+///   method on `StepDetailApp`.
+/// - `Appended` / `OpenQuestions` → no-op (those panes are read-only).
+/// - `BottomRow` → no-op here; opening the focused cell's picker is
+///   wired in step 12 of this plan.
+///
+/// `config` is cloned locally so the pane's `&mut Config` can be persisted
+/// via `save_at`; the on-disk file is the source of truth, and the app's
+/// in-memory mirrors (`config_prompt_prefix` / `config_prompt_suffix`) are
+/// updated by `edit_universal_pane` so the pane re-renders without a reload.
+fn step_detail_handle_c<E>(
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    conn: &Connection,
+    config: &Config,
+    config_dir: &Path,
+    edit_fn: E,
+) -> Result<()>
+where
+    E: FnOnce(&str) -> Result<Option<String>>,
+{
+    use crate::tui::toast::ToastKind;
+    use crate::tui::views::step_detail::{
+        EditOutcome, NO_CHANGES_TOAST, NO_EDITOR_TOAST, PARSE_ERROR_TOAST_PREFIX, Pane, SAVED_TOAST,
+    };
+    use std::time::Instant;
+
+    let outcome = match app.focused_pane {
+        Pane::UniversalPrompt => {
+            let mut local = config.clone();
+            app.edit_universal_pane(&mut local, config_dir, edit_fn)?
+        }
+        Pane::ProjectPrompt => app.edit_project_pane(conn, edit_fn)?,
+        Pane::PlanContextPrepend => app.edit_plan_context_prepend_pane(conn, edit_fn)?,
+        Pane::PlanPrompt => app.edit_plan_prompt_pane(conn, edit_fn)?,
+        Pane::StepPrompt => app.edit_step_prompt_pane(conn, edit_fn)?,
+        Pane::Tests => app.edit_tests_pane(conn, edit_fn)?,
+        Pane::Appended | Pane::OpenQuestions | Pane::BottomRow => return Ok(()),
+    };
+
+    let now = Instant::now();
+    match outcome {
+        EditOutcome::NoEditor => {
+            app.toasts.push(NO_EDITOR_TOAST, ToastKind::Error, now);
+        }
+        EditOutcome::Saved => {
+            app.toasts.push(SAVED_TOAST, ToastKind::Success, now);
+        }
+        EditOutcome::NoChanges => {
+            app.toasts.push(NO_CHANGES_TOAST, ToastKind::Info, now);
+        }
+        EditOutcome::ParseError(msg) => {
+            app.toasts.push(
+                format!("{PARSE_ERROR_TOAST_PREFIX}{msg}"),
+                ToastKind::Error,
+                now,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `<esc>` precedence in the step-detail view (TUI-plan.md §4): dismiss the
@@ -4617,5 +4687,237 @@ mod step_detail_dispatcher_tests {
         // A third Esc with no toasts left finally falls through to pop.
         assert!(!step_detail_handle_esc(&mut app));
         assert!(app.should_pop);
+    }
+
+    // -- step_detail_handle_c (TUI-plan.md §8 "Editing — `c`") -----------
+
+    use crate::tui::views::step_detail::{
+        NO_CHANGES_TOAST, NO_EDITOR_TOAST, PARSE_ERROR_TOAST_PREFIX, Pane, SAVED_TOAST,
+        format_step_pane, format_tests_pane, format_wrap_pane,
+    };
+
+    /// Build a step-detail app whose plan + first step are materialized in
+    /// `conn`, so dispatcher edits land on real rows we can read back.
+    fn db_app(conn: &Connection, project: &str) -> StepDetailApp {
+        let plan = storage::create_plan(
+            conn,
+            "tui-c",
+            project,
+            "branch-c",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _pos) = storage::create_step(
+            conn,
+            &plan.id,
+            "Original title",
+            "Original description",
+            None,
+            None,
+            &["original-crit".to_string()],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        StepDetailApp::new(
+            plan,
+            vec![step],
+            0,
+            &Config::default(),
+            storage::ProjectSettings::default(),
+            Vec::new(),
+        )
+    }
+
+    fn fake_editor(returning: Option<String>) -> impl FnOnce(&str) -> Result<Option<String>> {
+        move |_initial| Ok(returning)
+    }
+
+    #[test]
+    fn c_on_step_prompt_persists_edited_step() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = db_app(&conn, "/proj");
+        app.focused_pane = Pane::StepPrompt;
+
+        let buffer = format_step_pane("NEW TITLE", "NEW BODY", &["NEW-CRIT".to_string()]);
+        let dir = tempfile::tempdir().unwrap();
+        step_detail_handle_c(
+            &mut app,
+            &conn,
+            &Config::default(),
+            dir.path(),
+            fake_editor(Some(buffer)),
+        )
+        .unwrap();
+
+        assert_eq!(app.steps[0].title, "NEW TITLE");
+        assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
+        let reloaded = storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].title, "NEW TITLE");
+    }
+
+    #[test]
+    fn c_on_tests_pane_persists_edited_tests() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = db_app(&conn, "/proj");
+        app.focused_pane = Pane::Tests;
+
+        let buffer = format_tests_pane(&["cargo test".to_string()]);
+        let dir = tempfile::tempdir().unwrap();
+        step_detail_handle_c(
+            &mut app,
+            &conn,
+            &Config::default(),
+            dir.path(),
+            fake_editor(Some(buffer)),
+        )
+        .unwrap();
+
+        assert_eq!(app.plan.deterministic_tests, vec!["cargo test".to_string()]);
+        assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
+    }
+
+    #[test]
+    fn c_on_plan_prompt_persists_pair() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = db_app(&conn, "/proj");
+        app.focused_pane = Pane::PlanPrompt;
+
+        let buffer = format_wrap_pane(Some("PRE"), Some("SUF"));
+        let dir = tempfile::tempdir().unwrap();
+        step_detail_handle_c(
+            &mut app,
+            &conn,
+            &Config::default(),
+            dir.path(),
+            fake_editor(Some(buffer)),
+        )
+        .unwrap();
+
+        assert_eq!(app.plan.prompt_prefix.as_deref(), Some("PRE"));
+        assert_eq!(app.plan.prompt_suffix.as_deref(), Some("SUF"));
+        assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
+    }
+
+    #[test]
+    fn c_on_universal_pane_persists_to_disk() {
+        // Universal-prompt edits land in `<config_dir>/config.json`. Pointing
+        // `config_dir` at a tempdir keeps the test from touching the user's
+        // real config.
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = db_app(&conn, "/proj");
+        app.focused_pane = Pane::UniversalPrompt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = format_wrap_pane(Some("UP"), Some("US"));
+        step_detail_handle_c(
+            &mut app,
+            &conn,
+            &Config::default(),
+            dir.path(),
+            fake_editor(Some(buffer)),
+        )
+        .unwrap();
+
+        assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
+        assert_eq!(app.config_prompt_prefix.as_deref(), Some("UP"));
+        assert_eq!(app.config_prompt_suffix.as_deref(), Some("US"));
+        let written = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        let reloaded: Config = serde_json::from_str(&written).unwrap();
+        assert_eq!(reloaded.prompt_prefix.as_deref(), Some("UP"));
+        assert_eq!(reloaded.prompt_suffix.as_deref(), Some("US"));
+    }
+
+    #[test]
+    fn c_with_no_editor_toasts_no_editor() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = db_app(&conn, "/proj");
+        app.focused_pane = Pane::PlanPrompt;
+
+        let dir = tempfile::tempdir().unwrap();
+        step_detail_handle_c(
+            &mut app,
+            &conn,
+            &Config::default(),
+            dir.path(),
+            fake_editor(None),
+        )
+        .unwrap();
+
+        assert_eq!(app.toasts.current().unwrap().text, NO_EDITOR_TOAST);
+    }
+
+    #[test]
+    fn c_with_unchanged_buffer_toasts_no_changes() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = db_app(&conn, "/proj");
+        app.focused_pane = Pane::PlanPrompt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let unchanged = format_wrap_pane(
+            app.plan.prompt_prefix.as_deref(),
+            app.plan.prompt_suffix.as_deref(),
+        );
+        step_detail_handle_c(
+            &mut app,
+            &conn,
+            &Config::default(),
+            dir.path(),
+            fake_editor(Some(unchanged)),
+        )
+        .unwrap();
+
+        assert_eq!(app.toasts.current().unwrap().text, NO_CHANGES_TOAST);
+    }
+
+    #[test]
+    fn c_with_parse_error_toasts_prefixed_message() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = db_app(&conn, "/proj");
+        app.focused_pane = Pane::StepPrompt;
+
+        // Missing description header → parse error.
+        let bad = "# Title\nstill the title\n## Acceptance criteria\n- c\n".to_string();
+        let dir = tempfile::tempdir().unwrap();
+        step_detail_handle_c(
+            &mut app,
+            &conn,
+            &Config::default(),
+            dir.path(),
+            fake_editor(Some(bad)),
+        )
+        .unwrap();
+
+        let toast = app.toasts.current().unwrap();
+        assert!(
+            toast.text.starts_with(PARSE_ERROR_TOAST_PREFIX),
+            "expected parse-error prefix; got {}",
+            toast.text
+        );
+        // The original step row is untouched.
+        let reloaded = storage::list_steps(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded[0].title, "Original title");
+    }
+
+    #[test]
+    fn c_on_read_only_panes_is_a_noop() {
+        // Appended / OpenQuestions / BottomRow shouldn't run the edit handoff
+        // or toast — bare `c` is reserved for the editable text panes
+        // (BottomRow gets its own picker behavior in step 12 of this plan).
+        let dir = tempfile::tempdir().unwrap();
+        for pane in [Pane::Appended, Pane::OpenQuestions, Pane::BottomRow] {
+            let conn = crate::db::open_memory().unwrap();
+            let mut app = db_app(&conn, "/proj");
+            app.focused_pane = pane;
+            // The closure panics if it's invoked — proving the dispatch was a no-op.
+            let editor = |_: &str| -> Result<Option<String>> { panic!("editor must not run") };
+            step_detail_handle_c(&mut app, &conn, &Config::default(), dir.path(), editor).unwrap();
+            assert!(app.toasts.is_empty(), "no toast on read-only pane {pane:?}");
+        }
     }
 }
