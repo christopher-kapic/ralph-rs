@@ -11,6 +11,7 @@ pub mod editor;
 pub mod events;
 pub mod palette;
 pub mod palette_dispatch;
+pub mod read_only;
 pub mod run_dialog;
 pub mod selection;
 pub mod theme;

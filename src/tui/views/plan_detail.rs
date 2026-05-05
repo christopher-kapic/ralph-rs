@@ -15,6 +15,7 @@ use crate::frac_index::{self, FracIndexError};
 use crate::plan::{Phase, Plan, Step, StepStatus};
 use crate::run_lock::LiveRun;
 use crate::tui::events::{TAIL_BUFFER_LINES, TAIL_VISIBLE_LINES};
+use crate::tui::read_only::ReadOnly;
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
 
@@ -125,6 +126,12 @@ pub struct PlanDetailApp {
 
     /// Scroll offset for the test tail. Same semantics as `harness_tail_scroll`.
     pub test_tail_scroll: usize,
+
+    /// Read-only attach state (TUI-plan.md §13.2). When `Locked`, the edit
+    /// keybindings (`i`/`a`/`d`/`r`/`s`/`R`/Shift-`J`/`K`) are suppressed
+    /// and the persistent banner replaces the bottom hint line. The
+    /// dispatcher updates this each poll tick via [`Self::set_read_only`].
+    pub read_only: ReadOnly,
 }
 
 impl PlanDetailApp {
@@ -152,7 +159,16 @@ impl PlanDetailApp {
             test_tail: VecDeque::new(),
             harness_tail_scroll: 0,
             test_tail_scroll: 0,
+            read_only: ReadOnly::Editable,
         }
+    }
+
+    /// Update the read-only state. Called by the dispatcher after each
+    /// `run_locks` poll. Storing this on the App keeps draw + input
+    /// handling thin: both consult the same source of truth without an
+    /// extra argument. TUI-plan.md §13.2.
+    pub fn set_read_only(&mut self, state: ReadOnly) {
+        self.read_only = state;
     }
 
     // -- Navigation -------------------------------------------------------
@@ -1719,5 +1735,24 @@ mod tests {
         assert!(!app.has_tail_output());
         app.push_harness_line("first".into());
         assert!(app.has_tail_output());
+    }
+
+    // -- Read-only attach lockdown (TUI-plan.md §13.2) -------------------
+
+    #[test]
+    fn test_read_only_default_is_editable() {
+        let app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        assert!(!app.read_only.is_locked());
+    }
+
+    #[test]
+    fn test_set_read_only_records_state() {
+        use crate::tui::read_only::ReadOnly;
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(1), &Config::default());
+        app.set_read_only(ReadOnly::Locked { pid: 4242 });
+        assert!(app.read_only.is_locked());
+        assert_eq!(app.read_only.pid(), Some(4242));
+        app.set_read_only(ReadOnly::Editable);
+        assert!(!app.read_only.is_locked());
     }
 }

@@ -24,6 +24,7 @@ use crate::plan::{ChangePolicy, ExecutionLog, Plan, Step, StepStatus};
 use crate::prompt::DEFAULT_CONTEXT_PREPEND;
 use crate::storage::{self, ProjectSettings};
 use crate::tui::chrome::{self, Chrome};
+use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::theme;
 use crate::tui::toast::{ToastKind, ToastQueue};
 use crate::tui::views::step_detail_picker::{
@@ -577,6 +578,12 @@ pub struct StepDetailApp {
     /// [`Self::open_picker_for_focused_cell`] and cleared by either a
     /// `Cancelled` or `Submit` outcome from the picker's key loop.
     pub picker: Option<PickerState>,
+
+    /// Read-only attach state (TUI-plan.md §13.2). When `Locked`, the `c`
+    /// editor handoff on every editable pane is suppressed and the
+    /// persistent banner replaces the bottom hint line. The dispatcher
+    /// updates this each poll tick via [`Self::set_read_only`].
+    pub read_only: ReadOnly,
 }
 
 impl StepDetailApp {
@@ -623,7 +630,25 @@ impl StepDetailApp {
             appended_attempt_index,
             bottom_focus: BottomCell::Harness,
             picker: None,
+            read_only: ReadOnly::Editable,
         }
+    }
+
+    /// Update the read-only state. Called by the dispatcher after each
+    /// `run_locks` poll. While `Locked`, the `c` editor handoff and the
+    /// `a` (answer question) keybinding are suppressed per TUI-plan.md
+    /// §13.2; navigation, `S` (cancel), `q` (quit), and `?` (help) stay
+    /// active.
+    pub fn set_read_only(&mut self, state: ReadOnly) {
+        self.read_only = state;
+    }
+
+    /// True when `c` (editor handoff) and `a` (answer question) should be
+    /// honored. False during read-only attach (TUI-plan.md §13.2). The
+    /// future step-detail dispatcher consults this before invoking any of
+    /// the `edit_*_pane` methods or opening the question-answer modal.
+    pub fn can_edit_panes(&self) -> bool {
+        !self.read_only.is_locked()
     }
 
     // -- Pane focus ------------------------------------------------------
@@ -1301,12 +1326,14 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
     let step_segment = app.breadcrumb_step_segment();
     let crumbs: [&str; 3] = ["ralph", app.plan.slug.as_str(), step_segment.as_str()];
     let hint = "[j/k] pane  [h/←] back  [z] zen  [q] back";
+    let banner = read_only::banner(app.read_only);
     let body = chrome::render(
         frame,
         &Chrome {
             breadcrumbs: &crumbs,
             hint,
             cwd: Path::new(&app.plan.project),
+            banner: banner.as_deref(),
         },
     );
 
@@ -4297,5 +4324,32 @@ cargo clippy
         }
         let reloaded = crate::storage::list_steps(&conn, &app.plan.id).unwrap();
         assert_eq!(reloaded[0].model.as_deref(), Some("claude-opus-4-7"));
+    }
+
+    // -- Read-only attach lockdown (TUI-plan.md §13.2) -------------------
+
+    #[test]
+    fn test_step_detail_read_only_default_is_editable() {
+        let app = make_app(3, 0);
+        assert!(!app.read_only.is_locked());
+        assert!(app.can_edit_panes());
+    }
+
+    #[test]
+    fn test_step_detail_set_read_only_blocks_can_edit() {
+        let mut app = make_app(3, 0);
+        app.set_read_only(ReadOnly::Locked { pid: 4242 });
+        assert!(app.read_only.is_locked());
+        assert!(!app.can_edit_panes(),
+            "c (every pane edit) and a (answer question) must be blocked");
+    }
+
+    #[test]
+    fn test_step_detail_release_unlocks_can_edit() {
+        let mut app = make_app(3, 0);
+        app.set_read_only(ReadOnly::Locked { pid: 1 });
+        assert!(!app.can_edit_panes());
+        app.set_read_only(ReadOnly::Editable);
+        assert!(app.can_edit_panes(), "edits must come back when lock is released");
     }
 }

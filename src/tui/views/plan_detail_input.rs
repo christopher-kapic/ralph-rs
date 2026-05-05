@@ -61,6 +61,13 @@ pub fn handle_key(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
 // ---------------------------------------------------------------------------
 
 fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
+    // §13.2 lockdown: when an external runner holds the lock, the edit
+    // keybindings (i/a/d/r/s/R/Shift-J/Shift-K) are suppressed. Navigation,
+    // S (cancel via the dispatcher), q/h/← (pop), Esc, and tail scrolling
+    // remain active. We compute this once so each per-key arm only has to
+    // reason about its own edit-vs-non-edit classification.
+    let locked = app.read_only.is_locked();
+
     match key.code {
         // Navigation
         KeyCode::Char('j') | KeyCode::Down => {
@@ -78,20 +85,20 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             InputAction::None
         }
 
-        // Insert step above
-        KeyCode::Char('i') => {
+        // Insert step above (edit — suppressed when locked).
+        KeyCode::Char('i') if !locked => {
             app.enter_add_mode_above();
             InputAction::None
         }
 
-        // Append step below
-        KeyCode::Char('a') => {
+        // Append step below (edit — suppressed when locked).
+        KeyCode::Char('a') if !locked => {
             app.enter_add_mode_below();
             InputAction::None
         }
 
-        // Delete step(s)
-        KeyCode::Char('d') => {
+        // Delete step(s) (edit — suppressed when locked).
+        KeyCode::Char('d') if !locked => {
             let targets = app.delete_targets();
             if targets.is_empty() {
                 InputAction::None
@@ -100,8 +107,8 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             }
         }
 
-        // Reset step
-        KeyCode::Char('r') => {
+        // Reset step (edit — suppressed when locked).
+        KeyCode::Char('r') if !locked => {
             if let Some(id) = app.reset_target() {
                 InputAction::Reset(id)
             } else {
@@ -111,34 +118,41 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
 
         // Shift-J: scroll the right-pane tails one line newer when a live
         // subscription is producing output (TUI-plan.md §13); otherwise
-        // fall through to the original step-reorder semantics.
+        // fall through to the original step-reorder semantics — but the
+        // step-reorder branch is an edit and is suppressed when locked.
         KeyCode::Char('J') => {
             if tails_take_priority(app) {
                 app.scroll_tails_newer();
                 InputAction::None
-            } else if let Some(id) = app.move_down_target() {
-                InputAction::MoveDown(id)
+            } else if !locked {
+                if let Some(id) = app.move_down_target() {
+                    InputAction::MoveDown(id)
+                } else {
+                    InputAction::None
+                }
             } else {
                 InputAction::None
             }
         }
 
-        // Shift-K: scroll the right-pane tails one line older when a live
-        // subscription is producing output (TUI-plan.md §13); otherwise
-        // fall through to the original step-reorder semantics.
+        // Shift-K: same dual-mode as Shift-J but inverted direction.
         KeyCode::Char('K') => {
             if tails_take_priority(app) {
                 app.scroll_tails_older();
                 InputAction::None
-            } else if let Some(id) = app.move_up_target() {
-                InputAction::MoveUp(id)
+            } else if !locked {
+                if let Some(id) = app.move_up_target() {
+                    InputAction::MoveUp(id)
+                } else {
+                    InputAction::None
+                }
             } else {
                 InputAction::None
             }
         }
 
-        // Skip current step
-        KeyCode::Char('s') => {
+        // Skip current step (edit — suppressed when locked).
+        KeyCode::Char('s') if !locked => {
             if let Some(step_id) = app.request_skip() {
                 InputAction::SkipStep(step_id)
             } else {
@@ -146,8 +160,9 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             }
         }
 
-        // Run / resume the plan (TUI-plan.md §7).
-        KeyCode::Char('R') => InputAction::Run,
+        // Run / resume the plan (TUI-plan.md §7). `R` is suppressed when
+        // already locked because there's a run in progress.
+        KeyCode::Char('R') if !locked => InputAction::Run,
 
         // Stop the live run (TUI-plan.md §7).
         KeyCode::Char('S') => InputAction::Stop,
@@ -667,5 +682,130 @@ mod tests {
         app.selected_index = 0;
         let action = handle_key(&mut app, key(KeyCode::Char('J')));
         assert_eq!(action, InputAction::MoveDown("s0".to_string()));
+    }
+
+    // -- Read-only attach + edit lockdown (TUI-plan.md §13.2) -----------
+
+    /// Drive the App into the read-only state used by the lockdown tests.
+    fn lock_app(app: &mut PlanDetailApp) {
+        app.set_read_only(crate::tui::read_only::ReadOnly::Locked { pid: 4242 });
+    }
+
+    #[test]
+    fn test_locked_suppresses_i_add_above() {
+        let mut app = make_app(3);
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('i')));
+        assert_eq!(action, InputAction::None);
+        assert_eq!(app.input_mode, InputMode::Normal,
+            "i must NOT enter add mode while locked");
+    }
+
+    #[test]
+    fn test_locked_suppresses_a_add_below() {
+        let mut app = make_app(3);
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('a')));
+        assert_eq!(action, InputAction::None);
+        assert_eq!(app.input_mode, InputMode::Normal);
+    }
+
+    #[test]
+    fn test_locked_suppresses_d_delete() {
+        let mut app = make_app(3);
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('d')));
+        assert_eq!(action, InputAction::None);
+    }
+
+    #[test]
+    fn test_locked_suppresses_r_reset() {
+        let mut app = make_app(3);
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('r')));
+        assert_eq!(action, InputAction::None);
+    }
+
+    #[test]
+    fn test_locked_suppresses_s_skip() {
+        let mut app = make_app(3);
+        app.selected_index = 0; // InProgress step would otherwise be skippable.
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('s')));
+        assert_eq!(action, InputAction::None);
+    }
+
+    #[test]
+    fn test_locked_suppresses_shift_r_run() {
+        let mut app = make_app(3);
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('R')));
+        assert_eq!(action, InputAction::None);
+    }
+
+    #[test]
+    fn test_locked_suppresses_shift_j_move_down_without_subscription() {
+        // No subscription ⇒ J would otherwise be MoveDown — must be gated.
+        let mut app = make_app(3);
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('J')));
+        assert_eq!(action, InputAction::None);
+    }
+
+    #[test]
+    fn test_locked_suppresses_shift_k_move_up_without_subscription() {
+        let mut app = make_app(3);
+        app.selected_index = 2;
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('K')));
+        assert_eq!(action, InputAction::None);
+    }
+
+    #[test]
+    fn test_locked_still_allows_navigation() {
+        let mut app = make_app(3);
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('j')));
+        assert_eq!(action, InputAction::None);
+        assert_eq!(app.selected_index, 1);
+        let action = handle_key(&mut app, key(KeyCode::Char('k')));
+        assert_eq!(action, InputAction::None);
+        assert_eq!(app.selected_index, 0);
+    }
+
+    #[test]
+    fn test_locked_still_allows_shift_s_stop() {
+        let mut app = make_app(3);
+        lock_app(&mut app);
+        // S is the user's escape hatch when locked — must remain enabled.
+        let action = handle_key(&mut app, key(KeyCode::Char('S')));
+        assert_eq!(action, InputAction::Stop);
+    }
+
+    #[test]
+    fn test_locked_still_allows_q_pop() {
+        let mut app = make_app(3);
+        lock_app(&mut app);
+        let action = handle_key(&mut app, key(KeyCode::Char('q')));
+        assert_eq!(action, InputAction::Pop);
+        assert!(app.should_pop);
+    }
+
+    #[test]
+    fn test_locked_still_allows_shift_j_tail_scroll_when_subscription_has_output() {
+        // J in the dual-mode tail-scroll branch is read-only navigation, so
+        // it should keep working when the lockdown is engaged. (The lockdown
+        // suppresses the *step-move* fallback only.)
+        let mut app = make_app(3);
+        app.attach_subscription();
+        for i in 0..5 {
+            app.push_harness_line(format!("h{i}"));
+        }
+        app.scroll_tails_older(); // anchor 1 back so J has somewhere to scroll
+        lock_app(&mut app);
+        let before = app.harness_tail_scroll;
+        let action = handle_key(&mut app, key(KeyCode::Char('J')));
+        assert_eq!(action, InputAction::None);
+        assert!(app.harness_tail_scroll < before, "tail scroll should still work");
     }
 }

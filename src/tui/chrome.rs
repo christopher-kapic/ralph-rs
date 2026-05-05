@@ -20,10 +20,28 @@ const CRUMB_SEP: &str = " › ";
 /// Per-frame chrome inputs. `breadcrumbs` are joined with ` › ` for the top
 /// bar; `hint` is left-aligned on the bottom bar; `cwd` is shortened with `~`
 /// substitution and rendered bottom-right alongside `ralph v<version>`.
+///
+/// `banner` is the read-only lockdown banner (TUI-plan.md §13.2). When
+/// `Some`, it takes the bottom-bar slot in place of the per-view hint and is
+/// rendered in red so the lockdown state is visually prominent across every
+/// view; the cwd/version still renders on the right edge.
 pub struct Chrome<'a> {
     pub breadcrumbs: &'a [&'a str],
     pub hint: &'a str,
     pub cwd: &'a Path,
+    pub banner: Option<&'a str>,
+}
+
+impl<'a> Chrome<'a> {
+    /// Convenience constructor: chrome with no read-only banner.
+    pub fn new(breadcrumbs: &'a [&'a str], hint: &'a str, cwd: &'a Path) -> Self {
+        Self {
+            breadcrumbs,
+            hint,
+            cwd,
+            banner: None,
+        }
+    }
 }
 
 /// Render the chrome and return the inner Rect a view should draw into.
@@ -39,7 +57,7 @@ pub fn render(frame: &mut Frame, chrome: &Chrome<'_>) -> Rect {
         .split(area);
 
     render_breadcrumb(frame, chunks[0], chrome.breadcrumbs);
-    render_bottom(frame, chunks[2], chrome.hint, chrome.cwd);
+    render_bottom(frame, chunks[2], chrome.hint, chrome.cwd, chrome.banner);
 
     chunks[1]
 }
@@ -57,7 +75,7 @@ fn render_breadcrumb(frame: &mut Frame, area: Rect, crumbs: &[&str]) {
     frame.render_widget(para, area);
 }
 
-fn render_bottom(frame: &mut Frame, area: Rect, hint: &str, cwd: &Path) {
+fn render_bottom(frame: &mut Frame, area: Rect, hint: &str, cwd: &Path, banner: Option<&str>) {
     if area.width == 0 {
         return;
     }
@@ -73,13 +91,22 @@ fn render_bottom(frame: &mut Frame, area: Rect, hint: &str, cwd: &Path) {
         .constraints([Constraint::Min(0), Constraint::Length(right_len)])
         .split(area);
 
-    let hint_max = (chunks[0].width as usize).saturating_sub(1);
-    let hint_text = right_truncate(hint, hint_max);
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            hint_text,
+    let left_max = (chunks[0].width as usize).saturating_sub(1);
+    // The lockdown banner takes the hint slot when present, rendered in red
+    // with a bold modifier so it's visually distinct from the regular dim
+    // gray hint line (TUI-plan.md §13.2).
+    let (left_text, left_style) = match banner {
+        Some(b) => (
+            right_truncate(b, left_max),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        None => (
+            right_truncate(hint, left_max),
             Style::default().fg(Color::DarkGray),
-        )),
+        ),
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(left_text, left_style)),
         chunks[0],
     );
     frame.render_widget(
@@ -317,6 +344,7 @@ mod tests {
                         breadcrumbs: &["ralph", "my-plan"],
                         hint: "[q] quit",
                         cwd: Path::new("/tmp"),
+                        banner: None,
                     },
                 );
                 body_rect = Some(body);
@@ -337,6 +365,7 @@ mod tests {
                 breadcrumbs: &["ralph", "tui-v1"],
                 hint: "[j/k] nav  [q] quit",
                 cwd: Path::new("/tmp/proj"),
+                banner: None,
             },
         );
         assert!(
@@ -368,6 +397,7 @@ mod tests {
                 breadcrumbs: &["ralph", "p"],
                 hint: "h",
                 cwd: Path::new("/very/deeply/nested/project/path"),
+                banner: None,
             },
         );
         // The bottom row must still end with "ralph v<version>".
@@ -390,6 +420,40 @@ mod tests {
     }
 
     #[test]
+    fn render_banner_replaces_hint_on_bottom_row() {
+        let rendered = render_to_string(
+            120,
+            5,
+            &Chrome {
+                breadcrumbs: &["ralph", "tui-v1"],
+                hint: "[j/k] nav  [q] quit",
+                cwd: Path::new("/tmp/proj"),
+                banner: Some("🔒 Read-only — run in progress (PID 4242). [S] cancel  [q] quit"),
+            },
+        );
+        let bottom = rendered.lines().last().unwrap();
+        assert!(
+            bottom.contains("Read-only"),
+            "banner missing on bottom row: {bottom:?}"
+        );
+        assert!(
+            bottom.contains("PID 4242"),
+            "banner pid missing: {bottom:?}"
+        );
+        // The regular hint must NOT render when the banner is set; the
+        // banner replaces it.
+        assert!(
+            !bottom.contains("[j/k] nav"),
+            "hint should be hidden under banner: {bottom:?}"
+        );
+        // cwd/version still on the right.
+        assert!(
+            bottom.contains(&format!("ralph v{VERSION}")),
+            "version missing under banner: {bottom:?}"
+        );
+    }
+
+    #[test]
     fn render_does_not_panic_on_tiny_terminal() {
         // Very narrow / very short terminals must still render without panic.
         let _ = render_to_string(
@@ -399,6 +463,7 @@ mod tests {
                 breadcrumbs: &["ralph", "plan"],
                 hint: "[q] quit",
                 cwd: Path::new("/some/long/path"),
+                banner: None,
             },
         );
         let _ = render_to_string(
@@ -408,6 +473,7 @@ mod tests {
                 breadcrumbs: &["ralph"],
                 hint: "h",
                 cwd: Path::new("/x"),
+                banner: None,
             },
         );
     }

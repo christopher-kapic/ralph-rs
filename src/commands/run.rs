@@ -276,6 +276,7 @@ pub fn run_plan_list_tui(
 ) -> Result<()> {
     use crate::plan::PlanStatus;
     use crate::tui::dialog;
+    use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
     use crate::tui::toast::ToastKind;
     use crate::tui::views::plan_list::{self, PlanListApp};
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -292,6 +293,17 @@ pub fn run_plan_list_tui(
     let mut app = PlanListApp::new(tiles, project, &config.display_timezone)
         .with_archived_count(archived_count);
 
+    // §13.2: when an externally-spawned ralph runner already holds this
+    // project's run lock, the TUI starts in read-only mode and polls every
+    // 500ms for the runner to release. The plan-list view doesn't spawn
+    // child runners itself, so `spawned_child_pid` is always `None`.
+    let my_pid = std::process::id() as i64;
+    let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
+    if let Ok(initial) = read_only::detect(conn, project, my_pid, None) {
+        tracker.observe(initial, Instant::now());
+        app.set_read_only(tracker.state());
+    }
+
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = std::io::stdout();
     if let Err(e) = execute!(stdout, EnterAlternateScreen) {
@@ -303,17 +315,42 @@ pub fn run_plan_list_tui(
 
     let result: Result<()> = (|| {
         loop {
+            // Re-poll the run-lock state on a 500ms cadence (TUI-plan.md
+            // §13.2). On Released, push the "edits enabled" toast so the
+            // user sees the transition; on Engaged, no toast (the banner
+            // alone is enough notice).
+            let now = Instant::now();
+            if tracker.should_poll(now)
+                && let Ok(observed) = read_only::detect(conn, project, my_pid, None)
+            {
+                let transition = tracker.observe(observed, now);
+                app.set_read_only(tracker.state());
+                if transition == Transition::Released {
+                    app.toasts.push(read_only::RELEASED_TOAST, ToastKind::Success, now);
+                }
+            }
+
             terminal.draw(|f| plan_list::draw(f, &mut app))?;
+
+            // Use a polling read so the lock state stays current even when
+            // the user isn't pressing keys. The 250ms timeout balances UI
+            // smoothness against polling cost; the actual run-lock query
+            // still only fires once per `POLL_INTERVAL` thanks to
+            // `tracker.should_poll`.
+            if !event::poll(std::time::Duration::from_millis(250))? {
+                continue;
+            }
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
+                let locked = app.read_only.is_locked();
                 match key.code {
                     KeyCode::Char('j') | KeyCode::Down => app.navigate_down(),
                     KeyCode::Char('k') | KeyCode::Up => app.navigate_up(),
                     KeyCode::Char('g') => app.jump_top(),
                     KeyCode::Char('G') => app.jump_bottom(),
                     KeyCode::Char(' ') => app.toggle_selection(),
-                    KeyCode::Char('d') => {
+                    KeyCode::Char('d') if !locked => {
                         let targets = app.archive_targets();
                         if targets.is_empty() {
                             continue;
@@ -342,13 +379,13 @@ pub fn run_plan_list_tui(
                             app.toasts.push(msg, ToastKind::Success, Instant::now());
                         }
                     }
-                    KeyCode::Char('A') => {
+                    KeyCode::Char('A') if !locked => {
                         plan_list_approve_cursor(conn, project, &mut app)?;
                     }
-                    KeyCode::Char('Q') => {
+                    KeyCode::Char('Q') if !locked => {
                         plan_list_toggle_questions_cursor(conn, project, &mut app)?;
                     }
-                    KeyCode::Char('i') | KeyCode::Char('a') => {
+                    KeyCode::Char('i') | KeyCode::Char('a') if !locked => {
                         plan_list_create_plan(conn, config, project, &mut terminal, &mut app)?;
                     }
                     KeyCode::Esc => {
@@ -852,10 +889,13 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     slug: &str,
 ) -> Result<()> {
     use crate::tui::events::{self as tui_events, RunSubscription};
+    use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
+    use crate::tui::toast::ToastKind;
     use crate::tui::views::plan_detail::PlanDetailApp;
     use crate::tui::views::plan_detail_input::{self, InputAction};
     use crate::tui::views::plan_detail_ui;
     use crossterm::event::{self, Event, KeyEventKind};
+    use std::time::Instant;
 
     let plan = storage::get_plan_by_slug(conn, slug, project)?
         .with_context(|| format!("Plan not found: {slug}"))?;
@@ -863,6 +903,15 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     let mut app = PlanDetailApp::new(plan, steps, config);
 
     let mut subscription: Option<RunSubscription> = None;
+
+    // §13.2: read-only attach. While the TUI does not own a streaming
+    // subscription, any `run_locks` row owned by an unrelated pid means
+    // someone else is driving the run; suppress edits until they release.
+    // When `subscription` is `Some`, we are the runner host and skip the
+    // detection — the child's lock row is "ours" even though the row's
+    // recorded pid is the subprocess.
+    let my_pid = std::process::id() as i64;
+    let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
 
     loop {
         // -- Refresh state from the active source of truth ----------------
@@ -899,6 +948,33 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
         }
         if let Ok(latest_steps) = storage::list_steps(conn, &app.plan.id) {
             app.sync_steps_from_db(latest_steps);
+        }
+
+        // -- §13.2 read-only attach poll -------------------------------
+        //
+        // Only relevant when we are NOT the runner host: a TUI-spawned
+        // subscription already implies the lock holder is our child, so
+        // skip detection and treat the App as editable. (The user sees
+        // the existing right-pane "Running step N" surface for the
+        // active run instead.)
+        let now = Instant::now();
+        if subscription.is_none() {
+            if tracker.should_poll(now)
+                && let Ok(observed) = read_only::detect(conn, project, my_pid, None)
+            {
+                let transition = tracker.observe(observed, now);
+                app.set_read_only(tracker.state());
+                if transition == Transition::Released {
+                    app.toasts
+                        .push(read_only::RELEASED_TOAST, ToastKind::Success, now);
+                }
+            }
+        } else if app.read_only.is_locked() {
+            // We just spawned a runner — clear any latched lockdown so
+            // the banner doesn't keep showing while our own child holds
+            // the row.
+            tracker.observe(ReadOnly::Editable, now);
+            app.set_read_only(ReadOnly::Editable);
         }
 
         terminal.draw(|f| plan_detail_ui::draw(f, &mut app))?;

@@ -17,6 +17,7 @@ use super::plan_detail::{AddPosition, InputMode, PlanDetailApp};
 use crate::plan::{Phase, StepStatus};
 use crate::tui::chrome::{self, Chrome};
 use crate::tui::events::TAIL_VISIBLE_LINES;
+use crate::tui::read_only;
 use crate::tui::theme;
 
 /// Render the entire plan-detail view.
@@ -25,12 +26,14 @@ pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
 
     let crumbs: [&str; 2] = ["ralph", app.plan.slug.as_str()];
     let hint = hint_for(app);
+    let banner = read_only::banner(app.read_only);
     let body = chrome::render(
         frame,
         &Chrome {
             breadcrumbs: &crumbs,
             hint: &hint,
             cwd: Path::new(&app.plan.project),
+            banner: banner.as_deref(),
         },
     );
 

@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use crate::plan::{Plan, PlanStatus};
 use crate::tui::chrome::{self, Chrome};
+use crate::tui::read_only::{self, ReadOnly};
 use crate::tui::selection::Selection;
 use crate::tui::theme;
 use crate::tui::toast::ToastQueue;
@@ -102,6 +103,10 @@ pub struct PlanListApp {
     /// onto this after destructive operations (`d` archive) so the user sees
     /// a transient confirmation.
     pub toasts: ToastQueue,
+    /// Read-only attach state (TUI-plan.md §13.2). When `Locked`, the edit
+    /// keybindings (`i`/`a`/`A`/`d`/`Q`) are suppressed and the persistent
+    /// banner replaces the bottom hint line.
+    pub read_only: ReadOnly,
 }
 
 impl PlanListApp {
@@ -120,7 +125,16 @@ impl PlanListApp {
             display_timezone: display_timezone.into(),
             project: project.into(),
             toasts: ToastQueue::new(),
+            read_only: ReadOnly::Editable,
         }
+    }
+
+    /// Update the read-only state (called by the dispatcher each
+    /// poll tick). Storing this on the App keeps draw + input handling
+    /// thin: both consult the same source of truth without an extra
+    /// argument. TUI-plan.md §13.2.
+    pub fn set_read_only(&mut self, state: ReadOnly) {
+        self.read_only = state;
     }
 
     /// Builder-style setter for the archived plan count. Drives the optional
@@ -370,12 +384,14 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
 
     let crumbs: [&str; 1] = ["ralph"];
     let hint = "[j/k] nav  [enter] open  [space] select  [i] new  [A] approve  [Q] questions  [d] archive  [q] quit";
+    let banner = read_only::banner(app.read_only);
     let body = chrome::render(
         frame,
         &Chrome {
             breadcrumbs: &crumbs,
             hint,
             cwd: Path::new(&app.project),
+            banner: banner.as_deref(),
         },
     );
     update_scroll(app, body.height);
@@ -1383,5 +1399,21 @@ mod tests {
         assert_eq!(status_dot_color(PlanStatus::Failed), theme::STATUS_FAILED);
         assert_eq!(status_dot_color(PlanStatus::Aborted), theme::STATUS_FAILED);
         assert_eq!(status_dot_color(PlanStatus::Question), theme::STATUS_QUESTION);
+    }
+
+    // -- Read-only attach lockdown (TUI-plan.md §13.2) -------------------
+
+    #[test]
+    fn test_read_only_default_is_editable() {
+        let app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        assert_eq!(app.read_only, ReadOnly::Editable);
+    }
+
+    #[test]
+    fn test_set_read_only_updates_state() {
+        let mut app = PlanListApp::new(make_tiles(1), "/proj", "UTC");
+        app.set_read_only(ReadOnly::Locked { pid: 4242 });
+        assert_eq!(app.read_only, ReadOnly::Locked { pid: 4242 });
+        assert!(app.read_only.is_locked());
     }
 }

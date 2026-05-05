@@ -183,6 +183,7 @@ pub fn draw(frame: &mut Frame, app: &mut ArchivedListApp) {
             breadcrumbs: &crumbs,
             hint,
             cwd: Path::new(&app.project),
+            banner: None,
         },
     );
     update_scroll(app, body.height);
