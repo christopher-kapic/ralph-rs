@@ -27,11 +27,18 @@ const CRUMB_SEP: &str = " › ";
 /// `Some`, it takes the bottom-bar slot in place of the per-view hint and is
 /// rendered in red so the lockdown state is visually prominent across every
 /// view; the cwd/version still renders on the right edge.
+///
+/// `running_indicator` (step #29) is a compact one-line "▶ Running step N
+/// (phase) MM:SS" string surfaced just left of the cwd/version when a runner
+/// is bound to the plan. Lives in chrome so the user keeps seeing live
+/// progress regardless of which step the cursor is on (or which view they
+/// pushed onto the stack).
 pub struct Chrome<'a> {
     pub breadcrumbs: &'a [&'a str],
     pub hint: &'a str,
     pub cwd: &'a Path,
     pub banner: Option<&'a str>,
+    pub running_indicator: Option<&'a str>,
 }
 
 impl<'a> Chrome<'a> {
@@ -42,6 +49,7 @@ impl<'a> Chrome<'a> {
             hint,
             cwd,
             banner: None,
+            running_indicator: None,
         }
     }
 }
@@ -59,7 +67,14 @@ pub fn render(frame: &mut Frame, chrome: &Chrome<'_>) -> Rect {
         .split(area);
 
     render_breadcrumb(frame, chunks[0], chrome.breadcrumbs);
-    render_bottom(frame, chunks[2], chrome.hint, chrome.cwd, chrome.banner);
+    render_bottom(
+        frame,
+        chunks[2],
+        chrome.hint,
+        chrome.cwd,
+        chrome.banner,
+        chrome.running_indicator,
+    );
 
     chunks[1]
 }
@@ -77,7 +92,14 @@ fn render_breadcrumb(frame: &mut Frame, area: Rect, crumbs: &[&str]) {
     frame.render_widget(para, area);
 }
 
-fn render_bottom(frame: &mut Frame, area: Rect, hint: &str, cwd: &Path, banner: Option<&str>) {
+fn render_bottom(
+    frame: &mut Frame,
+    area: Rect,
+    hint: &str,
+    cwd: &Path,
+    banner: Option<&str>,
+    running_indicator: Option<&str>,
+) {
     if area.width == 0 {
         return;
     }
@@ -85,12 +107,33 @@ fn render_bottom(frame: &mut Frame, area: Rect, hint: &str, cwd: &Path, banner: 
     let cwd_text = left_truncate(&cwd_full, area.width as usize);
     let cwd_width = display_width(&cwd_text);
 
-    // Reserve the right side for cwd/version; the left side gets whatever's
-    // left after a 1-column gap.
-    let right_len = cwd_width as u16;
+    // Reserve room for the running indicator (when present) just left of the
+    // cwd/version; pad with two spaces so it doesn't visually fuse into the
+    // version string. If there isn't enough horizontal room (after the cwd),
+    // drop the indicator silently rather than truncate it into nonsense.
+    let running_text = running_indicator.unwrap_or("");
+    let running_width = if running_indicator.is_some() {
+        display_width(running_text)
+    } else {
+        0
+    };
+    let running_slot_width = if running_width > 0
+        && (area.width as usize) > cwd_width + running_width + 3
+    {
+        running_width as u16 + 2
+    } else {
+        0
+    };
+
+    // Reserve the right side for cwd/version (and optionally the running
+    // indicator); the left side gets whatever's left after a 1-column gap.
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(0), Constraint::Length(right_len)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(running_slot_width),
+            Constraint::Length(cwd_width as u16),
+        ])
         .split(area);
 
     let left_max = (chunks[0].width as usize).saturating_sub(1);
@@ -111,13 +154,25 @@ fn render_bottom(frame: &mut Frame, area: Rect, hint: &str, cwd: &Path, banner: 
         Paragraph::new(Span::styled(left_text, left_style)),
         chunks[0],
     );
+    if running_slot_width > 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                running_text,
+                Style::default()
+                    .fg(theme::STATUS_IN_PROGRESS)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Right),
+            chunks[1],
+        );
+    }
     frame.render_widget(
         Paragraph::new(Span::styled(
             cwd_text,
             Style::default().fg(theme::CHROME_DIM),
         ))
         .alignment(Alignment::Right),
-        chunks[1],
+        chunks[2],
     );
 }
 
@@ -349,6 +404,7 @@ mod tests {
                         hint: "[q] quit",
                         cwd: Path::new("/tmp"),
                         banner: None,
+                        running_indicator: None,
                     },
                 );
                 body_rect = Some(body);
@@ -370,6 +426,7 @@ mod tests {
                 hint: "[j/k] nav  [q] quit",
                 cwd: Path::new("/tmp/proj"),
                 banner: None,
+                running_indicator: None,
             },
         );
         assert!(
@@ -396,6 +453,7 @@ mod tests {
                 hint: "h",
                 cwd: Path::new("/very/deeply/nested/project/path"),
                 banner: None,
+                running_indicator: None,
             },
         );
         // The bottom row must still end with "ralph v<version>".
@@ -427,6 +485,7 @@ mod tests {
                 hint: "[j/k] nav  [q] quit",
                 cwd: Path::new("/tmp/proj"),
                 banner: Some("🔒 Read-only — run in progress (PID 4242). [S] cancel  [q] quit"),
+                running_indicator: None,
             },
         );
         let bottom = rendered.lines().last().unwrap();
@@ -462,6 +521,7 @@ mod tests {
                 hint: "[q] quit",
                 cwd: Path::new("/some/long/path"),
                 banner: None,
+                running_indicator: None,
             },
         );
         let _ = render_to_string(
@@ -472,6 +532,7 @@ mod tests {
                 hint: "h",
                 cwd: Path::new("/x"),
                 banner: None,
+                running_indicator: None,
             },
         );
     }

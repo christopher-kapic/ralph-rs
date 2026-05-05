@@ -223,6 +223,7 @@ pub fn draw(frame: &mut Frame, app: &mut ArchivedListApp) {
             hint,
             cwd: Path::new(&app.project),
             banner: None,
+            running_indicator: None,
         },
     );
     update_scroll(app, body.height);

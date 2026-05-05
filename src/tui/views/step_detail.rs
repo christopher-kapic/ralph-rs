@@ -1556,6 +1556,7 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
             hint,
             cwd: Path::new(&app.plan.project),
             banner: banner.as_deref(),
+            running_indicator: None,
         },
     );
 

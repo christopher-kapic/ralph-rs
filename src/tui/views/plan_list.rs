@@ -547,6 +547,7 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
             hint,
             cwd: Path::new(&app.project),
             banner: banner.as_deref(),
+            running_indicator: None,
         },
     );
 

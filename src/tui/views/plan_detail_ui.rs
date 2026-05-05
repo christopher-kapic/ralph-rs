@@ -30,6 +30,10 @@ pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
     let crumbs: [&str; 2] = ["ralph", app.plan.slug.as_str()];
     let hint = hint_for(app);
     let banner = read_only::banner(app.read_only);
+    // §29: surface a compact "▶ Running step N (phase) MM:SS" in the bottom
+    // chrome row whenever a runner is bound to the plan, so the user knows
+    // what's executing regardless of where their cursor is parked.
+    let running = running_indicator(app);
     let body = chrome::render(
         frame,
         &Chrome {
@@ -37,6 +41,7 @@ pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
             hint: &hint,
             cwd: Path::new(&app.plan.project),
             banner: banner.as_deref(),
+            running_indicator: running.as_deref(),
         },
     );
 
@@ -84,6 +89,28 @@ pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
             palette_bar::render(frame, palette_area, state);
         }
     }
+}
+
+/// Build the compact running-step indicator surfaced in the chrome bar.
+/// Returns `None` when no runner is bound to this plan; otherwise yields
+/// `▶ Running step N (phase) MM:SS` (some fields omitted when unknown so the
+/// indicator never renders as `(unknown)` placeholders).
+fn running_indicator(app: &PlanDetailApp) -> Option<String> {
+    if !app.is_run_live() {
+        return None;
+    }
+    let step_label = match app.live_step_num() {
+        Some(n) => format!("▶ Running step {n}"),
+        None => "▶ Running...".to_string(),
+    };
+    let phase_label = app
+        .current_phase()
+        .map(|p| format!(" ({})", phase_human_label(p)))
+        .unwrap_or_default();
+    let elapsed = app.elapsed_secs() as u64;
+    let mins = elapsed / 60;
+    let secs = elapsed % 60;
+    Some(format!("{step_label}{phase_label} {mins:02}:{secs:02}"))
 }
 
 fn hint_for(app: &PlanDetailApp) -> String {
@@ -177,72 +204,16 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
     let step = &app.steps[app.selected_index];
     let mut lines: Vec<Line> = Vec::new();
 
-    // Live-run banner (TUI-plan.md §7 / §13): when a runner is bound to
-    // this plan, surface "Running step N (phase) MM:SS" so the user sees
-    // progress regardless of which step the cursor is on. Phase prefers the
-    // NDJSON stream's `phase_changed` event over the DB-poll snapshot —
-    // see `PlanDetailApp::current_phase`.
-    if app.is_run_live() {
-        let step_label = match app.live_step_num() {
-            Some(n) => format!("▶ Running step {n}"),
-            None => "▶ Running...".to_string(),
-        };
-        let phase_label = app
-            .current_phase()
-            .map(|p| format!(" ({})", phase_human_label(p)))
-            .unwrap_or_default();
-        let elapsed = app.elapsed_secs();
-        let mins = (elapsed as u64) / 60;
-        let secs = (elapsed as u64) % 60;
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{step_label}{phase_label}"),
-                Style::default()
-                    .fg(theme::STATUS_IN_PROGRESS)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{mins:02}:{secs:02}"),
-                Style::default().fg(theme::STATUS_IN_PROGRESS),
-            ),
-        ]));
-        lines.push(Line::from(""));
-
-        // Tails — only render when the subscription has produced at least
-        // one chunk. Otherwise the panes would just say "(no output yet)"
-        // for the entire pre-harness phase, which is noise.
-        if !app.harness_tail.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "Harness output",
-                Style::default()
-                    .fg(theme::CHROME_DIM)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for tail_line in app.visible_harness_tail(TAIL_VISIBLE_LINES) {
-                lines.push(Line::from(Span::styled(
-                    tail_line,
-                    Style::default().fg(theme::CHROME_DIM),
-                )));
-            }
-            lines.push(Line::from(""));
-        }
-        if !app.test_tail.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "Test output",
-                Style::default()
-                    .fg(theme::CHROME_DIM)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for tail_line in app.visible_test_tail(TAIL_VISIBLE_LINES) {
-                lines.push(Line::from(Span::styled(
-                    tail_line,
-                    Style::default().fg(theme::CHROME_DIM),
-                )));
-            }
-            lines.push(Line::from(""));
-        }
-    }
+    // §29: tails follow the cursor — they belong to the live step, so when
+    // the user moves the cursor onto a pending step we don't want the
+    // running step's logs occluding what they're trying to read. The compact
+    // "▶ Running step N (phase) MM:SS" indicator lives in the chrome bar
+    // (see `running_indicator` / chrome::render) so the live state remains
+    // visible regardless of cursor position.
+    let cursor_on_live_step = app
+        .live_step_id()
+        .as_deref()
+        .is_some_and(|id| id == step.id);
 
     // Title
     lines.push(Line::from(vec![
@@ -345,6 +316,45 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
         )));
         for criterion in &step.acceptance_criteria {
             lines.push(Line::from(format!("  - {criterion}")));
+        }
+    }
+
+    // §29: harness/test output tails belong to the live step. Render them
+    // only when the cursor is parked on that step — otherwise the user is
+    // looking at a pending/complete step and would be drowned out by the
+    // running step's logs. The empty-buffer guard mirrors the pre-refactor
+    // behavior: don't show "(no output yet)" headers during the pre-harness
+    // phase.
+    if cursor_on_live_step {
+        if !app.harness_tail.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Harness output",
+                Style::default()
+                    .fg(theme::CHROME_DIM)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for tail_line in app.visible_harness_tail(TAIL_VISIBLE_LINES) {
+                lines.push(Line::from(Span::styled(
+                    tail_line,
+                    Style::default().fg(theme::CHROME_DIM),
+                )));
+            }
+        }
+        if !app.test_tail.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Test output",
+                Style::default()
+                    .fg(theme::CHROME_DIM)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for tail_line in app.visible_test_tail(TAIL_VISIBLE_LINES) {
+                lines.push(Line::from(Span::styled(
+                    tail_line,
+                    Style::default().fg(theme::CHROME_DIM),
+                )));
+            }
         }
     }
 
@@ -782,23 +792,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn right_pane_renders_running_step_banner_when_live() {
-        // §7 acceptance: when a runner is bound to this plan, the right
-        // pane shows "Running step N (phase)" alongside the live timer.
-        let mut app = make_app(3);
-        app.update_live_run(Some(crate::run_lock::LiveRun {
+    /// Build a [`LiveRun`] snapshot pinned to the given `step_id` / `step_num`
+    /// for the running-indicator + cursor-aware tail tests.
+    fn make_live_run_for(
+        step_id: &str,
+        step_num: i32,
+        phase: crate::plan::Phase,
+    ) -> crate::run_lock::LiveRun {
+        crate::run_lock::LiveRun {
             project: "/proj".to_string(),
             pid: 1234,
             pid_start_token: None,
             plan_id: Some("p1".to_string()),
             plan_slug: Some("test".to_string()),
             started_at: "2026-01-01T00:00:00Z".to_string(),
-            step_id: Some("s1".to_string()),
-            step_num: Some(2),
+            step_id: Some(step_id.to_string()),
+            step_num: Some(step_num),
             attempt: Some(1),
             max_attempts: Some(4),
-            phase: Some(crate::plan::Phase::Harness),
+            phase: Some(phase),
             phase_started_at: None,
             current_command: None,
             execution_log_id: None,
@@ -807,23 +819,117 @@ mod tests {
             updated_at: None,
             source_branch: None,
             stash_sha: None,
-        }));
-        let out = rendered(&mut app, 80, 24);
+        }
+    }
+
+    #[test]
+    fn running_indicator_visible_in_chrome_when_live() {
+        // §29: the compact "▶ Running step N (phase) MM:SS" indicator lives
+        // in the bottom chrome row so the user sees what's executing
+        // regardless of cursor position. We render at width=120 to ensure
+        // the indicator slot has room next to the cwd/version text — the
+        // chrome drops the indicator if there isn't enough horizontal room.
+        let mut app = make_app(3);
+        app.update_live_run(Some(make_live_run_for(
+            "s1",
+            2,
+            crate::plan::Phase::Harness,
+        )));
+        let out = rendered(&mut app, 120, 24);
+        let bottom_row = out.lines().last().unwrap();
         assert!(
-            out.contains("Running step 2"),
-            "running banner missing:\n{out}"
+            bottom_row.contains("Running step 2"),
+            "running indicator missing on chrome bottom row: {bottom_row:?}"
         );
-        assert!(out.contains("(harness)"), "phase missing:\n{out}");
+        assert!(
+            bottom_row.contains("(harness)"),
+            "phase missing on chrome: {bottom_row:?}"
+        );
+    }
+
+    #[test]
+    fn right_pane_renders_tails_when_cursor_on_live_step() {
+        // §29: tail content only appears in the right pane when the cursor
+        // is parked on the live step. Park selection at index 1 (matching
+        // step_id `s1`), push tail lines, render, and confirm the tail
+        // headers + content are present.
+        let mut app = make_app(3);
+        app.selected_index = 1;
+        app.update_live_run(Some(make_live_run_for(
+            "s1",
+            2,
+            crate::plan::Phase::Harness,
+        )));
+        app.push_harness_line("compiling crate...".to_string());
+        app.push_test_line("test result: ok. 42 passed".to_string());
+        let out = rendered(&mut app, 80, 30);
+        assert!(
+            out.contains("Harness output"),
+            "harness tail header missing when cursor on live step:\n{out}"
+        );
+        assert!(
+            out.contains("compiling crate"),
+            "harness tail line missing:\n{out}"
+        );
+        assert!(
+            out.contains("Test output"),
+            "test tail header missing:\n{out}"
+        );
+        assert!(
+            out.contains("42 passed"),
+            "test tail line missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn right_pane_hides_tails_when_cursor_on_other_step() {
+        // §29: when the cursor moves off the live step, tails disappear so
+        // the user can read pending step content. The cursor's step (title,
+        // status) must still render normally.
+        let mut app = make_app(3);
+        // live step is `s1` (step 2); cursor parked on `s2` (step 3).
+        app.selected_index = 2;
+        app.update_live_run(Some(make_live_run_for(
+            "s1",
+            2,
+            crate::plan::Phase::Harness,
+        )));
+        app.push_harness_line("compiling crate...".to_string());
+        app.push_test_line("test result: ok. 42 passed".to_string());
+        let out = rendered(&mut app, 80, 30);
+        assert!(
+            !out.contains("Harness output"),
+            "harness tail header should be hidden when cursor off live step:\n{out}"
+        );
+        assert!(
+            !out.contains("Test output"),
+            "test tail header should be hidden when cursor off live step:\n{out}"
+        );
+        assert!(
+            !out.contains("compiling crate"),
+            "harness tail content leaked into non-live step view:\n{out}"
+        );
+        // Cursor's step content remains visible — this is the whole point
+        // of the refactor: navigating ahead must not be blocked by logs.
+        assert!(
+            out.contains("Title: Step 3"),
+            "cursor's step title missing on non-live step:\n{out}"
+        );
+        assert!(out.contains("Status: pending"), "cursor's step status missing:\n{out}");
     }
 
     #[test]
     fn right_pane_omits_running_banner_when_no_live_run() {
-        // No update_live_run call → banner is hidden.
+        // Sanity: no live run → no chrome indicator and no in-body tails.
         let mut app = make_app(3);
-        let out = rendered(&mut app, 80, 24);
+        let out = rendered(&mut app, 120, 24);
         assert!(
             !out.contains("Running step"),
-            "banner should be hidden without live run:\n{out}"
+            "indicator should be hidden without live run:\n{out}"
+        );
+        assert!(
+            !out.contains("Harness output"),
+            "tails should be hidden without live run:\n{out}"
         );
     }
 

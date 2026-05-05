@@ -615,6 +615,14 @@ impl PlanDetailApp {
             .or_else(|| self.live_run.as_ref().and_then(|l| l.step_num))
     }
 
+    /// Step ID currently executing under the live runner, or `None` when no
+    /// run is active for this plan. Used by `draw_step_detail` to gate the
+    /// harness/test output tails on whether the cursor is parked on the
+    /// running step (step #29).
+    pub fn live_step_id(&self) -> Option<String> {
+        self.live_run.as_ref().and_then(|l| l.step_id.clone())
+    }
+
     /// True iff a runner is currently bound to this plan — either via an
     /// active TUI-spawned subscription (TUI-plan.md §13) or via a DB-poll
     /// snapshot of `run_locks` (read-only attach, §13.2).
