@@ -28,7 +28,7 @@ pub const TRUNCATION_MARKER_PREFIX: &str = "\n[output truncated to last ";
 /// the cap is an exact multiple, otherwise falls back to bytes.
 fn truncation_marker(cap: usize) -> String {
     const MIB: usize = 1024 * 1024;
-    if cap >= MIB && cap % MIB == 0 {
+    if cap >= MIB && cap.is_multiple_of(MIB) {
         format!("{TRUNCATION_MARKER_PREFIX}{} MiB]\n", cap / MIB)
     } else {
         format!("{TRUNCATION_MARKER_PREFIX}{cap} bytes]\n")

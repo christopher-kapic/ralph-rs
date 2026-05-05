@@ -862,13 +862,13 @@ pub fn create_step(
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
     // The new step is always appended, so its position is the total step count.
-    let position: usize = conn.query_row(
+    let position: i64 = conn.query_row(
         "SELECT COUNT(*) FROM steps WHERE plan_id = ?1",
         params![plan_id],
         |row| row.get(0),
     )?;
 
-    Ok((get_step(conn, &id)?, position))
+    Ok((get_step(conn, &id)?, position as usize))
 }
 
 /// List steps for a plan, ordered by sort_key.
@@ -1003,13 +1003,13 @@ pub fn create_step_at(
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
     // Count steps with sort_key <= the new one to get the 1-based position.
-    let position: usize = conn.query_row(
+    let position: i64 = conn.query_row(
         "SELECT COUNT(*) FROM steps WHERE plan_id = ?1 AND sort_key <= ?2",
         params![plan_id, sort_key],
         |row| row.get(0),
     )?;
 
-    Ok((get_step(conn, &id)?, position))
+    Ok((get_step(conn, &id)?, position as usize))
 }
 
 /// Extended step update: title, description, agent, harness, criteria, max_retries, model, change_policy, tags.

@@ -106,12 +106,10 @@ fn parse_porcelain_status(out: &str) -> Vec<String> {
         let status = line.get(..2).unwrap_or("");
         let rest = line.get(3..).unwrap_or(line);
         let is_rename_or_copy = status.contains('R') || status.contains('C');
-        if is_rename_or_copy {
-            if let Some((old, new)) = rest.split_once(" -> ") {
-                files.push(old.to_string());
-                files.push(new.to_string());
-                continue;
-            }
+        if is_rename_or_copy && let Some((old, new)) = rest.split_once(" -> ") {
+            files.push(old.to_string());
+            files.push(new.to_string());
+            continue;
         }
         files.push(rest.to_string());
     }
@@ -214,11 +212,10 @@ fn remove_untracked_except(
         } else {
             std::fs::remove_file(&path)
         };
-        if let Err(err) = result {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                return Err(err)
-                    .with_context(|| format!("failed to remove untracked path '{file}'"));
-            }
+        if let Err(err) = result
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(err).with_context(|| format!("failed to remove untracked path '{file}'"));
         }
     }
     Ok(())

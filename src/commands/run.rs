@@ -780,7 +780,10 @@ fn confirm_with_background<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     app: &mut crate::tui::views::plan_list::PlanListApp,
     c: &crate::tui::dialog::Confirm<'_>,
-) -> Result<bool> {
+) -> Result<bool>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::dialog::{self, Decision};
     use crate::tui::views::plan_list;
     use crossterm::event::{self, Event, KeyEventKind};
@@ -918,7 +921,10 @@ fn plan_list_create_plan<B: ratatui::backend::Backend>(
     project: &str,
     terminal: &mut ratatui::Terminal<B>,
     app: &mut crate::tui::views::plan_list::PlanListApp,
-) -> Result<()> {
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::views::create_plan::{self, CreatePlanModal, Outcome};
     use crate::tui::views::plan_list;
     use crossterm::event::{self, Event, KeyEventKind};
@@ -1104,6 +1110,7 @@ pub(crate) fn run_dialog_loop_with_bg<B, F>(
 ) -> Result<crate::tui::run_dialog::Outcome>
 where
     B: ratatui::backend::Backend,
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
     F: FnMut(&mut ratatui::Frame<'_>),
 {
     use crate::tui::run_dialog::{self, Outcome, RunDialog};
@@ -1137,6 +1144,7 @@ fn confirm_loop_with_bg<B, F>(
 ) -> Result<bool>
 where
     B: ratatui::backend::Backend,
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
     F: FnMut(&mut ratatui::Frame<'_>),
 {
     use crate::tui::dialog::{self, Decision};
@@ -1194,6 +1202,7 @@ pub(crate) fn apply_palette_run_outcome<B, F>(
 ) -> Result<PaletteRunReport>
 where
     B: ratatui::backend::Backend,
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
     F: FnMut(&mut ratatui::Frame<'_>),
 {
     use crate::tui::run_dialog::Outcome;
@@ -1753,7 +1762,10 @@ fn run_archived_list_tui<B: ratatui::backend::Backend>(
     project: &str,
     display_timezone: &str,
     default_harness: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::dialog;
     use crate::tui::views::archived_list::{self, ArchivedListApp};
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -2145,7 +2157,10 @@ fn confirm_with_archived_background<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     app: &mut crate::tui::views::archived_list::ArchivedListApp,
     c: &crate::tui::dialog::Confirm<'_>,
-) -> Result<bool> {
+) -> Result<bool>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::dialog::{self, Decision};
     use crate::tui::views::archived_list;
     use crossterm::event::{self, Event, KeyEventKind};
@@ -2196,7 +2211,10 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     project: &str,
     slug: &str,
     auto_start: Option<crate::tui::events::StreamMode>,
-) -> Result<()> {
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::events::{self as tui_events, RunSubscription};
     use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
     use crate::tui::toast::ToastKind;
@@ -2891,7 +2909,10 @@ pub(crate) fn plan_detail_apply_delete<B: ratatui::backend::Backend>(
     conn: &Connection,
     app: &mut crate::tui::views::plan_detail::PlanDetailApp,
     targets: &[String],
-) -> Result<()> {
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::dialog;
     use crate::tui::toast::ToastKind;
     use std::time::Instant;
@@ -3399,7 +3420,10 @@ fn confirm_with_plan_detail_background<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     app: &mut crate::tui::views::plan_detail::PlanDetailApp,
     c: &crate::tui::dialog::Confirm<'_>,
-) -> Result<bool> {
+) -> Result<bool>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::dialog::{self, Decision};
     use crate::tui::views::plan_detail_ui;
     use crossterm::event::{self, Event, KeyEventKind};
@@ -3444,7 +3468,10 @@ fn run_plan_dependencies_tui<B: ratatui::backend::Backend>(
     project: &str,
     plan_id: &str,
     plan_slug: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::toast::ToastKind;
     use crate::tui::views::plan_dependencies::{Mode, Outcome, PlanDependenciesApp, render};
     use crossterm::event::{self, Event, KeyEventKind};
@@ -3583,7 +3610,10 @@ fn run_plan_hooks_tui<B: ratatui::backend::Backend>(
     project: &str,
     plan_id: &str,
     plan_slug: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::toast::ToastKind;
     use crate::tui::views::plan_hooks::{Mode, Outcome, PlanHooksApp, render};
     use crossterm::event::{self, Event, KeyEventKind};
@@ -3721,7 +3751,10 @@ fn run_step_hooks_tui<B: ratatui::backend::Backend>(
     conn: &Connection,
     project: &str,
     step_id: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::toast::ToastKind;
     use crate::tui::views::step_hooks::{Mode, Outcome, StepHooksApp, render};
     use crossterm::event::{self, Event, KeyEventKind};
@@ -3884,7 +3917,10 @@ fn run_step_tags_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
     step_id: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::views::step_tags::{Outcome, StepTagsApp, render};
     use crossterm::event::{self, Event, KeyEventKind};
 
@@ -3991,7 +4027,10 @@ fn run_step_detail_tui<B: ratatui::backend::Backend>(
     project: &str,
     plan_app: &mut crate::tui::views::plan_detail::PlanDetailApp,
     target_step_id: &str,
-) -> Result<()> {
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
     use crate::tui::editor::edit_in_editor;
     use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
     use crate::tui::toast::ToastKind;
@@ -5546,7 +5585,7 @@ fn wait_for_release(
         std::thread::sleep(POLL);
         ticks += 1;
         // 200ms * 10 = 2s.
-        if show_progress && ticks % 10 == 0 {
+        if show_progress && ticks.is_multiple_of(10) {
             eprint!(".");
             use std::io::Write as _;
             let _ = std::io::stderr().flush();

@@ -773,13 +773,13 @@ impl Palette {
     fn tab(&mut self, ctx: &CompletionContext) {
         // Continue a cycle if we already have one and the buffer still
         // matches what the cycle produced last time.
-        if let Some(cycle) = &mut self.cycle {
-            if !cycle.candidates.is_empty() {
-                cycle.index = (cycle.index + 1) % cycle.candidates.len();
-                self.buffer = format!("{}{}", cycle.stem, cycle.candidates[cycle.index]);
-                self.cursor = self.buffer.len();
-                return;
-            }
+        if let Some(cycle) = &mut self.cycle
+            && !cycle.candidates.is_empty()
+        {
+            cycle.index = (cycle.index + 1) % cycle.candidates.len();
+            self.buffer = format!("{}{}", cycle.stem, cycle.candidates[cycle.index]);
+            self.cursor = self.buffer.len();
+            return;
         }
 
         let Some(completion) = build_completion(&self.buffer, ctx) else {

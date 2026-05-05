@@ -114,7 +114,10 @@ fn centered_rect(area: Rect, c: &Confirm<'_>) -> Rect {
 /// Block until the user accepts or rejects the dialog. Renders over the
 /// terminal's current contents — the caller is expected to have rendered the
 /// background view immediately prior.
-pub fn run<B: Backend>(terminal: &mut Terminal<B>, c: &Confirm<'_>) -> Result<bool> {
+pub fn run<B: Backend>(terminal: &mut Terminal<B>, c: &Confirm<'_>) -> Result<bool>
+where
+    <B as Backend>::Error: Send + Sync + 'static,
+{
     loop {
         terminal.draw(|f| {
             let area = f.area();
