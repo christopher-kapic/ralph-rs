@@ -30,7 +30,8 @@ use clap::Parser;
 
 use crate::cli::{
     AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
-    PlanHarnessCommand, PlanPrependCommand, PromptCommand, QuestionCommand, StepCommand,
+    PlanHarnessCommand, PlanPrependCommand, PromptCommand, QuestionCommand, QuestionsState,
+    StepCommand,
 };
 
 use crate::commands::{resolve_plan, resolve_project};
@@ -226,6 +227,10 @@ fn main() -> Result<()> {
                     std::process::exit(exit_code);
                 }
             },
+            PlanCommand::Questions { state, slug } => {
+                let enabled = matches!(state, QuestionsState::On);
+                commands::cmd_plan_questions(&conn, &slug, &project, enabled, &out)
+            }
             PlanCommand::Prepend(prepend_cmd) => match prepend_cmd {
                 PlanPrependCommand::Set {
                     plan,
@@ -620,6 +625,26 @@ fn main() -> Result<()> {
                     }
                     QuestionAskOutcome::Recorded { .. } => Ok(()),
                 }
+            }
+            QuestionCommand::List { plan } => {
+                commands::question::cmd_question_list(&conn, &project, plan.as_deref(), &out)
+            }
+            QuestionCommand::Answer { num, text } => {
+                use std::io::Read;
+                let answer = match text {
+                    Some(t) => t,
+                    None => {
+                        let mut buf = String::new();
+                        std::io::stdin()
+                            .read_to_string(&mut buf)
+                            .context("Failed to read answer text from stdin")?;
+                        buf.trim_end().to_string()
+                    }
+                };
+                commands::question::cmd_question_answer(&conn, &project, num, &answer, &out)
+            }
+            QuestionCommand::Show { num } => {
+                commands::question::cmd_question_show(&conn, &project, num, &out)
             }
         },
 

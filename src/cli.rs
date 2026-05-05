@@ -450,6 +450,18 @@ pub enum PlanCommand {
     /// top of every step's prompt).
     #[command(subcommand)]
     Prepend(PlanPrependCommand),
+
+    /// Toggle the pause-for-question feature for a plan.
+    ///
+    /// `ralph plan questions on <slug>` enables the feature; off disables it.
+    /// Mirrors the `Q` keybinding in the TUI plan list.
+    Questions {
+        /// `on` to enable, `off` to disable.
+        state: QuestionsState,
+
+        /// Plan slug.
+        slug: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +872,44 @@ pub enum QuestionCommand {
         #[arg(long = "suggest", short = 's', value_name = "ANSWER")]
         suggest: Vec<String>,
     },
+
+    /// List open (unanswered) questions for the current project.
+    ///
+    /// Output is numbered 1..N — those numbers are the input expected by
+    /// `ralph question answer` and `ralph question show`. Order is by
+    /// `asked_at` ASC then `id`, so a question's index does not change as
+    /// new questions arrive.
+    List {
+        /// Filter to questions on a specific plan slug. Without this, all
+        /// open questions on plans for the current project are listed.
+        plan: Option<String>,
+    },
+
+    /// Answer a specific open question by its index in `ralph question list`.
+    Answer {
+        /// 1-based index from `ralph question list`.
+        num: usize,
+
+        /// Answer text. If omitted, read from stdin (heredoc-friendly).
+        text: Option<String>,
+    },
+
+    /// Print a question's full text and any harness-supplied suggestions,
+    /// identified by its index in `ralph question list`.
+    Show {
+        /// 1-based index from `ralph question list`.
+        num: usize,
+    },
+}
+
+/// `on` / `off` value enum for `ralph plan questions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum QuestionsState {
+    /// Enable the per-plan pause-for-question feature.
+    On,
+    /// Disable the feature (the default for new plans).
+    Off,
 }
 
 // ---------------------------------------------------------------------------
@@ -1981,6 +2031,96 @@ mod tests {
         } else {
             panic!("Expected Question Ask");
         }
+    }
+
+    #[test]
+    fn test_parse_question_list_no_plan() {
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "list"]).unwrap();
+        if let Command::Question(QuestionCommand::List { plan }) = cli.command.unwrap() {
+            assert!(plan.is_none());
+        } else {
+            panic!("Expected Question List");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_list_with_plan() {
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "list", "my-plan"]).unwrap();
+        if let Command::Question(QuestionCommand::List { plan }) = cli.command.unwrap() {
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+        } else {
+            panic!("Expected Question List");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_answer() {
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "question", "answer", "3", "use Postgres"]).unwrap();
+        if let Command::Question(QuestionCommand::Answer { num, text }) = cli.command.unwrap() {
+            assert_eq!(num, 3);
+            assert_eq!(text.as_deref(), Some("use Postgres"));
+        } else {
+            panic!("Expected Question Answer");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_answer_text_optional_for_stdin() {
+        // Omitting the text positional must still parse so the dispatcher can
+        // fall back to stdin (heredoc-friendly invocation).
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "answer", "1"]).unwrap();
+        if let Command::Question(QuestionCommand::Answer { num, text }) = cli.command.unwrap() {
+            assert_eq!(num, 1);
+            assert!(text.is_none());
+        } else {
+            panic!("Expected Question Answer");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_show() {
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "show", "2"]).unwrap();
+        if let Command::Question(QuestionCommand::Show { num }) = cli.command.unwrap() {
+            assert_eq!(num, 2);
+        } else {
+            panic!("Expected Question Show");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_questions_on() {
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "questions", "on", "my-plan"]).unwrap();
+        if let Command::Plan(PlanCommand::Questions { state, slug }) = cli.command.unwrap() {
+            assert_eq!(state, QuestionsState::On);
+            assert_eq!(slug, "my-plan");
+        } else {
+            panic!("Expected Plan Questions");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_questions_off() {
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "questions", "off", "my-plan"]).unwrap();
+        if let Command::Plan(PlanCommand::Questions { state, slug }) = cli.command.unwrap() {
+            assert_eq!(state, QuestionsState::Off);
+            assert_eq!(slug, "my-plan");
+        } else {
+            panic!("Expected Plan Questions");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_questions_invalid_state_rejected() {
+        // Only `on`/`off` are valid; anything else must be rejected by clap.
+        let result = Cli::try_parse_from(["ralph-rs", "plan", "questions", "maybe", "my-plan"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_plan_questions_requires_slug() {
+        let result = Cli::try_parse_from(["ralph-rs", "plan", "questions", "on"]);
+        assert!(result.is_err());
     }
 
     #[test]

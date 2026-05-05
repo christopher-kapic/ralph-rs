@@ -281,6 +281,112 @@ pub fn set_plan_questions_enabled(
     Ok(())
 }
 
+/// One open (unanswered) `step_questions` row enriched with the plan + step
+/// context the CLI list/show commands need to render. Driven by
+/// [`list_open_questions`].
+///
+/// `step_id` and `plan_id` are exposed for upcoming runner + TUI consumers
+/// (TUI-plan.md §17 steps 42–43, which need to scope by plan id and locate
+/// the originating step row).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct OpenQuestion {
+    pub id: String,
+    pub step_id: String,
+    pub plan_id: String,
+    pub plan_slug: String,
+    /// 1-based position of the step within its plan (matches the numbering
+    /// shown by `ralph step list`).
+    pub step_num: usize,
+    pub step_title: String,
+    pub attempt: i32,
+    pub question: String,
+    pub suggestions: Vec<String>,
+    pub asked_at: String,
+}
+
+/// List unanswered questions for plans in `project`, optionally filtered to a
+/// single plan slug. Ordered by `asked_at` ASC then `id` ASC so the index of
+/// any given question is stable as new questions arrive.
+pub fn list_open_questions(
+    conn: &Connection,
+    project: &str,
+    plan_slug: Option<&str>,
+) -> Result<Vec<OpenQuestion>> {
+    // Compute each step's 1-based position via a window function so the result
+    // matches the numbering users see in `ralph step list`.
+    let base = "WITH step_pos AS (
+            SELECT id, plan_id,
+                   ROW_NUMBER() OVER (PARTITION BY plan_id ORDER BY sort_key) AS step_num
+            FROM steps
+        )
+        SELECT q.id, q.step_id, s.plan_id, p.slug, sp.step_num,
+               s.title, q.attempt, q.question, q.suggestions, q.asked_at
+        FROM step_questions q
+        JOIN steps s ON s.id = q.step_id
+        JOIN plans p ON p.id = s.plan_id
+        JOIN step_pos sp ON sp.id = q.step_id
+        WHERE q.answer IS NULL AND p.project = ?1";
+
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<OpenQuestion> {
+        let suggestions_json: String = row.get(8)?;
+        let suggestions: Vec<String> =
+            serde_json::from_str(&suggestions_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+        let step_num: i64 = row.get(4)?;
+        Ok(OpenQuestion {
+            id: row.get(0)?,
+            step_id: row.get(1)?,
+            plan_id: row.get(2)?,
+            plan_slug: row.get(3)?,
+            step_num: step_num as usize,
+            step_title: row.get(5)?,
+            attempt: row.get(6)?,
+            question: row.get(7)?,
+            suggestions,
+            asked_at: row.get(9)?,
+        })
+    };
+
+    let mut out = Vec::new();
+    if let Some(slug) = plan_slug {
+        let sql = format!("{base} AND p.slug = ?2 ORDER BY q.asked_at ASC, q.id ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![project, slug], map_row)?;
+        for row in rows {
+            out.push(row?);
+        }
+    } else {
+        let sql = format!("{base} ORDER BY q.asked_at ASC, q.id ASC");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![project], map_row)?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
+/// Write an answer to a `step_questions` row, stamping `answered_at` with
+/// the current SQLite UTC time. Errors if no row matches `question_id`.
+pub fn set_question_answer(conn: &Connection, question_id: &str, answer: &str) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE step_questions
+         SET answer = ?1, answered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE id = ?2",
+        params![answer, question_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Question not found: {question_id}");
+    }
+    Ok(())
+}
+
 /// Delete a plan (cascades to steps and execution_logs via FK).
 pub fn delete_plan(conn: &Connection, plan_id: &str) -> Result<()> {
     let affected = conn.execute("DELETE FROM plans WHERE id = ?1", params![plan_id])?;
