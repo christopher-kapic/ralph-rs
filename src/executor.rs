@@ -286,7 +286,10 @@ fn write_phase(
         child,
     )?;
     if json_output {
-        crate::output::emit_ndjson(&crate::output::RunEvent::PhaseChanged { phase })?;
+        crate::output::emit_ndjson(&crate::output::RunEvent::PhaseChanged {
+            phase,
+            phase_started_at: chrono::Utc::now(),
+        })?;
     }
     Ok(())
 }

@@ -260,51 +260,30 @@ pub fn run_tui_mode(
     config: &Config,
     project: &str,
     args: RunArgs,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
-    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
-    use crossterm::execute;
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
-    use ratatui::Terminal;
-    use ratatui::backend::CrosstermBackend;
-
     // Resolve the plan before touching the terminal so a "no active plan" or
     // "plan not found" error surfaces as plain stderr rather than corrupting
     // the user's terminal with a half-entered alternate screen.
     let plan = super::resolve_plan(conn, args.plan_slug, project, false)?;
     let slug = plan.slug.clone();
 
-    enable_raw_mode().context("enable raw mode")?;
-    let mut stdout = std::io::stdout();
-    // Mouse capture is paired with the alternate screen so per-view
-    // `handle_mouse` routing in the dispatcher event loops receives
-    // `Event::Mouse`. Bypass with Shift to fall back to native terminal
-    // selection (TUI-plan.md §4).
-    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
-        let _ = disable_raw_mode();
-        return Err(e).context("enter alternate screen");
-    }
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("create terminal")?;
-
-    let result = run_plan_detail_tui(
-        &mut terminal,
+    // Delegate to the plan-list dispatcher with an auto-push so popping
+    // back from plan-detail lands at plan-list — keeping the runner
+    // subscription alive across the navigation transition. Terminal /
+    // raw-mode setup happens inside `run_plan_list_tui`.
+    run_plan_list_tui(
         conn,
         config,
         project,
-        &slug,
-        Some(crate::tui::events::StreamMode::Run {
-            current_branch: false,
+        out,
+        Some(InitialPush::PlanDetail {
+            slug,
+            auto_start: Some(crate::tui::events::StreamMode::Run {
+                current_branch: false,
+            }),
         }),
-    );
-
-    let _ = disable_raw_mode();
-    let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
-
-    result
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -402,16 +381,8 @@ pub fn run_resume_tui_mode(
     config: &Config,
     project: &str,
     args: ResumeArgs,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
-    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
-    use crossterm::execute;
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
-    use ratatui::Terminal;
-    use ratatui::backend::CrosstermBackend;
-
     // Resolve the plan before touching the terminal so a "no resumable
     // plan" error surfaces as plain stderr rather than corrupting the
     // user's terminal with a half-entered alternate screen.
@@ -419,34 +390,37 @@ pub fn run_resume_tui_mode(
     let plan = super::resolve_resume_plan(conn, args.plan_slug, project, workdir)?;
     let slug = plan.slug.clone();
 
-    enable_raw_mode().context("enable raw mode")?;
-    let mut stdout = std::io::stdout();
-    if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
-        let _ = disable_raw_mode();
-        return Err(e).context("enter alternate screen");
-    }
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("create terminal")?;
-
-    let result = run_plan_detail_tui(
-        &mut terminal,
+    run_plan_list_tui(
         conn,
         config,
         project,
-        &slug,
-        Some(crate::tui::events::StreamMode::Resume),
-    );
-
-    let _ = disable_raw_mode();
-    let mut stdout = std::io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen, DisableMouseCapture);
-
-    result
+        out,
+        Some(InitialPush::PlanDetail {
+            slug,
+            auto_start: Some(crate::tui::events::StreamMode::Resume),
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Plan-list TUI dispatcher (TUI-plan.md §2 / §5)
 // ---------------------------------------------------------------------------
+
+/// One-shot view to push immediately on entry — used by `ralph run` /
+/// `ralph resume` to land directly in plan-detail with the runner
+/// subprocess auto-started, while still routing through the plan-list
+/// dispatcher so popping back falls into the plan-list view (and the
+/// runner subscription stays alive across the nav transition).
+pub enum InitialPush {
+    /// Push plan-detail for `slug`. `auto_start` is `Some` when the parent
+    /// CLI invocation wants to spawn a runner immediately on first frame
+    /// (`ralph run`, `ralph resume`); `None` matches a plain "open this
+    /// plan" entry.
+    PlanDetail {
+        slug: String,
+        auto_start: Option<crate::tui::events::StreamMode>,
+    },
+}
 
 /// Launch the plan-list view for a bare `ralph` invocation.
 ///
@@ -455,11 +429,18 @@ pub fn run_resume_tui_mode(
 /// down. `enter` / `→` / `l` push the plan-detail view for the highlighted
 /// tile; the dispatcher reuses the same terminal session so the user can
 /// pop back here when they exit plan-detail.
+///
+/// `initial_push` lets the caller jump straight into a child view on the
+/// first iteration (used by `ralph run` / `ralph resume` to auto-start a
+/// runner) while preserving plan-list as the navigation root: when the
+/// child pops, the user lands in plan-list with the runner still
+/// streaming in the background.
 pub fn run_plan_list_tui(
     conn: &Connection,
     config: &Config,
     project: &str,
     _out: &OutputContext,
+    initial_push: Option<InitialPush>,
 ) -> Result<()> {
     use crate::plan::PlanStatus;
     use crate::tui::dialog;
@@ -505,8 +486,59 @@ pub fn run_plan_list_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
+    // Subscription to a TUI-spawned runner. Owned here at the navigation
+    // root so popping plan-detail (or pushing through to a sub-view)
+    // doesn't tear it down — the run keeps streaming in the background
+    // and the user can re-attach by re-entering the running plan's
+    // detail. Released when the runner subprocess hangs up, or
+    // implicitly on TUI exit (the parent's `Drop` kills the child via
+    // `kill_on_drop`).
+    let mut subscription: Option<crate::tui::events::HostedSubscription> = None;
+
+    // Auto-push for `ralph run` / `ralph resume`: dispatched on the first
+    // iteration so the user sees plan-detail (with the auto-started
+    // runner) before plan-list ever paints. Latched so popping back from
+    // plan-detail doesn't re-fire it.
+    let mut pending_initial_push = initial_push;
+
     let result: Result<()> = (|| {
         loop {
+            // Auto-push (`ralph run` / `ralph resume`) — runs once before
+            // the first plan-list draw so the user lands directly in
+            // plan-detail. On pop the loop body resumes from the next
+            // iteration with plan-list as the visible root.
+            if let Some(push) = pending_initial_push.take() {
+                match push {
+                    InitialPush::PlanDetail { slug, auto_start } => {
+                        run_plan_detail_tui(
+                            &mut terminal,
+                            conn,
+                            config,
+                            project,
+                            &slug,
+                            auto_start,
+                            &mut subscription,
+                        )?;
+                        refresh_plan_list_state(conn, project, &mut app)?;
+                    }
+                }
+            }
+
+            // Drain the runner subscription on every tick to keep its
+            // unbounded mpsc channel from accumulating events the user
+            // can't see (the active view drains and dispatches; here we
+            // just discard so memory stays bounded). When the producer
+            // hangs up, release the slot so the next spawn attempt is
+            // unblocked. Tail/state recovery on re-entering plan-detail
+            // comes from the always-on `run_locks` poll inside that
+            // dispatcher.
+            if let Some(hosted) = subscription.as_mut() {
+                let _ = hosted.sub.drain();
+                if hosted.sub.is_disconnected() {
+                    subscription = None;
+                }
+            }
+
             // Re-poll the run-lock state on a 500ms cadence (TUI-plan.md
             // §13.2). On Released, push the "edits enabled" toast so the
             // user sees the transition; on Engaged, no toast (the banner
@@ -741,6 +773,7 @@ pub fn run_plan_list_tui(
                                     project,
                                     &slug,
                                     None,
+                                    &mut subscription,
                                 )?;
                                 // The plan-detail view can mutate step state
                                 // (skip / add) and counters; refresh tiles so
@@ -2211,11 +2244,12 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     project: &str,
     slug: &str,
     auto_start: Option<crate::tui::events::StreamMode>,
+    subscription: &mut Option<crate::tui::events::HostedSubscription>,
 ) -> Result<()>
 where
     <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
 {
-    use crate::tui::events::{self as tui_events, RunSubscription};
+    use crate::tui::events as tui_events;
     use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
     use crate::tui::toast::ToastKind;
     use crate::tui::views::plan_detail::{self, PlanDetailApp};
@@ -2229,14 +2263,29 @@ where
     let steps = storage::list_steps(conn, &plan.id)?;
     let mut app = PlanDetailApp::new(plan, steps, config);
 
-    let mut subscription: Option<RunSubscription> = None;
+    // The runner subscription is owned by the parent dispatcher
+    // (`run_plan_list_tui`) so that popping back to the plan list does NOT
+    // tear down the subprocess. We only attach to it when its slug matches
+    // the plan being viewed; otherwise the parent's drain keeps its
+    // channel from filling and we render this plan's static state.
+    let subscription_matches = |sub: &Option<tui_events::HostedSubscription>| {
+        sub.as_ref().is_some_and(|h| h.slug == slug)
+    };
 
-    // §13.2: read-only attach. While the TUI does not own a streaming
-    // subscription, any `run_locks` row owned by an unrelated pid means
-    // someone else is driving the run; suppress edits until they release.
-    // When `subscription` is `Some`, we are the runner host and skip the
-    // detection — the child's lock row is "ours" even though the row's
-    // recorded pid is the subprocess.
+    // Local "have we already done the attach handshake for the current
+    // subscription instance?" flag. Tracked separately from
+    // `app.subscribed` because `dispatch_event(PlanComplete)` clears the
+    // App's subscribed bit before the channel disconnects, and we don't
+    // want the next loop tick to falsely re-attach (which would wipe the
+    // final harness/test tails the user is reading). Reset to false
+    // whenever the slot becomes empty.
+    let mut attached_this_instance = false;
+
+    // §13.2: read-only attach. When a runner is bound to *this* plan
+    // (whether spawned by us or someone else), suppress the lockdown
+    // banner — the right-pane "Running step N" surface is enough notice.
+    // Edits stay disabled by way of the per-step status checks (you can't
+    // edit an in-progress step, etc.).
     let my_pid = std::process::id() as i64;
     let mut tracker = ReadOnlyTracker::new(ReadOnly::Editable);
 
@@ -2250,36 +2299,54 @@ where
     loop {
         // -- Refresh state from the active source of truth ----------------
         //
-        // TUI-plan.md §13 splits this in two:
-        //   - Subscription active (TUI spawned the runner): drain the
-        //     NDJSON stream and dispatch each event into the App. The DB
-        //     `run_locks` snapshot is intentionally skipped because the
-        //     stream gives us strictly fresher data and avoids the
-        //     250ms polling round-trip.
-        //   - No subscription (read-only attach to an externally spawned
-        //     runner): fall back to polling `run_locks` so the banner
-        //     still surfaces externally-spawned runs.
-        if let Some(sub) = subscription.as_mut() {
-            for evt in sub.drain() {
+        // The subscription is owned by the parent dispatcher and survives
+        // navigation, so on every tick we:
+        //   1. Attach (once) when the parent's subscription matches our
+        //      plan and the App hasn't yet noted the binding.
+        //   2. Drain the NDJSON stream and dispatch events into the App.
+        //   3. Detect producer hang-up (subprocess exited) and release
+        //      the subscription so the next `R` press can spawn a fresh
+        //      run.
+        //   4. Always poll `run_locks` so externally-spawned runs and
+        //      mid-flight re-attaches both get their `LiveRun` snapshot
+        //      populated (the `elapsed_secs` priority order keeps NDJSON
+        //      timestamps authoritative when present).
+        if subscription_matches(subscription) {
+            if !attached_this_instance {
+                app.attach_subscription();
+                attached_this_instance = true;
+            }
+            let hosted = subscription.as_mut().expect("matched above");
+            for evt in hosted.sub.drain() {
                 tui_events::dispatch_event(&mut app, &evt);
             }
-            // When the producer hangs up (subprocess exited and stdout
-            // closed), tear the subscription down so the next `R` press
-            // can spawn a fresh one. The App's run-live state is already
-            // cleared by `dispatch_event(PlanComplete | Summary)`; this
-            // also handles the no-events-but-disconnected case (e.g. the
-            // child failed to spawn).
-            if sub.is_disconnected() {
-                subscription = None;
+            if hosted.sub.is_disconnected() {
+                *subscription = None;
                 app.detach_subscription();
+                attached_this_instance = false;
             }
         } else {
-            let live_snapshot = storage::get_live_run(conn, project)
-                .ok()
-                .flatten()
-                .filter(|l| l.plan_slug.as_deref() == Some(slug));
-            app.update_live_run(live_snapshot);
+            if attached_this_instance {
+                // Parent dropped the subscription while we were attached
+                // (e.g. another view popped after a disconnect we missed).
+                app.detach_subscription();
+                attached_this_instance = false;
+            }
+            // Subscription exists but is bound to another plan: still
+            // drain-and-discard so the unbounded mpsc channel doesn't
+            // accumulate events while the user is parked here.
+            if let Some(hosted) = subscription.as_mut() {
+                let _ = hosted.sub.drain();
+                if hosted.sub.is_disconnected() {
+                    *subscription = None;
+                }
+            }
         }
+        let live_snapshot = storage::get_live_run(conn, project)
+            .ok()
+            .flatten()
+            .filter(|l| l.plan_slug.as_deref() == Some(slug));
+        app.update_live_run(live_snapshot);
         if let Ok(latest_steps) = storage::list_steps(conn, &app.plan.id) {
             app.sync_steps_from_db(latest_steps);
         }
@@ -2292,13 +2359,16 @@ where
 
         // -- §13.2 read-only attach poll -------------------------------
         //
-        // Only relevant when we are NOT the runner host: a TUI-spawned
-        // subscription already implies the lock holder is our child, so
-        // skip detection and treat the App as editable. (The user sees
-        // the existing right-pane "Running step N" surface for the
-        // active run instead.)
+        // Only relevant when the runner host is NOT us: a TUI-spawned
+        // subscription bound to *this* plan implies the lock holder is
+        // our child, so skip detection and treat the App as editable.
+        // (The user sees the existing right-pane "Running step N"
+        // surface for the active run instead.) When the parent's
+        // subscription is for a *different* plan, the per-project lock
+        // is still effectively ours, so we also stay editable.
         let now = Instant::now();
-        if subscription.is_none() {
+        let host_owns_subscription = subscription.is_some();
+        if !host_owns_subscription {
             if tracker.should_poll(now)
                 && let Ok(observed) = read_only::detect(conn, project, my_pid, None)
             {
@@ -2310,9 +2380,9 @@ where
                 }
             }
         } else if app.read_only.is_locked() {
-            // We just spawned a runner — clear any latched lockdown so
-            // the banner doesn't keep showing while our own child holds
-            // the row.
+            // We (the same TUI session) own a runner — clear any latched
+            // lockdown so the banner doesn't keep showing while our own
+            // child holds the row.
             tracker.observe(ReadOnly::Editable, now);
             app.set_read_only(ReadOnly::Editable);
         }
@@ -2324,14 +2394,7 @@ where
         // resume counterpart). Cleared after the single shot so subsequent
         // loop iterations don't re-spawn.
         if let Some(mode) = pending_auto_start.take() {
-            plan_detail_apply_run_streaming(
-                conn,
-                &mut app,
-                project,
-                slug,
-                mode,
-                &mut subscription,
-            )?;
+            plan_detail_apply_run_streaming(conn, &mut app, project, slug, mode, subscription)?;
         }
 
         // Poll with a short timeout so the live timer keeps ticking and
@@ -2540,7 +2603,7 @@ where
                     crate::tui::events::StreamMode::Run {
                         current_branch: false,
                     },
-                    &mut subscription,
+                    subscription,
                 )?;
             }
             InputAction::Stop => {
@@ -2572,11 +2635,12 @@ where
             }
         }
         if app.should_pop {
-            // Dropping the subscription tears down its tokio runtime and
-            // (via `kill_on_drop`) terminates the runner subprocess. The
-            // read-only attach path holds no subscription, so this drop is
-            // a no-op there — the external runner is left to finish.
-            drop(subscription);
+            // Subscription is owned by the parent dispatcher; we leave
+            // it intact so the runner subprocess keeps streaming while
+            // the user navigates back to the plan list and (optionally)
+            // into other plans. The subscription is torn down only when
+            // the parent dispatcher exits or the run completes (which
+            // disconnects the channel and clears the slot above).
             return Ok(());
         }
     }
@@ -2783,9 +2847,9 @@ pub(crate) fn plan_detail_apply_run_streaming(
     project: &str,
     slug: &str,
     mode: crate::tui::events::StreamMode,
-    subscription: &mut Option<crate::tui::events::RunSubscription>,
+    subscription: &mut Option<crate::tui::events::HostedSubscription>,
 ) -> Result<()> {
-    use crate::tui::events::spawn_streaming_runner;
+    use crate::tui::events::{HostedSubscription, spawn_streaming_runner};
     use crate::tui::toast::ToastKind;
     use std::time::Instant;
 
@@ -2794,12 +2858,17 @@ pub(crate) fn plan_detail_apply_run_streaming(
         crate::tui::events::StreamMode::Resume => "Resume",
     };
 
-    if subscription.is_some() {
-        app.toasts.push(
-            "Run already live for this plan.",
-            ToastKind::Info,
-            Instant::now(),
-        );
+    if let Some(existing) = subscription.as_ref() {
+        let msg = if existing.slug == slug {
+            "Run already live for this plan."
+        } else {
+            // A different plan is already streaming under the same TUI
+            // session. The per-project run lock would block our spawn
+            // anyway, but surfacing the conflict early avoids a
+            // failed-spawn toast that's harder to interpret.
+            "Another plan is already running. Stop it first."
+        };
+        app.toasts.push(msg, ToastKind::Info, Instant::now());
         return Ok(());
     }
     let already_live = storage::get_live_run(conn, project)?
@@ -2828,7 +2897,10 @@ pub(crate) fn plan_detail_apply_run_streaming(
 
     match spawn_streaming_runner(exe, project.into(), slug.to_string(), mode) {
         Ok(sub) => {
-            *subscription = Some(sub);
+            *subscription = Some(HostedSubscription {
+                slug: slug.to_string(),
+                sub,
+            });
             app.attach_subscription();
             app.toasts.push(
                 format!("Started {} for {slug}", verb.to_lowercase()),

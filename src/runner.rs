@@ -270,6 +270,19 @@ async fn run_plan_inner(
         storage::update_plan_status(conn, &effective_plan.id, PlanStatus::InProgress)?;
     }
 
+    // Anchor the elapsed-timer for NDJSON consumers (the TUI's in-process
+    // attach path, log shippers): emit `run_started` with the wall-clock
+    // start instant before the first step's phase transitions begin
+    // landing. Subscribers that drove their elapsed timer off this event
+    // alone still see something useful in the gap before the first
+    // `phase_changed`.
+    if out.format == OutputFormat::Json {
+        output::emit_ndjson(&RunEvent::RunStarted {
+            plan_slug: effective_plan.slug.clone(),
+            started_at: chrono::Utc::now(),
+        })?;
+    }
+
     // Load the hook library once for this run, filtered by project scope.
     let hook_ctx = HookContext::load(workdir, config.hook_timeout_secs)?;
 

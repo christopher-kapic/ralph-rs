@@ -111,6 +111,20 @@ pub struct PlanDetailApp {
     /// sourced from the NDJSON stream rather than a DB poll.
     pub current_phase: Option<Phase>,
 
+    /// Run-start instant captured from the NDJSON `run_started` event (the
+    /// first event a `--json` runner emits). Used as the elapsed-timer base
+    /// for the gap between run start and the first `phase_changed` and as
+    /// the primary source of truth while a TUI-spawned subscription is
+    /// active. `None` until `run_started` arrives or after
+    /// [`Self::detach_subscription`].
+    pub subscribed_started_at: Option<DateTime<Utc>>,
+
+    /// Phase-start instant captured from the NDJSON `phase_changed` event.
+    /// Preferred over `subscribed_started_at` once a phase has begun so the
+    /// "Elapsed" display reflects time-in-phase (matching the DB-poll path
+    /// which prefers `LiveRun.phase_started_at` over `started_at`).
+    pub subscribed_phase_started_at: Option<DateTime<Utc>>,
+
     /// Rolling tail of harness stdout/stderr lines (oldest at front, newest
     /// at back). Capped at [`TAIL_BUFFER_LINES`].
     pub harness_tail: VecDeque<String>,
@@ -185,6 +199,8 @@ impl PlanDetailApp {
             subscribed: false,
             subscribed_step_num: None,
             current_phase: None,
+            subscribed_started_at: None,
+            subscribed_phase_started_at: None,
             harness_tail: VecDeque::new(),
             test_tail: VecDeque::new(),
             harness_tail_scroll: 0,
@@ -621,12 +637,15 @@ impl PlanDetailApp {
     // -- NDJSON-stream driven state (TUI-plan.md §13) ---------------------
 
     /// Mark this view as bound to a TUI-spawned [`crate::tui::events::RunSubscription`].
-    /// Resets the per-run state (phase, tails, step number) so a fresh run
-    /// doesn't inherit stale chunks from a prior subscription.
+    /// Resets the per-run state (phase, tails, step number, timer
+    /// timestamps) so a fresh run doesn't inherit stale chunks or elapsed
+    /// readings from a prior subscription.
     pub fn attach_subscription(&mut self) {
         self.subscribed = true;
         self.subscribed_step_num = None;
         self.current_phase = None;
+        self.subscribed_started_at = None;
+        self.subscribed_phase_started_at = None;
         self.harness_tail.clear();
         self.test_tail.clear();
         self.harness_tail_scroll = 0;
@@ -640,6 +659,8 @@ impl PlanDetailApp {
         self.subscribed = false;
         self.subscribed_step_num = None;
         self.current_phase = None;
+        self.subscribed_started_at = None;
+        self.subscribed_phase_started_at = None;
     }
 
     /// Push a harness-output line onto the tail, evicting from the front
@@ -656,9 +677,23 @@ impl PlanDetailApp {
         push_into_tail(&mut self.test_tail, line, &mut self.test_tail_scroll);
     }
 
-    /// Update the cached current phase (NDJSON `phase_changed` event).
-    pub fn set_current_phase(&mut self, phase: Phase) {
+    /// Update the cached current phase and per-phase timer base (NDJSON
+    /// `phase_changed` event). The timestamp is the wall-clock instant the
+    /// runner recorded the phase transition; storing it on the App makes
+    /// `elapsed_secs` independent of any DB poll while a subscription is
+    /// active.
+    pub fn set_current_phase(&mut self, phase: Phase, phase_started_at: DateTime<Utc>) {
         self.current_phase = Some(phase);
+        self.subscribed_phase_started_at = Some(phase_started_at);
+    }
+
+    /// Anchor the elapsed-timer base to the run's start instant (NDJSON
+    /// `run_started` event). Cleared on detach / `plan_complete`. Setting
+    /// this before any `phase_changed` lands lets the right-pane "Elapsed"
+    /// counter advance during the pre-first-phase window.
+    pub fn note_run_started(&mut self, started_at: DateTime<Utc>) {
+        self.subscribed = true;
+        self.subscribed_started_at = Some(started_at);
     }
 
     /// Record that a `step_started` event just arrived: bring the run-live
@@ -760,15 +795,30 @@ impl PlanDetailApp {
     /// fails to parse — both treated as "no useful elapsed to show".
     /// Negative durations from clock skew are clamped to `0.0`.
     pub fn elapsed_secs(&self) -> f64 {
-        let Some(live) = self.live_run.as_ref() else {
-            return 0.0;
-        };
-        let timestamp = live.phase_started_at.as_deref().unwrap_or(&live.started_at);
-        timestamp
-            .parse::<DateTime<Utc>>()
-            .ok()
-            .map(|t| Utc::now().signed_duration_since(t).num_seconds().max(0) as f64)
-            .unwrap_or(0.0)
+        // Priority: NDJSON-derived timestamps win when present (the
+        // subscription stream gives us the freshest possible base instant
+        // without a DB roundtrip), falling back to the `LiveRun` snapshot
+        // for the read-only attach path. Within each source we prefer
+        // phase-start over run-start so the timer reflects time-in-phase
+        // — matching the per-step granularity users expect.
+        let base = self
+            .subscribed_phase_started_at
+            .or(self.subscribed_started_at)
+            .or_else(|| {
+                self.live_run
+                    .as_ref()
+                    .and_then(|l| l.phase_started_at.as_deref())
+                    .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+            })
+            .or_else(|| {
+                self.live_run
+                    .as_ref()
+                    .and_then(|l| l.started_at.parse::<DateTime<Utc>>().ok())
+            });
+        match base {
+            Some(t) => Utc::now().signed_duration_since(t).num_seconds().max(0) as f64,
+            None => 0.0,
+        }
     }
 
     // -- Display helpers --------------------------------------------------
@@ -1791,7 +1841,7 @@ mod tests {
         app.subscribed = true;
         app.harness_tail.push_back("stale stdout".into());
         app.test_tail.push_back("stale tests".into());
-        app.set_current_phase(crate::plan::Phase::Tests);
+        app.set_current_phase(crate::plan::Phase::Tests, Utc::now());
         app.harness_tail_scroll = 5;
 
         app.attach_subscription();
@@ -1807,7 +1857,7 @@ mod tests {
         let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
         app.attach_subscription();
         app.note_step_started("s1");
-        app.set_current_phase(crate::plan::Phase::Harness);
+        app.set_current_phase(crate::plan::Phase::Harness, Utc::now());
         assert!(app.is_run_live());
         app.detach_subscription();
         assert!(!app.is_run_live());
@@ -1906,7 +1956,7 @@ mod tests {
         app.update_live_run(Some(make_live_run("test-plan", Some("s1"), Some(2))));
         assert_eq!(app.current_phase(), Some(crate::plan::Phase::Harness));
         // A subscription-derived phase wins.
-        app.set_current_phase(crate::plan::Phase::Tests);
+        app.set_current_phase(crate::plan::Phase::Tests, Utc::now());
         assert_eq!(app.current_phase(), Some(crate::plan::Phase::Tests));
     }
 

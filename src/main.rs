@@ -95,7 +95,7 @@ fn main() -> Result<()> {
         None => {
             let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
             if stdout_is_tty && !cli.json && !cli.non_interactive {
-                return commands::run_plan_list_tui(&conn, &config, &project, &out);
+                return commands::run_plan_list_tui(&conn, &config, &project, &out, None);
             }
             use clap::CommandFactory;
             let _ = Cli::command().print_help();

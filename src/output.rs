@@ -33,6 +33,15 @@ pub enum ChunkStream {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum RunEvent {
+    /// First event emitted by `ralph run` / `ralph resume` when `--json` is
+    /// active: announces the run's start instant so subscribers (the TUI's
+    /// in-process attach path, log shippers) can drive the elapsed-time
+    /// display without polling `run_locks`. Anchors the elapsed-timer base
+    /// case for the gap between run start and the first phase transition.
+    RunStarted {
+        plan_slug: String,
+        started_at: DateTime<Utc>,
+    },
     StepStarted {
         step_id: String,
         step_title: String,
@@ -89,8 +98,14 @@ pub enum RunEvent {
         seq: u64,
     },
     /// Emitted on every transition recorded into `run_locks.phase`. Lets the
-    /// TUI redraw the phase indicator without polling.
-    PhaseChanged { phase: Phase },
+    /// TUI redraw the phase indicator without polling. `phase_started_at`
+    /// mirrors the `run_locks.phase_started_at` value written alongside the
+    /// transition so subscribers can derive elapsed-since-phase-began without
+    /// a separate DB poll.
+    PhaseChanged {
+        phase: Phase,
+        phase_started_at: DateTime<Utc>,
+    },
     /// Emitted when the runner exits cleanly because the operator set
     /// `plans.pause_requested` (TUI `[P]` keybinding or `ralph pause`).
     /// Distinct from `plan_complete`/`summary` so the TUI can surface the
@@ -1590,17 +1605,21 @@ mod tests {
 
     #[test]
     fn test_phase_changed_event_json_shape() {
+        let phase_started_at: DateTime<Utc> = "2026-04-22T18:00:05Z".parse().unwrap();
         let evt = RunEvent::PhaseChanged {
             phase: Phase::Tests,
+            phase_started_at,
         };
         let json = serde_json::to_string(&evt).unwrap();
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(val["event"], "phase_changed");
         assert_eq!(val["phase"], "tests");
+        assert_eq!(val["phase_started_at"], "2026-04-22T18:00:05Z");
     }
 
     #[test]
     fn test_phase_changed_serializes_each_phase_snake_case() {
+        let phase_started_at: DateTime<Utc> = "2026-04-22T18:00:00Z".parse().unwrap();
         for (phase, expected) in [
             (Phase::Idle, "idle"),
             (Phase::PreStepHook, "pre_step_hook"),
@@ -1612,11 +1631,28 @@ mod tests {
             (Phase::Rollback, "rollback"),
             (Phase::PostStepHook, "post_step_hook"),
         ] {
-            let evt = RunEvent::PhaseChanged { phase };
+            let evt = RunEvent::PhaseChanged {
+                phase,
+                phase_started_at,
+            };
             let val: serde_json::Value =
                 serde_json::from_str(&serde_json::to_string(&evt).unwrap()).unwrap();
             assert_eq!(val["phase"], expected);
         }
+    }
+
+    #[test]
+    fn test_run_started_event_json_shape() {
+        let started_at: DateTime<Utc> = "2026-04-22T18:00:00Z".parse().unwrap();
+        let evt = RunEvent::RunStarted {
+            plan_slug: "tui-v1".into(),
+            started_at,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["event"], "run_started");
+        assert_eq!(val["plan_slug"], "tui-v1");
+        assert_eq!(val["started_at"], "2026-04-22T18:00:00Z");
     }
 
     #[test]

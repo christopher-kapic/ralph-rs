@@ -61,6 +61,20 @@ pub struct RunSubscription {
     _runtime: Arc<Runtime>,
 }
 
+/// A live [`RunSubscription`] tagged with the plan slug it belongs to.
+///
+/// Owned by the top-level TUI dispatcher (`run_plan_list_tui`) so it
+/// survives navigation: pushing into plan-detail and popping back leaves
+/// the subscription untouched, and the runner subprocess keeps streaming
+/// the whole time. The slug lets a child dispatcher decide whether to
+/// attach and dispatch events into its `App` or leave the subscription
+/// alone (when the user is viewing a different plan than the one
+/// running).
+pub struct HostedSubscription {
+    pub slug: String,
+    pub sub: RunSubscription,
+}
+
 impl RunSubscription {
     /// Drain every event currently sitting in the channel and return them
     /// in arrival order. Non-blocking: returns immediately when the channel
@@ -210,14 +224,20 @@ where
 /// `StaleStepsSwept`) are observed but produce no state change.
 pub fn dispatch_event(app: &mut PlanDetailApp, event: &RunEvent) {
     match event {
+        RunEvent::RunStarted { started_at, .. } => {
+            app.note_run_started(*started_at);
+        }
         RunEvent::HarnessChunk { text, .. } => {
             app.push_harness_line(text.clone());
         }
         RunEvent::TestChunk { text, .. } => {
             app.push_test_line(text.clone());
         }
-        RunEvent::PhaseChanged { phase } => {
-            app.set_current_phase(*phase);
+        RunEvent::PhaseChanged {
+            phase,
+            phase_started_at,
+        } => {
+            app.set_current_phase(*phase, *phase_started_at);
         }
         RunEvent::StepStarted { step_id, .. } => {
             app.note_step_started(step_id);
@@ -338,9 +358,64 @@ mod tests {
         let mut app = make_app();
         let evt = RunEvent::PhaseChanged {
             phase: Phase::Tests,
+            phase_started_at: Utc::now(),
         };
         dispatch_event(&mut app, &evt);
         assert_eq!(app.current_phase(), Some(Phase::Tests));
+    }
+
+    #[test]
+    fn test_dispatch_run_started_anchors_elapsed_timer() {
+        let mut app = make_app();
+        // Before `run_started`, the elapsed timer is zero and the run is
+        // not considered live.
+        assert!(!app.is_run_live());
+        assert_eq!(app.elapsed_secs(), 0.0);
+
+        // 5 seconds in the past so the timer reads ~5.
+        let started_at = Utc::now() - chrono::Duration::seconds(5);
+        let evt = RunEvent::RunStarted {
+            plan_slug: "live".into(),
+            started_at,
+        };
+        dispatch_event(&mut app, &evt);
+
+        assert!(app.is_run_live());
+        let elapsed = app.elapsed_secs();
+        assert!(
+            (4.0..=6.0).contains(&elapsed),
+            "elapsed should reflect time since run_started, got {elapsed}"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_phase_changed_overrides_run_started_for_timer() {
+        let mut app = make_app();
+        // `run_started` 60s ago, then `phase_changed` 2s ago. The timer
+        // should reflect the phase boundary (per-step granularity), not the
+        // whole-run elapsed.
+        let run_started = Utc::now() - chrono::Duration::seconds(60);
+        dispatch_event(
+            &mut app,
+            &RunEvent::RunStarted {
+                plan_slug: "live".into(),
+                started_at: run_started,
+            },
+        );
+        let phase_started = Utc::now() - chrono::Duration::seconds(2);
+        dispatch_event(
+            &mut app,
+            &RunEvent::PhaseChanged {
+                phase: Phase::Harness,
+                phase_started_at: phase_started,
+            },
+        );
+
+        let elapsed = app.elapsed_secs();
+        assert!(
+            (1.0..=3.0).contains(&elapsed),
+            "phase-elapsed should win over run-elapsed, got {elapsed}"
+        );
     }
 
     #[test]
@@ -407,10 +482,10 @@ mod tests {
         // Emit a representative sequence: phase change → harness output →
         // phase change → test output → step finish.
         let lines = [
-            r#"{"event":"phase_changed","phase":"harness"}"#,
+            r#"{"event":"phase_changed","phase":"harness","phase_started_at":"2026-04-22T18:00:00Z"}"#,
             r#"{"event":"harness_chunk","stream":"stdout","text":"compiling…","seq":0}"#,
             r#"{"event":"harness_chunk","stream":"stdout","text":"done.","seq":1}"#,
-            r#"{"event":"phase_changed","phase":"tests"}"#,
+            r#"{"event":"phase_changed","phase":"tests","phase_started_at":"2026-04-22T18:00:05Z"}"#,
             r#"{"event":"test_chunk","test_index":0,"stream":"stdout","text":"PASS","seq":2}"#,
             r#"{"event":"step_finished","step_id":"s0","step_title":"step s0","step_num":1,"step_total":1,"outcome":"success","attempts":1,"duration_secs":1.5}"#,
         ];
@@ -452,7 +527,7 @@ mod tests {
 
         let lines = [
             "not json at all",
-            r#"{"event":"phase_changed","phase":"harness"}"#,
+            r#"{"event":"phase_changed","phase":"harness","phase_started_at":"2026-04-22T18:00:00Z"}"#,
             r#"{"event":"unknown_kind"}"#, // serde rejects unknown variant
             r#"{"event":"harness_chunk","stream":"stdout","text":"ok","seq":0}"#,
         ];
@@ -484,6 +559,7 @@ mod tests {
 
         tx.send(RunEvent::PhaseChanged {
             phase: Phase::Harness,
+            phase_started_at: Utc::now(),
         })
         .unwrap();
         // Producer hangs up.

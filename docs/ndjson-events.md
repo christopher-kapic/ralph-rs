@@ -31,6 +31,7 @@ The events fall into two groups:
 
 | Event              | Group     | Emitted                                                    |
 |--------------------|-----------|------------------------------------------------------------|
+| `run_started`      | lifecycle | First event of a run; anchors elapsed-timer subscribers    |
 | `step_started`     | lifecycle | Once per step at the start of its first/next attempt       |
 | `step_finished`    | lifecycle | Once per step on success / failure / skip                  |
 | `plan_complete`    | lifecycle | Once at the end of a run (compat shim — see `summary`)     |
@@ -45,6 +46,32 @@ The events fall into two groups:
 ---
 
 ## Lifecycle events
+
+### `run_started`
+
+The first event a `--json` runner emits, fired once after the per-project
+run lock has been acquired and the plan has been marked
+`in_progress`. Carries the wall-clock instant the runner began so
+elapsed-timer subscribers (the TUI's in-process attach path, log
+shippers) have a base instant before any `phase_changed` lands.
+
+Payload:
+
+| Field        | Type               | Notes                                |
+|--------------|--------------------|--------------------------------------|
+| `plan_slug`  | `string`           | Plan slug being run.                 |
+| `started_at` | `string` (RFC3339) | UTC instant the run began.           |
+
+```json
+{
+  "event": "run_started",
+  "plan_slug": "tui-v1",
+  "started_at": "2026-04-22T18:00:00Z"
+}
+```
+
+Consumer expectations: precedes every other event in the stream.
+Consumers that don't render an elapsed timer can ignore it.
 
 ### `step_started`
 
@@ -322,14 +349,16 @@ machine off these events alone.
 
 Payload:
 
-| Field   | Type     | Notes                                                |
-|---------|----------|------------------------------------------------------|
-| `phase` | `string` | `Phase` discriminant (see below).                    |
+| Field              | Type               | Notes                                       |
+|--------------------|--------------------|---------------------------------------------|
+| `phase`            | `string`           | `Phase` discriminant (see below).           |
+| `phase_started_at` | `string` (RFC3339) | UTC instant of this transition; mirrors `run_locks.phase_started_at`. |
 
 ```json
 {
   "event": "phase_changed",
-  "phase": "tests"
+  "phase": "tests",
+  "phase_started_at": "2026-04-22T18:00:05Z"
 }
 ```
 
