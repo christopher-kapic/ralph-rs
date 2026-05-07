@@ -2268,9 +2268,8 @@ where
     // tear down the subprocess. We only attach to it when its slug matches
     // the plan being viewed; otherwise the parent's drain keeps its
     // channel from filling and we render this plan's static state.
-    let subscription_matches = |sub: &Option<tui_events::HostedSubscription>| {
-        sub.as_ref().is_some_and(|h| h.slug == slug)
-    };
+    let subscription_matches =
+        |sub: &Option<tui_events::HostedSubscription>| sub.as_ref().is_some_and(|h| h.slug == slug);
 
     // Local "have we already done the attach handshake for the current
     // subscription instance?" flag. Tracked separately from
