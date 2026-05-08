@@ -68,7 +68,6 @@ pub fn is_default_run_invocation(args: &RunArgs, stdout_is_tty: bool) -> bool {
         && args.to.is_none()
         && !args.dry_run
         && !args.skip_preflight
-        && !args.current_branch
         && !args.no_auto_stash
         && !args.force
         && !args.verbose
@@ -282,7 +281,7 @@ pub fn run_tui_mode(
         Some(InitialPush::PlanDetail {
             slug,
             auto_start: Some(crate::tui::events::StreamMode::Run {
-                current_branch: false,
+                current_branch: args.current_branch,
             }),
         }),
     )
@@ -6626,6 +6625,18 @@ mod run_dispatch_tests {
     }
 
     #[test]
+    fn current_branch_does_not_bypass_tui() {
+        // `--current-branch` is a behavior modifier, not an opt-out from
+        // interactivity — the TUI's auto-start path threads it through to
+        // the spawned runner via `StreamMode::Run { current_branch }`.
+        let args = RunArgs {
+            current_branch: true,
+            ..defaults()
+        };
+        assert!(is_default_run_invocation(&args, true));
+    }
+
+    #[test]
     fn non_tty_stdout_bypasses_tui() {
         // Piping to `tee` (or any non-TTY) must keep today's runner path.
         assert!(!is_default_run_invocation(&defaults(), false));
@@ -6698,13 +6709,6 @@ mod run_dispatch_tests {
                 "--skip-preflight",
                 RunArgs {
                     skip_preflight: true,
-                    ..defaults()
-                },
-            ),
-            (
-                "--current-branch",
-                RunArgs {
-                    current_branch: true,
                     ..defaults()
                 },
             ),
