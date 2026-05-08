@@ -51,6 +51,7 @@ src/
     run.rs             — Status and log commands
     agents.rs          — Agent file CRUD commands
     hooks.rs           — Hook library CRUD, export/import commands
+    harness.rs         — Read-only harness inspection (`ralph harness list/show`)
   tui/
     mod.rs             — TUI module entry
     view.rs            — `View` enum (PlanList, ArchivedList, PlanDetail, StepDetail)
@@ -171,6 +172,8 @@ ralph log [<slug>] [--step <n>] [--limit <n>] [--full|--lines <n>]
 
 ralph agents list|show|create|delete
 ralph hooks list|show|add|remove|export|import
+ralph harness list [--json]
+ralph harness show <name> [--json]
 ralph doctor
 ralph completions <shell>
 ```

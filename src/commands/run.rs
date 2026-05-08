@@ -154,7 +154,8 @@ pub fn dispatch_run(
             let mut any_errors = false;
             for p in &runnable {
                 eprintln!("Running preflight checks for '{}'...", p.slug);
-                let results = preflight::run_preflight_checks(p, config, workdir)?;
+                let steps = storage::list_steps(conn, &p.id)?;
+                let results = preflight::run_preflight_checks(p, &steps, config, workdir)?;
                 results.print_report(out);
                 if !results.is_ok() {
                     any_errors = true;
@@ -215,7 +216,8 @@ pub fn dispatch_run(
     // Preflight checks
     if !args.skip_preflight && !args.dry_run {
         eprintln!("Running preflight checks...");
-        let preflight_results = preflight::run_preflight_checks(&plan, config, workdir)?;
+        let steps = storage::list_steps(conn, &plan.id)?;
+        let preflight_results = preflight::run_preflight_checks(&plan, &steps, config, workdir)?;
         preflight_results.print_report(out);
 
         if !preflight_results.is_ok() {
@@ -535,7 +537,28 @@ pub fn run_plan_list_tui(
             if let Some(hosted) = subscription.as_mut() {
                 let _ = hosted.sub.drain();
                 if hosted.sub.is_disconnected() {
-                    subscription = None;
+                    // Surface any captured runner failure (preflight error,
+                    // missing harness, dirty tree, etc.) on the way out so
+                    // the user understands why the run they just started
+                    // never produced any progress. The TUI was rooted at
+                    // plan-list when the disconnect was observed, so the
+                    // toast lands here even though the user may have
+                    // started the run from plan-detail.
+                    match hosted.sub.poll_failure_status() {
+                        crate::tui::events::FailureStatus::Pending => {}
+                        crate::tui::events::FailureStatus::Clean => {
+                            subscription = None;
+                        }
+                        crate::tui::events::FailureStatus::Message(msg) => {
+                            let slug = hosted.slug.clone();
+                            subscription = None;
+                            app.toasts.push(
+                                format!("[{slug}] {msg}"),
+                                ToastKind::Error,
+                                Instant::now(),
+                            );
+                        }
+                    }
                 }
             }
 
@@ -2320,9 +2343,24 @@ where
                 tui_events::dispatch_event(&mut app, &evt);
             }
             if hosted.sub.is_disconnected() {
-                *subscription = None;
-                app.detach_subscription();
-                attached_this_instance = false;
+                // The subscription belongs to *this* plan, so any failure
+                // message goes straight to this view's toast queue without
+                // a slug prefix — the user is staring at the plan it
+                // refers to.
+                match hosted.sub.poll_failure_status() {
+                    tui_events::FailureStatus::Pending => {}
+                    tui_events::FailureStatus::Clean => {
+                        *subscription = None;
+                        app.detach_subscription();
+                        attached_this_instance = false;
+                    }
+                    tui_events::FailureStatus::Message(msg) => {
+                        *subscription = None;
+                        app.detach_subscription();
+                        attached_this_instance = false;
+                        app.toasts.push(msg, ToastKind::Error, Instant::now());
+                    }
+                }
             }
         } else {
             if attached_this_instance {
@@ -2333,11 +2371,27 @@ where
             }
             // Subscription exists but is bound to another plan: still
             // drain-and-discard so the unbounded mpsc channel doesn't
-            // accumulate events while the user is parked here.
+            // accumulate events while the user is parked here. Surface a
+            // failure message with the slug prefix so the user knows which
+            // plan failed even though they're viewing a different one.
             if let Some(hosted) = subscription.as_mut() {
                 let _ = hosted.sub.drain();
                 if hosted.sub.is_disconnected() {
-                    *subscription = None;
+                    match hosted.sub.poll_failure_status() {
+                        tui_events::FailureStatus::Pending => {}
+                        tui_events::FailureStatus::Clean => {
+                            *subscription = None;
+                        }
+                        tui_events::FailureStatus::Message(msg) => {
+                            let slug = hosted.slug.clone();
+                            *subscription = None;
+                            app.toasts.push(
+                                format!("[{slug}] {msg}"),
+                                ToastKind::Error,
+                                Instant::now(),
+                            );
+                        }
+                    }
                 }
             }
         }

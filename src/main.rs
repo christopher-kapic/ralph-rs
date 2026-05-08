@@ -738,6 +738,16 @@ fn main() -> Result<()> {
         // -- Doctor --
         Command::Doctor => commands::cmd_doctor(&config, std::path::Path::new(&project), &out),
 
+        // -- Harness (read-only inspection) --
+        Command::Harness(sub) => match sub {
+            cli::HarnessCommand::List { json } => {
+                commands::harness::harness_list(&config, json, &out)
+            }
+            cli::HarnessCommand::Show { name, json } => {
+                commands::harness::harness_show(&config, &name, json, &out)
+            }
+        },
+
         // -- Config --
         Command::Config(sub) => match sub {
             cli::ConfigCommand::Show => commands::config_cmd::config_show(&out),

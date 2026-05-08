@@ -15,7 +15,7 @@ use anyhow::{Result, anyhow};
 use crate::config::{Config, HarnessConfig};
 use crate::git;
 use crate::output::OutputContext;
-use crate::plan::Plan;
+use crate::plan::{Plan, Step};
 
 // ---------------------------------------------------------------------------
 // Disk space
@@ -242,6 +242,7 @@ impl PreflightResults {
 /// pre-existing uncommitted changes untouched in the working tree.
 pub fn run_preflight_checks(
     plan: &Plan,
+    steps: &[Step],
     config: &Config,
     workdir: &Path,
 ) -> Result<PreflightResults> {
@@ -278,6 +279,13 @@ pub fn run_preflight_checks(
     // 5. Disk space — fail fast rather than crash mid-step with SQLITE_FULL
     //    and a half-written 25 GB target/ directory.
     checks.push(check_prerun_disk_space(workdir));
+
+    // 6. Step-description commit hygiene — warn (don't fail) when a step
+    //    description tells the agent to run `git commit` / `git add`. Ralph
+    //    owns commits per step, so those instructions trip the no_changes
+    //    failure path. See `AUTHORING_TIP_COMMITS` in cli.rs for the help
+    //    text counterpart.
+    checks.push(check_steps_for_commit_instructions(steps));
 
     Ok(PreflightResults { checks })
 }
@@ -417,6 +425,58 @@ fn run_auth_probe(harness_name: &str, harness_config: &HarnessConfig) -> CheckRe
     }
 }
 
+/// Scan step descriptions and acceptance criteria for `git commit` /
+/// `git add` instructions. Ralph owns commits per step (see
+/// `AUTHORING_TIP_COMMITS`), so these phrases in step text are a strong
+/// signal the author misunderstood the contract — the harness will follow
+/// them, leave a clean worktree behind, and get classified as no_changes.
+///
+/// Match is case-insensitive substring on either field; we deliberately
+/// avoid regex so the warning doesn't try to be smart about negations
+/// ("don't run `git commit`"). A warning is preferable to a hard failure
+/// because the substring can legitimately appear in steps that are about
+/// git tooling itself (e.g. "audit our git commit message hooks").
+fn check_steps_for_commit_instructions(steps: &[Step]) -> CheckResult {
+    let mut offenders: Vec<String> = Vec::new();
+    for (idx, step) in steps.iter().enumerate() {
+        let step_num = idx + 1;
+        if step_text_contains_commit_instruction(&step.description)
+            || step
+                .acceptance_criteria
+                .iter()
+                .any(|c| step_text_contains_commit_instruction(c))
+        {
+            offenders.push(format!("#{step_num} '{}'", step.title));
+        }
+    }
+
+    if offenders.is_empty() {
+        CheckResult {
+            name: "step-commit-hygiene".to_string(),
+            severity: CheckSeverity::Pass,
+            message: "no `git commit` / `git add` instructions in step text".to_string(),
+        }
+    } else {
+        CheckResult {
+            name: "step-commit-hygiene".to_string(),
+            severity: CheckSeverity::Warning,
+            message: format!(
+                "step(s) {} mention `git commit` or `git add`. Ralph owns commits per step; \
+                 the agent committing on its own will trip `reason: no_changes`. Remove those \
+                 instructions from the step description.",
+                offenders.join(", ")
+            ),
+        }
+    }
+}
+
+/// Case-insensitive substring check for the two phrases the preflight
+/// warning targets. Pulled out so unit tests can hit it directly.
+fn step_text_contains_commit_instruction(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("git commit") || lower.contains("git add")
+}
+
 /// Check git working tree state.
 fn check_git_state(workdir: &Path) -> CheckResult {
     match git::has_uncommitted_changes(workdir) {
@@ -501,8 +561,16 @@ pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
         }
     }
 
-    // 3. Check each configured harness binary.
-    for (name, harness_config) in &config.harnesses {
+    // 3. Check each configured harness binary, plus its args for known
+    //    foot-guns (codex without --sandbox, claude -p without
+    //    --permission-mode, etc.) that silently break `ralph run`.
+    //
+    //    Iterate in deterministic order so doctor output is stable across
+    //    runs — HashMap iteration order is randomized.
+    let mut harness_names: Vec<&String> = config.harnesses.keys().collect();
+    harness_names.sort_unstable();
+    for name in harness_names {
+        let harness_config = &config.harnesses[name];
         let binary = &harness_config.command;
         if is_binary_available(binary) {
             checks.push(CheckResult {
@@ -515,6 +583,17 @@ pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
                 name: format!("harness:{name}"),
                 severity: CheckSeverity::Warning,
                 message: format!("`{binary}` not found in PATH"),
+            });
+        }
+
+        // Foot-gun analysis is independent of on-PATH status — the args are
+        // wrong even if the binary doesn't exist yet, and surfacing both
+        // problems at once saves a doctor → fix → doctor round trip.
+        for issue in crate::config::harness_footguns(name, harness_config) {
+            checks.push(CheckResult {
+                name: format!("harness:{name}:args"),
+                severity: CheckSeverity::Warning,
+                message: issue,
             });
         }
     }
@@ -835,7 +914,7 @@ mod tests {
             last_run_branch: None,
             last_run_started_at: None,
         };
-        let results = run_preflight_checks(&plan, &config, tmp.path()).unwrap();
+        let results = run_preflight_checks(&plan, &[], &config, tmp.path()).unwrap();
         let auth = results
             .checks
             .iter()
@@ -861,6 +940,94 @@ mod tests {
         let result = check_git_state(tmp.path());
         // Not a git repo -> warning
         assert_eq!(result.severity, CheckSeverity::Warning);
+    }
+
+    /// Build a minimal Step fixture for the commit-hygiene tests. Only the
+    /// fields the check actually reads (title/description/acceptance_criteria)
+    /// vary per call; the rest are stable defaults.
+    fn step_fixture(title: &str, description: &str, criteria: Vec<String>) -> Step {
+        let now = chrono::Utc::now();
+        Step {
+            id: "id".to_string(),
+            plan_id: "plan".to_string(),
+            sort_key: "0".to_string(),
+            title: title.to_string(),
+            description: description.to_string(),
+            agent: None,
+            harness: None,
+            acceptance_criteria: criteria,
+            status: crate::plan::StepStatus::Pending,
+            attempts: 0,
+            max_retries: None,
+            created_at: now,
+            updated_at: now,
+            model: None,
+            skipped_reason: None,
+            change_policy: crate::plan::ChangePolicy::Required,
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn step_text_contains_commit_instruction_matches_phrases() {
+        assert!(step_text_contains_commit_instruction(
+            "git commit when done"
+        ));
+        assert!(step_text_contains_commit_instruction("Run git add -A"));
+        assert!(step_text_contains_commit_instruction(
+            "GIT COMMIT" // case-insensitive
+        ));
+        assert!(!step_text_contains_commit_instruction(
+            "implement feature; ralph commits automatically"
+        ));
+        assert!(!step_text_contains_commit_instruction(""));
+    }
+
+    #[test]
+    fn check_steps_passes_when_no_commit_phrases() {
+        let steps = vec![
+            step_fixture("Add foo", "Implement foo in src/foo.rs", vec![]),
+            step_fixture(
+                "Wire bar",
+                "Call foo from bar()",
+                vec!["bar uses foo".into()],
+            ),
+        ];
+        let result = check_steps_for_commit_instructions(&steps);
+        assert_eq!(result.severity, CheckSeverity::Pass);
+    }
+
+    #[test]
+    fn check_steps_warns_for_commit_instruction_in_description() {
+        let steps = vec![
+            step_fixture("Add foo", "Implement foo", vec![]),
+            step_fixture(
+                "Wire bar",
+                "Call foo from bar(); commit when done with `git commit -m 'wire bar'`",
+                vec![],
+            ),
+        ];
+        let result = check_steps_for_commit_instructions(&steps);
+        assert_eq!(result.severity, CheckSeverity::Warning);
+        assert!(
+            result.message.contains("#2"),
+            "message should cite step #2: {}",
+            result.message
+        );
+        assert!(result.message.contains("'Wire bar'"));
+        assert!(result.message.contains("`git commit`") || result.message.contains("git commit"));
+    }
+
+    #[test]
+    fn check_steps_warns_for_commit_instruction_in_acceptance_criteria() {
+        let steps = vec![step_fixture(
+            "Add foo",
+            "Implement foo",
+            vec!["run `git add` for the new file".into()],
+        )];
+        let result = check_steps_for_commit_instructions(&steps);
+        assert_eq!(result.severity, CheckSeverity::Warning);
+        assert!(result.message.contains("#1"));
     }
 
     #[test]

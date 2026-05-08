@@ -25,6 +25,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError};
+use tokio::sync::oneshot;
 
 use crate::output::RunEvent;
 use crate::tui::views::plan_detail::PlanDetailApp;
@@ -54,6 +55,13 @@ pub const TAIL_VISIBLE_LINES: usize = 20;
 /// reader task and (via `kill_on_drop`) terminates the child.
 pub struct RunSubscription {
     rx: UnboundedReceiver<RunEvent>,
+    /// Single-use channel for the runner's stderr + non-zero exit status
+    /// when it fails to start (preflight errors, missing harness, dirty
+    /// tree, run-lock held by another process, etc.). The spawn task
+    /// either sends a message exactly once (failure) or drops the sender
+    /// without sending (clean exit). The TUI poll loop drains via
+    /// [`Self::poll_failure_status`] when the subscription disconnects.
+    failure: oneshot::Receiver<String>,
     /// Owned tokio runtime. Held only to keep the spawned task running —
     /// callers never reach into it. Wrapping in `Arc` lets the spawned
     /// task hold its own strong reference if it ever needs to (it doesn't
@@ -75,6 +83,16 @@ pub struct HostedSubscription {
     pub sub: RunSubscription,
 }
 
+/// Current state of the runner-failure side channel.
+pub enum FailureStatus {
+    /// The runner task is still alive and hasn't produced a final outcome yet.
+    Pending,
+    /// The runner has settled cleanly and will never send a failure message.
+    Clean,
+    /// The runner failed and delivered a final one-shot message.
+    Message(String),
+}
+
 impl RunSubscription {
     /// Drain every event currently sitting in the channel and return them
     /// in arrival order. Non-blocking: returns immediately when the channel
@@ -92,6 +110,21 @@ impl RunSubscription {
     /// detect run completion and clean up the subscription.
     pub fn is_disconnected(&mut self) -> bool {
         matches!(self.rx.try_recv(), Err(TryRecvError::Disconnected))
+    }
+
+    /// Poll the runner-failure side channel without blocking. This keeps the
+    /// TUI from dropping the subscription in the brief window after stdout
+    /// closes but before the task has waited on the child and published the
+    /// final success/failure outcome.
+    ///
+    /// Designed to be called by the TUI poll loop right after observing
+    /// [`Self::is_disconnected`] returning true.
+    pub fn poll_failure_status(&mut self) -> FailureStatus {
+        match self.failure.try_recv() {
+            Ok(msg) => FailureStatus::Message(msg),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => FailureStatus::Pending,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => FailureStatus::Clean,
+        }
     }
 }
 
@@ -140,7 +173,11 @@ pub fn build_streaming_run_command(
     cmd.arg(slug);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Pipe stderr (was Null) so the spawn task can capture preflight
+        // failures, harness-not-found, run-lock contention, etc., and
+        // surface them to the TUI as a toast instead of silently dropping
+        // them on the floor.
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     cmd
 }
@@ -163,25 +200,93 @@ pub fn spawn_streaming_runner(
         tokio::runtime::Runtime::new().context("create tokio runtime for run subscription")?,
     );
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (failure_tx, failure_rx) = oneshot::channel::<String>();
+    // Held in an Option so the (at most one) send site can `.take()` it; on
+    // clean exits the Option remains Some at task end, the Sender drops, and
+    // the receiver observes a closed channel.
+    let mut failure_tx = Some(failure_tx);
 
     runtime.spawn(async move {
         let mut cmd = build_streaming_run_command(&exe, &project, &slug, mode);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
-            Err(_) => return,
+            Err(e) => {
+                if let Some(tx) = failure_tx.take() {
+                    let _ = tx.send(format!("Failed to spawn ralph runner: {e}"));
+                }
+                return;
+            }
         };
         let stdout = match child.stdout.take() {
             Some(s) => s,
             None => return,
         };
+        // Concurrently drain stderr into a buffer so we have something to
+        // show the user if the run aborts with a non-zero exit. Capped to
+        // a few KB — preflight error messages are short, and we don't want
+        // a runaway runner to balloon memory.
+        let stderr_handle = child.stderr.take().map(|stderr| {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                const STDERR_CAP: usize = 8192;
+                let mut buf = Vec::with_capacity(1024);
+                let mut reader = BufReader::new(stderr);
+                let mut chunk = [0u8; 1024];
+                while let Ok(n) = reader.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let remaining = STDERR_CAP.saturating_sub(buf.len());
+                    if remaining == 0 {
+                        // Already at cap — keep draining so the child's
+                        // stderr pipe doesn't block, but discard the bytes.
+                        continue;
+                    }
+                    buf.extend_from_slice(&chunk[..n.min(remaining)]);
+                }
+                String::from_utf8_lossy(&buf).into_owned()
+            })
+        });
         let reader = BufReader::new(stdout);
         consume_lines(reader, tx).await;
-        // Reap the child to avoid a zombie. Errors are best-effort.
-        let _ = child.wait().await;
+        // Reap the child and inspect its exit status. On non-zero, surface
+        // captured stderr (or a generic message) into the failure slot so
+        // the TUI poll loop can toast it.
+        let exit_status = child.wait().await;
+        let stderr_text = match stderr_handle {
+            Some(h) => h.await.unwrap_or_default(),
+            None => String::new(),
+        };
+        let nonzero = match exit_status {
+            Ok(s) => !s.success(),
+            Err(_) => true,
+        };
+        if nonzero {
+            let trimmed = stderr_text.trim();
+            let msg = if trimmed.is_empty() {
+                "ralph runner exited with an error (no stderr output).".to_string()
+            } else {
+                // Take the last non-empty line — anyhow's error chain prints
+                // the most-actionable message at the bottom, and toasts only
+                // have room for a single line anyway.
+                let last_line = trimmed
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or(trimmed)
+                    .trim()
+                    .to_string();
+                format!("Run failed: {last_line}")
+            };
+            if let Some(tx) = failure_tx.take() {
+                let _ = tx.send(msg);
+            }
+        }
     });
 
     Ok(RunSubscription {
         rx,
+        failure: failure_rx,
         _runtime: runtime,
     })
 }
@@ -545,6 +650,60 @@ mod tests {
         assert_eq!(count, 2, "exactly 2 well-formed events should pass through");
     }
 
+    /// A delivered failure message is surfaced exactly once.
+    #[test]
+    fn test_poll_failure_status_message_then_clean() {
+        let runtime = Arc::new(Runtime::new().unwrap());
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let (failure_tx, failure_rx) = oneshot::channel::<String>();
+        failure_tx.send("preflight failed".to_string()).unwrap();
+        let mut sub = RunSubscription {
+            rx,
+            failure: failure_rx,
+            _runtime: runtime,
+        };
+
+        match sub.poll_failure_status() {
+            FailureStatus::Message(msg) => assert_eq!(msg, "preflight failed"),
+            FailureStatus::Pending => panic!("message should have been ready"),
+            FailureStatus::Clean => panic!("failure channel should not look clean"),
+        }
+        assert!(
+            matches!(sub.poll_failure_status(), FailureStatus::Clean),
+            "once consumed, the oneshot receiver should settle to Clean"
+        );
+    }
+
+    /// A live sender with no value yet is distinct from a clean exit.
+    #[test]
+    fn test_poll_failure_status_pending() {
+        let runtime = Arc::new(Runtime::new().unwrap());
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let (failure_tx, failure_rx) = oneshot::channel::<String>();
+        let _keep_sender_alive = failure_tx;
+        let mut sub = RunSubscription {
+            rx,
+            failure: failure_rx,
+            _runtime: runtime,
+        };
+        assert!(matches!(sub.poll_failure_status(), FailureStatus::Pending));
+    }
+
+    /// Dropping the sender without sending simulates a clean exit.
+    #[test]
+    fn test_poll_failure_status_clean_run() {
+        let runtime = Arc::new(Runtime::new().unwrap());
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let (failure_tx, failure_rx) = oneshot::channel::<String>();
+        drop(failure_tx);
+        let mut sub = RunSubscription {
+            rx,
+            failure: failure_rx,
+            _runtime: runtime,
+        };
+        assert!(matches!(sub.poll_failure_status(), FailureStatus::Clean));
+    }
+
     /// `RunSubscription::drain` returns an empty Vec when the producer
     /// has hung up and there are no pending events. `is_disconnected`
     /// flips to true once the channel is empty AND closed.
@@ -552,8 +711,10 @@ mod tests {
     fn test_run_subscription_disconnect_after_drain() {
         let runtime = Arc::new(Runtime::new().unwrap());
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_failure_tx, failure_rx) = oneshot::channel::<String>();
         let mut sub = RunSubscription {
             rx,
+            failure: failure_rx,
             _runtime: runtime,
         };
 
