@@ -716,6 +716,10 @@ pub enum StepCommand {
         #[arg(long = "criteria")]
         criteria: Vec<String>,
 
+        /// Explicitly clear all acceptance criteria on the step (mirrors --clear-tags).
+        #[arg(long, conflicts_with = "criteria")]
+        clear_criteria: bool,
+
         /// New max retries override. Pass 0 to clear (sets to plan/global default).
         #[arg(long)]
         max_retries: Option<i32>,

@@ -154,7 +154,7 @@ ralph plan harness generate [<description>] [<slug>] [--use-harness <h>]
 ralph step list [<slug>]
 ralph step add <title> [<slug>] [-d <desc>] [--after <num>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--max-retries <n>] [--import-json <FILE|->]
 ralph step remove <num>|--step-id <uuid> [<slug>] [--force/-y]
-ralph step edit <num>|--step-id <uuid> [<slug>] [--title <t>] [--description <d>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--max-retries <n>] [--clear-max-retries]
+ralph step edit <num>|--step-id <uuid> [<slug>] [--title <t>] [--description <d>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--clear-criteria] [--max-retries <n>] [--clear-max-retries]
 ralph step reset <num>|--step-id <uuid> [<slug>]
 ralph step move <num>|--step-id <uuid> --to <n> [<slug>]
 ralph step set-hook <num>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --hook <name>
