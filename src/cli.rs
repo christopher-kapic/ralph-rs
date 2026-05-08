@@ -104,6 +104,7 @@ pub enum Command {
     /// (ignores the plan slug). --one and --all are mutually exclusive.
     Run {
         /// Plan slug to run. Defaults to the active plan.
+        #[arg(conflicts_with = "all")]
         plan: Option<String>,
 
         /// Run only the next pending step instead of all remaining.
@@ -1340,13 +1341,24 @@ mod tests {
 
     #[test]
     fn test_parse_run() {
-        let cli = Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--all"]).unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "run", "my-feature"]).unwrap();
         if let Command::Run { plan, all, .. } = cli.command.unwrap() {
             assert_eq!(plan.as_deref(), Some("my-feature"));
-            assert!(all);
+            assert!(!all);
         } else {
             panic!("Expected Run");
         }
+    }
+
+    #[test]
+    fn test_parse_run_all_with_slug_conflicts() {
+        // A positional plan slug paired with --all is ambiguous (the slug
+        // would be silently ignored), so clap must reject the combination.
+        let result = Cli::try_parse_from(["ralph-rs", "run", "my-plan", "--all"]);
+        assert!(
+            result.is_err(),
+            "clap must reject a plan slug combined with --all"
+        );
     }
 
     #[test]

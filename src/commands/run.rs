@@ -120,9 +120,6 @@ pub fn dispatch_run(
                 "--from/--to cannot be combined with --all (step numbers are per-plan and not comparable across plans)"
             );
         }
-        if args.plan_slug.is_some() {
-            eprintln!("Warning: plan slug argument is ignored when --all is set.");
-        }
 
         // Acquire the per-project run lock so two concurrent `ralph run`
         // invocations can't clobber each other. Dry runs skip the lock since
