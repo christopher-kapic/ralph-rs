@@ -69,7 +69,6 @@ pub fn is_default_run_invocation(args: &RunArgs, stdout_is_tty: bool) -> bool {
         && !args.dry_run
         && !args.skip_preflight
         && !args.force
-        && !args.verbose
         && args.run_harness.is_none()
         && args.cli_harness.is_none()
 }
@@ -6650,6 +6649,20 @@ mod run_dispatch_tests {
     }
 
     #[test]
+    fn verbose_does_not_bypass_tui() {
+        // `--verbose` only controls per-attempt prompt-preview length on
+        // stderr, and the TUI-spawned subprocess runs with
+        // `--non-interactive --json` (its stderr is captured by the events
+        // consumer), so the flag is effectively a no-op in TUI context and
+        // should not opt out of interactivity.
+        let args = RunArgs {
+            verbose: true,
+            ..defaults()
+        };
+        assert!(is_default_run_invocation(&args, true));
+    }
+
+    #[test]
     fn non_tty_stdout_bypasses_tui() {
         // Piping to `tee` (or any non-TTY) must keep today's runner path.
         assert!(!is_default_run_invocation(&defaults(), false));
@@ -6729,13 +6742,6 @@ mod run_dispatch_tests {
                 "--force",
                 RunArgs {
                     force: true,
-                    ..defaults()
-                },
-            ),
-            (
-                "--verbose",
-                RunArgs {
-                    verbose: true,
                     ..defaults()
                 },
             ),
