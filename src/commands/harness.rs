@@ -7,18 +7,18 @@
 use anyhow::{Result, anyhow};
 
 use crate::config::{self, Config, HarnessConfig};
-use crate::output::OutputContext;
+use crate::output::{OutputContext, OutputFormat};
 use crate::preflight;
 
 /// Print a table of all configured harnesses with on-PATH status, a one-line
 /// safety summary (sandbox value for codex, permission mode for claude, etc.)
 /// and a footgun count. Designed to be the first thing a user runs when
 /// asking "is my codex going to actually be able to write files?".
-pub fn harness_list(config: &Config, json: bool, _out: &OutputContext) -> Result<()> {
+pub fn harness_list(config: &Config, json: bool, out: &OutputContext) -> Result<()> {
     let mut names: Vec<&str> = config.harnesses.keys().map(String::as_str).collect();
     names.sort_unstable();
 
-    if json {
+    if json || matches!(out.format, OutputFormat::Json) {
         let payload: Vec<serde_json::Value> = names
             .iter()
             .map(|name| {
@@ -94,7 +94,7 @@ pub fn harness_show(
     config: &Config,
     name: &str,
     json: bool,
-    _out: &OutputContext,
+    out: &OutputContext,
 ) -> Result<()> {
     let hc: &HarnessConfig = config.harnesses.get(name).ok_or_else(|| {
         let mut available: Vec<&str> = config.harnesses.keys().map(String::as_str).collect();
@@ -105,7 +105,7 @@ pub fn harness_show(
         )
     })?;
 
-    if json {
+    if json || matches!(out.format, OutputFormat::Json) {
         let payload = serde_json::json!({
             "name": name,
             "default_harness": name == config.default_harness,
