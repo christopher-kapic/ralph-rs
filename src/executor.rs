@@ -180,6 +180,15 @@ fn try_parse_json(text: &str) -> Option<ParsedHarnessOutput> {
 // Failure handling
 // ---------------------------------------------------------------------------
 
+/// Diagnostic message used when an attempt ends with a clean worktree but
+/// HEAD has advanced — the harness committed on its own. Ralph owns commits
+/// per step, so a step description that tells the agent to commit is the
+/// usual cause. Surfaced both in the execution log's `test_results` (visible
+/// via `ralph log`) and to stderr at terminal failure.
+pub(crate) const NO_CHANGES_AGENT_COMMITTED_HINT: &str =
+    "no changes (worktree clean, but HEAD advanced during attempt — agent appears to have committed). \
+     Ralph owns commits per step; remove any 'git commit' / 'git add' instructions from the step description.";
+
 /// Reason a step execution failed terminally.
 #[derive(Debug, Clone, Copy)]
 enum FailureReason {
@@ -878,6 +887,14 @@ pub async fn execute_step(
         )?;
         let env_vars = harness::build_harness_env(harness_config, agent_file_path.as_deref());
 
+        // Snapshot HEAD just before the harness runs so we can detect the
+        // case where the harness committed on its own (clean worktree +
+        // HEAD advanced). Used to upgrade the no_changes diagnostic — see
+        // the agent_committed_clean check after the harness completes.
+        // `.ok()` because a missing HEAD (empty repo) shouldn't fail the
+        // run; we just won't detect the committed-on-its-own case.
+        let head_before_harness = git::get_commit_hash(workdir).ok();
+
         // Announce the harness phase with the harness name as the current
         // command so external observers (ralph status, TUI) can show what's
         // running before we have a pid to attach. `Keep` here because the
@@ -969,6 +986,20 @@ pub async fn execute_step(
                 } else {
                     Vec::new()
                 };
+
+                // Detect "agent appears to have committed on its own": the
+                // worktree is clean *and* HEAD advanced during this attempt.
+                // Surfaced in the no_changes diagnostic below so authors who
+                // told the harness to commit themselves get a self-explanatory
+                // error instead of a generic no_changes loop. Both halves
+                // must be Some — if either snapshot failed we can't compare
+                // safely, so suppress the hint rather than risk a false
+                // positive.
+                let agent_committed_clean = !has_changes
+                    && match (&head_before_harness, git::get_commit_hash(workdir).ok()) {
+                        (Some(before), Some(after)) => before != &after,
+                        _ => false,
+                    };
 
                 // Pause if the harness left unanswered `step_questions` rows
                 // behind during this attempt (TUI-plan.md §17). Tested first
@@ -1207,6 +1238,23 @@ pub async fn execute_step(
                     (false, vec!["no changes detected".to_string()], false)
                 };
 
+                // Commit-ownership invariant: if the worktree is clean *and*
+                // HEAD moved during this attempt, the agent committed on its
+                // own. That's a contract violation regardless of
+                // `change_policy` — under Optional we'd otherwise silently
+                // succeed with `committed=false` while HEAD has advanced,
+                // breaking provenance for every downstream step. Force the
+                // attempt to fail and surface the diagnostic above whatever
+                // test output was already recorded so the cause appears
+                // first in `ralph log`.
+                let (test_passed, test_result_strings, test_aborted) = if agent_committed_clean {
+                    let mut strings = test_result_strings;
+                    strings.insert(0, NO_CHANGES_AGENT_COMMITTED_HINT.to_string());
+                    (false, strings, test_aborted)
+                } else {
+                    (test_passed, test_result_strings, test_aborted)
+                };
+
                 // If Ctrl+C landed mid-test, the test runner will have killed
                 // its child; surface this as Aborted rather than a retry-worthy
                 // test failure. Capture partial test_results so the log row
@@ -1398,12 +1446,24 @@ pub async fn execute_step(
                         has_changes,
                     };
                     // Mapping to failure classification:
+                    //  - agent_committed_clean -> classify as NoChanges
+                    //    regardless of policy. The contract violation is the
+                    //    same whether the step was Required or Optional, and
+                    //    keeping the same termination_reason means hooks
+                    //    keying off `no_changes` cover both cases without
+                    //    needing a new label.
                     //  - has_changes     -> tests ran and failed
                     //  - Required + none -> NoChanges (unchanged behavior)
                     //  - Optional + none -> the only way to reach here with
                     //    Optional policy is a failing test run, so we classify
                     //    as TestFailed (tests did run; they just failed).
-                    let (reason, term_reason, test_st) = if has_changes {
+                    let (reason, term_reason, test_st) = if agent_committed_clean {
+                        (
+                            FailureReason::NoChanges,
+                            TerminationReason::NoChanges,
+                            TestStatus::NotRun,
+                        )
+                    } else if has_changes {
                         (
                             FailureReason::TestFailed,
                             TerminationReason::TestFailed,
@@ -1422,6 +1482,14 @@ pub async fn execute_step(
                             TestStatus::Failed,
                         )
                     };
+                    // Echo the diagnostic to stderr so a runner watching the
+                    // live output sees it without having to run `ralph log`.
+                    // Gated on json_output so NDJSON streams stay clean —
+                    // the same string is already in test_results, which the
+                    // log row carries.
+                    if agent_committed_clean && !exec_opts.json_output {
+                        eprintln!("  hint: {NO_CHANGES_AGENT_COMMITTED_HINT}");
+                    }
                     return finalize_failure(
                         &ctx,
                         exec_log.id,
@@ -1455,9 +1523,12 @@ pub async fn execute_step(
                 let test_output_summary = test_result_strings.join("\n");
                 // This row describes *this* attempt's termination even though
                 // the step will retry — record why this attempt failed. Same
-                // mapping as the terminal case: under Optional policy the only
-                // non-success path with no changes is a failed test run.
-                let (retry_term, retry_test_status) = if has_changes {
+                // precedence as the terminal case: agent_committed_clean is
+                // a contract violation regardless of policy, so it wins over
+                // the policy-specific branches.
+                let (retry_term, retry_test_status) = if agent_committed_clean {
+                    (TerminationReason::NoChanges, TestStatus::NotRun)
+                } else if has_changes {
                     (TerminationReason::TestFailed, TestStatus::Failed)
                 } else if step.change_policy == ChangePolicy::Required {
                     (TerminationReason::NoChanges, TestStatus::NotRun)
@@ -3410,6 +3481,356 @@ mod tests {
             Some(TerminationReason::NoChanges)
         );
         assert_eq!(logs[0].test_status, Some(TestStatus::NotRun));
+        // Plain "no_changes" path: the agent didn't commit, so the
+        // diagnostic hint should NOT fire.
+        assert!(
+            !logs[0]
+                .test_results
+                .iter()
+                .any(|s| s.contains("HEAD advanced")),
+            "vanilla no_changes should not surface the agent-committed hint",
+        );
+    }
+
+    /// Required policy + harness commits on its own (clean worktree, but
+    /// HEAD advanced) → step still Failed with NoChanges, but the execution
+    /// log carries the agent-committed diagnostic so the user sees *why*
+    /// rather than a generic `no_changes`. Regression guard for the
+    /// commit-ownership-contract discoverability fix.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_required_step_agent_committed_emits_hint() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        // Capture HEAD so we can verify it actually moved.
+        let head_before = crate::git::get_commit_hash(&dir).unwrap();
+
+        // Harness that touches a file, stages it, commits it, then exits 0
+        // — exactly the "Commit when done" failure mode the hint targets.
+        let harness_tmp = TempDir::new().unwrap();
+        let script = format!(
+            "#!/bin/sh\n\
+             cd {0}\n\
+             touch agent-commit-test.txt\n\
+             git add -A\n\
+             git -c user.email=agent@test -c user.name=agent commit -m 'agent commit' >/dev/null\n\
+             exit 0\n",
+            dir.to_string_lossy()
+        );
+        let harness_path = harness_tmp.path().join("commit-harness.sh");
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(step.change_policy, ChangePolicy::Required);
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(false);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // HEAD must actually have advanced — otherwise the hint can't fire
+        // and we'd be testing nothing.
+        let head_after = crate::git::get_commit_hash(&dir).unwrap();
+        assert_ne!(head_before, head_after, "harness should have committed");
+
+        assert_eq!(result.outcome, StepOutcome::Failed);
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::NoChanges),
+            "machine-readable termination_reason stays NoChanges for hook compat",
+        );
+        assert!(
+            logs[0]
+                .test_results
+                .iter()
+                .any(|s| s.contains("HEAD advanced") && s.contains("agent appears to have committed")),
+            "test_results should carry the agent-committed diagnostic; got: {:?}",
+            logs[0].test_results,
+        );
+    }
+
+    /// Write a harness script that touches a file, stages it, commits it,
+    /// then exits 0 — the "agent committed on its own, leaving a clean
+    /// worktree" failure mode the no_changes hint targets. Used by both
+    /// the Required and Optional regression tests so the harness behavior
+    /// stays identical across them.
+    #[cfg(test)]
+    fn write_agent_committing_harness(
+        outside_dir: &std::path::Path,
+        workdir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let script = format!(
+            "#!/bin/sh\n\
+             cd {0}\n\
+             touch agent-commit-test.txt\n\
+             git add -A\n\
+             git -c user.email=agent@test -c user.name=agent commit -m 'agent commit' >/dev/null\n\
+             exit 0\n",
+            workdir.to_string_lossy()
+        );
+        let path = outside_dir.join("commit-harness.sh");
+        fs::write(&path, script).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// Optional policy + no tests configured + harness commits on its own
+    /// → step Failed with NoChanges + the agent-committed diagnostic.
+    /// Codex review caught that the prior Optional success branch silently
+    /// swallowed this case, recording `committed=false` while HEAD had
+    /// advanced. The fix moves the commit-ownership check ahead of the
+    /// policy branches; this test guards the regression.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_optional_step_agent_committed_no_tests_fails() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        let head_before = crate::git::get_commit_hash(&dir).unwrap();
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_agent_committing_harness(harness_tmp.path(), &dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        // No deterministic tests configured.
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Review",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            Some(ChangePolicy::Optional),
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(false);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let head_after = crate::git::get_commit_hash(&dir).unwrap();
+        assert_ne!(head_before, head_after, "harness should have committed");
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Failed,
+            "Optional + agent-committed must fail, not silently succeed",
+        );
+        assert!(result.commit_hash.is_none());
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::NoChanges),
+            "agent_committed_clean classifies as NoChanges regardless of policy",
+        );
+        assert!(
+            logs[0]
+                .test_results
+                .iter()
+                .any(|s| s.contains("HEAD advanced") && s.contains("agent appears to have committed")),
+            "diagnostic must surface in execution log; got: {:?}",
+            logs[0].test_results,
+        );
+        assert!(!logs[0].committed);
+    }
+
+    /// Optional policy + tests configured and passing + harness commits on
+    /// its own → step still Failed with NoChanges + the agent-committed
+    /// diagnostic. Even though the tests passed on the post-agent-commit
+    /// tree, the commit-ownership invariant takes precedence: a "passing"
+    /// step with `committed=false` while HEAD advanced is the broken
+    /// provenance state the fix is preventing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_optional_step_agent_committed_passing_tests_fails() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        let head_before = crate::git::get_commit_hash(&dir).unwrap();
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_agent_committing_harness(harness_tmp.path(), &dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        // Deterministic test that always passes — to simulate the
+        // "agent committed but tests are green on the new tree" path.
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &["true".to_string()],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Review",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            Some(ChangePolicy::Optional),
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(false);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let head_after = crate::git::get_commit_hash(&dir).unwrap();
+        assert_ne!(head_before, head_after, "harness should have committed");
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Failed,
+            "Optional + agent-committed must fail even when tests pass",
+        );
+        assert!(result.commit_hash.is_none());
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::NoChanges),
+        );
+        assert!(
+            logs[0]
+                .test_results
+                .iter()
+                .any(|s| s.contains("HEAD advanced") && s.contains("agent appears to have committed")),
+            "diagnostic must lead the test_results vec; got: {:?}",
+            logs[0].test_results,
+        );
+        assert!(!logs[0].committed);
     }
 
     /// Optional policy + no tests configured + no changes → Success with

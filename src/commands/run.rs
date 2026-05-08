@@ -154,7 +154,8 @@ pub fn dispatch_run(
             let mut any_errors = false;
             for p in &runnable {
                 eprintln!("Running preflight checks for '{}'...", p.slug);
-                let results = preflight::run_preflight_checks(p, config, workdir)?;
+                let steps = storage::list_steps(conn, &p.id)?;
+                let results = preflight::run_preflight_checks(p, &steps, config, workdir)?;
                 results.print_report(out);
                 if !results.is_ok() {
                     any_errors = true;
@@ -215,7 +216,8 @@ pub fn dispatch_run(
     // Preflight checks
     if !args.skip_preflight && !args.dry_run {
         eprintln!("Running preflight checks...");
-        let preflight_results = preflight::run_preflight_checks(&plan, config, workdir)?;
+        let steps = storage::list_steps(conn, &plan.id)?;
+        let preflight_results = preflight::run_preflight_checks(&plan, &steps, config, workdir)?;
         preflight_results.print_report(out);
 
         if !preflight_results.is_ok() {

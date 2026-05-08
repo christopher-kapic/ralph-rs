@@ -7,9 +7,27 @@ use std::path::PathBuf;
 use crate::hook_library::Lifecycle;
 use crate::plan::{ChangePolicy, PlanStatus};
 
+/// Authoring tip surfaced via `--help` on plan/step creation commands and
+/// the top-level binary, so plan authors learn ralph's commit-ownership
+/// contract before they hit a confusing `reason: no_changes` loop. Kept as
+/// a single constant so the wording stays consistent across surfaces.
+pub(crate) const AUTHORING_TIP_COMMITS: &str = "Authoring tip:\n  \
+    Ralph owns commits. On a successful step, ralph stages the harness's \
+    diff and creates the commit itself. Step descriptions should NOT tell \
+    the agent to run `git commit` or `git add` — doing so leaves the \
+    worktree clean while HEAD advances, which trips the no_changes failure \
+    path and burns retries.";
+
 /// ralph-rs: a deterministic orchestrator for coding agent harnesses.
 #[derive(Debug, Parser)]
-#[command(name = "ralph", version, about, long_about = None)]
+#[command(
+    name = "ralph",
+    version,
+    about,
+    long_about = None,
+    after_help = "Note: ralph owns commits — step descriptions should not run `git commit`. \
+                  See `ralph plan create --help` or `ralph step add --help` for details."
+)]
 pub struct Cli {
     /// Path to the project directory (defaults to current directory).
     #[arg(long, short = 'C', global = true)]
@@ -372,6 +390,7 @@ pub enum HarnessCommand {
 #[derive(Debug, Subcommand)]
 pub enum PlanCommand {
     /// Create a new plan.
+    #[command(after_help = AUTHORING_TIP_COMMITS)]
     Create {
         /// Short slug identifier for the plan.
         slug: String,
@@ -569,6 +588,7 @@ pub enum StepCommand {
     /// flags are mutually exclusive with `--import-json`. When `--import-json`
     /// is used, the first positional is interpreted as the plan slug (since
     /// no title is meaningful for a bulk import).
+    #[command(after_help = AUTHORING_TIP_COMMITS)]
     Add {
         /// Step title. Required unless `--import-json` is used. With
         /// `--import-json`, a single positional is reinterpreted as the
