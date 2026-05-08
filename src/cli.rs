@@ -102,6 +102,10 @@ pub enum Command {
     /// Use --one to run only the next pending step. Use --from/--to to run a
     /// specific range of steps. Use --all to run every plan in dependency order
     /// (ignores the plan slug). --one and --all are mutually exclusive.
+    ///
+    /// `--one` may be combined with `--from`/`--to`: when both are present, ralph
+    /// resolves the step window from `--from`/`--to` and then runs only the first
+    /// actionable step inside it. `--one` is still mutually exclusive with `--all`.
     Run {
         /// Plan slug to run. Defaults to the active plan.
         #[arg(conflicts_with = "all")]
