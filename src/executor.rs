@@ -185,8 +185,7 @@ fn try_parse_json(text: &str) -> Option<ParsedHarnessOutput> {
 /// per step, so a step description that tells the agent to commit is the
 /// usual cause. Surfaced both in the execution log's `test_results` (visible
 /// via `ralph log`) and to stderr at terminal failure.
-pub(crate) const NO_CHANGES_AGENT_COMMITTED_HINT: &str =
-    "no changes (worktree clean, but HEAD advanced during attempt — agent appears to have committed). \
+pub(crate) const NO_CHANGES_AGENT_COMMITTED_HINT: &str = "no changes (worktree clean, but HEAD advanced during attempt — agent appears to have committed). \
      Ralph owns commits per step; remove any 'git commit' / 'git add' instructions from the step description.";
 
 /// Reason a step execution failed terminally.
@@ -3600,7 +3599,8 @@ mod tests {
             logs[0]
                 .test_results
                 .iter()
-                .any(|s| s.contains("HEAD advanced") && s.contains("agent appears to have committed")),
+                .any(|s| s.contains("HEAD advanced")
+                    && s.contains("agent appears to have committed")),
             "test_results should carry the agent-committed diagnostic; got: {:?}",
             logs[0].test_results,
         );
@@ -3727,7 +3727,8 @@ mod tests {
             logs[0]
                 .test_results
                 .iter()
-                .any(|s| s.contains("HEAD advanced") && s.contains("agent appears to have committed")),
+                .any(|s| s.contains("HEAD advanced")
+                    && s.contains("agent appears to have committed")),
             "diagnostic must surface in execution log; got: {:?}",
             logs[0].test_results,
         );
@@ -3826,7 +3827,8 @@ mod tests {
             logs[0]
                 .test_results
                 .iter()
-                .any(|s| s.contains("HEAD advanced") && s.contains("agent appears to have committed")),
+                .any(|s| s.contains("HEAD advanced")
+                    && s.contains("agent appears to have committed")),
             "diagnostic must lead the test_results vec; got: {:?}",
             logs[0].test_results,
         );

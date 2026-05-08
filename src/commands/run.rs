@@ -2347,8 +2347,7 @@ where
                 app.detach_subscription();
                 attached_this_instance = false;
                 if let Some(msg) = failure {
-                    app.toasts
-                        .push(msg, ToastKind::Error, Instant::now());
+                    app.toasts.push(msg, ToastKind::Error, Instant::now());
                 }
             }
         } else {

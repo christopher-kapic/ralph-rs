@@ -970,7 +970,9 @@ mod tests {
 
     #[test]
     fn step_text_contains_commit_instruction_matches_phrases() {
-        assert!(step_text_contains_commit_instruction("git commit when done"));
+        assert!(step_text_contains_commit_instruction(
+            "git commit when done"
+        ));
         assert!(step_text_contains_commit_instruction("Run git add -A"));
         assert!(step_text_contains_commit_instruction(
             "GIT COMMIT" // case-insensitive
@@ -985,7 +987,11 @@ mod tests {
     fn check_steps_passes_when_no_commit_phrases() {
         let steps = vec![
             step_fixture("Add foo", "Implement foo in src/foo.rs", vec![]),
-            step_fixture("Wire bar", "Call foo from bar()", vec!["bar uses foo".into()]),
+            step_fixture(
+                "Wire bar",
+                "Call foo from bar()",
+                vec!["bar uses foo".into()],
+            ),
         ];
         let result = check_steps_for_commit_instructions(&steps);
         assert_eq!(result.severity, CheckSeverity::Pass);
@@ -1003,7 +1009,11 @@ mod tests {
         ];
         let result = check_steps_for_commit_instructions(&steps);
         assert_eq!(result.severity, CheckSeverity::Warning);
-        assert!(result.message.contains("#2"), "message should cite step #2: {}", result.message);
+        assert!(
+            result.message.contains("#2"),
+            "message should cite step #2: {}",
+            result.message
+        );
         assert!(result.message.contains("'Wire bar'"));
         assert!(result.message.contains("`git commit`") || result.message.contains("git commit"));
     }

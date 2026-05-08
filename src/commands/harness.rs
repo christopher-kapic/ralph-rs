@@ -90,12 +90,7 @@ pub fn harness_list(config: &Config, json: bool, out: &OutputContext) -> Result<
 /// Pretty-print the full configuration of a single harness, plus on-PATH
 /// status and any footgun warnings. JSON form just dumps the underlying
 /// `HarnessConfig` as-stored.
-pub fn harness_show(
-    config: &Config,
-    name: &str,
-    json: bool,
-    out: &OutputContext,
-) -> Result<()> {
+pub fn harness_show(config: &Config, name: &str, json: bool, out: &OutputContext) -> Result<()> {
     let hc: &HarnessConfig = config.harnesses.get(name).ok_or_else(|| {
         let mut available: Vec<&str> = config.harnesses.keys().map(String::as_str).collect();
         available.sort_unstable();
@@ -132,7 +127,10 @@ pub fn harness_show(
             "no"
         }
     );
-    println!("  safety:               {}", config::harness_safety_summary(hc));
+    println!(
+        "  safety:               {}",
+        config::harness_safety_summary(hc)
+    );
     println!("  args:                 {}", format_arg_vec(&hc.args));
     println!("  plan_args:            {}", format_arg_vec(&hc.plan_args));
     println!(
@@ -163,10 +161,7 @@ pub fn harness_show(
         println!("  default_model:        {model}");
     }
     if !hc.auth_env_vars.is_empty() {
-        println!(
-            "  auth_env_vars:        {}",
-            hc.auth_env_vars.join(", ")
-        );
+        println!("  auth_env_vars:        {}", hc.auth_env_vars.join(", "));
     }
     if !hc.auth_probe_args.is_empty() {
         println!(

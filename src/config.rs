@@ -1124,7 +1124,8 @@ mod tests {
     #[test]
     fn test_footguns_flag_codex_without_sandbox() {
         let mut hc = Config::default().harnesses["codex"].clone();
-        hc.args.retain(|a| a != "--sandbox" && a != "workspace-write");
+        hc.args
+            .retain(|a| a != "--sandbox" && a != "workspace-write");
         let issues = harness_footguns("codex", &hc);
         assert_eq!(
             issues.len(),

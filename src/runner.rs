@@ -1329,8 +1329,7 @@ async fn restore_working_tree(workdir: &Path, state: Option<&StashedState>) -> R
                 if !state.staged_files.is_empty() {
                     let workdir_owned = workdir.to_path_buf();
                     let staged_owned = state.staged_files.clone();
-                    blocking_git(move || git::restage_files(&workdir_owned, &staged_owned))
-                        .await?;
+                    blocking_git(move || git::restage_files(&workdir_owned, &staged_owned)).await?;
                 }
                 if state.staged_files.is_empty() {
                     eprintln!("Restored your uncommitted changes.");
