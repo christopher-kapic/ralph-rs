@@ -224,6 +224,16 @@ fn main() -> Result<()> {
                         description.as_deref(),
                         plan_slug.as_deref(),
                     ))?;
+                    if exit_code == 0 {
+                        return Ok(());
+                    }
+                    // Drop the SQLite connection and tokio runtime explicitly
+                    // before process::exit so OS handles close cleanly —
+                    // process::exit does not run destructors. We still need
+                    // process::exit (rather than a normal return) to preserve
+                    // the harness's specific non-zero exit code.
+                    drop(rt);
+                    drop(conn);
                     std::process::exit(exit_code);
                 }
             },
