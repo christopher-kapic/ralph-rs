@@ -114,18 +114,27 @@ pub async fn run_plan(
         sweep_and_log_stale_in_progress(conn, &effective_plan, out)?;
     }
 
-    // 2. Stash dirty tree + create branch. The orchestrator
-    // (`run_all_plans`) handles stash/setup itself and forces
-    // `current_branch: true` on the inner `run_plan` call, so only
-    // top-level single-plan runs take this path.
-    let teardown = if !options.current_branch && !options.dry_run {
+    // 2. Stash dirty tree + (optionally) create branch.
+    //
+    // We always stash a dirty tree, regardless of `current_branch`. Two
+    // reasons:
+    //   - Even when not switching branches, the per-step commit logic in
+    //     the executor will sweep up any uncommitted changes the user had
+    //     in tracked files into the next step's commit. Stashing first
+    //     gives the agent a clean baseline.
+    //   - The user's request: ralph should "just work" with a dirty tree.
+    //
+    // The orchestrator (`run_all_plans`) handles stash/setup itself and
+    // forces `current_branch: true` on the inner `run_plan` call, so only
+    // top-level single-plan runs take this path; `dry_run` is a no-op.
+    let teardown = if !options.dry_run {
         let source_branch = {
             let workdir_owned = workdir.to_path_buf();
             blocking_git(move || git::get_current_branch(&workdir_owned))
                 .await
                 .context("Failed to get current git branch")?
         };
-        let stash_ref = stash_if_dirty(workdir, &effective_plan.slug, options.auto_stash).await?;
+        let stashed = stash_if_dirty(workdir, &effective_plan.slug, options.auto_stash).await?;
         // Record source_branch + stash_sha on the run_lock row so resume /
         // diagnostics can see what we'll try to restore. Best-effort — if
         // the row isn't there (tests), swallow the error.
@@ -133,7 +142,7 @@ pub async fn run_plan(
             conn,
             workdir.to_string_lossy().as_ref(),
             &source_branch,
-            stash_ref.as_ref().map(|s| s.as_str()),
+            stashed.as_ref().map(|s| s.stash_ref.as_str()),
         );
         // Construct teardown state BEFORE setup_branch so that a failure in
         // branch creation/checkout still triggers stash restoration. Without
@@ -141,10 +150,16 @@ pub async fn run_plan(
         // uncommitted work stranded on the stash stack.
         let td = TeardownState {
             workdir: workdir.to_path_buf(),
-            stash_ref,
+            stashed,
         };
-        if let Err(setup_err) = setup_branch(workdir, &effective_plan, None).await {
-            if let Err(te) = restore_working_tree(&td.workdir, td.stash_ref.as_ref()).await {
+        // Only switch branches when the caller didn't say `--current-branch`.
+        // (When current_branch is true, we still stash a dirty tree above —
+        // the stash gives the agent a clean baseline and gets popped on the
+        // way out.)
+        if !options.current_branch
+            && let Err(setup_err) = setup_branch(workdir, &effective_plan, None).await
+        {
+            if let Err(te) = restore_working_tree(&td.workdir, td.stashed.as_ref()).await {
                 eprintln!("Warning: teardown after failed branch setup: {te}");
             }
             return Err(setup_err);
@@ -173,12 +188,12 @@ pub async fn run_plan(
         match &outcome {
             Ok(_) => {
                 // Don't mask a teardown error with a success.
-                restore_working_tree(&td.workdir, td.stash_ref.as_ref()).await?;
+                restore_working_tree(&td.workdir, td.stashed.as_ref()).await?;
             }
             Err(_) => {
                 // Run already failed; log teardown errors but don't mask
                 // the original failure.
-                if let Err(te) = restore_working_tree(&td.workdir, td.stash_ref.as_ref()).await {
+                if let Err(te) = restore_working_tree(&td.workdir, td.stashed.as_ref()).await {
                     eprintln!("Warning: teardown after failed run: {te}");
                 }
             }
@@ -189,10 +204,11 @@ pub async fn run_plan(
 }
 
 /// State captured by the top-level `run_plan` before the plan body runs.
-/// Handed to `restore_working_tree` during teardown.
+/// Handed to `restore_working_tree` during teardown. `stashed` is `None` on
+/// a clean tree (nothing to restore).
 struct TeardownState {
     workdir: std::path::PathBuf,
-    stash_ref: Option<StashRef>,
+    stashed: Option<StashedState>,
 }
 
 async fn run_plan_inner(
@@ -752,26 +768,27 @@ pub async fn run_all_plans(
     let plan_by_id: HashMap<String, Plan> =
         runnable.into_iter().map(|p| (p.id.clone(), p)).collect();
 
-    // 3. Capture the run's starting SHA (used for plans with no deps) and,
-    // on the stash-managing path, stash any dirty tree + record the source
-    // branch for teardown.
-    let teardown = if !options.current_branch && !options.dry_run {
+    // 3. Capture the run's starting SHA (used for plans with no deps) and
+    // stash any dirty tree + record the source branch for teardown. We stash
+    // even with `--current-branch` so the per-plan executor sees a clean
+    // baseline (mirrors the single-plan path).
+    let teardown = if !options.dry_run {
         let source_branch = {
             let workdir_owned = workdir.to_path_buf();
             blocking_git(move || git::get_current_branch(&workdir_owned))
                 .await
                 .context("Failed to get current git branch")?
         };
-        let stash_ref = stash_if_dirty(workdir, "all", options.auto_stash).await?;
+        let stashed = stash_if_dirty(workdir, "all", options.auto_stash).await?;
         let _ = run_lock::record_source_branch_and_stash(
             conn,
             project,
             &source_branch,
-            stash_ref.as_ref().map(|s| s.as_str()),
+            stashed.as_ref().map(|s| s.stash_ref.as_str()),
         );
         Some(TeardownState {
             workdir: workdir.to_path_buf(),
-            stash_ref,
+            stashed,
         })
     } else {
         None
@@ -803,10 +820,10 @@ pub async fn run_all_plans(
     if let Some(td) = teardown {
         match &inner {
             Ok(_) => {
-                restore_working_tree(&td.workdir, td.stash_ref.as_ref()).await?;
+                restore_working_tree(&td.workdir, td.stashed.as_ref()).await?;
             }
             Err(_) => {
-                if let Err(te) = restore_working_tree(&td.workdir, td.stash_ref.as_ref()).await {
+                if let Err(te) = restore_working_tree(&td.workdir, td.stashed.as_ref()).await {
                     eprintln!("Warning: teardown after failed --all run: {te}");
                 }
             }
@@ -1216,10 +1233,22 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
     }
 }
 
+/// What we stashed at run start. Beyond the stash commit SHA we also remember
+/// which files were *staged* (in the index) at the time, so the matching
+/// teardown can re-stage them after `git stash pop` (which always restores
+/// everything as unstaged). Empty `staged_files` means the user had nothing
+/// staged — only unstaged or untracked changes — and teardown will leave the
+/// post-pop unstaged status as-is.
+#[derive(Debug, Clone)]
+pub(crate) struct StashedState {
+    pub stash_ref: StashRef,
+    pub staged_files: Vec<String>,
+}
+
 /// If the working tree is dirty, stash it with a ralph-branded message and
-/// return the stash's commit SHA. Returns `Ok(None)` on a clean tree. Bails
-/// with a user-facing error when the tree is dirty and `auto_stash` is
-/// false.
+/// return the stash's commit SHA plus the list of files that were staged at
+/// stash time. Returns `Ok(None)` on a clean tree. Bails with a user-facing
+/// error when the tree is dirty and `auto_stash` is false.
 ///
 /// The stash message is `"ralph: auto-stash for plan '<slug>' at
 /// <ISO-8601>"` so teardown (or manual recovery) can locate it by subject.
@@ -1227,7 +1256,7 @@ async fn stash_if_dirty(
     workdir: &Path,
     plan_slug: &str,
     auto_stash: bool,
-) -> Result<Option<StashRef>> {
+) -> Result<Option<StashedState>> {
     let workdir_owned = workdir.to_path_buf();
     let dirty = blocking_git(move || git::has_uncommitted_changes(&workdir_owned)).await?;
     if !dirty {
@@ -1238,8 +1267,8 @@ async fn stash_if_dirty(
         let workdir_owned = workdir.to_path_buf();
         let files = blocking_git(move || git::get_all_changed_files(&workdir_owned)).await?;
         let mut msg = format!(
-            "Working tree has uncommitted changes; refusing to switch branches \
-             with {} file(s) dirty:\n",
+            "Working tree has uncommitted changes; refusing to run with \
+             auto_stash disabled and {} file(s) dirty:\n",
             files.len(),
         );
         for f in &files {
@@ -1248,11 +1277,20 @@ async fn stash_if_dirty(
             msg.push('\n');
         }
         msg.push_str(
-            "Re-run without --no-auto-stash to let ralph preserve your changes \
-             via `git stash push --include-untracked`, or stash/commit them manually first.",
+            "Set `auto_stash: true` in ~/.config/ralph-rs/config.json (or omit \
+             `--no-auto-stash`) to let ralph preserve your changes via \
+             `git stash push --include-untracked` and restore them at run end. \
+             Or stash/commit the changes manually before re-running.",
         );
         bail!(msg);
     }
+
+    // Capture which files are currently staged BEFORE stashing — `git stash
+    // pop` always restores everything as unstaged, so we need this list to
+    // re-stage on teardown if we want to preserve the user's staged/unstaged
+    // split across the run.
+    let workdir_owned = workdir.to_path_buf();
+    let staged_files = blocking_git(move || git::list_staged_files(&workdir_owned)).await?;
 
     // Timestamp for traceability; the pairing of plan slug + timestamp makes
     // every ralph stash line distinct on the stack.
@@ -1263,39 +1301,60 @@ async fn stash_if_dirty(
     let msg_owned = message.clone();
     let stash = blocking_git(move || git::stash_push_with_untracked(&workdir_owned, &msg_owned))
         .await
-        .context("failed to stash dirty working tree before switching branches")?;
-    Ok(stash)
+        .context("failed to stash dirty working tree before running")?;
+    Ok(stash.map(|stash_ref| StashedState {
+        stash_ref,
+        staged_files,
+    }))
 }
 
 /// If we stashed at run start, pop the stash on whatever branch the run
-/// left us on (typically the plan branch). Called once at the end of the
-/// top-level run regardless of outcome.
+/// left us on (typically the plan branch) and re-stage any files that were
+/// staged at stash time. Called once at the end of the top-level run
+/// regardless of outcome.
 ///
 /// On `stash pop` conflict, we leave the stash on the stack and return a
 /// non-zero error — the user pops manually.
-async fn restore_working_tree(workdir: &Path, stash_ref: Option<&StashRef>) -> Result<()> {
-    if let Some(stash) = stash_ref {
+async fn restore_working_tree(workdir: &Path, state: Option<&StashedState>) -> Result<()> {
+    if let Some(state) = state {
         let workdir_owned = workdir.to_path_buf();
-        let stash_owned = stash.clone();
+        let stash_owned = state.stash_ref.clone();
         let outcome = blocking_git(move || git::stash_pop(&workdir_owned, &stash_owned)).await?;
         match outcome {
             StashPopOutcome::Clean => {
-                eprintln!("Restored your uncommitted changes.");
+                // Re-stage any files the user had staged before we stashed.
+                // `git stash pop` always restores them as unstaged, so this
+                // step is what preserves the staged/unstaged distinction
+                // across a run.
+                if !state.staged_files.is_empty() {
+                    let workdir_owned = workdir.to_path_buf();
+                    let staged_owned = state.staged_files.clone();
+                    blocking_git(move || git::restage_files(&workdir_owned, &staged_owned))
+                        .await?;
+                }
+                if state.staged_files.is_empty() {
+                    eprintln!("Restored your uncommitted changes.");
+                } else {
+                    eprintln!(
+                        "Restored your uncommitted changes ({} file(s) re-staged).",
+                        state.staged_files.len()
+                    );
+                }
             }
             StashPopOutcome::Conflicted(stderr) => {
                 bail!(
                     "Pop of ralph's stash conflicts with committed work. \
                      Your changes are preserved at {} — resolve manually with \
                      `git stash pop {}`.\n{}",
-                    stash.as_str(),
-                    stash.as_str(),
+                    state.stash_ref.as_str(),
+                    state.stash_ref.as_str(),
                     stderr,
                 );
             }
             StashPopOutcome::NotFound => {
                 eprintln!(
                     "Warning: ralph's auto-stash ({}) was no longer on the stack at teardown.",
-                    stash.as_str(),
+                    state.stash_ref.as_str(),
                 );
             }
         }
@@ -3149,12 +3208,52 @@ mod tests {
             "error must list the dirty file, got: {msg}"
         );
         assert!(
-            msg.contains("--no-auto-stash"),
-            "error must point users at the opt-out flag, got: {msg}"
+            msg.contains("auto_stash"),
+            "error must point users at the auto_stash setting, got: {msg}"
         );
 
         // Nothing was swept; the tree is still dirty.
         assert!(git::has_uncommitted_changes(&dir).unwrap());
+    }
+
+    /// Staged files are re-staged after the round trip — `git stash pop`
+    /// always returns everything as unstaged, so `restore_working_tree` has
+    /// to re-stage the files that were in the index at stash time. Without
+    /// this, users who had `git add`-ed a file before kicking off a run
+    /// would lose that staged status.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_stash_round_trip_preserves_staged_status() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+
+        // Two dirty files — one staged, one unstaged.
+        fs::write(dir.join("staged.txt"), "i am staged\n").unwrap();
+        fs::write(dir.join("unstaged.txt"), "i am unstaged\n").unwrap();
+        git::stage_except(&dir, &["unstaged.txt".to_string()]).unwrap();
+
+        // Sanity: only staged.txt is in the index.
+        let staged_before = git::list_staged_files(&dir).unwrap();
+        assert_eq!(staged_before, vec!["staged.txt".to_string()]);
+
+        let stashed = stash_if_dirty(&dir, "demo", true)
+            .await
+            .unwrap()
+            .expect("expected a stash");
+        assert_eq!(stashed.staged_files, vec!["staged.txt".to_string()]);
+
+        // After teardown the file is back AND staged.
+        restore_working_tree(&dir, Some(&stashed)).await.unwrap();
+        let staged_after = git::list_staged_files(&dir).unwrap();
+        assert_eq!(
+            staged_after,
+            vec!["staged.txt".to_string()],
+            "staged.txt must be re-staged after pop, got: {staged_after:?}"
+        );
+        // unstaged.txt should still be present in the worktree but not in
+        // the index.
+        assert!(dir.join("unstaged.txt").exists());
+        assert!(!staged_after.contains(&"unstaged.txt".to_string()));
     }
 
     /// Default (auto_stash=true) stash-push + stash-pop round trip: the
@@ -3303,14 +3402,14 @@ mod tests {
             .expect_err("pop must surface the conflict");
         let msg = format!("{err}");
         assert!(
-            msg.contains(stash.as_str()),
+            msg.contains(stash.stash_ref.as_str()),
             "error must surface the stash SHA for manual recovery, got: {msg}"
         );
 
         // The stash is still on the stack.
         let still_there =
             git::find_stash_by_message(&dir, "ralph: auto-stash for plan 'demo'").unwrap();
-        assert_eq!(still_there.as_ref(), Some(&stash));
+        assert_eq!(still_there.as_ref(), Some(&stash.stash_ref));
     }
 
     /// The teardown path must fire even when the inner plan body fails.
@@ -3478,7 +3577,7 @@ mod tests {
         // the stack.
         let recovered =
             git::find_stash_by_message(&dir, "ralph: auto-stash for plan 'crashy'").unwrap();
-        assert_eq!(recovered.as_ref(), Some(&stash));
+        assert_eq!(recovered.as_ref(), Some(&stash.stash_ref));
     }
 
     // -- sweep_stale_in_progress / stale-step recovery --

@@ -501,8 +501,16 @@ pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
         }
     }
 
-    // 3. Check each configured harness binary.
-    for (name, harness_config) in &config.harnesses {
+    // 3. Check each configured harness binary, plus its args for known
+    //    foot-guns (codex without --sandbox, claude -p without
+    //    --permission-mode, etc.) that silently break `ralph run`.
+    //
+    //    Iterate in deterministic order so doctor output is stable across
+    //    runs — HashMap iteration order is randomized.
+    let mut harness_names: Vec<&String> = config.harnesses.keys().collect();
+    harness_names.sort_unstable();
+    for name in harness_names {
+        let harness_config = &config.harnesses[name];
         let binary = &harness_config.command;
         if is_binary_available(binary) {
             checks.push(CheckResult {
@@ -515,6 +523,17 @@ pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
                 name: format!("harness:{name}"),
                 severity: CheckSeverity::Warning,
                 message: format!("`{binary}` not found in PATH"),
+            });
+        }
+
+        // Foot-gun analysis is independent of on-PATH status — the args are
+        // wrong even if the binary doesn't exist yet, and surfacing both
+        // problems at once saves a doctor → fix → doctor round trip.
+        for issue in crate::config::harness_footguns(name, harness_config) {
+            checks.push(CheckResult {
+                name: format!("harness:{name}:args"),
+                severity: CheckSeverity::Warning,
+                message: issue,
             });
         }
     }

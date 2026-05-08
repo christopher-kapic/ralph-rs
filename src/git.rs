@@ -122,6 +122,48 @@ pub fn get_all_changed_files(workdir: &Path) -> Result<Vec<String>> {
     Ok(parse_porcelain_status(&out))
 }
 
+/// Return a list of paths that currently have **staged** changes (the index
+/// differs from HEAD). Captured before [`stash_push_with_untracked`] so that
+/// after `stash pop` (which always restores everything as unstaged) we can
+/// re-stage exactly the files the user had staged before the run.
+///
+/// Uses `git diff --name-only --cached` rather than parsing porcelain so we
+/// only get index-vs-HEAD differences and don't have to disambiguate the
+/// per-file XY status codes.
+pub fn list_staged_files(workdir: &Path) -> Result<Vec<String>> {
+    let out = git(workdir, &["diff", "--name-only", "--cached"])
+        .context("could not list staged files")?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Re-stage `paths` after a stash pop. Best-effort: ignores files that no
+/// longer exist (the user may have manipulated the worktree mid-run) and
+/// surfaces only catastrophic errors that would prevent the run from
+/// finalising.
+///
+/// `git add` accepts globs and pathspec magic; we pass `--` as a sentinel so
+/// the caller's literal paths are interpreted as filenames even if they
+/// happen to start with a dash.
+pub fn restage_files(workdir: &Path, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args: Vec<&str> = vec!["add", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    // Don't fail the whole teardown on `git add` complaining about a single
+    // missing path; treat add failures as best-effort because the user's
+    // working tree is already restored at this point.
+    if let Err(e) = git(workdir, &args) {
+        eprintln!("Warning: re-staging files after stash pop failed: {e}");
+    }
+    Ok(())
+}
+
 /// Return the unified diff of all current (unstaged + staged) changes.
 pub fn get_diff(workdir: &Path) -> Result<String> {
     let unstaged = git(workdir, &["diff"]).context("could not get unstaged diff")?;

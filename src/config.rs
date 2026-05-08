@@ -406,6 +406,16 @@ impl Default for Config {
                 // for programmatic, non-interactive use — they prevent codex
                 // from blocking on approval prompts and avoid persisting
                 // session files that ralph-rs doesn't need.
+                //
+                // `--sandbox workspace-write` lets codex modify the workspace
+                // (the project directory). Without an explicit `--sandbox`,
+                // codex defaults to read-only, which silently fails on any
+                // implementation step and is too strict even for review steps
+                // that need to write pager state to /tmp. Steps that need to
+                // mutate state outside the workspace (e.g. a review step that
+                // appends fix steps via `ralph step add`, which writes to the
+                // ralph DB under `~/.local/share/ralph-rs/`) should select the
+                // `codex-orchestrator` harness, which uses `danger-full-access`.
                 command: "codex".to_string(),
                 // `codex exec` reads the prompt from stdin when no positional
                 // prompt argument is provided. In Stdin mode ralph strips the
@@ -417,6 +427,8 @@ impl Default for Config {
                     "{prompt}".to_string(),
                     "--skip-git-repo-check".to_string(),
                     "--ephemeral".to_string(),
+                    "--sandbox".to_string(),
+                    "workspace-write".to_string(),
                     "-c".to_string(),
                     "approval_policy=never".to_string(),
                 ],
@@ -441,6 +453,41 @@ impl Default for Config {
                 // codex exec reads from stdin when no positional prompt is
                 // present; the `{prompt}` placeholder is stripped in Stdin
                 // mode and the prompt is piped in.
+                prompt_input: PromptInputMode::Stdin,
+                color: None,
+            },
+        );
+
+        harnesses.insert(
+            "codex-orchestrator".to_string(),
+            HarnessConfig {
+                // Same as `codex` but with `--sandbox danger-full-access`. Use
+                // for steps that need to mutate state outside the workspace —
+                // most commonly, review steps that append follow-up steps via
+                // `ralph step add` (the ralph SQLite DB lives under
+                // `~/.local/share/ralph-rs/`, outside the workspace sandbox).
+                // Implementation steps should stick with `codex` (workspace-write).
+                command: "codex".to_string(),
+                args: vec![
+                    "exec".to_string(),
+                    "{prompt}".to_string(),
+                    "--skip-git-repo-check".to_string(),
+                    "--ephemeral".to_string(),
+                    "--sandbox".to_string(),
+                    "danger-full-access".to_string(),
+                    "-c".to_string(),
+                    "approval_policy=never".to_string(),
+                ],
+                plan_args: vec!["--full-auto".to_string(), "{prompt}".to_string()],
+                supports_agent_file: false,
+                supports_json_output: true,
+                json_output_args: vec!["--json".to_string()],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec!["-m".to_string(), "{model}".to_string()],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
                 prompt_input: PromptInputMode::Stdin,
                 color: None,
             },
@@ -644,6 +691,81 @@ impl Default for Config {
     }
 }
 
+/// Inspect a harness's `args` for known foot-guns — invocation flags that
+/// people commonly forget but which silently break `ralph run`. Returns one
+/// short warning string per issue, suitable for surfacing through
+/// `ralph harness list` / `show` and `ralph doctor`.
+///
+/// Currently flags:
+/// - `codex` (or anything invoking the `codex exec` subcommand) without an
+///   explicit `--sandbox`. Codex defaults to read-only with no sandbox flag,
+///   so writes silently fail. The default `codex` config now ships with
+///   `--sandbox workspace-write`; this catches users who copied an old
+///   config or hand-edited the args.
+/// - `claude` (the `-p` non-interactive path) without `--permission-mode`.
+///   Without it, claude blocks on interactive approval prompts and hangs the
+///   subprocess.
+///
+/// Heuristic-based: matches on `command` and arg presence. Conservative —
+/// false positives are worse than missed warnings, so we only flag patterns
+/// where the absent flag is clearly required, not "would be nicer".
+pub fn harness_footguns(name: &str, hc: &HarnessConfig) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    let is_codex_exec = hc.command == "codex" && hc.args.iter().any(|a| a == "exec");
+    if is_codex_exec && !hc.args.iter().any(|a| a == "--sandbox") {
+        issues.push(format!(
+            "harness `{name}` invokes `codex exec` without `--sandbox`. \
+             Codex defaults to read-only when no sandbox is specified, so \
+             implementation steps will silently fail. Add `--sandbox \
+             workspace-write` (or `danger-full-access` for steps that need \
+             to write outside the workspace, e.g. review steps that call \
+             `ralph step add`)."
+        ));
+    }
+
+    let is_claude_print = hc.command == "claude" && hc.args.iter().any(|a| a == "-p");
+    if is_claude_print && !hc.args.iter().any(|a| a == "--permission-mode") {
+        issues.push(format!(
+            "harness `{name}` invokes `claude -p` without `--permission-mode`. \
+             Claude will block on interactive approval prompts in non-interactive \
+             mode and hang the subprocess. Add `--permission-mode bypassPermissions`."
+        ));
+    }
+
+    issues
+}
+
+/// One-line summary of how the harness's args treat sandboxing / permissions,
+/// for the `ralph harness list` table. Returns "ok" when neither known
+/// permission flag is needed for the harness's command, or a short
+/// human-readable description of the active mode (`workspace-write`,
+/// `bypassPermissions`, etc.). Returns "no-sandbox!" or similar when a
+/// known foot-gun is present, so the table itself surfaces the issue.
+pub fn harness_safety_summary(hc: &HarnessConfig) -> String {
+    if hc.command == "codex" && hc.args.iter().any(|a| a == "exec") {
+        // Look for `--sandbox <value>` and report the value.
+        let mut iter = hc.args.iter();
+        while let Some(a) = iter.next() {
+            if a == "--sandbox" {
+                return iter.next().cloned().unwrap_or_else(|| "<missing>".into());
+            }
+        }
+        return "no-sandbox!".to_string();
+    }
+    if hc.command == "claude" && hc.args.iter().any(|a| a == "-p") {
+        // Look for `--permission-mode <value>`.
+        let mut iter = hc.args.iter();
+        while let Some(a) = iter.next() {
+            if a == "--permission-mode" {
+                return iter.next().cloned().unwrap_or_else(|| "<missing>".into());
+            }
+        }
+        return "no-permission-mode!".to_string();
+    }
+    "—".to_string()
+}
+
 /// Returns the configuration directory for ralph-rs.
 ///
 /// Uses XDG semantics on every platform so the config can live alongside
@@ -767,14 +889,22 @@ mod tests {
         // to opt in.
         assert!(config.auto_stash);
 
-        let expected_harnesses = ["claude", "codex", "pi", "opencode", "copilot", "goose"];
+        let expected_harnesses = [
+            "claude",
+            "codex",
+            "codex-orchestrator",
+            "pi",
+            "opencode",
+            "copilot",
+            "goose",
+        ];
         for name in &expected_harnesses {
             assert!(
                 config.harnesses.contains_key(*name),
                 "Missing harness: {name}"
             );
         }
-        assert_eq!(config.harnesses.len(), 6);
+        assert_eq!(config.harnesses.len(), 7);
     }
 
     #[test]
@@ -835,6 +965,37 @@ mod tests {
         assert!(codex.args.contains(&"--ephemeral".to_string()));
         assert!(codex.args.contains(&"--skip-git-repo-check".to_string()));
         assert!(codex.args.contains(&"approval_policy=never".to_string()));
+        // Default codex must run with workspace-write so steps can modify
+        // files. Read-only (codex's default with no --sandbox) silently fails
+        // on any implementation step.
+        assert!(
+            codex.args.contains(&"--sandbox".to_string()),
+            "codex args must include --sandbox: {:?}",
+            codex.args
+        );
+        assert!(
+            codex.args.contains(&"workspace-write".to_string()),
+            "codex args must use workspace-write sandbox: {:?}",
+            codex.args
+        );
+
+        // codex-orchestrator is the danger-full-access variant for steps
+        // that mutate state outside the workspace (e.g. review steps that
+        // call `ralph step add`, which writes to the ralph DB outside cwd).
+        let codex_orch = &config.harnesses["codex-orchestrator"];
+        assert_eq!(codex_orch.command, "codex");
+        assert_eq!(codex_orch.args[0], "exec");
+        assert!(codex_orch.args.contains(&"--sandbox".to_string()));
+        assert!(
+            codex_orch.args.contains(&"danger-full-access".to_string()),
+            "codex-orchestrator must use danger-full-access sandbox: {:?}",
+            codex_orch.args
+        );
+        assert!(
+            !codex_orch.args.contains(&"workspace-write".to_string()),
+            "codex-orchestrator must not also pass workspace-write: {:?}",
+            codex_orch.args
+        );
         // Plan-harness mode for codex must enter the interactive TUI
         // (default subcommand, NOT `exec`) with a seeded positional
         // prompt and the low-friction `--full-auto` autonomy combo.
@@ -945,6 +1106,70 @@ mod tests {
             goose.plan_args.contains(&"-s".to_string()),
             "goose plan_args must include -s (stay interactive after initial input): {:?}",
             goose.plan_args
+        );
+    }
+
+    #[test]
+    fn test_default_harnesses_have_no_footguns() {
+        let config = Config::default();
+        for (name, hc) in &config.harnesses {
+            let issues = harness_footguns(name, hc);
+            assert!(
+                issues.is_empty(),
+                "default harness `{name}` must not trigger footguns, got: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_footguns_flag_codex_without_sandbox() {
+        let mut hc = Config::default().harnesses["codex"].clone();
+        hc.args.retain(|a| a != "--sandbox" && a != "workspace-write");
+        let issues = harness_footguns("codex", &hc);
+        assert_eq!(
+            issues.len(),
+            1,
+            "codex without --sandbox must produce exactly one footgun warning: {issues:?}"
+        );
+        assert!(
+            issues[0].contains("--sandbox"),
+            "warning should mention --sandbox: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_footguns_flag_claude_without_permission_mode() {
+        let mut hc = Config::default().harnesses["claude"].clone();
+        // Strip both the flag and its value so the heuristic sees no
+        // --permission-mode at all.
+        hc.args
+            .retain(|a| a != "--permission-mode" && a != "bypassPermissions");
+        let issues = harness_footguns("claude", &hc);
+        assert_eq!(
+            issues.len(),
+            1,
+            "claude -p without --permission-mode must warn: {issues:?}"
+        );
+        assert!(
+            issues[0].contains("--permission-mode"),
+            "warning should mention --permission-mode: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_safety_summary_reports_sandbox_value() {
+        let config = Config::default();
+        assert_eq!(
+            harness_safety_summary(&config.harnesses["codex"]),
+            "workspace-write"
+        );
+        assert_eq!(
+            harness_safety_summary(&config.harnesses["codex-orchestrator"]),
+            "danger-full-access"
+        );
+        assert_eq!(
+            harness_safety_summary(&config.harnesses["claude"]),
+            "bypassPermissions"
         );
     }
 

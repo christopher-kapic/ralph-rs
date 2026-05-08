@@ -299,6 +299,15 @@ pub enum Command {
     /// Run preflight checks to verify the environment is ready.
     Doctor,
 
+    /// Inspect configured harnesses (read-only).
+    ///
+    /// Mutating harness config still goes through `~/.config/ralph-rs/config.json`
+    /// directly. These commands are for discovering what's configured, what's
+    /// on PATH, and which harness has known foot-guns (e.g. codex without
+    /// `--sandbox`).
+    #[command(subcommand)]
+    Harness(HarnessCommand),
+
     /// View or mutate the global config file (`~/.config/ralph-rs/config.json`).
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -327,6 +336,32 @@ pub enum ConfigCommand {
     SetTimezone {
         /// IANA timezone name.
         tz: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Harness subcommands (top-level `ralph harness …`, distinct from
+// `ralph plan harness …` which manages the plan-generation harness).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum HarnessCommand {
+    /// List all configured harnesses with on-PATH status, sandbox/permission
+    /// summary, and a flag for any known foot-guns.
+    List {
+        /// Emit machine-readable JSON instead of the default table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Print the full configuration of a single harness.
+    Show {
+        /// Harness name (e.g. `claude`, `codex`, `codex-orchestrator`).
+        name: String,
+
+        /// Emit machine-readable JSON instead of the default pretty form.
+        #[arg(long)]
+        json: bool,
     },
 }
 

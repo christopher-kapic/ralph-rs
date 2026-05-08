@@ -535,7 +535,23 @@ pub fn run_plan_list_tui(
             if let Some(hosted) = subscription.as_mut() {
                 let _ = hosted.sub.drain();
                 if hosted.sub.is_disconnected() {
+                    // Surface any captured runner failure (preflight error,
+                    // missing harness, dirty tree, etc.) on the way out so
+                    // the user understands why the run they just started
+                    // never produced any progress. The TUI was rooted at
+                    // plan-list when the disconnect was observed, so the
+                    // toast lands here even though the user may have
+                    // started the run from plan-detail.
+                    let failure = hosted.sub.take_failure_message();
+                    let slug = hosted.slug.clone();
                     subscription = None;
+                    if let Some(msg) = failure {
+                        app.toasts.push(
+                            format!("[{slug}] {msg}"),
+                            ToastKind::Error,
+                            Instant::now(),
+                        );
+                    }
                 }
             }
 
@@ -2320,9 +2336,18 @@ where
                 tui_events::dispatch_event(&mut app, &evt);
             }
             if hosted.sub.is_disconnected() {
+                // The subscription belongs to *this* plan, so any failure
+                // message goes straight to this view's toast queue without
+                // a slug prefix — the user is staring at the plan it
+                // refers to.
+                let failure = hosted.sub.take_failure_message();
                 *subscription = None;
                 app.detach_subscription();
                 attached_this_instance = false;
+                if let Some(msg) = failure {
+                    app.toasts
+                        .push(msg, ToastKind::Error, Instant::now());
+                }
             }
         } else {
             if attached_this_instance {
@@ -2333,11 +2358,22 @@ where
             }
             // Subscription exists but is bound to another plan: still
             // drain-and-discard so the unbounded mpsc channel doesn't
-            // accumulate events while the user is parked here.
+            // accumulate events while the user is parked here. Surface a
+            // failure message with the slug prefix so the user knows which
+            // plan failed even though they're viewing a different one.
             if let Some(hosted) = subscription.as_mut() {
                 let _ = hosted.sub.drain();
                 if hosted.sub.is_disconnected() {
+                    let failure = hosted.sub.take_failure_message();
+                    let slug = hosted.slug.clone();
                     *subscription = None;
+                    if let Some(msg) = failure {
+                        app.toasts.push(
+                            format!("[{slug}] {msg}"),
+                            ToastKind::Error,
+                            Instant::now(),
+                        );
+                    }
                 }
             }
         }

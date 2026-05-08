@@ -5,6 +5,7 @@
 
 mod agents;
 pub mod config_cmd;
+pub mod harness;
 mod hooks;
 mod plan;
 mod prompt;
