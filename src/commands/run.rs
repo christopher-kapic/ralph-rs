@@ -544,15 +544,20 @@ pub fn run_plan_list_tui(
                     // plan-list when the disconnect was observed, so the
                     // toast lands here even though the user may have
                     // started the run from plan-detail.
-                    let failure = hosted.sub.take_failure_message();
-                    let slug = hosted.slug.clone();
-                    subscription = None;
-                    if let Some(msg) = failure {
-                        app.toasts.push(
-                            format!("[{slug}] {msg}"),
-                            ToastKind::Error,
-                            Instant::now(),
-                        );
+                    match hosted.sub.poll_failure_status() {
+                        crate::tui::events::FailureStatus::Pending => {}
+                        crate::tui::events::FailureStatus::Clean => {
+                            subscription = None;
+                        }
+                        crate::tui::events::FailureStatus::Message(msg) => {
+                            let slug = hosted.slug.clone();
+                            subscription = None;
+                            app.toasts.push(
+                                format!("[{slug}] {msg}"),
+                                ToastKind::Error,
+                                Instant::now(),
+                            );
+                        }
                     }
                 }
             }
@@ -2342,12 +2347,19 @@ where
                 // message goes straight to this view's toast queue without
                 // a slug prefix — the user is staring at the plan it
                 // refers to.
-                let failure = hosted.sub.take_failure_message();
-                *subscription = None;
-                app.detach_subscription();
-                attached_this_instance = false;
-                if let Some(msg) = failure {
-                    app.toasts.push(msg, ToastKind::Error, Instant::now());
+                match hosted.sub.poll_failure_status() {
+                    tui_events::FailureStatus::Pending => {}
+                    tui_events::FailureStatus::Clean => {
+                        *subscription = None;
+                        app.detach_subscription();
+                        attached_this_instance = false;
+                    }
+                    tui_events::FailureStatus::Message(msg) => {
+                        *subscription = None;
+                        app.detach_subscription();
+                        attached_this_instance = false;
+                        app.toasts.push(msg, ToastKind::Error, Instant::now());
+                    }
                 }
             }
         } else {
@@ -2365,15 +2377,20 @@ where
             if let Some(hosted) = subscription.as_mut() {
                 let _ = hosted.sub.drain();
                 if hosted.sub.is_disconnected() {
-                    let failure = hosted.sub.take_failure_message();
-                    let slug = hosted.slug.clone();
-                    *subscription = None;
-                    if let Some(msg) = failure {
-                        app.toasts.push(
-                            format!("[{slug}] {msg}"),
-                            ToastKind::Error,
-                            Instant::now(),
-                        );
+                    match hosted.sub.poll_failure_status() {
+                        tui_events::FailureStatus::Pending => {}
+                        tui_events::FailureStatus::Clean => {
+                            *subscription = None;
+                        }
+                        tui_events::FailureStatus::Message(msg) => {
+                            let slug = hosted.slug.clone();
+                            *subscription = None;
+                            app.toasts.push(
+                                format!("[{slug}] {msg}"),
+                                ToastKind::Error,
+                                Instant::now(),
+                            );
+                        }
                     }
                 }
             }

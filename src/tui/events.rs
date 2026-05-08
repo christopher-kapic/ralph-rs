@@ -60,7 +60,7 @@ pub struct RunSubscription {
     /// tree, run-lock held by another process, etc.). The spawn task
     /// either sends a message exactly once (failure) or drops the sender
     /// without sending (clean exit). The TUI poll loop drains via
-    /// [`Self::take_failure_message`] when the subscription disconnects.
+    /// [`Self::poll_failure_status`] when the subscription disconnects.
     failure: oneshot::Receiver<String>,
     /// Owned tokio runtime. Held only to keep the spawned task running —
     /// callers never reach into it. Wrapping in `Arc` lets the spawned
@@ -83,6 +83,16 @@ pub struct HostedSubscription {
     pub sub: RunSubscription,
 }
 
+/// Current state of the runner-failure side channel.
+pub enum FailureStatus {
+    /// The runner task is still alive and hasn't produced a final outcome yet.
+    Pending,
+    /// The runner has settled cleanly and will never send a failure message.
+    Clean,
+    /// The runner failed and delivered a final one-shot message.
+    Message(String),
+}
+
 impl RunSubscription {
     /// Drain every event currently sitting in the channel and return them
     /// in arrival order. Non-blocking: returns immediately when the channel
@@ -102,19 +112,19 @@ impl RunSubscription {
         matches!(self.rx.try_recv(), Err(TryRecvError::Disconnected))
     }
 
-    /// Take any captured failure message from the runner subprocess. Returns
-    /// `Some(message)` exactly once — when the runner exited with a non-zero
-    /// status and produced stderr text, or when the spawn itself failed.
-    /// Returns `None` for clean exits (sender dropped without sending) and
-    /// after the message has already been consumed, so callers can poll
-    /// without re-toasting on every tick.
+    /// Poll the runner-failure side channel without blocking. This keeps the
+    /// TUI from dropping the subscription in the brief window after stdout
+    /// closes but before the task has waited on the child and published the
+    /// final success/failure outcome.
     ///
     /// Designed to be called by the TUI poll loop right after observing
     /// [`Self::is_disconnected`] returning true.
-    pub fn take_failure_message(&mut self) -> Option<String> {
-        // try_recv is non-blocking; both `Empty` (sender alive, hasn't sent)
-        // and `Closed` (sender dropped without sending) map to None.
-        self.failure.try_recv().ok()
+    pub fn poll_failure_status(&mut self) -> FailureStatus {
+        match self.failure.try_recv() {
+            Ok(msg) => FailureStatus::Message(msg),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => FailureStatus::Pending,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => FailureStatus::Clean,
+        }
     }
 }
 
@@ -640,11 +650,9 @@ mod tests {
         assert_eq!(count, 2, "exactly 2 well-formed events should pass through");
     }
 
-    /// `take_failure_message` returns the populated message exactly once.
-    /// Subsequent calls return None so the TUI poll loop doesn't re-toast
-    /// the same error on every tick.
+    /// A delivered failure message is surfaced exactly once.
     #[test]
-    fn test_take_failure_message_take_once() {
+    fn test_poll_failure_status_message_then_clean() {
         let runtime = Arc::new(Runtime::new().unwrap());
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
         let (failure_tx, failure_rx) = oneshot::channel::<String>();
@@ -655,20 +663,37 @@ mod tests {
             _runtime: runtime,
         };
 
-        let first = sub.take_failure_message();
-        assert_eq!(first.as_deref(), Some("preflight failed"));
-        let second = sub.take_failure_message();
-        assert!(second.is_none(), "second take must return None");
+        match sub.poll_failure_status() {
+            FailureStatus::Message(msg) => assert_eq!(msg, "preflight failed"),
+            FailureStatus::Pending => panic!("message should have been ready"),
+            FailureStatus::Clean => panic!("failure channel should not look clean"),
+        }
+        assert!(
+            matches!(sub.poll_failure_status(), FailureStatus::Clean),
+            "once consumed, the oneshot receiver should settle to Clean"
+        );
     }
 
-    /// A clean (non-populated) failure slot returns None — the common
-    /// success-case path so the TUI doesn't conjure a toast on a normal
-    /// run completion.
+    /// A live sender with no value yet is distinct from a clean exit.
     #[test]
-    fn test_take_failure_message_clean_run() {
+    fn test_poll_failure_status_pending() {
         let runtime = Arc::new(Runtime::new().unwrap());
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
-        // Drop the sender without sending — simulates a clean exit.
+        let (failure_tx, failure_rx) = oneshot::channel::<String>();
+        let _keep_sender_alive = failure_tx;
+        let mut sub = RunSubscription {
+            rx,
+            failure: failure_rx,
+            _runtime: runtime,
+        };
+        assert!(matches!(sub.poll_failure_status(), FailureStatus::Pending));
+    }
+
+    /// Dropping the sender without sending simulates a clean exit.
+    #[test]
+    fn test_poll_failure_status_clean_run() {
+        let runtime = Arc::new(Runtime::new().unwrap());
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
         let (failure_tx, failure_rx) = oneshot::channel::<String>();
         drop(failure_tx);
         let mut sub = RunSubscription {
@@ -676,7 +701,7 @@ mod tests {
             failure: failure_rx,
             _runtime: runtime,
         };
-        assert!(sub.take_failure_message().is_none());
+        assert!(matches!(sub.poll_failure_status(), FailureStatus::Clean));
     }
 
     /// `RunSubscription::drain` returns an empty Vec when the producer
