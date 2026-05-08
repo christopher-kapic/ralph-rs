@@ -116,8 +116,11 @@ pub async fn run_plan(
 
     // 2. Stash dirty tree + (optionally) create branch.
     //
-    // We always stash a dirty tree, regardless of `current_branch`. Two
-    // reasons:
+    // We stash a dirty tree whenever `auto_stash` is true (the default;
+    // togglable via `config.auto_stash = false` or the `--no-auto-stash`
+    // CLI flag), regardless of `current_branch`. With `auto_stash = false`,
+    // `stash_if_dirty` returns an error on a dirty tree, causing the run
+    // to bail before any branch switch. Two reasons:
     //   - Even when not switching branches, the per-step commit logic in
     //     the executor will sweep up any uncommitted changes the user had
     //     in tracked files into the next step's commit. Stashing first
