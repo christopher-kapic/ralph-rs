@@ -724,7 +724,9 @@ pub enum StepCommand {
         #[arg(long, conflicts_with = "criteria")]
         clear_criteria: bool,
 
-        /// New max retries override. Pass 0 to clear (sets to plan/global default).
+        /// New max retries override. Stores the value as-is — `--max-retries 0` means
+        /// zero retries (the step is final on its first failed attempt). To fall back
+        /// to the plan/global default instead, use `--clear-max-retries`.
         #[arg(long)]
         max_retries: Option<i32>,
 
