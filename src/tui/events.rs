@@ -138,8 +138,14 @@ impl RunSubscription {
 /// scaffolding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamMode {
-    /// `ralph run <slug>`, optionally with `--current-branch`.
-    Run { current_branch: bool },
+    /// `ralph run <slug>`, optionally with `--current-branch` and/or
+    /// `--no-auto-stash`. Both flags are behavior knobs (not opt-outs from
+    /// interactivity), so the TUI's auto-start path threads them through to
+    /// the spawned subprocess rather than bypassing the TUI.
+    Run {
+        current_branch: bool,
+        no_auto_stash: bool,
+    },
     /// `ralph resume <slug>`. The resume code path always operates on the
     /// current branch internally, so no flag is needed.
     Resume,
@@ -160,10 +166,16 @@ pub fn build_streaming_run_command(
         .arg("--non-interactive")
         .arg("--json");
     match mode {
-        StreamMode::Run { current_branch } => {
+        StreamMode::Run {
+            current_branch,
+            no_auto_stash,
+        } => {
             cmd.arg("run");
             if current_branch {
                 cmd.arg("--current-branch");
+            }
+            if no_auto_stash {
+                cmd.arg("--no-auto-stash");
             }
         }
         StreamMode::Resume => {
@@ -742,6 +754,7 @@ mod tests {
             "my-plan",
             StreamMode::Run {
                 current_branch: true,
+                no_auto_stash: false,
             },
         );
         let std_cmd = cmd.as_std();
@@ -772,6 +785,7 @@ mod tests {
             "my-plan",
             StreamMode::Run {
                 current_branch: false,
+                no_auto_stash: false,
             },
         );
         let std_cmd = cmd.as_std();
@@ -780,8 +794,75 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(!args.contains(&"--current-branch".to_string()));
+        assert!(!args.contains(&"--no-auto-stash".to_string()));
         // slug is still the final arg
         assert_eq!(args.last().map(String::as_str), Some("my-plan"));
+    }
+
+    /// `--no-auto-stash` is a behavior knob threaded through to the spawned
+    /// runner — when set, the streaming command emits the flag after
+    /// `--current-branch` (if present) and before the slug.
+    #[test]
+    fn test_build_streaming_run_command_with_no_auto_stash() {
+        let cmd = build_streaming_run_command(
+            Path::new("/usr/bin/ralph"),
+            Path::new("/proj"),
+            "my-plan",
+            StreamMode::Run {
+                current_branch: false,
+                no_auto_stash: true,
+            },
+        );
+        let std_cmd = cmd.as_std();
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-C".to_string(),
+                "/proj".to_string(),
+                "--non-interactive".to_string(),
+                "--json".to_string(),
+                "run".to_string(),
+                "--no-auto-stash".to_string(),
+                "my-plan".to_string(),
+            ]
+        );
+    }
+
+    /// Both behavior knobs together: `--current-branch` precedes
+    /// `--no-auto-stash`, both precede the slug.
+    #[test]
+    fn test_build_streaming_run_command_with_both_flags() {
+        let cmd = build_streaming_run_command(
+            Path::new("/usr/bin/ralph"),
+            Path::new("/proj"),
+            "my-plan",
+            StreamMode::Run {
+                current_branch: true,
+                no_auto_stash: true,
+            },
+        );
+        let std_cmd = cmd.as_std();
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-C".to_string(),
+                "/proj".to_string(),
+                "--non-interactive".to_string(),
+                "--json".to_string(),
+                "run".to_string(),
+                "--current-branch".to_string(),
+                "--no-auto-stash".to_string(),
+                "my-plan".to_string(),
+            ]
+        );
     }
 
     /// Resume streaming spawns `ralph resume <slug>` with `--non-interactive
