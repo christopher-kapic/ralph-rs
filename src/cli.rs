@@ -25,8 +25,7 @@ pub(crate) const AUTHORING_TIP_COMMITS: &str = "Authoring tip:\n  \
     version,
     about,
     long_about = None,
-    after_help = "Note: ralph owns commits — step descriptions should not run `git commit`. \
-                  See `ralph plan create --help` or `ralph step add --help` for details."
+    after_help = AUTHORING_TIP_COMMITS,
 )]
 pub struct Cli {
     /// Path to the project directory (defaults to current directory).

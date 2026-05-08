@@ -41,6 +41,17 @@ pub enum PromptInputMode {
     TempFile,
 }
 
+impl std::fmt::Display for PromptInputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            PromptInputMode::Stdin => "stdin",
+            PromptInputMode::Argv => "argv",
+            PromptInputMode::TempFile => "tempfile",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Configuration for a single coding agent harness.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HarnessConfig {
@@ -691,6 +702,35 @@ impl Default for Config {
     }
 }
 
+/// True when this harness invokes `codex exec` — the non-interactive code
+/// path that needs an explicit `--sandbox`. Shared by `harness_footguns` and
+/// `harness_safety_summary` so the two surfaces can't drift on what counts
+/// as "this is the codex case".
+fn is_codex_exec_args(hc: &HarnessConfig) -> bool {
+    hc.command == "codex" && hc.args.iter().any(|a| a == "exec")
+}
+
+/// True when this harness invokes `claude -p` — the non-interactive code
+/// path that needs an explicit `--permission-mode`. See `is_codex_exec_args`
+/// for why this is shared.
+fn is_claude_print_args(hc: &HarnessConfig) -> bool {
+    hc.command == "claude" && hc.args.iter().any(|a| a == "-p")
+}
+
+/// Look up the value following a flag in `args`. Returns `Some(value)` when
+/// the flag appears and is followed by another arg; `None` when the flag is
+/// absent or trails the vec. Linear scan — args lists are tiny (<10 items)
+/// so a HashMap would be heavier than the lookup it replaces.
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        if a == flag {
+            return iter.next().map(String::as_str);
+        }
+    }
+    None
+}
+
 /// Inspect a harness's `args` for known foot-guns — invocation flags that
 /// people commonly forget but which silently break `ralph run`. Returns one
 /// short warning string per issue, suitable for surfacing through
@@ -712,8 +752,7 @@ impl Default for Config {
 pub fn harness_footguns(name: &str, hc: &HarnessConfig) -> Vec<String> {
     let mut issues = Vec::new();
 
-    let is_codex_exec = hc.command == "codex" && hc.args.iter().any(|a| a == "exec");
-    if is_codex_exec && !hc.args.iter().any(|a| a == "--sandbox") {
+    if is_codex_exec_args(hc) && !hc.args.iter().any(|a| a == "--sandbox") {
         issues.push(format!(
             "harness `{name}` invokes `codex exec` without `--sandbox`. \
              Codex defaults to read-only when no sandbox is specified, so \
@@ -724,8 +763,7 @@ pub fn harness_footguns(name: &str, hc: &HarnessConfig) -> Vec<String> {
         ));
     }
 
-    let is_claude_print = hc.command == "claude" && hc.args.iter().any(|a| a == "-p");
-    if is_claude_print && !hc.args.iter().any(|a| a == "--permission-mode") {
+    if is_claude_print_args(hc) && !hc.args.iter().any(|a| a == "--permission-mode") {
         issues.push(format!(
             "harness `{name}` invokes `claude -p` without `--permission-mode`. \
              Claude will block on interactive approval prompts in non-interactive \
@@ -743,25 +781,15 @@ pub fn harness_footguns(name: &str, hc: &HarnessConfig) -> Vec<String> {
 /// `bypassPermissions`, etc.). Returns "no-sandbox!" or similar when a
 /// known foot-gun is present, so the table itself surfaces the issue.
 pub fn harness_safety_summary(hc: &HarnessConfig) -> String {
-    if hc.command == "codex" && hc.args.iter().any(|a| a == "exec") {
-        // Look for `--sandbox <value>` and report the value.
-        let mut iter = hc.args.iter();
-        while let Some(a) = iter.next() {
-            if a == "--sandbox" {
-                return iter.next().cloned().unwrap_or_else(|| "<missing>".into());
-            }
-        }
-        return "no-sandbox!".to_string();
+    if is_codex_exec_args(hc) {
+        return flag_value(&hc.args, "--sandbox")
+            .map(str::to_string)
+            .unwrap_or_else(|| "no-sandbox!".to_string());
     }
-    if hc.command == "claude" && hc.args.iter().any(|a| a == "-p") {
-        // Look for `--permission-mode <value>`.
-        let mut iter = hc.args.iter();
-        while let Some(a) = iter.next() {
-            if a == "--permission-mode" {
-                return iter.next().cloned().unwrap_or_else(|| "<missing>".into());
-            }
-        }
-        return "no-permission-mode!".to_string();
+    if is_claude_print_args(hc) {
+        return flag_value(&hc.args, "--permission-mode")
+            .map(str::to_string)
+            .unwrap_or_else(|| "no-permission-mode!".to_string());
     }
     "—".to_string()
 }
@@ -1135,6 +1163,22 @@ mod tests {
         assert!(
             issues[0].contains("--sandbox"),
             "warning should mention --sandbox: {issues:?}"
+        );
+    }
+
+    /// Regression guard: codex-orchestrator ships `--sandbox danger-full-access`,
+    /// which is a different value but still satisfies the "must have --sandbox"
+    /// rule. If a future footgun rule mistakenly flags any non-`workspace-write`
+    /// sandbox, this catches it. Pinning the orchestrator separately also
+    /// protects against accidentally extending the rule to "must be
+    /// workspace-write" — orchestrator deliberately needs broader access.
+    #[test]
+    fn test_footguns_codex_orchestrator_is_clean() {
+        let hc = Config::default().harnesses["codex-orchestrator"].clone();
+        let issues = harness_footguns("codex-orchestrator", &hc);
+        assert!(
+            issues.is_empty(),
+            "codex-orchestrator must not trigger footgun warnings: {issues:?}"
         );
     }
 

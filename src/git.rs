@@ -141,27 +141,24 @@ pub fn list_staged_files(workdir: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Re-stage `paths` after a stash pop. Best-effort: ignores files that no
-/// longer exist (the user may have manipulated the worktree mid-run) and
-/// surfaces only catastrophic errors that would prevent the run from
-/// finalising.
+/// Re-stage `paths` after a stash pop. Best-effort: the user's working tree
+/// is already restored at this point, so a `git add` failure (typically a
+/// path that no longer exists because the user reshuffled the worktree
+/// mid-run) is logged and swallowed rather than propagated. The signature
+/// reflects that — there is no error path the caller can act on.
 ///
 /// `git add` accepts globs and pathspec magic; we pass `--` as a sentinel so
 /// the caller's literal paths are interpreted as filenames even if they
 /// happen to start with a dash.
-pub fn restage_files(workdir: &Path, paths: &[String]) -> Result<()> {
+pub fn restage_files(workdir: &Path, paths: &[String]) {
     if paths.is_empty() {
-        return Ok(());
+        return;
     }
     let mut args: Vec<&str> = vec!["add", "--"];
     args.extend(paths.iter().map(String::as_str));
-    // Don't fail the whole teardown on `git add` complaining about a single
-    // missing path; treat add failures as best-effort because the user's
-    // working tree is already restored at this point.
     if let Err(e) = git(workdir, &args) {
         eprintln!("Warning: re-staging files after stash pop failed: {e}");
     }
-    Ok(())
 }
 
 /// Return the unified diff of all current (unstaged + staged) changes.

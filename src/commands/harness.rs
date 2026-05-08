@@ -133,10 +133,7 @@ pub fn harness_show(config: &Config, name: &str, json: bool, out: &OutputContext
     );
     println!("  args:                 {}", format_arg_vec(&hc.args));
     println!("  plan_args:            {}", format_arg_vec(&hc.plan_args));
-    println!(
-        "  prompt_input:         {}",
-        format!("{:?}", hc.prompt_input).to_lowercase()
-    );
+    println!("  prompt_input:         {}", hc.prompt_input);
     println!("  supports_agent_file:  {}", hc.supports_agent_file);
     if let Some(env) = &hc.agent_file_env {
         println!("  agent_file_env:       {env}");

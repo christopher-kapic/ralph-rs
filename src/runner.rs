@@ -1329,7 +1329,13 @@ async fn restore_working_tree(workdir: &Path, state: Option<&StashedState>) -> R
                 if !state.staged_files.is_empty() {
                     let workdir_owned = workdir.to_path_buf();
                     let staged_owned = state.staged_files.clone();
-                    blocking_git(move || git::restage_files(&workdir_owned, &staged_owned)).await?;
+                    // restage_files is best-effort and never returns an error;
+                    // wrap with Ok so blocking_git's signature stays uniform.
+                    blocking_git(move || {
+                        git::restage_files(&workdir_owned, &staged_owned);
+                        Ok(())
+                    })
+                    .await?;
                 }
                 if state.staged_files.is_empty() {
                     eprintln!("Restored your uncommitted changes.");
@@ -3213,6 +3219,91 @@ mod tests {
 
         // Nothing was swept; the tree is still dirty.
         assert!(git::has_uncommitted_changes(&dir).unwrap());
+    }
+
+    /// `--current-branch` + a dirty tree must still stash and restore.
+    /// Earlier behavior gated stashing on `!current_branch`, which left the
+    /// agent staring at a dirty tree on its first step. This guards the
+    /// fix: stash always happens (when not dry-run), and teardown pops
+    /// the stash regardless of whether we switched branches.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_current_branch_with_dirty_tree_stashes_and_restores() {
+        use std::fs;
+        use tokio::sync::watch;
+
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+        let starting_branch = git::get_current_branch(&dir).unwrap();
+
+        // Dirty the tree before the run.
+        fs::write(dir.join("scratch.txt"), "wip\n").unwrap();
+        assert!(git::has_uncommitted_changes(&dir).unwrap());
+
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            "demo",
+            &project,
+            "would-be-branch",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+        // One Complete step so run_plan_inner exits cleanly without an
+        // executor; the value-under-test is the stash/teardown wrapper.
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Done",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "demo", &project)
+            .unwrap()
+            .unwrap();
+        let config = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: true,
+            auto_stash: true,
+            ..Default::default()
+        };
+        run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        // We never switched branches.
+        assert_eq!(git::get_current_branch(&dir).unwrap(), starting_branch);
+        // The dirty file came back via stash pop.
+        assert_eq!(
+            fs::read_to_string(dir.join("scratch.txt")).unwrap(),
+            "wip\n",
+            "dirty file must be restored after the run",
+        );
+        assert!(
+            git::has_uncommitted_changes(&dir).unwrap(),
+            "tree should still be dirty (stash was popped, not discarded)",
+        );
+        // No leftover ralph stashes on the stack.
+        assert!(
+            git::find_stash_by_message(&dir, "ralph: auto-stash for plan 'demo'")
+                .unwrap()
+                .is_none(),
+            "ralph's stash entry must be popped at teardown",
+        );
     }
 
     /// Staged files are re-staged after the round trip — `git stash pop`
