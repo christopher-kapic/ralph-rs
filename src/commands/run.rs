@@ -69,6 +69,7 @@ pub fn is_default_run_invocation(args: &RunArgs, stdout_is_tty: bool) -> bool {
         && !args.dry_run
         && !args.skip_preflight
         && !args.force
+        && !args.verbose
         && args.run_harness.is_none()
         && args.cli_harness.is_none()
 }
@@ -2312,6 +2313,16 @@ where
     // [`StreamMode`] selects between the run and resume code paths.
     // Latched to a single shot.
     let mut pending_auto_start = auto_start;
+    if let Some(crate::tui::events::StreamMode::Run {
+        current_branch,
+        no_auto_stash,
+    }) = auto_start
+    {
+        app.set_preferred_run_mode(crate::tui::events::StreamMode::Run {
+            current_branch,
+            no_auto_stash,
+        });
+    }
 
     loop {
         // -- Refresh state from the active source of truth ----------------
@@ -2643,17 +2654,8 @@ where
                 plan_detail_apply_move(conn, &mut app, &step_id, MoveDir::Down)?;
             }
             InputAction::Run => {
-                plan_detail_apply_run_streaming(
-                    conn,
-                    &mut app,
-                    project,
-                    slug,
-                    crate::tui::events::StreamMode::Run {
-                        current_branch: false,
-                        no_auto_stash: false,
-                    },
-                    subscription,
-                )?;
+                let mode = app.preferred_run_mode();
+                plan_detail_apply_run_streaming(conn, &mut app, project, slug, mode, subscription)?;
             }
             InputAction::Stop => {
                 plan_detail_apply_stop(conn, &mut app, project, slug)?;
@@ -6646,17 +6648,15 @@ mod run_dispatch_tests {
     }
 
     #[test]
-    fn verbose_does_not_bypass_tui() {
-        // `--verbose` only controls per-attempt prompt-preview length on
-        // stderr, and the TUI-spawned subprocess runs with
-        // `--non-interactive --json` (its stderr is captured by the events
-        // consumer), so the flag is effectively a no-op in TUI context and
-        // should not opt out of interactivity.
+    fn verbose_bypasses_tui() {
+        // `--verbose` changes CLI stderr behavior, and the TUI path does not
+        // surface that output faithfully, so it must stay on the direct CLI
+        // runner path.
         let args = RunArgs {
             verbose: true,
             ..defaults()
         };
-        assert!(is_default_run_invocation(&args, true));
+        assert!(!is_default_run_invocation(&args, true));
     }
 
     #[test]
@@ -6739,6 +6739,13 @@ mod run_dispatch_tests {
                 "--force",
                 RunArgs {
                     force: true,
+                    ..defaults()
+                },
+            ),
+            (
+                "--verbose",
+                RunArgs {
+                    verbose: true,
                     ..defaults()
                 },
             ),

@@ -115,8 +115,8 @@ pub enum Command {
         #[arg(long, alias = "single", conflicts_with = "all")]
         one: bool,
 
-        /// Run all plans in dependency order (chains plans). Plan slug
-        /// is ignored when set.
+        /// Run all plans in dependency order (chains plans). Conflicts with
+        /// the positional plan slug.
         #[arg(long)]
         all: bool,
 

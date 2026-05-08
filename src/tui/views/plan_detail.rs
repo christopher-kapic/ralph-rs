@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::frac_index::{self, FracIndexError};
 use crate::plan::{Phase, Plan, Step, StepStatus};
 use crate::run_lock::LiveRun;
-use crate::tui::events::{TAIL_BUFFER_LINES, TAIL_VISIBLE_LINES};
+use crate::tui::events::{StreamMode, TAIL_BUFFER_LINES, TAIL_VISIBLE_LINES};
 use crate::tui::help::HelpState;
 use crate::tui::read_only::ReadOnly;
 use crate::tui::selection::Selection;
@@ -152,6 +152,12 @@ pub struct PlanDetailApp {
     /// banner pane and the `A` keybinding that pushes step-detail focused on
     /// the originating step. Refreshed by the dispatcher each poll tick.
     pub open_questions: Vec<crate::storage::OpenQuestion>,
+    /// Preferred plain `ralph run` mode for the `R` keybinding. Defaults to
+    /// the classic branch-creating, auto-stashing flow, but when this view
+    /// was entered via `ralph run --current-branch` and/or
+    /// `--no-auto-stash`, the dispatcher updates it so manual re-runs from
+    /// the same screen keep the user's requested run semantics.
+    preferred_run_mode: StreamMode,
     /// Help-overlay state. `?` toggles visibility; while visible the
     /// dispatcher routes input through [`HelpState::intercept_key`] before
     /// passing keys to the per-view input handler (TUI-plan.md §15).
@@ -207,6 +213,10 @@ impl PlanDetailApp {
             test_tail_scroll: 0,
             read_only: ReadOnly::Editable,
             open_questions: Vec::new(),
+            preferred_run_mode: StreamMode::Run {
+                current_branch: false,
+                no_auto_stash: false,
+            },
             help: HelpState::new(),
             palette_bar: None,
             split_pct: 40,
@@ -229,6 +239,20 @@ impl PlanDetailApp {
     /// Whether the palette bar is currently open and consuming keys.
     pub fn palette_active(&self) -> bool {
         self.palette_bar.is_some()
+    }
+
+    /// Return the preferred plain-run mode for this view's `R` keybinding.
+    pub fn preferred_run_mode(&self) -> StreamMode {
+        self.preferred_run_mode
+    }
+
+    /// Update the preferred plain-run mode when the view is entered from a
+    /// `ralph run` auto-start carrying explicit branch/stash behavior. Resume
+    /// auto-starts do not affect the `R` binding's semantics.
+    pub fn set_preferred_run_mode(&mut self, mode: StreamMode) {
+        if let StreamMode::Run { .. } = mode {
+            self.preferred_run_mode = mode;
+        }
     }
 
     /// Mouse-event entry point routed from the dispatcher's event loop.
@@ -1833,6 +1857,39 @@ mod tests {
         assert_eq!(app.current_phase(), None);
         assert!(app.harness_tail.is_empty());
         assert!(app.test_tail.is_empty());
+    }
+
+    #[test]
+    fn set_preferred_run_mode_updates_r_binding_mode() {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        assert_eq!(
+            app.preferred_run_mode(),
+            crate::tui::events::StreamMode::Run {
+                current_branch: false,
+                no_auto_stash: false,
+            }
+        );
+
+        app.set_preferred_run_mode(crate::tui::events::StreamMode::Run {
+            current_branch: true,
+            no_auto_stash: true,
+        });
+        assert_eq!(
+            app.preferred_run_mode(),
+            crate::tui::events::StreamMode::Run {
+                current_branch: true,
+                no_auto_stash: true,
+            }
+        );
+
+        app.set_preferred_run_mode(crate::tui::events::StreamMode::Resume);
+        assert_eq!(
+            app.preferred_run_mode(),
+            crate::tui::events::StreamMode::Run {
+                current_branch: true,
+                no_auto_stash: true,
+            }
+        );
     }
 
     #[test]
