@@ -101,7 +101,8 @@ pub enum Command {
     /// By default, runs all remaining pending steps in the plan sequentially.
     /// Use --one to run only the next pending step. Use --from/--to to run a
     /// specific range of steps. Use --all to run every plan in dependency order
-    /// (ignores the plan slug). --one and --all are mutually exclusive.
+    /// (conflicts with the positional plan slug). --one and --all are mutually
+    /// exclusive.
     ///
     /// `--one` may be combined with `--from`/`--to`: when both are present, ralph
     /// resolves the step window from `--from`/`--to` and then runs only the first
