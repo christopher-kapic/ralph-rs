@@ -68,8 +68,6 @@ pub fn is_default_run_invocation(args: &RunArgs, stdout_is_tty: bool) -> bool {
         && args.to.is_none()
         && !args.dry_run
         && !args.skip_preflight
-        && !args.current_branch
-        && !args.no_auto_stash
         && !args.force
         && !args.verbose
         && args.run_harness.is_none()
@@ -122,9 +120,6 @@ pub fn dispatch_run(
             anyhow::bail!(
                 "--from/--to cannot be combined with --all (step numbers are per-plan and not comparable across plans)"
             );
-        }
-        if args.plan_slug.is_some() {
-            eprintln!("Warning: plan slug argument is ignored when --all is set.");
         }
 
         // Acquire the per-project run lock so two concurrent `ralph run`
@@ -282,7 +277,8 @@ pub fn run_tui_mode(
         Some(InitialPush::PlanDetail {
             slug,
             auto_start: Some(crate::tui::events::StreamMode::Run {
-                current_branch: false,
+                current_branch: args.current_branch,
+                no_auto_stash: args.no_auto_stash,
             }),
         }),
     )
@@ -2260,6 +2256,20 @@ where
 /// the enclosed [`StreamMode`] so `ralph run` and `ralph resume`
 /// (TUI-plan.md §2) both land in plan-detail with their respective
 /// runner subprocess already kicked off.
+///
+/// Latches the run-mode flags (`--current-branch`, `--no-auto-stash`)
+/// from a `ralph run` auto-start onto the App so the `R` keybinding's
+/// manual re-runs preserve the user's invocation intent. Resume
+/// auto-starts and `None` are no-ops.
+fn plan_detail_init_preferred_run_mode(
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    auto_start: Option<crate::tui::events::StreamMode>,
+) {
+    if let Some(mode @ crate::tui::events::StreamMode::Run { .. }) = auto_start {
+        app.set_preferred_run_mode(mode);
+    }
+}
+
 fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
@@ -2317,6 +2327,7 @@ where
     // [`StreamMode`] selects between the run and resume code paths.
     // Latched to a single shot.
     let mut pending_auto_start = auto_start;
+    plan_detail_init_preferred_run_mode(&mut app, auto_start);
 
     loop {
         // -- Refresh state from the active source of truth ----------------
@@ -2648,16 +2659,8 @@ where
                 plan_detail_apply_move(conn, &mut app, &step_id, MoveDir::Down)?;
             }
             InputAction::Run => {
-                plan_detail_apply_run_streaming(
-                    conn,
-                    &mut app,
-                    project,
-                    slug,
-                    crate::tui::events::StreamMode::Run {
-                        current_branch: false,
-                    },
-                    subscription,
-                )?;
+                let mode = app.preferred_run_mode();
+                plan_detail_apply_run_streaming(conn, &mut app, project, slug, mode, subscription)?;
             }
             InputAction::Stop => {
                 plan_detail_apply_stop(conn, &mut app, project, slug)?;
@@ -6626,6 +6629,45 @@ mod run_dispatch_tests {
     }
 
     #[test]
+    fn current_branch_does_not_bypass_tui() {
+        // `--current-branch` is a behavior modifier, not an opt-out from
+        // interactivity — the TUI's auto-start path threads it through to
+        // the spawned runner via `StreamMode::Run { current_branch }`.
+        let args = RunArgs {
+            current_branch: true,
+            ..defaults()
+        };
+        assert!(is_default_run_invocation(&args, true));
+    }
+
+    #[test]
+    fn no_auto_stash_does_not_bypass_tui() {
+        // `--no-auto-stash` is a behavior modifier, not an opt-out from
+        // interactivity — the TUI's auto-start path threads it through to
+        // the spawned runner via `StreamMode::Run { no_auto_stash }`.
+        let args = RunArgs {
+            no_auto_stash: true,
+            ..defaults()
+        };
+        assert!(is_default_run_invocation(&args, true));
+    }
+
+    #[test]
+    fn verbose_bypasses_tui() {
+        // `--verbose` is an explicit user request to see the full prompt
+        // preview on stderr. The TUI's spawned subprocess runs with `--json`,
+        // which routes the preview through NDJSON `PromptPrepared` events
+        // instead — so the verbose stderr output the user asked for would
+        // never reach them. Honor the intent by staying on the direct CLI
+        // runner path.
+        let args = RunArgs {
+            verbose: true,
+            ..defaults()
+        };
+        assert!(!is_default_run_invocation(&args, true));
+    }
+
+    #[test]
     fn non_tty_stdout_bypasses_tui() {
         // Piping to `tee` (or any non-TTY) must keep today's runner path.
         assert!(!is_default_run_invocation(&defaults(), false));
@@ -6702,20 +6744,6 @@ mod run_dispatch_tests {
                 },
             ),
             (
-                "--current-branch",
-                RunArgs {
-                    current_branch: true,
-                    ..defaults()
-                },
-            ),
-            (
-                "--no-auto-stash",
-                RunArgs {
-                    no_auto_stash: true,
-                    ..defaults()
-                },
-            ),
-            (
                 "--force",
                 RunArgs {
                     force: true,
@@ -6753,6 +6781,83 @@ mod run_dispatch_tests {
             ..defaults()
         };
         assert!(!is_default_run_invocation(&global_only, true));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan-detail auto-start → preferred-run-mode wiring (TUI-plan.md §2)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod plan_detail_init_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::plan::{Plan, PlanStatus, Step};
+    use crate::tui::events::StreamMode;
+    use crate::tui::views::plan_detail::PlanDetailApp;
+    use chrono::Utc;
+
+    fn make_plan() -> Plan {
+        Plan {
+            id: "p1".to_string(),
+            slug: "demo".to_string(),
+            project: "/tmp/proj".to_string(),
+            branch_name: "feat/test".to_string(),
+            description: "A test plan".to_string(),
+            status: PlanStatus::InProgress,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            prompt_prefix: None,
+            prompt_suffix: None,
+            context_prepend: None,
+            questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
+        }
+    }
+
+    fn make_app() -> PlanDetailApp {
+        PlanDetailApp::new(make_plan(), Vec::<Step>::new(), &Config::default())
+    }
+
+    #[test]
+    fn auto_start_run_latches_flags_onto_app() {
+        let mut app = make_app();
+        plan_detail_init_preferred_run_mode(
+            &mut app,
+            Some(StreamMode::Run {
+                current_branch: true,
+                no_auto_stash: true,
+            }),
+        );
+        assert_eq!(
+            app.preferred_run_mode(),
+            StreamMode::Run {
+                current_branch: true,
+                no_auto_stash: true,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_start_resume_does_not_disturb_default_run_mode() {
+        let mut app = make_app();
+        let before = app.preferred_run_mode();
+        plan_detail_init_preferred_run_mode(&mut app, Some(StreamMode::Resume));
+        assert_eq!(app.preferred_run_mode(), before);
+    }
+
+    #[test]
+    fn no_auto_start_leaves_default_run_mode() {
+        let mut app = make_app();
+        let before = app.preferred_run_mode();
+        plan_detail_init_preferred_run_mode(&mut app, None);
+        assert_eq!(app.preferred_run_mode(), before);
     }
 }
 

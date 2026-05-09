@@ -101,17 +101,23 @@ pub enum Command {
     /// By default, runs all remaining pending steps in the plan sequentially.
     /// Use --one to run only the next pending step. Use --from/--to to run a
     /// specific range of steps. Use --all to run every plan in dependency order
-    /// (ignores the plan slug). --one and --all are mutually exclusive.
+    /// (conflicts with the positional plan slug). --one and --all are mutually
+    /// exclusive.
+    ///
+    /// `--one` may be combined with `--from`/`--to`: when both are present, ralph
+    /// resolves the step window from `--from`/`--to` and then runs only the first
+    /// actionable step inside it. `--one` is still mutually exclusive with `--all`.
     Run {
         /// Plan slug to run. Defaults to the active plan.
+        #[arg(conflicts_with = "all")]
         plan: Option<String>,
 
         /// Run only the next pending step instead of all remaining.
         #[arg(long, alias = "single", conflicts_with = "all")]
         one: bool,
 
-        /// Run all plans in dependency order (chains plans). Plan slug
-        /// is ignored when set.
+        /// Run all plans in dependency order (chains plans). Conflicts with
+        /// the positional plan slug.
         #[arg(long)]
         all: bool,
 
@@ -715,7 +721,13 @@ pub enum StepCommand {
         #[arg(long = "criteria")]
         criteria: Vec<String>,
 
-        /// New max retries override. Pass 0 to clear (sets to plan/global default).
+        /// Explicitly clear all acceptance criteria on the step (mirrors --clear-tags).
+        #[arg(long, conflicts_with = "criteria")]
+        clear_criteria: bool,
+
+        /// New max retries override. Stores the value as-is — `--max-retries 0` means
+        /// zero retries (the step is final on its first failed attempt). To fall back
+        /// to the plan/global default instead, use `--clear-max-retries`.
         #[arg(long)]
         max_retries: Option<i32>,
 
@@ -1340,13 +1352,24 @@ mod tests {
 
     #[test]
     fn test_parse_run() {
-        let cli = Cli::try_parse_from(["ralph-rs", "run", "my-feature", "--all"]).unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "run", "my-feature"]).unwrap();
         if let Command::Run { plan, all, .. } = cli.command.unwrap() {
             assert_eq!(plan.as_deref(), Some("my-feature"));
-            assert!(all);
+            assert!(!all);
         } else {
             panic!("Expected Run");
         }
+    }
+
+    #[test]
+    fn test_parse_run_all_with_slug_conflicts() {
+        // A positional plan slug paired with --all is ambiguous (the slug
+        // would be silently ignored), so clap must reject the combination.
+        let result = Cli::try_parse_from(["ralph-rs", "run", "my-plan", "--all"]);
+        assert!(
+            result.is_err(),
+            "clap must reject a plan slug combined with --all"
+        );
     }
 
     #[test]

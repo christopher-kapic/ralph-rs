@@ -418,6 +418,7 @@ pub fn step_edit(
     harness: Option<&str>,
     model: Option<&str>,
     criteria: &[String],
+    clear_criteria: bool,
     max_retries: Option<i32>,
     clear_max_retries: bool,
     change_policy: Option<ChangePolicy>,
@@ -436,6 +437,7 @@ pub fn step_edit(
         && harness.is_none()
         && model.is_none()
         && criteria.is_empty()
+        && !clear_criteria
         && max_retries.is_none()
         && !clear_max_retries
         && change_policy.is_none()
@@ -443,7 +445,7 @@ pub fn step_edit(
         && !clear_tags
     {
         bail!(
-            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --max-retries, --clear-max-retries, --change-policy, --tag, or --clear-tags"
+            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --clear-criteria, --max-retries, --clear-max-retries, --change-policy, --tag, or --clear-tags"
         );
     }
 
@@ -481,6 +483,17 @@ pub fn step_edit(
         None
     };
 
+    // Criteria: `--clear-criteria` substitutes an empty list, any `--criteria`
+    // invocation replaces the existing list, otherwise leave criteria
+    // untouched. Mirrors the tags handling above.
+    let criteria_update: Option<&[String]> = if clear_criteria {
+        Some(&[])
+    } else if !criteria.is_empty() {
+        Some(criteria)
+    } else {
+        None
+    };
+
     storage::update_step_fields_ext(
         conn,
         &step.id,
@@ -488,11 +501,7 @@ pub fn step_edit(
         description,
         agent_update,
         harness_update,
-        if criteria.is_empty() {
-            None
-        } else {
-            Some(criteria)
-        },
+        criteria_update,
         retries_update,
         model_update,
         change_policy,
@@ -1085,6 +1094,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
             None,
             false,
             None,
@@ -1119,6 +1129,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
             None,
             false,
             None,
@@ -1130,6 +1141,62 @@ mod tests {
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert!(steps[0].tags.is_empty());
+    }
+
+    #[test]
+    fn test_step_edit_clear_criteria() {
+        let (conn, project) = setup_with_plan();
+        let initial_criteria = vec!["tests pass".to_string(), "lint clean".to_string()];
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "with criteria",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &initial_criteria,
+            None,
+            None,
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+
+        // Sanity: the step really started with criteria.
+        let before = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(before[0].acceptance_criteria, initial_criteria);
+
+        step_edit(
+            &conn,
+            "bulk-plan",
+            &project,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            true, // clear_criteria
+            None,
+            false,
+            None,
+            &[],
+            false,
+            &test_out(),
+        )
+        .unwrap();
+
+        let after = storage::list_steps(&conn, &plan.id).unwrap();
+        assert!(after[0].acceptance_criteria.is_empty());
     }
 
     #[test]
@@ -1155,6 +1222,7 @@ mod tests {
             None,
             None,
             &[],
+            false,
             None,
             false,
             None,
