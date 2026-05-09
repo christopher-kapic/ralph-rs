@@ -180,6 +180,26 @@ ralph completions <shell>
 
 Global flags: `--project <path>` (`-C`), `--harness <name>`, `--json`, `--quiet`, `--no-color`
 
+## Plan-generation prompt parity
+
+There are **two** documents that teach an AI agent how to author a ralph plan,
+and they must stay in lockstep:
+
+- `.claude/skills/create-ralph/SKILL.md` — the slash-command skill, used when a
+  user runs `/create-ralph` inside Claude Code.
+- `HARNESS_PLAN_AGENT_BASE` in `src/plan_harness.rs` — the system prompt sent
+  to a coding harness spawned by `ralph plan harness generate`.
+
+Both teach the same workflow, anti-patterns, and CLI surface. If you change
+one, change the other in the same PR. Drift means the same user gets
+materially worse plans depending on which entry point they use.
+
+The harness prompt should not reference Claude-Code-specific things
+(`$ARGUMENTS`, `allowed-tools`, frontmatter); the skill should not duplicate
+the runtime hook-library injection that `render_plan_agent` does. Everything
+else — preflight, recommended shape, authoring (`--import-json` warning),
+review steps, anti-patterns, CLI flags — should match in substance.
+
 ## Build & Test
 
 ```bash
