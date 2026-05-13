@@ -141,6 +141,24 @@ pub fn record_source_branch_and_stash(
     Ok(())
 }
 
+/// True when a `run_locks` row exists for `project` whose `parent_tui_pid`
+/// matches `my_pid` — i.e. a runner subprocess started from this TUI session
+/// is currently holding the lock. Used by the TUI exit path to confirm
+/// before quitting and orphaning the runner.
+///
+/// Mirrors the inverse of [`crate::tui::read_only::detect`]: that function
+/// returns `Editable` precisely when *this TUI* owns the run.
+pub fn tui_owns_live_run(conn: &Connection, project: &str, my_pid: i64) -> Result<bool> {
+    let parent: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT parent_tui_pid FROM run_locks WHERE project = ?1",
+            params![project],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(matches!(parent, Some(Some(p)) if p == my_pid))
+}
+
 type ReleaseFn = Box<dyn FnOnce(&str) -> Result<()> + Send>;
 
 /// RAII guard that releases a run-lock row when dropped. The release strategy
@@ -1216,5 +1234,70 @@ mod tests {
             matches!(err, rusqlite::Error::FromSqlConversionFailure(_, _, _)),
             "expected FromSqlConversionFailure, got {err:?}"
         );
+    }
+
+    // -- tui_owns_live_run -----------------------------------------------
+
+    #[test]
+    fn tui_owns_live_run_false_when_no_row() {
+        let conn = mem_db();
+        assert!(!tui_owns_live_run(&conn, "/proj-empty", 4242).unwrap());
+    }
+
+    #[test]
+    fn tui_owns_live_run_true_when_parent_tui_pid_matches() {
+        let conn = mem_db();
+        let my_pid: i64 = 4242;
+        let runner_pid: i64 = 9999;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug, parent_tui_pid)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["/proj-owned", runner_pid, "p1", "feat", my_pid],
+        )
+        .unwrap();
+        assert!(tui_owns_live_run(&conn, "/proj-owned", my_pid).unwrap());
+    }
+
+    #[test]
+    fn tui_owns_live_run_false_when_parent_tui_pid_is_other_tui() {
+        let conn = mem_db();
+        let my_pid: i64 = 1;
+        let other_tui: i64 = 2000;
+        let runner_pid: i64 = 88;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug, parent_tui_pid)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["/proj-other-tui", runner_pid, "p1", "feat", other_tui],
+        )
+        .unwrap();
+        assert!(!tui_owns_live_run(&conn, "/proj-other-tui", my_pid).unwrap());
+    }
+
+    #[test]
+    fn tui_owns_live_run_false_when_parent_tui_pid_is_null() {
+        // Pre-V17 rows and runs not spawned by any TUI both produce NULL
+        // `parent_tui_pid` — the TUI must not falsely claim ownership.
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug)
+             VALUES (?1, ?2, ?3, ?4)",
+            params!["/proj-null-parent", 77i64, "p1", "feat"],
+        )
+        .unwrap();
+        assert!(!tui_owns_live_run(&conn, "/proj-null-parent", 1).unwrap());
+    }
+
+    #[test]
+    fn tui_owns_live_run_only_inspects_requested_project() {
+        let conn = mem_db();
+        let my_pid: i64 = 4242;
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug, parent_tui_pid)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["/proj-other", 88i64, "p1", "feat", my_pid],
+        )
+        .unwrap();
+        // Querying a different project's row must not report ownership.
+        assert!(!tui_owns_live_run(&conn, "/proj-mine", my_pid).unwrap());
     }
 }

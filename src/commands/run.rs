@@ -812,6 +812,24 @@ pub fn run_plan_list_tui(
                 }
             }
             if app.should_quit {
+                // If this TUI session owns a live runner subprocess
+                // (lock row's `parent_tui_pid` matches our pid),
+                // confirm before exiting so the user doesn't orphan
+                // the run by accident. DB errors fail-open — we never
+                // want to trap the user inside the TUI.
+                let owns = crate::run_lock::tui_owns_live_run(conn, project, my_pid)
+                    .unwrap_or(false);
+                if owns {
+                    let confirm = dialog::Confirm {
+                        title: "Run in progress",
+                        body: "There is currently a plan running. Are you sure you want to exit?",
+                        default: false,
+                    };
+                    if !confirm_with_background(&mut terminal, &mut app, &confirm)? {
+                        app.should_quit = false;
+                        continue;
+                    }
+                }
                 return Ok(());
             }
         }
