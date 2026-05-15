@@ -59,13 +59,14 @@ src/
     theme.rs           — Color tokens (truecolor `Color::Rgb` constants)
     toast.rs           — Transient bottom-row message bar with TTL
     dialog.rs          — Confirm-dialog primitive (yes/no over a background view)
+    choice.rs          — Generic single-select dialog primitive (vertical j/k/↑/↓ list, Enter/Esc)
     editor.rs          — `$EDITOR` handoff (round-trip text through a tempfile)
     events.rs          — NDJSON `RunEvent` subscription wiring (TUI → runner subprocess)
     help.rs            — `?` help overlay (per-view binding model + render)
     palette.rs         — `/` / `:` slash-command parser + tab completion
     palette_dispatch.rs — Maps parsed palette commands to per-view actions
     read_only.rs       — Read-only attach state when an external runner holds the lock
-    run_dialog.rs      — `/run` 3-button branch-choice dialog
+    run_dialog.rs      — `/run` branch-choice dialog (consumes `choice.rs`) + naming phase
     selection.rs       — Multi-selection state (with `[N]` badge ordering)
     views/
       plan_list.rs     — Landing screen: tile per plan, sort by recency

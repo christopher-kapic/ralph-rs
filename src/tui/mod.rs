@@ -5,6 +5,7 @@
 // graceful shutdown — as the interactive counterpart to the non-interactive
 // runner.
 
+pub mod choice;
 pub mod chrome;
 pub mod dialog;
 pub mod editor;
