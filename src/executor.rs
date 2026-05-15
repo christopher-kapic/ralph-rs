@@ -2604,6 +2604,7 @@ mod tests {
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
                 prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -2739,6 +2740,7 @@ mod tests {
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
                 prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -2856,6 +2858,7 @@ mod tests {
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
                 prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -2970,6 +2973,7 @@ mod tests {
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
                 prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -3113,6 +3117,7 @@ mod tests {
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
                 prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -3279,6 +3284,7 @@ mod tests {
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
                 prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -3373,6 +3379,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         }
     }
@@ -4724,6 +4731,7 @@ mod tests {
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
                 prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );

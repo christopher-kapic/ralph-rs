@@ -8,7 +8,7 @@ use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::config::{Config, HarnessConfig, PromptInputMode};
+use crate::config::{ArgvOverflowBehavior, Config, HarnessConfig, PromptInputMode};
 use crate::plan::{Plan, Step};
 
 /// Placeholder token in harness args that gets replaced with the actual prompt.
@@ -204,19 +204,54 @@ pub fn prepare_harness_invocation(
         remove_agent_file_args(&mut args);
     }
 
-    // Decide the effective delivery mode. Argv auto-spills to TempFile
-    // past the threshold so a retry-context-bloated prompt doesn't trip
-    // E2BIG on the kernel.
+    // Decide the effective delivery mode. Argv-mode invocations consult
+    // `argv_overflow` past the threshold so a retry-context-bloated prompt
+    // doesn't trip E2BIG on the kernel AND so harnesses without a working
+    // file/stdin fallback (e.g. copilot per github/copilot-cli#1046) fail
+    // loudly instead of silently feeding the harness a tempfile path
+    // it'll read as the literal prompt text.
     let mode = match harness_config.prompt_input {
         PromptInputMode::Argv if prompt.len() > ARGV_SPILL_THRESHOLD_BYTES => {
-            eprintln!(
-                "ralph: warning: prompt is {} bytes (>{} KB threshold); \
-                 spilling to temp file to avoid E2BIG on argv-mode harness '{}'.",
-                prompt.len(),
-                ARGV_SPILL_THRESHOLD_BYTES / 1024,
-                harness_name,
-            );
-            PromptInputMode::TempFile
+            match harness_config.argv_overflow {
+                ArgvOverflowBehavior::SpillToTempFile => {
+                    eprintln!(
+                        "ralph: warning: prompt is {} bytes (>{} KB threshold); \
+                         spilling to temp file to avoid E2BIG on argv-mode harness '{}'.",
+                        prompt.len(),
+                        ARGV_SPILL_THRESHOLD_BYTES / 1024,
+                        harness_name,
+                    );
+                    PromptInputMode::TempFile
+                }
+                ArgvOverflowBehavior::SpillToStdin => {
+                    eprintln!(
+                        "ralph: warning: prompt is {} bytes (>{} KB threshold); \
+                         spilling to stdin to avoid E2BIG on argv-mode harness '{}'.",
+                        prompt.len(),
+                        ARGV_SPILL_THRESHOLD_BYTES / 1024,
+                        harness_name,
+                    );
+                    PromptInputMode::Stdin
+                }
+                ArgvOverflowBehavior::Error => {
+                    anyhow::bail!(
+                        "harness '{harness}' accepts prompts only as inline argv \
+                         text and the prompt is {bytes} bytes ({kb} KB), past the \
+                         {limit_kb} KB safety threshold for the {arg_strlen_kb} KB \
+                         Linux argv ceiling (MAX_ARG_STRLEN). The harness has no \
+                         file-path or stdin fallback (argv_overflow: error in \
+                         config), so spilling would produce a broken invocation. \
+                         Reduce the prompt size — e.g. shorten plan/step context, \
+                         drop retry history, or split the step into smaller units \
+                         — or switch to a harness that supports stdin/file delivery.",
+                        harness = harness_name,
+                        bytes = prompt.len(),
+                        kb = prompt.len() / 1024,
+                        limit_kb = ARGV_SPILL_THRESHOLD_BYTES / 1024,
+                        arg_strlen_kb = 128,
+                    );
+                }
+            }
         }
         other => other,
     };
@@ -660,6 +695,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
 
@@ -683,6 +719,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
 
@@ -720,6 +757,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
 
@@ -958,6 +996,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
 
@@ -984,6 +1023,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
 
@@ -1039,6 +1079,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
 
@@ -1066,6 +1107,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
 
@@ -1094,6 +1136,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: mode,
+            argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         }
     }
@@ -1228,6 +1271,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: PromptInputMode::Stdin,
+            argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
         let prompt_bytes = b"line one\nline two\n".to_vec();
@@ -1249,5 +1293,103 @@ mod tests {
         assert_eq!(written, prompt_bytes);
         // Best-effort cleanup — ignore if the child already removed it.
         let _ = std::fs::remove_file(&out_path);
+    }
+
+    // -----------------------------------------------------------------
+    // argv_overflow behavior (copilot fix regression tests)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_argv_overflow_error_aborts_large_prompt() {
+        // A harness configured with argv_overflow=Error must NOT spill —
+        // it must return a hard error naming the harness and prompt size.
+        // This is the copilot case: spilling to a tempfile would feed
+        // copilot a path-as-prompt and silently break the run.
+        let mut hc = hc_with_mode(PromptInputMode::Argv, vec!["-p", "{prompt}"]);
+        hc.argv_overflow = ArgvOverflowBehavior::Error;
+        let big_prompt = "x".repeat(100 * 1024);
+
+        let result = prepare_harness_invocation("copilot", &hc, &big_prompt, None, None);
+        let err = result.expect_err("argv_overflow=Error must abort, not spill");
+        let msg = format!("{err}");
+
+        // The error must be actionable: it must name the harness and
+        // explain the constraint so the user knows what to do.
+        assert!(msg.contains("copilot"), "error must name harness: {msg}");
+        assert!(
+            msg.contains("inline argv") || msg.contains("argv_overflow"),
+            "error must explain the constraint: {msg}"
+        );
+        assert!(
+            msg.contains("Reduce") || msg.contains("smaller") || msg.contains("split"),
+            "error must suggest remediation: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_argv_overflow_error_allows_small_prompts() {
+        // argv_overflow=Error only fires past the threshold. Normal-sized
+        // prompts must continue to work — the copilot default must not
+        // regress against typical usage.
+        let mut hc = hc_with_mode(PromptInputMode::Argv, vec!["-p", "{prompt}"]);
+        hc.argv_overflow = ArgvOverflowBehavior::Error;
+
+        let (args, delivery) =
+            prepare_harness_invocation("copilot", &hc, "regular prompt", None, None).unwrap();
+        assert_eq!(args, vec!["-p".to_string(), "regular prompt".to_string()]);
+        assert!(matches!(delivery, PromptDelivery::Argv));
+    }
+
+    #[test]
+    fn test_argv_overflow_spill_to_stdin() {
+        // Verify the SpillToStdin variant: large prompt produces an args
+        // vector with the `{prompt}` placeholder stripped and the prompt
+        // delivered through PromptDelivery::Stdin.
+        let mut hc = hc_with_mode(PromptInputMode::Argv, vec!["-p", "{prompt}"]);
+        hc.argv_overflow = ArgvOverflowBehavior::SpillToStdin;
+        let big_prompt = "y".repeat(100 * 1024);
+
+        let (args, delivery) =
+            prepare_harness_invocation("test", &hc, &big_prompt, None, None).unwrap();
+        assert!(
+            !args.iter().any(|a| a.contains("{prompt}")),
+            "placeholder must be stripped in stdin mode: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.len() > ARGV_SPILL_THRESHOLD_BYTES),
+            "large prompt leaked into argv: {args:?}"
+        );
+        match delivery {
+            PromptDelivery::Stdin(bytes) => {
+                assert_eq!(bytes.len(), big_prompt.len());
+                assert_eq!(bytes, big_prompt.as_bytes());
+            }
+            other => panic!("expected Stdin delivery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_copilot_argv_mode_forwards_model_flag() {
+        // Regression for the agent's request #5: with the default copilot
+        // harness (prompt_input=Argv, model_args=["--model={model}"]),
+        // passing a step-level model override must produce an argv vector
+        // that includes the resolved model flag.
+        let config = crate::config::Config::default();
+        let copilot = config
+            .harnesses
+            .get("copilot")
+            .expect("default config must define copilot");
+
+        let (args, delivery) =
+            prepare_harness_invocation("copilot", copilot, "tiny prompt", None, Some("gpt-5.4"))
+                .unwrap();
+
+        assert!(
+            args.iter().any(|a| a == "--model=gpt-5.4"),
+            "expected --model=gpt-5.4 in argv, got: {args:?}"
+        );
+        // Sanity: the actual prompt text rides inline as argv (no spill).
+        assert!(args.iter().any(|a| a == "tiny prompt"));
+        assert!(matches!(delivery, PromptDelivery::Argv));
     }
 }

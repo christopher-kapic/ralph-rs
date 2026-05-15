@@ -252,8 +252,13 @@ pub fn cmd_init(opts: &InitOptions, out: &OutputContext) -> Result<()> {
     let config_exists = config_path.exists();
 
     if config_exists && !opts.force {
-        eprintln!("{icon} Config exists: {}", config_path.display());
-        eprintln!("  (use --force to regenerate)");
+        // Schema migration: layer built-in harness defaults under the
+        // user's on-disk config and persist if any recognized fields were
+        // added. Explicit values for known config keys are preserved;
+        // unknown JSON keys are outside the closed config schema and are
+        // not preserved when the typed Config is rewritten. `--force` is
+        // reserved for the full default-config rewrite path below.
+        migrate_existing_config(&config_path, out)?;
     } else {
         // Pick the default harness: explicit flag > interactive prompt >
         // first-available fallback > hard default ("claude").
@@ -289,6 +294,95 @@ pub fn cmd_init(opts: &InitOptions, out: &OutputContext) -> Result<()> {
             config_path.display()
         );
     }
+
+    Ok(())
+}
+
+/// Schema migration for an existing on-disk `config.json`: layer in any
+/// recognized fields that are missing from built-in harnesses, persist the
+/// merged typed config, and report each addition so the user can audit.
+/// Never changes a recognized key the user has explicitly set, including
+/// explicitly empty arrays or `null` values — only adds known keys that
+/// aren't present.
+///
+/// Writes via the same tmp-file + rename atomic published in
+/// `Config::save_at`, so concurrent readers never observe a partially
+/// written file and a crash mid-write leaves the original intact.
+fn migrate_existing_config(config_path: &Path, out: &OutputContext) -> Result<()> {
+    use std::fs;
+
+    let icon = output::check_icon(out.color);
+    let warn = output::severity_icon("warning", out.color);
+
+    let contents = fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    let mut raw: serde_json::Value = serde_json::from_str(&contents)
+        .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+
+    let filled = config::layer_builtin_harness_defaults(&mut raw).with_context(|| {
+        format!(
+            "Failed to layer built-in harness defaults for {}",
+            config_path.display()
+        )
+    })?;
+
+    if filled.is_empty() {
+        eprintln!(
+            "{icon} Config up to date: {} (no missing built-in fields)",
+            config_path.display()
+        );
+        return Ok(());
+    }
+
+    // Round-trip through Config to catch any post-merge validation failures
+    // BEFORE persisting. If the user's existing config is broken in a way
+    // that defeat the merge (e.g. invalid timezone), we want to surface
+    // that without overwriting the file.
+    let merged: config::Config = serde_json::from_value(raw.clone()).with_context(|| {
+        format!(
+            "Merged config failed to deserialize for {}",
+            config_path.display()
+        )
+    })?;
+    merged.validate().with_context(|| {
+        format!(
+            "Merged config failed validation for {}",
+            config_path.display()
+        )
+    })?;
+
+    // Persist via the canonical save path so we get the atomic
+    // tmp-file + rename treatment, formatted identically to a fresh
+    // `ralph init`.
+    let dir = config_path
+        .parent()
+        .with_context(|| format!("Config path has no parent: {}", config_path.display()))?;
+    merged.save_at(dir).with_context(|| {
+        format!(
+            "Failed to write merged config back to {}",
+            config_path.display()
+        )
+    })?;
+
+    // Group the report by harness so a config that's missing many fields
+    // doesn't print one line per field.
+    use std::collections::BTreeMap;
+    let mut by_harness: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (harness, field) in &filled {
+        by_harness
+            .entry(harness.clone())
+            .or_default()
+            .push(field.clone());
+    }
+
+    eprintln!(
+        "{warn} Migrated config: filled in {} missing field(s) for built-in harnesses.",
+        filled.len()
+    );
+    for (harness, fields) in &by_harness {
+        eprintln!("    {harness}: {}", fields.join(", "));
+    }
+    eprintln!("  Saved to: {}", config_path.display());
 
     Ok(())
 }
@@ -491,6 +585,92 @@ mod tests {
             quiet: true,
             color: false,
         }
+    }
+
+    // -- init migration ---------------------------------------------------
+
+    #[test]
+    fn test_migrate_existing_config_fills_missing_copilot_fields() {
+        // Simulates a config written by an older ralph that predates the
+        // new fields. `migrate_existing_config` must (a) write the merged
+        // result back atomically and (b) leave the user's explicit args
+        // untouched.
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+
+        let original = r#"{
+            "default_harness": "copilot",
+            "max_retries_per_step": 3,
+            "harnesses": {
+                "copilot": {
+                    "command": "copilot",
+                    "args": ["-p", "{prompt}", "--silent"]
+                }
+            }
+        }"#;
+        fs::write(&path, original).unwrap();
+
+        migrate_existing_config(&path, &test_out()).expect("migration ok");
+
+        // Re-read raw to confirm the merged keys are persisted on disk
+        // (not just in-memory).
+        let contents = fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let copilot = &parsed["harnesses"]["copilot"];
+
+        assert_eq!(
+            copilot["prompt_input"].as_str(),
+            Some("argv"),
+            "prompt_input must be persisted as the built-in default"
+        );
+        assert_eq!(
+            copilot["argv_overflow"].as_str(),
+            Some("error"),
+            "argv_overflow must be persisted as the built-in default"
+        );
+        assert!(
+            copilot["model_args"].is_array(),
+            "model_args must be persisted"
+        );
+        // The user's explicit args must NOT have been clobbered.
+        assert_eq!(
+            copilot["args"][0].as_str(),
+            Some("-p"),
+            "user args preserved"
+        );
+        assert_eq!(
+            copilot["args"][2].as_str(),
+            Some("--silent"),
+            "user args preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn test_migrate_existing_config_no_op_when_complete() {
+        // If the on-disk config is already complete, migration must NOT
+        // rewrite the file (idempotent — no spurious "modified" timestamps).
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+
+        // Write a default config — every field is present.
+        let cfg = crate::config::Config::default();
+        let json = serde_json::to_string_pretty(&cfg).unwrap();
+        fs::write(&path, &json).unwrap();
+
+        let mtime_before = fs::metadata(&path).unwrap().modified().unwrap();
+        // Small sleep so the FS timestamp would visibly change if a write
+        // occurs — most filesystems have ms-level resolution.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        migrate_existing_config(&path, &test_out()).expect("migration ok");
+
+        let mtime_after = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "migration must not rewrite a complete config"
+        );
     }
 
     #[test]
