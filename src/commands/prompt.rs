@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use crate::cli::PromptScope;
 use crate::config::{self, Config};
 use crate::output::{self, OutputContext, OutputFormat};
-use crate::storage;
+use crate::storage::{self, ProjectPromptSource};
 
 /// Serializable view of a single scope's prompt for JSON output.
 #[derive(Debug, serde::Serialize)]
@@ -19,6 +19,10 @@ struct ScopeView<'a> {
     scope: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt: Option<&'a str>,
+    /// Active source for the Project scope: `"file"` or `"db"`. Omitted for
+    /// the Global scope (always config.json).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<&'static str>,
 }
 
 /// Composed (fully-layered) prompt for `--resolved` output.
@@ -37,7 +41,7 @@ pub fn cmd_prompt_show(
     resolved: bool,
     out: &OutputContext,
 ) -> Result<()> {
-    let project_settings = storage::get_project_settings(conn, project)?;
+    let (project_settings, project_source) = storage::resolve_project_prompt(conn, project)?;
 
     if resolved {
         // Compose exactly how build_step_prompt stacks the layers, but
@@ -57,14 +61,21 @@ pub fn cmd_prompt_show(
         return Ok(());
     }
 
+    let project_source_label = match &project_source {
+        ProjectPromptSource::File(_) => "file",
+        ProjectPromptSource::Db => "db",
+    };
+
     let all_views = [
         ScopeView {
             scope: "global",
             prompt: config.prompt.as_deref(),
+            source: None,
         },
         ScopeView {
             scope: "project",
             prompt: project_settings.prompt.as_deref(),
+            source: Some(project_source_label),
         },
     ];
 
@@ -112,7 +123,19 @@ pub fn cmd_prompt_set(
             write_config(&cfg, config_path)?;
         }
         PromptScope::Project => {
-            storage::set_project_prompt(conn, project, value)?;
+            // The checked-in file, when it already exists, is the source of
+            // truth — write through to it so a shared file stays canonical.
+            // Otherwise fall back to the per-machine DB column (solo users
+            // aren't forced onto the file path).
+            let (_, source) = storage::resolve_project_prompt(conn, project)?;
+            match source {
+                ProjectPromptSource::File(_) => {
+                    storage::write_project_prompt_file(project, value.unwrap_or(""))?;
+                }
+                ProjectPromptSource::Db => {
+                    storage::set_project_prompt(conn, project, value)?;
+                }
+            }
         }
     }
 
@@ -139,7 +162,19 @@ pub fn cmd_prompt_clear(
             write_config(&cfg, config_path)?;
         }
         PromptScope::Project => {
-            storage::set_project_prompt(conn, project, None)?;
+            // Delete the file when it's the active source; otherwise clear
+            // the DB row. (If a stale DB value lurks behind a now-deleted
+            // file, a subsequent clear targets the DB on the next call —
+            // matches the read precedence the user sees.)
+            let (_, source) = storage::resolve_project_prompt(conn, project)?;
+            match source {
+                ProjectPromptSource::File(_) => {
+                    storage::delete_project_prompt_file(project)?;
+                }
+                ProjectPromptSource::Db => {
+                    storage::set_project_prompt(conn, project, None)?;
+                }
+            }
         }
     }
 
@@ -161,15 +196,27 @@ fn scope_name(s: PromptScope) -> &'static str {
     }
 }
 
+/// Persist `cfg` to `path` atomically (tmp-file + rename) via the shared
+/// `Config::save_at` helper, so a crash mid-write can't truncate
+/// `config.json`. `path` is always `<config_dir>/config.json`, so its
+/// parent is the directory `save_at` writes into.
 fn write_config(cfg: &Config, path: &std::path::Path) -> Result<()> {
-    let json = serde_json::to_string_pretty(cfg)?;
-    std::fs::write(path, json)
-        .with_context(|| format!("Failed to write config to {}", path.display()))?;
-    Ok(())
+    let dir = path.parent().with_context(|| {
+        format!("Config path {} has no parent directory", path.display())
+    })?;
+    cfg.save_at(dir)
+        .with_context(|| format!("Failed to write config to {}", path.display()))
 }
 
 fn print_scope_plain(view: &ScopeView<'_>) {
-    println!("[{}]", view.scope);
+    match view.source {
+        // Project scope: surface which source is active so users know
+        // whether `prompt set`/`clear` will touch the checked-in file or
+        // the per-machine DB row.
+        Some("file") => println!("[{}] (file: .ralph/prompt.md)", view.scope),
+        Some(_) => println!("[{}] (db)", view.scope),
+        None => println!("[{}]", view.scope),
+    }
     match view.prompt {
         Some(p) => println!("  prompt:\n{}", indent(p, "    ")),
         None => println!("  prompt: <unset>"),
@@ -194,4 +241,131 @@ fn indent(text: &str, prefix: &str) -> String {
         .map(|l| format!("{prefix}{l}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage;
+
+    fn quiet_out() -> OutputContext {
+        OutputContext {
+            format: OutputFormat::Plain,
+            quiet: true,
+            color: false,
+        }
+    }
+
+    /// `prompt set --scope project` writes to the DB when no file exists.
+    #[test]
+    fn project_set_targets_db_when_file_absent() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        let cfg_path = dir.path().join("config.json");
+
+        cmd_prompt_set(
+            &conn,
+            &cfg_path,
+            &project,
+            PromptScope::Project,
+            "db content",
+            &quiet_out(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt
+                .as_deref(),
+            Some("db content")
+        );
+        assert!(storage::read_project_prompt_file(&project).unwrap().is_none());
+    }
+
+    /// `prompt set --scope project` writes through to the file when the
+    /// file already exists (a team's checked-in shared prompt stays canonical).
+    #[test]
+    fn project_set_targets_file_when_file_present() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        let cfg_path = dir.path().join("config.json");
+
+        // File pre-exists with some content → it's the active source.
+        storage::write_project_prompt_file(&project, "original").unwrap();
+
+        cmd_prompt_set(
+            &conn,
+            &cfg_path,
+            &project,
+            PromptScope::Project,
+            "updated via file",
+            &quiet_out(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            storage::read_project_prompt_file(&project).unwrap().as_deref(),
+            Some("updated via file")
+        );
+        // DB column untouched.
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt,
+            None
+        );
+    }
+
+    /// `prompt clear --scope project` deletes the file when the file is
+    /// the active source.
+    #[test]
+    fn project_clear_deletes_file_when_file_active() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        let cfg_path = dir.path().join("config.json");
+
+        storage::write_project_prompt_file(&project, "shared").unwrap();
+
+        cmd_prompt_clear(
+            &conn,
+            &cfg_path,
+            &project,
+            PromptScope::Project,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        assert!(!storage::project_prompt_file_path(&project).exists());
+    }
+
+    /// `prompt clear --scope project` clears the DB row when no file exists.
+    #[test]
+    fn project_clear_clears_db_when_file_absent() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        let cfg_path = dir.path().join("config.json");
+
+        storage::set_project_prompt(&conn, &project, Some("db value")).unwrap();
+
+        cmd_prompt_clear(
+            &conn,
+            &cfg_path,
+            &project,
+            PromptScope::Project,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt,
+            None
+        );
+    }
 }

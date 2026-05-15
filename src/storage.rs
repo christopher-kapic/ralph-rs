@@ -691,19 +691,60 @@ pub fn set_plan_deterministic_tests(
 // Project settings (the Project layer of the four-layer prompt model)
 // ---------------------------------------------------------------------------
 
-/// The project-scope prompt loaded from the `project_settings` table — one
-/// content blob, the Project layer of the four-layer prompt model. `None`
-/// represents "no project-scope prompt configured".
+/// The project-scope prompt — one content blob, the Project layer of the
+/// four-layer prompt model. `None` represents "no project-scope prompt
+/// configured".
+///
+/// The value can be sourced from a checked-in file at
+/// `<project>/.ralph/prompt.md` (so teams can share it via version control)
+/// or from the `project_settings.prompt` DB column (the solo-user default).
+/// **The file wins on read**; see [`resolve_project_prompt`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectSettings {
     pub prompt: Option<String>,
 }
 
-/// Read project-scope settings for `project`. Returns a zero-value struct
-/// when no row exists — callers treat missing rows identically to NULLs.
-pub fn get_project_settings(conn: &Connection, project: &str) -> Result<ProjectSettings> {
-    let mut stmt =
-        conn.prepare("SELECT prompt FROM project_settings WHERE project = ?1")?;
+/// Where a resolved project-scope prompt came from. `prompt set`/`clear`
+/// route their writes by inspecting this so the file, when present, stays
+/// the source of truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectPromptSource {
+    /// Sourced from `<project>/.ralph/prompt.md` (path carried for messaging).
+    File(std::path::PathBuf),
+    /// Sourced from (or destined for) the `project_settings.prompt` column.
+    Db,
+}
+
+/// Path to the optional checked-in project-prompt file for `project`.
+/// `project` is the project workdir (an absolute path string, as produced
+/// by [`crate::commands::resolve_project`]).
+pub fn project_prompt_file_path(project: &str) -> std::path::PathBuf {
+    std::path::Path::new(project)
+        .join(".ralph")
+        .join("prompt.md")
+}
+
+/// Read `<project>/.ralph/prompt.md` if it exists and has non-whitespace
+/// content. An empty / whitespace-only file is treated as "not present" so
+/// an accidentally-blank file can't shadow a valid DB value. Any IO error
+/// other than "missing" is surfaced.
+pub fn read_project_prompt_file(project: &str) -> Result<Option<String>> {
+    let path = project_prompt_file_path(project);
+    match std::fs::read_to_string(&path) {
+        Ok(s) if s.trim().is_empty() => Ok(None),
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => {
+            Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
+        }
+    }
+}
+
+/// Read the DB-only project-scope prompt for `project` (the raw
+/// `project_settings.prompt` column), ignoring any checked-in file. Returns
+/// a zero-value struct when no row exists.
+pub fn get_project_settings_db(conn: &Connection, project: &str) -> Result<ProjectSettings> {
+    let mut stmt = conn.prepare("SELECT prompt FROM project_settings WHERE project = ?1")?;
     let mut rows = stmt.query_map(params![project], |row| {
         Ok(ProjectSettings {
             prompt: row.get(0)?,
@@ -715,7 +756,47 @@ pub fn get_project_settings(conn: &Connection, project: &str) -> Result<ProjectS
     }
 }
 
-/// Upsert the project-scope prompt. Pass `None` to clear the column.
+/// Resolve the effective project-scope prompt for `project`, file-first.
+///
+/// Returns the resolved content (if any) plus which source supplied it.
+/// When the checked-in file has usable content the file wins; otherwise we
+/// fall back to the DB column. The reported source reflects which path is
+/// *active* for writes: if the file exists with content it's [`File`], else
+/// [`Db`] even when both are empty.
+///
+/// [`File`]: ProjectPromptSource::File
+/// [`Db`]: ProjectPromptSource::Db
+pub fn resolve_project_prompt(
+    conn: &Connection,
+    project: &str,
+) -> Result<(ProjectSettings, ProjectPromptSource)> {
+    if let Some(content) = read_project_prompt_file(project)? {
+        let path = project_prompt_file_path(project);
+        return Ok((
+            ProjectSettings {
+                prompt: Some(content),
+            },
+            ProjectPromptSource::File(path),
+        ));
+    }
+    let db = get_project_settings_db(conn, project)?;
+    Ok((db, ProjectPromptSource::Db))
+}
+
+/// Read project-scope settings for `project`, file-first.
+///
+/// This is the central read used by the prompt-assembly path
+/// ([`crate::prompt::build_step_prompt`] callers). It checks
+/// `<project>/.ralph/prompt.md` before the DB column so a checked-in file
+/// transparently overrides per-machine DB state.
+pub fn get_project_settings(conn: &Connection, project: &str) -> Result<ProjectSettings> {
+    Ok(resolve_project_prompt(conn, project)?.0)
+}
+
+/// Upsert the project-scope prompt into the DB column. Pass `None` to clear
+/// the column. This writes the DB unconditionally — callers that want
+/// file-aware routing should consult [`resolve_project_prompt`] first (see
+/// `commands::prompt`).
 pub fn set_project_prompt(
     conn: &Connection,
     project: &str,
@@ -730,6 +811,33 @@ pub fn set_project_prompt(
         params![project, prompt],
     )?;
     Ok(())
+}
+
+/// Write the project-scope prompt to the checked-in file, creating the
+/// `.ralph/` directory as needed. Used by `prompt set --scope project`
+/// when the file is the active source.
+pub fn write_project_prompt_file(project: &str, content: &str) -> Result<()> {
+    let path = project_prompt_file_path(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&path, content)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
+}
+
+/// Delete the checked-in project-prompt file. A missing file is benign
+/// (the clear is idempotent).
+pub fn delete_project_prompt_file(project: &str) -> Result<()> {
+    let path = project_prompt_file_path(project);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            Err(anyhow::Error::new(e).context(format!("Failed to delete {}", path.display())))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4756,6 +4864,104 @@ mod tests {
         assert!(
             err.to_string().contains("Plan not found"),
             "unexpected error: {err}"
+        );
+    }
+
+    // -- Project-scope prompt: file-vs-db precedence --
+
+    /// `<project>/.ralph/prompt.md` content wins over the DB column on read.
+    #[test]
+    fn test_project_prompt_file_wins_over_db() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        set_project_prompt(&conn, &project, Some("from db")).unwrap();
+        write_project_prompt_file(&project, "from file").unwrap();
+
+        let (settings, source) = resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt.as_deref(), Some("from file"));
+        assert!(matches!(source, ProjectPromptSource::File(_)));
+        // The central assembly read also returns the file content.
+        assert_eq!(
+            get_project_settings(&conn, &project).unwrap().prompt.as_deref(),
+            Some("from file")
+        );
+    }
+
+    /// File absent → DB column is used and the source is `Db`.
+    #[test]
+    fn test_project_prompt_db_used_when_file_absent() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        set_project_prompt(&conn, &project, Some("only db")).unwrap();
+
+        let (settings, source) = resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt.as_deref(), Some("only db"));
+        assert_eq!(source, ProjectPromptSource::Db);
+    }
+
+    /// An empty / whitespace-only file must NOT shadow a valid DB value.
+    #[test]
+    fn test_project_prompt_blank_file_does_not_shadow_db() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        set_project_prompt(&conn, &project, Some("real db value")).unwrap();
+        write_project_prompt_file(&project, "   \n\t  \n").unwrap();
+
+        let (settings, source) = resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt.as_deref(), Some("real db value"));
+        assert_eq!(source, ProjectPromptSource::Db);
+        assert!(read_project_prompt_file(&project).unwrap().is_none());
+    }
+
+    /// Nothing configured anywhere → `None` / `Db`.
+    #[test]
+    fn test_project_prompt_none_when_unconfigured() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        let (settings, source) = resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt, None);
+        assert_eq!(source, ProjectPromptSource::Db);
+    }
+
+    /// Write helper creates `.ralph/` and the file with exact content;
+    /// delete helper removes it and is idempotent on a missing file.
+    #[test]
+    fn test_project_prompt_file_write_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        write_project_prompt_file(&project, "hello").unwrap();
+        let path = project_prompt_file_path(&project);
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+
+        delete_project_prompt_file(&project).unwrap();
+        assert!(!path.exists());
+        // Idempotent: deleting a now-missing file is benign.
+        delete_project_prompt_file(&project).unwrap();
+    }
+
+    /// `get_project_settings_db` ignores the file even when it exists.
+    #[test]
+    fn test_get_project_settings_db_ignores_file() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        set_project_prompt(&conn, &project, Some("db only")).unwrap();
+        write_project_prompt_file(&project, "file wins on resolve").unwrap();
+
+        assert_eq!(
+            get_project_settings_db(&conn, &project).unwrap().prompt.as_deref(),
+            Some("db only")
         );
     }
 }
