@@ -513,6 +513,81 @@ fn has_conflict_marker(porcelain_out: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Parking changes (skip handling)
+// ---------------------------------------------------------------------------
+
+/// How [`park_changes`] should dispose of the working-tree changes left
+/// behind when a step is skipped mid-run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // wired into the skip flow in a later step
+pub enum ParkStrategy {
+    /// `git stash push --include-untracked -m <label>` — recoverable later.
+    Stash { label: String },
+    /// `git add -A && git commit` with a `Ralph-Skipped-Step` trailer —
+    /// preserves the WIP as a real commit.
+    Commit { subject: String },
+    /// Throw the changes away (delegates to [`rollback_except`]).
+    Discard,
+}
+
+/// What [`park_changes`] actually did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the skip flow in a later step
+pub enum ParkOutcome {
+    /// Changes were stashed; `stash_ref` recovers them.
+    Stashed { stash_ref: StashRef },
+    /// Changes were committed; `sha` is the new commit.
+    Committed { sha: String },
+    /// Changes were discarded.
+    Discarded,
+}
+
+/// Dispose of the current working-tree changes per `strategy`.
+///
+/// A single entry point behind the three skip change-handling modes:
+///
+/// - [`ParkStrategy::Stash`] → `git stash push --include-untracked -m
+///   <label>`. The returned [`StashRef`] is stable across later stash
+///   pushes/drops. Errors if the tree is clean (nothing to stash).
+/// - [`ParkStrategy::Commit`] → `git add -A && git commit` with a
+///   `Ralph-Skipped-Step: <trailer_id>` trailer appended in git's standard
+///   trailer format (a blank line, then `Token: value`). This stages
+///   everything — including `pre_existing_untracked` — by design: a WIP
+///   commit is meant to be a complete snapshot.
+/// - [`ParkStrategy::Discard`] → [`rollback_except`], preserving
+///   `pre_existing_untracked`.
+///
+/// `trailer_id` is only consulted for `Commit`; `pre_existing_untracked`
+/// only for `Discard`.
+#[allow(dead_code)] // called by the skip flow in a later step
+pub fn park_changes(
+    workdir: &Path,
+    strategy: ParkStrategy,
+    pre_existing_untracked: &[String],
+    trailer_id: &str,
+) -> Result<ParkOutcome> {
+    match strategy {
+        ParkStrategy::Stash { label } => match stash_push_with_untracked(workdir, &label)? {
+            Some(stash_ref) => Ok(ParkOutcome::Stashed { stash_ref }),
+            None => bail!("nothing to stash: working tree is clean"),
+        },
+        ParkStrategy::Commit { subject } => {
+            // Blank line before the trailer block so git's trailer parser
+            // (`%(trailers)`, `git interpret-trailers`) recognizes it.
+            let message = format!("{subject}\n\nRalph-Skipped-Step: {trailer_id}\n");
+            commit_changes(workdir, &message).context("could not commit skipped-step WIP")?;
+            let sha = get_commit_hash(workdir)?;
+            Ok(ParkOutcome::Committed { sha })
+        }
+        ParkStrategy::Discard => {
+            rollback_except(workdir, pre_existing_untracked)
+                .context("could not discard changes on skip")?;
+            Ok(ParkOutcome::Discarded)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -949,5 +1024,141 @@ mod tests {
         // Merging A into B should fail with conflicts.
         let result = merge_sha(&dir, &a_sha);
         assert!(result.is_err());
+    }
+
+    // ----- park_changes -----
+
+    #[test]
+    fn test_park_changes_stash_label_recoverable() {
+        let (_tmp, dir) = init_repo();
+        // Tracked modification + untracked file — --include-untracked picks
+        // up both.
+        fs::write(dir.join("README.md"), "# modified").unwrap();
+        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+
+        let label = "ralph: skipped step 3 wip";
+        let outcome = park_changes(
+            &dir,
+            ParkStrategy::Stash {
+                label: label.to_string(),
+            },
+            &[],
+            "trailer-id-irrelevant-for-stash",
+        )
+        .unwrap();
+
+        let stash_ref = match outcome {
+            ParkOutcome::Stashed { stash_ref } => stash_ref,
+            other => panic!("expected Stashed, got {other:?}"),
+        };
+        assert_eq!(stash_ref.as_str().len(), 40);
+
+        // Stashing left the tree clean.
+        assert!(!has_uncommitted_changes(&dir).unwrap());
+
+        // The label is recoverable via `git stash list`.
+        let list = git(&dir, &["stash", "list"]).unwrap();
+        assert!(list.contains(label), "stash list missing label: {list}");
+
+        // And the returned ref resolves back to that stash.
+        let found = find_stash_by_message(&dir, label).unwrap().expect("found");
+        assert_eq!(found, stash_ref);
+    }
+
+    #[test]
+    fn test_park_changes_stash_clean_tree_errors() {
+        let (_tmp, dir) = init_repo();
+        let result = park_changes(
+            &dir,
+            ParkStrategy::Stash {
+                label: "ralph: nothing here".to_string(),
+            },
+            &[],
+            "ignored",
+        );
+        assert!(result.is_err(), "clean tree should error, got {result:?}");
+    }
+
+    #[test]
+    fn test_park_changes_commit_trailer_greppable() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("README.md"), "# modified").unwrap();
+        fs::write(dir.join("new.txt"), "added on skip").unwrap();
+
+        let trailer_id = "9f3c2a10-dead-beef-0000-000000000001";
+        let outcome = park_changes(
+            &dir,
+            ParkStrategy::Commit {
+                subject: "WIP: skipped step 7".to_string(),
+            },
+            &[],
+            trailer_id,
+        )
+        .unwrap();
+
+        let sha = match outcome {
+            ParkOutcome::Committed { sha } => sha,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+        assert_eq!(sha, get_commit_hash(&dir).unwrap());
+
+        // Everything got committed — tree is clean.
+        assert!(!has_uncommitted_changes(&dir).unwrap());
+
+        // The trailer is grep-pable in the raw commit body.
+        let body = git(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert!(
+            body.contains(&format!("Ralph-Skipped-Step: {trailer_id}")),
+            "commit body missing trailer: {body}"
+        );
+
+        // git's own trailer parser also recognizes it as a real trailer.
+        let parsed = git(
+            &dir,
+            &[
+                "log",
+                "-1",
+                "--format=%(trailers:key=Ralph-Skipped-Step,valueonly)",
+            ],
+        )
+        .unwrap();
+        assert!(
+            parsed.contains(trailer_id),
+            "git did not parse trailer: {parsed:?}"
+        );
+
+        // The new file is tracked now.
+        let tracked = git(&dir, &["ls-files"]).unwrap();
+        assert!(tracked.contains("new.txt"), "new.txt not committed");
+    }
+
+    #[test]
+    fn test_park_changes_discard_preserves_pre_existing_untracked() {
+        let (_tmp, dir) = init_repo();
+
+        // A pre-existing untracked file the user had before the run.
+        fs::write(dir.join("user-scratch.txt"), "user data").unwrap();
+        // The harness's work: a tracked modification + a new untracked file.
+        fs::write(dir.join("README.md"), "# clobbered by harness").unwrap();
+        fs::write(dir.join("agent-output.txt"), "agent junk").unwrap();
+
+        let preserve = vec!["user-scratch.txt".to_string()];
+        let outcome =
+            park_changes(&dir, ParkStrategy::Discard, &preserve, "ignored").unwrap();
+        assert_eq!(outcome, ParkOutcome::Discarded);
+
+        // Tracked modification rolled back.
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
+        // The harness's untracked file is gone.
+        assert!(!dir.join("agent-output.txt").exists());
+        // The user's pre-existing untracked file is preserved untouched.
+        assert!(dir.join("user-scratch.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "user data"
+        );
     }
 }
