@@ -1084,6 +1084,24 @@ fn read_and_validate(path: &Path) -> Result<Config> {
     Ok(config)
 }
 
+/// The exact pre-overhaul `prompt_prefix` literal that `ralph init` seeded
+/// for users who never customized the global prompt. Back then this short
+/// one-liner was the *only* global-prefix contribution; the full
+/// introspection block (`prompt::DEFAULT_CONTEXT_PREPEND`) was auto-injected
+/// separately at runtime and never lived in the config file. After the
+/// collapse + the removal of that runtime auto-injection, a verbatim copy of
+/// this string in the migrated `prompt` field means "uncustomized legacy
+/// default" — such a config must be re-seeded with the full block or the
+/// migrating user silently loses ralph's entire introspection guidance.
+///
+/// This constant exists **only** for that back-compat detection. It must
+/// stay byte-for-byte identical to the value of the (now-deleted)
+/// `DEFAULT_GLOBAL_PROMPT_PREFIX` constant as of commit `6e7fb97^`
+/// (`git show 6e7fb97^:src/config.rs`); do not "improve" the wording. The
+/// legacy default had no companion `prompt_suffix` (it defaulted to `None`),
+/// so there is no legacy-default suffix to match.
+const LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX: &str = "You are running as part of a `ralph` plan. Run `ralph status` to see the active plan, or `ralph plan show <slug>` for full details. Plan-specific conventions may be defined in AGENTS.md or CLAUDE.md.";
+
 /// Collapse the pre-overhaul global prompt fields (`prompt_prefix` /
 /// `prompt_suffix`) into the single `prompt` field on a freshly-parsed
 /// config `Value`. Returns `true` when the JSON object was changed, so the
@@ -1093,6 +1111,17 @@ fn read_and_validate(path: &Path) -> Result<Config> {
 /// only strip the stale legacy keys). Otherwise the two legacy values are
 /// concatenated with a blank line between them, skipping whichever side is
 /// absent/null/empty, so no user customization is lost.
+///
+/// **Data-loss guard:** if the collapsed result is *byte-equal* to the
+/// uncustomized legacy default ([`LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX`], with
+/// no suffix — the only shape `ralph init` ever wrote for a default user),
+/// it is treated as unseeded and replaced with the canonical
+/// [`prompt::DEFAULT_CONTEXT_PREPEND`] block, so a migrating default user
+/// ends up with the same effective content as a fresh install. The gate is
+/// strict equality: anything the user customized (not byte-equal to the
+/// legacy default) is preserved verbatim.
+///
+/// [`prompt::DEFAULT_CONTEXT_PREPEND`]: crate::prompt::DEFAULT_CONTEXT_PREPEND
 fn migrate_legacy_prompt_fields(raw: &mut serde_json::Value) -> bool {
     let Some(root) = raw.as_object_mut() else {
         return false;
@@ -1117,7 +1146,20 @@ fn migrate_legacy_prompt_fields(raw: &mut serde_json::Value) -> bool {
             (None, None) => None,
         };
         if let Some(m) = merged {
-            root.insert("prompt".to_string(), serde_json::Value::String(m));
+            // Data-loss guard: an uncustomized legacy default (the short
+            // one-liner prefix, no suffix) collapses to exactly
+            // `LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX`. That value is non-blank,
+            // so `seed_global_prompt` would skip re-seeding and the full
+            // introspection block (no longer auto-injected at runtime) would
+            // be permanently lost. Treat it as unseeded: substitute the
+            // canonical block so a migrating default user matches a fresh
+            // install. Strict byte equality — any customization is kept.
+            let value = if m == LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX {
+                crate::prompt::DEFAULT_CONTEXT_PREPEND.to_string()
+            } else {
+                m
+            };
+            root.insert("prompt".to_string(), serde_json::Value::String(value));
         }
     }
 
@@ -2187,5 +2229,72 @@ mod tests {
         assert!(migrate_legacy_prompt_fields(&mut raw));
         assert_eq!(raw.get("prompt").and_then(|v| v.as_str()), Some("NEW WINS"));
         assert!(raw.as_object().unwrap().get("prompt_prefix").is_none());
+    }
+
+    #[test]
+    fn test_legacy_default_prefix_migrates_to_context_prepend() {
+        // A pre-overhaul DEFAULT user had `prompt_prefix` == the old short
+        // one-liner and no suffix, while the full introspection block was
+        // auto-injected at runtime (since removed). Migrating that config
+        // must re-seed the canonical block, not collapse to the dead
+        // one-liner — otherwise the introspection guidance is lost forever.
+        let mut raw = serde_json::json!({
+            "prompt_prefix": LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX,
+        });
+        assert!(migrate_legacy_prompt_fields(&mut raw));
+        assert_eq!(
+            raw.get("prompt").and_then(|v| v.as_str()),
+            Some(crate::prompt::DEFAULT_CONTEXT_PREPEND)
+        );
+
+        // Same when the legacy default prefix is present with an explicit
+        // null/empty suffix (the only other shape `ralph init` ever wrote).
+        let mut raw = serde_json::json!({
+            "prompt_prefix": LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX,
+            "prompt_suffix": serde_json::Value::Null,
+        });
+        assert!(migrate_legacy_prompt_fields(&mut raw));
+        assert_eq!(
+            raw.get("prompt").and_then(|v| v.as_str()),
+            Some(crate::prompt::DEFAULT_CONTEXT_PREPEND)
+        );
+
+        // And the legacy literal really does contain the substring the
+        // doctor check keys on, proving the doctor check can't tell the
+        // dead one-liner apart from the real block (the reason this guard
+        // has to live in the migration path).
+        assert!(LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX.contains("ralph status"));
+    }
+
+    #[test]
+    fn test_legacy_customized_prefix_is_preserved_verbatim() {
+        // A user who customized the global prefix (anything not byte-equal
+        // to the legacy default) must keep their exact text — the data-loss
+        // guard is gated strictly on equality so it never clobbers a
+        // customization.
+        let mut raw = serde_json::json!({
+            "prompt_prefix": "My very own house style. Run `ralph status`.",
+        });
+        assert!(migrate_legacy_prompt_fields(&mut raw));
+        assert_eq!(
+            raw.get("prompt").and_then(|v| v.as_str()),
+            Some("My very own house style. Run `ralph status`.")
+        );
+
+        // Legacy default prefix PLUS a real custom suffix → not the
+        // uncustomized-default shape, so it's preserved (joined) verbatim,
+        // never re-seeded.
+        let mut raw = serde_json::json!({
+            "prompt_prefix": LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX,
+            "prompt_suffix": "Always run the linter.",
+        });
+        assert!(migrate_legacy_prompt_fields(&mut raw));
+        assert_eq!(
+            raw.get("prompt").and_then(|v| v.as_str()),
+            Some(
+                format!("{LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX}\n\nAlways run the linter.")
+                    .as_str()
+            )
+        );
     }
 }

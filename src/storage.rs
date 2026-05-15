@@ -726,17 +726,24 @@ pub fn project_prompt_file_path(project: &str) -> std::path::PathBuf {
 
 /// Read `<project>/.ralph/prompt.md` if it exists and has non-whitespace
 /// content. An empty / whitespace-only file is treated as "not present" so
-/// an accidentally-blank file can't shadow a valid DB value. Any IO error
-/// other than "missing" is surfaced.
+/// an accidentally-blank file can't shadow a valid DB value.
+///
+/// Anything that isn't a usable regular file — missing, a *directory* at
+/// that path, or any other read error (permissions, IsADirectory, etc.) —
+/// is treated the same as absent (`Ok(None)`) so the DB fallback applies.
+/// Otherwise a `.ralph/prompt.md` directory (or an unreadable file) would
+/// make *every* `ralph run` hard-fail instead of degrading gracefully. A
+/// genuinely present, readable, non-empty file still wins as before.
 pub fn read_project_prompt_file(project: &str) -> Result<Option<String>> {
     let path = project_prompt_file_path(project);
     match std::fs::read_to_string(&path) {
         Ok(s) if s.trim().is_empty() => Ok(None),
         Ok(s) => Ok(Some(s)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => {
-            Err(anyhow::Error::new(e).context(format!("Failed to read {}", path.display())))
-        }
+        // Missing, a directory, or otherwise not readable as a file: fall
+        // back to the DB rather than aborting the run. (Reading a directory
+        // surfaces as `IsADirectory` on Linux and `PermissionDenied` /
+        // other kinds elsewhere — none of them mean "use this as a prompt".)
+        Err(_) => Ok(None),
     }
 }
 
@@ -4947,6 +4954,34 @@ mod tests {
         assert!(!path.exists());
         // Idempotent: deleting a now-missing file is benign.
         delete_project_prompt_file(&project).unwrap();
+    }
+
+    /// A `.ralph/prompt.md` that is actually a *directory* must not abort
+    /// the run: the read degrades to "absent" so the DB value is used.
+    #[test]
+    fn test_project_prompt_dir_at_path_falls_back_to_db() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        set_project_prompt(&conn, &project, Some("db survives")).unwrap();
+
+        // Create `<project>/.ralph/prompt.md` as a directory.
+        let path = project_prompt_file_path(&project);
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(path.is_dir());
+
+        // No error, treated as absent.
+        assert!(read_project_prompt_file(&project).unwrap().is_none());
+
+        let (settings, source) = resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt.as_deref(), Some("db survives"));
+        assert_eq!(source, ProjectPromptSource::Db);
+        // The central assembly read also degrades gracefully.
+        assert_eq!(
+            get_project_settings(&conn, &project).unwrap().prompt.as_deref(),
+            Some("db survives")
+        );
     }
 
     /// `get_project_settings_db` ignores the file even when it exists.

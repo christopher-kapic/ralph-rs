@@ -162,19 +162,18 @@ pub fn cmd_prompt_clear(
             write_config(&cfg, config_path)?;
         }
         PromptScope::Project => {
-            // Delete the file when it's the active source; otherwise clear
-            // the DB row. (If a stale DB value lurks behind a now-deleted
-            // file, a subsequent clear targets the DB on the next call —
-            // matches the read precedence the user sees.)
+            // Empty the project layer in one shot. When the file is the
+            // active source we delete it AND null the DB row: otherwise a
+            // stale `project_settings.prompt` value would resurface on the
+            // very next read (file gone → DB fallback), so a single
+            // `prompt clear` wouldn't actually empty the project layer.
+            // When no file is active there's nothing to delete and we just
+            // clear the DB row (the existing DB-only path).
             let (_, source) = storage::resolve_project_prompt(conn, project)?;
-            match source {
-                ProjectPromptSource::File(_) => {
-                    storage::delete_project_prompt_file(project)?;
-                }
-                ProjectPromptSource::Db => {
-                    storage::set_project_prompt(conn, project, None)?;
-                }
+            if let ProjectPromptSource::File(_) = source {
+                storage::delete_project_prompt_file(project)?;
             }
+            storage::set_project_prompt(conn, project, None)?;
         }
     }
 
@@ -319,16 +318,24 @@ mod tests {
         );
     }
 
-    /// `prompt clear --scope project` deletes the file when the file is
-    /// the active source.
+    /// `prompt clear --scope project` with the file active deletes the file
+    /// AND nulls the DB row, so the project layer is genuinely empty after
+    /// one clear — a stale DB value must not resurface on the next read.
     #[test]
-    fn project_clear_deletes_file_when_file_active() {
+    fn project_clear_deletes_file_and_clears_db_when_file_active() {
         let conn = crate::db::open_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().to_string_lossy().into_owned();
         let cfg_path = dir.path().join("config.json");
 
+        // Both a stale DB value and the active file are present; the file
+        // is the active source.
+        storage::set_project_prompt(&conn, &project, Some("stale db value")).unwrap();
         storage::write_project_prompt_file(&project, "shared").unwrap();
+        assert!(matches!(
+            storage::resolve_project_prompt(&conn, &project).unwrap().1,
+            ProjectPromptSource::File(_)
+        ));
 
         cmd_prompt_clear(
             &conn,
@@ -339,7 +346,18 @@ mod tests {
         )
         .unwrap();
 
+        // File gone.
         assert!(!storage::project_prompt_file_path(&project).exists());
+        // DB row cleared too — no resurrection.
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt,
+            None
+        );
+        // The effective project layer is genuinely empty.
+        let (settings, _) = storage::resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt, None);
     }
 
     /// `--scope universal` (clap alias for `global`) drives the exact same
