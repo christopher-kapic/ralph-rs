@@ -513,6 +513,36 @@ pub fn log_status_icon(committed: bool, rolled_back: bool, color: bool) -> &'sta
     }
 }
 
+/// Format a duration in seconds as a collapsing `Hh Mm Ss` string.
+///
+/// The largest non-zero unit is the leftmost shown; smaller units are always
+/// present once a larger one appears (so minutes/seconds aren't dropped):
+/// - `< 60s` → `Ns` (e.g. `45s`)
+/// - `< 1h`  → `Mm Ss` (e.g. `2m 3s`, `1m 0s`)
+/// - `≥ 1h`  → `Hh Mm Ss` (e.g. `1h 6m 40s`)
+///
+/// Input is `f64` seconds (matching [`ExecutionLog::duration_secs`]). The
+/// value is truncated toward zero to whole seconds; negative inputs clamp
+/// to `0`.
+#[allow(dead_code)] // wired into the step_detail right pane in phase 7
+pub fn format_duration_secs(secs: f64) -> String {
+    let total = if secs.is_finite() && secs > 0.0 {
+        secs.floor() as u64
+    } else {
+        0
+    };
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Interactive confirmation
 // ---------------------------------------------------------------------------
@@ -906,6 +936,29 @@ pub struct HookInfo {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    // -- format_duration_secs ----------------------------------------------
+
+    #[test]
+    fn test_format_duration_secs_boundaries() {
+        assert_eq!(format_duration_secs(0.0), "0s");
+        assert_eq!(format_duration_secs(0.5), "0s"); // sub-second truncates down
+        assert_eq!(format_duration_secs(1.0), "1s");
+        assert_eq!(format_duration_secs(59.0), "59s");
+        assert_eq!(format_duration_secs(59.9), "59s"); // still < 60 after trunc
+        assert_eq!(format_duration_secs(60.0), "1m 0s");
+        assert_eq!(format_duration_secs(61.0), "1m 1s");
+        assert_eq!(format_duration_secs(3599.0), "59m 59s");
+        assert_eq!(format_duration_secs(3600.0), "1h 0m 0s");
+        assert_eq!(format_duration_secs(3661.0), "1h 1m 1s");
+        assert_eq!(format_duration_secs(7322.0), "2h 2m 2s");
+    }
+
+    #[test]
+    fn test_format_duration_secs_negative_clamps_to_zero() {
+        assert_eq!(format_duration_secs(-1.0), "0s");
+        assert_eq!(format_duration_secs(-3661.0), "0s");
+    }
 
     // -- emit_ndjson --------------------------------------------------------
 
