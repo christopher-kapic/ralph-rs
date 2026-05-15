@@ -4693,8 +4693,8 @@ pub(crate) fn step_detail_observe_read_only(
 ///
 /// `config` is cloned locally so the pane's `&mut Config` can be persisted
 /// via `save_at`; the on-disk file is the source of truth, and the app's
-/// in-memory mirrors (`config_prompt_prefix` / `config_prompt_suffix`) are
-/// updated by `edit_universal_pane` so the pane re-renders without a reload.
+/// in-memory mirror (`config_prompt`) is updated by `edit_universal_pane`
+/// so the pane re-renders without a reload.
 fn step_detail_handle_c<E>(
     app: &mut crate::tui::views::step_detail::StepDetailApp,
     conn: &Connection,
@@ -7752,7 +7752,7 @@ mod step_detail_dispatcher_tests {
 
     use crate::tui::views::step_detail::{
         NO_CHANGES_TOAST, NO_EDITOR_TOAST, PARSE_ERROR_TOAST_PREFIX, Pane, SAVED_TOAST,
-        format_step_pane, format_tests_pane, format_wrap_pane,
+        format_prompt_pane, format_step_pane, format_tests_pane,
     };
 
     /// Build a step-detail app whose plan + first step are materialized in
@@ -7873,7 +7873,7 @@ mod step_detail_dispatcher_tests {
         app.focused_pane = Pane::UniversalPrompt;
 
         let dir = tempfile::tempdir().unwrap();
-        let buffer = format_wrap_pane(Some("UP"), Some("US"));
+        let buffer = format_prompt_pane(Some("UNIVERSAL PROMPT"));
         step_detail_handle_c(
             &mut app,
             &conn,
@@ -7884,12 +7884,10 @@ mod step_detail_dispatcher_tests {
         .unwrap();
 
         assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
-        assert_eq!(app.config_prompt_prefix.as_deref(), Some("UP"));
-        assert_eq!(app.config_prompt_suffix.as_deref(), Some("US"));
+        assert_eq!(app.config_prompt.as_deref(), Some("UNIVERSAL PROMPT"));
         let written = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
         let reloaded: Config = serde_json::from_str(&written).unwrap();
-        assert_eq!(reloaded.prompt_prefix.as_deref(), Some("UP"));
-        assert_eq!(reloaded.prompt_suffix.as_deref(), Some("US"));
+        assert_eq!(reloaded.prompt.as_deref(), Some("UNIVERSAL PROMPT"));
     }
 
     #[test]
@@ -7918,10 +7916,7 @@ mod step_detail_dispatcher_tests {
         app.focused_pane = Pane::ProjectPrompt;
 
         let dir = tempfile::tempdir().unwrap();
-        let unchanged = format_wrap_pane(
-            app.project_settings.prompt_prefix.as_deref(),
-            app.project_settings.prompt_suffix.as_deref(),
-        );
+        let unchanged = format_prompt_pane(app.project_settings.prompt.as_deref());
         step_detail_handle_c(
             &mut app,
             &conn,

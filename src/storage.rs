@@ -688,26 +688,25 @@ pub fn set_plan_deterministic_tests(
 }
 
 // ---------------------------------------------------------------------------
-// Project settings (prompt prefix/suffix at project scope)
+// Project settings (the Project layer of the four-layer prompt model)
 // ---------------------------------------------------------------------------
 
-/// Prefix and suffix pair loaded from the `project_settings` table. Both
-/// fields `None` represents "no project-scope wrap configured".
+/// The project-scope prompt loaded from the `project_settings` table — one
+/// content blob, the Project layer of the four-layer prompt model. `None`
+/// represents "no project-scope prompt configured".
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectSettings {
-    pub prompt_prefix: Option<String>,
-    pub prompt_suffix: Option<String>,
+    pub prompt: Option<String>,
 }
 
 /// Read project-scope settings for `project`. Returns a zero-value struct
 /// when no row exists — callers treat missing rows identically to NULLs.
 pub fn get_project_settings(conn: &Connection, project: &str) -> Result<ProjectSettings> {
-    let mut stmt = conn
-        .prepare("SELECT prompt_prefix, prompt_suffix FROM project_settings WHERE project = ?1")?;
+    let mut stmt =
+        conn.prepare("SELECT prompt FROM project_settings WHERE project = ?1")?;
     let mut rows = stmt.query_map(params![project], |row| {
         Ok(ProjectSettings {
-            prompt_prefix: row.get(0)?,
-            prompt_suffix: row.get(1)?,
+            prompt: row.get(0)?,
         })
     })?;
     match rows.next() {
@@ -716,39 +715,19 @@ pub fn get_project_settings(conn: &Connection, project: &str) -> Result<ProjectS
     }
 }
 
-/// Upsert the project-scope prompt prefix. Pass `None` to clear the column.
-pub fn set_project_prompt_prefix(
+/// Upsert the project-scope prompt. Pass `None` to clear the column.
+pub fn set_project_prompt(
     conn: &Connection,
     project: &str,
-    prefix: Option<&str>,
-) -> Result<()> {
-    // ON CONFLICT … DO UPDATE keeps the sibling suffix untouched so a
-    // standalone "set prefix" call never silently wipes a previously-set
-    // suffix on the same project row.
-    conn.execute(
-        "INSERT INTO project_settings (project, prompt_prefix)
-         VALUES (?1, ?2)
-         ON CONFLICT(project) DO UPDATE SET
-             prompt_prefix = excluded.prompt_prefix,
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-        params![project, prefix],
-    )?;
-    Ok(())
-}
-
-/// Upsert the project-scope prompt suffix. Pass `None` to clear the column.
-pub fn set_project_prompt_suffix(
-    conn: &Connection,
-    project: &str,
-    suffix: Option<&str>,
+    prompt: Option<&str>,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO project_settings (project, prompt_suffix)
+        "INSERT INTO project_settings (project, prompt)
          VALUES (?1, ?2)
          ON CONFLICT(project) DO UPDATE SET
-             prompt_suffix = excluded.prompt_suffix,
+             prompt = excluded.prompt,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-        params![project, suffix],
+        params![project, prompt],
     )?;
     Ok(())
 }

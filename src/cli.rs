@@ -1051,65 +1051,50 @@ pub enum HooksCommand {
 // Prompt subcommands
 // ---------------------------------------------------------------------------
 
-/// Which scope a prompt prefix/suffix command targets.
+/// Which layer of the four-layer prompt model a prompt command targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub enum PromptScope {
-    /// Global wrap stored in `~/.config/ralph-rs/config.json`.
+    /// Global layer stored in `~/.config/ralph-rs/config.json`.
     Global,
-    /// Project wrap stored in SQLite keyed on the current project path.
+    /// Project layer stored in SQLite keyed on the current project path.
     Project,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum PromptCommand {
-    /// Show the prompt prefix/suffix configured for one or all scopes.
+    /// Show the prompt configured for one or all scopes.
     ///
     /// With no `--scope`, displays the global and project entries. Use
-    /// `--resolved` to print the fully layered wrap exactly as it would
-    /// appear around a step prompt.
+    /// `--resolved` to print the composed prompt (global + project joined by
+    /// a blank line) exactly as it would lead a step prompt.
     Show {
         /// Limit output to a single scope.
         #[arg(long)]
         scope: Option<PromptScope>,
 
-        /// Show the final composed prefix/suffix (global + project)
-        /// rather than each scope's individual contribution.
+        /// Show the final composed prompt (global + project) rather than
+        /// each scope's individual contribution.
         #[arg(long)]
         resolved: bool,
     },
 
-    /// Set a prompt prefix and/or suffix at the given scope. At least one of
-    /// `--prefix` / `--suffix` must be provided; omitted values leave the
-    /// sibling field untouched. Pass an empty string to blank a value.
+    /// Set the prompt at the given scope, replacing any existing value.
+    /// Pass an empty string to blank it (equivalent to `prompt clear`).
     Set {
         /// Target scope.
         #[arg(long)]
         scope: PromptScope,
 
-        /// New prefix text. Omit to leave the stored prefix unchanged.
-        #[arg(long)]
-        prefix: Option<String>,
-
-        /// New suffix text. Omit to leave the stored suffix unchanged.
-        #[arg(long)]
-        suffix: Option<String>,
+        /// The prompt content for this scope.
+        content: String,
     },
 
-    /// Clear a prompt prefix and/or suffix at the given scope. Pass at least
-    /// one of `--prefix` / `--suffix` to specify which fields to clear.
+    /// Clear the prompt at the given scope.
     Clear {
         /// Target scope.
         #[arg(long)]
         scope: PromptScope,
-
-        /// Clear the prefix for this scope.
-        #[arg(long)]
-        prefix: bool,
-
-        /// Clear the suffix for this scope.
-        #[arg(long)]
-        suffix: bool,
     },
 }
 

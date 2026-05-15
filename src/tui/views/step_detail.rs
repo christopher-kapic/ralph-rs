@@ -83,14 +83,6 @@ pub const NO_CHANGES_TOAST: &str = "No changes.";
 /// the user can fix the structural problem and re-edit.
 pub const PARSE_ERROR_TOAST_PREFIX: &str = "Edit not saved: ";
 
-/// Header line used by the Universal-, Project-, and Plan-prompt panes'
-/// two-section editor format. The body that follows up to the next header
-/// (or EOF) is the `prompt_prefix` value.
-const PREFIX_HEADER: &str = "## Prefix";
-
-/// Header line for the Suffix section — paired with [`PREFIX_HEADER`] above.
-const SUFFIX_HEADER: &str = "## Suffix";
-
 /// Top-level header introducing the title in the Step-prompt editor format.
 /// Marks a single-line section: the first non-blank line after this header
 /// is the title and any further content before the next header is rejected.
@@ -194,78 +186,30 @@ pub enum EditOutcome {
     ParseError(String),
 }
 
-/// Format a prefix/suffix pair into the two-section markdown blob shown to
-/// `$EDITOR`. Section headers are always emitted so the editor sees the
-/// structure even when one (or both) values are unset.
-///
-/// Round-trips through [`parse_wrap_pane`] when the user makes no edits —
-/// trailing newlines on each value are normalized to one to avoid spurious
-/// "Saved" outcomes from editors that auto-append a final newline.
-pub(crate) fn format_wrap_pane(prefix: Option<&str>, suffix: Option<&str>) -> String {
-    let mut out = String::new();
-    out.push_str(PREFIX_HEADER);
-    out.push('\n');
-    if let Some(s) = prefix {
-        out.push_str(s);
-        if !s.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    out.push('\n');
-    out.push_str(SUFFIX_HEADER);
-    out.push('\n');
-    if let Some(s) = suffix {
-        out.push_str(s);
-        if !s.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Parse a two-section markdown blob written by `$EDITOR` back into its
-/// prefix/suffix pair. Whitespace-only sections become `None`; section
-/// content is trimmed of leading/trailing whitespace so editor-added blank
-/// lines don't drift the value across round-trips.
-///
-/// Tolerant of missing headers: text before the first header is dropped, and
-/// a missing section just yields `None` for that side.
-pub(crate) fn parse_wrap_pane(text: &str) -> (Option<String>, Option<String>) {
-    enum Section {
-        None,
-        Prefix,
-        Suffix,
-    }
-    let mut section = Section::None;
-    let mut prefix = String::new();
-    let mut suffix = String::new();
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed == PREFIX_HEADER {
-            section = Section::Prefix;
-        } else if trimmed == SUFFIX_HEADER {
-            section = Section::Suffix;
-        } else {
-            match section {
-                Section::None => {}
-                Section::Prefix => {
-                    if !prefix.is_empty() {
-                        prefix.push('\n');
-                    }
-                    prefix.push_str(line);
-                }
-                Section::Suffix => {
-                    if !suffix.is_empty() {
-                        suffix.push('\n');
-                    }
-                    suffix.push_str(line);
-                }
+/// Format a single prompt layer into the blob shown to `$EDITOR`. The buffer
+/// is just the raw prompt text (the four-layer model has one content blob
+/// per layer — no prefix/suffix split). A trailing newline is normalized in
+/// so editors that auto-append one don't produce a spurious "Saved" outcome
+/// on an otherwise-unchanged round-trip through [`parse_prompt_pane`].
+pub(crate) fn format_prompt_pane(prompt: Option<&str>) -> String {
+    match prompt {
+        Some(s) if !s.is_empty() => {
+            if s.ends_with('\n') {
+                s.to_string()
+            } else {
+                format!("{s}\n")
             }
         }
+        _ => String::new(),
     }
+}
 
-    (trim_to_option(&prefix), trim_to_option(&suffix))
+/// Parse the blob written by `$EDITOR` back into a single prompt layer.
+/// Whitespace-only input becomes `None` so saving an empty buffer clears the
+/// layer; otherwise the content is trimmed of leading/trailing whitespace so
+/// editor-added blank lines don't drift the value across round-trips.
+pub(crate) fn parse_prompt_pane(text: &str) -> Option<String> {
+    trim_to_option(text)
 }
 
 /// Trim and lift to `Option<String>` — empty/whitespace-only becomes `None`,
@@ -551,14 +495,12 @@ pub struct StepDetailApp {
     /// confirmations.
     pub toasts: ToastQueue,
 
-    /// Universal-prompt prefix sourced from `Config.prompt_prefix`. Cloned at
-    /// construction so the view doesn't need to retain a `&Config` reference.
-    pub config_prompt_prefix: Option<String>,
+    /// Universal (Global-layer) prompt sourced from `Config.prompt`. Cloned
+    /// at construction so the view doesn't need to retain a `&Config`
+    /// reference.
+    pub config_prompt: Option<String>,
 
-    /// Universal-prompt suffix sourced from `Config.prompt_suffix`.
-    pub config_prompt_suffix: Option<String>,
-
-    /// Project-prompt wrap pair sourced from the `project_settings` row.
+    /// Project-layer prompt sourced from the `project_settings` row.
     pub project_settings: ProjectSettings,
 
     /// `Config.default_harness` — used as the bottom-row Harness fallback when
@@ -689,8 +631,7 @@ impl StepDetailApp {
             terminal_width: 0,
             should_pop: false,
             toasts: ToastQueue::new(),
-            config_prompt_prefix: config.prompt_prefix.clone(),
-            config_prompt_suffix: config.prompt_suffix.clone(),
+            config_prompt: config.prompt.clone(),
             project_settings,
             default_harness_name: config.default_harness.clone(),
             harness_default_models,
@@ -1302,11 +1243,11 @@ impl StepDetailApp {
 
     // -- `c` editor handoff for single-string panes (TUI-plan.md §8 + §18 Q3)
 
-    /// `c` on the Universal pane: round-trip `Config.prompt_prefix` and
-    /// `Config.prompt_suffix` through `$EDITOR` and persist via
+    /// `c` on the Universal pane: round-trip the Global-layer prompt
+    /// (`Config.prompt`) through `$EDITOR` and persist via
     /// [`Config::save_at`]. Mutates the in-memory `config` so subsequent
-    /// reads of the same struct see the new values, and refreshes the
-    /// app's mirrored copies so the pane re-renders without a reload.
+    /// reads of the same struct see the new value, and refreshes the app's
+    /// mirrored copy so the pane re-renders without a reload.
     ///
     /// `edit_fn` is the editor-handoff callback — production passes
     /// `tui::editor::edit_in_editor`; tests pass a closure backed by a
@@ -1320,56 +1261,38 @@ impl StepDetailApp {
     where
         E: FnOnce(&str) -> Result<Option<String>>,
     {
-        let initial = format_wrap_pane(
-            config.prompt_prefix.as_deref(),
-            config.prompt_suffix.as_deref(),
-        );
+        let initial = format_prompt_pane(config.prompt.as_deref());
         let new_text = match edit_fn(&initial)? {
             None => return Ok(EditOutcome::NoEditor),
             Some(s) => s,
         };
-        let (new_prefix, new_suffix) = parse_wrap_pane(&new_text);
-        if new_prefix == config.prompt_prefix && new_suffix == config.prompt_suffix {
+        let new_prompt = parse_prompt_pane(&new_text);
+        if new_prompt == config.prompt {
             return Ok(EditOutcome::NoChanges);
         }
-        config.prompt_prefix = new_prefix.clone();
-        config.prompt_suffix = new_suffix.clone();
+        config.prompt = new_prompt.clone();
         config.save_at(config_dir)?;
-        self.config_prompt_prefix = new_prefix;
-        self.config_prompt_suffix = new_suffix;
+        self.config_prompt = new_prompt;
         Ok(EditOutcome::Saved)
     }
 
-    /// `c` on the Project pane: round-trip the project-scope prompt prefix
-    /// and suffix through `$EDITOR` and persist via the storage helpers.
-    /// Each side updates independently so a no-op on one half doesn't churn
-    /// its `updated_at` stamp.
+    /// `c` on the Project pane: round-trip the Project-layer prompt through
+    /// `$EDITOR` and persist via the storage helper.
     pub fn edit_project_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
     where
         E: FnOnce(&str) -> Result<Option<String>>,
     {
-        let initial = format_wrap_pane(
-            self.project_settings.prompt_prefix.as_deref(),
-            self.project_settings.prompt_suffix.as_deref(),
-        );
+        let initial = format_prompt_pane(self.project_settings.prompt.as_deref());
         let new_text = match edit_fn(&initial)? {
             None => return Ok(EditOutcome::NoEditor),
             Some(s) => s,
         };
-        let (new_prefix, new_suffix) = parse_wrap_pane(&new_text);
-        if new_prefix == self.project_settings.prompt_prefix
-            && new_suffix == self.project_settings.prompt_suffix
-        {
+        let new_prompt = parse_prompt_pane(&new_text);
+        if new_prompt == self.project_settings.prompt {
             return Ok(EditOutcome::NoChanges);
         }
-        if new_prefix != self.project_settings.prompt_prefix {
-            storage::set_project_prompt_prefix(conn, &self.plan.project, new_prefix.as_deref())?;
-            self.project_settings.prompt_prefix = new_prefix;
-        }
-        if new_suffix != self.project_settings.prompt_suffix {
-            storage::set_project_prompt_suffix(conn, &self.plan.project, new_suffix.as_deref())?;
-            self.project_settings.prompt_suffix = new_suffix;
-        }
+        storage::set_project_prompt(conn, &self.plan.project, new_prompt.as_deref())?;
+        self.project_settings.prompt = new_prompt;
         Ok(EditOutcome::Saved)
     }
 
@@ -1866,18 +1789,10 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
     }
 
     match pane {
-        Pane::UniversalPrompt => render_wrap_pane(
-            frame,
-            inner,
-            app.config_prompt_prefix.as_deref(),
-            app.config_prompt_suffix.as_deref(),
-        ),
-        Pane::ProjectPrompt => render_wrap_pane(
-            frame,
-            inner,
-            app.project_settings.prompt_prefix.as_deref(),
-            app.project_settings.prompt_suffix.as_deref(),
-        ),
+        Pane::UniversalPrompt => render_text_pane(frame, inner, app.config_prompt.as_deref()),
+        Pane::ProjectPrompt => {
+            render_text_pane(frame, inner, app.project_settings.prompt.as_deref())
+        }
         // The legacy per-plan prompt-wrap columns were dropped in migration
         // V21. These pane variants are inert placeholders pending their full
         // removal — render them empty.
@@ -1960,67 +1875,6 @@ fn render_text_pane(frame: &mut Frame, area: Rect, text: Option<&str>) {
         Some(s) => Paragraph::new(s.to_string()),
     }
     .wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
-}
-
-/// Render a prefix/suffix wrap pane (Universal, Project). Both halves render
-/// with bolded labels so the operator can tell which is which even when one
-/// side is empty. When both are absent we collapse to a single `(none)` line
-/// to match the other read-only renders.
-fn render_wrap_pane(frame: &mut Frame, area: Rect, prefix: Option<&str>, suffix: Option<&str>) {
-    let mut lines: Vec<Line> = Vec::new();
-    let label_style = Style::default().add_modifier(Modifier::BOLD);
-
-    if prefix.is_none() && suffix.is_none() {
-        lines.push(Line::from(Span::styled(
-            NONE_PLACEHOLDER,
-            Style::default().fg(theme::CHROME_DIM),
-        )));
-    } else {
-        lines.push(Line::from(Span::styled("Prefix:", label_style)));
-        match prefix {
-            Some(s) if !s.is_empty() => {
-                for line in s.lines() {
-                    lines.push(Line::from(line.to_string()));
-                }
-            }
-            Some(_) => {
-                lines.push(Line::from(Span::styled(
-                    "(empty)",
-                    Style::default().fg(theme::CHROME_DIM),
-                )));
-            }
-            None => {
-                lines.push(Line::from(Span::styled(
-                    NONE_PLACEHOLDER,
-                    Style::default().fg(theme::CHROME_DIM),
-                )));
-            }
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Suffix:", label_style)));
-        match suffix {
-            Some(s) if !s.is_empty() => {
-                for line in s.lines() {
-                    lines.push(Line::from(line.to_string()));
-                }
-            }
-            Some(_) => {
-                lines.push(Line::from(Span::styled(
-                    "(empty)",
-                    Style::default().fg(theme::CHROME_DIM),
-                )));
-            }
-            None => {
-                lines.push(Line::from(Span::styled(
-                    NONE_PLACEHOLDER,
-                    Style::default().fg(theme::CHROME_DIM),
-                )));
-            }
-        }
-    }
-
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(para, area);
 }
 
@@ -2919,12 +2773,11 @@ mod tests {
     }
 
     #[test]
-    fn universal_pane_renders_config_prefix_and_suffix() {
+    fn universal_pane_renders_config_prompt() {
         let plan = make_plan();
         let steps = make_steps(3);
         let config = Config {
-            prompt_prefix: Some("CFG-PREFIX-MARKER".to_string()),
-            prompt_suffix: Some("CFG-SUFFIX-MARKER".to_string()),
+            prompt: Some("CFG-PROMPT-MARKER".to_string()),
             ..Config::default()
         };
         let mut app = StepDetailApp::new(
@@ -2937,19 +2790,17 @@ mod tests {
         );
         let screen = render_to_string(160, 100, &mut app);
         assert!(screen.contains("Universal prompt"), "{screen}");
-        assert!(screen.contains("CFG-PREFIX-MARKER"), "{screen}");
-        assert!(screen.contains("CFG-SUFFIX-MARKER"), "{screen}");
+        assert!(screen.contains("CFG-PROMPT-MARKER"), "{screen}");
     }
 
     #[test]
     fn universal_pane_shows_none_when_unset() {
         let plan = make_plan();
         let steps = make_steps(1);
-        // Default Config has a global prefix seeded by `ralph init`; clear
-        // both fields so the pane shows the (none) placeholder.
+        // Default Config has a global prompt seeded by `ralph init`; clear
+        // it so the pane shows the (none) placeholder.
         let config = Config {
-            prompt_prefix: None,
-            prompt_suffix: None,
+            prompt: None,
             ..Config::default()
         };
         let mut app = StepDetailApp::new(
@@ -2975,8 +2826,7 @@ mod tests {
         let plan = make_plan();
         let steps = make_steps(2);
         let project_settings = ProjectSettings {
-            prompt_prefix: Some("PROJ-PRE-MARK".to_string()),
-            prompt_suffix: Some("PROJ-SUF-MARK".to_string()),
+            prompt: Some("PROJ-PROMPT-MARK".to_string()),
         };
         let mut app = StepDetailApp::new(
             plan,
@@ -2988,8 +2838,7 @@ mod tests {
         );
         let screen = render_to_string(160, 100, &mut app);
         assert!(screen.contains("Project prompt"), "{screen}");
-        assert!(screen.contains("PROJ-PRE-MARK"), "{screen}");
-        assert!(screen.contains("PROJ-SUF-MARK"), "{screen}");
+        assert!(screen.contains("PROJ-PROMPT-MARK"), "{screen}");
     }
 
     #[test]
@@ -3531,74 +3380,35 @@ mod tests {
         );
     }
 
-    // -- format_wrap_pane / parse_wrap_pane (TUI-plan.md §8 + §18 Q3) -----
+    // -- format_prompt_pane / parse_prompt_pane (TUI-plan.md §8 + §18 Q3) --
 
     #[test]
-    fn format_wrap_pane_emits_both_headers_when_both_set() {
-        let s = format_wrap_pane(Some("hello"), Some("world"));
-        assert!(s.contains("## Prefix\nhello"), "got: {s}");
-        assert!(s.contains("## Suffix\nworld"), "got: {s}");
+    fn format_prompt_pane_normalizes_trailing_newline() {
+        // A value without a trailing newline gets one appended so editors
+        // that auto-add a final newline don't make the round-trip look
+        // "changed"; a value that already ends in one is left as-is.
+        assert_eq!(format_prompt_pane(Some("hello")), "hello\n");
+        assert_eq!(format_prompt_pane(Some("hello\n")), "hello\n");
     }
 
     #[test]
-    fn format_wrap_pane_emits_both_headers_when_both_none() {
-        let s = format_wrap_pane(None, None);
-        assert!(s.contains("## Prefix"), "got: {s}");
-        assert!(s.contains("## Suffix"), "got: {s}");
-        // Bodies are empty — no spurious content slips between headers.
-        let (p, q) = parse_wrap_pane(&s);
-        assert_eq!(p, None);
-        assert_eq!(q, None);
+    fn format_prompt_pane_empty_for_none_or_blank() {
+        assert_eq!(format_prompt_pane(None), "");
+        assert_eq!(format_prompt_pane(Some("")), "");
+        // Round-trips back to None (the "clear this layer" workflow).
+        assert_eq!(parse_prompt_pane(&format_prompt_pane(None)), None);
     }
 
     #[test]
-    fn parse_wrap_pane_round_trips_when_both_set() {
-        let s = format_wrap_pane(Some("a\nb"), Some("c"));
-        let (p, q) = parse_wrap_pane(&s);
-        assert_eq!(p.as_deref(), Some("a\nb"));
-        assert_eq!(q.as_deref(), Some("c"));
+    fn parse_prompt_pane_round_trips_multiline_content() {
+        let s = format_prompt_pane(Some("line a\n\nline b"));
+        assert_eq!(parse_prompt_pane(&s).as_deref(), Some("line a\n\nline b"));
     }
 
     #[test]
-    fn parse_wrap_pane_round_trips_with_one_side_unset() {
-        let s = format_wrap_pane(Some("only-prefix"), None);
-        let (p, q) = parse_wrap_pane(&s);
-        assert_eq!(p.as_deref(), Some("only-prefix"));
-        assert_eq!(q, None);
-
-        let s = format_wrap_pane(None, Some("only-suffix"));
-        let (p, q) = parse_wrap_pane(&s);
-        assert_eq!(p, None);
-        assert_eq!(q.as_deref(), Some("only-suffix"));
-    }
-
-    #[test]
-    fn parse_wrap_pane_treats_whitespace_only_section_as_none() {
-        let text = "## Prefix\n   \n\n## Suffix\n\n";
-        let (p, q) = parse_wrap_pane(text);
-        assert_eq!(p, None);
-        assert_eq!(q, None);
-    }
-
-    #[test]
-    fn parse_wrap_pane_drops_text_before_first_header() {
-        // Anything written above the first `## Prefix` is treated as a
-        // free-form comment by the user and discarded — the editor file is
-        // not a general-purpose markdown document.
-        let text = "stray noise\n## Prefix\nbody\n## Suffix\nsuf\n";
-        let (p, q) = parse_wrap_pane(text);
-        assert_eq!(p.as_deref(), Some("body"));
-        assert_eq!(q.as_deref(), Some("suf"));
-    }
-
-    #[test]
-    fn parse_wrap_pane_handles_missing_suffix_section() {
-        // A user could delete the suffix header entirely; parser treats the
-        // missing section as `None` rather than panicking.
-        let text = "## Prefix\nbody\n";
-        let (p, q) = parse_wrap_pane(text);
-        assert_eq!(p.as_deref(), Some("body"));
-        assert_eq!(q, None);
+    fn parse_prompt_pane_treats_whitespace_only_as_none() {
+        assert_eq!(parse_prompt_pane("   \n\n  \n"), None);
+        assert_eq!(parse_prompt_pane(""), None);
     }
 
     // -- edit_universal_pane ----------------------------------------------
@@ -3635,10 +3445,9 @@ mod tests {
     }
 
     #[test]
-    fn edit_universal_pane_seeds_editor_with_current_pair() {
+    fn edit_universal_pane_seeds_editor_with_current_prompt() {
         let mut config = Config {
-            prompt_prefix: Some("PRE".to_string()),
-            prompt_suffix: Some("SUF".to_string()),
+            prompt: Some("CURRENT PROMPT".to_string()),
             ..Config::default()
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -3651,8 +3460,7 @@ mod tests {
         assert_eq!(outcome, EditOutcome::NoEditor);
 
         let buf = seen.borrow().clone().expect("editor was invoked");
-        assert!(buf.contains("## Prefix\nPRE\n"), "got: {buf}");
-        assert!(buf.contains("## Suffix\nSUF\n"), "got: {buf}");
+        assert_eq!(buf, "CURRENT PROMPT\n");
     }
 
     #[test]
@@ -3674,17 +3482,13 @@ mod tests {
     #[test]
     fn edit_universal_pane_returns_no_changes_when_buffer_unchanged() {
         let mut config = Config {
-            prompt_prefix: Some("hello".to_string()),
-            prompt_suffix: None,
+            prompt: Some("hello".to_string()),
             ..Config::default()
         };
         let tmp = tempfile::tempdir().unwrap();
         let mut app = make_step_app();
 
-        let initial = format_wrap_pane(
-            config.prompt_prefix.as_deref(),
-            config.prompt_suffix.as_deref(),
-        );
+        let initial = format_prompt_pane(config.prompt.as_deref());
         let outcome = app
             .edit_universal_pane(&mut config, tmp.path(), fake_editor(Some(initial)))
             .unwrap();
@@ -3695,59 +3499,55 @@ mod tests {
             "no-changes path must not write the config"
         );
         // Config struct unchanged.
-        assert_eq!(config.prompt_prefix.as_deref(), Some("hello"));
-        assert_eq!(config.prompt_suffix, None);
+        assert_eq!(config.prompt.as_deref(), Some("hello"));
     }
 
     #[test]
     fn edit_universal_pane_persists_on_change() {
         let mut config = Config {
-            prompt_prefix: Some("old-pre".to_string()),
-            prompt_suffix: Some("old-suf".to_string()),
+            prompt: Some("old prompt".to_string()),
             ..Config::default()
         };
         let tmp = tempfile::tempdir().unwrap();
         let mut app = make_step_app();
 
-        let new_text = format_wrap_pane(Some("new-pre"), Some("new-suf"));
         let outcome = app
-            .edit_universal_pane(&mut config, tmp.path(), fake_editor(Some(new_text)))
+            .edit_universal_pane(
+                &mut config,
+                tmp.path(),
+                fake_editor(Some("new prompt".to_string())),
+            )
             .unwrap();
         assert_eq!(outcome, EditOutcome::Saved);
-        // In-memory config and app mirrors both updated.
-        assert_eq!(config.prompt_prefix.as_deref(), Some("new-pre"));
-        assert_eq!(config.prompt_suffix.as_deref(), Some("new-suf"));
-        assert_eq!(app.config_prompt_prefix.as_deref(), Some("new-pre"));
-        assert_eq!(app.config_prompt_suffix.as_deref(), Some("new-suf"));
+        // In-memory config and app mirror both updated.
+        assert_eq!(config.prompt.as_deref(), Some("new prompt"));
+        assert_eq!(app.config_prompt.as_deref(), Some("new prompt"));
 
-        // File written and parses back to the new values.
+        // File written and parses back to the new value.
         let path = tmp.path().join("config.json");
         assert!(path.exists());
         let contents = std::fs::read_to_string(&path).unwrap();
         let reloaded: Config = serde_json::from_str(&contents).unwrap();
-        assert_eq!(reloaded.prompt_prefix.as_deref(), Some("new-pre"));
-        assert_eq!(reloaded.prompt_suffix.as_deref(), Some("new-suf"));
+        assert_eq!(reloaded.prompt.as_deref(), Some("new prompt"));
     }
 
     #[test]
-    fn edit_universal_pane_can_clear_both_fields() {
-        // Saving a buffer with empty bodies clears prefix and suffix to
-        // `None` — this is the "wipe my universal prompt" workflow.
+    fn edit_universal_pane_can_clear_the_prompt() {
+        // Saving an empty buffer clears the prompt to `None` — this is the
+        // "wipe my universal prompt" workflow.
         let mut config = Config {
-            prompt_prefix: Some("X".to_string()),
-            prompt_suffix: Some("Y".to_string()),
+            prompt: Some("X".to_string()),
             ..Config::default()
         };
         let tmp = tempfile::tempdir().unwrap();
         let mut app = make_step_app();
 
-        let cleared = "## Prefix\n\n## Suffix\n".to_string();
         let outcome = app
-            .edit_universal_pane(&mut config, tmp.path(), fake_editor(Some(cleared)))
+            .edit_universal_pane(&mut config, tmp.path(), fake_editor(Some(String::new())))
             .unwrap();
         assert_eq!(outcome, EditOutcome::Saved);
-        assert_eq!(config.prompt_prefix, None);
-        assert_eq!(config.prompt_suffix, None);
+        assert_eq!(config.prompt, None);
+        assert_eq!(app.config_prompt, None);
     }
 
     #[cfg(unix)]
@@ -3761,18 +3561,16 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("ed.sh");
-        // Editor writes a known prefix/suffix pair, ignoring the seeded
-        // file contents.
+        // Editor writes a known prompt, ignoring the seeded file contents.
         std::fs::write(
             &script,
-            "#!/bin/sh\nprintf '## Prefix\\nMOCK-PRE\\n\\n## Suffix\\nMOCK-SUF\\n' > \"$1\"\n",
+            "#!/bin/sh\nprintf 'MOCK PROMPT\\n' > \"$1\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut config = Config {
-            prompt_prefix: Some("before-pre".to_string()),
-            prompt_suffix: Some("before-suf".to_string()),
+            prompt: Some("before".to_string()),
             ..Config::default()
         };
         let mut app = make_step_app();
@@ -3791,8 +3589,7 @@ mod tests {
         let reloaded: Config =
             serde_json::from_str(&std::fs::read_to_string(tmp.path().join("config.json")).unwrap())
                 .unwrap();
-        assert_eq!(reloaded.prompt_prefix.as_deref(), Some("MOCK-PRE"));
-        assert_eq!(reloaded.prompt_suffix.as_deref(), Some("MOCK-SUF"));
+        assert_eq!(reloaded.prompt.as_deref(), Some("MOCK PROMPT"));
     }
 
     // -- edit_project_pane ------------------------------------------------
@@ -3823,63 +3620,55 @@ mod tests {
         assert_eq!(outcome, EditOutcome::NoEditor);
         // Nothing should be inserted into project_settings.
         let stored = storage::get_project_settings(&conn, "/proj").unwrap();
-        assert_eq!(stored.prompt_prefix, None);
-        assert_eq!(stored.prompt_suffix, None);
+        assert_eq!(stored.prompt, None);
     }
 
     #[test]
     fn edit_project_pane_no_changes_skips_writes() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_project_app(&conn, "/proj");
-        app.project_settings.prompt_prefix = Some("a".to_string());
-        let buffer = format_wrap_pane(Some("a"), None);
+        app.project_settings.prompt = Some("a".to_string());
+        let buffer = format_prompt_pane(Some("a"));
         let outcome = app
             .edit_project_pane(&conn, fake_editor(Some(buffer)))
             .unwrap();
         assert_eq!(outcome, EditOutcome::NoChanges);
         // No row written; storage still reflects the absence.
         let stored = storage::get_project_settings(&conn, "/proj").unwrap();
-        assert_eq!(stored.prompt_prefix, None);
-        assert_eq!(stored.prompt_suffix, None);
+        assert_eq!(stored.prompt, None);
     }
 
     #[test]
-    fn edit_project_pane_persists_changed_pair() {
+    fn edit_project_pane_persists_changed_prompt() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_project_app(&conn, "/proj");
-        let buffer = format_wrap_pane(Some("hello"), Some("world"));
         let outcome = app
-            .edit_project_pane(&conn, fake_editor(Some(buffer)))
+            .edit_project_pane(&conn, fake_editor(Some("hello world".to_string())))
             .unwrap();
         assert_eq!(outcome, EditOutcome::Saved);
-        // Both halves landed in the project_settings row.
+        // The new prompt landed in the project_settings row.
         let stored = storage::get_project_settings(&conn, "/proj").unwrap();
-        assert_eq!(stored.prompt_prefix.as_deref(), Some("hello"));
-        assert_eq!(stored.prompt_suffix.as_deref(), Some("world"));
+        assert_eq!(stored.prompt.as_deref(), Some("hello world"));
         // App's own mirror is in sync so the pane re-renders correctly.
-        assert_eq!(app.project_settings.prompt_prefix.as_deref(), Some("hello"));
-        assert_eq!(app.project_settings.prompt_suffix.as_deref(), Some("world"));
+        assert_eq!(app.project_settings.prompt.as_deref(), Some("hello world"));
     }
 
     #[test]
-    fn edit_project_pane_can_clear_only_one_side() {
+    fn edit_project_pane_can_clear_the_prompt() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_project_app(&conn, "/proj");
-        // Seed both sides via the storage helpers so the row exists.
-        storage::set_project_prompt_prefix(&conn, "/proj", Some("PRE")).unwrap();
-        storage::set_project_prompt_suffix(&conn, "/proj", Some("SUF")).unwrap();
-        app.project_settings.prompt_prefix = Some("PRE".to_string());
-        app.project_settings.prompt_suffix = Some("SUF".to_string());
+        // Seed a prompt via the storage helper so the row exists.
+        storage::set_project_prompt(&conn, "/proj", Some("PROMPT")).unwrap();
+        app.project_settings.prompt = Some("PROMPT".to_string());
 
-        // User clears just the suffix — prefix must be untouched.
-        let buffer = format_wrap_pane(Some("PRE"), None);
+        // User clears the prompt by saving an empty buffer.
         let outcome = app
-            .edit_project_pane(&conn, fake_editor(Some(buffer)))
+            .edit_project_pane(&conn, fake_editor(Some(String::new())))
             .unwrap();
         assert_eq!(outcome, EditOutcome::Saved);
         let stored = storage::get_project_settings(&conn, "/proj").unwrap();
-        assert_eq!(stored.prompt_prefix.as_deref(), Some("PRE"));
-        assert_eq!(stored.prompt_suffix, None);
+        assert_eq!(stored.prompt, None);
+        assert_eq!(app.project_settings.prompt, None);
     }
 
     // -- Step-prompt pane format/parse round-trips ------------------------

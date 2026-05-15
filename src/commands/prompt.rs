@@ -1,38 +1,34 @@
-// Prompt prefix/suffix commands.
+// Prompt commands.
 //
-// Two scopes share a single CLI noun (`ralph prompt ...`): global lives in
-// config.json, project lives in `project_settings`. Both read/write paths
-// share the same `PromptScope` enum dispatched here.
+// The four-layer prompt model has ONE content blob per layer. Two scopes
+// share a single CLI noun (`ralph prompt ...`): the Global layer lives in
+// config.json, the Project layer lives in `project_settings`. Both read/write
+// paths share the same `PromptScope` enum dispatched here.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::cli::PromptScope;
 use crate::config::{self, Config};
 use crate::output::{self, OutputContext, OutputFormat};
-use crate::prompt::{PromptWrap, PromptWraps};
 use crate::storage;
 
-/// Serializable view of a single scope's prefix/suffix pair for JSON output.
+/// Serializable view of a single scope's prompt for JSON output.
 #[derive(Debug, serde::Serialize)]
 struct ScopeView<'a> {
     scope: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prefix: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    suffix: Option<&'a str>,
+    prompt: Option<&'a str>,
 }
 
-/// Composed (fully-layered) wrap for `--resolved` output.
+/// Composed (fully-layered) prompt for `--resolved` output.
 #[derive(Debug, serde::Serialize)]
 struct ResolvedView {
     #[serde(skip_serializing_if = "Option::is_none")]
-    prefix: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    suffix: Option<String>,
+    prompt: Option<String>,
 }
 
-/// `ralph prompt show` — display configured prompt wraps.
+/// `ralph prompt show` — display configured prompts.
 pub fn cmd_prompt_show(
     conn: &Connection,
     config: &Config,
@@ -44,30 +40,31 @@ pub fn cmd_prompt_show(
     let project_settings = storage::get_project_settings(conn, project)?;
 
     if resolved {
-        let wraps = PromptWraps {
-            global: PromptWrap::from_opts(
-                config.prompt_prefix.as_ref(),
-                config.prompt_suffix.as_ref(),
-            ),
-            project: PromptWrap::from_opts(
-                project_settings.prompt_prefix.as_ref(),
-                project_settings.prompt_suffix.as_ref(),
-            ),
-            plan: PromptWrap::default(),
-        };
-        return print_resolved(&wraps, out);
+        // Compose exactly how build_step_prompt stacks the layers, but
+        // without a step body — the user sees the leading text a harness
+        // receives. There's no plan in this command's context, so only the
+        // global and project layers participate.
+        let composed = join_layers([config.prompt.as_deref(), project_settings.prompt.as_deref()]);
+        let view = ResolvedView { prompt: composed };
+        if out.format == OutputFormat::Json {
+            println!("{}", serde_json::to_string(&view)?);
+        } else {
+            match &view.prompt {
+                Some(p) => println!("prompt:\n{}", indent(p, "  ")),
+                None => println!("prompt: <none>"),
+            }
+        }
+        return Ok(());
     }
 
     let all_views = [
         ScopeView {
             scope: "global",
-            prefix: config.prompt_prefix.as_deref(),
-            suffix: config.prompt_suffix.as_deref(),
+            prompt: config.prompt.as_deref(),
         },
         ScopeView {
             scope: "project",
-            prefix: project_settings.prompt_prefix.as_deref(),
-            suffix: project_settings.prompt_suffix.as_deref(),
+            prompt: project_settings.prompt.as_deref(),
         },
     ];
 
@@ -89,99 +86,66 @@ pub fn cmd_prompt_show(
     Ok(())
 }
 
-/// `ralph prompt set` — upsert prefix and/or suffix at one scope.
+/// `ralph prompt set` — replace the prompt at one scope. An empty string
+/// clears it (stored as "unset" so the layer contributes nothing).
 pub fn cmd_prompt_set(
     conn: &Connection,
     config_path: &std::path::Path,
     project: &str,
     scope: PromptScope,
-    prefix: Option<&str>,
-    suffix: Option<&str>,
+    content: &str,
     out: &OutputContext,
 ) -> Result<()> {
-    if prefix.is_none() && suffix.is_none() {
-        bail!("Provide at least one of --prefix / --suffix");
-    }
+    let value = if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    };
 
     match scope {
         PromptScope::Global => {
             // Load from disk (not the preloaded `Config`) so we only rewrite
-            // the fields we own — preserving any manual edits the user made
+            // the field we own — preserving any manual edits the user made
             // between this process starting and the set call.
             let mut cfg = config::load_or_create_config()?;
-            if let Some(p) = prefix {
-                cfg.prompt_prefix = Some(p.to_string());
-            }
-            if let Some(s) = suffix {
-                cfg.prompt_suffix = Some(s.to_string());
-            }
+            cfg.prompt = value.map(str::to_string);
             write_config(&cfg, config_path)?;
         }
         PromptScope::Project => {
-            if let Some(p) = prefix {
-                storage::set_project_prompt_prefix(conn, project, Some(p))?;
-            }
-            if let Some(s) = suffix {
-                storage::set_project_prompt_suffix(conn, project, Some(s))?;
-            }
+            storage::set_project_prompt(conn, project, value)?;
         }
     }
 
     if !out.quiet {
         let icon = output::check_icon(out.color);
-        eprintln!(
-            "{icon} Updated {} prompt wrap{}{}",
-            scope_name(scope),
-            prefix.map_or("", |_| " (prefix)"),
-            suffix.map_or("", |_| " (suffix)"),
-        );
+        let verb = if value.is_some() { "Updated" } else { "Cleared" };
+        eprintln!("{icon} {verb} {} prompt", scope_name(scope));
     }
     Ok(())
 }
 
-/// `ralph prompt clear` — null out prefix and/or suffix at one scope.
+/// `ralph prompt clear` — null out the prompt at one scope.
 pub fn cmd_prompt_clear(
     conn: &Connection,
     config_path: &std::path::Path,
     project: &str,
     scope: PromptScope,
-    clear_prefix: bool,
-    clear_suffix: bool,
     out: &OutputContext,
 ) -> Result<()> {
-    if !clear_prefix && !clear_suffix {
-        bail!("Pass at least one of --prefix / --suffix to specify what to clear");
-    }
-
     match scope {
         PromptScope::Global => {
             let mut cfg = config::load_or_create_config()?;
-            if clear_prefix {
-                cfg.prompt_prefix = None;
-            }
-            if clear_suffix {
-                cfg.prompt_suffix = None;
-            }
+            cfg.prompt = None;
             write_config(&cfg, config_path)?;
         }
         PromptScope::Project => {
-            if clear_prefix {
-                storage::set_project_prompt_prefix(conn, project, None)?;
-            }
-            if clear_suffix {
-                storage::set_project_prompt_suffix(conn, project, None)?;
-            }
+            storage::set_project_prompt(conn, project, None)?;
         }
     }
 
     if !out.quiet {
         let icon = output::check_icon(out.color);
-        eprintln!(
-            "{icon} Cleared {} prompt wrap{}{}",
-            scope_name(scope),
-            if clear_prefix { " (prefix)" } else { "" },
-            if clear_suffix { " (suffix)" } else { "" },
-        );
+        eprintln!("{icon} Cleared {} prompt", scope_name(scope));
     }
     Ok(())
 }
@@ -206,36 +170,11 @@ fn write_config(cfg: &Config, path: &std::path::Path) -> Result<()> {
 
 fn print_scope_plain(view: &ScopeView<'_>) {
     println!("[{}]", view.scope);
-    match view.prefix {
-        Some(p) => println!("  prefix:\n{}", indent(p, "    ")),
-        None => println!("  prefix: <unset>"),
-    }
-    match view.suffix {
-        Some(s) => println!("  suffix:\n{}", indent(s, "    ")),
-        None => println!("  suffix: <unset>"),
+    match view.prompt {
+        Some(p) => println!("  prompt:\n{}", indent(p, "    ")),
+        None => println!("  prompt: <unset>"),
     }
     println!();
-}
-
-fn print_resolved(wraps: &PromptWraps<'_>, out: &OutputContext) -> Result<()> {
-    // Compose prefix/suffix exactly how build_step_prompt would, but without
-    // the body in between — the user sees the actual text a harness receives.
-    let prefix = join_layers([wraps.global.prefix, wraps.project.prefix, wraps.plan.prefix]);
-    let suffix = join_layers([wraps.plan.suffix, wraps.project.suffix, wraps.global.suffix]);
-    let view = ResolvedView { prefix, suffix };
-    if out.format == OutputFormat::Json {
-        println!("{}", serde_json::to_string(&view)?);
-    } else {
-        match &view.prefix {
-            Some(p) => println!("prefix:\n{}\n", indent(p, "  ")),
-            None => println!("prefix: <none>\n"),
-        }
-        match &view.suffix {
-            Some(s) => println!("suffix:\n{}", indent(s, "  ")),
-            None => println!("suffix: <none>"),
-        }
-    }
-    Ok(())
 }
 
 fn join_layers<const N: usize>(layers: [Option<&str>; N]) -> Option<String> {

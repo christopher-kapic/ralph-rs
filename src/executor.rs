@@ -19,7 +19,7 @@ use crate::hooks::{self, HookContext};
 use crate::io_util;
 use crate::output::ChunkStream;
 use crate::plan::{ChangePolicy, Phase, Plan, Step, StepStatus, TerminationReason, TestStatus};
-use crate::prompt::{self, PromptWrap, PromptWraps, RetryContext};
+use crate::prompt::{self, Prompts, RetryContext};
 use crate::run_lock::process_start_token;
 use crate::storage::{self, ChildUpdate};
 use crate::test_runner;
@@ -730,21 +730,15 @@ pub async fn execute_step(
         // prompts when the harness can't take an agent file directly).
         let agent_name = step.agent.as_deref().or(plan.agent.as_deref());
 
-        // Collect prompt prefix/suffix layers. Project-scope settings are
-        // looked up by project path; a missing row is treated as "no wrap".
-        // The plan layer no longer carries a prompt wrap (the legacy per-plan
-        // prefix/suffix columns were dropped in migration V21).
+        // Collect the four-layer prompt model's configurable layers. The
+        // Global layer comes from config, the Project layer from the
+        // `project_settings` row (a missing row is treated as "no project
+        // prompt"), and the Plan layer is the plan's own description.
         let project_settings = storage::get_project_settings(conn, &plan.project)?;
-        let wraps = PromptWraps {
-            global: PromptWrap::from_opts(
-                config.prompt_prefix.as_ref(),
-                config.prompt_suffix.as_ref(),
-            ),
-            project: PromptWrap::from_opts(
-                project_settings.prompt_prefix.as_ref(),
-                project_settings.prompt_suffix.as_ref(),
-            ),
-            plan: PromptWrap::default(),
+        let prompts = Prompts {
+            global: config.prompt.clone(),
+            project: project_settings.prompt.clone(),
+            plan: Some(plan.description.clone()),
         };
 
         // Fetch any answered questions for this step so the next-attempt
@@ -762,7 +756,7 @@ pub async fn execute_step(
             agent_name,
             retry_context.as_ref(),
             harness_config.supports_agent_file,
-            &wraps,
+            &prompts,
             &answered_questions,
         );
 

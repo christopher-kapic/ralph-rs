@@ -660,32 +660,17 @@ fn main() -> Result<()> {
                 PromptCommand::Show { scope, resolved } => commands::cmd_prompt_show(
                     &conn, &config, &project, scope, resolved, &out,
                 ),
-                PromptCommand::Set {
-                    scope,
-                    prefix,
-                    suffix,
-                } => commands::cmd_prompt_set(
+                PromptCommand::Set { scope, content } => commands::cmd_prompt_set(
                     &conn,
                     &config_path,
                     &project,
                     scope,
-                    prefix.as_deref(),
-                    suffix.as_deref(),
+                    &content,
                     &out,
                 ),
-                PromptCommand::Clear {
-                    scope,
-                    prefix,
-                    suffix,
-                } => commands::cmd_prompt_clear(
-                    &conn,
-                    &config_path,
-                    &project,
-                    scope,
-                    prefix,
-                    suffix,
-                    &out,
-                ),
+                PromptCommand::Clear { scope } => {
+                    commands::cmd_prompt_clear(&conn, &config_path, &project, scope, &out)
+                }
             }
         }
 

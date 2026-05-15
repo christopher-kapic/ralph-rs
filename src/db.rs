@@ -31,6 +31,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v19,
     migrate_v20,
     migrate_v21,
+    migrate_v22,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -672,6 +673,41 @@ fn migrate_v21(conn: &Connection) -> Result<()> {
         ALTER TABLE plans DROP COLUMN prompt_prefix;
         ALTER TABLE plans DROP COLUMN prompt_suffix;
         ALTER TABLE plans DROP COLUMN context_prepend;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V22: collapse project_settings prompt prefix/suffix into `prompt`
+// ---------------------------------------------------------------------------
+
+fn migrate_v22(conn: &Connection) -> Result<()> {
+    // The prompt model collapsed to a strict four-layer
+    // (Global/Project/Plan/Step) shape with ONE content blob per layer. The
+    // project layer kept a `prompt_prefix` / `prompt_suffix` pair (added
+    // V10); fold them into a single `prompt` column.
+    //
+    // Backfill concatenates the two with a blank line between them, skipping
+    // whichever side is NULL, so no user-set project prompt is lost. SQLite
+    // 3.50.x (bundled) supports `ALTER TABLE ... DROP COLUMN`, and neither
+    // column participates in an index or constraint (the table's only key is
+    // `project`), so the drops succeed directly.
+    conn.execute_batch(
+        "
+        ALTER TABLE project_settings ADD COLUMN prompt TEXT;
+
+        UPDATE project_settings
+        SET prompt = CASE
+            WHEN prompt_prefix IS NOT NULL AND prompt_suffix IS NOT NULL
+                THEN prompt_prefix || char(10) || char(10) || prompt_suffix
+            WHEN prompt_prefix IS NOT NULL THEN prompt_prefix
+            WHEN prompt_suffix IS NOT NULL THEN prompt_suffix
+            ELSE NULL
+        END;
+
+        ALTER TABLE project_settings DROP COLUMN prompt_prefix;
+        ALTER TABLE project_settings DROP COLUMN prompt_suffix;
         ",
     )?;
     Ok(())
@@ -1548,6 +1584,86 @@ mod tests {
         assert_eq!(slug, "old");
         assert_eq!(desc, "desc");
         assert_eq!(lrb.as_deref(), Some("feat/x"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op (DROP COLUMN must not run twice).
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v22_collapses_project_settings_prompt_columns() {
+        // Seed a pre-V22 DB, populate project_settings rows exercising every
+        // prefix/suffix NULL combination, then run V22 and verify the
+        // concatenation backfill and the dropped columns.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v21.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v21 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(21) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        // Four rows: both, prefix-only, suffix-only, neither.
+        conn.execute_batch(
+            "
+            INSERT INTO project_settings (project, prompt_prefix, prompt_suffix)
+                VALUES ('/both', 'PRE', 'SUF');
+            INSERT INTO project_settings (project, prompt_prefix, prompt_suffix)
+                VALUES ('/preonly', 'ONLY-PRE', NULL);
+            INSERT INTO project_settings (project, prompt_prefix, prompt_suffix)
+                VALUES ('/sufonly', NULL, 'ONLY-SUF');
+            INSERT INTO project_settings (project, prompt_prefix, prompt_suffix)
+                VALUES ('/neither', NULL, NULL);
+            ",
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V22 applies, backfills `prompt`, drops the old columns.
+        let conn = open_at(&path).unwrap();
+
+        let cols: Vec<String> = conn
+            .prepare("SELECT * FROM project_settings LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        for dropped in ["prompt_prefix", "prompt_suffix"] {
+            assert!(
+                !cols.iter().any(|c| c == dropped),
+                "column {dropped} should have been dropped by V22 (cols: {cols:?})"
+            );
+        }
+        assert!(cols.iter().any(|c| c == "prompt"));
+
+        let prompt_for = |project: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT prompt FROM project_settings WHERE project = ?1",
+                [project],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(prompt_for("/both").as_deref(), Some("PRE\n\nSUF"));
+        assert_eq!(prompt_for("/preonly").as_deref(), Some("ONLY-PRE"));
+        assert_eq!(prompt_for("/sufonly").as_deref(), Some("ONLY-SUF"));
+        assert_eq!(prompt_for("/neither"), None);
 
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
