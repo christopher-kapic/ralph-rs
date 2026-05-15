@@ -52,6 +52,58 @@ impl std::fmt::Display for PromptInputMode {
     }
 }
 
+/// What to do when `PromptInputMode::Argv` is selected but the prompt
+/// exceeds the kernel's argv ceiling (`MAX_ARG_STRLEN` = 128 KB on Linux).
+///
+/// Consulted only when the primary mode is `Argv` and the prompt is large
+/// enough to risk `E2BIG`. The default — `SpillToTempFile` — preserves the
+/// historical "transparently materialize a tempfile and swap its path into
+/// `{prompt}`" behavior, which only works for harnesses that interpret the
+/// substituted value as a file path. Most harnesses do NOT; their CLI reads
+/// the value as literal prompt text.
+///
+/// `Error` is for harnesses that accept prompts only as inline argv text
+/// with no file/stdin fallback. Spilling silently produces a broken
+/// invocation (the harness sees a path string and treats it as the prompt),
+/// so the safer behavior is to abort with a clear error. The canonical
+/// example is the GitHub Copilot CLI: as of github/copilot-cli#1046 it has
+/// no `--prompt-file`, no `@file` syntax, and no stdin support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ArgvOverflowBehavior {
+    /// Materialize the prompt to a `NamedTempFile` and substitute its path
+    /// for `{prompt}` in `args`. The default. Correct only when the
+    /// harness's CLI interprets the value as a file path, not as inline
+    /// text. Verified for: none of the current built-ins (kept as default
+    /// for backward compatibility — harnesses that need stricter behavior
+    /// set `Error` or `SpillToStdin` explicitly).
+    #[default]
+    SpillToTempFile,
+    /// Pipe the prompt to the child's stdin and strip the `{prompt}`
+    /// placeholder from `args`. Valid only when the harness's CLI accepts
+    /// prompts on stdin (typically via a trailing `-` positional or by
+    /// having no positional prompt arg at all). None of the current
+    /// built-ins use this — they declare `prompt_input: Stdin` directly
+    /// instead — but it stays in the enum for harnesses that prefer argv
+    /// for short prompts and accept stdin only as a fallback.
+    SpillToStdin,
+    /// Abort the invocation with a clear error. The harness's CLI accepts
+    /// prompts only as inline argv text and has no working alternative
+    /// delivery mode. Used by `copilot` per github/copilot-cli#1046.
+    Error,
+}
+
+impl std::fmt::Display for ArgvOverflowBehavior {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ArgvOverflowBehavior::SpillToTempFile => "spill_to_temp_file",
+            ArgvOverflowBehavior::SpillToStdin => "spill_to_stdin",
+            ArgvOverflowBehavior::Error => "error",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Configuration for a single coding agent harness.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HarnessConfig {
@@ -129,10 +181,21 @@ pub struct HarnessConfig {
     /// is stripped from `args` at spawn time and the prompt text is piped
     /// to the child's stdin instead. In `TempFile` mode the placeholder is
     /// replaced with a temp file path. In `Argv` mode the prompt is passed
-    /// inline — with an automatic spill to `TempFile` when the prompt
-    /// exceeds 64 KB (half the kernel limit, for safety margin).
+    /// inline; what happens past the 64 KB threshold is controlled by
+    /// [`Self::argv_overflow`].
     #[serde(default)]
     pub prompt_input: PromptInputMode,
+    /// Fallback delivery when `prompt_input == Argv` and the prompt
+    /// exceeds the argv spill threshold. Defaults to
+    /// [`ArgvOverflowBehavior::SpillToTempFile`] for backward compatibility
+    /// (preserves the pre-existing auto-spill behavior), but for harnesses
+    /// whose CLI cannot read a file path or stdin in place of the inline
+    /// prompt, set this to [`ArgvOverflowBehavior::Error`] so ralph fails
+    /// loudly instead of producing a silently-broken invocation.
+    ///
+    /// Ignored when `prompt_input != Argv`.
+    #[serde(default)]
+    pub argv_overflow: ArgvOverflowBehavior,
     /// Optional per-harness color override as `#RRGGBB` hex. Takes
     /// precedence over the hardcoded color map in `output::harness_color`.
     /// Validated at config load time; malformed values cause a hard error.
@@ -403,6 +466,8 @@ impl Default for Config {
                 // Claude accepts prompts on stdin via `-p -` (see args
                 // above). Stdin mode bypasses the 128 KB argv cap.
                 prompt_input: PromptInputMode::Stdin,
+                // Stdin mode; argv_overflow is unused but set for clarity.
+                argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -465,6 +530,8 @@ impl Default for Config {
                 // present; the `{prompt}` placeholder is stripped in Stdin
                 // mode and the prompt is piped in.
                 prompt_input: PromptInputMode::Stdin,
+                // Stdin mode; argv_overflow is unused but set for clarity.
+                argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -500,6 +567,8 @@ impl Default for Config {
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
                 prompt_input: PromptInputMode::Stdin,
+                // Stdin mode; argv_overflow is unused but set for clarity.
+                argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -530,11 +599,15 @@ impl Default for Config {
                 default_model: None,
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
-                // Pi takes the prompt as a positional argv element. Uses
-                // the auto-spill guard in harness.rs to promote to a
-                // TempFile when the prompt exceeds 64 KB — no verified
-                // stdin support at this time.
+                // Pi takes the prompt as a positional argv element. The
+                // auto-spill guard in harness.rs promotes to TempFile when
+                // the prompt exceeds 64 KB — preserved as the historical
+                // default. Pi has no verified file-path or stdin fallback,
+                // so the spilled path may be misinterpreted as a literal
+                // prompt; revisit if pi gains an explicit file-input flag
+                // or if users report large-prompt failures.
                 prompt_input: PromptInputMode::Argv,
+                argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -570,6 +643,8 @@ impl Default for Config {
                 // positional prompt is supplied; Stdin mode strips the
                 // `{prompt}` placeholder and pipes the prompt in.
                 prompt_input: PromptInputMode::Stdin,
+                // Stdin mode; argv_overflow is unused but set for clarity.
+                argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -617,11 +692,17 @@ impl Default for Config {
                     "GITHUB_TOKEN".to_string(),
                 ],
                 auth_probe_args: vec![],
-                // copilot's CLI doesn't accept prompts on stdin, so ralph
-                // materializes the prompt to a temp file and substitutes
-                // the path into the `{prompt}` placeholder. The tempfile
-                // is held alive until the child exits.
-                prompt_input: PromptInputMode::TempFile,
+                // Copilot CLI accepts prompts ONLY as inline argv text:
+                // no `--prompt-file`, no `@file` syntax for `-p`, and no
+                // stdin support as of github/copilot-cli#1046 (filed Jan
+                // 2026, still open). Any other delivery mode silently
+                // produces a broken invocation (the harness sees a path
+                // string and treats it as the prompt). `argv_overflow:
+                // Error` makes ralph fail loudly when the prompt is too
+                // large for the kernel argv limit, instead of spilling
+                // to a tempfile and feeding copilot a path-as-prompt.
+                prompt_input: PromptInputMode::Argv,
+                argv_overflow: ArgvOverflowBehavior::Error,
                 color: None,
             },
         );
@@ -680,8 +761,13 @@ impl Default for Config {
                 auth_probe_args: vec![],
                 // goose's `-t` flag takes the prompt as an argv element.
                 // The auto-spill guard in harness.rs promotes to TempFile
-                // when the prompt exceeds 64 KB.
+                // when the prompt exceeds 64 KB — preserved as the
+                // historical default. Goose has no verified file-path
+                // fallback, so the spilled path may be misinterpreted as
+                // a literal prompt; revisit if users report large-prompt
+                // failures.
                 prompt_input: PromptInputMode::Argv,
+                argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -768,6 +854,75 @@ pub fn harness_footguns(name: &str, hc: &HarnessConfig) -> Vec<String> {
             "harness `{name}` invokes `claude -p` without `--permission-mode`. \
              Claude will block on interactive approval prompts in non-interactive \
              mode and hang the subprocess. Add `--permission-mode bypassPermissions`."
+        ));
+    }
+
+    issues
+}
+
+/// Underlying CLI binaries known to accept a `--model` / `-m` flag for
+/// per-invocation model selection. Used by [`harness_compatibility_warnings`]
+/// to flag harness configs that point at one of these commands but have an
+/// empty `model_args`, in which case `ralph step add --model …` silently
+/// drops the model override on the floor.
+///
+/// Matched on `HarnessConfig::command` (the actual binary name), not on
+/// harness *name*, so a user who creates a custom harness called
+/// `copilot-fast` pointing at `command: "copilot"` still gets the warning.
+pub const MODEL_CAPABLE_COMMANDS: &[&str] =
+    &["claude", "codex", "copilot", "goose", "opencode", "pi"];
+
+/// Inspect a harness for known compatibility issues that won't show up in
+/// `harness_footguns` but will silently break runs.
+///
+/// Currently flags:
+/// - `copilot` with `prompt_input != Argv`: the Copilot CLI accepts prompts
+///   only as inline argv text (no `--prompt-file`, no `@file` syntax, no
+///   stdin per github/copilot-cli#1046). Stdin / TempFile mode produces a
+///   broken invocation that copilot reads as a path-as-prompt.
+/// - `copilot` with `argv_overflow != Error`: same root cause — the auto-
+///   spill on large prompts would feed copilot a tempfile path; the
+///   `Error` overflow mode aborts cleanly instead.
+/// - Any harness whose `command` is in [`MODEL_CAPABLE_COMMANDS`] but whose
+///   `model_args` is empty: `ralph step add --model X` will be silently
+///   ignored.
+pub fn harness_compatibility_warnings(name: &str, hc: &HarnessConfig) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    if hc.command == "copilot" {
+        if hc.prompt_input != PromptInputMode::Argv {
+            issues.push(format!(
+                "harness `{name}` uses command `copilot` with prompt_input \
+                 = `{}`, but Copilot CLI accepts prompts ONLY as inline argv \
+                 text (no --prompt-file, no stdin per github/copilot-cli#1046). \
+                 Any other delivery silently produces a broken invocation \
+                 where copilot reads a tempfile path as the literal prompt. \
+                 Set prompt_input to `argv`.",
+                hc.prompt_input
+            ));
+        }
+        if hc.prompt_input == PromptInputMode::Argv
+            && hc.argv_overflow != ArgvOverflowBehavior::Error
+        {
+            issues.push(format!(
+                "harness `{name}` uses command `copilot` with argv_overflow \
+                 = `{}`. Copilot has no working spill fallback (no \
+                 --prompt-file / no stdin), so spilling on prompts >64 KB \
+                 would feed copilot a path-as-prompt. Set argv_overflow to \
+                 `error` so large prompts fail loudly instead.",
+                hc.argv_overflow
+            ));
+        }
+    }
+
+    if MODEL_CAPABLE_COMMANDS.contains(&hc.command.as_str()) && hc.model_args.is_empty() {
+        issues.push(format!(
+            "harness `{name}` uses command `{}` which supports per-invocation \
+             model selection, but `model_args` is empty — so `ralph step add \
+             --model X` (or the plan-level model override) is silently dropped. \
+             Add the appropriate template, e.g. `[\"--model\", \"{{model}}\"]` \
+             (or `[\"--model={{model}}\"]` for copilot).",
+            hc.command
         ));
     }
 
@@ -894,12 +1049,91 @@ fn load_or_create_config_at(dir: &Path, path: &Path) -> Result<Config> {
 fn read_and_validate(path: &Path) -> Result<Config> {
     let contents =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
-    let config: Config = serde_json::from_str(&contents)
+    let mut raw: serde_json::Value = serde_json::from_str(&contents)
         .with_context(|| format!("Failed to parse {}", path.display()))?;
+
+    // Silently fill in missing fields at load time — the report variant is
+    // for `ralph init` to surface what it persisted.
+    let _ = layer_builtin_harness_defaults(&mut raw).with_context(|| {
+        format!(
+            "Failed to layer built-in harness defaults for {}",
+            path.display()
+        )
+    })?;
+
+    let config: Config = serde_json::from_value(raw)
+        .with_context(|| format!("Failed to deserialize {}", path.display()))?;
     config
         .validate()
         .with_context(|| format!("Invalid config at {}", path.display()))?;
     Ok(config)
+}
+
+/// Layer the built-in harness defaults underneath the user's on-disk
+/// config so fields the user has not explicitly set come from
+/// [`Config::default`] rather than from `serde(default)`'s zero-value
+/// fallback.
+///
+/// Returns a list of `(harness_name, field_name)` pairs that were filled
+/// in, so callers (e.g. `ralph init`) can report exactly what was added
+/// before persisting the merged config back to disk. The load path
+/// discards this list and silently applies the merge in-memory; init
+/// uses it to print a one-line summary per added field.
+///
+/// This protects users from silent breakage when new fields are added to
+/// `HarnessConfig` in code: a config written by an older ralph that
+/// predates `model_args` or `argv_overflow` continues to work, because
+/// missing keys are filled from the current built-in default at load time.
+///
+/// The merge is JSON-level on a `serde_json::Value`, which preserves the
+/// crucial distinction between "key absent" and "key present with an
+/// empty/null value" for recognized harness fields. User-set known keys,
+/// including explicit `[]` arrays or `null` values, are never touched —
+/// only known keys that don't appear in the user's object are filled in.
+/// The config file is a closed schema: callers that persist the merged
+/// result through [`Config`] do not preserve unknown JSON keys.
+///
+/// Only applied to harnesses whose *name* matches one of the built-ins
+/// defined by [`Config::default`]. Custom-named harnesses are left alone
+/// (no built-in default exists to layer against).
+pub fn layer_builtin_harness_defaults(
+    raw: &mut serde_json::Value,
+) -> Result<Vec<(String, String)>> {
+    let mut filled: Vec<(String, String)> = Vec::new();
+
+    let Some(root) = raw.as_object_mut() else {
+        return Ok(filled);
+    };
+    let Some(harnesses_value) = root.get_mut("harnesses") else {
+        return Ok(filled);
+    };
+    let Some(user_harnesses) = harnesses_value.as_object_mut() else {
+        return Ok(filled);
+    };
+
+    let defaults = Config::default();
+    for (name, default_hc) in &defaults.harnesses {
+        let Some(user_entry) = user_harnesses.get_mut(name) else {
+            continue;
+        };
+        let Some(user_obj) = user_entry.as_object_mut() else {
+            continue;
+        };
+
+        let default_value = serde_json::to_value(default_hc).with_context(|| {
+            format!("failed to serialize built-in defaults for harness '{name}'")
+        })?;
+        let Some(default_obj) = default_value.as_object() else {
+            continue;
+        };
+        for (k, v) in default_obj {
+            if !user_obj.contains_key(k) {
+                user_obj.insert(k.clone(), v.clone());
+                filled.push((name.clone(), k.clone()));
+            }
+        }
+    }
+    Ok(filled)
 }
 
 #[cfg(test)]
@@ -1570,6 +1804,233 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.harnesses["claude"].color.as_deref(), Some("#112233"));
+    }
+
+    // -- layered harness defaults (migration / drift protection) ---------
+
+    /// Simulates the precise on-disk shape that bit the user: copilot
+    /// configured by an older ralph that predates `prompt_input` and
+    /// `argv_overflow`. The layered load MUST fill them in so the
+    /// resulting in-memory `HarnessConfig` matches the current built-in
+    /// default for delivery semantics, otherwise the run silently
+    /// produces a path-as-prompt invocation.
+    #[test]
+    fn test_layered_load_fills_missing_copilot_delivery_fields() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.json");
+        // Hand-write a config WITHOUT prompt_input or argv_overflow for
+        // copilot. Everything else uses defaults.
+        let raw = r#"{
+            "default_harness": "copilot",
+            "max_retries_per_step": 3,
+            "harnesses": {
+                "copilot": {
+                    "command": "copilot",
+                    "args": ["-p", "{prompt}", "--silent"]
+                }
+            }
+        }"#;
+        fs::write(&path, raw).unwrap();
+
+        let cfg = read_and_validate(&path).expect("read_and_validate");
+        let copilot = cfg.harnesses.get("copilot").expect("copilot present");
+
+        // The fields the user did not set must be filled from the
+        // current built-in default — NOT the enum/serde fallback.
+        assert_eq!(
+            copilot.prompt_input,
+            PromptInputMode::Argv,
+            "missing prompt_input must default to current built-in (Argv), not enum default (Stdin)"
+        );
+        assert_eq!(
+            copilot.argv_overflow,
+            ArgvOverflowBehavior::Error,
+            "missing argv_overflow must default to current built-in (Error)"
+        );
+        // model_args is the one the original agent request was about —
+        // an older config without this field must still get the model
+        // flag template wired up.
+        assert_eq!(copilot.model_args, vec!["--model={model}".to_string()]);
+        // The user's explicit args override must be preserved verbatim.
+        assert_eq!(
+            copilot.args,
+            vec![
+                "-p".to_string(),
+                "{prompt}".to_string(),
+                "--silent".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_layered_load_preserves_explicit_empty_array() {
+        // Critical semantic: an explicit `[]` is "user opted out", not
+        // "missing". The merger must NOT overwrite it with defaults.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.json");
+        let raw = r#"{
+            "default_harness": "copilot",
+            "max_retries_per_step": 3,
+            "harnesses": {
+                "copilot": {
+                    "command": "copilot",
+                    "args": ["-p", "{prompt}"],
+                    "model_args": []
+                }
+            }
+        }"#;
+        fs::write(&path, raw).unwrap();
+
+        let cfg = read_and_validate(&path).expect("read_and_validate");
+        let copilot = cfg.harnesses.get("copilot").expect("copilot present");
+        assert!(
+            copilot.model_args.is_empty(),
+            "explicit empty `model_args: []` must NOT be overwritten with defaults; got {:?}",
+            copilot.model_args
+        );
+    }
+
+    #[test]
+    fn test_layered_load_leaves_custom_harnesses_untouched() {
+        // A custom-named harness has no built-in to layer against — the
+        // merger must not touch it, leaving missing fields to serde's
+        // zero-value defaults.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("config.json");
+        let raw = r#"{
+            "default_harness": "my-custom",
+            "max_retries_per_step": 3,
+            "harnesses": {
+                "my-custom": {
+                    "command": "echo",
+                    "args": ["{prompt}"]
+                }
+            }
+        }"#;
+        fs::write(&path, raw).unwrap();
+
+        let cfg = read_and_validate(&path).expect("read_and_validate");
+        let custom = cfg.harnesses.get("my-custom").expect("present");
+        // No layered fill → serde defaults apply: empty model_args,
+        // Stdin prompt_input, etc.
+        assert_eq!(custom.command, "echo");
+        assert!(custom.model_args.is_empty());
+        assert_eq!(custom.prompt_input, PromptInputMode::Stdin);
+    }
+
+    #[test]
+    fn test_layer_function_reports_filled_fields() {
+        // The merger returns a list of (harness, field) it added — used
+        // by `ralph init` to print a one-line audit per addition. Sparse
+        // copilot entry should report at least the missing delivery
+        // fields and model_args.
+        let mut raw: serde_json::Value = serde_json::from_str(
+            r#"{
+                "default_harness": "copilot",
+                "max_retries_per_step": 3,
+                "harnesses": {
+                    "copilot": {
+                        "command": "copilot"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let filled = layer_builtin_harness_defaults(&mut raw).unwrap();
+        let copilot_fields: Vec<&str> = filled
+            .iter()
+            .filter(|(h, _)| h == "copilot")
+            .map(|(_, f)| f.as_str())
+            .collect();
+
+        for expected in &["prompt_input", "argv_overflow", "model_args", "args"] {
+            assert!(
+                copilot_fields.contains(expected),
+                "expected `{expected}` in filled fields, got {copilot_fields:?}"
+            );
+        }
+    }
+
+    // -- compatibility warnings -------------------------------------------
+
+    #[test]
+    fn test_compat_warns_on_copilot_with_non_argv_prompt_input() {
+        let mut hc = Config::default().harnesses["copilot"].clone();
+        hc.prompt_input = PromptInputMode::TempFile;
+        let issues = harness_compatibility_warnings("copilot", &hc);
+        assert!(
+            issues
+                .iter()
+                .any(|m| m.contains("Copilot CLI accepts prompts ONLY as inline argv")),
+            "expected compat warning for copilot+tempfile, got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_compat_warns_on_copilot_with_spill_overflow() {
+        // Argv + SpillToTempFile is wrong for copilot — the spill would
+        // produce a path-as-prompt invocation.
+        let mut hc = Config::default().harnesses["copilot"].clone();
+        hc.argv_overflow = ArgvOverflowBehavior::SpillToTempFile;
+        let issues = harness_compatibility_warnings("copilot", &hc);
+        assert!(
+            issues.iter().any(|m| m.contains("argv_overflow")),
+            "expected argv_overflow compat warning, got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_compat_warns_on_missing_model_args() {
+        // Any harness whose underlying CLI is in MODEL_CAPABLE_COMMANDS
+        // and has empty model_args must warn — per-step `--model` is
+        // silently dropped otherwise.
+        for cmd in MODEL_CAPABLE_COMMANDS {
+            let mut hc = HarnessConfig {
+                command: (*cmd).to_string(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: PromptInputMode::Argv,
+                argv_overflow: ArgvOverflowBehavior::Error,
+                color: None,
+            };
+            // For copilot, the prompt_input=Argv/Error combo above won't
+            // trigger the copilot-specific warning; ensure only the
+            // model_args warning fires by construction.
+            if *cmd == "copilot" {
+                hc.prompt_input = PromptInputMode::Argv;
+                hc.argv_overflow = ArgvOverflowBehavior::Error;
+            }
+            let issues = harness_compatibility_warnings("test", &hc);
+            assert!(
+                issues
+                    .iter()
+                    .any(|m| m.contains("supports per-invocation model selection")),
+                "command `{cmd}` with empty model_args must warn, got: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compat_clean_on_default_config() {
+        // The shipped Config::default() must produce zero compat warnings
+        // — otherwise `ralph init` on a fresh machine would emit noise.
+        for (name, hc) in &Config::default().harnesses {
+            let issues = harness_compatibility_warnings(name, hc);
+            assert!(
+                issues.is_empty(),
+                "default harness `{name}` must not trigger compat warnings, got: {issues:?}"
+            );
+        }
     }
 
     // -- save() round trip -------------------------------------------------

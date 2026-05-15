@@ -596,6 +596,18 @@ pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
                 message: issue,
             });
         }
+
+        // Compatibility checks (prompt_input / argv_overflow / model_args)
+        // are also delivery-mode and capability concerns that doctor should
+        // surface even when the binary isn't installed yet, so a user fixing
+        // their config in advance sees everything in one pass.
+        for issue in crate::config::harness_compatibility_warnings(name, harness_config) {
+            checks.push(CheckResult {
+                name: format!("harness:{name}:compat"),
+                severity: CheckSeverity::Warning,
+                message: issue,
+            });
+        }
     }
 
     // 4. Agents directory
@@ -734,6 +746,7 @@ mod tests {
             ],
             auth_probe_args: vec![],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
         let result = check_harness_auth("copilot", &harness);
@@ -769,6 +782,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec![],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
         let result = check_harness_auth("claude", &harness);
@@ -793,6 +807,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec!["--help".to_string()],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
         let result = check_harness_auth("custom", &harness);
@@ -817,6 +832,7 @@ mod tests {
             auth_env_vars: vec![],
             auth_probe_args: vec!["--ignored".to_string()],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
         let result = check_harness_auth("custom", &harness);
@@ -846,6 +862,7 @@ mod tests {
             auth_env_vars: vec![var.to_string()],
             auth_probe_args: vec!["--nope".to_string()],
             prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
             color: None,
         };
         let result = check_harness_auth("custom", &harness);
@@ -876,6 +893,7 @@ mod tests {
                 auth_env_vars: vec![],
                 auth_probe_args: vec![],
                 prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
                 color: None,
             },
         );
@@ -1098,6 +1116,106 @@ mod tests {
         // Config should always pass
         let config_check = checks.iter().find(|c| c.name == "config").unwrap();
         assert_eq!(config_check.severity, CheckSeverity::Pass);
+    }
+
+    #[test]
+    fn test_doctor_surfaces_copilot_incompat_warnings() {
+        // Construct a copilot harness with the broken legacy delivery
+        // (prompt_input: TempFile) and confirm `ralph doctor` surfaces
+        // the compat warning, not just the binary-availability check.
+        let mut hc = Config::default().harnesses["copilot"].clone();
+        hc.prompt_input = crate::config::PromptInputMode::TempFile;
+        // Restore overflow to default so we only get the prompt_input
+        // warning, isolating this regression's signal.
+        hc.argv_overflow = crate::config::ArgvOverflowBehavior::SpillToTempFile;
+
+        let mut harnesses = HashMap::new();
+        harnesses.insert("copilot".to_string(), hc);
+        let config = Config {
+            default_harness: "copilot".to_string(),
+            max_retries_per_step: 3,
+            timeout_secs: None,
+            hook_timeout_secs: 120,
+            auto_stash: true,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            min_free_disk_mb: 1024,
+            display_timezone: "UTC".to_string(),
+            harness_chunk_max_bytes: 4096,
+            harnesses,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let checks = run_doctor_checks(&config, tmp.path());
+
+        let compat = checks.iter().find(|c| c.name == "harness:copilot:compat");
+        assert!(
+            compat.is_some(),
+            "expected a harness:copilot:compat check, got names: {:?}",
+            checks.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        let compat = compat.unwrap();
+        assert_eq!(compat.severity, CheckSeverity::Warning);
+        assert!(
+            compat.message.contains("inline argv"),
+            "compat warning must explain the constraint, got: {}",
+            compat.message
+        );
+    }
+
+    #[test]
+    fn test_doctor_surfaces_missing_model_args_warning() {
+        // A user-defined harness that points at `claude` but clears
+        // model_args must trigger the doctor warning — per-step --model
+        // would otherwise be silently dropped.
+        let hc = crate::config::HarnessConfig {
+            command: "claude".to_string(),
+            args: vec![
+                "-p".to_string(),
+                "-".to_string(),
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+            ],
+            plan_args: vec![],
+            supports_agent_file: false,
+            supports_json_output: false,
+            json_output_args: vec![],
+            agent_file_env: None,
+            agent_file_args: vec![],
+            model_args: vec![], // <- the issue
+            default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+            color: None,
+        };
+        let mut harnesses = HashMap::new();
+        harnesses.insert("custom-claude".to_string(), hc);
+        let config = Config {
+            default_harness: "custom-claude".to_string(),
+            max_retries_per_step: 3,
+            timeout_secs: None,
+            hook_timeout_secs: 120,
+            auto_stash: true,
+            prompt_prefix: None,
+            prompt_suffix: None,
+            min_free_disk_mb: 1024,
+            display_timezone: "UTC".to_string(),
+            harness_chunk_max_bytes: 4096,
+            harnesses,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let checks = run_doctor_checks(&config, tmp.path());
+
+        let compat = checks
+            .iter()
+            .find(|c| c.name == "harness:custom-claude:compat")
+            .expect("expected compat check for custom-claude");
+        assert!(
+            compat.message.contains("model selection"),
+            "compat warning must call out the model_args issue, got: {}",
+            compat.message
+        );
     }
 
     #[test]

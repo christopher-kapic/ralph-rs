@@ -25,6 +25,7 @@ pub fn harness_list(config: &Config, json: bool, out: &OutputContext) -> Result<
                 let hc = &config.harnesses[*name];
                 let on_path = preflight::is_binary_available(&hc.command);
                 let footguns = config::harness_footguns(name, hc);
+                let compat = config::harness_compatibility_warnings(name, hc);
                 serde_json::json!({
                     "name": name,
                     "command": hc.command,
@@ -32,6 +33,7 @@ pub fn harness_list(config: &Config, json: bool, out: &OutputContext) -> Result<
                     "default_harness": *name == config.default_harness,
                     "safety": config::harness_safety_summary(hc),
                     "footguns": footguns,
+                    "compat_warnings": compat,
                 })
             })
             .collect();
@@ -54,12 +56,14 @@ pub fn harness_list(config: &Config, json: bool, out: &OutputContext) -> Result<
         };
         let safety = config::harness_safety_summary(hc);
         let footguns = config::harness_footguns(name, hc);
+        let compat = config::harness_compatibility_warnings(name, hc);
+        let warn_count = footguns.len() + compat.len();
         let mut notes = Vec::new();
         if *name == config.default_harness {
             notes.push("default".to_string());
         }
-        if !footguns.is_empty() {
-            notes.push(format!("⚠ {} footgun(s)", footguns.len()));
+        if warn_count > 0 {
+            notes.push(format!("⚠ {warn_count} warning(s)"));
         }
         let notes_str = notes.join(", ");
         println!(
@@ -68,16 +72,18 @@ pub fn harness_list(config: &Config, json: bool, out: &OutputContext) -> Result<
         );
     }
 
-    // Print any footgun details after the table so the user sees the
+    // Print any warning details after the table so the user sees the
     // remediation text inline. `ralph harness list` is the discovery path
     // for "why is my run silently doing nothing?" — burying these details
     // behind another command would defeat that.
-    let mut any_footgun = false;
+    let mut any_warning = false;
     for name in &names {
-        let issues = config::harness_footguns(name, &config.harnesses[*name]);
-        if !issues.is_empty() && !any_footgun {
+        let hc = &config.harnesses[*name];
+        let mut issues = config::harness_footguns(name, hc);
+        issues.extend(config::harness_compatibility_warnings(name, hc));
+        if !issues.is_empty() && !any_warning {
             println!();
-            any_footgun = true;
+            any_warning = true;
         }
         for issue in &issues {
             println!("  ⚠ {issue}");
@@ -107,6 +113,7 @@ pub fn harness_show(config: &Config, name: &str, json: bool, out: &OutputContext
             "on_path": preflight::is_binary_available(&hc.command),
             "safety": config::harness_safety_summary(hc),
             "footguns": config::harness_footguns(name, hc),
+            "compat_warnings": config::harness_compatibility_warnings(name, hc),
             "config": hc,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -134,6 +141,7 @@ pub fn harness_show(config: &Config, name: &str, json: bool, out: &OutputContext
     println!("  args:                 {}", format_arg_vec(&hc.args));
     println!("  plan_args:            {}", format_arg_vec(&hc.plan_args));
     println!("  prompt_input:         {}", hc.prompt_input);
+    println!("  argv_overflow:        {}", hc.argv_overflow);
     println!("  supports_agent_file:  {}", hc.supports_agent_file);
     if let Some(env) = &hc.agent_file_env {
         println!("  agent_file_env:       {env}");
@@ -170,10 +178,11 @@ pub fn harness_show(config: &Config, name: &str, json: bool, out: &OutputContext
         println!("  color:                {color}");
     }
 
-    let footguns = config::harness_footguns(name, hc);
-    if !footguns.is_empty() {
+    let mut issues = config::harness_footguns(name, hc);
+    issues.extend(config::harness_compatibility_warnings(name, hc));
+    if !issues.is_empty() {
         println!();
-        for issue in &footguns {
+        for issue in &issues {
             println!("  ⚠ {issue}");
         }
     }
