@@ -226,11 +226,6 @@ fn default_min_free_disk_mb() -> u64 {
     1024
 }
 
-/// Default global prompt seeded by `ralph init`. Points agents at the
-/// ralph CLI so they can look up plan details themselves, and flags
-/// AGENTS.md/CLAUDE.md as the place for plan-specific conventions.
-pub const DEFAULT_GLOBAL_PROMPT: &str = "You are running as part of a `ralph` plan. Run `ralph status` to see the active plan, or `ralph plan show <slug>` for full details. Plan-specific conventions may be defined in AGENTS.md or CLAUDE.md.";
-
 /// Default IANA timezone name used by the progress-header "started at"
 /// stamp. UTC is safe on any platform and doesn't change semantics at DST
 /// boundaries. Users opt in to a local zone via `ralph config set-timezone`.
@@ -780,7 +775,11 @@ impl Default for Config {
             timeout_secs: None,
             hook_timeout_secs: default_hook_timeout_secs(),
             auto_stash: default_auto_stash(),
-            prompt: Some(DEFAULT_GLOBAL_PROMPT.to_string()),
+            // The global prompt is seeded by `ralph init` (see
+            // `commands::seed_global_prompt`), the canonical source of
+            // ralph's built-in introspection block. A default config has no
+            // prompt; init fills it with `prompt::DEFAULT_CONTEXT_PREPEND`.
+            prompt: None,
             min_free_disk_mb: default_min_free_disk_mb(),
             display_timezone: default_display_timezone(),
             harness_chunk_max_bytes: default_harness_chunk_max_bytes(),

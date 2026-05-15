@@ -86,6 +86,12 @@ pub enum Command {
         /// config is preserved and init will not re-prompt.
         #[arg(long)]
         force: bool,
+
+        /// Re-seed the global prompt with ralph's built-in default,
+        /// overwriting any existing customization. Without this flag the
+        /// global prompt is only seeded when it is missing or blank.
+        #[arg(long)]
+        restore_prompts: bool,
     },
 
     /// Manage plans.

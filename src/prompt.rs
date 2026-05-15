@@ -39,6 +39,13 @@ attempt. After your last call, exit normally (zero status). The plan
 will pause; the user will answer in the TUI; your next attempt will
 receive every answered question in the appended retry context.";
 
+/// Seed source for the global prompt (`config.prompt`): `ralph init` is the
+/// canonical place this block is written from (see
+/// `commands::seed_global_prompt`). A fresh or blank `config.prompt` is
+/// filled with it, and `ralph init --restore-prompts` re-seeds it
+/// unconditionally. It is still consumed directly by `build_step_prompt`
+/// today (removing that use is a later step).
+///
 /// This string is a user-facing contract — case, punctuation, and line
 /// breaks are load-bearing and should not drift without a conscious bump.
 pub const DEFAULT_CONTEXT_PREPEND: &str = "\

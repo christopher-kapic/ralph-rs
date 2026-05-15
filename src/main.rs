@@ -86,11 +86,13 @@ fn main() -> Result<()> {
             non_interactive,
             default_harness,
             force,
+            restore_prompts,
         } => {
             let opts = commands::InitOptions {
                 non_interactive,
                 default_harness,
                 force,
+                restore_prompts,
             };
             commands::cmd_init(&opts, &out)?;
             Ok(())
