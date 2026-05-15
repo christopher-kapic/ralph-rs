@@ -342,6 +342,83 @@ mod tests {
         assert!(!storage::project_prompt_file_path(&project).exists());
     }
 
+    /// `--scope universal` (clap alias for `global`) drives the exact same
+    /// global config.json path as `--scope global` through `cmd_prompt_set`.
+    /// We parse the CLI so the alias-resolution is exercised end to end, then
+    /// assert the handler wrote `config.prompt`.
+    #[test]
+    fn universal_alias_sets_global_prompt_like_global() {
+        use crate::cli::{Cli, Command, PromptCommand};
+        use clap::Parser;
+
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        // Resolve the scope through clap's alias machinery, exactly as the
+        // real CLI dispatch does.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "prompt",
+            "set",
+            "--scope",
+            "universal",
+            "from universal alias",
+        ])
+        .unwrap();
+        let scope = match cli.command.unwrap() {
+            Command::Prompt(PromptCommand::Set { scope, .. }) => scope,
+            _ => panic!("expected prompt set"),
+        };
+        assert_eq!(scope, PromptScope::Global);
+
+        // Point config loading at the isolated temp dir so we don't touch
+        // the user's real config. The Global path in `cmd_prompt_set`
+        // round-trips through `config::load_or_create_config()` /
+        // `config::config_dir()`, so the config_path we pass must be the
+        // XDG-resolved one (not an arbitrary tempfile).
+        let _xdg = set_xdg(dir.path());
+        let cfg_path = crate::config::config_dir().unwrap().join("config.json");
+
+        cmd_prompt_set(
+            &conn,
+            &cfg_path,
+            &project,
+            scope,
+            "from universal alias",
+            &quiet_out(),
+        )
+        .unwrap();
+
+        let cfg = crate::config::load_or_create_config().unwrap();
+        assert_eq!(cfg.prompt.as_deref(), Some("from universal alias"));
+    }
+
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serialize tests that mutate `$XDG_CONFIG_HOME` (process-wide env).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct XdgGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl Drop for XdgGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+                None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            }
+        }
+    }
+    fn set_xdg(path: &std::path::Path) -> XdgGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: guarded by ENV_LOCK for the lifetime of the returned guard.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", path) };
+        XdgGuard { _lock: lock, prev }
+    }
+
     /// `prompt clear --scope project` clears the DB row when no file exists.
     #[test]
     fn project_clear_clears_db_when_file_absent() {

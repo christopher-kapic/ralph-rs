@@ -1061,7 +1061,10 @@ pub enum HooksCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub enum PromptScope {
-    /// Global layer stored in `~/.config/ralph-rs/config.json`.
+    /// Global layer stored in `~/.config/ralph-rs/config.json`. Accepts
+    /// `universal` as an alias — both resolve to this single variant, so
+    /// every prompt subcommand path treats them identically.
+    #[value(alias = "universal")]
     Global,
     /// Project layer stored in SQLite keyed on the current project path.
     Project,
@@ -2161,5 +2164,61 @@ mod tests {
         } else {
             panic!("Expected Plan SetHook");
         }
+    }
+
+    #[test]
+    fn test_parse_prompt_scope_universal_resolves_to_global() {
+        // `--scope universal` is a clap value alias for `global`; the enum
+        // maps it onto the single `Global` variant so every downstream
+        // prompt subcommand path treats them identically.
+        let cli = Cli::try_parse_from([
+            "ralph-rs", "prompt", "set", "--scope", "universal", "hello world",
+        ])
+        .unwrap();
+        if let Command::Prompt(PromptCommand::Set { scope, content }) = cli.command.unwrap() {
+            assert_eq!(scope, PromptScope::Global);
+            assert_eq!(content, "hello world");
+        } else {
+            panic!("Expected Prompt Set");
+        }
+
+        // Same for `clear` and `show`.
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "prompt", "clear", "--scope", "universal"]).unwrap();
+        if let Command::Prompt(PromptCommand::Clear { scope }) = cli.command.unwrap() {
+            assert_eq!(scope, PromptScope::Global);
+        } else {
+            panic!("Expected Prompt Clear");
+        }
+
+        let cli = Cli::try_parse_from([
+            "ralph-rs", "prompt", "show", "--scope", "universal",
+        ])
+        .unwrap();
+        if let Command::Prompt(PromptCommand::Show { scope, .. }) = cli.command.unwrap() {
+            assert_eq!(scope, Some(PromptScope::Global));
+        } else {
+            panic!("Expected Prompt Show");
+        }
+    }
+
+    #[test]
+    fn test_parse_prompt_scope_global_and_universal_are_indistinguishable() {
+        // The two spellings must parse to the exact same variant — there's
+        // no separate "Universal" variant to diverge later.
+        let from_global =
+            Cli::try_parse_from(["ralph-rs", "prompt", "clear", "--scope", "global"]).unwrap();
+        let from_universal =
+            Cli::try_parse_from(["ralph-rs", "prompt", "clear", "--scope", "universal"]).unwrap();
+        let g = match from_global.command.unwrap() {
+            Command::Prompt(PromptCommand::Clear { scope }) => scope,
+            _ => panic!("Expected Prompt Clear"),
+        };
+        let u = match from_universal.command.unwrap() {
+            Command::Prompt(PromptCommand::Clear { scope }) => scope,
+            _ => panic!("Expected Prompt Clear"),
+        };
+        assert_eq!(g, u);
+        assert_eq!(g, PromptScope::Global);
     }
 }
