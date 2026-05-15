@@ -1,8 +1,8 @@
 // Prompt prefix/suffix commands.
 //
-// Three scopes share a single CLI noun (`ralph prompt ...`): global lives in
-// config.json, project lives in `project_settings`, plan lives on the plan row.
-// All three read/write paths share the same `PromptScope` enum dispatched here.
+// Two scopes share a single CLI noun (`ralph prompt ...`): global lives in
+// config.json, project lives in `project_settings`. Both read/write paths
+// share the same `PromptScope` enum dispatched here.
 
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
@@ -37,25 +37,10 @@ pub fn cmd_prompt_show(
     conn: &Connection,
     config: &Config,
     project: &str,
-    plan_slug: Option<&str>,
     scope: Option<PromptScope>,
     resolved: bool,
     out: &OutputContext,
 ) -> Result<()> {
-    // Plan lookup is only needed when plan-scope is requested (or in the
-    // "all scopes" default). Skip the DB hit when the user targeted a single
-    // non-plan scope. When plan is implicit (no slug, no active plan), treat
-    // it as "no plan wrap configured" rather than bailing — lets users see
-    // their global/project setup before any plan exists.
-    let plan = match scope {
-        Some(PromptScope::Global) | Some(PromptScope::Project) => None,
-        Some(PromptScope::Plan) => Some(resolve_plan_for_prompt(conn, plan_slug, project)?),
-        None => match plan_slug {
-            Some(s) => Some(resolve_plan_for_prompt(conn, Some(s), project)?),
-            None => storage::find_active_plan(conn, project, true)?,
-        },
-    };
-
     let project_settings = storage::get_project_settings(conn, project)?;
 
     if resolved {
@@ -68,15 +53,10 @@ pub fn cmd_prompt_show(
                 project_settings.prompt_prefix.as_ref(),
                 project_settings.prompt_suffix.as_ref(),
             ),
-            plan: plan.as_ref().map_or(PromptWrap::default(), |p| {
-                PromptWrap::from_opts(p.prompt_prefix.as_ref(), p.prompt_suffix.as_ref())
-            }),
+            plan: PromptWrap::default(),
         };
         return print_resolved(&wraps, out);
     }
-
-    let plan_prefix = plan.as_ref().and_then(|p| p.prompt_prefix.as_deref());
-    let plan_suffix = plan.as_ref().and_then(|p| p.prompt_suffix.as_deref());
 
     let all_views = [
         ScopeView {
@@ -88,11 +68,6 @@ pub fn cmd_prompt_show(
             scope: "project",
             prefix: project_settings.prompt_prefix.as_deref(),
             suffix: project_settings.prompt_suffix.as_deref(),
-        },
-        ScopeView {
-            scope: "plan",
-            prefix: plan_prefix,
-            suffix: plan_suffix,
         },
     ];
 
@@ -115,13 +90,11 @@ pub fn cmd_prompt_show(
 }
 
 /// `ralph prompt set` — upsert prefix and/or suffix at one scope.
-#[allow(clippy::too_many_arguments)]
 pub fn cmd_prompt_set(
     conn: &Connection,
     config_path: &std::path::Path,
     project: &str,
     scope: PromptScope,
-    plan_slug: Option<&str>,
     prefix: Option<&str>,
     suffix: Option<&str>,
     out: &OutputContext,
@@ -152,15 +125,6 @@ pub fn cmd_prompt_set(
                 storage::set_project_prompt_suffix(conn, project, Some(s))?;
             }
         }
-        PromptScope::Plan => {
-            let plan = resolve_plan_for_prompt(conn, plan_slug, project)?;
-            if let Some(p) = prefix {
-                storage::set_plan_prompt_prefix(conn, &plan.id, Some(p))?;
-            }
-            if let Some(s) = suffix {
-                storage::set_plan_prompt_suffix(conn, &plan.id, Some(s))?;
-            }
-        }
     }
 
     if !out.quiet {
@@ -176,13 +140,11 @@ pub fn cmd_prompt_set(
 }
 
 /// `ralph prompt clear` — null out prefix and/or suffix at one scope.
-#[allow(clippy::too_many_arguments)]
 pub fn cmd_prompt_clear(
     conn: &Connection,
     config_path: &std::path::Path,
     project: &str,
     scope: PromptScope,
-    plan_slug: Option<&str>,
     clear_prefix: bool,
     clear_suffix: bool,
     out: &OutputContext,
@@ -210,15 +172,6 @@ pub fn cmd_prompt_clear(
                 storage::set_project_prompt_suffix(conn, project, None)?;
             }
         }
-        PromptScope::Plan => {
-            let plan = resolve_plan_for_prompt(conn, plan_slug, project)?;
-            if clear_prefix {
-                storage::set_plan_prompt_prefix(conn, &plan.id, None)?;
-            }
-            if clear_suffix {
-                storage::set_plan_prompt_suffix(conn, &plan.id, None)?;
-            }
-        }
     }
 
     if !out.quiet {
@@ -241,25 +194,6 @@ fn scope_name(s: PromptScope) -> &'static str {
     match s {
         PromptScope::Global => "global",
         PromptScope::Project => "project",
-        PromptScope::Plan => "plan",
-    }
-}
-
-fn resolve_plan_for_prompt(
-    conn: &Connection,
-    slug: Option<&str>,
-    project: &str,
-) -> Result<crate::plan::Plan> {
-    match slug {
-        Some("") => bail!(
-            "Plan slug cannot be empty. Specify a non-empty slug or omit the argument to use the active plan."
-        ),
-        Some(s) => storage::get_plan_by_slug(conn, s, project)?
-            .with_context(|| format!("Plan not found: {s}")),
-        // include_complete=true: let users read/edit prompt wraps on a plan
-        // even after it has finished, mirroring `ralph plan show`'s behavior.
-        None => storage::find_active_plan(conn, project, true)?
-            .context("No active plan found. Specify a plan slug as a positional argument."),
     }
 }
 

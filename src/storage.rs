@@ -668,57 +668,6 @@ pub fn set_plan_harness_gen(conn: &Connection, plan_id: &str, harness: Option<&s
     Ok(())
 }
 
-/// Set the plan-scope prompt prefix. Pass `None` to clear.
-pub fn set_plan_prompt_prefix(
-    conn: &Connection,
-    plan_id: &str,
-    prefix: Option<&str>,
-) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE plans SET prompt_prefix = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![prefix, plan_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Plan not found: {plan_id}");
-    }
-    Ok(())
-}
-
-/// Set the plan-scope prompt suffix. Pass `None` to clear.
-pub fn set_plan_prompt_suffix(
-    conn: &Connection,
-    plan_id: &str,
-    suffix: Option<&str>,
-) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE plans SET prompt_suffix = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![suffix, plan_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Plan not found: {plan_id}");
-    }
-    Ok(())
-}
-
-/// Set the plan-scope context prepend override. Pass `None` to fall back to
-/// [`crate::prompt::DEFAULT_CONTEXT_PREPEND`]. An empty-string argument is
-/// stored verbatim and means "no prepend at all" for this plan — see
-/// [`crate::plan::Plan::context_prepend`] for the precedence rules.
-pub fn set_plan_context_prepend(
-    conn: &Connection,
-    plan_id: &str,
-    prepend: Option<&str>,
-) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE plans SET context_prepend = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![prepend, plan_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Plan not found: {plan_id}");
-    }
-    Ok(())
-}
-
 /// Replace the plan's deterministic test commands. The slice is JSON-encoded
 /// into the `deterministic_tests` column verbatim — empty slice clears the
 /// list (one row of `[]`).
@@ -4785,36 +4734,6 @@ mod tests {
 
         let affected = delete_run_lock_row_unscoped(&conn, "/proj-del3", 4242, None).unwrap();
         assert_eq!(affected, 1);
-    }
-
-    #[test]
-    fn test_plan_context_prepend_round_trip() {
-        let conn = setup();
-        let plan = create_plan(&conn, "ctx", "/proj", "b", "d", None, None, &[]).unwrap();
-
-        // Newly-created plans have `None` context_prepend — callers fall back
-        // to the system default via `prompt::effective_context_prepend`.
-        assert_eq!(plan.context_prepend, None);
-
-        // Set to Some("custom"), read back.
-        set_plan_context_prepend(&conn, &plan.id, Some("custom")).unwrap();
-        let reloaded = get_plan_by_slug(&conn, "ctx", "/proj").unwrap().unwrap();
-        assert_eq!(reloaded.context_prepend.as_deref(), Some("custom"));
-
-        // Empty string is a real value — power-user escape hatch for "no
-        // prepend at all". Must survive the round trip distinct from None.
-        set_plan_context_prepend(&conn, &plan.id, Some("")).unwrap();
-        let reloaded = get_plan_by_slug(&conn, "ctx", "/proj").unwrap().unwrap();
-        assert_eq!(
-            reloaded.context_prepend.as_deref(),
-            Some(""),
-            "empty string override must round-trip as Some(\"\"), not None"
-        );
-
-        // Clear back to None.
-        set_plan_context_prepend(&conn, &plan.id, None).unwrap();
-        let reloaded = get_plan_by_slug(&conn, "ctx", "/proj").unwrap().unwrap();
-        assert_eq!(reloaded.context_prepend, None);
     }
 
     #[test]

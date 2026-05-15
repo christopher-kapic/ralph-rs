@@ -41,11 +41,6 @@ pub struct ExportedPlanMeta {
     pub depends_on: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_harness: Option<String>,
-    /// Per-plan context-prepend override. Omitted from the JSON when the
-    /// plan is using the system default so pre-V14 export output is
-    /// unchanged for plans that didn't customize their prepend.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_prepend: Option<String>,
 }
 
 /// Step stripped of internal fields.
@@ -94,7 +89,6 @@ pub fn build_exported_plan(
         deterministic_tests: plan.deterministic_tests.clone(),
         depends_on: depends_on_slugs,
         plan_harness: plan.plan_harness.clone(),
-        context_prepend: plan.context_prepend.clone(),
     };
 
     let exported_steps: Vec<ExportedStep> = steps

@@ -82,12 +82,6 @@ pub struct ImportedPlanMeta {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub plan_harness: Option<String>,
-    /// Per-plan context-prepend override. `None` (missing field) means "use
-    /// the system default at prompt-build time"; `Some(s)` is stored
-    /// verbatim, preserving round-trip fidelity for both overridden and
-    /// empty-string escape-hatch values.
-    #[serde(default)]
-    pub context_prepend: Option<String>,
 }
 
 /// Step from the portable JSON.
@@ -200,14 +194,6 @@ fn import_plan_inner(
 
     if data.plan.plan_harness.is_some() {
         storage::set_plan_harness_gen(conn, &plan.id, data.plan.plan_harness.as_deref())?;
-    }
-
-    if data.plan.context_prepend.is_some() {
-        // Distinct from "missing field": a `None` import means the export
-        // didn't carry a context_prepend override, so we leave the new plan
-        // at its freshly-created NULL (system-default) state. `Some("")`
-        // imports as an explicit no-prepend escape hatch and must survive.
-        storage::set_plan_context_prepend(conn, &plan.id, data.plan.context_prepend.as_deref())?;
     }
 
     for step_data in &data.steps {

@@ -4682,9 +4682,11 @@ pub(crate) fn step_detail_observe_read_only(
 /// dispatch the editor handoff for the focused pane and toast the result.
 ///
 /// Routes by `app.focused_pane`:
-/// - `UniversalPrompt` / `ProjectPrompt` / `PlanContextPrepend` /
-///   `PlanPrefix` / `PlanSuffix` / `StepPrompt` / `Tests` → the matching
-///   `edit_*_pane` method on `StepDetailApp`.
+/// - `UniversalPrompt` / `ProjectPrompt` / `StepPrompt` / `Tests` → the
+///   matching `edit_*_pane` method on `StepDetailApp`.
+/// - `PlanContextPrepend` / `PlanPrefix` / `PlanSuffix` → no-op. The legacy
+///   per-plan prompt-wrap columns were dropped in migration V21; these pane
+///   variants are inert placeholders pending their full removal.
 /// - `Appended` / `OpenQuestions` → no-op (those panes are read-only).
 /// - `BottomRow` → no-op here; the focused cell's picker is opened by
 ///   `step_detail_handle_bottom_row_c` instead.
@@ -4715,12 +4717,14 @@ where
             app.edit_universal_pane(&mut local, config_dir, edit_fn)?
         }
         Pane::ProjectPrompt => app.edit_project_pane(conn, edit_fn)?,
-        Pane::PlanContextPrepend => app.edit_plan_context_prepend_pane(conn, edit_fn)?,
-        Pane::PlanPrefix => app.edit_plan_prefix_pane(conn, edit_fn)?,
-        Pane::PlanSuffix => app.edit_plan_suffix_pane(conn, edit_fn)?,
         Pane::StepPrompt => app.edit_step_prompt_pane(conn, edit_fn)?,
         Pane::Tests => app.edit_tests_pane(conn, edit_fn)?,
-        Pane::Appended | Pane::OpenQuestions | Pane::BottomRow => return Ok(()),
+        Pane::PlanContextPrepend
+        | Pane::PlanPrefix
+        | Pane::PlanSuffix
+        | Pane::Appended
+        | Pane::OpenQuestions
+        | Pane::BottomRow => return Ok(()),
     };
 
     let now = Instant::now();
@@ -6811,9 +6815,6 @@ mod plan_detail_init_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
@@ -7660,9 +7661,6 @@ mod step_detail_dispatcher_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
@@ -7836,43 +7834,33 @@ mod step_detail_dispatcher_tests {
     }
 
     #[test]
-    fn c_on_plan_prefix_persists_value() {
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::PlanPrefix;
-
+    fn c_on_inert_plan_panes_is_a_noop() {
+        // The legacy per-plan prompt-wrap columns were dropped in migration
+        // V21. The PlanContextPrepend / PlanPrefix / PlanSuffix panes are
+        // inert placeholders: `c` must short-circuit without invoking the
+        // editor or pushing a toast.
         let dir = tempfile::tempdir().unwrap();
-        step_detail_handle_c(
-            &mut app,
-            &conn,
-            &Config::default(),
-            dir.path(),
-            fake_editor(Some("PRE".to_string())),
-        )
-        .unwrap();
-
-        assert_eq!(app.plan.prompt_prefix.as_deref(), Some("PRE"));
-        assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
-    }
-
-    #[test]
-    fn c_on_plan_suffix_persists_value() {
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::PlanSuffix;
-
-        let dir = tempfile::tempdir().unwrap();
-        step_detail_handle_c(
-            &mut app,
-            &conn,
-            &Config::default(),
-            dir.path(),
-            fake_editor(Some("SUF".to_string())),
-        )
-        .unwrap();
-
-        assert_eq!(app.plan.prompt_suffix.as_deref(), Some("SUF"));
-        assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
+        for pane in [
+            Pane::PlanContextPrepend,
+            Pane::PlanPrefix,
+            Pane::PlanSuffix,
+        ] {
+            let conn = crate::db::open_memory().unwrap();
+            let mut app = db_app(&conn, "/proj");
+            app.focused_pane = pane;
+            step_detail_handle_c(
+                &mut app,
+                &conn,
+                &Config::default(),
+                dir.path(),
+                fake_editor(Some("SHOULD-BE-IGNORED".to_string())),
+            )
+            .unwrap();
+            assert!(
+                app.toasts.current().is_none(),
+                "{pane:?} edit must be a silent no-op"
+            );
+        }
     }
 
     #[test]
@@ -7908,7 +7896,7 @@ mod step_detail_dispatcher_tests {
     fn c_with_no_editor_toasts_no_editor() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::PlanPrefix;
+        app.focused_pane = Pane::ProjectPrompt;
 
         let dir = tempfile::tempdir().unwrap();
         step_detail_handle_c(
@@ -7927,10 +7915,13 @@ mod step_detail_dispatcher_tests {
     fn c_with_unchanged_buffer_toasts_no_changes() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::PlanPrefix;
+        app.focused_pane = Pane::ProjectPrompt;
 
         let dir = tempfile::tempdir().unwrap();
-        let unchanged = app.plan.prompt_prefix.clone().unwrap_or_default();
+        let unchanged = format_wrap_pane(
+            app.project_settings.prompt_prefix.as_deref(),
+            app.project_settings.prompt_suffix.as_deref(),
+        );
         step_detail_handle_c(
             &mut app,
             &conn,
@@ -8639,9 +8630,6 @@ mod sub_view_routing_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
@@ -9063,9 +9051,6 @@ mod mouse_routing_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
@@ -9088,9 +9073,6 @@ mod mouse_routing_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,

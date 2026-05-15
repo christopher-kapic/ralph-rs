@@ -311,11 +311,11 @@ pub enum Command {
     #[command(subcommand)]
     Hooks(HooksCommand),
 
-    /// Configure prompt prefixes/suffixes at global, project, or plan scope.
+    /// Configure prompt prefixes/suffixes at global or project scope.
     ///
     /// Each scope's prefix is prepended and suffix appended to every step
-    /// prompt; prefixes stack outermost (global) to innermost (plan) at the
-    /// top, suffixes stack innermost to outermost at the bottom.
+    /// prompt; prefixes stack outermost (global) to innermost (project) at
+    /// the top, suffixes stack innermost to outermost at the bottom.
     #[command(subcommand)]
     Prompt(PromptCommand),
 
@@ -515,11 +515,6 @@ pub enum PlanCommand {
     /// Manage the plan-generation harness.
     #[command(subcommand)]
     Harness(PlanHarnessCommand),
-
-    /// Manage the plan's context-prepend override (the block injected at the
-    /// top of every step's prompt).
-    #[command(subcommand)]
-    Prepend(PlanPrependCommand),
 
     /// Toggle the pause-for-question feature for a plan.
     ///
@@ -878,57 +873,6 @@ pub enum PlanHarnessCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Plan prepend subcommands (nested under `plan prepend`)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Subcommand)]
-pub enum PlanPrependCommand {
-    /// Set the plan's context-prepend override.
-    ///
-    /// Exactly one of `--text`, `--file`, or `--stdin` is required. The
-    /// stored string replaces the built-in default for this plan — it is not
-    /// concatenated with it. An empty string (e.g. `--text ""`) is valid and
-    /// means "no prepend at all" for this plan.
-    Set {
-        /// Plan slug. Defaults to the active plan.
-        plan: Option<String>,
-
-        /// Literal text to store as the prepend override.
-        #[arg(long, conflicts_with_all = ["file", "stdin"])]
-        text: Option<String>,
-
-        /// Path to a file whose contents will be stored verbatim.
-        #[arg(long, conflicts_with_all = ["text", "stdin"])]
-        file: Option<PathBuf>,
-
-        /// Read the prepend text from standard input.
-        #[arg(long, conflicts_with_all = ["text", "file"])]
-        stdin: bool,
-    },
-
-    /// Show the effective context-prepend text for a plan.
-    ///
-    /// Without `--default`, prints the plan's override if set or the system
-    /// default otherwise. With `--default`, always prints the built-in
-    /// default regardless of the plan's setting.
-    Show {
-        /// Plan slug. Defaults to the active plan.
-        plan: Option<String>,
-
-        /// Print the system default, ignoring any plan override.
-        #[arg(long)]
-        default: bool,
-    },
-
-    /// Clear the plan's context-prepend override (fall back to the system
-    /// default).
-    Clear {
-        /// Plan slug. Defaults to the active plan.
-        plan: Option<String>,
-    },
-}
-
-// ---------------------------------------------------------------------------
 // Question subcommands
 // ---------------------------------------------------------------------------
 
@@ -1115,27 +1059,21 @@ pub enum PromptScope {
     Global,
     /// Project wrap stored in SQLite keyed on the current project path.
     Project,
-    /// Plan wrap stored on a single plan row (requires `--plan <slug>`,
-    /// defaults to the active plan).
-    Plan,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum PromptCommand {
     /// Show the prompt prefix/suffix configured for one or all scopes.
     ///
-    /// With no `--scope`, displays global, project, and plan entries for the
-    /// current (or specified) plan. Use `--resolved` to print the fully
-    /// layered wrap exactly as it would appear around a step prompt.
+    /// With no `--scope`, displays the global and project entries. Use
+    /// `--resolved` to print the fully layered wrap exactly as it would
+    /// appear around a step prompt.
     Show {
-        /// Plan slug for plan-scope entries. Defaults to the active plan.
-        plan: Option<String>,
-
         /// Limit output to a single scope.
         #[arg(long)]
         scope: Option<PromptScope>,
 
-        /// Show the final composed prefix/suffix (global + project + plan)
+        /// Show the final composed prefix/suffix (global + project)
         /// rather than each scope's individual contribution.
         #[arg(long)]
         resolved: bool,
@@ -1145,7 +1083,7 @@ pub enum PromptCommand {
     /// `--prefix` / `--suffix` must be provided; omitted values leave the
     /// sibling field untouched. Pass an empty string to blank a value.
     Set {
-        /// Target scope. Plan scope uses `<plan>` or the active plan.
+        /// Target scope.
         #[arg(long)]
         scope: PromptScope,
 
@@ -1156,10 +1094,6 @@ pub enum PromptCommand {
         /// New suffix text. Omit to leave the stored suffix unchanged.
         #[arg(long)]
         suffix: Option<String>,
-
-        /// Plan slug (only used with `--scope plan`). Defaults to the
-        /// active plan.
-        plan: Option<String>,
     },
 
     /// Clear a prompt prefix and/or suffix at the given scope. Pass at least
@@ -1176,10 +1110,6 @@ pub enum PromptCommand {
         /// Clear the suffix for this scope.
         #[arg(long)]
         suffix: bool,
-
-        /// Plan slug (only used with `--scope plan`). Defaults to the
-        /// active plan.
-        plan: Option<String>,
     },
 }
 

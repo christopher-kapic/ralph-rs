@@ -732,6 +732,8 @@ pub async fn execute_step(
 
         // Collect prompt prefix/suffix layers. Project-scope settings are
         // looked up by project path; a missing row is treated as "no wrap".
+        // The plan layer no longer carries a prompt wrap (the legacy per-plan
+        // prefix/suffix columns were dropped in migration V21).
         let project_settings = storage::get_project_settings(conn, &plan.project)?;
         let wraps = PromptWraps {
             global: PromptWrap::from_opts(
@@ -742,7 +744,7 @@ pub async fn execute_step(
                 project_settings.prompt_prefix.as_ref(),
                 project_settings.prompt_suffix.as_ref(),
             ),
-            plan: PromptWrap::from_opts(plan.prompt_prefix.as_ref(), plan.prompt_suffix.as_ref()),
+            plan: PromptWrap::default(),
         };
 
         // Fetch any answered questions for this step so the next-attempt

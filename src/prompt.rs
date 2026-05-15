@@ -3,10 +3,7 @@
 use crate::plan::{AnsweredQuestion, Plan, Step, StepStatus};
 
 /// Default "how to introspect this plan" block prepended to every step's
-/// prompt. Plans can override it via [`Plan::context_prepend`]; a `None`
-/// override means "use this default verbatim", `Some(s)` means "use `s`
-/// verbatim (no concatenation with this default)", and `Some("")` is an
-/// explicit escape hatch meaning "no prepend at all".
+/// prompt. Injected verbatim — there is no per-plan override.
 ///
 /// Trailing instruction appended to every step prompt when the plan has
 /// `questions_enabled = true` (TUI-plan.md §17). Verbatim from the spec —
@@ -138,24 +135,10 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
     s.filter(|v| !v.is_empty())
 }
 
-/// Resolve the effective context-prepend text for a plan.
-///
-/// `None` -> [`DEFAULT_CONTEXT_PREPEND`]. `Some("")` -> `""` (power-user
-/// escape hatch). `Some(s)` -> `s` verbatim, not concatenated with the
-/// default. Callers that want to print the effective prepend (for example
-/// `ralph plan prepend show`) should route through this helper so the
-/// precedence stays in one place.
-pub fn effective_context_prepend(plan: &Plan) -> &str {
-    match plan.context_prepend.as_deref() {
-        Some(s) => s,
-        None => DEFAULT_CONTEXT_PREPEND,
-    }
-}
-
 /// Build the full prompt for a step execution.
 ///
 /// The prompt is assembled from these parts, in order:
-/// 1. Context prepend — per-plan override or [`DEFAULT_CONTEXT_PREPEND`]
+/// 1. Context prepend — [`DEFAULT_CONTEXT_PREPEND`]
 /// 2. Agent pointer (instructs the harness to fetch the agent profile itself)
 /// 3. Retry context (if this is a retry attempt)
 /// 4. Plan context (plan description and overall goal)
@@ -194,9 +177,8 @@ pub fn build_step_prompt(
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
 
-    // 1. Context prepend — plan override or system default. An empty override
-    // is the explicit "no prepend" signal and contributes nothing.
-    let prepend = effective_context_prepend(plan);
+    // 1. Context prepend — the system default introspection block.
+    let prepend = DEFAULT_CONTEXT_PREPEND;
     if !prepend.is_empty() {
         // The constant includes a trailing `\n\n---\n\n` separator, but the
         // outer `sections.join("\n\n")` will also add one between sections.
@@ -487,9 +469,6 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
@@ -591,8 +570,8 @@ mod tests {
     }
 
     #[test]
-    fn test_default_prepend_is_used_when_plan_override_is_none() {
-        let plan = make_plan(); // context_prepend: None
+    fn test_default_prepend_is_always_used() {
+        let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
 
@@ -613,64 +592,6 @@ mod tests {
         assert!(prompt.contains("## Introspecting the plan"));
         assert!(prompt.contains("`ralph status`"));
         assert!(prompt.contains("Do NOT use `--after <N>` during a run"));
-    }
-
-    #[test]
-    fn test_plan_override_replaces_default() {
-        let mut plan = make_plan();
-        plan.context_prepend = Some("# Custom prepend\n\nBe concise.".to_string());
-        let step = make_step();
-        let all_steps = vec![step.clone()];
-
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &PromptWraps::default(),
-            &[],
-        );
-
-        // Custom text IS present …
-        assert!(prompt.contains("# Custom prepend"));
-        assert!(prompt.contains("Be concise."));
-        // … and the default is NOT concatenated with it.
-        assert!(
-            !prompt.contains("# Ralph context"),
-            "plan override must REPLACE the default, not append to it"
-        );
-        assert!(!prompt.contains("## Introspecting the plan"));
-    }
-
-    #[test]
-    fn test_empty_string_override_yields_no_prepend() {
-        let mut plan = make_plan();
-        plan.context_prepend = Some(String::new());
-        let step = make_step();
-        let all_steps = vec![step.clone()];
-
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &PromptWraps::default(),
-            &[],
-        );
-
-        // Neither the default nor any custom prepend is present.
-        assert!(!prompt.contains("# Ralph context"));
-        assert!(!prompt.contains("## Introspecting the plan"));
-        // The prompt should start with the plan context, not a blank line.
-        assert!(
-            prompt.starts_with("# Plan:"),
-            "empty override should leave plan context as the first section, got start: {:?}",
-            &prompt[..prompt.len().min(80)]
-        );
     }
 
     #[test]
@@ -1113,26 +1034,6 @@ mod tests {
                 .trim_end()
                 .ends_with(&format!("Focus on: {}", step.title))
         );
-    }
-
-    #[test]
-    fn test_effective_context_prepend_returns_default_when_none() {
-        let plan = make_plan();
-        assert_eq!(effective_context_prepend(&plan), DEFAULT_CONTEXT_PREPEND);
-    }
-
-    #[test]
-    fn test_effective_context_prepend_returns_override() {
-        let mut plan = make_plan();
-        plan.context_prepend = Some("custom".to_string());
-        assert_eq!(effective_context_prepend(&plan), "custom");
-    }
-
-    #[test]
-    fn test_effective_context_prepend_returns_empty_for_empty_override() {
-        let mut plan = make_plan();
-        plan.context_prepend = Some(String::new());
-        assert_eq!(effective_context_prepend(&plan), "");
     }
 
     // ---- Question injection (TUI-plan.md §17) ----

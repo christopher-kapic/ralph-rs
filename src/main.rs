@@ -30,8 +30,7 @@ use clap::Parser;
 
 use crate::cli::{
     AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
-    PlanHarnessCommand, PlanPrependCommand, PromptCommand, QuestionCommand, QuestionsState,
-    StepCommand,
+    PlanHarnessCommand, PromptCommand, QuestionCommand, QuestionsState, StepCommand,
 };
 
 use crate::commands::{resolve_plan, resolve_project};
@@ -41,29 +40,6 @@ use crate::output::OutputContext;
 /// accepted input sources. Clap's `conflicts_with_all` guarantees at most
 /// one of `text` / `file` / `stdin` is set; this helper enforces the
 /// "at least one" half and normalises to a `String`.
-fn resolve_prepend_input(
-    text: Option<String>,
-    file: Option<std::path::PathBuf>,
-    stdin: bool,
-) -> Result<String> {
-    use std::io::Read;
-    match (text, file, stdin) {
-        (Some(t), None, false) => Ok(t),
-        (None, Some(path), false) => std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read prepend source file: {}", path.display())),
-        (None, None, true) => {
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .context("Failed to read prepend text from stdin")?;
-            Ok(buf)
-        }
-        _ => anyhow::bail!(
-            "Exactly one of --text, --file, or --stdin is required for `ralph plan prepend set`"
-        ),
-    }
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -241,26 +217,6 @@ fn main() -> Result<()> {
                 let enabled = matches!(state, QuestionsState::On);
                 commands::cmd_plan_questions(&conn, &slug, &project, enabled, &out)
             }
-            PlanCommand::Prepend(prepend_cmd) => match prepend_cmd {
-                PlanPrependCommand::Set {
-                    plan,
-                    text,
-                    file,
-                    stdin,
-                } => {
-                    let p = resolve_plan(&conn, plan, &project, true)?;
-                    let body = resolve_prepend_input(text, file, stdin)?;
-                    commands::plan_prepend_set(&conn, &p, &body, &out)
-                }
-                PlanPrependCommand::Show { plan, default } => {
-                    let p = resolve_plan(&conn, plan, &project, true)?;
-                    commands::plan_prepend_show(&conn, &p, default, &out)
-                }
-                PlanPrependCommand::Clear { plan } => {
-                    let p = resolve_plan(&conn, plan, &project, true)?;
-                    commands::plan_prepend_clear(&conn, &p, &out)
-                }
-            },
         },
 
         // -- Step --
@@ -701,30 +657,18 @@ fn main() -> Result<()> {
         Command::Prompt(subcmd) => {
             let config_path = config::config_dir()?.join("config.json");
             match subcmd {
-                PromptCommand::Show {
-                    plan,
-                    scope,
-                    resolved,
-                } => commands::cmd_prompt_show(
-                    &conn,
-                    &config,
-                    &project,
-                    plan.as_deref(),
-                    scope,
-                    resolved,
-                    &out,
+                PromptCommand::Show { scope, resolved } => commands::cmd_prompt_show(
+                    &conn, &config, &project, scope, resolved, &out,
                 ),
                 PromptCommand::Set {
                     scope,
                     prefix,
                     suffix,
-                    plan,
                 } => commands::cmd_prompt_set(
                     &conn,
                     &config_path,
                     &project,
                     scope,
-                    plan.as_deref(),
                     prefix.as_deref(),
                     suffix.as_deref(),
                     &out,
@@ -733,13 +677,11 @@ fn main() -> Result<()> {
                     scope,
                     prefix,
                     suffix,
-                    plan,
                 } => commands::cmd_prompt_clear(
                     &conn,
                     &config_path,
                     &project,
                     scope,
-                    plan.as_deref(),
                     prefix,
                     suffix,
                     &out,

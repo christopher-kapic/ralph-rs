@@ -22,7 +22,6 @@ use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::plan::{ChangePolicy, ExecutionLog, Plan, Step, StepStatus};
-use crate::prompt::DEFAULT_CONTEXT_PREPEND;
 use crate::storage::{self, ProjectSettings};
 use crate::tui::chrome::{self, Chrome};
 use crate::tui::help::{self, HelpState};
@@ -1374,86 +1373,10 @@ impl StepDetailApp {
         Ok(EditOutcome::Saved)
     }
 
-    /// `c` on the Plan-context-prepend pane: round-trip
-    /// `plan.context_prepend` through `$EDITOR` and persist via
-    /// [`storage::set_plan_context_prepend`].
-    ///
-    /// When `plan.context_prepend` is `None`, the editor is seeded with the
-    /// system [`DEFAULT_CONTEXT_PREPEND`] so the user sees what the runner
-    /// would inject — but a no-op edit leaves the column as `None` (so the
-    /// plan continues to track the default if it changes upstream). Any
-    /// real edit pins the override to `Some(text)`, including the empty
-    /// string (the documented escape hatch for "no prepend at all").
-    pub fn edit_plan_context_prepend_pane<E>(
-        &mut self,
-        conn: &Connection,
-        edit_fn: E,
-    ) -> Result<EditOutcome>
-    where
-        E: FnOnce(&str) -> Result<Option<String>>,
-    {
-        let initial = match self.plan.context_prepend.as_deref() {
-            Some(s) => s.to_string(),
-            None => DEFAULT_CONTEXT_PREPEND.to_string(),
-        };
-        let new_text = match edit_fn(&initial)? {
-            None => return Ok(EditOutcome::NoEditor),
-            Some(s) => s,
-        };
-        // Normalize trailing-newline noise so editors that auto-append a
-        // newline don't flip a no-op edit into a "Saved" outcome.
-        let new_normalized = new_text.trim_end_matches('\n').to_string();
-        let initial_normalized = initial.trim_end_matches('\n');
-        if new_normalized == initial_normalized {
-            return Ok(EditOutcome::NoChanges);
-        }
-        storage::set_plan_context_prepend(conn, &self.plan.id, Some(&new_normalized))?;
-        self.plan.context_prepend = Some(new_normalized);
-        Ok(EditOutcome::Saved)
-    }
-
-    /// `c` on the Plan-prefix pane: round-trip `plan.prompt_prefix` through
-    /// `$EDITOR` as a single text body. Whitespace-only input clears the
-    /// field (stored as `NULL`) so the user can drop the prefix entirely
-    /// without leaving an empty-string artifact.
-    pub fn edit_plan_prefix_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
-    where
-        E: FnOnce(&str) -> Result<Option<String>>,
-    {
-        let initial = self.plan.prompt_prefix.clone().unwrap_or_default();
-        let new_text = match edit_fn(&initial)? {
-            None => return Ok(EditOutcome::NoEditor),
-            Some(s) => s,
-        };
-        let new_value = trim_to_option(&new_text);
-        if new_value == self.plan.prompt_prefix {
-            return Ok(EditOutcome::NoChanges);
-        }
-        storage::set_plan_prompt_prefix(conn, &self.plan.id, new_value.as_deref())?;
-        self.plan.prompt_prefix = new_value;
-        Ok(EditOutcome::Saved)
-    }
-
-    /// `c` on the Plan-suffix pane: round-trip `plan.prompt_suffix` through
-    /// `$EDITOR` as a single text body. Whitespace-only input clears the
-    /// field — same semantics as [`Self::edit_plan_prefix_pane`].
-    pub fn edit_plan_suffix_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
-    where
-        E: FnOnce(&str) -> Result<Option<String>>,
-    {
-        let initial = self.plan.prompt_suffix.clone().unwrap_or_default();
-        let new_text = match edit_fn(&initial)? {
-            None => return Ok(EditOutcome::NoEditor),
-            Some(s) => s,
-        };
-        let new_value = trim_to_option(&new_text);
-        if new_value == self.plan.prompt_suffix {
-            return Ok(EditOutcome::NoChanges);
-        }
-        storage::set_plan_prompt_suffix(conn, &self.plan.id, new_value.as_deref())?;
-        self.plan.prompt_suffix = new_value;
-        Ok(EditOutcome::Saved)
-    }
+    // The Plan-context-prepend / Plan-prefix / Plan-suffix panes used to own
+    // `c`-edit handlers here. The legacy per-plan prompt-wrap columns were
+    // dropped in migration V21, so those panes are now inert (the dispatcher
+    // routes them to a no-op) pending their full removal.
 
     /// `c` on the Step-prompt pane: round-trip `step.title`,
     /// `step.description`, and `step.acceptance_criteria` through `$EDITOR`
@@ -1955,19 +1878,12 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
             app.project_settings.prompt_prefix.as_deref(),
             app.project_settings.prompt_suffix.as_deref(),
         ),
-        Pane::PlanContextPrepend => render_text_pane(
-            frame,
-            inner,
-            // `None` means "use DEFAULT_CONTEXT_PREPEND"; `Some("")` is the
-            // power-user "no prepend" escape hatch and renders as a literal
-            // blank — distinguishable from the dim `(none)` placeholder.
-            match app.plan.context_prepend.as_deref() {
-                Some(s) => Some(s),
-                None => Some(DEFAULT_CONTEXT_PREPEND),
-            },
-        ),
-        Pane::PlanPrefix => render_text_pane(frame, inner, app.plan.prompt_prefix.as_deref()),
-        Pane::PlanSuffix => render_text_pane(frame, inner, app.plan.prompt_suffix.as_deref()),
+        // The legacy per-plan prompt-wrap columns were dropped in migration
+        // V21. These pane variants are inert placeholders pending their full
+        // removal — render them empty.
+        Pane::PlanContextPrepend | Pane::PlanPrefix | Pane::PlanSuffix => {
+            render_text_pane(frame, inner, None)
+        }
         Pane::StepPrompt => render_step_prompt(frame, app, inner),
         Pane::OpenQuestions => render_open_questions(frame, app, inner),
         Pane::Appended => render_appended(frame, app, inner),
@@ -2355,9 +2271,6 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
@@ -3077,71 +2990,6 @@ mod tests {
         assert!(screen.contains("Project prompt"), "{screen}");
         assert!(screen.contains("PROJ-PRE-MARK"), "{screen}");
         assert!(screen.contains("PROJ-SUF-MARK"), "{screen}");
-    }
-
-    #[test]
-    fn plan_context_prepend_pane_uses_default_when_none() {
-        // When plan.context_prepend is None, the pane renders
-        // DEFAULT_CONTEXT_PREPEND verbatim (the same string the runner injects
-        // into every step prompt).
-        let mut plan = make_plan();
-        plan.context_prepend = None;
-        let steps = make_steps(1);
-        let mut app = StepDetailApp::new(
-            plan,
-            steps,
-            0,
-            &Config::default(),
-            ProjectSettings::default(),
-            Vec::new(),
-        );
-        let screen = render_to_string(140, 60, &mut app);
-        // The default prepend opens with "# Ralph context" — distinctive
-        // enough to confirm the fallback wired up correctly.
-        assert!(screen.contains("Ralph context"), "{screen}");
-    }
-
-    #[test]
-    fn plan_context_prepend_pane_uses_override() {
-        let mut plan = make_plan();
-        plan.context_prepend = Some("OVERRIDE-PREPEND-MARKER".to_string());
-        let steps = make_steps(1);
-        let mut app = StepDetailApp::new(
-            plan,
-            steps,
-            0,
-            &Config::default(),
-            ProjectSettings::default(),
-            Vec::new(),
-        );
-        let screen = render_to_string(140, 60, &mut app);
-        assert!(screen.contains("OVERRIDE-PREPEND-MARKER"), "{screen}");
-        // The default's "Ralph context" header must NOT leak into the pane
-        // when an override is set (verifies we don't render *both*).
-        assert!(
-            !screen.contains("Ralph context"),
-            "override must replace default, got: {screen}"
-        );
-    }
-
-    #[test]
-    fn plan_prefix_and_suffix_panes_render_independently() {
-        let mut plan = make_plan();
-        plan.prompt_prefix = Some("PLAN-PRE-MARK".to_string());
-        plan.prompt_suffix = Some("PLAN-SUF-MARK".to_string());
-        let mut app = StepDetailApp::new(
-            plan,
-            make_steps(1),
-            0,
-            &Config::default(),
-            ProjectSettings::default(),
-            Vec::new(),
-        );
-        let screen = render_to_string(140, 60, &mut app);
-        assert!(screen.contains("Plan prefix"), "{screen}");
-        assert!(screen.contains("Plan suffix"), "{screen}");
-        assert!(screen.contains("PLAN-PRE-MARK"), "{screen}");
-        assert!(screen.contains("PLAN-SUF-MARK"), "{screen}");
     }
 
     #[test]
@@ -4034,140 +3882,6 @@ mod tests {
         assert_eq!(stored.prompt_suffix, None);
     }
 
-    // -- edit_plan_context_prepend_pane -----------------------------------
-
-    #[test]
-    fn edit_plan_context_prepend_no_editor_short_circuits() {
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = setup_project_app(&conn, "/proj");
-        let outcome = app
-            .edit_plan_context_prepend_pane(&conn, fake_editor(None))
-            .unwrap();
-        assert_eq!(outcome, EditOutcome::NoEditor);
-    }
-
-    #[test]
-    fn edit_plan_context_prepend_seeds_default_when_unset() {
-        // When `plan.context_prepend` is None, the editor sees the system
-        // DEFAULT_CONTEXT_PREPEND so the user can edit-from-default.
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = setup_project_app(&conn, "/proj");
-        assert!(app.plan.context_prepend.is_none());
-
-        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let _ = app
-            .edit_plan_context_prepend_pane(&conn, capturing_editor(seen.clone()))
-            .unwrap();
-        let buf = seen.borrow().clone().expect("editor was invoked");
-        assert_eq!(buf, DEFAULT_CONTEXT_PREPEND);
-    }
-
-    #[test]
-    fn edit_plan_context_prepend_no_op_on_default_keeps_override_none() {
-        // Closing the editor without changes when override was None should
-        // leave context_prepend as None (not pin it to the default's text).
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = setup_project_app(&conn, "/proj");
-        let outcome = app
-            .edit_plan_context_prepend_pane(
-                &conn,
-                fake_editor(Some(DEFAULT_CONTEXT_PREPEND.to_string())),
-            )
-            .unwrap();
-        assert_eq!(outcome, EditOutcome::NoChanges);
-        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded.context_prepend, None);
-        assert_eq!(app.plan.context_prepend, None);
-    }
-
-    #[test]
-    fn edit_plan_context_prepend_normalizes_trailing_newline() {
-        // Many editors append a trailing newline on save — a no-op edit
-        // should still be NoChanges, not Saved.
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = setup_project_app(&conn, "/proj");
-        app.plan.context_prepend = Some("snippet".to_string());
-        storage::set_plan_context_prepend(&conn, &app.plan.id, Some("snippet")).unwrap();
-
-        let outcome = app
-            .edit_plan_context_prepend_pane(&conn, fake_editor(Some("snippet\n".to_string())))
-            .unwrap();
-        assert_eq!(outcome, EditOutcome::NoChanges);
-    }
-
-    #[test]
-    fn edit_plan_context_prepend_persists_changed_value() {
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = setup_project_app(&conn, "/proj");
-        let outcome = app
-            .edit_plan_context_prepend_pane(&conn, fake_editor(Some("CUSTOM-PREPEND".to_string())))
-            .unwrap();
-        assert_eq!(outcome, EditOutcome::Saved);
-        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded.context_prepend.as_deref(), Some("CUSTOM-PREPEND"));
-        assert_eq!(app.plan.context_prepend.as_deref(), Some("CUSTOM-PREPEND"));
-    }
-
-    #[test]
-    fn edit_plan_context_prepend_persists_empty_string_escape_hatch() {
-        // The empty-string override is the documented "no prepend at all"
-        // escape hatch (see Plan::context_prepend doc) and must round-trip
-        // through the c-handoff distinct from None.
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = setup_project_app(&conn, "/proj");
-        let outcome = app
-            .edit_plan_context_prepend_pane(&conn, fake_editor(Some(String::new())))
-            .unwrap();
-        assert_eq!(outcome, EditOutcome::Saved);
-        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded.context_prepend.as_deref(), Some(""));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn edit_plan_context_prepend_with_mock_editor_script() {
-        // Acceptance test: shell out to a real mock $EDITOR via the lower
-        // `edit_at` helper and verify the new value lands in the plans row.
-        use crate::tui::editor::edit_at;
-        use std::os::unix::fs::PermissionsExt;
-
-        let conn = crate::db::open_memory().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let script = tmp.path().join("ed.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nprintf 'SCRIPT-WROTE-THIS\\n' > \"$1\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let mut app = setup_project_app(&conn, "/proj");
-        let outcome = app
-            .edit_plan_context_prepend_pane(&conn, |initial| {
-                edit_at(
-                    script.to_str().unwrap(),
-                    &tmp.path().join("buf.md"),
-                    initial,
-                )
-            })
-            .unwrap();
-
-        assert_eq!(outcome, EditOutcome::Saved);
-        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            reloaded.context_prepend.as_deref(),
-            Some("SCRIPT-WROTE-THIS")
-        );
-    }
-
     // -- Step-prompt pane format/parse round-trips ------------------------
 
     #[test]
@@ -4341,76 +4055,6 @@ cargo clippy
         let text = "# only the help text remains\n";
         let parsed = parse_tests_pane(text).unwrap();
         assert!(parsed.is_empty());
-    }
-
-    // -- edit_plan_prefix_pane / edit_plan_suffix_pane --------------------
-
-    #[test]
-    fn edit_plan_prefix_no_editor_short_circuits() {
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = setup_project_app(&conn, "/proj");
-        let outcome = app.edit_plan_prefix_pane(&conn, fake_editor(None)).unwrap();
-        assert_eq!(outcome, EditOutcome::NoEditor);
-    }
-
-    #[test]
-    fn edit_plan_prefix_no_changes_skips_writes() {
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = setup_project_app(&conn, "/proj");
-        // Seed a value so we can verify the unchanged round-trip path.
-        storage::set_plan_prompt_prefix(&conn, &app.plan.id, Some("a")).unwrap();
-        app.plan.prompt_prefix = Some("a".to_string());
-        let outcome = app
-            .edit_plan_prefix_pane(&conn, fake_editor(Some("a".to_string())))
-            .unwrap();
-        assert_eq!(outcome, EditOutcome::NoChanges);
-        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded.prompt_prefix.as_deref(), Some("a"));
-    }
-
-    #[test]
-    fn edit_plan_prefix_persists_changed_value() {
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = setup_project_app(&conn, "/proj");
-        let outcome = app
-            .edit_plan_prefix_pane(&conn, fake_editor(Some("PLAN-PRE".to_string())))
-            .unwrap();
-        assert_eq!(outcome, EditOutcome::Saved);
-        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded.prompt_prefix.as_deref(), Some("PLAN-PRE"));
-        assert_eq!(app.plan.prompt_prefix.as_deref(), Some("PLAN-PRE"));
-    }
-
-    #[test]
-    fn edit_plan_suffix_persists_changed_value() {
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = setup_project_app(&conn, "/proj");
-        let outcome = app
-            .edit_plan_suffix_pane(&conn, fake_editor(Some("PLAN-SUF".to_string())))
-            .unwrap();
-        assert_eq!(outcome, EditOutcome::Saved);
-        let reloaded = storage::get_plan_by_slug(&conn, "tui-v1", "/proj")
-            .unwrap()
-            .unwrap();
-        assert_eq!(reloaded.prompt_suffix.as_deref(), Some("PLAN-SUF"));
-        assert_eq!(app.plan.prompt_suffix.as_deref(), Some("PLAN-SUF"));
-    }
-
-    #[test]
-    fn edit_plan_prefix_whitespace_clears_field() {
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = setup_project_app(&conn, "/proj");
-        storage::set_plan_prompt_prefix(&conn, &app.plan.id, Some("seed")).unwrap();
-        app.plan.prompt_prefix = Some("seed".to_string());
-        let outcome = app
-            .edit_plan_prefix_pane(&conn, fake_editor(Some("   \n".to_string())))
-            .unwrap();
-        assert_eq!(outcome, EditOutcome::Saved);
-        assert_eq!(app.plan.prompt_prefix, None);
     }
 
     // -- edit_step_prompt_pane --------------------------------------------

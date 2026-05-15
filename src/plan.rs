@@ -405,14 +405,15 @@ impl std::str::FromStr for TestStatus {
 /// Canonical column list for `SELECT` queries against the `plans` table.
 ///
 /// Matches the physical table layout after all migrations: V1 defined every
-/// column through `updated_at`, V5 appended `plan_harness`, V10 appended
-/// `prompt_prefix` and `prompt_suffix`, V14 appended `context_prepend`,
+/// column through `updated_at`, V5 appended `plan_harness`,
 /// V16 appended `questions_enabled`, V18 appended `pause_requested`,
 /// V19 appended `last_run_branch`, and V20 appended `last_run_started_at`
-/// via `ALTER TABLE ... ADD COLUMN`. Every `Plan`-returning query MUST use
-/// this list so [`Plan::from_row`]'s indices line up — a raw `SELECT *`
-/// would otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, prompt_prefix, prompt_suffix, context_prepend, questions_enabled, pause_requested, last_run_branch, last_run_started_at";
+/// via `ALTER TABLE ... ADD COLUMN`. V10's `prompt_prefix`/`prompt_suffix`
+/// and V14's `context_prepend` were dropped again by V21 (preserving the
+/// physical order of the remaining columns). Every `Plan`-returning query
+/// MUST use this list so [`Plan::from_row`]'s indices line up — a raw
+/// `SELECT *` would otherwise swap columns.
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,16 +430,6 @@ pub struct Plan {
     pub plan_harness: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    #[serde(default)]
-    pub prompt_prefix: Option<String>,
-    #[serde(default)]
-    pub prompt_suffix: Option<String>,
-    /// Per-plan override for the default "how to introspect this plan"
-    /// prepend text injected at the top of every step's prompt. `None`
-    /// means "use [`crate::prompt::DEFAULT_CONTEXT_PREPEND`]". `Some("")`
-    /// is an explicit escape hatch meaning "no prepend at all".
-    #[serde(default)]
-    pub context_prepend: Option<String>,
     /// Per-plan opt-in for the pause-for-question feature. When `false`
     /// (default), `ralph question ask` invocations from a harness against a
     /// step in this plan are rejected and no `step_questions` rows are
@@ -480,8 +471,8 @@ impl Plan {
     /// Expected column order matches [`PLAN_COLUMNS`]:
     /// id, slug, project, branch_name, description, status, harness, agent,
     /// deterministic_tests, created_at, updated_at, plan_harness,
-    /// prompt_prefix, prompt_suffix, context_prepend, questions_enabled,
-    /// pause_requested, last_run_branch, last_run_started_at
+    /// questions_enabled, pause_requested, last_run_branch,
+    /// last_run_started_at
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -506,8 +497,8 @@ impl Plan {
         // `questions_enabled` and `pause_requested` are INTEGER NOT NULL
         // DEFAULT 0 on disk; SQLite has no native bool, so read as i64 and
         // coerce.
-        let questions_enabled_int: i64 = row.get(15)?;
-        let pause_requested_int: i64 = row.get(16)?;
+        let questions_enabled_int: i64 = row.get(12)?;
+        let pause_requested_int: i64 = row.get(13)?;
 
         Ok(Plan {
             id: row.get(0)?,
@@ -522,13 +513,10 @@ impl Plan {
             plan_harness: row.get(11)?,
             created_at,
             updated_at,
-            prompt_prefix: row.get(12)?,
-            prompt_suffix: row.get(13)?,
-            context_prepend: row.get(14)?,
             questions_enabled: questions_enabled_int != 0,
             pause_requested: pause_requested_int != 0,
-            last_run_branch: row.get(17)?,
-            last_run_started_at: row.get(18)?,
+            last_run_branch: row.get(14)?,
+            last_run_started_at: row.get(15)?,
         })
     }
 }
