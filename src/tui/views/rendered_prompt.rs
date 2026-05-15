@@ -92,9 +92,17 @@ pub enum Outcome {
 /// persisted in `execution_logs`, so for a historical attempt we cannot
 /// reproduce it exactly. We reconstruct the file list from the stored diff's
 /// `diff --git a/<path> b/<path>` headers — the closest faithful
-/// approximation available from persisted data. Everything else
-/// (`previous_diff`, `previous_test_output`, `attempt`, `max_attempts`)
-/// matches the executor byte-for-byte.
+/// approximation available from persisted data. The other retry-context
+/// fields (`previous_diff`, `previous_test_output`, `attempt`,
+/// `max_attempts`) match the executor exactly *for the inputs given*.
+///
+/// Fidelity caveat: this is a "what would be sent now" preview. It
+/// re-renders from *current* plan/project/step text and the *current*
+/// answered-question set, so a historical attempt's preview reflects edits
+/// made after that attempt ran — it is not the point-in-time prompt the
+/// agent actually received. The exact prompt sent for each attempt is
+/// persisted verbatim in `execution_logs.prompt_text`; this view
+/// deliberately re-assembles instead, so layer edits are visible.
 pub fn build_retry_context_for_attempt(
     attempt: i32,
     max_attempts: i32,

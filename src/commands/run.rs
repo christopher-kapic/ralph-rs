@@ -4156,7 +4156,7 @@ fn list_agent_names() -> Vec<String> {
 /// returns [`rendered_prompt::Outcome::Pop`]. There are no storage
 /// write-throughs — the prompts are assembled once up front.
 ///
-/// The per-attempt prompts are built by reconstructing the *exact* inputs the
+/// The per-attempt prompts are built by reconstructing the inputs the
 /// executor passes to [`crate::prompt::build_step_prompt`]:
 ///   * agent name: `step.agent` → `plan.agent` (same as `execute_step`),
 ///   * `harness_supports_agent_file`: from the resolved harness config,
@@ -4165,6 +4165,12 @@ fn list_agent_names() -> Vec<String> {
 ///   * answered questions for the step,
 ///   * `max_attempts = step.max_retries.unwrap_or(config.max_retries_per_step) + 1`,
 ///   * the step's execution logs (chronological) for per-attempt retry ctx.
+///
+/// This is a "what would be sent now" preview: the inputs above are read
+/// from *current* state, so a historical attempt reflects later edits to the
+/// plan/project/step text or answered questions rather than the point-in-time
+/// values the agent actually received (those are persisted verbatim in
+/// `execution_logs.prompt_text`, which this view intentionally does not use).
 fn run_rendered_prompt_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
