@@ -4682,11 +4682,8 @@ pub(crate) fn step_detail_observe_read_only(
 /// dispatch the editor handoff for the focused pane and toast the result.
 ///
 /// Routes by `app.focused_pane`:
-/// - `UniversalPrompt` / `ProjectPrompt` / `StepPrompt` / `Tests` → the
-///   matching `edit_*_pane` method on `StepDetailApp`.
-/// - `PlanContextPrepend` / `PlanPrefix` / `PlanSuffix` → no-op. The legacy
-///   per-plan prompt-wrap columns were dropped in migration V21; these pane
-///   variants are inert placeholders pending their full removal.
+/// - `GlobalPrompt` / `ProjectPrompt` / `PlanPrompt` / `StepPrompt` /
+///   `Tests` → the matching `edit_*_pane` method on `StepDetailApp`.
 /// - `Appended` / `OpenQuestions` → no-op (those panes are read-only).
 /// - `BottomRow` → no-op here; the focused cell's picker is opened by
 ///   `step_detail_handle_bottom_row_c` instead.
@@ -4712,19 +4709,15 @@ where
     use std::time::Instant;
 
     let outcome = match app.focused_pane {
-        Pane::UniversalPrompt => {
+        Pane::GlobalPrompt => {
             let mut local = config.clone();
             app.edit_universal_pane(&mut local, config_dir, edit_fn)?
         }
         Pane::ProjectPrompt => app.edit_project_pane(conn, edit_fn)?,
+        Pane::PlanPrompt => app.edit_plan_prompt_pane(conn, edit_fn)?,
         Pane::StepPrompt => app.edit_step_prompt_pane(conn, edit_fn)?,
         Pane::Tests => app.edit_tests_pane(conn, edit_fn)?,
-        Pane::PlanContextPrepend
-        | Pane::PlanPrefix
-        | Pane::PlanSuffix
-        | Pane::Appended
-        | Pane::OpenQuestions
-        | Pane::BottomRow => return Ok(()),
+        Pane::Appended | Pane::OpenQuestions | Pane::BottomRow => return Ok(()),
     };
 
     let now = Instant::now();
@@ -7834,33 +7827,28 @@ mod step_detail_dispatcher_tests {
     }
 
     #[test]
-    fn c_on_inert_plan_panes_is_a_noop() {
-        // The legacy per-plan prompt-wrap columns were dropped in migration
-        // V21. The PlanContextPrepend / PlanPrefix / PlanSuffix panes are
-        // inert placeholders: `c` must short-circuit without invoking the
-        // editor or pushing a toast.
+    fn c_on_plan_prompt_pane_persists_plan_description() {
+        // The Plan layer IS `plan.description`; `c` on the Plan pane must
+        // round-trip through the editor and persist via
+        // `storage::update_plan_description`.
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = db_app(&conn, "/proj");
+        app.focused_pane = Pane::PlanPrompt;
+
         let dir = tempfile::tempdir().unwrap();
-        for pane in [
-            Pane::PlanContextPrepend,
-            Pane::PlanPrefix,
-            Pane::PlanSuffix,
-        ] {
-            let conn = crate::db::open_memory().unwrap();
-            let mut app = db_app(&conn, "/proj");
-            app.focused_pane = pane;
-            step_detail_handle_c(
-                &mut app,
-                &conn,
-                &Config::default(),
-                dir.path(),
-                fake_editor(Some("SHOULD-BE-IGNORED".to_string())),
-            )
-            .unwrap();
-            assert!(
-                app.toasts.current().is_none(),
-                "{pane:?} edit must be a silent no-op"
-            );
-        }
+        step_detail_handle_c(
+            &mut app,
+            &conn,
+            &Config::default(),
+            dir.path(),
+            fake_editor(Some("NEW PLAN DESCRIPTION".to_string())),
+        )
+        .unwrap();
+
+        assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
+        assert_eq!(app.plan.description, "NEW PLAN DESCRIPTION");
+        let reloaded = storage::get_plan_by_id(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded.description, "NEW PLAN DESCRIPTION");
     }
 
     #[test]
@@ -7870,7 +7858,7 @@ mod step_detail_dispatcher_tests {
         // real config.
         let conn = crate::db::open_memory().unwrap();
         let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::UniversalPrompt;
+        app.focused_pane = Pane::GlobalPrompt;
 
         let dir = tempfile::tempdir().unwrap();
         let buffer = format_prompt_pane(Some("UNIVERSAL PROMPT"));

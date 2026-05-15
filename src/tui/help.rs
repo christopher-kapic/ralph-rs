@@ -298,6 +298,15 @@ pub fn for_step_detail() -> HelpModel {
                     ("a", "Answer focused open question"),
                 ],
             ),
+            Group::new(
+                "Prompt layers",
+                vec![
+                    ("Global (universal)", "Config.prompt — applies everywhere"),
+                    ("Project", ".ralph/prompt.md or the project DB row"),
+                    ("Plan", "The plan description"),
+                    ("Step", "This step's title / description / criteria"),
+                ],
+            ),
             Group::new("View", vec![("z", "Toggle zen mode (collapse sidebar)")]),
             Group::new(
                 "Other",

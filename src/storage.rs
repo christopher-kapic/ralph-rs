@@ -668,6 +668,24 @@ pub fn set_plan_harness_gen(conn: &Connection, plan_id: &str, harness: Option<&s
     Ok(())
 }
 
+/// Update a plan's description and bump `updated_at`. The plan description
+/// IS the Plan layer of the four-layer prompt model, so this is the write
+/// path behind the step-detail "Plan prompt" pane editor.
+pub fn update_plan_description(
+    conn: &Connection,
+    plan_id: &str,
+    description: &str,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET description = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![description, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
 /// Replace the plan's deterministic test commands. The slice is JSON-encoded
 /// into the `deterministic_tests` column verbatim — empty slice clears the
 /// list (one row of `[]`).

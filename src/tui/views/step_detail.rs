@@ -22,7 +22,7 @@ use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::plan::{ChangePolicy, ExecutionLog, Plan, Step, StepStatus};
-use crate::storage::{self, ProjectSettings};
+use crate::storage::{self, ProjectPromptSource, ProjectSettings};
 use crate::tui::chrome::{self, Chrome};
 use crate::tui::help::{self, HelpState};
 use crate::tui::read_only::{self, ReadOnly};
@@ -103,11 +103,15 @@ const STEP_CRITERIA_HEADER: &str = "## Acceptance criteria";
 /// wrapping at the ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
-    UniversalPrompt,
+    /// Global-layer prompt (`Config.prompt`). Labelled "Global (universal)"
+    /// in user-facing text — "universal" is kept as a synonym only.
+    GlobalPrompt,
+    /// Project-layer prompt. Resolves file-first from
+    /// `<workdir>/.ralph/prompt.md`, else the `project_settings.prompt` DB
+    /// column; the edit handler routes the write to whichever is active.
     ProjectPrompt,
-    PlanContextPrepend,
-    PlanPrefix,
-    PlanSuffix,
+    /// Plan-layer prompt — this IS `plan.description`.
+    PlanPrompt,
     StepPrompt,
     /// Open (unanswered) `step_questions` rows for the focused step
     /// (TUI-plan.md §17). Sits between [`Pane::StepPrompt`] and
@@ -122,12 +126,10 @@ pub enum Pane {
 impl Pane {
     /// Display order — index into the pane stack from top to bottom. Drives
     /// the wrapping nav arithmetic below.
-    pub const ORDER: [Pane; 10] = [
-        Pane::UniversalPrompt,
+    pub const ORDER: [Pane; 8] = [
+        Pane::GlobalPrompt,
         Pane::ProjectPrompt,
-        Pane::PlanContextPrepend,
-        Pane::PlanPrefix,
-        Pane::PlanSuffix,
+        Pane::PlanPrompt,
         Pane::StepPrompt,
         Pane::OpenQuestions,
         Pane::Appended,
@@ -147,11 +149,9 @@ impl Pane {
     /// tests share a single source of truth for the heading text.
     pub fn title(self) -> &'static str {
         match self {
-            Pane::UniversalPrompt => "Universal prompt",
+            Pane::GlobalPrompt => "Global (universal) prompt",
             Pane::ProjectPrompt => "Project prompt",
-            Pane::PlanContextPrepend => "Plan context prepend",
-            Pane::PlanPrefix => "Plan prefix",
-            Pane::PlanSuffix => "Plan suffix",
+            Pane::PlanPrompt => "Plan prompt",
             Pane::StepPrompt => "Step prompt",
             Pane::OpenQuestions => "Open question(s)",
             Pane::Appended => "Appended",
@@ -1277,29 +1277,74 @@ impl StepDetailApp {
     }
 
     /// `c` on the Project pane: round-trip the Project-layer prompt through
-    /// `$EDITOR` and persist via the storage helper.
+    /// `$EDITOR` and persist to whichever source is *active*.
+    ///
+    /// Precedence follows [`storage::resolve_project_prompt`]: when
+    /// `<workdir>/.ralph/prompt.md` is present (and non-blank) the file is
+    /// the source of truth, so the edit is seeded from and written back to
+    /// that file via [`storage::write_project_prompt_file`]. Otherwise the
+    /// DB column (`project_settings.prompt`) is edited via
+    /// [`storage::set_project_prompt`]. The precedence itself is not
+    /// re-implemented here — the storage resolver decides.
     pub fn edit_project_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
     where
         E: FnOnce(&str) -> Result<Option<String>>,
     {
-        let initial = format_prompt_pane(self.project_settings.prompt.as_deref());
+        let (resolved, source) =
+            storage::resolve_project_prompt(conn, &self.plan.project)?;
+        let initial = format_prompt_pane(resolved.prompt.as_deref());
         let new_text = match edit_fn(&initial)? {
             None => return Ok(EditOutcome::NoEditor),
             Some(s) => s,
         };
         let new_prompt = parse_prompt_pane(&new_text);
-        if new_prompt == self.project_settings.prompt {
+        if new_prompt == resolved.prompt {
             return Ok(EditOutcome::NoChanges);
         }
-        storage::set_project_prompt(conn, &self.plan.project, new_prompt.as_deref())?;
+        match source {
+            ProjectPromptSource::File(_) => match new_prompt.as_deref() {
+                Some(content) => {
+                    storage::write_project_prompt_file(&self.plan.project, content)?
+                }
+                // Clearing a file-backed prompt removes the file so the DB
+                // (or nothing) becomes the active source again.
+                None => storage::delete_project_prompt_file(&self.plan.project)?,
+            },
+            ProjectPromptSource::Db => {
+                storage::set_project_prompt(conn, &self.plan.project, new_prompt.as_deref())?
+            }
+        }
         self.project_settings.prompt = new_prompt;
         Ok(EditOutcome::Saved)
     }
 
-    // The Plan-context-prepend / Plan-prefix / Plan-suffix panes used to own
-    // `c`-edit handlers here. The legacy per-plan prompt-wrap columns were
-    // dropped in migration V21, so those panes are now inert (the dispatcher
-    // routes them to a no-op) pending their full removal.
+    /// `c` on the Plan pane: round-trip the Plan-layer prompt — which IS
+    /// `plan.description` — through `$EDITOR` and persist via
+    /// [`storage::update_plan_description`]. The in-memory `plan` mirror is
+    /// refreshed so the pane re-renders without a reload.
+    pub fn edit_plan_prompt_pane<E>(
+        &mut self,
+        conn: &Connection,
+        edit_fn: E,
+    ) -> Result<EditOutcome>
+    where
+        E: FnOnce(&str) -> Result<Option<String>>,
+    {
+        let initial = format_prompt_pane(Some(self.plan.description.as_str()));
+        let new_text = match edit_fn(&initial)? {
+            None => return Ok(EditOutcome::NoEditor),
+            Some(s) => s,
+        };
+        // The plan description is a plain `String` (not `Option`); an empty
+        // edit clears it to the empty string rather than `None`.
+        let new_desc = parse_prompt_pane(&new_text).unwrap_or_default();
+        if new_desc == self.plan.description {
+            return Ok(EditOutcome::NoChanges);
+        }
+        storage::update_plan_description(conn, &self.plan.id, &new_desc)?;
+        self.plan.description = new_desc;
+        Ok(EditOutcome::Saved)
+    }
 
     /// `c` on the Step-prompt pane: round-trip `step.title`,
     /// `step.description`, and `step.acceptance_criteria` through `$EDITOR`
@@ -1789,16 +1834,17 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
     }
 
     match pane {
-        Pane::UniversalPrompt => render_text_pane(frame, inner, app.config_prompt.as_deref()),
+        Pane::GlobalPrompt => render_text_pane(frame, inner, app.config_prompt.as_deref()),
         Pane::ProjectPrompt => {
             render_text_pane(frame, inner, app.project_settings.prompt.as_deref())
         }
-        // The legacy per-plan prompt-wrap columns were dropped in migration
-        // V21. These pane variants are inert placeholders pending their full
-        // removal — render them empty.
-        Pane::PlanContextPrepend | Pane::PlanPrefix | Pane::PlanSuffix => {
-            render_text_pane(frame, inner, None)
-        }
+        // The Plan layer IS `plan.description`. An empty description renders
+        // the `(none)` placeholder via `render_text_pane`.
+        Pane::PlanPrompt => render_text_pane(
+            frame,
+            inner,
+            Some(app.plan.description.as_str()).filter(|s| !s.is_empty()),
+        ),
         Pane::StepPrompt => render_step_prompt(frame, app, inner),
         Pane::OpenQuestions => render_open_questions(frame, app, inner),
         Pane::Appended => render_appended(frame, app, inner),
@@ -2214,18 +2260,16 @@ mod tests {
     // -- Pane order / titles ------------------------------------------------
 
     #[test]
-    fn pane_order_matches_section_8_layout() {
-        // The §8 sketch lists the prompt-wrapping panes; §17 adds the
-        // OpenQuestions pane between StepPrompt and Appended. The plan
-        // prefix/suffix are split so each is editable as a single body.
+    fn pane_order_matches_four_layer_layout() {
+        // The four-layer prompt model collapses the prompt panes to
+        // Global → Project → Plan → Step; §17 adds the OpenQuestions pane
+        // between StepPrompt and Appended.
         assert_eq!(
             Pane::ORDER,
             [
-                Pane::UniversalPrompt,
+                Pane::GlobalPrompt,
                 Pane::ProjectPrompt,
-                Pane::PlanContextPrepend,
-                Pane::PlanPrefix,
-                Pane::PlanSuffix,
+                Pane::PlanPrompt,
                 Pane::StepPrompt,
                 Pane::OpenQuestions,
                 Pane::Appended,
@@ -2254,7 +2298,7 @@ mod tests {
     #[test]
     fn focus_down_walks_full_stack_and_wraps() {
         let mut app = make_app(3, 0);
-        app.focused_pane = Pane::UniversalPrompt;
+        app.focused_pane = Pane::GlobalPrompt;
         let mut seen = vec![app.focused_pane];
         for _ in 0..Pane::ORDER.len() {
             app.focus_down();
@@ -2262,8 +2306,8 @@ mod tests {
         }
         // After ORDER.len() down-presses we should have walked through every
         // pane and wrapped back to the start.
-        assert_eq!(seen.first(), Some(&Pane::UniversalPrompt));
-        assert_eq!(seen.last(), Some(&Pane::UniversalPrompt));
+        assert_eq!(seen.first(), Some(&Pane::GlobalPrompt));
+        assert_eq!(seen.last(), Some(&Pane::GlobalPrompt));
         // The middle of the trace should hit each pane exactly once.
         let middle: Vec<Pane> = seen[..Pane::ORDER.len()].to_vec();
         assert_eq!(middle, Pane::ORDER.to_vec());
@@ -2272,7 +2316,7 @@ mod tests {
     #[test]
     fn focus_up_walks_stack_in_reverse_and_wraps() {
         let mut app = make_app(3, 0);
-        app.focused_pane = Pane::UniversalPrompt;
+        app.focused_pane = Pane::GlobalPrompt;
         // First up-press wraps to the bottom row.
         app.focus_up();
         assert_eq!(app.focused_pane, Pane::BottomRow);
@@ -2283,17 +2327,17 @@ mod tests {
     }
 
     #[test]
-    fn focus_down_from_bottom_row_wraps_to_universal() {
+    fn focus_down_from_bottom_row_wraps_to_global() {
         let mut app = make_app(3, 0);
         app.focused_pane = Pane::BottomRow;
         app.focus_down();
-        assert_eq!(app.focused_pane, Pane::UniversalPrompt);
+        assert_eq!(app.focused_pane, Pane::GlobalPrompt);
     }
 
     #[test]
-    fn focus_up_from_universal_wraps_to_bottom_row() {
+    fn focus_up_from_global_wraps_to_bottom_row() {
         let mut app = make_app(3, 0);
-        app.focused_pane = Pane::UniversalPrompt;
+        app.focused_pane = Pane::GlobalPrompt;
         app.focus_up();
         assert_eq!(app.focused_pane, Pane::BottomRow);
     }
@@ -2789,7 +2833,7 @@ mod tests {
             Vec::new(),
         );
         let screen = render_to_string(160, 100, &mut app);
-        assert!(screen.contains("Universal prompt"), "{screen}");
+        assert!(screen.contains("Global (universal)"), "{screen}");
         assert!(screen.contains("CFG-PROMPT-MARKER"), "{screen}");
     }
 
@@ -3627,15 +3671,18 @@ mod tests {
     fn edit_project_pane_no_changes_skips_writes() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = setup_project_app(&conn, "/proj");
-        app.project_settings.prompt = Some("a".to_string());
+        // Seed the DB row (the active source for `/proj`, which has no
+        // checked-in `.ralph/prompt.md`). The handler resolves the buffer
+        // from the resolver, not the in-memory mirror.
+        storage::set_project_prompt(&conn, "/proj", Some("a")).unwrap();
         let buffer = format_prompt_pane(Some("a"));
         let outcome = app
             .edit_project_pane(&conn, fake_editor(Some(buffer)))
             .unwrap();
         assert_eq!(outcome, EditOutcome::NoChanges);
-        // No row written; storage still reflects the absence.
+        // Row unchanged.
         let stored = storage::get_project_settings(&conn, "/proj").unwrap();
-        assert_eq!(stored.prompt, None);
+        assert_eq!(stored.prompt.as_deref(), Some("a"));
     }
 
     #[test]
@@ -3669,6 +3716,135 @@ mod tests {
         let stored = storage::get_project_settings(&conn, "/proj").unwrap();
         assert_eq!(stored.prompt, None);
         assert_eq!(app.project_settings.prompt, None);
+    }
+
+    #[test]
+    fn edit_project_pane_routes_to_db_when_no_file() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        let mut app = setup_project_app(&conn, &project);
+
+        let outcome = app
+            .edit_project_pane(&conn, fake_editor(Some("to db".to_string())))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+
+        // The DB column got the value; no file was created.
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt
+                .as_deref(),
+            Some("to db")
+        );
+        assert!(!storage::project_prompt_file_path(&project).exists());
+    }
+
+    #[test]
+    fn edit_project_pane_routes_to_file_when_present() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        // A checked-in file is the active source; the DB also has a value
+        // that must NOT be touched.
+        storage::write_project_prompt_file(&project, "old file value").unwrap();
+        storage::set_project_prompt(&conn, &project, Some("db untouched")).unwrap();
+        let mut app = setup_project_app(&conn, &project);
+
+        let outcome = app
+            .edit_project_pane(&conn, fake_editor(Some("new file value".to_string())))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+
+        // File got the edit; DB column is unchanged.
+        assert_eq!(
+            storage::read_project_prompt_file(&project).unwrap().as_deref(),
+            Some("new file value")
+        );
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt
+                .as_deref(),
+            Some("db untouched")
+        );
+    }
+
+    #[test]
+    fn edit_project_pane_clearing_file_backed_prompt_deletes_file() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        storage::write_project_prompt_file(&project, "file content").unwrap();
+        let mut app = setup_project_app(&conn, &project);
+
+        // Saving an empty buffer over a file-backed prompt removes the file.
+        let outcome = app
+            .edit_project_pane(&conn, fake_editor(Some(String::new())))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        assert!(!storage::project_prompt_file_path(&project).exists());
+    }
+
+    // -- edit_plan_prompt_pane --------------------------------------------
+
+    #[test]
+    fn edit_plan_prompt_pane_seeds_editor_with_plan_description() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        app.plan.description = "CURRENT PLAN DESC".to_string();
+
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let outcome = app
+            .edit_plan_prompt_pane(&conn, capturing_editor(seen.clone()))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::NoEditor);
+        assert_eq!(
+            seen.borrow().clone().expect("editor invoked"),
+            "CURRENT PLAN DESC\n"
+        );
+    }
+
+    #[test]
+    fn edit_plan_prompt_pane_no_changes_when_unchanged() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+        // setup_project_app created the plan with description "desc".
+        let buffer = format_prompt_pane(Some("desc"));
+        let outcome = app
+            .edit_plan_prompt_pane(&conn, fake_editor(Some(buffer)))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::NoChanges);
+    }
+
+    #[test]
+    fn edit_plan_prompt_pane_persists_changed_description() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+
+        let outcome = app
+            .edit_plan_prompt_pane(&conn, fake_editor(Some("NEW DESC".to_string())))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        assert_eq!(app.plan.description, "NEW DESC");
+        let reloaded = storage::get_plan_by_id(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded.description, "NEW DESC");
+    }
+
+    #[test]
+    fn edit_plan_prompt_pane_empty_buffer_clears_to_empty_string() {
+        let conn = crate::db::open_memory().unwrap();
+        let mut app = setup_project_app(&conn, "/proj");
+
+        let outcome = app
+            .edit_plan_prompt_pane(&conn, fake_editor(Some(String::new())))
+            .unwrap();
+        assert_eq!(outcome, EditOutcome::Saved);
+        // plan.description is a String, not Option — clears to "".
+        assert_eq!(app.plan.description, "");
+        let reloaded = storage::get_plan_by_id(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded.description, "");
     }
 
     // -- Step-prompt pane format/parse round-trips ------------------------
