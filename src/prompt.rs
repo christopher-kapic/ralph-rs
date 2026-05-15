@@ -39,12 +39,13 @@ attempt. After your last call, exit normally (zero status). The plan
 will pause; the user will answer in the TUI; your next attempt will
 receive every answered question in the appended retry context.";
 
-/// Seed source for the global prompt (`config.prompt`): `ralph init` is the
-/// canonical place this block is written from (see
-/// `commands::seed_global_prompt`). A fresh or blank `config.prompt` is
+/// Seed source for the global prompt (`config.prompt`) — **init only**.
+/// `ralph init` is the sole place this block is written from (see
+/// `commands::seed_global_prompt`): a fresh or blank `config.prompt` is
 /// filled with it, and `ralph init --restore-prompts` re-seeds it
-/// unconditionally. It is still consumed directly by `build_step_prompt`
-/// today (removing that use is a later step).
+/// unconditionally. `build_step_prompt` no longer injects it — the global
+/// prompt layer (sourced from `config.prompt`) carries it at runtime, so
+/// editing the global prompt fully customizes this block.
 ///
 /// This string is a user-facing contract — case, punctuation, and line
 /// breaks are load-bearing and should not drift without a conscious bump.
@@ -90,15 +91,19 @@ pub struct RetryContext {
 }
 
 /// The three configurable layers of the four-layer prompt model
-/// (Global → Project → Plan → Step), outermost to innermost. All three
-/// stack as prefix sections at the top of the assembled prompt in
-/// global → project → plan order; there is no suffix concept. Empty strings
+/// (Global → Project → Plan → Step), outermost to innermost. Empty strings
 /// are treated as `None` so a layer can be "set but blank" without
 /// contaminating the prompt.
 ///
+/// Global and Project stack as plain prefix sections at the top of the
+/// assembled prompt in global → project order; there is no suffix concept.
+/// The Plan layer is the plan's description (not a separate column) and is
+/// rendered by [`format_plan_context`] into the `# Plan: {slug}` block —
+/// it is NOT a bare prefix section, so the description is emitted exactly
+/// once with consistent slug/branch/project framing.
+///
 /// The Step layer is the step body itself (built by [`build_step_prompt`])
-/// and is not represented here. The `plan` layer is sourced from the plan's
-/// description, not a separate column.
+/// and is not represented here.
 #[derive(Debug, Clone, Default)]
 pub struct Prompts {
     pub global: Option<String>,
@@ -107,17 +112,15 @@ pub struct Prompts {
 }
 
 impl Prompts {
-    /// Iterator over the layer strings in the order they should appear at
-    /// the top of the assembled prompt (global → project → plan), skipping
-    /// any layer that is unset or blank.
+    /// Iterator over the plain prefix layer strings (global → project) in
+    /// the order they should appear at the top of the assembled prompt,
+    /// skipping any layer that is unset or blank. The Plan layer is NOT
+    /// included — it is rendered through [`format_plan_context`] in the
+    /// body so the plan description is emitted exactly once.
     fn prefix_sections(&self) -> impl Iterator<Item = &str> {
-        [
-            self.global.as_deref(),
-            self.project.as_deref(),
-            self.plan.as_deref(),
-        ]
-        .into_iter()
-        .filter_map(non_empty)
+        [self.global.as_deref(), self.project.as_deref()]
+            .into_iter()
+            .filter_map(non_empty)
     }
 }
 
@@ -128,13 +131,18 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 /// Build the full prompt for a step execution.
 ///
 /// The prompt is assembled from these parts, in order:
-/// 1. Context prepend — [`DEFAULT_CONTEXT_PREPEND`]
-/// 2. Agent pointer (instructs the harness to fetch the agent profile itself)
-/// 3. Retry context (if this is a retry attempt)
-/// 4. Plan context (plan description and overall goal)
-/// 5. Previously answered questions (only if `answered_questions` is non-empty)
-/// 6. Step details (title and description of current step)
-/// 7. Acceptance criteria (specific criteria the step must meet)
+/// 1. Global prompt layer (`prompts.global`; sourced from `config.prompt`,
+///    which `ralph init` seeds with [`DEFAULT_CONTEXT_PREPEND`])
+/// 2. Project prompt layer (`prompts.project`)
+/// 3. Plan prompt layer — the plan-context block, rendered by
+///    [`format_plan_context`] from `prompts.plan` (the plan's description)
+///    plus the plan's slug/branch/project framing. This is the **single**
+///    place the plan description is emitted.
+/// 4. Agent pointer (instructs the harness to fetch the agent profile itself)
+/// 5. Retry context (if this is a retry attempt)
+/// 6. Previously answered questions (only if `answered_questions` is non-empty)
+/// 7. Step details (title and description of current step) + acceptance
+///    criteria
 /// 8. Plan step map — a compact titles-only list of ALL steps in the plan
 ///    with their current status, so the agent can see where it is in the
 ///    sequence without us paying O(n²) bytes for full prior descriptions
@@ -142,9 +150,8 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 /// 10. Focus instruction (reminder to stay focused on just this step)
 /// 11. Question-ask instruction (only if `plan.questions_enabled`)
 ///
-/// Then the global/project/plan prompt layers are stacked as prefix
-/// sections ahead of the joined body in global → project → plan order.
-/// There is no suffix stage — assembly is pure prefix-stacking.
+/// Assembly is pure prefix-stacking — there is no suffix stage and no
+/// auto-injected context prepend (the global layer carries that block).
 ///
 /// `all_steps` is the full ordered list of steps in the plan (as returned by
 /// `storage::list_steps`). `step` must be one of them — matched by `id`.
@@ -167,17 +174,16 @@ pub fn build_step_prompt(
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
 
-    // 1. Context prepend — the system default introspection block.
-    let prepend = DEFAULT_CONTEXT_PREPEND;
-    if !prepend.is_empty() {
-        // The constant includes a trailing `\n\n---\n\n` separator, but the
-        // outer `sections.join("\n\n")` will also add one between sections.
-        // Push the prepend with its trailing whitespace trimmed so we don't
-        // end up with three blank lines between it and the next section.
-        sections.push(prepend.trim_end().to_string());
-    }
+    // Plan layer — the plan-context block. This is the SINGLE place the plan
+    // description is emitted: `prompts.plan` carries the description (the
+    // executor wires it from `plan.description`), and `format_plan_context`
+    // wraps it in the `# Plan: {slug}` header with branch/project framing.
+    // We deliberately do NOT also stack `prompts.plan` as a bare prefix
+    // section (see `Prompts::prefix_sections`) — doing so previously emitted
+    // the description twice.
+    sections.push(format_plan_context(plan, prompts.plan.as_deref()));
 
-    // 2. Agent pointer
+    // Agent pointer.
     // For harnesses without native agent-file support, point the agent at
     // `ralph agents show <name>` rather than inlining the full file — the
     // agent can fetch it on demand and we save tokens in every prompt.
@@ -187,15 +193,12 @@ pub fn build_step_prompt(
         sections.push(format_agent_pointer(name));
     }
 
-    // 3. Retry context
+    // Retry context.
     if let Some(retry) = retry_context {
         sections.push(format_retry_context(retry));
     }
 
-    // 4. Plan context
-    sections.push(format_plan_context(plan));
-
-    // 5. Previously answered questions — injected between plan context and
+    // Previously answered questions — injected between plan context and
     // step details so the harness sees the user's clarifications before
     // re-reading the step description (TUI-plan.md §17 "Retry context after
     // answering"). Empty slice contributes nothing.
@@ -203,7 +206,7 @@ pub fn build_step_prompt(
         sections.push(format_answered_questions(answered_questions));
     }
 
-    // 6. Step details (with 1-based position in the plan)
+    // Step details (with 1-based position in the plan)
     let step_num = all_steps
         .iter()
         .position(|s| s.id == step.id)
@@ -211,39 +214,40 @@ pub fn build_step_prompt(
         .unwrap_or(0);
     sections.push(format_step_details(step, step_num, all_steps.len()));
 
-    // 7. Acceptance criteria
+    // Acceptance criteria.
     if !step.acceptance_criteria.is_empty() {
         sections.push(format_acceptance_criteria(&step.acceptance_criteria));
     }
 
-    // 8. Plan step map — titles-only listing of every step in the plan.
+    // Plan step map — titles-only listing of every step in the plan.
     // Strictly linear in plan size (~80 bytes/step) vs the old quadratic
     // prior-step descriptions dump.
     if !all_steps.is_empty() {
         sections.push(format_plan_step_map(all_steps, &step.id));
     }
 
-    // 9. Deterministic tests
+    // Deterministic tests.
     if !plan.deterministic_tests.is_empty() {
         sections.push(format_deterministic_tests(&plan.deterministic_tests));
     }
 
-    // 10. Focus instruction
+    // Focus instruction.
     sections.push(format_focus_instruction(step));
 
-    // 11. Question-ask instruction — appended at the very end (after the
+    // Question-ask instruction — appended at the very end (after the
     // focus instruction) when the plan opted into questions (TUI-plan.md §17
-    // "Prompt injection (when enabled)"). Other prompt layers (suffix wraps)
-    // stack outside this block.
+    // "Prompt injection (when enabled)").
     if plan.questions_enabled {
         sections.push(QUESTION_ASK_INSTRUCTION.to_string());
     }
 
-    // Stack the global/project/plan layers as prefix sections ahead of the
-    // joined body. Each layer is inserted as its own `\n\n`-separated
-    // section, matching the rest of the prompt's delimiter so nothing looks
-    // glued on. There is no suffix stage — assembly is pure prefix-stacking.
-    let mut all = Vec::with_capacity(sections.len() + 3);
+    // Stack the global/project layers as prefix sections ahead of the joined
+    // body. Each layer is inserted as its own `\n\n`-separated section,
+    // matching the rest of the prompt's delimiter so nothing looks glued on.
+    // The Plan layer is already the first body section (rendered via
+    // `format_plan_context`), so it is not stacked here. There is no suffix
+    // stage — assembly is pure prefix-stacking.
+    let mut all = Vec::with_capacity(sections.len() + 2);
     all.extend(prompts.prefix_sections().map(str::to_string));
     all.extend(sections);
 
@@ -294,14 +298,29 @@ fn format_retry_context(ctx: &RetryContext) -> String {
     parts.join("\n\n")
 }
 
-fn format_plan_context(plan: &Plan) -> String {
+/// Render the Plan-layer block: `# Plan: {slug}` header, the plan
+/// description, and branch/project framing.
+///
+/// **Single-source decision (Step 9):** the description is taken from
+/// `plan_layer` — the configurable Plan prompt layer (`prompts.plan`, wired
+/// by the executor from `plan.description`) — NOT from `plan.description`
+/// directly, and the Plan layer is *not* also stacked as a bare prefix
+/// section by `build_step_prompt`. This is why the description appears
+/// exactly once. Chosen over "keep a header on a separate prefix layer"
+/// because routing the description through this one formatter keeps a single
+/// emission site and consistent slug/branch/project framing. `plan_layer`
+/// being `None`/blank yields a header-only block (no empty body line).
+fn format_plan_context(plan: &Plan, plan_layer: Option<&str>) -> String {
+    let body = match non_empty(plan_layer) {
+        Some(desc) => format!("{desc}\n\n"),
+        None => String::new(),
+    };
     format!(
         "# Plan: {slug}\n\n\
-         {description}\n\n\
+         {body}\
          **Branch:** `{branch}`\n\
          **Project:** `{project}`",
         slug = plan.slug,
-        description = plan.description,
         branch = plan.branch_name,
         project = plan.project,
     )
@@ -519,6 +538,12 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
+        // Mirror the executor: the Plan layer is the plan's description.
+        let prompts = Prompts {
+            global: None,
+            project: None,
+            plan: Some(plan.description.clone()),
+        };
         let prompt = build_step_prompt(
             &plan,
             &step,
@@ -526,7 +551,7 @@ mod tests {
             None,
             None,
             true, // harness supports agent file natively
-            &Prompts::default(),
+            &prompts,
             &[],
         );
 
@@ -560,7 +585,69 @@ mod tests {
     }
 
     #[test]
-    fn test_default_prepend_is_always_used() {
+    fn test_plan_description_emitted_exactly_once_executor_realistic() {
+        // Carried-forward regression (Step 9): the executor wires the Plan
+        // layer to `plan.description` verbatim. Previously `format_plan_context`
+        // ALSO re-emitted `plan.description` independently, so the description
+        // appeared TWICE in every real run. This test drives the
+        // executor-realistic case — the Plan layer string IS `plan.description`
+        // (not a synthetic "PLAN-LAYER" placeholder, which is exactly what
+        // masked the bug) — and asserts it appears exactly once.
+        let mut plan = make_plan();
+        // A distinctive, unlikely-to-collide marker so a substring count is a
+        // faithful occurrence count (won't accidentally match boilerplate).
+        plan.description =
+            "ZZZ_UNIQUE_PLAN_DESCRIPTION_MARKER: build the widget pipeline".to_string();
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+
+        // Exactly how src/executor.rs (~line 741) builds `Prompts`: the Plan
+        // layer is `Some(plan.description.clone())`.
+        let prompts = Prompts {
+            global: config_like_global(),
+            project: None,
+            plan: Some(plan.description.clone()),
+        };
+
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &prompts,
+            &[],
+        );
+
+        assert_eq!(
+            prompt.matches("ZZZ_UNIQUE_PLAN_DESCRIPTION_MARKER").count(),
+            1,
+            "plan description must appear EXACTLY ONCE (no Plan-layer + \
+             format_plan_context double-emission). Prompt:\n{prompt}"
+        );
+        // And it must be inside the Plan-context block at the Plan-layer
+        // position (after any global/project prefix, before the step body).
+        let plan_hdr = prompt.find("# Plan: test-plan").unwrap();
+        let desc_pos = prompt.find("ZZZ_UNIQUE_PLAN_DESCRIPTION_MARKER").unwrap();
+        let step_pos = prompt.find("## Your step").unwrap();
+        assert!(plan_hdr < desc_pos);
+        assert!(desc_pos < step_pos);
+    }
+
+    /// Stand-in for a seeded `config.prompt` global layer so the regression
+    /// test exercises a realistic multi-layer prompt (not just the Plan
+    /// layer in isolation).
+    fn config_like_global() -> Option<String> {
+        Some(DEFAULT_CONTEXT_PREPEND.to_string())
+    }
+
+    #[test]
+    fn test_default_prepend_not_auto_injected() {
+        // Step 9 removed the context-prepend auto-injection stage. With no
+        // Global layer set, NONE of DEFAULT_CONTEXT_PREPEND's load-bearing
+        // markers may appear — the block now travels via `config.prompt`
+        // (the Global layer), not the prompt builder.
         let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
@@ -576,12 +663,41 @@ mod tests {
             &[],
         );
 
-        // The DEFAULT_CONTEXT_PREPEND starts with "# Ralph context" and lists
-        // introspection commands. Spot-check a few load-bearing markers.
+        assert!(!prompt.contains("# Ralph context"));
+        assert!(!prompt.contains("## Introspecting the plan"));
+        assert!(!prompt.contains("Do NOT use `--after <N>` during a run"));
+    }
+
+    #[test]
+    fn test_default_prepend_flows_through_global_layer() {
+        // When the Global layer carries DEFAULT_CONTEXT_PREPEND (as `ralph
+        // init` seeds it into `config.prompt`), its markers DO appear, at the
+        // very top of the prompt.
+        let plan = make_plan();
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+        let prompts = Prompts {
+            global: Some(DEFAULT_CONTEXT_PREPEND.to_string()),
+            project: None,
+            plan: None,
+        };
+
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &prompts,
+            &[],
+        );
+
         assert!(prompt.contains("# Ralph context"));
         assert!(prompt.contains("## Introspecting the plan"));
         assert!(prompt.contains("`ralph status`"));
         assert!(prompt.contains("Do NOT use `--after <N>` during a run"));
+        assert!(prompt.starts_with("# Ralph context"));
     }
 
     #[test]
@@ -915,6 +1031,12 @@ mod tests {
             answer: "SQLite".to_string(),
         }];
 
+        let prompts = Prompts {
+            global: Some(DEFAULT_CONTEXT_PREPEND.to_string()),
+            project: Some("PROJECT-LAYER".to_string()),
+            plan: Some(plan.description.clone()),
+        };
+
         let prompt = build_step_prompt(
             &plan,
             &s2,
@@ -922,17 +1044,18 @@ mod tests {
             Some("senior-engineer"),
             Some(&retry),
             false,
-            &Prompts::default(),
+            &prompts,
             &answered,
         );
 
         // Verify ordering:
-        // prepend -> agent -> retry -> plan -> answered_questions -> step ->
-        // criteria -> step map -> tests -> focus -> ask-instruction
-        let prepend_pos = prompt.find("# Ralph context").unwrap();
+        // global -> project -> plan -> agent -> retry -> answered_questions
+        // -> step -> criteria -> step map -> tests -> focus -> ask-instruction
+        let global_pos = prompt.find("# Ralph context").unwrap();
+        let project_pos = prompt.find("PROJECT-LAYER").unwrap();
+        let plan_pos = prompt.find("# Plan:").unwrap();
         let agent_pos = prompt.find("# Agent Profile").unwrap();
         let retry_pos = prompt.find("# Retry Context").unwrap();
-        let plan_pos = prompt.find("# Plan:").unwrap();
         let answered_pos = prompt.find("## Previously answered questions").unwrap();
         let step_pos = prompt.find("## Your step").unwrap();
         let criteria_pos = prompt.find("Acceptance criteria").unwrap();
@@ -941,10 +1064,11 @@ mod tests {
         let focus_pos = prompt.find("Only modify files").unwrap();
         let ask_pos = prompt.find("## Asking the user a question").unwrap();
 
-        assert!(prepend_pos < agent_pos);
+        assert!(global_pos < project_pos);
+        assert!(project_pos < plan_pos);
+        assert!(plan_pos < agent_pos);
         assert!(agent_pos < retry_pos);
-        assert!(retry_pos < plan_pos);
-        assert!(plan_pos < answered_pos);
+        assert!(retry_pos < answered_pos);
         assert!(answered_pos < step_pos);
         assert!(step_pos < criteria_pos);
         assert!(criteria_pos < map_pos);
@@ -966,15 +1090,18 @@ mod tests {
 
         let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
 
-        // Layers stack global → project → plan at the very top, ahead of the
-        // system-content prepend section. There is no suffix stage.
+        // Global and Project stack as plain prefix sections in
+        // global → project order. The Plan layer is rendered through
+        // `format_plan_context`, so the configured plan-layer text appears
+        // inside the `# Plan:` block (immediately after the project prefix),
+        // not as a separate bare prefix section.
         let g = prompt.find("GLOBAL-LAYER").unwrap();
         let p = prompt.find("PROJECT-LAYER").unwrap();
+        let plan_hdr = prompt.find("# Plan: test-plan").unwrap();
         let pl = prompt.find("PLAN-LAYER").unwrap();
-        let prepend_pos = prompt.find("# Ralph context").unwrap();
         assert!(g < p);
-        assert!(p < pl);
-        assert!(pl < prepend_pos);
+        assert!(p < plan_hdr);
+        assert!(plan_hdr < pl, "plan-layer text must sit inside the # Plan block");
 
         // Global layer is the very start; the body's focus instruction is
         // the tail — nothing is appended after it.
@@ -984,6 +1111,9 @@ mod tests {
                 .trim_end()
                 .ends_with(&format!("Focus on: {}", step.title))
         );
+        // The configured plan-layer string appears exactly once (no bare
+        // prefix + format_plan_context double-emission).
+        assert_eq!(prompt.matches("PLAN-LAYER").count(), 1);
         // None of the old suffix markers leak in.
         assert!(!prompt.contains("-SUF"));
     }
@@ -1003,7 +1133,10 @@ mod tests {
 
         let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
 
-        assert!(prompt.starts_with("PLAN-LAYER"));
+        // Global is blank and Project is None, so the first section is the
+        // Plan-context block. The configured plan-layer text lives inside it.
+        assert!(prompt.starts_with("# Plan: test-plan"));
+        assert!(prompt.contains("PLAN-LAYER"));
         assert!(
             !prompt.contains("\n\n\n"),
             "should not produce blank sections"
