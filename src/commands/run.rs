@@ -4148,6 +4148,107 @@ fn list_agent_names() -> Vec<String> {
     names
 }
 
+/// Rendered-prompt preview sub-view dispatcher (prompt-overhaul, step 14).
+///
+/// Mirrors the [`run_step_hooks_tui`] / [`run_step_tags_tui`] shape: reuses
+/// the parent terminal + raw-mode session, owns its own crossterm event loop,
+/// and pops back to step-detail when the [`RenderedPromptApp`] state machine
+/// returns [`rendered_prompt::Outcome::Pop`]. There are no storage
+/// write-throughs — the prompts are assembled once up front.
+///
+/// The per-attempt prompts are built by reconstructing the *exact* inputs the
+/// executor passes to [`crate::prompt::build_step_prompt`]:
+///   * agent name: `step.agent` → `plan.agent` (same as `execute_step`),
+///   * `harness_supports_agent_file`: from the resolved harness config,
+///   * the four-layer `Prompts` (Global from `config.prompt`, Project from
+///     the `project_settings` row, Plan = `plan.description`),
+///   * answered questions for the step,
+///   * `max_attempts = step.max_retries.unwrap_or(config.max_retries_per_step) + 1`,
+///   * the step's execution logs (chronological) for per-attempt retry ctx.
+fn run_rendered_prompt_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    plan: &crate::plan::Plan,
+    step: &crate::plan::Step,
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
+    use crate::tui::views::rendered_prompt::{Outcome, RenderedPromptApp, render};
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let all_steps = storage::list_steps(conn, &plan.id)?;
+    let step_num = all_steps
+        .iter()
+        .position(|s| s.id == step.id)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let step_label = format!("#{step_num} — {}", step.title);
+
+    // Resolve the agent name exactly as the executor does (step → plan).
+    let agent_name = step.agent.as_deref().or(plan.agent.as_deref());
+
+    // Resolve the harness so we know whether the agent file is delivered
+    // natively (drives whether build_step_prompt emits the agent pointer).
+    let supports_agent_file = match crate::harness::resolve_harness(step, plan, config) {
+        Ok((_, hc)) => hc.supports_agent_file,
+        // Unknown harness: fall back to the executor's parameter default for
+        // a preview (it would error at run time, but the preview should
+        // still render rather than abort the TUI).
+        Err(_) => false,
+    };
+
+    // The four-layer prompt model — identical wiring to src/executor.rs.
+    let project_settings = storage::get_project_settings(conn, project)?;
+    let prompts = crate::prompt::Prompts {
+        global: config.prompt.clone(),
+        project: project_settings.prompt.clone(),
+        plan: Some(plan.description.clone()),
+    };
+
+    let answered_questions = storage::list_answered_questions_for_step(conn, &step.id)?;
+
+    // max_attempts resolution mirrors execute_step in src/executor.rs.
+    let max_attempts = step
+        .max_retries
+        .unwrap_or(config.max_retries_per_step as i32)
+        + 1;
+
+    let logs = storage::list_execution_logs_for_step(conn, &step.id)?;
+
+    let attempts = RenderedPromptApp::build_attempts(
+        plan,
+        step,
+        &all_steps,
+        agent_name,
+        supports_agent_file,
+        &prompts,
+        &answered_questions,
+        max_attempts,
+        &logs,
+    );
+
+    let mut app = RenderedPromptApp::new(plan.slug.clone(), step_label, attempts);
+
+    loop {
+        terminal.draw(|f| render(f, f.area(), &mut app))?;
+
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+        match app.handle_key(key) {
+            Outcome::Pending => {}
+            Outcome::Pop => return Ok(()),
+        }
+    }
+}
+
 fn run_step_detail_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
@@ -4428,6 +4529,16 @@ where
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => app.handle_left(),
+            // §14: from the Step-prompt pane, `l`/`→` drills into the
+            // rendered-prompt preview sub-view (the fully-assembled prompt
+            // the agent receives). Other panes keep their `l`/`→` behavior
+            // (Appended pagination / bottom-row focus / no-op).
+            KeyCode::Char('l') | KeyCode::Right if app.focused_pane == Pane::StepPrompt => {
+                if let Some(step) = app.current_step().cloned() {
+                    let plan = app.plan.clone();
+                    run_rendered_prompt_tui(terminal, conn, config, project, &plan, &step)?;
+                }
+            }
             KeyCode::Char('l') | KeyCode::Right => app.handle_right(),
             KeyCode::Char('z') => {
                 app.toggle_zen();
