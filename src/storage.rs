@@ -2912,7 +2912,13 @@ mod tests {
 
         // Corrupt / forward-compat token resolves to the non-destructive
         // Stash default, same contract as take_skip_request.
-        request_skip(&conn, &plan.id, "step-C", crate::git::ParkStrategyKind::Discard).unwrap();
+        request_skip(
+            &conn,
+            &plan.id,
+            "step-C",
+            crate::git::ParkStrategyKind::Discard,
+        )
+        .unwrap();
         conn.execute(
             "UPDATE plans SET skip_changes = 'bogus' WHERE id = ?1",
             params![plan.id],
