@@ -2239,7 +2239,7 @@ mod tests {
         // process-wide cancel registry / in-flight flag against the
         // signal-module tests that touch the same globals. The
         // current_thread runtime rules out cross-thread guard transfer.
-        let _guard = crate::signal::EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _guard = crate::signal::lock_exit_cleanup_test();
 
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
@@ -2277,7 +2277,7 @@ mod tests {
     /// `skip_step` keeps the original synchronous DB-flip behavior.
     #[test]
     fn test_skip_step_not_in_flight_flips_db() {
-        let _guard = crate::signal::EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _guard = crate::signal::lock_exit_cleanup_test();
         crate::signal::set_step_in_flight(false);
 
         let conn = setup();

@@ -775,6 +775,11 @@ pub enum StepCommand {
 
         /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
+
+        /// Skip the confirmation prompt shown before reverting any
+        /// `[ralph wip]` skip commit(s) belonging to this step.
+        #[arg(long, short, alias = "yes")]
+        force: bool,
     },
 
     /// Move a step to a different position.

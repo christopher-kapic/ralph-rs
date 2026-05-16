@@ -1374,7 +1374,7 @@ mod tests {
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
 
-        step_reset(&conn, "my-plan", &project, Some(1), None, &test_out()).unwrap();
+        step_reset(&conn, "my-plan", &project, Some(1), None, true, &test_out()).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Pending);

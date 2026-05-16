@@ -610,6 +610,177 @@ pub fn park_changes(
 }
 
 // ---------------------------------------------------------------------------
+// Skipped-step WIP commit discovery & revert
+// ---------------------------------------------------------------------------
+
+/// The git trailer key written by [`park_changes`] for `ParkStrategy::Commit`.
+pub const SKIPPED_STEP_TRAILER: &str = "Ralph-Skipped-Step";
+
+/// A skip-WIP commit discovered on a branch: its SHA plus the step id pulled
+/// out of the `Ralph-Skipped-Step` trailer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkipWipCommit {
+    pub sha: String,
+    pub step_id: String,
+}
+
+/// Extract the `Ralph-Skipped-Step` trailer value from a single commit.
+///
+/// Uses `git interpret-trailers --parse` fed the commit's raw message so we
+/// only ever match a *real* trailer line (git's own parser decides what
+/// counts as the trailer block) — never the words happening to appear in a
+/// commit body or a quoted diff. Returns `None` when the commit carries no
+/// such trailer.
+pub fn parse_skipped_step_trailer(workdir: &Path, sha: &str) -> Result<Option<String>> {
+    let raw = git(workdir, &["log", "-1", "--format=%B", sha])
+        .with_context(|| format!("could not read commit message for {sha}"))?;
+
+    // `git interpret-trailers --parse` prints only the trailer block, one
+    // `Key: value` per line. We feed the raw message on stdin.
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .args(["interpret-trailers", "--parse"])
+        .current_dir(workdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn git interpret-trailers")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(raw.as_bytes())
+            .context("failed to write commit message to git interpret-trailers")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("git interpret-trailers --parse failed to run")?;
+    if !output.status.success() {
+        bail!(
+            "git interpret-trailers --parse failed (exit {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let parsed = String::from_utf8_lossy(&output.stdout);
+    for line in parsed.lines() {
+        // Anchor on the trailer key at the start of a parsed trailer line so
+        // a body sentence mentioning the token can't false-match.
+        if let Some((key, value)) = line.split_once(':')
+            && key.trim().eq_ignore_ascii_case(SKIPPED_STEP_TRAILER)
+        {
+            let v = value.trim();
+            if !v.is_empty() {
+                return Ok(Some(v.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Walk the commits reachable from `branch` and return every skip-WIP commit
+/// (one carrying a `Ralph-Skipped-Step` trailer), **newest first** — i.e. in
+/// reverse-chronological / `git log` order.
+///
+/// `branch` is resolved with `git rev-list`, so it works whether or not the
+/// branch is currently checked out. Commits without the trailer are ignored.
+pub fn list_skip_wip_commits(workdir: &Path, branch: &str) -> Result<Vec<SkipWipCommit>> {
+    // `git rev-list` already yields newest-first.
+    let shas = git(workdir, &["rev-list", branch])
+        .with_context(|| format!("could not list commits on branch '{branch}'"))?;
+    let mut out = Vec::new();
+    for sha in shas.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(step_id) = parse_skipped_step_trailer(workdir, sha)? {
+            out.push(SkipWipCommit {
+                sha: sha.to_string(),
+                step_id,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Skip-WIP commits on `branch` whose trailer step id equals `step_id`,
+/// newest-first. Convenience filter over [`list_skip_wip_commits`].
+pub fn skip_wip_commits_for_step(
+    workdir: &Path,
+    branch: &str,
+    step_id: &str,
+) -> Result<Vec<String>> {
+    Ok(list_skip_wip_commits(workdir, branch)?
+        .into_iter()
+        .filter(|c| c.step_id == step_id)
+        .map(|c| c.sha)
+        .collect())
+}
+
+/// Outcome of attempting to `git revert --no-edit` a single skip-WIP commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevertOutcome {
+    /// A new revert commit was created.
+    Reverted { revert_sha: String },
+    /// The revert was an effective no-op (the change is already gone — the
+    /// WIP commit was manually reverted earlier). No revert commit created.
+    AlreadyReverted,
+}
+
+/// `git revert --no-edit <sha>`.
+///
+/// Handles the "already reverted" edge case: when the commit's changes are
+/// already absent, `git revert` either reports "nothing to commit" (empty
+/// revert) or conflicts. In both cases we abort the in-progress revert with
+/// `git revert --abort` (so the worktree/index is left clean) and return
+/// [`RevertOutcome::AlreadyReverted`] instead of a hard error. A genuine
+/// merge conflict from *unrelated* later work is still surfaced as an error
+/// after aborting.
+pub fn revert_commit(workdir: &Path, sha: &str) -> Result<RevertOutcome> {
+    let output = Command::new("git")
+        .args(["revert", "--no-edit", sha])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git revert {sha}"))?;
+
+    if output.status.success() {
+        let revert_sha = get_commit_hash(workdir)?;
+        return Ok(RevertOutcome::Reverted { revert_sha });
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}{stderr}");
+
+    // `git revert` leaves a revert-in-progress on failure; clean it up so the
+    // tree isn't wedged regardless of which failure path we took.
+    let revert_in_progress = workdir.join(".git").join("REVERT_HEAD").exists();
+    if revert_in_progress {
+        // Best-effort abort; ignore its own failure (nothing left to abort).
+        let _ = Command::new("git")
+            .args(["revert", "--abort"])
+            .current_dir(workdir)
+            .output();
+    }
+
+    // Effective no-op: the change is already gone. git phrases this as
+    // "nothing to commit" / "previous cherry-pick/revert is now empty" / a
+    // conflict where every hunk is already applied.
+    let lc = combined.to_lowercase();
+    if lc.contains("nothing to commit")
+        || lc.contains("nothing added to commit")
+        || lc.contains("is now empty")
+        || lc.contains("no changes")
+        || lc.contains("the previous cherry-pick is now empty")
+    {
+        return Ok(RevertOutcome::AlreadyReverted);
+    }
+
+    bail!(
+        "git revert {sha} failed (exit {}): {}",
+        output.status,
+        combined.trim()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1182,5 +1353,155 @@ mod tests {
             fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
             "user data"
         );
+    }
+
+    // ----- skip-WIP discovery & revert (STEP 19) -----
+
+    /// Stage everything and write a WIP commit carrying the trailer, the same
+    /// way `park_changes(Commit)` does. Returns the new commit SHA.
+    fn commit_wip(dir: &Path, subject: &str, step_id: &str) -> String {
+        let message = format!("{subject}\n\nRalph-Skipped-Step: {step_id}\n");
+        commit_changes(dir, &message).unwrap();
+        get_commit_hash(dir).unwrap()
+    }
+
+    #[test]
+    fn test_parse_skipped_step_trailer_detects_only_real_trailer() {
+        let (_tmp, dir) = init_repo();
+
+        // A commit whose *body* merely mentions the token must NOT match.
+        fs::write(dir.join("a.txt"), "1").unwrap();
+        commit_changes(
+            &dir,
+            "normal commit\n\nWe discussed Ralph-Skipped-Step: not-a-trailer here in prose.\n",
+        )
+        .unwrap();
+        let body_sha = get_commit_hash(&dir).unwrap();
+        assert_eq!(
+            parse_skipped_step_trailer(&dir, &body_sha).unwrap(),
+            None,
+            "prose mention must not be parsed as a trailer"
+        );
+
+        // A real trailer commit matches.
+        fs::write(dir.join("b.txt"), "2").unwrap();
+        let sha = commit_wip(&dir, "[ralph wip] skipped step 2: foo", "step-uuid-2");
+        assert_eq!(
+            parse_skipped_step_trailer(&dir, &sha).unwrap(),
+            Some("step-uuid-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_list_skip_wip_commits_newest_first() {
+        let (_tmp, dir) = init_repo();
+        let branch = get_current_branch(&dir).unwrap();
+
+        fs::write(dir.join("x.txt"), "1").unwrap();
+        let first = commit_wip(&dir, "[ralph wip] skipped step 1: a", "step-A");
+        // An ordinary commit in between — must be ignored.
+        fs::write(dir.join("y.txt"), "2").unwrap();
+        commit_changes(&dir, "ordinary work").unwrap();
+        fs::write(dir.join("z.txt"), "3").unwrap();
+        let second = commit_wip(&dir, "[ralph wip] skipped step 2: b", "step-B");
+
+        let wips = list_skip_wip_commits(&dir, &branch).unwrap();
+        assert_eq!(wips.len(), 2, "ordinary commit should be excluded");
+        // Newest first.
+        assert_eq!(wips[0].sha, second);
+        assert_eq!(wips[0].step_id, "step-B");
+        assert_eq!(wips[1].sha, first);
+        assert_eq!(wips[1].step_id, "step-A");
+
+        // Filtered convenience accessor.
+        let only_a = skip_wip_commits_for_step(&dir, &branch, "step-A").unwrap();
+        assert_eq!(only_a, vec![first]);
+    }
+
+    #[test]
+    fn test_revert_commit_success() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("wip.txt"), "wip content").unwrap();
+        let sha = commit_wip(&dir, "[ralph wip] skipped step 1: t", "step-1");
+        assert!(dir.join("wip.txt").exists());
+
+        match revert_commit(&dir, &sha).unwrap() {
+            RevertOutcome::Reverted { revert_sha } => {
+                assert_eq!(revert_sha, get_commit_hash(&dir).unwrap());
+            }
+            other => panic!("expected Reverted, got {other:?}"),
+        }
+        // The WIP file is gone, history preserved (3 commits: init, wip, revert).
+        assert!(!dir.join("wip.txt").exists());
+        let log = git(&dir, &["rev-list", "--count", "HEAD"]).unwrap();
+        assert_eq!(log.trim(), "3");
+    }
+
+    #[test]
+    fn test_revert_commit_not_on_head() {
+        // Edge case: a later step committed on top of the WIP. Revert must
+        // still work and must NOT touch the later commit's file.
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("wip.txt"), "wip").unwrap();
+        let wip = commit_wip(&dir, "[ralph wip] skipped step 1: t", "step-1");
+        fs::write(dir.join("later.txt"), "later step output").unwrap();
+        commit_changes(&dir, "step 2 done").unwrap();
+
+        assert!(matches!(
+            revert_commit(&dir, &wip).unwrap(),
+            RevertOutcome::Reverted { .. }
+        ));
+        assert!(!dir.join("wip.txt").exists(), "WIP change reverted");
+        assert!(
+            dir.join("later.txt").exists(),
+            "later step's work preserved"
+        );
+    }
+
+    #[test]
+    fn test_revert_commit_already_reverted_is_noop() {
+        // Edge case: the WIP was already manually reverted. A second revert is
+        // an effective no-op — detect and report cleanly, no hard error, tree
+        // left clean.
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("wip.txt"), "wip").unwrap();
+        let wip = commit_wip(&dir, "[ralph wip] skipped step 1: t", "step-1");
+
+        assert!(matches!(
+            revert_commit(&dir, &wip).unwrap(),
+            RevertOutcome::Reverted { .. }
+        ));
+        // Second revert: already gone.
+        let outcome = revert_commit(&dir, &wip).unwrap();
+        assert_eq!(outcome, RevertOutcome::AlreadyReverted);
+        // Tree is clean and no revert-in-progress is wedged.
+        assert!(!has_uncommitted_changes(&dir).unwrap());
+        assert!(!dir.join(".git").join("REVERT_HEAD").exists());
+    }
+
+    #[test]
+    fn test_revert_multiple_wip_commits_newest_first() {
+        // Edge case: the same step was skipped+committed more than once.
+        // Reverting newest-first applies each revert cleanly.
+        let (_tmp, dir) = init_repo();
+        let branch = get_current_branch(&dir).unwrap();
+
+        fs::write(dir.join("f.txt"), "v1\n").unwrap();
+        let first = commit_wip(&dir, "[ralph wip] skipped step 1: a", "step-1");
+        fs::write(dir.join("f.txt"), "v1\nv2\n").unwrap();
+        let second = commit_wip(&dir, "[ralph wip] skipped step 1: a again", "step-1");
+
+        let shas = skip_wip_commits_for_step(&dir, &branch, "step-1").unwrap();
+        assert_eq!(shas, vec![second.clone(), first.clone()], "newest first");
+
+        for sha in &shas {
+            assert!(matches!(
+                revert_commit(&dir, sha).unwrap(),
+                RevertOutcome::Reverted { .. }
+            ));
+        }
+        // Both layers undone; f.txt no longer exists (back to init state).
+        assert!(!dir.join("f.txt").exists());
+        assert!(!has_uncommitted_changes(&dir).unwrap());
     }
 }

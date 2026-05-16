@@ -533,10 +533,16 @@ fn cancel_skipped_attempt(
 /// - `Discard` → `committed = false`
 /// - tree clean / only pre-existing untracked → no parking, `committed = false`
 ///
-/// The park strategy is read from the process-global slot
-/// [`crate::signal::take_requested_park_kind`] set by `request_skip_in_flight`.
-/// A `None` there (e.g. a cross-process SIGTERM-style skip that couldn't set
-/// it) defaults to `Stash` so a skip never silently destroys work.
+/// The park strategy is decided *once* by the caller (the
+/// `WaitResult::Skipped` arm) from the process-global slot set by
+/// `request_skip_in_flight`, and passed in as `kind`. A `None` slot (e.g. a
+/// cross-process SIGTERM-style skip that couldn't set it) is resolved to
+/// `Stash` by the caller so a skip never silently destroys work. Threading it
+/// as an argument — rather than re-reading the global slot here — removes a
+/// store/take race: under load the independent second read could observe the
+/// slot before `request_skip_in_flight`'s store landed, silently falling back
+/// to `Stash` (which, like `Discard`, also cleans the tree, so only the
+/// `rolled_back` bookkeeping diverged — a subtle, load-dependent bug).
 #[allow(clippy::too_many_arguments)]
 async fn finalize_skipped(
     ctx: &ExecCtx<'_>,
@@ -545,6 +551,7 @@ async fn finalize_skipped(
     attempt: i32,
     stdout: &str,
     stderr: &str,
+    kind: crate::git::ParkStrategyKind,
 ) -> Result<StepResult> {
     let parsed = parse_harness_json(stdout);
 
@@ -556,9 +563,6 @@ async fn finalize_skipped(
     } else {
         None
     };
-
-    let kind = crate::signal::take_requested_park_kind()
-        .unwrap_or(crate::git::ParkStrategyKind::Stash);
 
     let park_relevant = has_step_attributable_changes(ctx.workdir, ctx.pre_existing_untracked)?;
 
@@ -1866,14 +1870,16 @@ pub async fn execute_step(
                 // with the prompt *before* the harness spawns), and re-enter
                 // the retry loop at the *same* attempt number. Net effect:
                 // the cancelled attempt consumes no retry budget and leaves
-                // no `UNIQUE(step_id, attempt)` row. We *peek* the registry
-                // slot here so the non-cancel path's `take_*` inside
-                // `finalize_skipped` still works unchanged.
-                if crate::signal::peek_requested_park_kind()
-                    == Some(crate::git::ParkStrategyKind::Cancel)
-                {
-                    // Consume the slot so it can't leak into a later skip.
-                    let _ = crate::signal::take_requested_park_kind();
+                // no `UNIQUE(step_id, attempt)` row.
+                //
+                // Authoritatively consume the requested park kind exactly
+                // once here, then branch / thread it down. Doing the single
+                // `take` at this point (after the cancel watch fired, which
+                // happens-after `request_skip_in_flight`'s store) guarantees
+                // we observe the stored value; `finalize_skipped` no longer
+                // does an independent second read that could race the store.
+                let requested_kind = crate::signal::take_requested_park_kind();
+                if requested_kind == Some(crate::git::ParkStrategyKind::Cancel) {
                     cancel_skipped_attempt(&ctx, exec_log.id, attempt)?;
                     // Re-enter at the SAME attempt: the loop bumps `attempt`
                     // at the top, so step back one to neutralize that bump.
@@ -1885,6 +1891,11 @@ pub async fn execute_step(
                     storage::update_step_status(conn, &step.id, StepStatus::InProgress)?;
                     continue;
                 }
+                // A `None` slot (cross-process SIGTERM-style skip that
+                // couldn't record a choice) resolves to `Stash` so a skip
+                // never silently destroys work.
+                let park_kind =
+                    requested_kind.unwrap_or(crate::git::ParkStrategyKind::Stash);
                 return finalize_skipped(
                     &ctx,
                     exec_log.id,
@@ -1892,6 +1903,7 @@ pub async fn execute_step(
                     attempt,
                     &stdout,
                     &stderr,
+                    park_kind,
                 )
                 .await;
             }
@@ -3791,7 +3803,7 @@ mod tests {
         use std::time::Duration;
         use tempfile::TempDir;
 
-        let registry_guard = crate::signal::EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let registry_guard = crate::signal::lock_exit_cleanup_test();
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -3873,17 +3885,37 @@ mod tests {
         let (_handle, rx) = crate::signal::install_and_spawn_with_handle();
 
         let pid_path_clone = pid_path.clone();
+        let dir_clone = dir.clone();
         let skip_task = tokio::spawn(async move {
-            for _ in 0..120 {
-                if pid_path_clone.exists()
+            // Wait for the harness to have ACTUALLY dirtied the worktree, not
+            // merely for it to have written its pid. The pid file alone is a
+            // racy proxy: this future and `execute_step` share one
+            // `current_thread` runtime, so a heavily-loaded box can starve
+            // this task's timed sleeps and let it fire the skip before the
+            // harness's edits land — leaving the tree clean, `park_relevant`
+            // false, and the discard path's `rolled_back=true` never
+            // recorded. Gating on a genuinely dirty tree removes that race.
+            // The bound is generous (≈30s of attempts) because the only
+            // failure mode worth surfacing is the harness never running at
+            // all, which the outer 15s `execute_step` timeout already covers.
+            let mut dirtied = false;
+            for _ in 0..600 {
+                let pid_ready = pid_path_clone.exists()
                     && fs::read_to_string(&pid_path_clone)
                         .map(|s| !s.trim().is_empty())
-                        .unwrap_or(false)
+                        .unwrap_or(false);
+                if pid_ready
+                    && crate::git::has_uncommitted_changes(&dir_clone).unwrap_or(false)
                 {
+                    dirtied = true;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
+            assert!(
+                dirtied,
+                "harness never dirtied the worktree before skip — test setup race"
+            );
             // Mark a step in-flight and request the skip exactly like
             // runner::skip_step's in-flight branch.
             let _g = crate::signal::StepInFlightGuard::enter();
@@ -4063,7 +4095,7 @@ mod tests {
         use std::time::Duration;
         use tempfile::TempDir;
 
-        let _registry_guard = crate::signal::EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _registry_guard = crate::signal::lock_exit_cleanup_test();
 
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().to_path_buf();

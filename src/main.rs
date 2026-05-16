@@ -341,9 +341,18 @@ fn main() -> Result<()> {
                 step,
                 step_id,
                 plan,
+                force,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::step_reset(&conn, &p.slug, &project, step, step_id.as_deref(), &out)
+                commands::step_reset(
+                    &conn,
+                    &p.slug,
+                    &project,
+                    step,
+                    step_id.as_deref(),
+                    force,
+                    &out,
+                )
             }
             StepCommand::Move {
                 step,

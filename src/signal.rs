@@ -152,19 +152,12 @@ pub fn take_requested_park_kind() -> Option<crate::git::ParkStrategyKind> {
     REQUESTED_PARK_KIND.lock().unwrap().take()
 }
 
-/// Peek (without consuming) at the park strategy a prior
-/// [`request_skip_in_flight`] recorded.
-///
-/// The executor's `WaitResult::Skipped` arm needs to know *before* deciding
-/// how to finalize whether this is the TUI skip dialog's
-/// [`crate::git::ParkStrategyKind::Cancel`] (Esc) — in which case it must
-/// re-enter the retry loop at the same attempt instead of finalizing the
-/// step — or a real park strategy. Branching is decided on a peek; the
-/// matching call frame then [`take_requested_park_kind`]s it so the value
-/// can't leak into a later unrelated skip.
-pub fn peek_requested_park_kind() -> Option<crate::git::ParkStrategyKind> {
-    *REQUESTED_PARK_KIND.lock().unwrap()
-}
+// NOTE: an earlier design `peek`ed the park-kind slot in the executor's
+// `WaitResult::Skipped` arm and then `take`-d it again inside
+// `finalize_skipped`. That second, independent read could race the
+// `request_skip_in_flight` store under load (silently defaulting to `Stash`).
+// The executor now does a single authoritative `take` at the `Skipped` arm
+// and threads the kind down, so a separate peek accessor is no longer needed.
 
 /// Clear (reset to `None`) the process's cancel watch channel.
 ///
@@ -206,6 +199,23 @@ static EXIT_CLEANUP: Mutex<Option<ExitCleanup>> = Mutex::new(None);
 /// same binary don't race on the global slot.
 #[cfg(test)]
 pub(crate) static EXIT_CLEANUP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire [`EXIT_CLEANUP_TEST_LOCK`], tolerating poisoning.
+///
+/// The guard protects nothing but *execution ordering* — there is no shared
+/// invariant a panicking test could leave half-updated. Without this, one
+/// asserting test that panics while holding the guard poisons the mutex, and
+/// every subsequently-serialized signal test then fails with `PoisonError`
+/// instead of running — a cascade of false failures whose appearance depends
+/// on cross-test scheduling (i.e. flaky under full parallel `cargo test`).
+/// Recovering the poisoned guard is always safe here.
+#[cfg(test)]
+pub(crate) fn lock_exit_cleanup_test()
+-> std::sync::MutexGuard<'static, ()> {
+    EXIT_CLEANUP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Register a cleanup to run before `exit(130)` on forced shutdown. Replaces
 /// any previously-registered cleanup.
@@ -562,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_exit_cleanup_runs_once_and_is_cleared() {
-        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _guard = lock_exit_cleanup_test();
         clear_exit_cleanup();
 
         let ran = std::sync::Arc::new(AtomicBool::new(false));
@@ -596,7 +606,7 @@ mod tests {
         // (listener setup + raise + flag check) against other tests that
         // mutate process-wide state. The test runs on a current_thread
         // runtime, so there's no risk of cross-thread guard transfer.
-        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _guard = lock_exit_cleanup_test();
         let controller = ShutdownController::new();
         let (_handle, mut rx) = controller.spawn_signal_listener();
         assert!(rx.borrow().is_none());
@@ -626,7 +636,7 @@ mod tests {
 
     #[test]
     fn test_clear_exit_cleanup_prevents_run() {
-        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _guard = lock_exit_cleanup_test();
         clear_exit_cleanup();
 
         let ran = std::sync::Arc::new(AtomicBool::new(false));
@@ -651,7 +661,7 @@ mod tests {
     /// reports `false` so the caller falls back to a plain DB status flip.
     #[test]
     fn test_request_skip_no_step_in_flight_is_noop() {
-        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _guard = lock_exit_cleanup_test();
         set_step_in_flight(false);
         assert!(!request_skip_in_flight(crate::git::ParkStrategyKind::Stash));
     }
@@ -668,7 +678,7 @@ mod tests {
         // in-flight flag against other tests that mutate the same globals,
         // and the current_thread runtime rules out cross-thread guard
         // transfer (same rationale as test_sigterm_triggers_graceful_shutdown).
-        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _guard = lock_exit_cleanup_test();
         let controller = ShutdownController::new();
         let (_handle, mut rx) = controller.spawn_signal_listener();
         assert!(rx.borrow().is_none());

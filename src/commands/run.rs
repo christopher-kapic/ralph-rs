@@ -5599,9 +5599,28 @@ pub fn cmd_log(
             .filter(|s| s.status == StepStatus::Skipped)
             .collect();
 
-        if entries.is_empty() && skipped_with_reason.is_empty() {
+        // Skip-WIP commits parked on the plan branch (ParkStrategy::Commit).
+        // These don't have an execution_logs row, so surface them from git.
+        let wip_skips = collect_skip_wip_commits(conn, &plan);
+
+        if entries.is_empty() && skipped_with_reason.is_empty() && wip_skips.is_empty() {
             eprintln!("No execution logs for plan '{}'.", plan.slug);
             return Ok(());
+        }
+
+        if !wip_skips.is_empty() {
+            eprintln!("WIP-committed skips for plan '{}':", plan.slug);
+            eprintln!();
+            for (num, short_sha) in &wip_skips {
+                let line = format!("  ~ step {num} skipped (WIP committed: {short_sha})");
+                if out.color {
+                    // Dim/yellow to distinguish from normal log rows.
+                    println!("\x1b[33m{line}\x1b[0m");
+                } else {
+                    println!("{line}");
+                }
+            }
+            println!();
         }
 
         if !skipped_with_reason.is_empty() {
@@ -5638,6 +5657,48 @@ pub fn cmd_log(
     }
 
     Ok(())
+}
+
+/// Scan the plan branch for `[ralph wip]` skip commits and resolve each one's
+/// `Ralph-Skipped-Step` trailer step-id back to a 1-based step number.
+///
+/// Returns `(step_number, short_sha)` pairs, newest commit first. Best-effort:
+/// any git failure (project not a repo, branch absent) yields an empty list so
+/// `ralph log` never hard-errors just because the WIP scan couldn't run.
+fn collect_skip_wip_commits(conn: &Connection, plan: &crate::plan::Plan) -> Vec<(usize, String)> {
+    let workdir = Path::new(&plan.project);
+    if !crate::git::branch_exists(workdir, &plan.branch_name).unwrap_or(false) {
+        return Vec::new();
+    }
+    let commits = match crate::git::list_skip_wip_commits(workdir, &plan.branch_name) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    if commits.is_empty() {
+        return Vec::new();
+    }
+    let steps = storage::list_steps(conn, &plan.id).unwrap_or_default();
+    commits
+        .into_iter()
+        .map(|c| {
+            // Resolve the trailer step-id back to a step. Prefer the ordered
+            // position in this plan; fall back to get_step_by_id so a step
+            // since-removed from the list still renders something sane.
+            let num = steps
+                .iter()
+                .position(|s| s.id == c.step_id)
+                .map(|i| i + 1)
+                .or_else(|| {
+                    storage::get_step_by_id(conn, &c.step_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| steps.iter().position(|x| x.id == s.id).map(|i| i + 1))
+                })
+                .unwrap_or(0);
+            let short = c.sha[..c.sha.len().min(8)].to_string();
+            (num, short)
+        })
+        .collect()
 }
 
 fn print_log_entry(step_title: &str, log: &ExecutionLog, output_mode: &LogOutputMode, color: bool) {
@@ -6868,6 +6929,80 @@ mod status_live_view_tests {
             !json.contains("child_pid"),
             "cleared child_pid must be absent from status JSON: {json}"
         );
+    }
+
+    // ----- ralph log surfaces skip-WIP commits (STEP 19) -----
+
+    #[test]
+    fn test_collect_skip_wip_commits_resolves_step_and_short_sha() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        }
+        fs::write(dir.join("README.md"), "# hi").unwrap();
+        crate::git::commit_changes(&dir, "init").unwrap();
+        let branch = crate::git::get_current_branch(&dir).unwrap();
+        let project = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let conn = db::open_memory().unwrap();
+        let plan =
+            storage::create_plan(&conn, "logp", &project, &branch, "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "Step one", "", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        let (_s2, _) = storage::create_step(
+            &conn, &plan.id, "Step two", "", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        // An ordinary commit (no trailer) — must NOT appear.
+        fs::write(dir.join("ord.txt"), "x").unwrap();
+        crate::git::commit_changes(&dir, "ordinary work").unwrap();
+        // A skip-WIP commit for step 1.
+        fs::write(dir.join("wip.txt"), "wip").unwrap();
+        let s1_id = s1.id;
+        let msg = format!("[ralph wip] skipped step 1: Step one\n\nRalph-Skipped-Step: {s1_id}\n");
+        crate::git::commit_changes(&dir, &msg).unwrap();
+        let full = crate::git::get_commit_hash(&dir).unwrap();
+
+        let got = collect_skip_wip_commits(&conn, &plan);
+        assert_eq!(got.len(), 1, "ordinary commit excluded");
+        let (num, short) = &got[0];
+        assert_eq!(*num, 1, "trailer step-id resolved to step #1");
+        assert_eq!(*short, full[..8], "short SHA is first 8 chars");
+
+        // The prefix format used by cmd_log for this row.
+        let line = format!("  ~ step {num} skipped (WIP committed: {short})");
+        assert!(line.contains("~ step 1 skipped (WIP committed: "));
+    }
+
+    #[test]
+    fn test_collect_skip_wip_commits_empty_when_no_repo() {
+        let conn = db::open_memory().unwrap();
+        // Project path that isn't a git repo → best-effort empty, no panic.
+        let plan = storage::create_plan(
+            &conn,
+            "norepo",
+            "/tmp/definitely-not-a-git-repo-xyz",
+            "br",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(collect_skip_wip_commits(&conn, &plan).is_empty());
     }
 }
 

@@ -517,18 +517,84 @@ pub fn step_edit(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn step_reset(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
     step_num: Option<usize>,
     step_id: Option<&str>,
+    force: bool,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
     let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
+
+    // Before flipping the step back to pending, undo any `[ralph wip]`
+    // skip commit(s) we parked on the plan branch for this step. We revert
+    // (never `reset --hard`) so branch history is preserved even when later
+    // steps committed on top of the WIP.
+    let workdir = std::path::Path::new(project);
+    // Only scan when the plan branch actually exists in this repo. A clean
+    // `Ok(false)` (or any error from `branch_exists`, e.g. the project dir
+    // isn't a git repo) means there can't be a skip-WIP commit to revert —
+    // reset proceeds as a plain status flip.
+    let branch_present = crate::git::branch_exists(workdir, &plan.branch_name).unwrap_or(false);
+    let wip_shas = if branch_present {
+        crate::git::skip_wip_commits_for_step(workdir, &plan.branch_name, &step.id).with_context(
+            || {
+                format!(
+                    "could not scan branch '{}' for skip-WIP commits",
+                    plan.branch_name
+                )
+            },
+        )?
+    } else {
+        Vec::new()
+    };
+
+    if !wip_shas.is_empty() {
+        if !force {
+            let plural = if wip_shas.len() == 1 { "" } else { "s" };
+            let shorts: Vec<String> = wip_shas
+                .iter()
+                .map(|s| s[..s.len().min(8)].to_string())
+                .collect();
+            let prompt = format!(
+                "Resetting step #{display_num} will revert {} skip-WIP commit{plural} ({}) on branch '{}'. This adds revert commit(s). Continue?",
+                wip_shas.len(),
+                shorts.join(", "),
+                plan.branch_name
+            );
+            if !output::confirm(&prompt)? {
+                eprintln!("Aborted; step not reset.");
+                return Ok(());
+            }
+        }
+
+        // `wip_shas` is newest-first; revert in that order so each revert
+        // applies cleanly on top of the previous one.
+        for sha in &wip_shas {
+            let short = &sha[..sha.len().min(8)];
+            match crate::git::revert_commit(workdir, sha)? {
+                crate::git::RevertOutcome::Reverted { revert_sha } => {
+                    eprintln!(
+                        "{} Reverted skip-WIP commit {short} (revert {})",
+                        output::check_icon(out.color),
+                        &revert_sha[..revert_sha.len().min(8)]
+                    );
+                }
+                crate::git::RevertOutcome::AlreadyReverted => {
+                    eprintln!(
+                        "  skip-WIP commit {short} was already reverted — skipping"
+                    );
+                }
+            }
+        }
+    }
+
     storage::reset_step(conn, &step.id)?;
     eprintln!(
         "{} Reset step #{} '{}' to pending (0 attempts)",
@@ -1313,5 +1379,175 @@ mod tests {
 
         assert_eq!(render_tags_inline(&steps[0]), "[FIX][REGRESSION]");
         assert_eq!(render_tags_inline(&steps[1]), "");
+    }
+
+    // ----- step_reset reverts skip-WIP commits (STEP 19) -----
+
+    /// A git repo + plan + one step, with the plan's branch_name pointing at
+    /// the repo's actual branch. Returns (conn, project, dir, step_id, branch).
+    fn reset_fixture() -> (
+        Connection,
+        String,
+        std::path::PathBuf,
+        String,
+        String,
+        tempfile::TempDir,
+    ) {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        }
+        fs::write(dir.join("README.md"), "# hi").unwrap();
+        crate::git::commit_changes(&dir, "init").unwrap();
+        let branch = crate::git::get_current_branch(&dir).unwrap();
+        let project = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let conn = db::open_memory().unwrap();
+        let plan =
+            storage::create_plan(&conn, "p", &project, &branch, "d", None, None, &[]).unwrap();
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Wire it", "", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        (conn, project, dir, step.id, branch, tmp)
+    }
+
+    /// Park a WIP commit the way `park_changes(Commit)` does.
+    fn park_wip(dir: &std::path::Path, subject: &str, step_id: &str) -> String {
+        let msg = format!("{subject}\n\nRalph-Skipped-Step: {step_id}\n");
+        crate::git::commit_changes(dir, &msg).unwrap();
+        crate::git::get_commit_hash(dir).unwrap()
+    }
+
+    #[test]
+    fn test_step_reset_force_reverts_wip() {
+        let (conn, project, dir, step_id, _branch, _tmp) = reset_fixture();
+        std::fs::write(dir.join("wip.txt"), "wip").unwrap();
+        park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
+        assert!(dir.join("wip.txt").exists());
+
+        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+
+        // Revert happened (no prompt because force) and the step is pending.
+        assert!(!dir.join("wip.txt").exists(), "WIP reverted");
+        let plan = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn test_step_reset_without_force_prompt_declined_no_revert() {
+        // Under `cargo test` stdin is at EOF, so `confirm` returns false:
+        // exercises the prompt path. The WIP must be left intact and the
+        // step NOT reset.
+        let (conn, project, dir, step_id, _branch, _tmp) = reset_fixture();
+        std::fs::write(dir.join("wip.txt"), "wip").unwrap();
+        park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
+
+        step_reset(&conn, "p", &project, Some(1), None, false, &test_out()).unwrap();
+
+        assert!(
+            dir.join("wip.txt").exists(),
+            "declined prompt must not revert"
+        );
+        let plan = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].status,
+            StepStatus::Pending,
+            "step starts pending; reset aborted leaves it unchanged"
+        );
+        // Mark it failed then re-confirm the abort really skipped reset.
+        storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
+        step_reset(&conn, "p", &project, Some(1), None, false, &test_out()).unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].status,
+            StepStatus::Failed,
+            "aborted reset must not flip status"
+        );
+    }
+
+    #[test]
+    fn test_step_reset_no_wip_still_resets() {
+        // No skip-WIP commit at all: reset is a plain status flip even
+        // without --force (no prompt should appear).
+        let (conn, project, _dir, _step_id, _branch, _tmp) = reset_fixture();
+        let plan = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
+
+        step_reset(&conn, "p", &project, Some(1), None, false, &test_out()).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn test_step_reset_wip_not_on_head() {
+        let (conn, project, dir, step_id, _branch, _tmp) = reset_fixture();
+        std::fs::write(dir.join("wip.txt"), "wip").unwrap();
+        park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
+        // A later step lands on top of the WIP.
+        std::fs::write(dir.join("later.txt"), "later").unwrap();
+        crate::git::commit_changes(&dir, "step 2 done").unwrap();
+
+        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+
+        assert!(!dir.join("wip.txt").exists(), "WIP reverted");
+        assert!(dir.join("later.txt").exists(), "later work preserved");
+    }
+
+    #[test]
+    fn test_step_reset_already_reverted_clean() {
+        let (conn, project, dir, step_id, _branch, _tmp) = reset_fixture();
+        std::fs::write(dir.join("wip.txt"), "wip").unwrap();
+        let wip = park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
+        // Manually revert it already.
+        match crate::git::revert_commit(&dir, &wip).unwrap() {
+            crate::git::RevertOutcome::Reverted { .. } => {}
+            o => panic!("setup revert failed: {o:?}"),
+        }
+
+        // step_reset should detect the already-reverted state and not error.
+        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+
+        assert!(!crate::git::has_uncommitted_changes(&dir).unwrap());
+        let plan = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn test_step_reset_multiple_wip_commits_reverted() {
+        let (conn, project, dir, step_id, _branch, _tmp) = reset_fixture();
+        std::fs::write(dir.join("f.txt"), "v1\n").unwrap();
+        park_wip(&dir, "[ralph wip] skipped step 1: a", &step_id);
+        std::fs::write(dir.join("f.txt"), "v1\nv2\n").unwrap();
+        park_wip(&dir, "[ralph wip] skipped step 1: a again", &step_id);
+
+        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+
+        // Both WIP layers undone (newest-first reverts applied cleanly).
+        assert!(!dir.join("f.txt").exists());
+        assert!(!crate::git::has_uncommitted_changes(&dir).unwrap());
     }
 }

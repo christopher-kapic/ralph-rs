@@ -736,7 +736,7 @@ mod tests {
     fn double_signal_cleanup_clears_run_lock_row() {
         use std::sync::Mutex as StdMutex;
 
-        let _guard = crate::signal::EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _guard = crate::signal::lock_exit_cleanup_test();
         crate::signal::clear_exit_cleanup();
 
         let conn = mem_db();
