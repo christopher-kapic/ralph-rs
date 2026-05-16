@@ -16,6 +16,7 @@ pub mod palette_dispatch;
 pub mod read_only;
 pub mod run_dialog;
 pub mod selection;
+pub mod skip_dialog;
 pub mod theme;
 pub mod toast;
 pub mod view;

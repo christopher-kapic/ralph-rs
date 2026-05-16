@@ -1288,6 +1288,23 @@ pub fn create_execution_log(
     get_execution_log_by_id(conn, id)
 }
 
+/// Delete a single `execution_logs` row by id.
+///
+/// Used by the executor's TUI-skip *cancel* path (step 18): the retry loop
+/// creates the `execution_logs` row (with the prompt) *before* spawning the
+/// harness, so a cancelled attempt must delete that row to honor the
+/// guarantee that a cancelled attempt leaves no `UNIQUE(step_id, attempt)`
+/// row behind and consumes no retry budget. Idempotent — deleting a missing
+/// id is a no-op.
+pub fn delete_execution_log(conn: &Connection, log_id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM execution_logs WHERE id = ?1",
+        params![log_id],
+    )
+    .with_context(|| format!("Failed to delete execution log {log_id}"))?;
+    Ok(())
+}
+
 /// Get the latest (highest attempt) execution log for a step.
 ///
 /// Currently only referenced from tests — kept in the public API because it

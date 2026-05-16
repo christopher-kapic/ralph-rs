@@ -450,6 +450,72 @@ fn has_step_attributable_changes(workdir: &Path, pre_existing_untracked: &[Strin
         .any(|f| !pre_existing_untracked.contains(f)))
 }
 
+/// Undo an in-flight attempt that the TUI skip dialog *cancelled* (Esc),
+/// without finalizing the step (STEP 18).
+///
+/// Reached only from the `WaitResult::Skipped` arm when the registry slot
+/// carried [`crate::git::ParkStrategyKind::Cancel`]. The harness child is
+/// already dead (the cancel ladder killed it before we got here). This
+/// function makes the cancelled attempt a no-op from the step's point of
+/// view:
+///
+/// 1. Roll back the killed harness's working-tree changes via
+///    [`git::rollback_except`], preserving the user's `pre_existing_untracked`
+///    scratch (same preservation rule as the `Discard` park strategy).
+/// 2. Emit a [`crate::output::RunEvent::AttemptCancelled`] NDJSON event so
+///    a subscribed TUI/log shipper knows the attempt was undone (and that
+///    another attempt at the *same* number is coming).
+/// 3. Delete the `execution_logs` row this attempt created — it was inserted
+///    (with the prompt) *before* the harness spawned, so leaving it would
+///    both leak a `UNIQUE(step_id, attempt)` row and make a later resume
+///    think the budget was consumed.
+/// 4. Clear the process cancel channel so the re-entered attempt isn't
+///    immediately swept through `finalize_precancel`.
+///
+/// The caller (`execute_step`'s retry loop) then steps `attempt` back by one
+/// and `continue`s, so the next loop iteration re-runs the *same* attempt
+/// number — consuming no retry budget.
+/// Build the [`crate::output::RunEvent::AttemptCancelled`] event the
+/// executor emits when the TUI skip dialog's Esc/cancel path undoes an
+/// in-flight attempt (step 18). Pure (no I/O) so the exact payload — field
+/// shape, `step_num` derivation from the i32 `ctx.step_num` — is
+/// unit-testable without capturing stdout.
+fn attempt_cancelled_event(ctx: &ExecCtx<'_>, attempt: i32) -> crate::output::RunEvent {
+    crate::output::RunEvent::AttemptCancelled {
+        step_id: ctx.step.id.clone(),
+        step_num: ctx.step_num.max(0) as usize,
+        attempt,
+        at: chrono::Utc::now(),
+    }
+}
+
+fn cancel_skipped_attempt(
+    ctx: &ExecCtx<'_>,
+    exec_log_id: i64,
+    attempt: i32,
+) -> Result<()> {
+    // 1. Roll back the killed harness's work, preserving the user's
+    //    pre-existing untracked files. A clean tree makes this a no-op.
+    if git::has_uncommitted_changes(ctx.workdir)? {
+        git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)
+            .context("could not roll back cancelled skip attempt")?;
+    }
+
+    // 2. Emit the NDJSON event (best-effort: a dropped event must not break
+    //    the run — the durable state is the absence of the log row).
+    if ctx.json_output {
+        let _ = crate::output::emit_ndjson(&attempt_cancelled_event(ctx, attempt));
+    }
+
+    // 3. Delete the execution_logs row this attempt created.
+    storage::delete_execution_log(ctx.conn, exec_log_id)?;
+
+    // 4. Reset the cancel channel so the re-entered attempt runs for real.
+    crate::signal::clear_cancel_state();
+
+    Ok(())
+}
+
 /// Finalize a step that was skipped while its harness was in-flight
 /// (`WaitResult::Skipped`, reached only via the `ralph skip` → cancel-ladder
 /// path). This is step 16's terminal-skip path, extended for step 17 to
@@ -537,6 +603,13 @@ async fn finalize_skipped(
                 ),
             },
             crate::git::ParkStrategyKind::Discard => crate::git::ParkStrategy::Discard,
+            // Unreachable: the `WaitResult::Skipped` arm peels off `Cancel`
+            // (and re-enters the loop) *before* `finalize_skipped` is ever
+            // called, so the registry slot can't carry `Cancel` here.
+            // Fall back to Discard rather than panic so a future refactor
+            // that lets it through still doesn't destroy nothing/lose work
+            // silently — it just throws the killed harness's work away.
+            crate::git::ParkStrategyKind::Cancel => crate::git::ParkStrategy::Discard,
         };
 
         let outcome = git::park_changes(
@@ -1782,6 +1855,36 @@ pub async fn execute_step(
                 // single `user_skipped` execution_logs row itself — we
                 // deliberately do NOT also go through `finalize_failure`, so
                 // there is exactly one row.
+                //
+                // STEP 18: the TUI skip dialog adds a fourth choice — Esc
+                // (cancel). It rides the same cancel ladder + registry slot
+                // but carries `ParkStrategyKind::Cancel`. On cancel we must
+                // NOT finalize the step: roll back the killed harness's work
+                // (preserving the user's pre-existing untracked scratch),
+                // emit an `attempt_cancelled` NDJSON event, delete the
+                // execution_logs row this attempt created (the row is created
+                // with the prompt *before* the harness spawns), and re-enter
+                // the retry loop at the *same* attempt number. Net effect:
+                // the cancelled attempt consumes no retry budget and leaves
+                // no `UNIQUE(step_id, attempt)` row. We *peek* the registry
+                // slot here so the non-cancel path's `take_*` inside
+                // `finalize_skipped` still works unchanged.
+                if crate::signal::peek_requested_park_kind()
+                    == Some(crate::git::ParkStrategyKind::Cancel)
+                {
+                    // Consume the slot so it can't leak into a later skip.
+                    let _ = crate::signal::take_requested_park_kind();
+                    cancel_skipped_attempt(&ctx, exec_log.id, attempt)?;
+                    // Re-enter at the SAME attempt: the loop bumps `attempt`
+                    // at the top, so step back one to neutralize that bump.
+                    attempt -= 1;
+                    // Reset the persisted attempt counter too — `set_step_attempts`
+                    // was bumped before the harness spawned; leaving it would
+                    // make a later resume think the budget was consumed.
+                    set_step_attempts(conn, &step.id, attempt)?;
+                    storage::update_step_status(conn, &step.id, StepStatus::InProgress)?;
+                    continue;
+                }
                 return finalize_skipped(
                     &ctx,
                     exec_log.id,
@@ -3933,6 +4036,310 @@ mod tests {
         assert!(!logs[0].committed);
         assert!(logs[0].commit_hash.is_none());
         assert!(logs[0].rolled_back, "discard records rolled_back=true");
+    }
+
+    /// STEP 18: the TUI skip dialog's Esc/cancel path. A skip request
+    /// carrying [`crate::git::ParkStrategyKind::Cancel`] must:
+    ///   - kill the in-flight harness (same cancel ladder),
+    ///   - roll the tree back (preserving pre-existing untracked scratch),
+    ///   - write NO `execution_logs` row for the cancelled attempt,
+    ///   - re-enter the executor at the *SAME* attempt number (no retry
+    ///     budget consumed).
+    ///
+    /// Mechanism under test: the harness records every invocation. The skip
+    /// task issues `Cancel` on invocation #1 (executor rolls back, deletes
+    /// the attempt-1 log row, resets the cancel channel + attempt counter,
+    /// re-enters), then `Skipped`(Stash) on invocation #2 so the re-entered
+    /// attempt finalizes and the test terminates. Final assertions prove the
+    /// re-entry happened at attempt 1 (budget untouched) and the cancelled
+    /// attempt left no log row behind.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tui_skip_cancel_reenters_same_attempt_no_budget_no_log_row() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let _registry_guard = crate::signal::EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        // A pre-existing untracked file the user had *before* the run. The
+        // cancel rollback must preserve it.
+        fs::write(dir.join("user-scratch.txt"), "user data").unwrap();
+
+        let shared = TempDir::new().unwrap();
+        let count_path = shared.path().join("invocations.txt");
+        let pid_path = shared.path().join("pid.txt");
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("cancel-harness.sh");
+        // Every invocation: append a marker to the counter file, dirty the
+        // tree (tracked edit + new untracked file), publish our pid, block.
+        let script = format!(
+            "#!/bin/sh\n\
+             echo x >> {count}\n\
+             echo 'harness edit' >> {readme}\n\
+             echo 'agent output' > {agent}\n\
+             echo \"$$\" > {pid}\n\
+             sleep 60\n",
+            count = count_path.to_string_lossy(),
+            readme = dir.join("README.md").to_string_lossy(),
+            agent = dir.join("agent-new.txt").to_string_lossy(),
+            pid = pid_path.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "demo-plan",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Wire the thing", "desc", None, None, &[], Some(0), None, None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "skip".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+
+        let (_handle, rx) = crate::signal::install_and_spawn_with_handle();
+
+        // Wait until the counter file shows `target` invocations, then
+        // return once the harness has (re-)published a pid for that run.
+        async fn wait_for_invocation(count_path: &std::path::Path, pid_path: &std::path::Path, target: usize) {
+            for _ in 0..240 {
+                let n = std::fs::read_to_string(count_path)
+                    .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+                    .unwrap_or(0);
+                if n >= target
+                    && pid_path.exists()
+                    && std::fs::read_to_string(pid_path)
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("harness never reached invocation {target}");
+        }
+
+        let count_clone = count_path.clone();
+        let pid_clone = pid_path.clone();
+        let skip_task = tokio::spawn(async move {
+            // Invocation #1 → request CANCEL.
+            wait_for_invocation(&count_clone, &pid_clone, 1).await;
+            let _g = crate::signal::StepInFlightGuard::enter();
+            assert!(
+                crate::signal::request_skip_in_flight(crate::git::ParkStrategyKind::Cancel),
+                "Cancel skip must signal when a step is in-flight"
+            );
+            // Invocation #2 (the re-entered SAME attempt) → finalize with a
+            // real Skipped(Discard) so the test terminates. Discard is used
+            // (not Stash) because Stash's `--include-untracked` would also
+            // sweep up the user's pre-existing scratch, masking the
+            // preservation assertion below; Discard routes through
+            // `rollback_except(pre_existing_untracked)`, the same
+            // preservation contract the cancel rollback uses.
+            wait_for_invocation(&count_clone, &pid_clone, 2).await;
+            assert!(
+                crate::signal::request_skip_in_flight(crate::git::ParkStrategyKind::Discard),
+                "second skip must signal when the re-entered attempt is in-flight"
+            );
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 20s on cancel+skip")
+        .unwrap();
+
+        skip_task.await.ok();
+
+        // The harness ran exactly twice: the cancelled attempt and the
+        // re-entered same-numbered attempt.
+        let invocations = std::fs::read_to_string(&count_path)
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        assert_eq!(
+            invocations, 2,
+            "harness must run twice (cancelled attempt + re-entered same attempt)"
+        );
+
+        // The step finalized as Skipped at attempt 1 — the cancelled
+        // attempt consumed NO retry budget (otherwise this would be 2).
+        assert_eq!(result.outcome, StepOutcome::Skipped);
+        assert_eq!(
+            result.attempts_used, 1,
+            "re-entry must reuse the SAME attempt number (no budget consumed)"
+        );
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Skipped);
+        assert_eq!(
+            updated.attempts, 1,
+            "persisted attempt counter must not advance for the cancelled attempt"
+        );
+
+        // Exactly ONE execution_logs row exists — the cancelled attempt's
+        // row (created with the prompt before the harness spawned) was
+        // deleted, so there is no UNIQUE(step_id, attempt) leak and no row
+        // for the cancelled attempt.
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(
+            logs.len(),
+            1,
+            "the cancelled attempt must leave NO execution_logs row; only the \
+             final Skipped row should remain (got {logs:?})"
+        );
+        assert_eq!(logs[0].attempt, 1, "the surviving row is attempt 1");
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped),
+            "the surviving row is the final Skipped(Stash) finalize"
+        );
+
+        // The user's pre-existing untracked scratch survived the cancel
+        // rollback untouched.
+        assert!(
+            dir.join("user-scratch.txt").exists(),
+            "cancel rollback must preserve pre-existing untracked files"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "user data"
+        );
+    }
+
+    /// STEP 18: the executor's cancel path constructs exactly the documented
+    /// `attempt_cancelled` NDJSON event (event tag, `step_id`, `step_num`
+    /// derived from the i32 `ExecCtx.step_num`, `attempt`). Pairs with the
+    /// `output.rs` serde-shape tests (casing / field names) and the
+    /// integration test (the cancel branch is actually taken). Building the
+    /// event is the seam `cancel_skipped_attempt` emits through, so this
+    /// proves the executor emits the right payload without flaky stdout
+    /// capture.
+    #[test]
+    fn test_attempt_cancelled_event_payload_from_exec_ctx() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "demo-plan",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Wire the thing", "desc", None, None, &[], Some(0), None, None,
+            None,
+        )
+        .unwrap();
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let pre: Vec<String> = vec![];
+        let ctx = ExecCtx {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            workdir: &dir,
+            pre_existing_untracked: &pre,
+            hook_ctx: &hook_ctx,
+            step_num: 4,
+            max_attempts: 3,
+            json_output: true,
+        };
+
+        let evt = attempt_cancelled_event(&ctx, 2);
+        match evt {
+            crate::output::RunEvent::AttemptCancelled {
+                step_id,
+                step_num,
+                attempt,
+                ..
+            } => {
+                assert_eq!(step_id, step.id);
+                assert_eq!(step_num, 4, "i32 step_num maps to usize");
+                assert_eq!(attempt, 2, "carries the cancelled attempt number");
+            }
+            other => panic!("expected AttemptCancelled, got {other:?}"),
+        }
+
+        // The event must serialize to the documented tag/casing too.
+        let val: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&attempt_cancelled_event(&ctx, 1)).unwrap())
+                .unwrap();
+        assert_eq!(val["event"], "attempt_cancelled");
+        assert_eq!(val["step_id"], step.id);
+        assert_eq!(val["step_num"], 4);
+        assert_eq!(val["attempt"], 1);
+        assert!(val.get("at").is_some(), "timestamp field present");
     }
 
     /// Complements `test_abort_kills_harness_process_group` with the

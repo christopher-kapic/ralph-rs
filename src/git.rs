@@ -521,11 +521,21 @@ fn has_conflict_marker(porcelain_out: &str) -> bool {
 /// [`crate::signal::CancelReason`]: the skip command only knows the user's
 /// `--changes` choice; the executor reconstitutes the full [`ParkStrategy`]
 /// from the skipped step's identity at park time.
+///
+/// [`ParkStrategyKind::Cancel`] is **not** a park strategy at all — it's the
+/// TUI skip dialog's Esc/cancel signal threaded through the same registry
+/// slot (step 18). When the executor consumes it in `finalize_skipped`, it
+/// rolls back the killed harness's work, emits an `attempt_cancelled` NDJSON
+/// event, writes **no** `execution_logs` row, and re-enters the retry loop at
+/// the *same* attempt number so the cancelled attempt consumes no retry
+/// budget. It never reaches [`park_changes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkStrategyKind {
     Stash,
     Commit,
     Discard,
+    /// TUI-only: the user pressed Esc on the skip dialog. See the type doc.
+    Cancel,
 }
 
 /// How [`park_changes`] should dispose of the working-tree changes left

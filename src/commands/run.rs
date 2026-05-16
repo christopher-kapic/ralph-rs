@@ -1186,6 +1186,39 @@ where
     }
 }
 
+/// Drive the STEP-18 skip dialog over a custom background until the user
+/// confirms a choice or cancels. Mirrors [`run_dialog_loop_with_bg`]; the
+/// caller maps the terminal [`SkipOutcome`] onto the skip plumbing.
+pub(crate) fn skip_dialog_loop_with_bg<B, F>(
+    terminal: &mut ratatui::Terminal<B>,
+    mut draw_bg: F,
+) -> Result<crate::tui::skip_dialog::SkipOutcome>
+where
+    B: ratatui::backend::Backend,
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+    F: FnMut(&mut ratatui::Frame<'_>),
+{
+    use crate::tui::skip_dialog::{self, SkipDialog, SkipOutcome};
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let mut dialog = SkipDialog::new();
+    loop {
+        terminal.draw(|f| {
+            draw_bg(f);
+            let area = f.area();
+            skip_dialog::render(f, area, &dialog);
+        })?;
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match dialog.handle_key(key) {
+                SkipOutcome::Pending => continue,
+                other => return Ok(other),
+            }
+        }
+    }
+}
+
 /// Drive a `dialog::Confirm` loop with a custom background. Mirrors the
 /// per-view `confirm_with_*_background` helpers but parameterized on a
 /// closure so the run-dialog flow can reuse it without a per-view variant.
@@ -2644,7 +2677,7 @@ where
                 plan_detail_apply_add(conn, &mut app, pos, &title)?;
             }
             InputAction::SkipStep(step_id) => {
-                plan_detail_apply_skip(conn, &mut app, &step_id)?;
+                plan_detail_skip_with_dialog(terminal, conn, &mut app, &step_id)?;
             }
             InputAction::Delete(targets) => {
                 plan_detail_apply_delete(terminal, conn, &mut app, &targets)?;
@@ -2795,6 +2828,119 @@ pub(crate) fn plan_detail_apply_skip(
             app.refresh_steps(storage::list_steps(conn, &plan_id)?);
             app.toasts
                 .push("Step skipped.", ToastKind::Success, Instant::now());
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to skip step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// STEP 18 — `s` on a step in the plan-detail step list.
+///
+/// Decides whether to open the [`crate::tui::skip_dialog`] before skipping.
+///
+/// Case A — the step is currently running (status `InProgress` and a run is
+/// live for this plan): the skip is routed through the cancel ladder
+/// ([`runner::skip_step`] → `request_skip_in_flight`), killing the harness.
+/// If the tree is clean (or holds only the user's pre-existing untracked
+/// scratch) the step is just marked Skipped with no dialog. If the tree is
+/// dirty with step-attributable work, the dialog opens
+/// (`Stash`/`Commit`/`Discard`, default `Stash`): `Enter` parks per the
+/// chosen strategy; `Esc` maps to [`ParkStrategyKind::Cancel`], so the
+/// executor rolls the tree back, emits `attempt_cancelled`, and re-enters at
+/// the *same* attempt (no retry budget consumed, no `execution_logs` row
+/// written for the cancelled attempt).
+///
+/// Case B — the step is not running: the dialog opens only when the step is
+/// `Failed` *and* there are uncommitted changes from its last attempt;
+/// otherwise it's just marked Skipped with no dialog. Here `Esc` simply
+/// dismisses the dialog (no skip, no cancel semantics — there is no
+/// in-flight attempt to re-enter).
+fn plan_detail_skip_with_dialog<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    step_id: &str,
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
+    use crate::plan::StepStatus;
+    use crate::tui::skip_dialog::SkipOutcome;
+    use crate::tui::toast::ToastKind;
+    use std::path::Path;
+    use std::time::Instant;
+
+    let Some(step) = app.steps.iter().find(|s| s.id == step_id).cloned() else {
+        return Ok(());
+    };
+    let is_running = step.status == StepStatus::InProgress && app.is_run_live();
+    let is_failed = step.status == StepStatus::Failed;
+
+    // A dirty tree is only *attributable* to this step if at least one
+    // changed file isn't already part of the user's pre-existing untracked
+    // scratch. We can't cheaply reconstruct the runner's pre-existing set
+    // here, so use "any uncommitted change" as the gate — the executor's
+    // park path re-checks attribution precisely (`has_step_attributable_changes`).
+    let workdir = Path::new(&app.plan.project);
+    let dirty = crate::git::has_uncommitted_changes(workdir).unwrap_or(false);
+
+    // Open the dialog when: running+dirty, OR a failed step left a dirty
+    // tree. Everything else is a plain skip with no dialog.
+    let needs_dialog = dirty && (is_running || is_failed);
+
+    if !needs_dialog {
+        plan_detail_apply_skip(conn, app, step_id)?;
+        return Ok(());
+    }
+
+    let outcome = skip_dialog_loop_with_bg(terminal, |f| {
+        crate::tui::views::plan_detail_ui::draw(f, app);
+    })?;
+
+    // Map the dialog outcome onto a park strategy kind. For a *running*
+    // step, Esc is the spec's cancel-restart path (ParkStrategyKind::Cancel).
+    // For a non-running failed step there is no in-flight attempt to
+    // re-enter, so Esc just dismisses the dialog.
+    let kind = match outcome {
+        SkipOutcome::Pending => unreachable!("loop only returns terminal outcomes"),
+        SkipOutcome::Confirmed(choice) => choice.to_park_kind(),
+        SkipOutcome::Cancelled => {
+            if is_running {
+                crate::git::ParkStrategyKind::Cancel
+            } else {
+                app.toasts
+                    .push("Skip cancelled.", ToastKind::Info, Instant::now());
+                return Ok(());
+            }
+        }
+    };
+
+    // Route through the same plumbing the CLI / palette use. For an
+    // in-flight step this trips the cancel ladder (kills the harness) and
+    // hands `kind` to the executor via the registry; otherwise it's a
+    // synchronous DB flip (the `kind` is irrelevant there and skip_step
+    // notes that).
+    let plan = app.plan.clone();
+    let step_num = app
+        .steps
+        .iter()
+        .position(|s| s.id == step_id)
+        .map(|i| i + 1);
+    match crate::runner::skip_step(conn, &plan, step_num, None, kind) {
+        Ok(actual_num) => {
+            app.refresh_steps(storage::list_steps(conn, &app.plan.id)?);
+            let msg = if kind == crate::git::ParkStrategyKind::Cancel {
+                format!("Cancelled in-flight attempt for step {actual_num} (no retry consumed).")
+            } else {
+                format!("Skipped step {actual_num}.")
+            };
+            app.toasts.push(msg, ToastKind::Success, Instant::now());
         }
         Err(e) => {
             app.toasts.push(

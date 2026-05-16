@@ -152,6 +152,44 @@ pub fn take_requested_park_kind() -> Option<crate::git::ParkStrategyKind> {
     REQUESTED_PARK_KIND.lock().unwrap().take()
 }
 
+/// Peek (without consuming) at the park strategy a prior
+/// [`request_skip_in_flight`] recorded.
+///
+/// The executor's `WaitResult::Skipped` arm needs to know *before* deciding
+/// how to finalize whether this is the TUI skip dialog's
+/// [`crate::git::ParkStrategyKind::Cancel`] (Esc) — in which case it must
+/// re-enter the retry loop at the same attempt instead of finalizing the
+/// step — or a real park strategy. Branching is decided on a peek; the
+/// matching call frame then [`take_requested_park_kind`]s it so the value
+/// can't leak into a later unrelated skip.
+pub fn peek_requested_park_kind() -> Option<crate::git::ParkStrategyKind> {
+    *REQUESTED_PARK_KIND.lock().unwrap()
+}
+
+/// Clear (reset to `None`) the process's cancel watch channel.
+///
+/// Used only by the executor's TUI-skip *cancel* path (step 18): after a
+/// cancelled attempt is rolled back, the channel still holds
+/// `Some(CancelReason::Skipped)`. Without clearing it, the retry loop's
+/// pre-attempt cancel check would immediately route the re-entered attempt
+/// through `finalize_precancel` (marking the step Skipped) — defeating the
+/// "re-enter at the same attempt" guarantee. Resetting it to `None` lets the
+/// loop genuinely re-run the attempt. Sends through the registered sender so
+/// every cloned receiver sees the reset.
+///
+/// Returns `true` if a cancel sender was registered (the reset was applied),
+/// `false` otherwise (no in-process runner — nothing to reset).
+pub fn clear_cancel_state() -> bool {
+    let guard = ACTIVE_CANCEL_TX.lock().unwrap();
+    match guard.as_ref() {
+        Some(tx) => {
+            let _ = tx.send(None);
+            true
+        }
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Forced-exit cleanup registry
 // ---------------------------------------------------------------------------

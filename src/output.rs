@@ -106,6 +106,21 @@ pub enum RunEvent {
         phase: Phase,
         phase_started_at: DateTime<Utc>,
     },
+    /// Emitted when an in-flight attempt is cancelled via the TUI skip
+    /// dialog's Esc/cancel path (step 18). Unlike `step_finished`, this is
+    /// **not** terminal for the step: the runner rolled back the killed
+    /// harness's work, wrote no `execution_logs` row, and is re-entering the
+    /// retry loop at the *same* `attempt` number — so the cancelled attempt
+    /// consumes no retry budget. Consumers should treat it as "the attempt
+    /// was undone; expect another `prompt_prepared`/`phase_changed` for the
+    /// same `step_id` at the same `attempt`". `attempt` is the 1-based number
+    /// of the attempt that was cancelled.
+    AttemptCancelled {
+        step_id: String,
+        step_num: usize,
+        attempt: i32,
+        at: DateTime<Utc>,
+    },
     /// Emitted when the runner exits cleanly because the operator set
     /// `plans.pause_requested` (TUI `[P]` keybinding or `ralph pause`).
     /// Distinct from `plan_complete`/`summary` so the TUI can surface the
@@ -1743,6 +1758,55 @@ mod tests {
             "cost_usd must be omitted when None, got {json}"
         );
         assert!(json.contains("\"event\":\"summary\""));
+    }
+
+    #[test]
+    fn test_attempt_cancelled_event_json_shape() {
+        // STEP 18: schema documented in docs/ndjson-events.md. Field
+        // names/casing must match the sibling lifecycle events
+        // (`step_id`, `step_num`, `attempt`, snake_case `at` timestamp).
+        let at: DateTime<Utc> = "2026-05-16T09:30:00Z".parse().unwrap();
+        let evt = RunEvent::AttemptCancelled {
+            step_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            step_num: 3,
+            attempt: 2,
+            at,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["event"], "attempt_cancelled");
+        assert_eq!(val["step_id"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(val["step_num"], 3);
+        assert_eq!(val["attempt"], 2);
+        assert_eq!(val["at"], "2026-05-16T09:30:00Z");
+    }
+
+    #[test]
+    fn test_attempt_cancelled_roundtrips_through_deserialize() {
+        // The TUI subscriber path requires Deserialize alongside Serialize.
+        let at: DateTime<Utc> = "2026-05-16T10:00:00Z".parse().unwrap();
+        let evt = RunEvent::AttemptCancelled {
+            step_id: "abc".to_string(),
+            step_num: 1,
+            attempt: 1,
+            at,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let back: RunEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            RunEvent::AttemptCancelled {
+                step_id,
+                step_num,
+                attempt,
+                at: at_back,
+            } => {
+                assert_eq!(step_id, "abc");
+                assert_eq!(step_num, 1);
+                assert_eq!(attempt, 1);
+                assert_eq!(at_back, at);
+            }
+            other => panic!("expected AttemptCancelled, got {other:?}"),
+        }
     }
 
     #[test]
