@@ -1503,6 +1503,32 @@ pub fn set_step_retry_strategy(
     Ok(())
 }
 
+/// Overwrite a step's `short_id` with a caller-supplied value.
+///
+/// The V25 backfill and runtime `create_step` mint a fresh random
+/// `short_id`; the DAG-aware import path instead **preserves** the
+/// bundle's portable edge handles (docs/dag-redesign.md §13.3), so it
+/// creates the step (which mints a throwaway id) and then calls this to
+/// pin the bundle's `short_id`. Mirrors the V25 migration's raw
+/// `UPDATE steps SET short_id` (no `updated_at` bump — `short_id` is an
+/// identity handle, not a mutable user field). The
+/// `idx_steps_short_id (plan_id, short_id)` unique index still enforces
+/// plan-uniqueness; a violation surfaces as an `Err` here and (because
+/// imports are transactional) rolls the whole import back, so no partial
+/// plan is written.
+pub fn set_step_short_id(conn: &Connection, step_id: &str, short_id: &str) -> Result<()> {
+    let affected = conn
+        .execute(
+            "UPDATE steps SET short_id = ?1 WHERE id = ?2",
+            params![short_id, step_id],
+        )
+        .with_context(|| format!("Failed to set short_id '{short_id}' for step {step_id}"))?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
 /// Reset a step's status to pending and zero out attempts.
 ///
 /// Also deletes the step's `execution_logs` rows — otherwise the zeroed

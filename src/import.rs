@@ -119,6 +119,167 @@ pub struct ImportedStep {
     /// V24.
     #[serde(default)]
     pub retry_strategy: Option<crate::plan::RetryStrategy>,
+    /// Plan-unique portable edge handle (docs/dag-redesign.md §13.2/§13.3).
+    /// Absent in pre-DAG bundles and in chain-suppressed exports of linear
+    /// plans (`#[serde(default)]` → `None`); present and preserved verbatim
+    /// for genuinely-branched DAG-aware bundles (never re-minted — that
+    /// would orphan the bundle's `depends_on` references).
+    #[serde(default)]
+    pub short_id: Option<String>,
+    /// `short_id`s of the steps this step directly depends on
+    /// (docs/dag-redesign.md §13.2/§13.3). `#[serde(default)]` so a legacy
+    /// bundle or a chain-suppressed linear-plan export (field absent)
+    /// deserializes to an empty list and takes the linear-chain backfill
+    /// path; a non-empty list anywhere marks the bundle DAG-aware and is
+    /// validated before any DB write.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// DAG validation (docs/dag-redesign.md §13.3)
+// ---------------------------------------------------------------------------
+
+/// True when the bundle carries explicit step edges — i.e. any step has a
+/// non-empty `depends_on`. A legacy pre-DAG bundle *and* a chain-suppressed
+/// export of a linear plan (where `resolve_step_depends_on` deliberately
+/// drops the chain edges) both have no `depends_on` anywhere and so are
+/// **not** DAG-aware: they re-import via the linear-chain backfill, exactly
+/// as the V25 migration backfills existing linear plans
+/// (docs/dag-redesign.md §13.2/§13.3 — the round-trip guarantee for a
+/// linear plan is reproduced by re-synthesizing, not preserving, the
+/// chain). Only a genuinely-branched bundle is DAG-aware.
+fn is_dag_aware(steps: &[ImportedStep]) -> bool {
+    steps.iter().any(|s| !s.depends_on.is_empty())
+}
+
+/// In-memory analogue of [`storage::would_create_step_cycle`] (§6) applied
+/// to the whole imported edge set, *before* any DB write.
+///
+/// Builds the edge set incrementally in a deterministic order (steps in
+/// array order, each step's `depends_on` in listed order); before adding
+/// each edge `s -> d` it asks the same question
+/// [`storage::would_create_step_cycle`] asks — "is `s` already reachable
+/// from `d`?" — over the edges added so far, using the identical
+/// stack/visited DFS. A self-edge (`s == d`) is a cycle, mirroring that
+/// function's early return. Returns the offending `(s, d)` pair on the
+/// first edge that would close a cycle.
+fn find_imported_cycle(steps: &[ImportedStep]) -> Option<(String, String)> {
+    use std::collections::{HashMap, HashSet};
+
+    // short_id -> already-added dependency short_ids.
+    let mut built: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    // Identical stack/visited DFS to `storage::would_create_step_cycle`:
+    // is `target` reachable from `from` over the edges added so far?
+    fn reachable(built: &HashMap<&str, Vec<&str>>, from: &str, target: &str) -> bool {
+        let mut stack: Vec<&str> = vec![from];
+        let mut visited: HashSet<&str> = HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !visited.insert(cur) {
+                continue;
+            }
+            if cur == target {
+                return true;
+            }
+            if let Some(deps) = built.get(cur) {
+                for d in deps {
+                    if !visited.contains(d) {
+                        stack.push(d);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    for step in steps {
+        let Some(s) = step.short_id.as_deref() else {
+            continue;
+        };
+        for d in &step.depends_on {
+            let d = d.as_str();
+            if s == d || reachable(&built, d, s) {
+                return Some((s.to_string(), d.to_string()));
+            }
+            built.entry(s).or_default().push(d);
+        }
+    }
+    None
+}
+
+/// Validate a DAG-aware bundle's edge set *before any DB write*
+/// (docs/dag-redesign.md §13.3). Enforced in order:
+///
+///  0. every step carries a `short_id` (the portable edge handle — a
+///     DAG-aware exporter always emits one for every step; a missing one
+///     is a corrupt bundle that cannot be wired deterministically);
+///  1. no dangling edge — every `depends_on` entry resolves to a
+///     `short_id` present in the same bundle;
+///  2. `short_id`s are unique within the bundle;
+///  3. the edge set is acyclic ([`find_imported_cycle`]);
+///  4. ≥1 root (a step with no `depends_on`).
+///
+/// Any failure returns an `Err` naming the offending `short_id` and the
+/// violated rule. The caller runs this before `create_plan`, so a
+/// rejected bundle writes no partial plan (imports are also transactional
+/// as a backstop).
+fn validate_dag_aware_steps(steps: &[ImportedStep]) -> Result<()> {
+    use std::collections::HashSet;
+
+    // Rule 0 + 2: every step has a short_id, and they are unique.
+    let mut seen: HashSet<&str> = HashSet::new();
+    for (i, step) in steps.iter().enumerate() {
+        let sid = step.short_id.as_deref().ok_or_else(|| {
+            anyhow!(
+                "DAG-aware import: step #{} ('{}') has no short_id; \
+                 a branched bundle must carry a short_id for every step",
+                i + 1,
+                step.title
+            )
+        })?;
+        if !seen.insert(sid) {
+            return Err(anyhow!(
+                "DAG-aware import: duplicate short_id '{sid}' in the bundle; \
+                 short_ids must be unique within a plan"
+            ));
+        }
+    }
+
+    // Rule 1: no dangling edge.
+    for step in steps {
+        let sid = step.short_id.as_deref().expect("rule 0 ensured Some");
+        for dep in &step.depends_on {
+            if !seen.contains(dep.as_str()) {
+                return Err(anyhow!(
+                    "DAG-aware import: step '{sid}' depends on '{dep}', \
+                     which is not a short_id present in the bundle (dangling edge)"
+                ));
+            }
+        }
+    }
+
+    // Rule 3: acyclic.
+    if let Some((s, d)) = find_imported_cycle(steps) {
+        if s == d {
+            return Err(anyhow!(
+                "DAG-aware import: step '{s}' depends on itself (cycle)"
+            ));
+        }
+        return Err(anyhow!(
+            "DAG-aware import: edge '{s}' -> '{d}' closes a dependency cycle"
+        ));
+    }
+
+    // Rule 4: at least one root.
+    if !steps.iter().any(|s| s.depends_on.is_empty()) {
+        return Err(anyhow!(
+            "DAG-aware import: no root step (every step has at least one \
+             dependency); a DAG must have ≥1 root"
+        ));
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +351,16 @@ fn import_plan_inner(
     harness: Option<&str>,
     options: &ImportOptions<'_>,
 ) -> Result<String> {
+    // Decide the step-graph shape *before any DB write* so a malformed
+    // DAG-aware bundle aborts without leaving a partial plan
+    // (docs/dag-redesign.md §13.3). A legacy bundle / chain-suppressed
+    // linear export takes the linear-chain backfill path; a branched
+    // bundle is validated here.
+    let dag_aware = is_dag_aware(&data.steps);
+    if dag_aware {
+        validate_dag_aware_steps(&data.steps)?;
+    }
+
     let plan = storage::create_plan(
         conn,
         slug,
@@ -215,6 +386,16 @@ fn import_plan_inner(
         storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
     }
 
+    // First pass: create every step (in array order — the deterministic
+    // scheduler tie-break seed). On the DAG-aware path the bundle's
+    // `short_id`s are preserved verbatim (create_step mints a throwaway id
+    // that we immediately overwrite); on the linear-chain backfill path
+    // the minted id is kept, exactly as the V25 migration mints fresh ids
+    // for existing linear plans (docs/dag-redesign.md §13.3). `created_ids`
+    // is parallel to `data.steps`.
+    let mut created_ids: Vec<String> = Vec::with_capacity(data.steps.len());
+    let mut short_to_id: std::collections::HashMap<&str, String> =
+        std::collections::HashMap::new();
     for step_data in &data.steps {
         let tags_arg: Option<&[String]> = if step_data.tags.is_empty() {
             None
@@ -238,6 +419,37 @@ fn import_plan_inner(
         // so an unset imported step stays unset (round-trip preserved).
         if let Some(rs) = step_data.retry_strategy {
             storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
+        }
+        if dag_aware {
+            // validate_dag_aware_steps guaranteed Some + uniqueness.
+            let sid = step_data.short_id.as_deref().expect("validated Some");
+            storage::set_step_short_id(conn, &step.id, sid)?;
+            short_to_id.insert(sid, step.id.clone());
+        }
+        created_ids.push(step.id);
+    }
+
+    // Second pass: wire dependency edges.
+    if dag_aware {
+        // Preserve the bundle's explicit edges, resolved short_id -> id.
+        // The edge set was already validated acyclic/non-dangling above;
+        // add_step_dependency re-checks defensively (§6) — harmless and
+        // consistent with every other edge-mutation path.
+        for (step_data, step_id) in data.steps.iter().zip(&created_ids) {
+            for dep in &step_data.depends_on {
+                let dep_id = short_to_id
+                    .get(dep.as_str())
+                    .expect("rule 1 ensured every dep resolves");
+                storage::add_step_dependency(conn, step_id, dep_id)?;
+            }
+        }
+    } else {
+        // Linear-chain backfill: step k depends on step k-1 by array
+        // order — byte-identical to the V25 migration backfill, so import
+        // and migration produce the same DAG for the same linear input
+        // (docs/dag-redesign.md §13.3).
+        for window in created_ids.windows(2) {
+            storage::add_step_dependency(conn, &window[1], &window[0])?;
         }
     }
 
@@ -1423,5 +1635,395 @@ mod tests {
         let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
         assert!(imported_plan.retry_strategy.is_none());
         assert!(imported_steps[0].retry_strategy.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // DAG redesign §13.3: legacy backfill + DAG-aware validation
+    // -----------------------------------------------------------------
+
+    /// The plan's step edge set as a sorted set of `(step_short_id,
+    /// dep_short_id)` pairs — a stable, UUID-independent fingerprint of
+    /// the DAG used by the round-trip assertions.
+    fn edge_set(
+        conn: &Connection,
+        plan_id: &str,
+    ) -> std::collections::BTreeSet<(String, String)> {
+        let steps = storage::list_steps(conn, plan_id).unwrap();
+        let by_id: std::collections::HashMap<String, String> = steps
+            .iter()
+            .map(|s| (s.id.clone(), s.short_id.clone()))
+            .collect();
+        let mut out = std::collections::BTreeSet::new();
+        for s in &steps {
+            for dep in storage::list_step_dependencies(conn, &s.id).unwrap() {
+                out.insert((s.short_id.clone(), by_id[&dep].clone()));
+            }
+        }
+        out
+    }
+
+    /// A legacy bundle (no `short_id`, no per-step `depends_on`) backfills
+    /// to the same linear-chain DAG the V25 migration produces: every step
+    /// gets a minted 8-char `short_id` and step *k* depends on step *k-1*
+    /// by array order, with step 0 the sole root.
+    #[test]
+    fn test_legacy_bundle_backfills_linear_chain_like_v25() {
+        let conn = setup();
+        let json = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {"slug": "legacy", "branch_name": "b", "description": "d"},
+            "steps": [
+                {"title": "S0", "description": "d"},
+                {"title": "S1", "description": "d"},
+                {"title": "S2", "description": "d"}
+            ]
+        }"#;
+        let data: ImportedPlan = serde_json::from_str(json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj",
+            strict: false,
+        };
+        let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
+        let steps = storage::list_steps(&conn, &plan_id).unwrap();
+        assert_eq!(steps.len(), 3);
+        // short_ids minted (8-char base-62) and plan-unique.
+        for s in &steps {
+            assert!(
+                storage::is_short_id_shaped(&s.short_id),
+                "minted short_id must be 8-char base-62: {:?}",
+                s.short_id
+            );
+        }
+        // Linear chain: S1->S0, S2->S1; S0 the sole root.
+        assert!(storage::list_step_dependencies(&conn, &steps[0].id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &steps[1].id).unwrap(),
+            vec![steps[0].id.clone()]
+        );
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &steps[2].id).unwrap(),
+            vec![steps[1].id.clone()]
+        );
+    }
+
+    /// A DAG-aware (branched) bundle preserves the bundle's `short_id`s
+    /// verbatim (never re-minted) and reproduces its explicit edges.
+    #[test]
+    fn test_dag_aware_bundle_preserves_short_ids_and_edges() {
+        let conn = setup();
+        let json = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {"slug": "branched", "branch_name": "b", "description": "d"},
+            "steps": [
+                {"title": "A", "description": "d", "short_id": "aaaaaaaa"},
+                {"title": "B", "description": "d", "short_id": "bbbbbbbb", "depends_on": ["aaaaaaaa"]},
+                {"title": "C", "description": "d", "short_id": "cccccccc", "depends_on": ["aaaaaaaa", "bbbbbbbb"]}
+            ]
+        }"#;
+        let data: ImportedPlan = serde_json::from_str(json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj",
+            strict: false,
+        };
+        let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
+        let steps = storage::list_steps(&conn, &plan_id).unwrap();
+        // short_ids preserved verbatim, in array order.
+        assert_eq!(steps[0].short_id, "aaaaaaaa");
+        assert_eq!(steps[1].short_id, "bbbbbbbb");
+        assert_eq!(steps[2].short_id, "cccccccc");
+        // Exactly the bundle's edges.
+        let mut expected = std::collections::BTreeSet::new();
+        expected.insert(("bbbbbbbb".to_string(), "aaaaaaaa".to_string()));
+        expected.insert(("cccccccc".to_string(), "aaaaaaaa".to_string()));
+        expected.insert(("cccccccc".to_string(), "bbbbbbbb".to_string()));
+        assert_eq!(edge_set(&conn, &plan_id), expected);
+    }
+
+    /// Round-trip guarantee (§13.3): exporting then importing a genuinely
+    /// branched plan reproduces the same DAG — identical edges, roots,
+    /// step order, and `short_id`s.
+    #[test]
+    fn test_roundtrip_branched_plan_reproduces_dag() {
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn, "diamond", "/tmp/src", "b", "d", None, None, &[],
+        )
+        .unwrap();
+        let mk = |t: &str| {
+            storage::create_step(
+                &conn, &plan.id, t, "d", None, None, &[], None, None, None, None,
+            )
+            .unwrap()
+            .0
+        };
+        let a = mk("A");
+        let b = mk("B");
+        let c = mk("C");
+        let d = mk("D");
+        // Diamond: B->A, C->A, D->B, D->C.
+        storage::add_step_dependency(&conn, &b.id, &a.id).unwrap();
+        storage::add_step_dependency(&conn, &c.id, &a.id).unwrap();
+        storage::add_step_dependency(&conn, &d.id, &b.id).unwrap();
+        storage::add_step_dependency(&conn, &d.id, &c.id).unwrap();
+
+        let orig_edges = edge_set(&conn, &plan.id);
+
+        // Export through the real pipeline (chain suppression decided
+        // inside export_plan), then re-import into a fresh project.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("diamond.json");
+        export::export_plan(&conn, "diamond", "/tmp/src", Some(&file_path)).unwrap();
+        let imported_data = read_plan_file(&file_path).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: false,
+        };
+        let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
+
+        let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
+        // Step order preserved.
+        let titles: Vec<&str> = imported_steps.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, vec!["A", "B", "C", "D"]);
+        // short_ids preserved.
+        assert_eq!(imported_steps[0].short_id, a.short_id);
+        assert_eq!(imported_steps[1].short_id, b.short_id);
+        assert_eq!(imported_steps[2].short_id, c.short_id);
+        assert_eq!(imported_steps[3].short_id, d.short_id);
+        // Same edges and same single root.
+        assert_eq!(edge_set(&conn, &imported_id), orig_edges);
+        let roots: Vec<&str> = imported_steps
+            .iter()
+            .filter(|s| storage::list_step_dependencies(&conn, &s.id).unwrap().is_empty())
+            .map(|s| s.short_id.as_str())
+            .collect();
+        assert_eq!(roots, vec![a.short_id.as_str()]);
+    }
+
+    /// Round-trip for a *linear* plan: export suppresses the chain edges
+    /// (byte-identical to pre-DAG output); re-import re-synthesizes the
+    /// identical chain DAG via the legacy backfill (§13.3), with fresh
+    /// minted short_ids — structure, not handle identity, is guaranteed.
+    #[test]
+    fn test_roundtrip_linear_plan_resynthesizes_chain() {
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn, "linear", "/tmp/src", "b", "d", None, None, &[],
+        )
+        .unwrap();
+        let mk = |t: &str| {
+            storage::create_step(
+                &conn, &plan.id, t, "d", None, None, &[], None, None, None, None,
+            )
+            .unwrap()
+            .0
+        };
+        let s0 = mk("S0");
+        let s1 = mk("S1");
+        let s2 = mk("S2");
+        storage::add_step_dependency(&conn, &s1.id, &s0.id).unwrap();
+        storage::add_step_dependency(&conn, &s2.id, &s1.id).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("linear.json");
+        export::export_plan(&conn, "linear", "/tmp/src", Some(&file_path)).unwrap();
+        // The chain is suppressed: no per-step depends_on in the bundle.
+        let imported_data = read_plan_file(&file_path).unwrap();
+        assert!(
+            imported_data.steps.iter().all(|s| s.depends_on.is_empty()),
+            "linear export must suppress chain edges"
+        );
+
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: false,
+        };
+        let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
+        let steps = storage::list_steps(&conn, &imported_id).unwrap();
+        let titles: Vec<&str> = steps.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, vec!["S0", "S1", "S2"]);
+        // Chain re-synthesized structurally (short_ids are freshly minted).
+        for s in &steps {
+            assert!(storage::is_short_id_shaped(&s.short_id));
+        }
+        assert!(storage::list_step_dependencies(&conn, &steps[0].id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &steps[1].id).unwrap(),
+            vec![steps[0].id.clone()]
+        );
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &steps[2].id).unwrap(),
+            vec![steps[1].id.clone()]
+        );
+    }
+
+    /// Helper: a DAG-aware bundle JSON with caller-supplied step entries.
+    fn dag_bundle(steps_json: &str) -> ImportedPlan {
+        let json = format!(
+            r#"{{
+                "ralph_rs_version": "0.1.0",
+                "exported_at": "2025-01-01T00:00:00Z",
+                "plan": {{"slug": "bad", "branch_name": "b", "description": "d"}},
+                "steps": [{steps_json}]
+            }}"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    fn opts() -> ImportOptions<'static> {
+        ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/bad",
+            strict: false,
+        }
+    }
+
+    /// Rule 1: a `depends_on` entry that resolves to no in-bundle
+    /// `short_id` aborts the import; no partial plan is written.
+    #[test]
+    fn test_import_rejects_dangling_edge() {
+        let conn = setup();
+        let data = dag_bundle(
+            r#"{"title": "A", "short_id": "aaaaaaaa"},
+               {"title": "B", "short_id": "bbbbbbbb", "depends_on": ["zzzzzzzz"]}"#,
+        );
+        let err = import_plan_from_data(&conn, &data, &opts()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("zzzzzzzz"), "message must name the bad id: {msg}");
+        assert!(msg.contains("dangling"), "message must cite the rule: {msg}");
+        assert!(storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Rule 2: duplicate `short_id`s within the bundle abort the import.
+    #[test]
+    fn test_import_rejects_duplicate_short_id() {
+        let conn = setup();
+        let data = dag_bundle(
+            r#"{"title": "A", "short_id": "samesame"},
+               {"title": "B", "short_id": "samesame"},
+               {"title": "C", "short_id": "cccccccc", "depends_on": ["samesame"]}"#,
+        );
+        let err = import_plan_from_data(&conn, &data, &opts()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate short_id"), "got: {msg}");
+        assert!(msg.contains("samesame"), "got: {msg}");
+        assert!(storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Rule 0: a DAG-aware bundle with a step missing its `short_id`
+    /// aborts (a branched exporter always emits one for every step).
+    #[test]
+    fn test_import_rejects_missing_short_id_in_dag_bundle() {
+        let conn = setup();
+        let data = dag_bundle(
+            r#"{"title": "A"},
+               {"title": "B", "short_id": "bbbbbbbb", "depends_on": ["aaaaaaaa"]}"#,
+        );
+        let err = import_plan_from_data(&conn, &data, &opts()).unwrap_err();
+        assert!(
+            err.to_string().contains("no short_id"),
+            "got: {err}"
+        );
+        assert!(storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Rule 3: a dependency cycle aborts the import.
+    #[test]
+    fn test_import_rejects_cycle() {
+        let conn = setup();
+        let data = dag_bundle(
+            r#"{"title": "A", "short_id": "aaaaaaaa", "depends_on": ["bbbbbbbb"]},
+               {"title": "B", "short_id": "bbbbbbbb", "depends_on": ["aaaaaaaa"]}"#,
+        );
+        let err = import_plan_from_data(&conn, &data, &opts()).unwrap_err();
+        assert!(err.to_string().contains("cycle"), "got: {err}");
+        assert!(storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Rule 3: a self-edge is reported as a cycle (mirrors
+    /// `would_create_step_cycle`'s self-edge early return).
+    #[test]
+    fn test_import_rejects_self_edge() {
+        let conn = setup();
+        let data = dag_bundle(
+            r#"{"title": "A", "short_id": "aaaaaaaa", "depends_on": ["aaaaaaaa"]},
+               {"title": "B", "short_id": "bbbbbbbb"}"#,
+        );
+        let err = import_plan_from_data(&conn, &data, &opts()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("itself"), "got: {msg}");
+        assert!(msg.contains("aaaaaaaa"), "got: {msg}");
+        assert!(storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Rule 4 (`≥1 root`) is a defensive backstop: once rules 1–3 hold it
+    /// is unreachable, because a finite graph whose edges are all internal
+    /// and acyclic always has a source. The only way to make every step
+    /// have a dependency without a dangling edge is to introduce a cycle,
+    /// which rule 3 catches first. This asserts that ordered behavior — a
+    /// rootless (mutually-dependent) graph is rejected by the validator.
+    #[test]
+    fn test_validate_rejects_rootless_dag() {
+        let steps = vec![
+            ImportedStep {
+                title: "A".into(),
+                description: String::new(),
+                agent: None,
+                harness: None,
+                acceptance_criteria: vec![],
+                max_retries: None,
+                model: None,
+                change_policy: crate::plan::ChangePolicy::default(),
+                tags: vec![],
+                retry_strategy: None,
+                short_id: Some("aaaaaaaa".into()),
+                depends_on: vec!["bbbbbbbb".into()],
+            },
+            ImportedStep {
+                title: "B".into(),
+                description: String::new(),
+                agent: None,
+                harness: None,
+                acceptance_criteria: vec![],
+                max_retries: None,
+                model: None,
+                change_policy: crate::plan::ChangePolicy::default(),
+                tags: vec![],
+                retry_strategy: None,
+                short_id: Some("bbbbbbbb".into()),
+                depends_on: vec!["aaaaaaaa".into()],
+            },
+        ];
+        let err = validate_dag_aware_steps(&steps).unwrap_err();
+        assert!(err.to_string().contains("cycle"));
     }
 }
