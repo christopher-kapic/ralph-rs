@@ -150,6 +150,7 @@ mod tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         }
     }
 

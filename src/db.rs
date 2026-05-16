@@ -33,6 +33,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v21,
     migrate_v22,
     migrate_v23,
+    migrate_v24,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -740,6 +741,29 @@ fn migrate_v23(conn: &Connection) -> Result<()> {
         "
         ALTER TABLE plans ADD COLUMN skip_requested_step_id TEXT;
         ALTER TABLE plans ADD COLUMN skip_changes TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V24: retry_strategy columns on plans and steps
+// ---------------------------------------------------------------------------
+
+fn migrate_v24(conn: &Connection) -> Result<()> {
+    // Per-plan / per-step opt-in for how a step's working tree is treated
+    // between failed attempts (`keep` vs `rollback`). Resolution is
+    // step > plan > built-in default (`keep`), implemented by
+    // `plan::Step::effective_retry_strategy`.
+    //
+    // Both columns are nullable TEXT with NO non-null default: NULL means
+    // "inherit from the parent / use the built-in default" rather than
+    // pinning every pre-V24 row to an explicit value. A non-null value is a
+    // serialized `plan::RetryStrategy` (`keep` | `rollback`).
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN retry_strategy TEXT;
+        ALTER TABLE steps ADD COLUMN retry_strategy TEXT;
         ",
     )?;
     Ok(())
@@ -2227,6 +2251,119 @@ mod tests {
             .unwrap();
         assert_eq!(sid2.as_deref(), Some("step-uuid"));
         assert_eq!(sch2.as_deref(), Some("discard"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v24_adds_retry_strategy_to_plans_and_steps() {
+        // Seed a pre-V24 DB with a plans row + a steps row, run V24, and
+        // verify the existing rows default `retry_strategy` to NULL (inherit
+        // / use default — the correct behavior), and that fresh values
+        // round-trip on both tables.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v23.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v23 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(23) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V24 applies. Pre-V24 rows must default the column NULL on
+        // both tables.
+        let conn = open_at(&path).unwrap();
+        let plan_rs: Option<String> = conn
+            .query_row(
+                "SELECT retry_strategy FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let step_rs: Option<String> = conn
+            .query_row(
+                "SELECT retry_strategy FROM steps WHERE id = ?1",
+                ["s1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            plan_rs.is_none() && step_rs.is_none(),
+            "pre-V24 rows must default retry_strategy to NULL (got plan={plan_rs:?}, step={step_rs:?})"
+        );
+
+        // Confirm the schema actually carries the column on both tables.
+        for table in ["plans", "steps"] {
+            let cols: Vec<String> = conn
+                .prepare(&format!("SELECT * FROM {table} LIMIT 0"))
+                .unwrap()
+                .column_names()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            assert!(
+                cols.iter().any(|c| c == "retry_strategy"),
+                "{table} must have a retry_strategy column post-V24 (cols: {cols:?})"
+            );
+        }
+
+        // Fresh inserts can carry explicit values; they round-trip.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, retry_strategy) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", "rollback"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description, retry_strategy) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["s2", "p2", "a0", "Step", "d", "keep"],
+        )
+        .unwrap();
+        let plan_rs2: Option<String> = conn
+            .query_row(
+                "SELECT retry_strategy FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let step_rs2: Option<String> = conn
+            .query_row(
+                "SELECT retry_strategy FROM steps WHERE id = ?1",
+                ["s2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(plan_rs2.as_deref(), Some("rollback"));
+        assert_eq!(step_rs2.as_deref(), Some("keep"));
 
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))

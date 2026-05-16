@@ -601,6 +601,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         }
     }
 
@@ -623,6 +624,7 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         }
     }
 

@@ -18,7 +18,7 @@ use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 /// can index by column position. Kept as a single shared constant so adding a
 /// new column (V13+ tags etc.) only requires editing one place instead of the
 /// dozen scattered SELECTs.
-const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags";
+const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy";
 
 // ---------------------------------------------------------------------------
 // Plan operations

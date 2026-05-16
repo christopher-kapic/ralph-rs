@@ -6849,6 +6849,7 @@ mod status_live_view_tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         };
         let rendered = render_live_block(&live, std::slice::from_ref(&fake_step));
         assert!(rendered.contains("Current:"));
@@ -7226,6 +7227,7 @@ mod plan_detail_init_tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         }
     }
 
@@ -8074,6 +8076,7 @@ mod step_detail_dispatcher_tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -8093,6 +8096,7 @@ mod step_detail_dispatcher_tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         }];
         StepDetailApp::new(
             plan,
@@ -9035,6 +9039,7 @@ mod sub_view_routing_tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
         let steps = vec![Step {
             id: "step-1".to_string(),
@@ -9054,6 +9059,7 @@ mod sub_view_routing_tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         }];
         StepDetailApp::new(
             plan,
@@ -9458,6 +9464,7 @@ mod mouse_routing_tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
         PlanDetailApp::new(plan, Vec::new(), &Config::default())
     }
@@ -9482,6 +9489,7 @@ mod mouse_routing_tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
         let step = Step {
             id: "step-1".to_string(),
@@ -9501,6 +9509,7 @@ mod mouse_routing_tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         };
         StepDetailApp::new(
             plan,

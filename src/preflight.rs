@@ -968,6 +968,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
         let results = run_preflight_checks(&plan, &[], &config, tmp.path()).unwrap();
         let auth = results
@@ -1020,6 +1021,7 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         }
     }
 

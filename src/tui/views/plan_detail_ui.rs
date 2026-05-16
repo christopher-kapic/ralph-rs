@@ -473,6 +473,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
@@ -493,6 +494,7 @@ mod tests {
                 skipped_reason: None,
                 change_policy: crate::plan::ChangePolicy::Required,
                 tags: vec![],
+                retry_strategy: None,
             })
             .collect();
         PlanDetailApp::new(plan, steps, &Config::default())
@@ -570,6 +572,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -589,6 +592,7 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         }];
         let config = Config {
             max_retries_per_step: 7,
@@ -697,6 +701,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -716,6 +721,7 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         }];
         PlanDetailApp::new(plan, steps, &Config::default())
     }

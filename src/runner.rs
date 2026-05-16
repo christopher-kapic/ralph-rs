@@ -1870,6 +1870,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         }
     }
 
@@ -1945,6 +1946,7 @@ mod tests {
                 skipped_reason: None,
                 change_policy: crate::plan::ChangePolicy::Required,
                 tags: vec![],
+                retry_strategy: None,
             })
             .collect()
     }
@@ -3013,6 +3015,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -3052,6 +3055,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -3640,6 +3644,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -3702,6 +3707,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
+            retry_strategy: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");
@@ -4159,6 +4165,7 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         };
         grown.insert(1, new_step.clone());
         // The inserted step becomes step 2; what was step 2 (s1) is now
