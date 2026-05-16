@@ -1252,7 +1252,7 @@ mod tests {
 
     #[test]
     fn test_question_ask_instruction_absent_when_questions_disabled() {
-        let plan = make_plan(); // questions_enabled defaults to false
+        let plan = make_plan(); // make_plan() hard-codes questions_enabled = false
         assert!(!plan.questions_enabled);
         let step = make_step();
         let all_steps = vec![step.clone()];

@@ -380,7 +380,9 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let project = "/proj-disabled";
         let (plan_id, step_id) = seed_plan_and_step(&conn, "p-disabled", project);
-        // Default `questions_enabled = false` (V16 default).
+        // New plans default to questions_enabled = true; this test
+        // exercises the DISABLED path, so force it off explicitly.
+        storage::set_plan_questions_enabled(&conn, &plan_id, false).unwrap();
         seed_run_lock(&conn, project, &plan_id, "p-disabled", &step_id, 2);
 
         let outcome = record_question_ask(

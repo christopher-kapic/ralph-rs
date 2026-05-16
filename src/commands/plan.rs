@@ -683,7 +683,11 @@ mod tests {
         let project = "/tmp/q-toggle";
         let plan =
             storage::create_plan(&conn, "qp", project, "br", "desc", None, None, &[]).unwrap();
-        assert!(!plan.questions_enabled, "default must be off");
+        // New plans default to questions_enabled = true; force it off so the
+        // on→off toggle round-trip below is meaningful.
+        storage::set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
+        let plan = storage::get_plan_by_id(&conn, &plan.id).unwrap();
+        assert!(!plan.questions_enabled, "forced off for the round-trip");
 
         cmd_plan_questions(&conn, "qp", project, true, &quiet_out()).unwrap();
         let on = storage::get_plan_by_slug(&conn, "qp", project)

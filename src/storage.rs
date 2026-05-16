@@ -39,9 +39,15 @@ pub fn create_plan(
     let id = Uuid::new_v4().to_string();
     let tests_json = serde_json::to_string(deterministic_tests)?;
 
+    // `questions_enabled` is set explicitly to 1 here rather than relying on
+    // the V16 column `DEFAULT 0`. New plans opt INTO the pause-for-question
+    // feature by default; existing rows are untouched (no migration), so only
+    // plans created via this path get the new default. The SQL column default
+    // stays 0 so a bare INSERT (e.g. an import path that omits the column)
+    // still behaves as before.
     conn.execute(
-        "INSERT INTO plans (id, slug, project, branch_name, description, harness, agent, deterministic_tests)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO plans (id, slug, project, branch_name, description, harness, agent, deterministic_tests, questions_enabled)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
         params![id, slug, project, branch_name, description, harness, agent, tests_json],
     )
     .with_context(|| format!("Failed to insert plan '{slug}' for project '{project}'"))?;
@@ -2628,16 +2634,16 @@ mod tests {
     fn test_set_plan_questions_enabled_flips_column() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        assert!(!plan.questions_enabled, "default should be off");
-
-        set_plan_questions_enabled(&conn, &plan.id, true).unwrap();
-        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
-        assert!(on.questions_enabled);
-        assert!(on.updated_at >= plan.updated_at);
+        assert!(plan.questions_enabled, "new plans default to on");
 
         set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
         let off = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
         assert!(!off.questions_enabled);
+        assert!(off.updated_at >= plan.updated_at);
+
+        set_plan_questions_enabled(&conn, &plan.id, true).unwrap();
+        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert!(on.questions_enabled);
     }
 
     #[test]

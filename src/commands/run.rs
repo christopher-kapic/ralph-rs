@@ -7531,6 +7531,20 @@ mod plan_list_action_tests {
         (conn, app)
     }
 
+    /// Like `seed_app` but forces `questions_enabled = false` on every seeded
+    /// plan. New plans now default to questions-on; the toggle-mechanics tests
+    /// below need a known-off starting point so their on→off round-trips and
+    /// "non-cursor untouched" assertions stay meaningful.
+    fn seed_app_questions_off(project: &str) -> (Connection, PlanListApp) {
+        let (conn, _) = seed_app(project);
+        for p in storage::list_plans(&conn, project, false).unwrap() {
+            storage::set_plan_questions_enabled(&conn, &p.id, false).unwrap();
+        }
+        let tiles = build_plan_tiles(&conn, project).unwrap();
+        let app = PlanListApp::new(tiles, project, "UTC");
+        (conn, app)
+    }
+
     #[test]
     fn approve_cursor_flips_planning_to_ready() {
         let project = "/tmp/approve-flow";
@@ -7590,7 +7604,7 @@ mod plan_list_action_tests {
     #[test]
     fn toggle_questions_flips_column_and_toasts_new_state() {
         let project = "/tmp/questions-toggle";
-        let (conn, mut app) = seed_app(project);
+        let (conn, mut app) = seed_app_questions_off(project);
         let target_slug = app.cursor_plan().unwrap().slug.clone();
         assert!(!app.cursor_plan().unwrap().questions_enabled);
 
@@ -7616,7 +7630,7 @@ mod plan_list_action_tests {
     #[test]
     fn toggle_questions_does_not_touch_non_cursor_tiles() {
         let project = "/tmp/questions-cursor-only";
-        let (conn, mut app) = seed_app(project);
+        let (conn, mut app) = seed_app_questions_off(project);
         let cursor_slug = app.cursor_plan().unwrap().slug.clone();
         // The other tile.
         let other_slug = app
@@ -8608,6 +8622,19 @@ mod palette_action_tests {
         (conn, app)
     }
 
+    /// Like `seed_app` but forces `questions_enabled = false` on every seeded
+    /// plan. New plans now default to questions-on; the questions-toggle test
+    /// needs a known-off starting point for its on round-trip assertion.
+    fn seed_app_questions_off(project: &str) -> (Connection, PlanListApp) {
+        let (conn, _) = seed_app(project);
+        for p in storage::list_plans(&conn, project, false).unwrap() {
+            storage::set_plan_questions_enabled(&conn, &p.id, false).unwrap();
+        }
+        let tiles = build_plan_tiles(&conn, project).unwrap();
+        let app = PlanListApp::new(tiles, project, "UTC");
+        (conn, app)
+    }
+
     // -- Toast path -----------------------------------------------------
 
     #[test]
@@ -8690,7 +8717,7 @@ mod palette_action_tests {
         // updates the in-memory tile so the next render reflects the new
         // state without a full refresh.
         let project = "/tmp/palette-questions";
-        let (conn, mut app) = seed_app(project);
+        let (conn, mut app) = seed_app_questions_off(project);
         let target_slug = app.cursor_plan().unwrap().slug.clone();
         assert!(!app.cursor_plan().unwrap().questions_enabled);
 
