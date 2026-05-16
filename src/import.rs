@@ -659,7 +659,7 @@ mod tests {
 
         // Export
         let steps = storage::list_steps(&conn, &original.id).unwrap();
-        let exported = export::build_exported_plan(&original, &steps, Vec::new());
+        let exported = export::build_exported_plan(&original, &steps, Vec::new(), &[]);
         let json = serde_json::to_string_pretty(&exported).unwrap();
 
         // Import into a different project
@@ -814,7 +814,7 @@ mod tests {
 
         // Build the export payload for B manually, resolving A's slug.
         let b_steps = storage::list_steps(&conn, &plan_b.id).unwrap();
-        let exported_b = export::build_exported_plan(&plan_b, &b_steps, vec!["dep-a".to_string()]);
+        let exported_b = export::build_exported_plan(&plan_b, &b_steps, vec!["dep-a".to_string()], &[]);
         assert_eq!(exported_b.plan.depends_on, vec!["dep-a".to_string()]);
         let json_b = serde_json::to_string_pretty(&exported_b).unwrap();
 
@@ -1159,7 +1159,7 @@ mod tests {
 
         // Export through the real export pipeline.
         let steps = storage::list_steps(&conn, &original.id).unwrap();
-        let exported = export::build_exported_plan(&original, &steps, Vec::new());
+        let exported = export::build_exported_plan(&original, &steps, Vec::new(), &[]);
         let json = serde_json::to_string_pretty(&exported).unwrap();
         // The exported JSON must mention both policy values literally.
         assert!(json.contains("\"required\""));
@@ -1342,7 +1342,7 @@ mod tests {
         // set_plan_retry_strategy write (the original handle is stale).
         let original = storage::get_plan_by_id(&conn, &original.id).unwrap();
         let steps = storage::list_steps(&conn, &original.id).unwrap();
-        let exported = export::build_exported_plan(&original, &steps, Vec::new());
+        let exported = export::build_exported_plan(&original, &steps, Vec::new(), &[]);
         let json = serde_json::to_string_pretty(&exported).unwrap();
 
         // Plan override + the explicit step override are present; the unset
@@ -1403,7 +1403,7 @@ mod tests {
         .unwrap();
 
         let steps = storage::list_steps(&conn, &original.id).unwrap();
-        let exported = export::build_exported_plan(&original, &steps, Vec::new());
+        let exported = export::build_exported_plan(&original, &steps, Vec::new(), &[]);
         let json = serde_json::to_string_pretty(&exported).unwrap();
         assert!(
             !json.contains("retry_strategy"),

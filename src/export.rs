@@ -74,20 +74,99 @@ pub struct ExportedStep {
     /// `#[serde(default)]` field on [`crate::import::ImportedStep`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_strategy: Option<RetryStrategy>,
+    /// Plan-unique, portable edge handle (docs/dag-redesign.md §13.2).
+    /// **Always emitted** — it is the stable handle other steps' `depends_on`
+    /// reference. The internal UUID is still never exported. Export reuses the
+    /// step's existing `short_id` (never re-minted), so re-exporting a bundle
+    /// yields byte-stable `short_id`s.
+    pub short_id: String,
+    /// `short_id`s of the steps this step directly depends on
+    /// (docs/dag-redesign.md §13.2). `#[serde(skip_serializing_if =
+    /// "Vec::is_empty")]` so a degenerate linear plan — whose chain edges are
+    /// *suppressed* by [`build_exported_plan`] (see [`resolve_step_depends_on`])
+    /// — still exports byte-identical to pre-DAG output for the common case;
+    /// only genuinely-branched plans carry edge data. A suppressed-edge bundle
+    /// re-imports via the legacy linear-chain backfill to the identical DAG
+    /// (the §13.3 round-trip guarantee).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Export logic
 // ---------------------------------------------------------------------------
 
+/// Resolve each step's direct dependencies to a sorted list of *step*
+/// `short_id`s, suppressing the edge data entirely when the plan is a
+/// degenerate linear chain (docs/dag-redesign.md §13.2 / §13.3).
+///
+/// The canonical chain is exactly the V25 backfill / legacy-import shape
+/// (step *k* depends on step *k−1* by `sort_key` order, step 0 a root). When
+/// the whole edge set is precisely that chain, every step's `depends_on` is
+/// suppressed (returned empty) so the bundle exports byte-identical to
+/// pre-DAG output for the common case, and re-imports via the legacy
+/// linear-chain backfill to the identical DAG. Only genuinely-branched plans
+/// carry edge data.
+///
+/// `steps` must be in canonical `sort_key` order (as [`storage::list_steps`]
+/// returns). The returned vec is parallel to `steps`; `short_id`s within each
+/// entry are sorted so re-exports are byte-stable regardless of internal UUID
+/// values.
+fn resolve_step_depends_on(conn: &Connection, steps: &[Step]) -> Result<Vec<Vec<String>>> {
+    use std::collections::HashMap;
+
+    let id_to_short: HashMap<&str, &str> = steps
+        .iter()
+        .map(|s| (s.id.as_str(), s.short_id.as_str()))
+        .collect();
+
+    let mut resolved: Vec<Vec<String>> = Vec::with_capacity(steps.len());
+    for s in steps {
+        let dep_ids = storage::list_step_dependencies(conn, &s.id)?;
+        // Only edges whose target is also a step of this plan are portable;
+        // anything else (shouldn't happen in practice) is silently dropped,
+        // mirroring the plan-level dependency resolution in `export_plan`.
+        let mut shorts: Vec<String> = dep_ids
+            .iter()
+            .filter_map(|id| id_to_short.get(id.as_str()).map(|x| x.to_string()))
+            .collect();
+        shorts.sort();
+        resolved.push(shorts);
+    }
+
+    // Degenerate linear chain ⇔ step 0 is a root and every later step
+    // depends on exactly its immediate `sort_key` predecessor. Vacuously
+    // true for an empty plan.
+    let is_linear_chain = (0..steps.len()).all(|i| {
+        if i == 0 {
+            resolved[0].is_empty()
+        } else {
+            resolved[i].len() == 1 && resolved[i][0] == steps[i - 1].short_id
+        }
+    });
+
+    if is_linear_chain {
+        Ok(vec![Vec::new(); steps.len()])
+    } else {
+        Ok(resolved)
+    }
+}
+
 /// Build an ExportedPlan from a Plan and its steps.
 ///
 /// `depends_on_slugs` is the caller-supplied list of slugs this plan
 /// depends on (resolved by [`export_plan`] from the dependency graph).
+///
+/// `step_depends_on` is parallel to `steps`: entry *i* is the (already
+/// chain-suppressed, sorted) list of dependency `short_id`s for `steps[i]`,
+/// as produced by [`resolve_step_depends_on`]. A shorter/empty slice is
+/// treated as "no edges" for the unspecified steps, which keeps pure
+/// callers (tests, legacy linear plans) byte-stable.
 pub fn build_exported_plan(
     plan: &Plan,
     steps: &[Step],
     depends_on_slugs: Vec<String>,
+    step_depends_on: &[Vec<String>],
 ) -> ExportedPlan {
     let version = env!("CARGO_PKG_VERSION").to_string();
     let exported_at = Utc::now().to_rfc3339();
@@ -106,7 +185,8 @@ pub fn build_exported_plan(
 
     let exported_steps: Vec<ExportedStep> = steps
         .iter()
-        .map(|s| ExportedStep {
+        .enumerate()
+        .map(|(i, s)| ExportedStep {
             title: s.title.clone(),
             description: s.description.clone(),
             agent: s.agent.clone(),
@@ -117,6 +197,8 @@ pub fn build_exported_plan(
             change_policy: s.change_policy,
             tags: s.tags.clone(),
             retry_strategy: s.retry_strategy,
+            short_id: s.short_id.clone(),
+            depends_on: step_depends_on.get(i).cloned().unwrap_or_default(),
         })
         .collect();
 
@@ -151,7 +233,9 @@ pub fn export_plan(
     }
     dep_slugs.sort();
 
-    let exported = build_exported_plan(&plan, &steps, dep_slugs);
+    let step_depends_on = resolve_step_depends_on(conn, &steps)?;
+
+    let exported = build_exported_plan(&plan, &steps, dep_slugs, &step_depends_on);
     let json = serde_json::to_string_pretty(&exported)?;
 
     match output {
@@ -230,7 +314,7 @@ mod tests {
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
 
         // Check version and timestamp are present
         assert!(!exported.ralph_rs_version.is_empty());
@@ -294,7 +378,7 @@ mod tests {
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
         let json = serde_json::to_string_pretty(&exported).unwrap();
 
         // The JSON should NOT contain internal fields
@@ -346,7 +430,7 @@ mod tests {
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
         let json = serde_json::to_string(&exported).unwrap();
 
         // Should parse back as valid JSON
@@ -464,7 +548,7 @@ mod tests {
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
 
         assert_eq!(exported.steps[0].title, "Alpha");
         assert_eq!(exported.steps[1].title, "Beta");
@@ -506,7 +590,7 @@ mod tests {
 
         // Export should NOT include status at all (the ExportedStep struct has no status field)
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
         let json = serde_json::to_string(&exported).unwrap();
 
         // The steps array shouldn't have "status" or "attempts" fields
@@ -566,7 +650,7 @@ mod tests {
         .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        let exported = build_exported_plan(&plan, &steps, Vec::new());
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
         assert_eq!(exported.steps[0].tags, tags);
         assert!(exported.steps[1].tags.is_empty());
 
@@ -579,5 +663,125 @@ mod tests {
         assert_eq!(tagged_tags[1], "REGRESSION");
         // Untagged step omits the field (skip_serializing_if).
         assert!(parsed["steps"][1].get("tags").is_none());
+    }
+
+    /// Helper: create a titled step with all-default optional fields.
+    fn mk_step(conn: &Connection, plan_id: &str, title: &str) -> Step {
+        let (s, _) = storage::create_step(
+            conn, plan_id, title, "desc", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn test_export_short_id_always_emitted_and_chain_suppressed() {
+        // docs/dag-redesign.md §13.2: `short_id` is ALWAYS emitted; a
+        // degenerate linear chain suppresses `depends_on` so the bundle
+        // stays byte-identical (w.r.t. edge data) to pre-DAG output.
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn, "chain", "/tmp/proj", "branch", "desc", None, None, &[],
+        )
+        .unwrap();
+        let a = mk_step(&conn, &plan.id, "A");
+        let b = mk_step(&conn, &plan.id, "B");
+        let c = mk_step(&conn, &plan.id, "C");
+        // Canonical V25/legacy-import chain: B→A, C→B.
+        storage::add_step_dependency(&conn, &b.id, &a.id).unwrap();
+        storage::add_step_dependency(&conn, &c.id, &b.id).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let resolved = resolve_step_depends_on(&conn, &steps).unwrap();
+        // Chain is detected → every step's edge data is suppressed.
+        assert!(resolved.iter().all(|d| d.is_empty()));
+
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &resolved);
+        // short_id is carried through verbatim, never re-minted.
+        assert_eq!(exported.steps[0].short_id, a.short_id);
+        assert_eq!(exported.steps[1].short_id, b.short_id);
+        assert_eq!(exported.steps[2].short_id, c.short_id);
+        assert!(exported.steps.iter().all(|s| s.depends_on.is_empty()));
+
+        let json = serde_json::to_string(&exported).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for i in 0..3 {
+            // short_id present on every step.
+            assert!(parsed["steps"][i]["short_id"].is_string());
+            // depends_on suppressed (skip_serializing_if) for a linear plan.
+            assert!(parsed["steps"][i].get("depends_on").is_none());
+        }
+    }
+
+    #[test]
+    fn test_export_branched_plan_emits_depends_on() {
+        // A genuinely-branched plan (not the canonical chain) carries edge
+        // data: B→A and C→A (fan-out), so chain suppression does NOT apply.
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn, "branched", "/tmp/proj", "branch", "desc", None, None, &[],
+        )
+        .unwrap();
+        let a = mk_step(&conn, &plan.id, "A");
+        let b = mk_step(&conn, &plan.id, "B");
+        let c = mk_step(&conn, &plan.id, "C");
+        storage::add_step_dependency(&conn, &b.id, &a.id).unwrap();
+        storage::add_step_dependency(&conn, &c.id, &a.id).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let resolved = resolve_step_depends_on(&conn, &steps).unwrap();
+        let exported = build_exported_plan(&plan, &steps, Vec::new(), &resolved);
+
+        assert!(exported.steps[0].depends_on.is_empty(), "A is a root");
+        assert_eq!(exported.steps[1].depends_on, vec![a.short_id.clone()]);
+        assert_eq!(exported.steps[2].depends_on, vec![a.short_id.clone()]);
+
+        let json = serde_json::to_string(&exported).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Root omits the field; branched dependents emit it referencing
+        // A's short_id (the portable edge handle, never the UUID).
+        assert!(parsed["steps"][0].get("depends_on").is_none());
+        assert_eq!(parsed["steps"][1]["depends_on"][0], a.short_id);
+        assert_eq!(parsed["steps"][2]["depends_on"][0], a.short_id);
+        assert!(!json.contains(&a.id), "internal UUID must never be exported");
+    }
+
+    #[test]
+    fn test_export_round_trip_short_ids_stable() {
+        // Re-exporting a bundle must yield byte-stable short_ids and edges
+        // (docs/dag-redesign.md §13.2: short_ids are not re-minted on export).
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn, "stable", "/tmp/proj", "branch", "desc", None, None, &[],
+        )
+        .unwrap();
+        let a = mk_step(&conn, &plan.id, "A");
+        let b = mk_step(&conn, &plan.id, "B");
+        let c = mk_step(&conn, &plan.id, "C");
+        // Branched so depends_on is actually serialized (not suppressed).
+        storage::add_step_dependency(&conn, &b.id, &a.id).unwrap();
+        storage::add_step_dependency(&conn, &c.id, &a.id).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let r1 = resolve_step_depends_on(&conn, &steps).unwrap();
+        let e1 = build_exported_plan(&plan, &steps, Vec::new(), &r1);
+        let steps2 = storage::list_steps(&conn, &plan.id).unwrap();
+        let r2 = resolve_step_depends_on(&conn, &steps2).unwrap();
+        let e2 = build_exported_plan(&plan, &steps2, Vec::new(), &r2);
+
+        for i in 0..3 {
+            assert_eq!(
+                e1.steps[i].short_id, e2.steps[i].short_id,
+                "short_id must be stable across re-exports"
+            );
+            assert_eq!(
+                e1.steps[i].depends_on, e2.steps[i].depends_on,
+                "edge data must be stable across re-exports"
+            );
+        }
+        // Stable also means equal to the stored step short_ids.
+        assert_eq!(e1.steps[0].short_id, a.short_id);
+        assert_eq!(e1.steps[1].short_id, b.short_id);
+        assert_eq!(e1.steps[2].short_id, c.short_id);
     }
 }
