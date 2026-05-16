@@ -37,7 +37,7 @@ when:
 - The work spans more than a single coherent session of edits.
 - You want each step independently verified by tests before the next one starts.
 - You want a review pass interleaved with implementation passes.
-- You want the option to roll back a step on failure.
+- You want per-step retry on failure (and, opt-in via `--retry-strategy rollback`, a clean-tree rollback between attempts).
 
 A bugfix that's "find the line, change three characters, run tests" is not a
 ralph. A multi-phase refactor with verification gates is.
@@ -146,7 +146,7 @@ ralph plan approve <slug>
 Plan slug is a trailing positional argument on every step command and defaults
 to the active plan when omitted.
 
-- `ralph step add "<title>" <slug> [--description "<desc>"] [--after <n>] [--harness <h>] [--change-policy {required|optional|forbidden}] [--max-retries <n>] [--import-json <FILE|->]`
+- `ralph step add "<title>" <slug> [--description "<desc>"] [--after <n>] [--harness <h>] [--change-policy {required|optional|forbidden}] [--max-retries <n>] [--retry-strategy {keep|rollback}] [--import-json <FILE|->]`
 - `ralph step list <slug>`
 - `ralph step edit <n> <slug> [--title "<title>"] [--description "<desc>"]`
 - `ralph step remove <n> <slug> --force`
@@ -228,9 +228,9 @@ Pick granularity based on the work, not a target count. Rough bands:
 - large refactor or greenfield: 40–300
 
 Don't compress a big task into a handful of mega-steps — you lose the
-per-step checkpointing, retry, and rollback. Don't inflate a small task into
-trivial steps either. Whatever the size, every step must be atomic and
-independently verifiable.
+per-step checkpointing, retry, and per-step diff isolation. Don't inflate a
+small task into trivial steps either. Whatever the size, every step must be
+atomic and independently verifiable.
 
 ## Guidelines
 
@@ -267,6 +267,18 @@ independently verifiable.
   review); `forbidden` fails on any diff (use for read-only audit).
 - `ralph step add ... --max-retries <n>` — per-step retry override.
 - `ralph step add ... --harness <name>` — per-step harness override.
+- `ralph plan create ... --retry-strategy {keep|rollback}` /
+  `ralph step add|edit ... --retry-strategy {keep|rollback}` — how a failed
+  attempt's tree is handled before the retry. `keep` (the default) carries
+  the dirty tree forward; `rollback` reverts to a clean tree and feeds the
+  prior diff into the next prompt. Use `rollback` for steps where a
+  half-done attempt would poison the retry (e.g. partial migrations).
+  `ralph step edit --clear-retry-strategy` drops a step-level override back
+  to plan/global inheritance.
+- `ralph skip [<slug>] [--step <n>] --changes {stash|commit|discard}` — skip
+  a step; `--changes` (default `stash`) decides what happens to a killed
+  harness's uncommitted work. `commit` writes a `[ralph wip]` commit with a
+  `Ralph-Skipped-Step` trailer that `ralph step reset` can later revert.
 - `ralph harness list` / `ralph harness show <name>` — verify configured
   harnesses, sandbox modes, and known foot-guns.
 - `ralph step move <num> --to <n>` — reorder steps after creation.

@@ -4,7 +4,7 @@ A Rust CLI that orchestrates coding agent harnesses (Claude Code, Codex, OpenCod
 
 ## Design Spec
 
-The full design spec is in `ralph-rs-plan.md` at the project root. **Note:** that document was written before implementation and some sections (CLI surface, module structure, defaults) have drifted from the current code. This file is the authoritative reference for the project's current state.
+The TUI design spec is `TUI-plan.md` at the project root. **Note:** that document was written before implementation. Its prompt-layer model (§8/§11), questions storage (§15), and build-phase list still describe the *pre-overhaul* shape (per-plan `context_prepend`, global/project prefix-suffix pairs, `questions_enabled DEFAULT 0`); the prompt-overhaul branch superseded those — see "Prompt model" and "Key Design Decisions" below for the current four-layer model, retry strategy, and skip behavior. The narrative sections that the overhaul touched have been reconciled in `TUI-plan.md`, but the older keybinding tables and ASCII mocks were left as historical design notes. This file is the authoritative reference for the project's current state.
 
 ## Tech Stack
 
@@ -25,13 +25,13 @@ src/
   main.rs              — Entry point, clap CLI dispatch, resolve_plan helper
   cli.rs               — Clap command/arg definitions (ValueEnum for Lifecycle, PlanStatus)
   config.rs            — JSON config loading (~/.config/ralph-rs/config.json), harness definitions
-  db.rs                — SQLite connection, migrations (V1–V5)
-  plan.rs              — Plan/Step/ExecutionLog data models and enums
+  db.rs                — SQLite connection, migrations (V1–V24)
+  plan.rs              — Plan/Step/ExecutionLog models, enums (incl. RetryStrategy {Keep, Rollback})
   frac_index.rs        — Base-62 fractional indexing for O(1) step reordering
-  storage.rs           — High-level CRUD operations (plans, steps, dependencies, hooks, locks)
+  storage.rs           — High-level CRUD operations (plans, steps, dependencies, hooks, locks, project prompt)
   harness.rs           — Harness resolution, subprocess spawning, output parsing
-  prompt.rs            — Prompt construction (agent def, retry context, plan context, hooks)
-  executor.rs          — Single-step execution (spawn harness → test → commit/rollback)
+  prompt.rs            — Prompt construction (four-layer `Prompts`, retry context, plan context, hooks); DEFAULT_CONTEXT_PREPEND global-prompt seed
+  executor.rs          — Single-step execution (spawn harness → test → commit; retry honors RetryStrategy; skip parks WIP)
   runner.rs            — Plan-level orchestrator (step iteration, status transitions, --all)
   run_lock.rs          — Per-project run lock to prevent concurrent runs
   signal.rs            — Two-stage Ctrl+C handling (graceful then forceful)
@@ -46,9 +46,11 @@ src/
   output.rs            — Output formatting (JSON, plain, color detection, NDJSON events)
   commands/
     mod.rs             — Re-exports, shared helpers (resolve_project/step, init, doctor, confirm)
-    plan.rs            — Plan CRUD, dependency, plan-level hook, plan harness set/show commands
-    step.rs            — Step CRUD, move, edit (with agent/harness/criteria/max-retries), step-level hooks
-    run.rs             — Status and log commands
+    plan.rs            — Plan CRUD, dependency, plan-level hook, plan harness set/show, retry-strategy commands
+    step.rs            — Step CRUD, move, edit (agent/harness/criteria/max-retries/retry-strategy), step-level hooks
+    run.rs             — Status, log (incl. WIP-skip commits), skip (`--changes`) commands
+    prompt.rs          — `ralph prompt set/clear/show` (global/project scope; `.ralph/prompt.md`-aware)
+    question.rs        — `ralph question ask/list/answer` (per-plan pause-for-clarification)
     agents.rs          — Agent file CRUD commands
     hooks.rs           — Hook library CRUD, export/import commands
     harness.rs         — Read-only harness inspection (`ralph harness list/show`)
@@ -67,6 +69,7 @@ src/
     palette_dispatch.rs — Maps parsed palette commands to per-view actions
     read_only.rs       — Read-only attach state when an external runner holds the lock
     run_dialog.rs      — `/run` branch-choice dialog (consumes `choice.rs`) + naming phase
+    skip_dialog.rs     — `s` skip change-handling dialog (Stash/Commit/Discard via `choice.rs`; Esc = cancel-restart, no retry budget)
     selection.rs       — Multi-selection state (with `[N]` badge ordering)
     views/
       plan_list.rs     — Landing screen: tile per plan, sort by recency
@@ -74,8 +77,9 @@ src/
       plan_detail.rs   — Plan-detail view state
       plan_detail_input.rs — Pure key handler returning `InputAction`s
       plan_detail_ui.rs — Plan-detail rendering (step list + right pane)
-      step_detail.rs   — Step-detail pane stack (Universal/Project/Plan/Step prompts, etc.)
+      step_detail.rs   — Step-detail pane stack (four layers: Global/Project/Plan/Step prompts, etc.)
       step_detail_picker.rs — Bottom-row pickers (harness/model/agent/change_policy)
+      rendered_prompt.rs — Read-only fully-assembled-prompt preview (`l`/`→` from StepPrompt pane; per-attempt nav)
       create_plan.rs   — Inline create-plan modal (slug → description → tests)
       answer_modal.rs  — `❓` answer modal + post-answer resume modal
       plan_dependencies.rs — Plan-dependency sub-view (List + Picker modes)
@@ -88,15 +92,33 @@ src/
 
 The TUI is **multi-view** (plan list / archived list / plan detail /
 step detail) with sub-views pushed on top for plan dependencies, plan
-hooks, step hooks, and step tags. Each view is a self-contained `App`
-struct with pure state-machine methods, plus a separate render function
-and a per-view input handler — splitting these three lets us
-unit-test state transitions without spinning up a real terminal.
+hooks, step hooks, step tags, and the rendered-prompt preview. Each view
+is a self-contained `App` struct with pure state-machine methods, plus a
+separate render function and a per-view input handler — splitting these
+three lets us unit-test state transitions without spinning up a real
+terminal.
+
+The step-detail screen exposes the **four user-facing prompt layers** as
+panes (`GlobalPrompt` / `ProjectPrompt` / `PlanPrompt` / `StepPrompt`) —
+the pre-overhaul `PlanContextPrepend` / `PlanPrefix` / `PlanSuffix` panes
+are gone. From the `StepPrompt` pane, `l`/`→` pushes the
+**`RenderedPromptView`** sub-view (`src/tui/views/rendered_prompt.rs`): a
+read-only preview of the fully-assembled prompt exactly as
+`prompt::build_step_prompt` produces it, with `j`/`k` navigating between
+per-attempt renders (each attempt re-assembled with the retry context the
+executor would have built for it).
+
+Mouse is supported in the list views: in plan_list / archived_list /
+plan_detail's step list, a click selects the row, a second click on the
+already-selected row enters it, and the scroll wheel moves the cursor.
+The TUI still enables mouse capture (Shift-click bypasses it for native
+text selection).
 
 The dispatchers live in `src/commands/run.rs` (`run_plan_list_tui`,
 `run_archived_list_tui`, `run_plan_detail_tui`, `run_step_detail_tui`,
-`run_plan_dependencies_tui`). They own the alternate-screen / raw-mode
-session, the crossterm event loop, and any DB/storage write-throughs.
+`run_plan_dependencies_tui`, `run_rendered_prompt_tui`). They own the
+alternate-screen / raw-mode session, the crossterm event loop, and any
+DB/storage write-throughs.
 Sub-view state machines expose a pure `handle_key(KeyEvent) -> Outcome`
 method; the dispatcher executes the side effect and loops on `Pending`.
 
@@ -121,21 +143,47 @@ view bindings don't fire under the overlay.
 
 - **Deterministic-only:** No built-in LLM; plans created manually or via harness delegation
 - **Multi-harness:** Pluggable harness support with different integration patterns (native agent file, env var, prompt injection)
-- **Git-integrated:** All steps are git commits; branches per plan; rollback on failure
+- **Git-integrated:** All steps are git commits; branches per plan
+- **Retry strategy:** `RetryStrategy {Keep, Rollback}`, precedence step > plan > default `Keep`. `Keep` (the default) carries the dirty tree forward between failed attempts (the prior diff is on disk; the retry context omits it); `Rollback` reverts the tree before each retry and feeds the rolled-back diff into the next prompt
 - **SQLite storage** at platform-appropriate data dir (`~/.local/share/ralph-rs/ralph.db` on Linux)
 - **JSON config** at `~/.config/ralph-rs/config.json` (XDG semantics on all platforms)
 - **Signal-aware:** Two-stage Ctrl+C (graceful then forceful) via tokio watch channels
 - **Fractional indexing:** O(1) step insertion without full reindex
 - **Run locks:** SQLite-based per-project lock prevents concurrent `ralph run` invocations; `--force` to recover stale locks
 - **Hook system:** Reusable hooks in `~/.config/ralph-rs/hooks/*.md` with scope, export/import, and lifecycle attachment
-- **NDJSON output:** `--json` flag streams structured events during runs; `--quiet` suppresses progress; `--no-color` and `NO_COLOR` respected
+- **NDJSON output:** `--json` flag streams structured events during runs; `--quiet` suppresses progress; `--no-color` and `NO_COLOR` respected. Includes an `attempt_cancelled` event (TUI skip-dialog Esc/cancel)
+- **Skip overhaul:** `ralph skip --changes <stash|commit|discard>` (default `stash`) and a TUI Choice<T> skip dialog (Stash/Commit/Discard; Esc-cancel restarts the attempt consuming no retry budget) decide what happens to the killed harness's in-flight work. `commit` writes a `[ralph wip]` commit carrying a `Ralph-Skipped-Step: <id>` git trailer; `ralph log` surfaces those commits and `ralph step reset` reverts them (confirm / `--force`). A cross-process **skip bridge** (`plans.skip_requested_step_id` / `plans.skip_changes`, migration V23) lets the TUI/CLI skip a step running inside a separate spawned-runner process
 - **Shell completions:** `ralph completions <shell>` generates bash/zsh/fish/elvish/powershell
+
+## Prompt model
+
+Four layers, assembled outermost → innermost by `prompt::build_step_prompt`
+(`Prompts` struct in `src/prompt.rs`):
+
+1. **Global** — `config.prompt` in `~/.config/ralph-rs/config.json`. Seeded
+   with `DEFAULT_CONTEXT_PREPEND` (the ralph-CLI introspection hints) at
+   `ralph init`; `ralph init --restore-prompts` re-seeds it unconditionally
+   (overwriting customization); uncustomized legacy configs are reseeded on
+   migration. `build_step_prompt` no longer auto-injects the prepend — the
+   Global layer carries it, so editing the global prompt fully customizes it.
+2. **Project** — `<project>/.ralph/prompt.md` (a file, if present) **wins
+   over** the `project_settings.prompt` DB column. `ralph prompt
+   set/clear/show --scope project` is file-vs-DB aware.
+3. **Plan** — the plan's `description`, rendered once into the `# Plan:
+   {slug}` context block. There is **no** per-plan prefix/suffix and no
+   per-plan `context_prepend` (legacy columns dropped in migrations V21/V22).
+4. **Step** — the step body (title / description / acceptance criteria).
+
+There is no suffix concept; layers stack as prefix sections only.
+`--scope universal` is a clap alias for `--scope global`. `ralph doctor`
+emits a non-fatal warning when the global prompt lacks the ralph-CLI
+hints, pointing the user at `ralph init --restore-prompts`.
 
 ## CLI Surface
 
 ```
-ralph init [--non-interactive] [--default-harness <name>] [--force]
-ralph plan create <slug> [-d <desc>] [--test <cmd>]... [--harness <h>] [--agent <name>] [--branch <name>] [--depends-on <slug>]...
+ralph init [--non-interactive] [--default-harness <name>] [--force] [--restore-prompts]
+ralph plan create <slug> [-d <desc>] [--test <cmd>]... [--harness <h>] [--agent <name>] [--branch <name>] [--depends-on <slug>]... [--retry-strategy <keep|rollback>]
 ralph plan list [--all] [--status <status>] [--archived]
 ralph plan show <slug>
 ralph plan approve <slug>
@@ -148,14 +196,15 @@ ralph plan hooks <slug>
 ralph plan dependency add <slug> --depends-on <slug>...
 ralph plan dependency remove <slug> --depends-on <slug>...
 ralph plan dependency list <slug>
+ralph plan questions <on|off> [<slug>]
 ralph plan harness set <harness> [<slug>]
 ralph plan harness show [<slug>]
 ralph plan harness generate [<description>] [<slug>] [--use-harness <h>]
 
 ralph step list [<slug>]
-ralph step add <title> [<slug>] [-d <desc>] [--after <num>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--max-retries <n>] [--import-json <FILE|->]
+ralph step add <title> [<slug>] [-d <desc>] [--after <num>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--max-retries <n>] [--retry-strategy <keep|rollback>] [--import-json <FILE|->]
 ralph step remove <num>|--step-id <uuid> [<slug>] [--force/-y]
-ralph step edit <num>|--step-id <uuid> [<slug>] [--title <t>] [--description <d>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--clear-criteria] [--max-retries <n>] [--clear-max-retries]
+ralph step edit <num>|--step-id <uuid> [<slug>] [--title <t>] [--description <d>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--clear-criteria] [--max-retries <n>] [--clear-max-retries] [--retry-strategy <keep|rollback>] [--clear-retry-strategy]
 ralph step reset <num>|--step-id <uuid> [<slug>]
 ralph step move <num>|--step-id <uuid> --to <n> [<slug>]
 ralph step set-hook <num>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --hook <name>
@@ -163,13 +212,23 @@ ralph step unset-hook <num>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --
 
 ralph run [<slug>] [--one/--single] [--all] [--from <n>] [--to <m>] [--dry-run] [--skip-preflight] [--current-branch] [--auto-stash] [--harness <h>] [--force]
 ralph resume [<slug>]
-ralph skip [<slug>] [--step <n>] [--reason <reason>]
+ralph skip [<slug>] [--step <n>] [--reason <reason>] [--changes <stash|commit|discard>] [--force]
+ralph step reset <num>|--step-id <uuid> [<slug>] [--force/-y]
 
 ralph export <slug> [-o <file>]
-ralph import <file> [--slug <name>] [--branch <name>] [--harness <h>]
+ralph import <file> [--slug <name>] [--branch <name>] [--strict]
 
 ralph status [<slug>] [--verbose/-v]
 ralph log [<slug>] [--step <n>] [--limit <n>] [--full|--lines <n>]
+
+ralph prompt show [--scope <global|project|universal>] [--resolved]
+ralph prompt set --scope <global|project|universal> <content>
+ralph prompt clear --scope <global|project|universal>
+
+ralph question ask [<text>] [--suggest/-s <answer>]...
+ralph question list [<slug>]
+ralph question answer <num> [<text>]
+ralph question show <num>
 
 ralph agents list|show|create|delete
 ralph hooks list|show|add|remove|export|import

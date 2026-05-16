@@ -33,7 +33,9 @@ They all have working CLI surfaces today; v2 of the TUI absorbs them.
 - Plan hook attachment (`plan set-hook/unset-hook/hooks`).
 - Step hook attachment.
 - Step tag editor (`step edit --tags ...`).
-- Mouse support (keyboard only, like lazygit).
+- Full mouse support (keyboard-first, like lazygit). **Prompt-overhaul
+  update:** the list views now support click-to-select / click-again-to-
+  enter and scroll-wheel cursor movement; everything else stays keyboard.
 - Replacing scriptable commands (`plan show --json`, `status --json`, etc.) —
   the TUI is additive.
 - Any LLM functionality inside the TUI itself; the only AI invocations are
@@ -48,8 +50,9 @@ they're cheap to implement as keybindings or palette commands:
 - Step move (Shift-`J` / Shift-`K` in plan detail to nudge selected
   step down/up; `/step move <num> --to <m>` in palette).
 - Step reset (`r` on a step in plan detail).
-- Per-plan `context_prepend` editing (a new editable pane in step
-  detail, sitting above "Plan prompt" since it's plan-scoped).
+- Prompt editing (Global / Project / Plan panes in step detail; the
+  prompt-overhaul collapsed the old per-plan `context_prepend` and
+  prefix/suffix panes into one blob per scope).
 - Per-step `change_policy` toggle (4th cell in step-detail's bottom row,
   Required ↔ Optional).
 - Per-step `model` / `agent` / `harness` overrides (existing bottom-row
@@ -350,7 +353,7 @@ navigate but `R` is disabled while the external runner holds the lock; `S`
 | `r`                  | Reset highlighted step (status → `pending`, attempts → 0)                    |
 | `Shift-J`            | Move highlighted (or selected) step **down** one position                    |
 | `Shift-K`            | Move highlighted (or selected) step **up** one position                      |
-| `s`                  | Skip currently-running step (existing `request_skip`)                        |
+| `s`                  | Skip step. If it left uncommitted work, opens the Stash/Commit/Discard skip dialog (Esc = cancel, restarts the attempt with no retry-budget cost) |
 | `R`                  | Run / resume this plan (no-op if already running)                            |
 | `S`                  | Stop the live run (sends SIGTERM via `ralph cancel` semantics)               |
 | `/` or `:`           | Command palette                                                              |
@@ -364,18 +367,23 @@ Entered via `enter` on a step. The screen swaps to a stacked main-pane layout
 with the step list collapsed to a thin gutter on the left (or hidden — see
 §18 Q5):
 
+> **Prompt-overhaul update.** The prompt model collapsed to four layers
+> (Global / Project / Plan / Step). The panes below replace the original
+> Universal/Project/Plan-context-prepend/Plan-prompt stack: there is one
+> content blob per scope, no prefix/suffix split, and no per-plan
+> `context_prepend` pane. The `l`/`→` key on the Step-prompt pane pushes a
+> read-only **rendered-prompt preview** sub-view (the fully-assembled
+> prompt, navigable per attempt).
+
 ```
-┌─ Universal prompt ─────────────────────────────────────────────────┐
-│ <config.prompt_prefix> … <config.prompt_suffix>                    │
+┌─ Global (universal) prompt ────────────────────────────────────────┐
+│ <config.prompt>  (seeded with DEFAULT_CONTEXT_PREPEND at init)      │
 └─────────────────────────────────────────────────────────────────────┘
 ┌─ Project prompt ───────────────────────────────────────────────────┐
-│ <project_settings.prompt_prefix> … <project_settings.prompt_suffix>│
-└─────────────────────────────────────────────────────────────────────┘
-┌─ Plan context prepend ─────────────────────────────────────────────┐
-│ <plan.context_prepend  or  DEFAULT_CONTEXT_PREPEND>                │
+│ <.ralph/prompt.md  if present, else project_settings.prompt>       │
 └─────────────────────────────────────────────────────────────────────┘
 ┌─ Plan prompt ──────────────────────────────────────────────────────┐
-│ <plan.prompt_prefix> … <plan.prompt_suffix>                        │
+│ <plan.description>  (rendered into the `# Plan: {slug}` block)      │
 └─────────────────────────────────────────────────────────────────────┘
 ┌─ Step prompt ──────────────────────────────────────────────────────┐  ← initial focus
 │ <step.title>                                                       │
@@ -401,10 +409,9 @@ text. Initial focus is the **Step prompt** pane.
 
 | Pane                  | Source of truth (read)                               | `c` writes to                                                  |
 | --------------------- | ---------------------------------------------------- | -------------------------------------------------------------- |
-| Universal prompt      | `Config.prompt_prefix`, `Config.prompt_suffix`       | `~/.config/ralph-rs/config.json` (plain serde round-trip)      |
-| Project prompt        | `project_settings` row for current project           | `project_settings` table                                       |
-| Plan context prepend  | `plan.context_prepend` or `DEFAULT_CONTEXT_PREPEND`  | `plans.context_prepend`                                        |
-| Plan prompt           | `plan.prompt_prefix`, `prompt_suffix`                | `plans` row                                                    |
+| Global (universal)    | `Config.prompt` (seeded with `DEFAULT_CONTEXT_PREPEND`) | `~/.config/ralph-rs/config.json` (plain serde round-trip)    |
+| Project prompt        | `<project>/.ralph/prompt.md` if present, else `project_settings.prompt` | the active source (file or `project_settings`)|
+| Plan prompt           | `plan.description` (rendered into the `# Plan:` block) | `plans.description`                                            |
 | Step prompt           | `step.title`, `description`, `acceptance_criteria`   | `steps` row                                                    |
 | Appended (per-attempt)| `execution_log` rows for the step                    | **read-only**; `h`/`l` paginate by attempt                     |
 | Tests                 | `plan.deterministic_tests`                           | `plans.deterministic_tests`                                    |
@@ -576,16 +583,23 @@ Documented in `docs/ndjson-events.md` (separate doc).
 
 ## 11. Prompt-layer model (recap)
 
-The step-detail view exposes four editable prompt scopes plus one read-only
-historical scope. They map onto existing storage:
+> **Prompt-overhaul update.** The model collapsed to a strict **four-layer**
+> shape (Global / Project / Plan / Step). One content blob per scope — no
+> prefix/suffix split, no per-plan `context_prepend`. The legacy per-plan
+> columns were dropped (migrations V21/V22).
+
+The step-detail view exposes three editable prompt scopes (Global / Project
+/ Plan) plus the read-only Step and Appended scopes. They map onto storage:
 
 ```
                 ┌───────────────┐
-Universal       │ config.json   │  prompt_prefix / prompt_suffix
-                └───────────────┘
-Project         project_settings   prompt_prefix / prompt_suffix
+Global          │ config.json   │  config.prompt  (seeded w/ DEFAULT_CONTEXT_PREPEND
+(universal)     └───────────────┘                   at `ralph init`)
                 ┌───────────────┐
-Plan            │ plans row     │  prompt_prefix, prompt_suffix, context_prepend
+Project         │ project_settings │  <project>/.ralph/prompt.md  (file wins)
+                └───────────────┘                   else project_settings.prompt
+                ┌───────────────┐
+Plan            │ plans row     │  description  (rendered into `# Plan: {slug}` once)
                 └───────────────┘
                 ┌───────────────┐
 Step            │ steps row     │  title, description, acceptance_criteria
@@ -595,10 +609,16 @@ Appended        │ execution_log │  retry context (per attempt; read-only)
                 └───────────────┘
 ```
 
-The step detail view does **not** show the composed prompt that gets sent to
-the harness — that's a derived value. If we want a "preview composed prompt"
-mode later, it can be a `:preview` command that diffs source-of-truth into
-the assembled string from `prompt::build_step_prompt`.
+The CLI surface is `ralph prompt show|set|clear --scope <global|project>`
+(`universal` is an alias for `global`); `ralph prompt show --resolved`
+prints the composed global+project lead. `ralph init --restore-prompts`
+re-seeds the global prompt; `ralph doctor` warns (non-fatal) if the global
+prompt is missing the ralph-CLI hints.
+
+The step-detail view does **not** show the composed prompt inline, but
+`l`/`→` on the Step-prompt pane pushes a read-only **rendered-prompt
+preview** sub-view that runs `prompt::build_step_prompt` exactly as the
+harness would receive it, with per-attempt navigation.
 
 ---
 
@@ -752,7 +772,8 @@ A possible ordering for ralph plans built from this doc:
 4. Plan detail view — refactor existing TUI into a view; preserve current
    tests. Include `r` reset, Shift-`J`/`K` move, confirmable `d` delete.
 5. Step detail view — pane navigation only (no editing yet); includes
-   the `context_prepend` pane and the `change_policy` cell.
+   the four prompt-layer panes (Global/Project/Plan/Step) and the
+   `change_policy` cell.
 6. `c` editor handoff for each text pane.
 7. Bottom-row pickers (harness / model / agent / change policy).
 8. NDJSON event-schema additions: `harness_chunk`, `test_chunk`,
@@ -929,6 +950,10 @@ receive every answered question in the appended retry context.
 
 - Migration V16:
   - `ALTER TABLE plans ADD COLUMN questions_enabled INTEGER NOT NULL DEFAULT 0;`
+    (the column DEFAULT is unchanged so pre-existing rows stay opted-out.
+    **Prompt-overhaul update:** `ralph plan create` now writes
+    `questions_enabled = true` for *newly created* plans — the app-level
+    default flipped to on; no migration touched existing rows.)
   - New table:
     ```sql
     CREATE TABLE step_questions (
@@ -1080,8 +1105,8 @@ verbatim — no paraphrasing — so it can pick up where it left off.
 - **Q4 (step delete):** Confirm dialog before deleting steps in the plan-
   detail view. Selection-aware (so deleting 5 selected steps shows one
   dialog with the count, not five dialogs).
-- **Q3 (universal prompt save):** Plain serde round-trip — read
-  `config.json`, mutate `prompt_prefix` / `prompt_suffix`, write back via
+- **Q3 (global prompt save):** Plain serde round-trip — read
+  `config.json`, mutate the single `prompt` field, write back via
   `serde_json::to_string_pretty`. Hand-written comments / custom key
   ordering are not preserved; this is acceptable since `config.json` is
   ralph-generated and editing happens through the TUI surface.
