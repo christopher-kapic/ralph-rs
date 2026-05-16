@@ -4865,4 +4865,195 @@ mod tests {
             pick_next_step(&done, &deps_of, &depths, &full_window(), &HashSet::new()).is_none()
         );
     }
+
+    // -- linear-plan parity regression (docs/dag-redesign.md §1, §3.5
+    //    item 4, §13.1) --
+    //
+    // Phase-1 hard invariant: a plan whose only edges are the V25
+    // linear-chain backfill must execute in EXACTLY today's `sort_key`
+    // order, and any DAG must execute in EXACTLY the documented
+    // `(depth, sort_key, short_id)` order — stable and reproducible
+    // given identical inputs. The §3.5 tests above assert specific
+    // orders against hand-computed expectations; these instead compare
+    // the scheduler's emission against an *independent oracle* (the
+    // steps sorted by the documented key) and prove the emission is a
+    // pure function of the DAG + tie-break tuple, never of the order
+    // the steps happen to arrive in or of how many times the scheduler
+    // is run. That is the precise byte-identical-to-pre-DAG claim.
+
+    /// Apply a fixed, deterministic, fixed-point-free permutation (for
+    /// `n >= 2`) to a step vec: reverse, then rotate left by one. No
+    /// `rand` dependency, so the "reproducible given identical inputs"
+    /// assertions stay deterministic. Used to prove the scheduler's
+    /// emission order does not depend on input-slice position.
+    fn scrambled(steps: &[Step]) -> Vec<Step> {
+        let mut v: Vec<Step> = steps.iter().rev().cloned().collect();
+        v.rotate_left(1);
+        v
+    }
+
+    /// Translate id-keyed `(dependent_id, dependency_id)` pairs into the
+    /// index-edge form `deps_map`/`schedule_order` expect, resolved
+    /// against *this* slice ordering. Lets a test scramble the step vec
+    /// while keeping the same logical DAG.
+    fn edges_for(steps: &[Step], id_pairs: &[(&str, &str)]) -> Vec<(usize, usize)> {
+        let pos = |id: &str| steps.iter().position(|s| s.id == id).unwrap();
+        id_pairs.iter().map(|&(a, b)| (pos(a), pos(b))).collect()
+    }
+
+    /// The documented deterministic emission order (§3.5 item 4): every
+    /// step sorted by `(topological depth, sort_key, short_id)`, using
+    /// the same `compute_step_depths` the scheduler uses. For an
+    /// all-`Pending`, full-window DAG the scheduler emits exactly this
+    /// total order: a dependency always has strictly smaller depth —
+    /// hence a strictly smaller tuple — than its dependents, so the
+    /// global tuple-minimum unexecuted step is always runnable. This is
+    /// the independent oracle, not a re-derivation of the scheduler.
+    fn tie_break_order(steps: &[Step], id_pairs: &[(&str, &str)]) -> Vec<String> {
+        let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        for &(a, b) in id_pairs {
+            deps_of
+                .entry(a.to_string())
+                .or_default()
+                .push(b.to_string());
+        }
+        let depths = compute_step_depths(steps, &deps_of);
+        let mut ranked: Vec<&Step> = steps.iter().collect();
+        ranked.sort_by(|a, b| {
+            depths[&a.id]
+                .cmp(&depths[&b.id])
+                .then_with(|| a.sort_key.cmp(&b.sort_key))
+                .then_with(|| a.short_id.cmp(&b.short_id))
+        });
+        ranked.into_iter().map(|s| s.id.clone()).collect()
+    }
+
+    /// Run the scheduler on the original input order and on several
+    /// fixed permutations of it, repeatedly, asserting every run emits
+    /// `expected`. This is the "stable and reproducible given identical
+    /// inputs" guarantee of §3.5 item 4.
+    fn assert_reproducible(steps: &[Step], id_pairs: &[(&str, &str)], expected: &[String]) {
+        let orderings: Vec<Vec<Step>> = vec![
+            steps.to_vec(),
+            scrambled(steps),
+            scrambled(&scrambled(steps)),
+            steps.iter().rev().cloned().collect(),
+        ];
+        for _ in 0..3 {
+            for ord in &orderings {
+                let mut s = ord.clone();
+                let edges = edges_for(&s, id_pairs);
+                let order = schedule_order(&mut s, &edges, &full_window());
+                assert_eq!(
+                    order, expected,
+                    "scheduler emission must be stable & reproducible \
+                     regardless of input-slice order or run count"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_linear_chain_is_byte_identical_to_sort_key_order() {
+        // V25 backfill: order a plan's steps by `sort_key`, then chain
+        // each onto its sort_key-predecessor. The scheduler must emit
+        // them in EXACTLY `sort_key` order — byte-identical to the
+        // pre-DAG loop, which iterated `list_steps` (`ORDER BY
+        // sort_key`) — no matter what order the rows arrive in.
+        let mut steps = make_steps(5);
+        // sort_keys deliberately NOT in `s{i}`/input order, so the
+        // oracle is a non-trivial permutation and the assertion bites.
+        let keys = ["a30", "a10", "a40", "a00", "a20"];
+        for (s, k) in steps.iter_mut().zip(keys) {
+            s.sort_key = k.to_string();
+        }
+        // Realistic V25: every step carries a distinct minted short_id.
+        for (i, s) in steps.iter_mut().enumerate() {
+            s.short_id = format!("h{i}");
+        }
+
+        // Independent oracle: the steps sorted by `sort_key` — exactly
+        // what `list_steps` yields, hence exactly the pre-DAG order.
+        let mut by_key: Vec<&Step> = steps.iter().collect();
+        by_key.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        let expected: Vec<String> = by_key.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(
+            expected,
+            vec!["s3", "s1", "s4", "s0", "s2"],
+            "sanity: sort_key order is the intended non-trivial permutation"
+        );
+
+        // V25 backfill edges: each step depends on its sort_key
+        // predecessor (the linear chain).
+        let chain: Vec<&str> = expected.iter().map(|s| s.as_str()).collect();
+        let id_pairs: Vec<(&str, &str)> = (1..chain.len())
+            .map(|i| (chain[i], chain[i - 1]))
+            .collect();
+
+        // The chain's topological depth ranking equals its sort_key
+        // ranking, so `(depth, sort_key, short_id)` collapses to
+        // sort_key — i.e. the DAG oracle agrees with the parity oracle.
+        assert_eq!(tie_break_order(&steps, &id_pairs), expected);
+
+        // Emission equals the sort_key oracle, regardless of input
+        // order and repeated runs.
+        assert_reproducible(&steps, &id_pairs, &expected);
+    }
+
+    #[test]
+    fn test_multi_root_dag_order_is_oracle_stable() {
+        //   s0 ──► s2 ─┐
+        //   s1 ──► s3 ─┴► s4
+        // sort_keys interleave the two roots / two mids so the
+        // expected order is not the `s{i}` order — proving the
+        // `(depth, sort_key, …)` ranking, not authored index, decides.
+        let mut steps = make_steps(5);
+        let keys = ["a50", "a10", "a40", "a20", "a99"];
+        for (s, k) in steps.iter_mut().zip(keys) {
+            s.sort_key = k.to_string();
+        }
+        for (i, s) in steps.iter_mut().enumerate() {
+            s.short_id = format!("k{i}");
+        }
+        let id_pairs = [("s2", "s0"), ("s3", "s1"), ("s4", "s2"), ("s4", "s3")];
+
+        let expected = tie_break_order(&steps, &id_pairs);
+        // depth0 {s1@a10, s0@a50} → s1,s0 ; depth1 {s3@a20, s2@a40} →
+        // s3,s2 ; depth2 s4.
+        assert_eq!(
+            expected,
+            vec!["s1", "s0", "s3", "s2", "s4"],
+            "multi-root order is determined by (depth, sort_key)"
+        );
+        assert_reproducible(&steps, &id_pairs, &expected);
+    }
+
+    #[test]
+    fn test_diamond_dag_short_id_is_stable_final_discriminator() {
+        // s0 ─┬► s1 ─┐
+        //     └► s2 ─┴► s3
+        // s1 and s2 share a sort_key (same depth too): the
+        // tie-break must fall through to `short_id` and stay stable
+        // and reproducible across runs and input orderings.
+        let mut steps = make_steps(4);
+        let keys = ["a05", "a10", "a10", "a90"]; // s1 / s2 sort_key tie
+        for (s, k) in steps.iter_mut().zip(keys) {
+            s.sort_key = k.to_string();
+        }
+        let short_ids = ["m0", "zzz", "aaa", "m3"];
+        for (s, sid) in steps.iter_mut().zip(short_ids) {
+            s.short_id = sid.to_string();
+        }
+        let id_pairs = [("s1", "s0"), ("s2", "s0"), ("s3", "s1"), ("s3", "s2")];
+
+        let expected = tie_break_order(&steps, &id_pairs);
+        // depth1 tie on sort_key "a10" broken by short_id: "aaa"(s2) <
+        // "zzz"(s1) ⇒ s2 before s1.
+        assert_eq!(
+            expected,
+            vec!["s0", "s2", "s1", "s3"],
+            "short_id is the stable final discriminator under a sort_key tie"
+        );
+        assert_reproducible(&steps, &id_pairs, &expected);
+    }
 }
