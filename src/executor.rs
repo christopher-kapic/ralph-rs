@@ -4479,14 +4479,28 @@ mod tests {
     /// park strategy. Returns `(dir, conn, step_id)` for per-strategy
     /// assertions.
     ///
+    /// The skip trigger runs on a dedicated **OS thread** (`std::thread::spawn`
+    /// with blocking `std::thread::sleep`), NOT a `tokio::spawn` co-located
+    /// with `execute_step` on the test's `current_thread` runtime. Under heavy
+    /// parallel `cargo test` load a single cooperative scheduler can starve a
+    /// co-located skip future's timed poll loop long enough that
+    /// `execute_step`'s 15s timeout fires first (`WaitResult::Timeout` instead
+    /// of `Skipped` → rare spurious failure that always passes in isolation).
+    /// A real thread is OS-preempted regardless of runtime load, so the
+    /// readiness gate and skip request are immune to that starvation. This is
+    /// a test-runtime artifact only: production runs the signal listener on a
+    /// dedicated thread of a multi-threaded runtime.
+    ///
     /// Holds `EXIT_CLEANUP_TEST_LOCK` across the `.await`s on purpose:
     /// `install_and_spawn` registers a process-global cancel TX and
     /// `request_skip_in_flight` mutates the global in-flight flag + park-kind
     /// slot, so this must be serialized against the other signal-registry
-    /// tests. Each caller runs on a `current_thread` runtime, ruling out
-    /// cross-thread guard transfer (same rationale as the signal-module
-    /// tests). The guard is returned to the caller so it stays alive until
-    /// the test (and its per-strategy assertions) finishes.
+    /// tests. The non-`Send` `registry_guard` is acquired on, used by, and
+    /// returned from the test's own runtime thread — only the skip *trigger*
+    /// moves to the OS thread, so the guard never transfers across threads and
+    /// switching to a `multi_thread` flavor (which would risk exactly that)
+    /// stays unnecessary. The guard is returned to the caller so it stays
+    /// alive until the test (and its per-strategy assertions) finishes.
     #[cfg(unix)]
     #[allow(clippy::await_holding_lock)]
     async fn run_inflight_skip_with_changes(
@@ -4587,15 +4601,27 @@ mod tests {
 
         let pid_path_clone = pid_path.clone();
         let dir_clone = dir.clone();
-        let skip_task = tokio::spawn(async move {
+        // Drive the skip trigger on a REAL OS thread with BLOCKING sleeps,
+        // not a `tokio::spawn` on `execute_step`'s `current_thread` runtime.
+        // Rationale: `execute_step` and a co-located skip future share one
+        // cooperative scheduler, so under heavy parallel `cargo test` load
+        // the runtime can starve the skip future's `tokio::time::sleep` poll
+        // loop long enough that `execute_step`'s 15s `tokio::time::timeout`
+        // fires first → `WaitResult::Timeout` instead of `Skipped` → a rare
+        // spurious failure (always passes in isolation). A dedicated thread
+        // with `std::thread::sleep` is preempted by the OS regardless of
+        // runtime load, so the readiness gate and skip request are immune to
+        // single-runtime starvation. We deliberately do NOT switch the test
+        // to the `multi_thread` flavor: the non-`Send` `EXIT_CLEANUP_TEST_LOCK`
+        // `registry_guard` must not transfer across threads, and it stays
+        // acquired on (and returned from) the test's own runtime thread —
+        // only the skip trigger moves off it, so that invariant is preserved.
+        let skip_thread = std::thread::spawn(move || {
             // Wait for the harness to have ACTUALLY dirtied the worktree, not
             // merely for it to have written its pid. The pid file alone is a
-            // racy proxy: this future and `execute_step` share one
-            // `current_thread` runtime, so a heavily-loaded box can starve
-            // this task's timed sleeps and let it fire the skip before the
-            // harness's edits land — leaving the tree clean, `park_relevant`
-            // false, and the discard path's `rolled_back=true` never
-            // recorded. Gating on a genuinely dirty tree removes that race.
+            // racy proxy: gating on a genuinely dirty tree ensures the skip
+            // lands with real work present (so `park_relevant` is true and
+            // the discard path's `rolled_back=true` is actually recorded).
             // The bound is generous (≈30s of attempts) because the only
             // failure mode worth surfacing is the harness never running at
             // all, which the outer 15s `execute_step` timeout already covers.
@@ -4611,14 +4637,17 @@ mod tests {
                     dirtied = true;
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                std::thread::sleep(Duration::from_millis(50));
             }
             assert!(
                 dirtied,
                 "harness never dirtied the worktree before skip — test setup race"
             );
             // Mark a step in-flight and request the skip exactly like
-            // runner::skip_step's in-flight branch.
+            // runner::skip_step's in-flight branch. Both calls are synchronous
+            // and operate on process-global atomics/mutexes, so running them
+            // on this OS thread is behaviorally identical to the prior
+            // `tokio::spawn` — just immune to cooperative starvation.
             let _g = crate::signal::StepInFlightGuard::enter();
             assert!(
                 crate::signal::request_skip_in_flight(kind),
@@ -4643,7 +4672,13 @@ mod tests {
         .expect("execute_step did not return within 15s on skip")
         .unwrap();
 
-        skip_task.await.ok();
+        // Join the OS-thread skip trigger. `.join()` returns `Err` if the
+        // thread panicked; resume-unwind so the in-thread `dirtied` /
+        // `request_skip_in_flight` assertions still fail the test loudly
+        // (they previously surfaced via the tokio `JoinError` path).
+        if let Err(panic) = skip_thread.join() {
+            std::panic::resume_unwind(panic);
+        }
 
         assert_eq!(
             result.outcome,

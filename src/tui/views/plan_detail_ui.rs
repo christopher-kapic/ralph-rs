@@ -334,12 +334,23 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
                 // way 0.0 does (the formatter clamps non-positive to "0s").
                 let dur = crate::output::format_duration_secs(log.duration_secs.unwrap_or(0.0));
                 let outcome = attempt_outcome_label(log);
+                // Color the `(<outcome>)` segment with the same theme status
+                // palette the `Status:` line uses (see `attempt_outcome_color`):
+                // success → STATUS_COMPLETE, user_skipped → CHROME_DIM, every
+                // other failure → STATUS_FAILED. The `Attempt N:` label stays
+                // bold and the duration stays uncolored, and the rendered text
+                // is byte-identical to before (color spans only) so the
+                // string-content snapshot tests still pass.
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("Attempt {}: ", log.attempt),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(format!("{dur} ({outcome})")),
+                    Span::raw(format!("{dur} ")),
+                    Span::styled(
+                        format!("({outcome})"),
+                        Style::default().fg(attempt_outcome_color(log)),
+                    ),
                 ]));
             }
         }
@@ -479,6 +490,23 @@ fn attempt_outcome_label(log: &crate::plan::ExecutionLog) -> String {
         Some(TerminationReason::Success) => "success".to_string(),
         Some(TerminationReason::Unknown) | None => "failed".to_string(),
         Some(reason) => format!("failed: {}", reason.as_str()),
+    }
+}
+
+/// Theme color for one attempt's `(<outcome>)` segment, reusing the exact
+/// `theme::STATUS_*` palette the `Status:` line already maps onto:
+/// a successful attempt is the completed/success green
+/// ([`theme::STATUS_COMPLETE`]), a `user_skipped` attempt is the same dim
+/// the `Status: skipped` line uses ([`theme::CHROME_DIM`]), and every other
+/// failure/timeout/no_changes/harness_failed/unknown attempt is the failed
+/// red ([`theme::STATUS_FAILED`]) — same as `Status: failed`. No new colors
+/// or mapping concepts are introduced.
+fn attempt_outcome_color(log: &crate::plan::ExecutionLog) -> Color {
+    use crate::plan::TerminationReason;
+    match log.termination_reason {
+        Some(TerminationReason::Success) => theme::STATUS_COMPLETE,
+        Some(TerminationReason::UserSkipped) => theme::CHROME_DIM,
+        _ => theme::STATUS_FAILED,
     }
 }
 
