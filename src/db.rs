@@ -839,30 +839,20 @@ fn migrate_v25(conn: &Connection) -> Result<()> {
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
-        let mut assigned: Vec<String> = Vec::with_capacity(step_ids.len());
         let mut prev_step_id: Option<&str> = None;
         for step_id in &step_ids {
-            // Mint a plan-unique 8-char short_id. UUID v4's hex form gives
-            // ~16^8 candidates; the in-loop collision check keeps it
-            // unique within the plan even though a clash is astronomically
-            // unlikely. (Step #2 of the redesign promotes this to a shared
-            // minting helper; the migration generates inline.)
-            let short_id = loop {
-                let candidate: String = uuid::Uuid::new_v4()
-                    .simple()
-                    .to_string()
-                    .chars()
-                    .take(8)
-                    .collect();
-                if !assigned.iter().any(|a| a == &candidate) {
-                    break candidate;
-                }
-            };
+            // Mint via the one shared helper so migration-backfill and
+            // runtime step creation are byte-for-byte the same logic
+            // (docs/dag-redesign.md §13.3 requires import-backfill and
+            // migration-backfill to produce the same DAG). The helper's
+            // collision check reads prior same-loop UPDATEs on this
+            // connection (SQLite read-your-own-writes), so ids stay
+            // plan-unique without a local "already assigned" set.
+            let short_id = crate::storage::mint_short_id(conn, &plan_id)?;
             conn.execute(
                 "UPDATE steps SET short_id = ?1 WHERE id = ?2",
                 rusqlite::params![short_id, step_id],
             )?;
-            assigned.push(short_id);
 
             if let Some(prev) = prev_step_id {
                 conn.execute(

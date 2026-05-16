@@ -1090,6 +1090,59 @@ pub fn delete_project_prompt_file(project: &str) -> Result<()> {
 // Step operations
 // ---------------------------------------------------------------------------
 
+/// Length of a step `short_id` (docs/dag-redesign.md §3): the stable,
+/// plan-unique handle that replaces the positional step number as the
+/// user-facing selector once a plan is a dependency DAG.
+const SHORT_ID_LEN: usize = 8;
+
+/// The base-62 alphabet (`0-9A-Za-z`) `short_id`s draw from — the same
+/// alphabet `frac_index` uses for sort keys.
+const SHORT_ID_ALPHABET: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// Generate one random 8-char base-62 candidate `short_id`.
+///
+/// UUID v4 supplies 122 bits of entropy; we consume it as a `u128` and peel
+/// off [`SHORT_ID_LEN`] base-62 digits. 62^8 ≈ 2.18e14 keeps single-plan
+/// collisions astronomically rare; [`mint_short_id`] still re-rolls on the
+/// off chance, so the (negligible) modulo bias here is irrelevant.
+fn random_short_id() -> String {
+    let mut n = Uuid::new_v4().as_u128();
+    let mut buf = [0u8; SHORT_ID_LEN];
+    for slot in buf.iter_mut() {
+        *slot = SHORT_ID_ALPHABET[(n % 62) as usize];
+        n /= 62;
+    }
+    // Invariant: every byte came from SHORT_ID_ALPHABET (ASCII).
+    String::from_utf8(buf.to_vec()).expect("base-62 alphabet is valid ASCII")
+}
+
+/// Mint a plan-unique 8-char base-62 `short_id`, re-rolling on collision
+/// against existing `steps.short_id` rows for `plan_id`.
+///
+/// The V25 unique index `idx_steps_short_id` (`(plan_id, short_id)`)
+/// enforces uniqueness at the DB layer; checking here avoids the
+/// round-trip insert failure. This is the **single** source of minting
+/// logic: the V25 migration backfill and runtime step creation both call
+/// it, so migration-backfill and import-backfill produce the same DAG for
+/// the same linear input (docs/dag-redesign.md §13.3). The collision check
+/// observes prior same-transaction writes (SQLite read-your-own-writes), so
+/// callers that mint-then-write in a loop on one connection stay unique
+/// without a local "already assigned" set.
+pub fn mint_short_id(conn: &Connection, plan_id: &str) -> Result<String> {
+    loop {
+        let candidate = random_short_id();
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM steps WHERE plan_id = ?1 AND short_id = ?2)",
+            params![plan_id, candidate],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(candidate);
+        }
+    }
+}
+
 /// Create a new step appended at the end of the plan's step list.
 ///
 /// Automatically generates a sort_key after the last existing step.
@@ -2363,6 +2416,48 @@ mod tests {
 
     fn setup() -> Connection {
         db::open_memory().expect("open_memory")
+    }
+
+    // -- short_id minting --
+
+    #[test]
+    fn test_mint_short_id_unique_length_charset() {
+        let conn = setup();
+        let plan = create_plan(&conn, "mint", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        // Mint a short_id per step, persisting each so the next mint's
+        // collision check (against steps.short_id) actually observes prior
+        // assignments — exactly the V25-migration usage pattern.
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..256 {
+            let (step, _) = create_step(
+                &conn,
+                &plan.id,
+                &format!("Step {i}"),
+                "d",
+                None,
+                None,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let sid = mint_short_id(&conn, &plan.id).expect("mint_short_id");
+            assert_eq!(sid.chars().count(), 8, "short_id must be 8 chars: {sid:?}");
+            assert!(
+                sid.bytes().all(|b| SHORT_ID_ALPHABET.contains(&b)),
+                "short_id must be base-62 ([0-9A-Za-z]): {sid:?}"
+            );
+            assert!(seen.insert(sid.clone()), "duplicate short_id minted: {sid}");
+            conn.execute(
+                "UPDATE steps SET short_id = ?1 WHERE id = ?2",
+                params![sid, step.id],
+            )
+            .unwrap();
+        }
+        assert_eq!(seen.len(), 256, "every minted short_id must be unique");
     }
 
     // -- Plan tests --
