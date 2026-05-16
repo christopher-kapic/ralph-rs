@@ -106,6 +106,7 @@ fn main() -> Result<()> {
                 branch,
                 harness,
                 agent,
+                retry_strategy,
                 tests,
                 depends_on,
             } => {
@@ -121,6 +122,7 @@ fn main() -> Result<()> {
                     branch.as_deref(),
                     h,
                     agent.as_deref(),
+                    retry_strategy,
                     &tests,
                     &depends_on,
                     &out,
@@ -238,6 +240,7 @@ fn main() -> Result<()> {
                 criteria,
                 max_retries,
                 change_policy,
+                retry_strategy,
                 tags,
                 import_json,
             } => {
@@ -276,6 +279,7 @@ fn main() -> Result<()> {
                         &criteria,
                         max_retries,
                         change_policy,
+                        retry_strategy,
                         &tags,
                         &out,
                     )
@@ -312,6 +316,8 @@ fn main() -> Result<()> {
                 max_retries,
                 clear_max_retries,
                 change_policy,
+                retry_strategy,
+                clear_retry_strategy,
                 tags,
                 clear_tags,
             } => {
@@ -332,6 +338,8 @@ fn main() -> Result<()> {
                     max_retries,
                     clear_max_retries,
                     change_policy,
+                    retry_strategy,
+                    clear_retry_strategy,
                     &tags,
                     clear_tags,
                     &out,
@@ -675,17 +683,12 @@ fn main() -> Result<()> {
         Command::Prompt(subcmd) => {
             let config_path = config::config_dir()?.join("config.json");
             match subcmd {
-                PromptCommand::Show { scope, resolved } => commands::cmd_prompt_show(
-                    &conn, &config, &project, scope, resolved, &out,
-                ),
-                PromptCommand::Set { scope, content } => commands::cmd_prompt_set(
-                    &conn,
-                    &config_path,
-                    &project,
-                    scope,
-                    &content,
-                    &out,
-                ),
+                PromptCommand::Show { scope, resolved } => {
+                    commands::cmd_prompt_show(&conn, &config, &project, scope, resolved, &out)
+                }
+                PromptCommand::Set { scope, content } => {
+                    commands::cmd_prompt_set(&conn, &config_path, &project, scope, &content, &out)
+                }
                 PromptCommand::Clear { scope } => {
                     commands::cmd_prompt_clear(&conn, &config_path, &project, scope, &out)
                 }

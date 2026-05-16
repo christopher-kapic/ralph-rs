@@ -82,6 +82,12 @@ pub struct ImportedPlanMeta {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub plan_harness: Option<String>,
+    /// Optional plan-level retry-strategy override. Missing/absent field
+    /// deserializes to `None` via serde(default) (no override — steps fall
+    /// through to the global `keep` default), preserving backward
+    /// compatibility with plan JSON written before V24.
+    #[serde(default)]
+    pub retry_strategy: Option<crate::plan::RetryStrategy>,
 }
 
 /// Step from the portable JSON.
@@ -107,6 +113,12 @@ pub struct ImportedStep {
     /// with plan JSON written before V13.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Optional step-level retry-strategy override. Missing/absent field
+    /// deserializes to `None` via serde(default) (inherit plan/global),
+    /// preserving backward compatibility with plan JSON written before
+    /// V24.
+    #[serde(default)]
+    pub retry_strategy: Option<crate::plan::RetryStrategy>,
 }
 
 // ---------------------------------------------------------------------------
@@ -196,13 +208,20 @@ fn import_plan_inner(
         storage::set_plan_harness_gen(conn, &plan.id, data.plan.plan_harness.as_deref())?;
     }
 
+    // Restore the plan-level retry-strategy override only when the import
+    // carried one. `None` is the column default, so skipping the write
+    // keeps an unset plan unset (round-trip: None stays None).
+    if let Some(rs) = data.plan.retry_strategy {
+        storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
+    }
+
     for step_data in &data.steps {
         let tags_arg: Option<&[String]> = if step_data.tags.is_empty() {
             None
         } else {
             Some(&step_data.tags)
         };
-        storage::create_step(
+        let (step, _pos) = storage::create_step(
             conn,
             &plan.id,
             &step_data.title,
@@ -215,6 +234,11 @@ fn import_plan_inner(
             Some(step_data.change_policy),
             tags_arg,
         )?;
+        // Same rule for the step-level override: write only when present
+        // so an unset imported step stays unset (round-trip preserved).
+        if let Some(rs) = step_data.retry_strategy {
+            storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
+        }
     }
 
     for dep_slug in &data.plan.depends_on {
@@ -1257,5 +1281,147 @@ mod tests {
             steps[0].tags,
             vec!["FIX".to_string(), "REGRESSION".to_string()]
         );
+    }
+
+    /// Round-trip `retry_strategy` through export -> JSON -> import for all
+    /// three states: plan-set, step-set, and unset. The value (including
+    /// `None`) must survive the round-trip unchanged (Step 23).
+    #[test]
+    fn test_roundtrip_preserves_retry_strategy_all_states() {
+        use crate::plan::RetryStrategy;
+        let conn = setup();
+
+        let original = storage::create_plan(
+            &conn,
+            "rs-plan",
+            "/tmp/src",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        // Plan-level override = rollback.
+        storage::set_plan_retry_strategy(&conn, &original.id, Some(RetryStrategy::Rollback))
+            .unwrap();
+
+        // step 1: explicit step-level keep override.
+        let (s1, _) = storage::create_step(
+            &conn,
+            &original.id,
+            "explicit",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::set_step_retry_strategy(&conn, &s1.id, Some(RetryStrategy::Keep)).unwrap();
+        // step 2: no step-level override (unset -> None).
+        storage::create_step(
+            &conn,
+            &original.id,
+            "inherits",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Re-fetch so the in-memory Plan reflects the post-create
+        // set_plan_retry_strategy write (the original handle is stale).
+        let original = storage::get_plan_by_id(&conn, &original.id).unwrap();
+        let steps = storage::list_steps(&conn, &original.id).unwrap();
+        let exported = export::build_exported_plan(&original, &steps, Vec::new());
+        let json = serde_json::to_string_pretty(&exported).unwrap();
+
+        // Plan override + the explicit step override are present; the unset
+        // step omits the field entirely (skip_serializing_if).
+        assert!(json.contains("\"retry_strategy\": \"rollback\""));
+        assert!(json.contains("\"retry_strategy\": \"keep\""));
+
+        // Import into a fresh project and verify all three states survived.
+        let imported_data: ImportedPlan = serde_json::from_str(&json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: false,
+        };
+        let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
+        let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
+        let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
+
+        assert_eq!(imported_plan.retry_strategy, Some(RetryStrategy::Rollback));
+        assert_eq!(imported_steps[0].retry_strategy, Some(RetryStrategy::Keep));
+        assert!(
+            imported_steps[1].retry_strategy.is_none(),
+            "unset step-level override must round-trip as None"
+        );
+    }
+
+    /// An unset plan-level override exports without the `retry_strategy`
+    /// key at all (pre-V24 JSON shape preserved) and re-imports as `None`.
+    #[test]
+    fn test_roundtrip_unset_plan_retry_strategy_omitted_and_none() {
+        let conn = setup();
+        let original = storage::create_plan(
+            &conn,
+            "no-rs",
+            "/tmp/src",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::create_step(
+            &conn,
+            &original.id,
+            "s",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let steps = storage::list_steps(&conn, &original.id).unwrap();
+        let exported = export::build_exported_plan(&original, &steps, Vec::new());
+        let json = serde_json::to_string_pretty(&exported).unwrap();
+        assert!(
+            !json.contains("retry_strategy"),
+            "an all-unset plan must not emit retry_strategy at all; got:\n{json}"
+        );
+
+        let imported_data: ImportedPlan = serde_json::from_str(&json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: false,
+        };
+        let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
+        let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
+        let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
+        assert!(imported_plan.retry_strategy.is_none());
+        assert!(imported_steps[0].retry_strategy.is_none());
     }
 }

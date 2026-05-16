@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::frac_index;
 use crate::plan::{
-    AnsweredQuestion, ChangePolicy, ExecutionLog, PLAN_COLUMNS, Phase, Plan, PlanStatus, Step,
-    StepStatus,
+    AnsweredQuestion, ChangePolicy, ExecutionLog, PLAN_COLUMNS, Phase, Plan, PlanStatus,
+    RetryStrategy, Step, StepStatus,
 };
 use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 
@@ -802,14 +802,34 @@ pub fn set_plan_harness_gen(conn: &Connection, plan_id: &str, harness: Option<&s
     Ok(())
 }
 
+/// Set (or clear) the plan-level retry-strategy override and bump
+/// `updated_at`.
+///
+/// `Some(strategy)` records a plan-wide default; `None` writes SQL NULL,
+/// meaning "no plan-level override" — resolution then falls through to the
+/// global default ([`RetryStrategy::Keep`]) unless a step overrides it.
+/// Kept as a dedicated setter (rather than threaded through `create_plan`)
+/// to mirror [`set_plan_harness_gen`] and avoid churning every existing
+/// `create_plan` callsite.
+pub fn set_plan_retry_strategy(
+    conn: &Connection,
+    plan_id: &str,
+    strategy: Option<RetryStrategy>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET retry_strategy = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![strategy.map(|s| s.as_str()), plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
 /// Update a plan's description and bump `updated_at`. The plan description
 /// IS the Plan layer of the four-layer prompt model, so this is the write
 /// path behind the step-detail "Plan prompt" pane editor.
-pub fn update_plan_description(
-    conn: &Connection,
-    plan_id: &str,
-    description: &str,
-) -> Result<()> {
+pub fn update_plan_description(conn: &Connection, plan_id: &str, description: &str) -> Result<()> {
     let affected = conn.execute(
         "UPDATE plans SET description = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
         params![description, plan_id],
@@ -956,11 +976,7 @@ pub fn get_project_settings(conn: &Connection, project: &str) -> Result<ProjectS
 /// the column. This writes the DB unconditionally — callers that want
 /// file-aware routing should consult [`resolve_project_prompt`] first (see
 /// `commands::prompt`).
-pub fn set_project_prompt(
-    conn: &Connection,
-    project: &str,
-    prompt: Option<&str>,
-) -> Result<()> {
+pub fn set_project_prompt(conn: &Connection, project: &str, prompt: Option<&str>) -> Result<()> {
     conn.execute(
         "INSERT INTO project_settings (project, prompt)
          VALUES (?1, ?2)
@@ -1311,6 +1327,31 @@ pub fn update_step_fields_ext(
     Ok(())
 }
 
+/// Set (or clear) the step-level retry-strategy override and bump
+/// `updated_at`.
+///
+/// `Some(strategy)` records a per-step override; `None` writes SQL NULL,
+/// meaning "no step-level override" — resolution falls through to the
+/// plan's value and then the global default ([`RetryStrategy::Keep`]).
+/// Kept as a dedicated setter (rather than a new field on
+/// [`update_step_fields_ext`]) so the ~100 `create_step` callsites and the
+/// existing `update_step_fields_ext` callers stay untouched, mirroring how
+/// `plan_harness` is set via [`set_plan_harness_gen`] after `create_plan`.
+pub fn set_step_retry_strategy(
+    conn: &Connection,
+    step_id: &str,
+    strategy: Option<RetryStrategy>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE steps SET retry_strategy = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![strategy.map(|s| s.as_str()), step_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
 /// Reset a step's status to pending and zero out attempts.
 ///
 /// Also deletes the step's `execution_logs` rows — otherwise the zeroed
@@ -1431,11 +1472,8 @@ pub fn create_execution_log(
 /// row behind and consumes no retry budget. Idempotent — deleting a missing
 /// id is a no-op.
 pub fn delete_execution_log(conn: &Connection, log_id: i64) -> Result<()> {
-    conn.execute(
-        "DELETE FROM execution_logs WHERE id = ?1",
-        params![log_id],
-    )
-    .with_context(|| format!("Failed to delete execution log {log_id}"))?;
+    conn.execute("DELETE FROM execution_logs WHERE id = ?1", params![log_id])
+        .with_context(|| format!("Failed to delete execution log {log_id}"))?;
     Ok(())
 }
 
@@ -2677,7 +2715,10 @@ mod tests {
         let peeked = peek_skip_request(&conn, &plan.id).unwrap();
         assert_eq!(
             peeked,
-            Some(("step-uuid-1".to_string(), crate::git::ParkStrategyKind::Commit))
+            Some((
+                "step-uuid-1".to_string(),
+                crate::git::ParkStrategyKind::Commit
+            ))
         );
         // Peek must NOT clear.
         assert!(peek_skip_request(&conn, &plan.id).unwrap().is_some());
@@ -2686,7 +2727,10 @@ mod tests {
         let taken = take_skip_request(&conn, &plan.id).unwrap();
         assert_eq!(
             taken,
-            Some(("step-uuid-1".to_string(), crate::git::ParkStrategyKind::Commit))
+            Some((
+                "step-uuid-1".to_string(),
+                crate::git::ParkStrategyKind::Commit
+            ))
         );
         assert!(
             take_skip_request(&conn, &plan.id).unwrap().is_none(),
@@ -2751,9 +2795,13 @@ mod tests {
     #[test]
     fn test_request_skip_missing_plan_errs() {
         let conn = setup();
-        let err =
-            request_skip(&conn, "no-such-id", "step", crate::git::ParkStrategyKind::Stash)
-                .unwrap_err();
+        let err = request_skip(
+            &conn,
+            "no-such-id",
+            "step",
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("Plan not found"));
     }
 
@@ -5168,7 +5216,10 @@ mod tests {
         assert!(matches!(source, ProjectPromptSource::File(_)));
         // The central assembly read also returns the file content.
         assert_eq!(
-            get_project_settings(&conn, &project).unwrap().prompt.as_deref(),
+            get_project_settings(&conn, &project)
+                .unwrap()
+                .prompt
+                .as_deref(),
             Some("from file")
         );
     }
@@ -5256,7 +5307,10 @@ mod tests {
         assert_eq!(source, ProjectPromptSource::Db);
         // The central assembly read also degrades gracefully.
         assert_eq!(
-            get_project_settings(&conn, &project).unwrap().prompt.as_deref(),
+            get_project_settings(&conn, &project)
+                .unwrap()
+                .prompt
+                .as_deref(),
             Some("db survives")
         );
     }
@@ -5272,7 +5326,10 @@ mod tests {
         write_project_prompt_file(&project, "file wins on resolve").unwrap();
 
         assert_eq!(
-            get_project_settings_db(&conn, &project).unwrap().prompt.as_deref(),
+            get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt
+                .as_deref(),
             Some("db only")
         );
     }

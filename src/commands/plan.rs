@@ -5,7 +5,7 @@ use rusqlite::Connection;
 
 use crate::hook_library::{self, Lifecycle};
 use crate::output::{self, OutputContext, OutputFormat};
-use crate::plan::PlanStatus;
+use crate::plan::{PlanStatus, RetryStrategy};
 use crate::storage;
 
 // ---------------------------------------------------------------------------
@@ -21,6 +21,7 @@ pub fn plan_create(
     branch: Option<&str>,
     harness: Option<&str>,
     agent: Option<&str>,
+    retry_strategy: Option<RetryStrategy>,
     tests: &[String],
     depends_on: &[String],
     out: &OutputContext,
@@ -48,6 +49,14 @@ pub fn plan_create(
         agent,
         tests,
     )?;
+
+    // Persist a plan-level retry-strategy override when the user supplied
+    // one. `None` is the column default (no override) so we skip the write
+    // entirely in that case, mirroring how `plan_harness` is only set when
+    // present.
+    if let Some(rs) = retry_strategy {
+        storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
+    }
 
     // Attach each resolved dependency. Self-references and cycles are
     // rejected by the storage layer (the new plan has no deps yet, so a
@@ -287,6 +296,10 @@ pub fn plan_show(conn: &Connection, slug: &str, project: &str, out: &OutputConte
     }
     if let Some(ref a) = plan.agent {
         println!("  Agent:       {a}");
+    }
+    match plan.retry_strategy {
+        Some(rs) => println!("  Retry strategy: {rs}"),
+        None => println!("  Retry strategy: <unset — default keep>"),
     }
     if !plan.deterministic_tests.is_empty() {
         println!("  Tests:");

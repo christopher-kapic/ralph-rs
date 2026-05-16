@@ -5,7 +5,7 @@ use clap_complete::Shell;
 use std::path::PathBuf;
 
 use crate::hook_library::Lifecycle;
-use crate::plan::{ChangePolicy, PlanStatus};
+use crate::plan::{ChangePolicy, PlanStatus, RetryStrategy};
 
 /// Authoring tip surfaced via `--help` on plan/step creation commands and
 /// the top-level binary, so plan authors learn ralph's commit-ownership
@@ -428,6 +428,19 @@ pub enum PlanCommand {
         #[arg(long)]
         agent: Option<String>,
 
+        /// Plan-level default retry strategy for failed step attempts.
+        /// Effective value is resolved step > plan > default `keep`:
+        /// a step's own `--retry-strategy` wins, then this plan-level
+        /// default, then the built-in default (`keep`). `keep` = a failed
+        /// attempt leaves the working tree as-is so the next attempt
+        /// builds on it directly; `rollback` = a failed attempt rolls the
+        /// working tree back and feeds the prior diff into the next
+        /// attempt's prompt instead. Omit to leave the plan with no
+        /// override (steps then fall through to the global `keep`
+        /// default).
+        #[arg(long, value_name = "STRATEGY")]
+        retry_strategy: Option<RetryStrategy>,
+
         /// Deterministic test command(s) to validate each step.
         #[arg(long = "test")]
         tests: Vec<String>,
@@ -645,9 +658,21 @@ pub enum StepCommand {
         /// fails when the harness exits with an empty diff — appropriate for
         /// implementation steps. `optional` allows a clean harness exit with
         /// no diff — appropriate for review, audit, or check steps where the
-        /// prompt directs the harness not to modify code.
+        /// prompt directs the harness not to modify code. Omit to leave the
+        /// step at the default (`required`).
         #[arg(long, value_name = "POLICY", conflicts_with = "import_json")]
         change_policy: Option<ChangePolicy>,
+
+        /// Step-level retry strategy for failed attempts. Effective value
+        /// is resolved step > plan > default `keep`: this step-level
+        /// override wins, then the plan's `--retry-strategy`, then the
+        /// built-in default (`keep`). `keep` = a failed attempt leaves the
+        /// working tree as-is so the next attempt builds on it directly;
+        /// `rollback` = a failed attempt rolls the working tree back and
+        /// feeds the prior diff into the next attempt's prompt instead.
+        /// Omit to inherit the plan/global value.
+        #[arg(long, value_name = "STRATEGY", conflicts_with = "import_json")]
+        retry_strategy: Option<RetryStrategy>,
 
         /// Attach a free-form tag to the new step (repeatable). Tags are
         /// user-defined labels for filtering with `ralph step list --tag`;
@@ -742,10 +767,32 @@ pub enum StepCommand {
         #[arg(long)]
         clear_max_retries: bool,
 
-        /// Update the step's change policy (`required` or `optional`). Omit
-        /// to leave the existing policy unchanged.
+        /// Update the step's change policy. `required` fails the step when
+        /// the harness exits with an empty diff; `optional` allows a clean
+        /// no-diff exit (for review/audit/check steps). Omit to leave the
+        /// existing policy unchanged. `change_policy` is NOT NULL, so there
+        /// is no clear form — you always substitute one valid policy for
+        /// another.
         #[arg(long, value_name = "POLICY")]
         change_policy: Option<ChangePolicy>,
+
+        /// Update the step-level retry strategy. Effective value is
+        /// resolved step > plan > default `keep`: this step-level override
+        /// wins, then the plan's `--retry-strategy`, then the built-in
+        /// default (`keep`). `keep` = a failed attempt leaves the working
+        /// tree as-is so the next attempt builds on it directly;
+        /// `rollback` = a failed attempt rolls the working tree back and
+        /// feeds the prior diff into the next attempt's prompt instead.
+        /// Omit to leave the existing override unchanged; use
+        /// `--clear-retry-strategy` to revert to plan/global inheritance.
+        #[arg(long, value_name = "STRATEGY")]
+        retry_strategy: Option<RetryStrategy>,
+
+        /// Explicitly clear the step-level retry-strategy override (sets to
+        /// NULL so the step inherits the plan/global default). Mirrors
+        /// `--clear-max-retries`; conflicts with `--retry-strategy`.
+        #[arg(long, conflicts_with = "retry_strategy")]
+        clear_retry_strategy: bool,
 
         /// Replace the step's tag list with these values (repeatable). Omit
         /// to leave existing tags unchanged; pass at least once to overwrite.
@@ -2053,6 +2100,150 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_plan_create_retry_strategy() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "create",
+            "my-plan",
+            "--retry-strategy",
+            "rollback",
+        ])
+        .unwrap();
+        if let Command::Plan(PlanCommand::Create { retry_strategy, .. }) = cli.command.unwrap() {
+            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Rollback));
+        } else {
+            panic!("Expected Plan Create");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_create_retry_strategy_default_none() {
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "create", "my-plan"]).unwrap();
+        if let Command::Plan(PlanCommand::Create { retry_strategy, .. }) = cli.command.unwrap() {
+            assert!(retry_strategy.is_none());
+        } else {
+            panic!("Expected Plan Create");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_retry_strategy() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "Implement",
+            "--retry-strategy",
+            "keep",
+        ])
+        .unwrap();
+        if let Command::Step(StepCommand::Add { retry_strategy, .. }) = cli.command.unwrap() {
+            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Keep));
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_retry_strategy_invalid_rejected() {
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "Implement",
+            "--retry-strategy",
+            "discard",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_step_edit_retry_strategy() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "edit",
+            "1",
+            "--retry-strategy",
+            "rollback",
+        ])
+        .unwrap();
+        if let Command::Step(StepCommand::Edit {
+            retry_strategy,
+            clear_retry_strategy,
+            ..
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Rollback));
+            assert!(!clear_retry_strategy);
+        } else {
+            panic!("Expected Step Edit");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_edit_clear_retry_strategy() {
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "edit", "1", "--clear-retry-strategy"])
+            .unwrap();
+        if let Command::Step(StepCommand::Edit {
+            retry_strategy,
+            clear_retry_strategy,
+            ..
+        }) = cli.command.unwrap()
+        {
+            assert!(retry_strategy.is_none());
+            assert!(clear_retry_strategy);
+        } else {
+            panic!("Expected Step Edit");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_edit_set_and_clear_retry_strategy_conflict() {
+        // Mirrors how `--criteria` + `--clear-criteria` conflict: clap must
+        // reject passing both `--retry-strategy` and `--clear-retry-strategy`
+        // in the same invocation.
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "edit",
+            "1",
+            "--retry-strategy",
+            "keep",
+            "--clear-retry-strategy",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_retry_strategy_help_explains_precedence() {
+        // Render the long help for `step add` and assert the precedence rule
+        // and both value meanings are documented (acceptance criterion:
+        // "help text explains the precedence"). We introspect the clap
+        // Command rather than shelling out so the test is hermetic.
+        let mut cmd = Cli::command();
+        let mut step_add = cmd
+            .find_subcommand_mut("step")
+            .and_then(|s| s.find_subcommand_mut("add"))
+            .expect("step add subcommand")
+            .clone();
+        let help = step_add.render_long_help().to_string();
+        assert!(
+            help.contains("step > plan > default"),
+            "help should state the step>plan>default precedence; got:\n{help}"
+        );
+        assert!(
+            help.contains("keep") && help.contains("rollback"),
+            "help should explain both keep and rollback; got:\n{help}"
+        );
+        assert!(
+            help.to_lowercase().contains("rolls the working tree back"),
+            "help should explain rollback semantics; got:\n{help}"
+        );
+    }
+
+    #[test]
     fn test_parse_question_ask_positional() {
         let cli = Cli::try_parse_from([
             "ralph-rs",
@@ -2210,7 +2401,12 @@ mod tests {
         // maps it onto the single `Global` variant so every downstream
         // prompt subcommand path treats them identically.
         let cli = Cli::try_parse_from([
-            "ralph-rs", "prompt", "set", "--scope", "universal", "hello world",
+            "ralph-rs",
+            "prompt",
+            "set",
+            "--scope",
+            "universal",
+            "hello world",
         ])
         .unwrap();
         if let Command::Prompt(PromptCommand::Set { scope, content }) = cli.command.unwrap() {
@@ -2229,10 +2425,8 @@ mod tests {
             panic!("Expected Prompt Clear");
         }
 
-        let cli = Cli::try_parse_from([
-            "ralph-rs", "prompt", "show", "--scope", "universal",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "prompt", "show", "--scope", "universal"]).unwrap();
         if let Command::Prompt(PromptCommand::Show { scope, .. }) = cli.command.unwrap() {
             assert_eq!(scope, Some(PromptScope::Global));
         } else {

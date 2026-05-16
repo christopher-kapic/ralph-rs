@@ -9,7 +9,7 @@ use crate::frac_index;
 use crate::hook_library::{self, Lifecycle};
 use crate::import::ImportedStep;
 use crate::output::{self, OutputContext, OutputFormat};
-use crate::plan::{ChangePolicy, Step, StepStatus};
+use crate::plan::{ChangePolicy, RetryStrategy, Step, StepStatus};
 use crate::storage;
 
 use super::resolve_step;
@@ -53,6 +53,27 @@ pub(crate) fn render_tags_inline(step: &Step) -> String {
         s.push(']');
     }
     s
+}
+
+/// Render the effective retry strategy for a step *with provenance*, for
+/// human-readable step detail output (`ralph status --verbose`).
+///
+/// Resolution mirrors [`crate::plan::Step::effective_retry_strategy`]
+/// (step > plan > default `keep`) but the returned string also reports
+/// *where* the effective value came from so the operator can tell an
+/// inherited value apart from an explicit per-step one:
+///
+/// - step sets it          → `"<value> (step-level)"`
+/// - only the plan sets it → `"<value> (inherited from plan)"`
+/// - neither sets it       → `"<unset — default keep>"`
+pub(crate) fn retry_strategy_provenance(step: &Step, plan: &crate::plan::Plan) -> String {
+    if let Some(rs) = step.retry_strategy {
+        format!("{rs} (step-level)")
+    } else if let Some(rs) = plan.retry_strategy {
+        format!("{rs} (inherited from plan)")
+    } else {
+        "<unset — default keep>".to_string()
+    }
 }
 
 pub fn step_list(
@@ -169,6 +190,7 @@ pub fn step_add(
     criteria: &[String],
     max_retries: Option<i32>,
     change_policy: Option<ChangePolicy>,
+    retry_strategy: Option<RetryStrategy>,
     tags: &[String],
     out: &OutputContext,
 ) -> Result<()> {
@@ -246,6 +268,14 @@ pub fn step_add(
             tags_arg,
         )?
     };
+
+    // Persist a step-level retry-strategy override when the user supplied
+    // one. `None` is the column default (inherit plan/global) so we skip
+    // the write entirely in that case — mirroring how the plan-level
+    // override is set after `create_plan`.
+    if let Some(rs) = retry_strategy {
+        storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
+    }
 
     eprintln!(
         "{} Added step #{}: {}",
@@ -422,6 +452,8 @@ pub fn step_edit(
     max_retries: Option<i32>,
     clear_max_retries: bool,
     change_policy: Option<ChangePolicy>,
+    retry_strategy: Option<RetryStrategy>,
+    clear_retry_strategy: bool,
     tags: &[String],
     clear_tags: bool,
     out: &OutputContext,
@@ -441,11 +473,13 @@ pub fn step_edit(
         && max_retries.is_none()
         && !clear_max_retries
         && change_policy.is_none()
+        && retry_strategy.is_none()
+        && !clear_retry_strategy
         && tags.is_empty()
         && !clear_tags
     {
         bail!(
-            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --clear-criteria, --max-retries, --clear-max-retries, --change-policy, --tag, or --clear-tags"
+            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --clear-criteria, --max-retries, --clear-max-retries, --change-policy, --retry-strategy, --clear-retry-strategy, --tag, or --clear-tags"
         );
     }
 
@@ -507,6 +541,17 @@ pub fn step_edit(
         change_policy,
         tags_update,
     )?;
+
+    // Retry strategy lives on its own dedicated setter (kept off
+    // `update_step_fields_ext` to avoid churning that call surface).
+    // `--clear-retry-strategy` writes NULL (inherit plan/global);
+    // `--retry-strategy V` writes V; absence of both leaves the stored
+    // value untouched. clap already rejects passing both at once.
+    if clear_retry_strategy {
+        storage::set_step_retry_strategy(conn, &step.id, None)?;
+    } else if let Some(rs) = retry_strategy {
+        storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
+    }
 
     eprintln!(
         "{} Updated step #{}: {}",
@@ -587,9 +632,7 @@ pub fn step_reset(
                     );
                 }
                 crate::git::RevertOutcome::AlreadyReverted => {
-                    eprintln!(
-                        "  skip-WIP commit {short} was already reverted — skipping"
-                    );
+                    eprintln!("  skip-WIP commit {short} was already reverted — skipping");
                 }
             }
         }
@@ -797,6 +840,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -956,6 +1000,7 @@ mod tests {
             &[],
             Some(3),
             None,
+            None,
             &[],
             &test_out(),
         )
@@ -996,6 +1041,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             &[],
             &test_out(),
         )
@@ -1026,6 +1072,7 @@ mod tests {
             None,
             &[],
             None, // no max_retries override — falls back to config default.
+            None,
             None,
             &[],
             &test_out(),
@@ -1062,6 +1109,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             tags,
@@ -1101,6 +1149,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             &tags,
             &test_out(),
         )
@@ -1123,6 +1172,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &tags,
@@ -1164,6 +1214,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            false,
             &new_tags,
             false,
             &test_out(),
@@ -1199,6 +1251,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            false,
             &[],
             true, // clear_tags
             &test_out(),
@@ -1224,6 +1278,7 @@ mod tests {
             None,
             None,
             &initial_criteria,
+            None,
             None,
             None,
             &[],
@@ -1255,6 +1310,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            false,
             &[],
             false,
             &test_out(),
@@ -1292,6 +1349,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            false,
             &[],
             false,
             &test_out(),
@@ -1416,7 +1475,17 @@ mod tests {
         let plan =
             storage::create_plan(&conn, "p", &project, &branch, "d", None, None, &[]).unwrap();
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Wire it", "", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Wire it",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         (conn, project, dir, step.id, branch, tmp)
@@ -1549,5 +1618,299 @@ mod tests {
         // Both WIP layers undone (newest-first reverts applied cleanly).
         assert!(!dir.join("f.txt").exists());
         assert!(!crate::git::has_uncommitted_changes(&dir).unwrap());
+    }
+
+    // -----------------------------------------------------------------
+    // Retry strategy: CLI handler round-trip + provenance (Step 23)
+    // -----------------------------------------------------------------
+
+    /// Add a step via `step_add` with an explicit retry strategy and read
+    /// it back, asserting the override was persisted at the step level.
+    #[test]
+    fn test_step_add_persists_retry_strategy() {
+        let (conn, project) = setup_with_plan();
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "rollback step",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some(crate::plan::RetryStrategy::Rollback),
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].retry_strategy,
+            Some(crate::plan::RetryStrategy::Rollback)
+        );
+    }
+
+    /// `step_add` without `--retry-strategy` leaves the column NULL so the
+    /// step inherits the plan/global value.
+    #[test]
+    fn test_step_add_without_retry_strategy_is_none() {
+        let (conn, project) = setup_with_plan();
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "plain",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert!(steps[0].retry_strategy.is_none());
+    }
+
+    /// Provenance: a step that sets its own strategy reports `(step-level)`;
+    /// a step that inherits from the plan reports `(inherited from plan)`;
+    /// a step where neither is set reports the default-keep marker.
+    #[test]
+    fn test_retry_strategy_provenance_all_three_states() {
+        let (conn, project) = setup_with_plan();
+
+        // Plan-level default = rollback so the inherited case is observable.
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        storage::set_plan_retry_strategy(
+            &conn,
+            &plan.id,
+            Some(crate::plan::RetryStrategy::Rollback),
+        )
+        .unwrap();
+
+        // step 1: explicit step-level keep (wins over plan rollback).
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "explicit",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some(crate::plan::RetryStrategy::Keep),
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+        // step 2: no step-level override -> inherits plan rollback.
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "inherits",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+
+        assert_eq!(
+            retry_strategy_provenance(&steps[0], &plan),
+            "keep (step-level)"
+        );
+        assert_eq!(
+            retry_strategy_provenance(&steps[1], &plan),
+            "rollback (inherited from plan)"
+        );
+
+        // Now clear the plan default: step 2 falls through to the global
+        // default-keep marker.
+        storage::set_plan_retry_strategy(&conn, &plan.id, None).unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            retry_strategy_provenance(&steps[1], &plan),
+            "<unset — default keep>"
+        );
+        // Effective resolution must agree with the displayed provenance.
+        assert_eq!(
+            steps[1].effective_retry_strategy(&plan),
+            crate::plan::RetryStrategy::Keep
+        );
+    }
+
+    /// `--clear-retry-strategy` on `step edit` reverts a step-level override
+    /// back to NULL so the step re-inherits the plan/global value.
+    #[test]
+    fn test_step_edit_clear_retry_strategy_reverts_to_inheritance() {
+        let (conn, project) = setup_with_plan();
+
+        // Plan default = rollback.
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        storage::set_plan_retry_strategy(
+            &conn,
+            &plan.id,
+            Some(crate::plan::RetryStrategy::Rollback),
+        )
+        .unwrap();
+
+        // Step starts with an explicit keep override.
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "s",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some(crate::plan::RetryStrategy::Keep),
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+
+        // Clear it via step_edit.
+        step_edit(
+            &conn,
+            "bulk-plan",
+            &project,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+            None,
+            false,
+            None,
+            None, // retry_strategy
+            true, // clear_retry_strategy
+            &[],
+            false,
+            &test_out(),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert!(
+            steps[0].retry_strategy.is_none(),
+            "clear must NULL out the step-level override"
+        );
+        // Now reports inherited-from-plan, and effective resolves to rollback.
+        assert_eq!(
+            retry_strategy_provenance(&steps[0], &plan),
+            "rollback (inherited from plan)"
+        );
+        assert_eq!(
+            steps[0].effective_retry_strategy(&plan),
+            crate::plan::RetryStrategy::Rollback
+        );
+    }
+
+    /// `step edit --retry-strategy V` sets a fresh step-level override on a
+    /// step that previously had none.
+    #[test]
+    fn test_step_edit_sets_retry_strategy() {
+        let (conn, project) = setup_with_plan();
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "s",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+        step_edit(
+            &conn,
+            "bulk-plan",
+            &project,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+            None,
+            false,
+            None,
+            Some(crate::plan::RetryStrategy::Rollback),
+            false,
+            &[],
+            false,
+            &test_out(),
+        )
+        .unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].retry_strategy,
+            Some(crate::plan::RetryStrategy::Rollback)
+        );
     }
 }

@@ -5419,6 +5419,10 @@ fn render_status_plain(
                 output::colored_status(step.status, out.color),
                 step.attempts,
             );
+            println!(
+                "       Retry strategy: {}",
+                crate::commands::step::retry_strategy_provenance(step, plan),
+            );
             if step.status == StepStatus::Skipped
                 && let Some(reason) = step.skipped_reason.as_deref()
             {
@@ -5426,7 +5430,6 @@ fn render_status_plain(
             }
         }
     }
-    let _ = plan; // quiet unused-param warning; kept for future plan-level fields.
 }
 
 /// Render the plain-text `Current:` block for the live-run snapshot. Lines
@@ -6961,11 +6964,31 @@ mod status_live_view_tests {
         let plan =
             storage::create_plan(&conn, "logp", &project, &branch, "d", None, None, &[]).unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "Step one", "", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Step one",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let (_s2, _) = storage::create_step(
-            &conn, &plan.id, "Step two", "", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Step two",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
