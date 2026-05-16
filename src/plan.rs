@@ -293,6 +293,12 @@ pub enum TerminationReason {
     /// (harness-driven pause) so the history reflects exactly which
     /// pause path triggered.
     PausedByUser,
+    /// Operator ran `ralph skip` (or the TUI skip binding) while this step
+    /// was the in-flight step in the runner process. The harness was killed
+    /// via the cancel ladder and the step was marked `Skipped`. Distinct
+    /// from `UserInterrupted` (Ctrl+C, which terminates the *whole* run)
+    /// because a skip only drops the current step and lets the run advance.
+    UserSkipped,
     Unknown,
 }
 
@@ -311,6 +317,7 @@ impl TerminationReason {
             Self::InsufficientDiskSpace => "insufficient_disk_space",
             Self::PausedForQuestion => "paused_for_question",
             Self::PausedByUser => "paused_by_user",
+            Self::UserSkipped => "user_skipped",
             Self::Unknown => "unknown",
         }
     }
@@ -339,6 +346,7 @@ impl std::str::FromStr for TerminationReason {
             "insufficient_disk_space" => Ok(Self::InsufficientDiskSpace),
             "paused_for_question" => Ok(Self::PausedForQuestion),
             "paused_by_user" => Ok(Self::PausedByUser),
+            "user_skipped" => Ok(Self::UserSkipped),
             "unknown" => Ok(Self::Unknown),
             other => Err(ParseStatusError(other.to_string())),
         }
@@ -1129,6 +1137,7 @@ mod tests {
             TerminationReason::InsufficientDiskSpace,
             TerminationReason::PausedForQuestion,
             TerminationReason::PausedByUser,
+            TerminationReason::UserSkipped,
             TerminationReason::Unknown,
         ];
         for r in &reasons {

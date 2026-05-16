@@ -17,6 +17,114 @@ use anyhow::Result;
 use tokio::sync::watch;
 
 // ---------------------------------------------------------------------------
+// CancelReason
+// ---------------------------------------------------------------------------
+
+/// Why the harness cancel channel was tripped.
+///
+/// The abort/cancel watch channel carries `Option<CancelReason>`: `None` while
+/// the run is healthy, `Some(reason)` once something asked the in-flight
+/// harness child to die. Both reasons drive the *same* SIGTERM→SIGKILL ladder
+/// in [`crate::executor`]; the reason only changes what the executor does
+/// *after* the child is dead:
+///
+/// - [`CancelReason::Aborted`] — operator Ctrl+C / SIGTERM. Terminates the
+///   **whole run** (the existing two-stage shutdown behavior).
+/// - [`CancelReason::Skipped`] — operator ran `ralph skip` (or the TUI skip
+///   binding) against the step that is currently executing in *this* process.
+///   Only the current step is dropped; the run advances to the next step.
+///
+/// They are deliberately distinct: conflating them would make a skip kill the
+/// entire run, which is the opposite of what the user asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// Ctrl+C / SIGTERM — abort the whole run.
+    Aborted,
+    /// `ralph skip` against the in-flight step — drop this step, keep running.
+    Skipped,
+}
+
+/// Payload carried by the cancel watch channel. `None` == not cancelled.
+pub type CancelState = Option<CancelReason>;
+
+// ---------------------------------------------------------------------------
+// In-process cancel registry (for `ralph skip` of the in-flight step)
+// ---------------------------------------------------------------------------
+
+/// The cancel `Sender` for the run active in *this* process, if any.
+///
+/// `signal::install_and_spawn*` registers the sender it hands the runner here
+/// so a same-process `ralph skip` (a free function with no channel handle of
+/// its own) can inject [`CancelReason::Skipped`] into the exact channel the
+/// executor's wait loop is listening on — reusing the existing kill ladder
+/// rather than spawning a parallel one. Cleared on a fresh install.
+static ACTIVE_CANCEL_TX: Mutex<Option<watch::Sender<CancelState>>> = Mutex::new(None);
+
+/// `true` while the runner in this process is inside `execute_step` for a
+/// step. `skip_step` consults this to decide whether to route through the
+/// cancel ladder (a step is in-flight here) or just flip the DB status (no
+/// in-flight step, or the runner is a different process entirely).
+static STEP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+fn register_active_cancel_tx(tx: watch::Sender<CancelState>) {
+    *ACTIVE_CANCEL_TX.lock().unwrap() = Some(tx);
+}
+
+/// Mark a step as in-flight (or not) for the in-process runner. Returns a
+/// guard-free toggle — the runner sets `true` immediately before
+/// `execute_step` and `false` immediately after.
+pub fn set_step_in_flight(in_flight: bool) {
+    STEP_IN_FLIGHT.store(in_flight, Ordering::SeqCst);
+}
+
+/// Whether a step is currently executing in this process's runner.
+pub fn step_in_flight() -> bool {
+    STEP_IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+/// RAII guard: sets the in-flight flag on construction, clears it on drop
+/// (including the `?`-early-return / panic paths in the runner loop). While
+/// it's alive, a same-process `ralph skip` routes through the cancel ladder.
+pub struct StepInFlightGuard {
+    _private: (),
+}
+
+impl StepInFlightGuard {
+    pub fn enter() -> Self {
+        set_step_in_flight(true);
+        Self { _private: () }
+    }
+}
+
+impl Drop for StepInFlightGuard {
+    fn drop(&mut self) {
+        set_step_in_flight(false);
+    }
+}
+
+/// Request that the in-flight step be skipped: inject
+/// [`CancelReason::Skipped`] into this process's cancel channel, kicking the
+/// existing SIGTERM→SIGKILL ladder against the harness child.
+///
+/// Returns `true` if a cancel sender was registered and a step is in-flight
+/// (so the caller should expect the executor to mark the step `Skipped`),
+/// `false` if there's nothing running here to interrupt (the caller should
+/// fall back to a plain DB status flip).
+pub fn request_skip_in_flight() -> bool {
+    if !step_in_flight() {
+        return false;
+    }
+    let guard = ACTIVE_CANCEL_TX.lock().unwrap();
+    match guard.as_ref() {
+        Some(tx) => {
+            let _ = tx.send(Some(CancelReason::Skipped));
+            true
+        }
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Forced-exit cleanup registry
 // ---------------------------------------------------------------------------
 
@@ -62,7 +170,7 @@ pub(crate) fn run_exit_cleanup() {
 /// same effect as receiving a first Ctrl+C. Cheap to clone.
 #[derive(Clone)]
 pub struct ShutdownHandle {
-    abort_tx: watch::Sender<bool>,
+    abort_tx: watch::Sender<CancelState>,
 }
 
 impl ShutdownHandle {
@@ -70,14 +178,14 @@ impl ShutdownHandle {
     /// finishes its lifecycle, then the runner exits. Idempotent.
     #[allow(dead_code)]
     pub fn shutdown(&self) {
-        let _ = self.abort_tx.send(true);
+        let _ = self.abort_tx.send(Some(CancelReason::Aborted));
     }
 
     /// Whether shutdown has already been requested (by signal or by a prior
     /// [`shutdown`](Self::shutdown) call).
     #[allow(dead_code)]
     pub fn is_shutdown_requested(&self) -> bool {
-        *self.abort_tx.borrow()
+        self.abort_tx.borrow().is_some()
     }
 }
 
@@ -88,10 +196,11 @@ impl ShutdownHandle {
 /// Pass [`ShutdownController::abort_rx`] to the runner/executor.
 #[allow(dead_code)]
 pub struct ShutdownController {
-    /// Sends `true` on first signal to request graceful abort.
-    abort_tx: watch::Sender<bool>,
+    /// Sends `Some(CancelReason::Aborted)` on first signal to request a
+    /// graceful abort of the whole run.
+    abort_tx: watch::Sender<CancelState>,
     /// Receivers cloned from here are handed to runner/executor.
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     /// `true` once the first signal has been received. Per-instance so
     /// concurrent tests don't race on a shared global slot.
     first_signal_received: Arc<AtomicBool>,
@@ -104,7 +213,7 @@ impl ShutdownController {
     /// controllers in parallel (e.g. across test threads) does not contend on
     /// shared state.
     pub fn new() -> Self {
-        let (abort_tx, abort_rx) = watch::channel(false);
+        let (abort_tx, abort_rx) = watch::channel(None);
         Self {
             abort_tx,
             abort_rx,
@@ -115,7 +224,7 @@ impl ShutdownController {
     /// Obtain a cloneable receiver for the abort flag.
     ///
     /// Hand this to [`runner::run_plan`] / [`executor::execute_step`].
-    pub fn abort_rx(&self) -> watch::Receiver<bool> {
+    pub fn abort_rx(&self) -> watch::Receiver<CancelState> {
         self.abort_rx.clone()
     }
 
@@ -128,11 +237,15 @@ impl ShutdownController {
     ///
     /// Returns a [`ShutdownHandle`] for triggering shutdown programmatically
     /// and a receiver for the abort flag.
-    pub fn spawn_signal_listener(self) -> (ShutdownHandle, watch::Receiver<bool>) {
+    pub fn spawn_signal_listener(self) -> (ShutdownHandle, watch::Receiver<CancelState>) {
         let rx = self.abort_rx.clone();
         let handle = ShutdownHandle {
             abort_tx: self.abort_tx.clone(),
         };
+        // Publish this run's cancel sender so a same-process `ralph skip`
+        // can inject `Skipped` into the very channel the executor's wait
+        // loop is listening on (reusing the existing kill ladder).
+        register_active_cancel_tx(self.abort_tx.clone());
         tokio::spawn(async move {
             Self::listen(self.abort_tx, self.first_signal_received).await;
         });
@@ -140,7 +253,7 @@ impl ShutdownController {
     }
 
     /// Internal listener loop.
-    async fn listen(abort_tx: watch::Sender<bool>, first_received: Arc<AtomicBool>) {
+    async fn listen(abort_tx: watch::Sender<CancelState>, first_received: Arc<AtomicBool>) {
         loop {
             // Wait for either SIGINT (Ctrl+C) or SIGTERM (`ralph cancel`
             // delivers the latter, and external process supervisors often
@@ -155,8 +268,11 @@ impl ShutdownController {
                     "\n{signal_name} received — finishing current step. \
                      Send again to force-quit."
                 );
-                // Tell the executor to abort after the current lifecycle phase.
-                let _ = abort_tx.send(true);
+                // Tell the executor to abort after the current lifecycle
+                // phase. `Aborted` (distinct from `Skipped`) terminates the
+                // whole run; it also overrides any pending skip request so a
+                // Ctrl+C after a skip still tears the run down.
+                let _ = abort_tx.send(Some(CancelReason::Aborted));
             } else {
                 // --- Second signal (grace period active) ---
                 eprintln!("\nForce-quit — killing harness and exiting.");
@@ -171,7 +287,7 @@ impl ShutdownController {
     /// Check whether the shutdown flag is currently set.
     #[allow(dead_code)]
     pub fn is_shutdown_requested(&self) -> bool {
-        *self.abort_rx.borrow()
+        self.abort_rx.borrow().is_some()
     }
 }
 
@@ -234,7 +350,7 @@ async fn next_signal() -> &'static str {
 /// rt.block_on(runner::run_plan(&conn, &plan, &cfg, workdir, &opts, abort_rx))?;
 /// ```
 #[allow(dead_code)]
-pub fn install() -> Result<(ShutdownController, watch::Receiver<bool>)> {
+pub fn install() -> Result<(ShutdownController, watch::Receiver<CancelState>)> {
     let controller = ShutdownController::new();
     let rx = controller.abort_rx();
     Ok((controller, rx))
@@ -243,7 +359,7 @@ pub fn install() -> Result<(ShutdownController, watch::Receiver<bool>)> {
 /// Install signal handlers and spawn the listener task.
 ///
 /// Must be called from within an active tokio runtime.
-pub fn install_and_spawn() -> watch::Receiver<bool> {
+pub fn install_and_spawn() -> watch::Receiver<CancelState> {
     let (_handle, rx) = install_and_spawn_with_handle();
     rx
 }
@@ -253,7 +369,7 @@ pub fn install_and_spawn() -> watch::Receiver<bool> {
 ///
 /// Must be called from within an active tokio runtime.
 #[allow(dead_code)]
-pub fn install_and_spawn_with_handle() -> (ShutdownHandle, watch::Receiver<bool>) {
+pub fn install_and_spawn_with_handle() -> (ShutdownHandle, watch::Receiver<CancelState>) {
     ShutdownController::new().spawn_signal_listener()
 }
 
@@ -269,7 +385,7 @@ mod tests {
     fn test_shutdown_controller_initial_state() {
         let controller = ShutdownController::new();
         assert!(!controller.is_shutdown_requested());
-        assert!(!*controller.abort_rx().borrow());
+        assert!(controller.abort_rx().borrow().is_none());
     }
 
     #[test]
@@ -287,11 +403,14 @@ mod tests {
     fn test_abort_tx_propagates() {
         let controller = ShutdownController::new();
         let rx = controller.abort_rx();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
 
-        // Simulate first signal: send true.
-        controller.abort_tx.send(true).unwrap();
-        assert!(*rx.borrow());
+        // Simulate first signal: send the abort reason.
+        controller
+            .abort_tx
+            .send(Some(CancelReason::Aborted))
+            .unwrap();
+        assert_eq!(*rx.borrow(), Some(CancelReason::Aborted));
         assert!(controller.is_shutdown_requested());
     }
 
@@ -301,9 +420,12 @@ mod tests {
         let rx1 = controller.abort_rx();
         let rx2 = controller.abort_rx();
 
-        controller.abort_tx.send(true).unwrap();
-        assert!(*rx1.borrow());
-        assert!(*rx2.borrow());
+        controller
+            .abort_tx
+            .send(Some(CancelReason::Aborted))
+            .unwrap();
+        assert_eq!(*rx1.borrow(), Some(CancelReason::Aborted));
+        assert_eq!(*rx2.borrow(), Some(CancelReason::Aborted));
     }
 
     #[test]
@@ -330,8 +452,8 @@ mod tests {
     async fn test_spawn_signal_listener_returns_handle_and_rx() {
         let controller = ShutdownController::new();
         let (handle, rx) = controller.spawn_signal_listener();
-        // Initially false.
-        assert!(!*rx.borrow());
+        // Initially not cancelled.
+        assert!(rx.borrow().is_none());
         assert!(!handle.is_shutdown_requested());
     }
 
@@ -342,33 +464,33 @@ mod tests {
         // spawn_signal_listener itself consumes the controller.
         let controller = ShutdownController::new();
         let (handle, mut rx) = controller.spawn_signal_listener();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
 
         handle.shutdown();
 
         // Wait for the value to propagate through the watch channel.
         rx.changed().await.unwrap();
-        assert!(*rx.borrow());
+        assert_eq!(*rx.borrow(), Some(CancelReason::Aborted));
         assert!(handle.is_shutdown_requested());
     }
 
     #[tokio::test]
     async fn test_install_and_spawn_with_handle() {
         let (handle, rx) = install_and_spawn_with_handle();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
         assert!(!handle.is_shutdown_requested());
     }
 
     #[tokio::test]
     async fn test_install_and_spawn() {
         let rx = install_and_spawn();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
     }
 
     #[test]
     fn test_install_returns_controller_and_rx() {
         let (controller, rx) = install().unwrap();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
         assert!(!controller.is_shutdown_requested());
     }
 
@@ -411,7 +533,7 @@ mod tests {
         let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
         let controller = ShutdownController::new();
         let (_handle, mut rx) = controller.spawn_signal_listener();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
 
         // Give the listener a moment to register its SIGTERM handler
         // before we deliver the signal. Without this wait, we'd race the
@@ -429,7 +551,11 @@ mod tests {
             .await
             .expect("abort flag never flipped after SIGTERM")
             .expect("watch sender dropped");
-        assert!(*rx.borrow(), "abort flag should be true after SIGTERM");
+        assert_eq!(
+            *rx.borrow(),
+            Some(CancelReason::Aborted),
+            "SIGTERM must set the cancel reason to Aborted (whole-run abort)"
+        );
     }
 
     #[test]
@@ -445,5 +571,52 @@ mod tests {
         clear_exit_cleanup();
         run_exit_cleanup();
         assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// `CancelReason::Skipped` must be a distinct value from
+    /// `CancelReason::Aborted` — the executor branches on this to decide
+    /// "drop one step" vs "tear the whole run down".
+    #[test]
+    fn test_cancel_reasons_are_distinct() {
+        assert_ne!(CancelReason::Aborted, CancelReason::Skipped);
+    }
+
+    /// With no step in-flight, `request_skip_in_flight` is a no-op and
+    /// reports `false` so the caller falls back to a plain DB status flip.
+    #[test]
+    fn test_request_skip_no_step_in_flight_is_noop() {
+        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        set_step_in_flight(false);
+        assert!(!request_skip_in_flight());
+    }
+
+    /// When a step is in-flight, `request_skip_in_flight` injects exactly
+    /// `Some(CancelReason::Skipped)` into the registered cancel channel —
+    /// the same channel the executor's wait loop listens on — and returns
+    /// `true`. Distinct from the `Aborted` value the signal listener sends.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_request_skip_in_flight_signals_skipped() {
+        // Holding the std::Mutex guard across .await is intentional and
+        // safe: this serializes the process-wide cancel registry +
+        // in-flight flag against other tests that mutate the same globals,
+        // and the current_thread runtime rules out cross-thread guard
+        // transfer (same rationale as test_sigterm_triggers_graceful_shutdown).
+        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let controller = ShutdownController::new();
+        let (_handle, mut rx) = controller.spawn_signal_listener();
+        assert!(rx.borrow().is_none());
+
+        set_step_in_flight(true);
+        assert!(request_skip_in_flight(), "should signal when in-flight");
+
+        rx.changed().await.unwrap();
+        assert_eq!(
+            *rx.borrow(),
+            Some(CancelReason::Skipped),
+            "skip must inject Skipped, not Aborted"
+        );
+
+        set_step_in_flight(false);
     }
 }

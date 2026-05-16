@@ -22,6 +22,7 @@ use crate::hooks::HookContext;
 use crate::output::{self, OutputContext, OutputFormat, RunEvent};
 use crate::plan::{Plan, PlanStatus, Step, StepStatus};
 use crate::run_lock;
+use crate::signal::CancelState;
 use crate::storage;
 
 // ---------------------------------------------------------------------------
@@ -95,7 +96,7 @@ pub async fn run_plan(
     config: &Config,
     workdir: &Path,
     options: &RunOptions,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
 ) -> Result<PlanRunResult> {
     // 1. Validate plan status.
@@ -220,7 +221,7 @@ async fn run_plan_inner(
     config: &Config,
     workdir: &Path,
     options: &RunOptions,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
 ) -> Result<PlanRunResult> {
     let effective_plan = effective_plan.clone();
@@ -346,8 +347,14 @@ async fn run_plan_inner(
     };
 
     loop {
-        // Check abort signal between steps.
-        if *abort_rx.borrow() {
+        // Check the cancel signal between steps. Only `Aborted` (Ctrl+C)
+        // terminates the whole run here; a `Skipped` reason only ever
+        // targets the in-flight step (consumed inside the executor) and
+        // must NOT end the run — fall through and pick the next step.
+        if matches!(
+            *abort_rx.borrow(),
+            Some(crate::signal::CancelReason::Aborted)
+        ) {
             eprintln!("Aborted");
             storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
             result.final_status = PlanStatus::Aborted;
@@ -458,6 +465,12 @@ async fn run_plan_inner(
 
         let started = Instant::now();
 
+        // Mark this step in-flight for the duration of `execute_step` so a
+        // same-process `ralph skip` (CLI or TUI) routes through the cancel
+        // ladder instead of just flipping the DB status. The guard clears
+        // the flag on drop — covering the `?`-early-return path too.
+        let _in_flight = crate::signal::StepInFlightGuard::enter();
+
         // Execute the step.
         let step_result = executor::execute_step(
             conn,
@@ -478,6 +491,7 @@ async fn run_plan_inner(
             },
         )
         .await?;
+        drop(_in_flight);
 
         let elapsed = started.elapsed();
         result.steps_executed += 1;
@@ -488,6 +502,7 @@ async fn run_plan_inner(
             StepOutcome::Success => "success",
             StepOutcome::Failed => "failed",
             StepOutcome::Aborted => "aborted",
+            StepOutcome::Skipped => "skipped",
             StepOutcome::Timeout => "timeout",
             StepOutcome::PausedForQuestion => "paused_for_question",
         };
@@ -552,6 +567,20 @@ async fn run_plan_inner(
                 result.final_status = PlanStatus::Aborted;
                 result.step_results.push(step_result);
                 return Ok(result);
+            }
+            StepOutcome::Skipped => {
+                // `ralph skip` killed the in-flight harness for THIS step
+                // only. Unlike Aborted, the run does NOT end — count the
+                // skip and fall through so the loop advances to the next
+                // actionable step.
+                result.steps_skipped += 1;
+                emit_finished(outcome_str)?;
+                if out.format != OutputFormat::Json {
+                    eprintln!(
+                        "[{}/{}] > {} ... SKIPPED",
+                        step_num, total_now, current_step.title
+                    );
+                }
             }
             StepOutcome::Timeout => {
                 result.steps_failed += 1;
@@ -743,7 +772,7 @@ pub async fn run_all_plans(
     config: &Config,
     workdir: &Path,
     options: &RunOptions,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
 ) -> Result<Vec<PlanRunResult>> {
     // 1. Load runnable plans.
@@ -843,7 +872,7 @@ async fn run_all_plans_inner(
     config: &Config,
     workdir: &Path,
     options: &RunOptions,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
     topo_order: Vec<String>,
     plan_by_id: HashMap<String, Plan>,
@@ -878,8 +907,12 @@ async fn run_all_plans_inner(
     let total = topo_order.len();
 
     for (i, plan_id) in topo_order.iter().enumerate() {
-        // Abort check between plans.
-        if *abort_rx.borrow() {
+        // Abort check between plans. Only Ctrl+C (`Aborted`) tears the
+        // multi-plan run down; a leftover `Skipped` reason is step-scoped.
+        if matches!(
+            *abort_rx.borrow(),
+            Some(crate::signal::CancelReason::Aborted)
+        ) {
             eprintln!("Aborted before plan {}/{}", i + 1, total);
             return Ok(results);
         }
@@ -1098,7 +1131,7 @@ pub async fn resume_plan(
     plan: &Plan,
     config: &Config,
     workdir: &Path,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
 ) -> Result<PlanRunResult> {
     // Validate status early so the sweep never fires on a plan the caller
@@ -1183,6 +1216,26 @@ pub fn skip_step(
         StepStatus::Aborted => {
             // Allow skipping aborted steps too.
         }
+    }
+
+    // If the target is the step currently running in *this* process, route
+    // through the cancel ladder: signalling `Skipped` kicks the existing
+    // SIGTERM→SIGKILL ladder against the harness child, and the executor's
+    // wait loop then marks the step `Skipped` and writes the
+    // `user_skipped` execution-log row itself. We must NOT also flip the
+    // status here — that's the executor's job on this path, and a double
+    // write would race the in-flight attempt.
+    //
+    // For any other case (the step isn't in-flight, or the runner is a
+    // different process entirely so no cancel sender is registered here),
+    // `request_skip_in_flight` returns false and we keep the original
+    // synchronous DB-flip behavior.
+    if step.status == StepStatus::InProgress && crate::signal::request_skip_in_flight() {
+        eprintln!(
+            "Skipping in-flight step {} '{}' — interrupting the harness…",
+            actual_num, step.title
+        );
+        return Ok(actual_num);
     }
 
     storage::mark_step_skipped(conn, &step.id, reason)?;
@@ -2151,6 +2204,80 @@ mod tests {
         assert_eq!(steps[1].status, StepStatus::Skipped);
     }
 
+    /// STEP 16: `skip_step` against a step that is in-flight in THIS
+    /// process must route through the cancel channel (signalling
+    /// `Skipped`, which kicks the kill ladder) rather than flipping the DB
+    /// status itself — the executor owns the status/log write on that
+    /// path. The step must therefore stay `InProgress` here (no executor
+    /// is running in this unit test to consume the signal), and the cancel
+    /// channel must receive exactly `Some(CancelReason::Skipped)`.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_skip_step_in_flight_routes_through_cancel_channel() {
+        // Holding the std::Mutex guard across .await serializes the
+        // process-wide cancel registry / in-flight flag against the
+        // signal-module tests that touch the same globals. The
+        // current_thread runtime rules out cross-thread guard transfer.
+        let _guard = crate::signal::EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
+
+        // Register a cancel sender for this process (as the signal listener
+        // would for a real run) and mark a step in-flight.
+        let (_handle, mut rx) = crate::signal::install_and_spawn_with_handle();
+        let _in_flight = crate::signal::StepInFlightGuard::enter();
+
+        let skipped = skip_step(&conn, &plan, Some(1), None).unwrap();
+        assert_eq!(skipped, 1);
+
+        // The cancel channel received the Skipped reason (distinct from
+        // the Aborted the SIGINT/SIGTERM listener would send).
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), Some(crate::signal::CancelReason::Skipped));
+
+        // skip_step must NOT have flipped the status — the executor owns
+        // that on the in-flight path.
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].status,
+            StepStatus::InProgress,
+            "in-flight skip must defer the status flip to the executor"
+        );
+    }
+
+    /// Counterpart: with NO step in-flight (the common `ralph skip` case
+    /// where the runner is a different process, or nothing is running),
+    /// `skip_step` keeps the original synchronous DB-flip behavior.
+    #[test]
+    fn test_skip_step_not_in_flight_flips_db() {
+        let _guard = crate::signal::EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        crate::signal::set_step_in_flight(false);
+
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
+
+        let skipped = skip_step(&conn, &plan, Some(1), None).unwrap();
+        assert_eq!(skipped, 1);
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].status,
+            StepStatus::Skipped,
+            "no in-flight step → plain DB flip"
+        );
+    }
+
     #[test]
     fn test_skip_step_rejects_complete() {
         let conn = setup();
@@ -2580,7 +2707,7 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let workdir = std::path::Path::new("/tmp");
         let options = RunOptions {
             all_plans: true,
@@ -2608,7 +2735,7 @@ mod tests {
 
         let conn = setup();
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let workdir = std::path::Path::new("/tmp");
         let options = RunOptions {
             all_plans: true,
@@ -2874,7 +3001,7 @@ mod tests {
             .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: true,
@@ -2942,7 +3069,7 @@ mod tests {
             .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: true,
@@ -3030,7 +3157,7 @@ mod tests {
             .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: true,
@@ -3105,7 +3232,7 @@ mod tests {
         assert!(plan.last_run_branch.is_none());
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: true,
@@ -3165,7 +3292,7 @@ mod tests {
             .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: false,
@@ -3268,7 +3395,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: true,
@@ -3532,7 +3659,7 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, true, true);
         // current_branch=false so run_plan drives the stash/branch/teardown
         // path; auto_stash=true mirrors the CLI default.
@@ -3606,7 +3733,7 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, true, true);
         let options = RunOptions {
             auto_stash: true,

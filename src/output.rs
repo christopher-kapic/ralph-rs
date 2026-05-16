@@ -308,7 +308,8 @@ pub fn colored_termination_reason(reason: TerminationReason, color: bool) -> Str
         | TerminationReason::InsufficientDiskSpace => "\x1b[31m",
         TerminationReason::NoChanges
         | TerminationReason::PausedForQuestion
-        | TerminationReason::PausedByUser => "\x1b[33m",
+        | TerminationReason::PausedByUser
+        | TerminationReason::UserSkipped => "\x1b[33m",
         TerminationReason::Unknown => "\x1b[90m",
     };
     format!("{code}{}\x1b[0m", reason.as_str())

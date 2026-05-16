@@ -21,6 +21,7 @@ use crate::output::ChunkStream;
 use crate::plan::{ChangePolicy, Phase, Plan, Step, StepStatus, TerminationReason, TestStatus};
 use crate::prompt::{self, Prompts, RetryContext};
 use crate::run_lock::process_start_token;
+use crate::signal::{CancelReason, CancelState};
 use crate::storage::{self, ChildUpdate};
 use crate::test_runner;
 
@@ -42,8 +43,15 @@ pub enum StepOutcome {
     Success,
     /// Tests failed (or harness exited non-zero) after exhausting attempts.
     Failed,
-    /// Execution was aborted via signal.
+    /// Execution was aborted via signal (Ctrl+C / SIGTERM). Terminates the
+    /// whole run.
     Aborted,
+    /// The operator ran `ralph skip` (or the TUI skip binding) against this
+    /// step while it was executing in this process. The harness was killed
+    /// via the cancel ladder and the step marked `Skipped`. Distinct from
+    /// [`StepOutcome::Aborted`]: a skip drops only this step; the runner
+    /// continues to the next one.
+    Skipped,
     /// The harness process exceeded the timeout.
     Timeout,
     /// The harness called `ralph question ask` during the attempt, leaving one
@@ -193,8 +201,15 @@ pub(crate) const NO_CHANGES_AGENT_COMMITTED_HINT: &str = "no changes (worktree c
 enum FailureReason {
     /// Harness exceeded timeout.
     Timeout,
-    /// Execution was aborted via signal.
+    /// Execution was aborted via signal (Ctrl+C / SIGTERM) — terminates the
+    /// whole run.
     Aborted,
+    /// Operator ran `ralph skip` against the in-flight step. Not really a
+    /// *failure* — the step is intentionally dropped — but it shares
+    /// `finalize_failure`'s teardown (rollback of uncommitted work, log row,
+    /// post-step hook). Distinct from `Aborted` so the step is marked
+    /// `Skipped`/`UserSkipped` and the run advances instead of ending.
+    Skipped,
     /// Tests failed after exhausting all attempts.
     TestFailed,
     /// Harness produced no changes after exhausting all attempts.
@@ -207,6 +222,7 @@ impl FailureReason {
     fn to_step_status(self) -> StepStatus {
         match self {
             Self::Aborted => StepStatus::Aborted,
+            Self::Skipped => StepStatus::Skipped,
             _ => StepStatus::Failed,
         }
     }
@@ -215,6 +231,7 @@ impl FailureReason {
         match self {
             Self::Timeout => StepOutcome::Timeout,
             Self::Aborted => StepOutcome::Aborted,
+            Self::Skipped => StepOutcome::Skipped,
             _ => StepOutcome::Failed,
         }
     }
@@ -223,6 +240,7 @@ impl FailureReason {
         match self {
             Self::Timeout => "timeout",
             Self::Aborted => "aborted",
+            Self::Skipped => "skipped",
             Self::NoChanges => "no_changes",
             Self::TestFailed => "failed",
             Self::HarnessFailed => "harness_failed",
@@ -545,7 +563,7 @@ pub async fn execute_step(
     config: &Config,
     workdir: &Path,
     hook_ctx: &HookContext,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     exec_opts: ExecuteOptions,
 ) -> Result<StepResult> {
     let max_retries = step
@@ -676,37 +694,13 @@ pub async fn execute_step(
     while attempt < max_attempts {
         attempt += 1;
 
-        // Check abort before starting. Persist the bumped attempt count and
+        // Check cancel before starting. Persist the bumped attempt count and
         // drop an execution-log row so the DB reflects the same attempt number
-        // that StepResult reports and the abort has a visible audit trail.
-        if *abort_rx.borrow() {
-            set_step_attempts(conn, &step.id, attempt)?;
-            let exec_log = storage::create_execution_log(conn, &step.id, attempt, None, None)?;
-            storage::update_execution_log(
-                conn,
-                exec_log.id,
-                Some(0.0),
-                None,
-                &[],
-                false,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(TerminationReason::UserInterrupted),
-                Some(TestStatus::NotRun),
-            )?;
-            storage::update_step_status(conn, &step.id, StepStatus::Aborted)?;
-            return Ok(StepResult {
-                outcome: StepOutcome::Aborted,
-                step_id: step.id.clone(),
-                attempts_used: attempt,
-                commit_hash: None,
-            });
+        // that StepResult reports and the cancel has a visible audit trail.
+        // `Aborted` (Ctrl+C) terminates the whole run; `Skipped` (a same-
+        // process `ralph skip` of this step) drops only this step.
+        if let Some(reason) = *abort_rx.borrow() {
+            return finalize_precancel(conn, &step.id, attempt, reason);
         }
 
         // Mark step as in-progress and bump attempts.
@@ -1598,7 +1592,7 @@ pub async fn execute_step(
             WaitResult::Aborted => {
                 // Harness was killed before we ever reached the test phase,
                 // so test_status is NotRun (the test runner itself was never
-                // invoked on this attempt).
+                // invoked on this attempt). Aborted terminates the WHOLE run.
                 return finalize_failure(
                     &ctx,
                     exec_log.id,
@@ -1607,6 +1601,46 @@ pub async fn execute_step(
                     FailureReason::Aborted,
                     None,
                     TerminationReason::UserInterrupted,
+                    TestStatus::NotRun,
+                )
+                .await;
+            }
+
+            WaitResult::Skipped { stdout, stderr } => {
+                // `ralph skip` killed the in-flight harness via the same
+                // ladder as Aborted, but only THIS step is dropped — the
+                // runner advances. Capture any partial output + parsed JSON
+                // so `ralph log` retains diagnostic context for the skipped
+                // attempt. test_status is NotRun (tests never ran), and
+                // termination_reason is UserSkipped (distinct from the
+                // UserInterrupted that Ctrl+C records). committed=false:
+                // change-handling (stash/commit/discard) lands in steps
+                // 17-18; for now finalize_failure rolls back any uncommitted
+                // work, exactly like the abort path.
+                let parsed = parse_harness_json(&stdout);
+                let has_changes = git::has_uncommitted_changes(workdir)?;
+                let diff = if has_changes {
+                    Some(git::get_diff(workdir)?)
+                } else {
+                    None
+                };
+                let skip_results: Vec<String> = Vec::new();
+                let fail_output = FailureOutput {
+                    diff: diff.as_deref(),
+                    test_results: &skip_results,
+                    stdout: &stdout,
+                    stderr: &stderr,
+                    parsed: &parsed,
+                    has_changes,
+                };
+                return finalize_failure(
+                    &ctx,
+                    exec_log.id,
+                    duration_secs,
+                    attempt,
+                    FailureReason::Skipped,
+                    Some(&fail_output),
+                    TerminationReason::UserSkipped,
                     TestStatus::NotRun,
                 )
                 .await;
@@ -1691,8 +1725,17 @@ enum WaitResult {
     /// captured before the kill are surfaced so the execution log retains
     /// diagnostic context for the failed attempt.
     Timeout { stdout: String, stderr: String },
-    /// Abort signal received.
+    /// Abort signal received (Ctrl+C / SIGTERM). Terminates the whole run.
+    /// Carries no output — the abort path drops the drain tasks.
     Aborted,
+    /// `ralph skip` of the in-flight step tripped the cancel channel with
+    /// [`CancelReason::Skipped`]. The harness was killed via the same ladder
+    /// as `Aborted`, but only this step is dropped — the run continues.
+    /// Distinct variant so the executor records `UserSkipped` (not
+    /// `UserInterrupted`) and returns [`StepOutcome::Skipped`]. Partial
+    /// stdout/stderr is captured so the skipped attempt's log row retains
+    /// diagnostic context.
+    Skipped { stdout: String, stderr: String },
 }
 
 /// Wait for a child process, racing against an optional timeout and an abort signal.
@@ -1715,7 +1758,7 @@ enum WaitResult {
 async fn wait_with_timeout_and_abort(
     mut child: tokio::process::Child,
     timeout: Option<Duration>,
-    mut abort_rx: watch::Receiver<bool>,
+    mut abort_rx: watch::Receiver<CancelState>,
     emitters: (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>),
 ) -> WaitResult {
     // Take stdout/stderr handles before entering select! so we can still
@@ -1780,18 +1823,9 @@ async fn wait_with_timeout_and_abort(
                     let stderr = io_util::join_drain_string(stderr_task).await;
                     WaitResult::Timeout { stdout, stderr }
                 }
-                _ = wait_for_abort(&mut abort_rx) => {
+                reason = wait_for_abort(&mut abort_rx) => {
                     graceful_shutdown(&mut child).await;
-                    // Abort the drain tasks rather than awaiting them.
-                    // A harness that spawned a grandchild inheriting
-                    // stdout/stderr will leave those pipes open past
-                    // SIGKILL (the grandchild is reparented to init),
-                    // and the drain loop would block on `read` until it
-                    // exits. WaitResult::Aborted doesn't carry output,
-                    // so we have nothing to lose by dropping the tasks.
-                    stdout_task.abort();
-                    stderr_task.abort();
-                    WaitResult::Aborted
+                    finish_cancelled(reason, stdout_task, stderr_task).await
                 }
             }
         }
@@ -1817,33 +1851,74 @@ async fn wait_with_timeout_and_abort(
                         }
                     }
                 }
-                _ = wait_for_abort(&mut abort_rx) => {
+                reason = wait_for_abort(&mut abort_rx) => {
                     graceful_shutdown(&mut child).await;
-                    // See matching comment in the timeout arm above.
-                    stdout_task.abort();
-                    stderr_task.abort();
-                    WaitResult::Aborted
+                    finish_cancelled(reason, stdout_task, stderr_task).await
                 }
             }
         }
     }
 }
 
-/// Block until the abort watch channel signals `true`.
-async fn wait_for_abort(rx: &mut watch::Receiver<bool>) {
-    // If already aborted, return immediately.
-    if *rx.borrow() {
-        return;
+/// Turn a tripped cancel channel into the matching [`WaitResult`] after the
+/// kill ladder has already run.
+///
+/// - [`CancelReason::Aborted`] → [`WaitResult::Aborted`]. The drain tasks are
+///   aborted rather than awaited: a harness that spawned a grandchild
+///   inheriting stdout/stderr leaves those pipes open past SIGKILL (the
+///   grandchild reparents to init) and the drain loop would block on `read`
+///   until it exits. `Aborted` carries no output, so dropping the tasks
+///   loses nothing.
+/// - [`CancelReason::Skipped`] → [`WaitResult::Skipped`]. We *do* want the
+///   partial output for the skipped attempt's log row, but we still can't
+///   block indefinitely on a reparented grandchild's pipe — so the drain is
+///   best-effort with a short timeout, then the tasks are aborted.
+async fn finish_cancelled(
+    reason: CancelReason,
+    stdout_task: tokio::task::JoinHandle<Vec<u8>>,
+    stderr_task: tokio::task::JoinHandle<Vec<u8>>,
+) -> WaitResult {
+    match reason {
+        CancelReason::Aborted => {
+            stdout_task.abort();
+            stderr_task.abort();
+            WaitResult::Aborted
+        }
+        CancelReason::Skipped => {
+            // Best-effort: collect whatever the drainers captured before the
+            // kill, but cap the wait so a grandchild holding the pipe open
+            // can't wedge the skip path.
+            let grace = Duration::from_millis(500);
+            let stdout = tokio::time::timeout(grace, io_util::join_drain_string(stdout_task))
+                .await
+                .unwrap_or_default();
+            let stderr = tokio::time::timeout(grace, io_util::join_drain_string(stderr_task))
+                .await
+                .unwrap_or_default();
+            WaitResult::Skipped { stdout, stderr }
+        }
     }
-    // Wait for a change that sets abort to true.
+}
+
+/// Block until the cancel watch channel is tripped, returning *why*.
+///
+/// The reason distinguishes a whole-run abort ([`CancelReason::Aborted`],
+/// Ctrl+C) from a single-step skip ([`CancelReason::Skipped`],
+/// `ralph skip`). Both drive the same kill ladder; the caller branches on
+/// the returned reason to decide what to do *after* the child is dead.
+async fn wait_for_abort(rx: &mut watch::Receiver<CancelState>) -> CancelReason {
+    // If already cancelled, return immediately.
+    if let Some(reason) = *rx.borrow() {
+        return reason;
+    }
+    // Wait for a change that sets a cancel reason.
     loop {
         if rx.changed().await.is_err() {
-            // Sender dropped — treat as "never abort" by pending forever.
+            // Sender dropped — treat as "never cancel" by pending forever.
             std::future::pending::<()>().await;
-            return;
         }
-        if *rx.borrow() {
-            return;
+        if let Some(reason) = *rx.borrow() {
+            return reason;
         }
     }
 }
@@ -1961,6 +2036,68 @@ fn set_step_attempts(conn: &Connection, step_id: &str, attempts: i32) -> Result<
         rusqlite::params![attempts, step_id],
     ).context("Failed to update step attempts")?;
     Ok(())
+}
+
+/// Finalize an attempt that was cancelled *before* the harness ran (the
+/// cancel flag was already set when we checked it at the top of the loop).
+///
+/// Persists the bumped attempt count, drops an execution-log row (so the DB
+/// reflects the same attempt number `StepResult` reports and the cancel has a
+/// visible audit trail), flips the step status, and returns the matching
+/// outcome:
+///
+/// - [`CancelReason::Aborted`] → step `Aborted`, log `UserInterrupted`,
+///   outcome [`StepOutcome::Aborted`] (the runner ends the whole run).
+/// - [`CancelReason::Skipped`] → step `Skipped`, log `UserSkipped`, outcome
+///   [`StepOutcome::Skipped`] (the runner advances to the next step).
+///
+/// `committed` is always `false` here — no work ran. Change-handling
+/// (stash/commit/discard) for the skip case lands in steps 17-18.
+fn finalize_precancel(
+    conn: &Connection,
+    step_id: &str,
+    attempt: i32,
+    reason: CancelReason,
+) -> Result<StepResult> {
+    let (step_status, term_reason, outcome) = match reason {
+        CancelReason::Aborted => (
+            StepStatus::Aborted,
+            TerminationReason::UserInterrupted,
+            StepOutcome::Aborted,
+        ),
+        CancelReason::Skipped => (
+            StepStatus::Skipped,
+            TerminationReason::UserSkipped,
+            StepOutcome::Skipped,
+        ),
+    };
+    set_step_attempts(conn, step_id, attempt)?;
+    let exec_log = storage::create_execution_log(conn, step_id, attempt, None, None)?;
+    storage::update_execution_log(
+        conn,
+        exec_log.id,
+        Some(0.0),
+        None,
+        &[],
+        false, // not committed — no work ran (steps 17-18 add change-handling)
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(term_reason),
+        Some(TestStatus::NotRun),
+    )?;
+    storage::update_step_status(conn, step_id, step_status)?;
+    Ok(StepResult {
+        outcome,
+        step_id: step_id.to_string(),
+        attempts_used: attempt,
+        commit_hash: None,
+    })
 }
 
 /// Print the per-attempt start header to stderr:
@@ -2326,8 +2463,8 @@ mod tests {
         .unwrap();
         assert_eq!(step.attempts, 0);
 
-        let (tx, rx) = watch::channel(false);
-        tx.send(true).unwrap();
+        let (tx, rx) = watch::channel(None);
+        tx.send(Some(crate::signal::CancelReason::Aborted)).unwrap();
 
         let config = Config::default();
         let hook_ctx = HookContext {
@@ -2511,7 +2648,7 @@ mod tests {
             hook_timeout_secs: 30,
         };
 
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let config = Config::default();
         let result = execute_step(
@@ -2610,7 +2747,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = execute_step(
             &conn,
@@ -2746,7 +2883,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         // Cap the whole test at 30s so a regression hangs fast rather than
         // stalling the suite forever.
@@ -2864,7 +3001,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let _result = tokio::time::timeout(
             Duration::from_secs(60),
@@ -2979,7 +3116,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
@@ -3123,7 +3260,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (tx, rx) = watch::channel(false);
+        let (tx, rx) = watch::channel(None);
 
         // In a concurrent task: wait until the pids file appears (harness
         // has spawned its grandchild), then signal abort. The main task
@@ -3142,7 +3279,7 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let _ = tx.send(true);
+            let _ = tx.send(Some(crate::signal::CancelReason::Aborted));
         });
 
         let result = tokio::time::timeout(
@@ -3188,6 +3325,186 @@ mod tests {
             !alive,
             "grandchild sleep (pid {grandchild}) survived the abort — \
              process-group kill did not fan out",
+        );
+    }
+
+    /// STEP 16: a `Skipped` cancel reason must (a) kill the in-flight
+    /// harness child via the SAME ladder Ctrl+C uses, (b) leave the step
+    /// `Skipped` (not `Aborted`), and (c) write an execution_logs row with
+    /// `termination_reason = user_skipped` and `committed = false` — while
+    /// the run as a whole is NOT torn down (StepOutcome::Skipped, distinct
+    /// from StepOutcome::Aborted which the runner turns into a whole-run
+    /// abort).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_skip_kills_harness_and_marks_skipped() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let shared = TempDir::new().unwrap();
+        let pid_path = shared.path().join("pid.txt");
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("skip-harness.sh");
+        // Record our pid, then block for a long time so the skip lands
+        // while the harness is mid-flight.
+        let script = format!(
+            "#!/bin/sh\necho \"$$\" > {pid}\nsleep 60\n",
+            pid = pid_path.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "skip".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (tx, rx) = watch::channel(None);
+
+        // Once the harness has written its pid, trip the cancel channel
+        // with `Skipped` (NOT `Aborted`) — same channel, same ladder.
+        let pid_path_clone = pid_path.clone();
+        let skip_task = tokio::spawn(async move {
+            for _ in 0..60 {
+                if pid_path_clone.exists()
+                    && fs::read_to_string(&pid_path_clone)
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let _ = tx.send(Some(CancelReason::Skipped));
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 10s on skip")
+        .unwrap();
+
+        skip_task.await.ok();
+
+        // (Aborted vs Skipped kept distinct) — a skip must NOT surface as
+        // Aborted (which the runner would turn into a whole-run abort).
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Skipped,
+            "skip must yield StepOutcome::Skipped, not Aborted"
+        );
+        assert_ne!(result.outcome, StepOutcome::Aborted);
+
+        // (a) the harness child was killed.
+        let harness_pid: i32 = fs::read_to_string(&pid_path)
+            .expect("pid file should exist")
+            .trim()
+            .parse()
+            .expect("pid should parse");
+        let mut alive = true;
+        for _ in 0..40 {
+            // SAFETY: libc::kill with signo=0 is a pure liveness probe.
+            let r = unsafe { libc::kill(harness_pid, 0) };
+            if r != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !alive,
+            "harness (pid {harness_pid}) survived the skip — \
+             the cancel ladder did not fire"
+        );
+
+        // (b) the step is Skipped (not Aborted).
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Skipped);
+        assert_ne!(updated.status, StepStatus::Aborted);
+
+        // (c) an execution_logs row exists with termination_reason
+        //     user_skipped and committed = false.
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1, "exactly one execution_log row for the skip");
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped),
+            "skip must record user_skipped, not user_interrupted",
+        );
+        assert!(
+            !logs[0].committed,
+            "no work was kept on the skip path (committed must be false)"
         );
     }
 
@@ -3290,7 +3607,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (tx, rx) = watch::channel(false);
+        let (tx, rx) = watch::channel(None);
 
         // Abort once the harness has registered its pids.
         let pids_path_clone = pids_path.clone();
@@ -3305,7 +3622,7 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let _ = tx.send(true);
+            let _ = tx.send(Some(crate::signal::CancelReason::Aborted));
         });
 
         // Whole test capped at 10s — if the grandchild survives we want a
@@ -3461,7 +3778,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -3570,7 +3887,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -3695,7 +4012,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -3796,7 +4113,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -3889,7 +4206,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -3970,7 +4287,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4046,7 +4363,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4123,7 +4440,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4229,7 +4546,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4313,7 +4630,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4398,7 +4715,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4485,7 +4802,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4595,7 +4912,7 @@ mod tests {
         });
         let emitters = build_chunk_emitters_with_sink(cfg, sink);
 
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             wait_with_timeout_and_abort(child, None, rx, emitters),
@@ -4608,6 +4925,7 @@ mod tests {
             WaitResult::Completed(Err(e)) => panic!("harness errored: {e}"),
             WaitResult::Timeout { .. } => panic!("unexpected Timeout"),
             WaitResult::Aborted => panic!("unexpected Aborted"),
+            WaitResult::Skipped { .. } => panic!("unexpected Skipped"),
         }
 
         let mut events = collected.lock().unwrap().clone();
@@ -4668,7 +4986,7 @@ mod tests {
             .stdin(std::process::Stdio::null());
         let child = cmd.spawn().expect("spawn sh");
 
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             wait_with_timeout_and_abort(child, None, rx, (None, None)),
@@ -4685,6 +5003,7 @@ mod tests {
             WaitResult::Completed(Err(e)) => panic!("harness errored: {e}"),
             WaitResult::Timeout { .. } => panic!("unexpected Timeout"),
             WaitResult::Aborted => panic!("unexpected Aborted"),
+            WaitResult::Skipped { .. } => panic!("unexpected Skipped"),
         }
     }
 
@@ -4792,7 +5111,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = execute_step(
             &conn,
@@ -4894,7 +5213,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = execute_step(
             &conn,
@@ -4983,7 +5302,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = execute_step(
             &conn,
@@ -5071,7 +5390,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = execute_step(
             &conn,
