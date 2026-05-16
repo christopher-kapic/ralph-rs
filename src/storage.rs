@@ -2093,8 +2093,10 @@ pub fn topo_sort_plans(conn: &Connection, plan_ids: &[String]) -> Result<Vec<Str
 /// A direct structural clone of [`add_plan_dependency`] against the V25
 /// `step_dependencies` table (docs/dag-redesign.md §3.1). Bails with a
 /// user-friendly error if the two IDs are the same (mirroring the table's
-/// self-edge `CHECK`). Cycle rejection is intentionally *not* performed here —
-/// the cycle-safe variant lands in the next step via `would_create_step_cycle`.
+/// self-edge `CHECK`), or if adding the edge would create a cycle in the step
+/// dependency graph. Cycle detection runs before the insert via
+/// [`would_create_step_cycle`], so callers never need to invoke it themselves
+/// (docs/dag-redesign.md §6: DAG acyclicity validated on every edge mutation).
 ///
 /// The CLI/scheduler callers land in later DAG-redesign steps (`ralph step
 /// dependency`, `--depends-on`, the topological scheduler); until then tests
@@ -2108,6 +2110,12 @@ pub fn add_step_dependency(
 ) -> Result<()> {
     if step_id == depends_on_step_id {
         anyhow::bail!("A step cannot depend on itself");
+    }
+
+    if would_create_step_cycle(conn, step_id, depends_on_step_id)? {
+        anyhow::bail!(
+            "Adding dependency {step_id} -> {depends_on_step_id} would create a cycle"
+        );
     }
 
     conn.execute(
@@ -2164,6 +2172,44 @@ pub fn list_step_dependents(conn: &Connection, step_id: &str) -> Result<Vec<Stri
         out.push(row?);
     }
     Ok(out)
+}
+
+/// Check whether adding `step_id -> new_dep_id` would create a cycle.
+///
+/// A direct structural clone of [`would_create_cycle`] against the V25
+/// `step_dependencies` table (docs/dag-redesign.md §6): walks the transitive
+/// dependencies of `new_dep_id`; if `step_id` appears in that set, the edge
+/// would close a cycle. A self-edge (`step_id == new_dep_id`) is also reported
+/// as a cycle. Reused by import validation (docs/dag-redesign.md §13.3).
+#[allow(dead_code)] // CLI/scheduler callers land in later DAG-redesign steps.
+pub fn would_create_step_cycle(
+    conn: &Connection,
+    step_id: &str,
+    new_dep_id: &str,
+) -> Result<bool> {
+    if step_id == new_dep_id {
+        return Ok(true);
+    }
+
+    let mut stack: Vec<String> = vec![new_dep_id.to_string()];
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current.clone()) {
+            continue;
+        }
+        if current == step_id {
+            return Ok(true);
+        }
+        let deps = list_step_dependencies(conn, &current)?;
+        for d in deps {
+            if !visited.contains(&d) {
+                stack.push(d);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -4871,6 +4917,59 @@ mod tests {
         // V25's ON DELETE CASCADE drops dependent edges with the step.
         delete_step(&conn, &ids[1]).unwrap();
         assert!(list_step_dependencies(&conn, &ids[0]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_would_create_step_cycle_direct() {
+        let conn = setup();
+        let ids = make_steps(&conn, 2);
+
+        // Self-edge is always a cycle.
+        assert!(would_create_step_cycle(&conn, &ids[0], &ids[0]).unwrap());
+
+        // A -> B. Adding B -> A closes a direct cycle.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        assert!(would_create_step_cycle(&conn, &ids[1], &ids[0]).unwrap());
+    }
+
+    #[test]
+    fn test_would_create_step_cycle_transitive() {
+        let conn = setup();
+        let ids = make_steps(&conn, 3);
+
+        // A -> B -> C. Adding C -> A would create a 3-node cycle.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_step_dependency(&conn, &ids[1], &ids[2]).unwrap();
+
+        assert!(would_create_step_cycle(&conn, &ids[2], &ids[0]).unwrap());
+    }
+
+    #[test]
+    fn test_would_create_step_cycle_no_cycle() {
+        let conn = setup();
+        let ids = make_steps(&conn, 3);
+
+        // A -> B. Adding A -> C does not create a cycle.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+
+        assert!(!would_create_step_cycle(&conn, &ids[0], &ids[2]).unwrap());
+    }
+
+    #[test]
+    fn test_add_step_dependency_rejects_cycle() {
+        let conn = setup();
+        let ids = make_steps(&conn, 3);
+
+        // A -> B -> C, then attempt C -> A: rejected before the insert.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_step_dependency(&conn, &ids[1], &ids[2]).unwrap();
+
+        let err = add_step_dependency(&conn, &ids[2], &ids[0]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cycle"), "unexpected error: {msg}");
+
+        // The rejected edge was not persisted.
+        assert!(list_step_dependencies(&conn, &ids[2]).unwrap().is_empty());
     }
 
     #[test]
