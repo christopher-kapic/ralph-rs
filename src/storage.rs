@@ -1189,10 +1189,15 @@ pub fn create_step(
         None => frac_index::initial_key(),
     };
 
+    // Mint the plan-unique short_id via the one shared helper so runtime
+    // step creation and the V25 migration/import backfill produce the same
+    // handle for the same input (docs/dag-redesign.md §3.1, §13.3).
+    let short_id = mint_short_id(conn, plan_id)?;
+
     conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json],
+        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags, short_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json, short_id],
     )
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
@@ -1330,10 +1335,14 @@ pub fn create_step_at(
     let change_policy = change_policy.unwrap_or_default();
     let tags_json = serde_json::to_string(tags.unwrap_or(&[]))?;
 
+    // See [`create_step`]: same single-source short_id minting helper so
+    // every step-creation path is consistent (docs/dag-redesign.md §3.1).
+    let short_id = mint_short_id(conn, plan_id)?;
+
     conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json],
+        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags, short_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json, short_id],
     )
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
@@ -2458,6 +2467,55 @@ mod tests {
             .unwrap();
         }
         assert_eq!(seen.len(), 256, "every minted short_id must be unique");
+    }
+
+    #[test]
+    fn test_create_step_assigns_unique_short_id() {
+        let conn = setup();
+        let plan = create_plan(&conn, "sid", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        let (s1, _) = create_step(
+            &conn, &plan.id, "Step one", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        let (s2, _) = create_step(
+            &conn, &plan.id, "Step two", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        assert!(
+            !s1.short_id.is_empty(),
+            "create_step must assign a non-empty short_id"
+        );
+        assert!(
+            !s2.short_id.is_empty(),
+            "create_step must assign a non-empty short_id"
+        );
+        assert_ne!(
+            s1.short_id, s2.short_id,
+            "two steps in one plan must get distinct short_ids"
+        );
+
+        // create_step_at goes through the same minting helper and must also
+        // produce a plan-unique short_id distinct from the appended steps.
+        let (s3, _) = create_step_at(
+            &conn,
+            &plan.id,
+            "z",
+            "Step three",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!s3.short_id.is_empty());
+        assert_ne!(s3.short_id, s1.short_id);
+        assert_ne!(s3.short_id, s2.short_id);
     }
 
     // -- Plan tests --

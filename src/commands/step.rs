@@ -278,9 +278,10 @@ pub fn step_add(
     }
 
     eprintln!(
-        "{} Added step #{}: {}",
+        "{} Added step #{} [{}]: {}",
         output::check_icon(out.color),
         pos,
+        step.short_id,
         output::bold(&step.title, out.color),
     );
     Ok(())
@@ -392,9 +393,10 @@ pub fn step_add_bulk(
     } else {
         for (step, pos) in &inserted {
             eprintln!(
-                "{} Added step #{}: {}",
+                "{} Added step #{} [{}]: {}",
                 output::check_icon(out.color),
                 pos,
+                step.short_id,
                 output::bold(&step.title, out.color),
             );
         }
