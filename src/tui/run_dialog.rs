@@ -33,9 +33,11 @@ use super::theme;
 // State machine
 // ---------------------------------------------------------------------------
 
-/// The three rows of the branch-choice list, top to bottom. Rendered and
-/// navigated by the generic [`Choice`] primitive; `RunDialog` maps a
-/// confirmed `RunChoice` back onto its public [`Outcome`].
+/// The three rows of the branch-choice list, top to bottom. Rendered by
+/// the generic [`Choice`] primitive with focus pinned at row 0 (`/run`
+/// opts out of the primitive's vertical navigation — see
+/// [`RunDialog::handle_choosing`]); `RunDialog` maps a confirmed
+/// `RunChoice` back onto its public [`Outcome`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunChoice {
     /// Run in the cwd's currently-checked-out branch.
@@ -142,11 +144,27 @@ impl RunDialog {
             };
             return Outcome::Pending;
         }
-        // Everything else (j/k/↑/↓ navigation, Enter, Esc) is handled by
-        // the generic primitive; map its terminal outcome back onto ours.
+        // `/run` opts OUT of the generic primitive's vertical navigation.
+        // Pre-generalization, `j`/`k`/`↑`/`↓` (and every other non-Esc /
+        // non-Enter / non-`n` key) were INERT in the Choosing phase: focus
+        // never moved off "Use current branch", so a later `Enter` always
+        // resolved to `Current`. We restore that contract by swallowing
+        // navigation keys here BEFORE they reach `Choice::handle_key`,
+        // keeping focus pinned at row 0. `Choice<T>` itself is unmodified —
+        // skip/retry dialogs that delegate every key still navigate.
+        if matches!(
+            key.code,
+            KeyCode::Char('j') | KeyCode::Char('k') | KeyCode::Down | KeyCode::Up
+        ) {
+            self.state = DialogState::Choosing;
+            return Outcome::Pending;
+        }
+        // Terminal/other keys (Enter, Esc, unrecognized) go to the generic
+        // primitive; map its terminal outcome back onto ours. Because focus
+        // is pinned at row 0, `Enter` always confirms `RunChoice::Current`.
         match self.choice.handle_key(key) {
             ChoiceOutcome::Pending => {
-                // Navigation or unrecognized key — stay in Choosing.
+                // Unrecognized key — stay in Choosing.
                 self.state = DialogState::Choosing;
                 Outcome::Pending
             }
@@ -446,40 +464,76 @@ mod tests {
         assert_eq!(d.state, DialogState::Choosing);
     }
 
-    // -- Choosing phase navigates the generic Choice primitive ----------
+    // -- Choosing phase: /run opts OUT of vertical navigation -----------
+    //
+    // Pre-generalization, `j`/`k`/`↑`/`↓` were INERT in the Choosing phase
+    // (focus never left "Use current branch"), so a later `Enter` always
+    // resolved to `Current`. STEP 31 restores that contract while keeping
+    // the generic `Choice<T>` primitive intact for skip/retry dialogs.
 
     #[test]
-    fn j_then_enter_focuses_new_branch_and_enters_naming() {
+    fn j_is_inert_and_later_enter_still_picks_current() {
         let mut d = RunDialog::new("feature-x", 1);
-        // j moves focus Current → NewBranch.
+        // j is swallowed: stays in Choosing, focus pinned at row 0.
         assert_eq!(d.handle_key(key(KeyCode::Char('j'))), Outcome::Pending);
-        assert_eq!(d.choice.focused(), Some(&RunChoice::NewBranch));
-        // Enter on NewBranch transitions to the naming phase.
-        let out = d.handle_key(key(KeyCode::Enter));
+        assert_eq!(d.state, DialogState::Choosing);
+        assert_eq!(d.choice.focused(), Some(&RunChoice::Current));
+        // Enter still resolves to Current (no naming phase).
+        assert_eq!(d.handle_key(key(KeyCode::Enter)), Outcome::Current);
+    }
+
+    #[test]
+    fn down_twice_is_inert_and_later_enter_still_picks_current() {
+        let mut d = RunDialog::new("main", 1);
+        assert_eq!(d.handle_key(key(KeyCode::Down)), Outcome::Pending);
+        assert_eq!(d.handle_key(key(KeyCode::Down)), Outcome::Pending);
+        // Focus never moved off Current — no jump to Cancel.
+        assert_eq!(d.choice.focused(), Some(&RunChoice::Current));
+        assert_eq!(d.state, DialogState::Choosing);
+        assert_eq!(d.handle_key(key(KeyCode::Enter)), Outcome::Current);
+    }
+
+    #[test]
+    fn k_and_up_are_inert_and_enter_still_picks_current() {
+        let mut d = RunDialog::new("main", 1);
+        assert_eq!(d.handle_key(key(KeyCode::Char('k'))), Outcome::Pending);
+        assert_eq!(d.handle_key(key(KeyCode::Up)), Outcome::Pending);
+        assert_eq!(d.choice.focused(), Some(&RunChoice::Current));
+        assert_eq!(d.state, DialogState::Choosing);
+        assert_eq!(d.handle_key(key(KeyCode::Enter)), Outcome::Current);
+    }
+
+    #[test]
+    fn mixed_navigation_then_enter_is_still_current() {
+        // A realistic fat-finger sequence: j, Down, k, Up, j — every one
+        // inert, Enter still picks Current (pre-generalization parity).
+        let mut d = RunDialog::new("main", 1);
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Down,
+            KeyCode::Char('k'),
+            KeyCode::Up,
+            KeyCode::Char('j'),
+        ] {
+            assert_eq!(d.handle_key(key(code)), Outcome::Pending);
+            assert_eq!(d.state, DialogState::Choosing);
+            assert_eq!(d.choice.focused(), Some(&RunChoice::Current));
+        }
+        assert_eq!(d.handle_key(key(KeyCode::Enter)), Outcome::Current);
+    }
+
+    #[test]
+    fn navigation_then_n_still_enters_naming_phase() {
+        // `n` shortcut is unaffected by prior inert navigation keys.
+        let mut d = RunDialog::new("feature-x", 1);
+        d.handle_key(key(KeyCode::Char('j')));
+        d.handle_key(key(KeyCode::Down));
+        let out = d.handle_key(key(KeyCode::Char('n')));
         assert_eq!(out, Outcome::Pending);
         match &d.state {
             DialogState::NamingBranch { buffer } => assert_eq!(buffer, "feature-x"),
             other => panic!("unexpected state {other:?}"),
         }
-    }
-
-    #[test]
-    fn down_twice_then_enter_focuses_cancel_and_cancels() {
-        let mut d = RunDialog::new("main", 1);
-        d.handle_key(key(KeyCode::Down)); // → NewBranch
-        d.handle_key(key(KeyCode::Down)); // → Cancel
-        assert_eq!(d.choice.focused(), Some(&RunChoice::Cancel));
-        assert_eq!(d.handle_key(key(KeyCode::Enter)), Outcome::Cancelled);
-    }
-
-    #[test]
-    fn k_clamps_at_top_and_enter_still_picks_current() {
-        let mut d = RunDialog::new("main", 1);
-        // Already on the first row; k must not wrap to Cancel.
-        d.handle_key(key(KeyCode::Char('k')));
-        d.handle_key(key(KeyCode::Up));
-        assert_eq!(d.choice.focused(), Some(&RunChoice::Current));
-        assert_eq!(d.handle_key(key(KeyCode::Enter)), Outcome::Current);
     }
 
     #[test]
