@@ -30,7 +30,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::plan::{AnsweredQuestion, ExecutionLog, Plan, Step};
+use crate::plan::{AnsweredQuestion, ExecutionLog, Plan, RetryStrategy, Step, TerminationReason};
 use crate::prompt::{self, Prompts, RetryContext};
 use crate::tui::help::{self, HelpState};
 use crate::tui::theme;
@@ -103,10 +103,17 @@ pub enum Outcome {
 /// agent actually received. The exact prompt sent for each attempt is
 /// persisted verbatim in `execution_logs.prompt_text`; this view
 /// deliberately re-assembles instead, so layer edits are visible.
+/// `strategy` is the step's resolved [`RetryStrategy`] (step > plan >
+/// default `Keep`). It scopes the reconstruction exactly as the executor
+/// does (Step 22): under `Rollback` the diff/files are included (the agent
+/// no longer sees the reverted work); under `Keep` they are omitted (the
+/// work is still on disk). `previous_failure_reason` is reconstructed from
+/// the previous attempt's `termination_reason` under both strategies.
 pub fn build_retry_context_for_attempt(
     attempt: i32,
     max_attempts: i32,
     logs: &[ExecutionLog],
+    strategy: RetryStrategy,
 ) -> Option<RetryContext> {
     if attempt <= 1 {
         return None;
@@ -116,7 +123,6 @@ pub fn build_retry_context_for_attempt(
     // attempt is the row whose `attempt == attempt - 1`.
     let prev = logs.iter().find(|l| l.attempt == attempt - 1)?;
 
-    let previous_diff = prev.diff.clone();
     let previous_test_output = if prev.test_results.is_empty() {
         None
     } else {
@@ -124,7 +130,28 @@ pub fn build_retry_context_for_attempt(
         // `Some(test_output_summary)` in src/executor.rs.
         Some(prev.test_results.join("\n"))
     };
-    let files_modified = files_from_diff(prev.diff.as_deref());
+
+    // Strategy-scoped, mirroring src/executor.rs's RetryContext build:
+    // Rollback re-sends the (now reverted) diff/files; Keep omits them
+    // because the work is still on disk for the agent to `git diff`.
+    let (previous_diff, files_modified) = match strategy {
+        RetryStrategy::Rollback => {
+            (prev.diff.clone(), files_from_diff(prev.diff.as_deref()))
+        }
+        RetryStrategy::Keep => (None, Vec::new()),
+    };
+
+    let previous_failure_reason = prev.termination_reason.map(|r| {
+        match r {
+            TerminationReason::TestFailed => "tests failed",
+            TerminationReason::NoChanges => "no changes produced",
+            TerminationReason::HarnessFailed => "harness exited non-zero",
+            TerminationReason::HookFailed => "a lifecycle hook failed",
+            TerminationReason::Timeout => "the harness timed out",
+            other => other.as_str(),
+        }
+        .to_string()
+    });
 
     Some(RetryContext {
         attempt,
@@ -132,6 +159,7 @@ pub fn build_retry_context_for_attempt(
         previous_diff,
         previous_test_output,
         files_modified,
+        previous_failure_reason,
     })
 }
 
@@ -268,9 +296,16 @@ impl RenderedPromptApp {
             return out;
         }
 
+        // Resolve the step's retry strategy once so each per-attempt preview
+        // scopes the diff/files exactly as the executor would (Step 22).
+        let strategy = step.effective_retry_strategy(plan);
         for log in logs {
-            let retry =
-                build_retry_context_for_attempt(log.attempt, max_attempts, logs);
+            let retry = build_retry_context_for_attempt(
+                log.attempt,
+                max_attempts,
+                logs,
+                strategy,
+            );
             let prompt = prompt::build_step_prompt(
                 plan,
                 step,
@@ -668,20 +703,31 @@ mod tests {
 
     #[test]
     fn attempt_one_has_no_retry_context() {
-        assert!(build_retry_context_for_attempt(1, 4, &[]).is_none());
+        assert!(
+            build_retry_context_for_attempt(1, 4, &[], RetryStrategy::Keep).is_none()
+        );
+        assert!(
+            build_retry_context_for_attempt(1, 4, &[], RetryStrategy::Rollback)
+                .is_none()
+        );
     }
 
     #[test]
-    fn later_attempt_pulls_previous_log_outcome() {
+    fn later_attempt_pulls_previous_log_outcome_rollback() {
+        // Under Rollback the reverted diff/files are re-sent so the agent
+        // can learn from work it no longer sees on disk.
         let mut l1 = make_log(1, Utc::now());
         l1.diff = Some(
             "diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string(),
         );
         l1.test_results = vec!["FAIL test_a".to_string(), "error: boom".to_string()];
+        l1.termination_reason = Some(TerminationReason::TestFailed);
         let l2 = make_log(2, Utc::now());
         let logs = vec![l1, l2];
 
-        let ctx = build_retry_context_for_attempt(2, 4, &logs).expect("retry ctx for attempt 2");
+        let ctx =
+            build_retry_context_for_attempt(2, 4, &logs, RetryStrategy::Rollback)
+                .expect("retry ctx for attempt 2");
         assert_eq!(ctx.attempt, 2);
         assert_eq!(ctx.max_attempts, 4);
         assert_eq!(
@@ -695,6 +741,45 @@ mod tests {
         );
         // files_modified parsed from the diff's `diff --git ... b/<path>`.
         assert_eq!(ctx.files_modified, vec!["src/foo.rs".to_string()]);
+        assert_eq!(
+            ctx.previous_failure_reason.as_deref(),
+            Some("tests failed")
+        );
+    }
+
+    #[test]
+    fn later_attempt_keep_omits_diff_and_files_keeps_reason_and_output() {
+        // Step 22: under Keep the prior work is still on disk, so the preview
+        // mirrors the executor by omitting diff/files but keeping the test
+        // output and a reconstructed failure reason.
+        let mut l1 = make_log(1, Utc::now());
+        l1.diff = Some(
+            "diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string(),
+        );
+        l1.test_results = vec!["FAIL test_a".to_string()];
+        l1.termination_reason = Some(TerminationReason::TestFailed);
+        let l2 = make_log(2, Utc::now());
+        let logs = vec![l1, l2];
+
+        let ctx = build_retry_context_for_attempt(2, 4, &logs, RetryStrategy::Keep)
+            .expect("retry ctx for attempt 2");
+        assert_eq!(ctx.attempt, 2);
+        assert!(
+            ctx.previous_diff.is_none(),
+            "Keep must not re-send the diff"
+        );
+        assert!(
+            ctx.files_modified.is_empty(),
+            "Keep must not re-send the file list"
+        );
+        assert_eq!(
+            ctx.previous_test_output.as_deref(),
+            Some("FAIL test_a")
+        );
+        assert_eq!(
+            ctx.previous_failure_reason.as_deref(),
+            Some("tests failed")
+        );
     }
 
     #[test]
@@ -757,7 +842,16 @@ mod tests {
         assert!(!attempts[0].prompt.contains("# Retry Context"));
 
         // Attempt 2: retry context reconstructed from attempt 1's log.
-        let ctx = build_retry_context_for_attempt(2, 4, &logs).unwrap();
+        // `build_attempts` resolves the strategy via
+        // `step.effective_retry_strategy(plan)`; make_step/make_plan both
+        // leave it None → default `Keep`, so mirror that here.
+        let ctx = build_retry_context_for_attempt(
+            2,
+            4,
+            &logs,
+            step.effective_retry_strategy(&plan),
+        )
+        .unwrap();
         let exp2 = prompt::build_step_prompt(
             &plan, &step, &all, None, Some(&ctx), true, &prompts, &[],
         );

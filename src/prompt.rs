@@ -76,18 +76,44 @@ and inserting before the current step is a no-op for this execution.
 ";
 
 /// Context from a previous failed attempt, used when retrying a step.
+///
+/// The diff/files fields are **strategy-scoped** (Step 22):
+///
+/// - Under [`RetryStrategy::Rollback`](crate::plan::RetryStrategy::Rollback)
+///   the working tree was reverted before the retry, so the agent can no
+///   longer see its prior work on disk. We therefore feed the rolled-back
+///   diff and changed-file list back through this struct so the agent can
+///   still learn from — without inheriting — that work.
+/// - Under [`RetryStrategy::Keep`](crate::plan::RetryStrategy::Keep) (the
+///   default) the dirty tree is carried forward, so the prior work is
+///   already on disk for the agent to inspect via `git diff`. Re-sending the
+///   same diff in the prompt would be redundant and confusing, so the
+///   executor leaves `previous_diff = None` and `files_modified = []`;
+///   [`format_retry_context`] then omits those sections entirely.
+///
+/// `previous_failure_reason` is populated under **both** strategies — it's a
+/// short human-readable note (derived from the prior attempt's
+/// [`TerminationReason`](crate::plan::TerminationReason)) so the Keep prompt
+/// still conveys *why* the last attempt failed even without the diff section.
 #[derive(Debug, Clone)]
 pub struct RetryContext {
     /// Which attempt number this is (1-indexed, so attempt 2 means first retry).
     pub attempt: i32,
     /// Maximum number of attempts allowed.
     pub max_attempts: i32,
-    /// The diff produced by the previous attempt (if any).
+    /// The diff produced by the previous attempt. `None` under `Keep` (the
+    /// diff is already on disk) and when the prior attempt produced no diff.
     pub previous_diff: Option<String>,
     /// Test output from the previous attempt (if tests were run).
     pub previous_test_output: Option<String>,
-    /// Files that were modified in the previous attempt.
+    /// Files that were modified in the previous attempt. Empty under `Keep`
+    /// (the changes are already on disk) and when nothing was modified.
     pub files_modified: Vec<String>,
+    /// Short human-readable reason the previous attempt failed (e.g. "tests
+    /// failed", "harness exited non-zero", "no changes produced"). Always
+    /// set on a real retry so the Keep prompt — which omits the diff — still
+    /// states what went wrong. `None` only when no reason was available.
+    pub previous_failure_reason: Option<String>,
 }
 
 /// The three configurable layers of the four-layer prompt model
@@ -267,12 +293,19 @@ fn format_agent_pointer(name: &str) -> String {
 }
 
 fn format_retry_context(ctx: &RetryContext) -> String {
-    let mut parts = vec![format!(
+    let mut header = format!(
         "# Retry Context\n\n\
          This is attempt {attempt} of {max} for this step. The previous attempt failed.",
         attempt = ctx.attempt,
         max = ctx.max_attempts,
-    )];
+    );
+    if let Some(reason) = &ctx.previous_failure_reason {
+        // Under `Keep` the diff section is omitted (the work is on disk), so
+        // this line is the only thing telling the agent *what* failed —
+        // keep it on the header so it's the first thing read.
+        header.push_str(&format!("\n\nPrevious failure: {reason}."));
+    }
+    let mut parts = vec![header];
 
     if !ctx.files_modified.is_empty() {
         parts.push(format!(
@@ -855,6 +888,7 @@ mod tests {
             previous_diff: Some("+added a line\n-removed a line".to_string()),
             previous_test_output: Some("error: test failed\nassert_eq failed".to_string()),
             files_modified: vec!["src/harness.rs".to_string(), "src/main.rs".to_string()],
+            previous_failure_reason: Some("tests failed".to_string()),
         };
 
         let prompt = build_step_prompt(
@@ -992,11 +1026,37 @@ mod tests {
             previous_diff: None,
             previous_test_output: None,
             files_modified: vec![],
+            previous_failure_reason: None,
         };
         let result = format_retry_context(&ctx);
         assert!(result.contains("attempt 2 of 3"));
         assert!(!result.contains("Previous Diff"));
         assert!(!result.contains("Previous Test Output"));
+        assert!(!result.contains("Files Modified"));
+        assert!(!result.contains("Previous failure:"));
+    }
+
+    #[test]
+    fn test_format_retry_context_keep_scoped_no_diff_but_reason_and_output() {
+        // Step 22: under `Keep` the executor passes diff=None / files=[] but
+        // still sets previous_test_output + previous_failure_reason. The
+        // formatter must convey attempt N/M, the failure reason, and the
+        // test output, while OMITTING the diff/files sections entirely.
+        let ctx = RetryContext {
+            attempt: 2,
+            max_attempts: 4,
+            previous_diff: None,
+            previous_test_output: Some("assertion failed: foo == bar".to_string()),
+            files_modified: vec![],
+            previous_failure_reason: Some("tests failed".to_string()),
+        };
+        let result = format_retry_context(&ctx);
+        assert!(result.contains("attempt 2 of 4"));
+        assert!(result.contains("Previous failure: tests failed."));
+        assert!(result.contains("Previous Test Output"));
+        assert!(result.contains("assertion failed: foo == bar"));
+        // Diff/files sections are absent under Keep.
+        assert!(!result.contains("Previous Diff"));
         assert!(!result.contains("Files Modified"));
     }
 
@@ -1008,9 +1068,11 @@ mod tests {
             previous_diff: Some("diff content".to_string()),
             previous_test_output: Some("test output".to_string()),
             files_modified: vec!["a.rs".to_string(), "b.rs".to_string()],
+            previous_failure_reason: Some("tests failed".to_string()),
         };
         let result = format_retry_context(&ctx);
         assert!(result.contains("attempt 3 of 5"));
+        assert!(result.contains("Previous failure: tests failed."));
         assert!(result.contains("diff content"));
         assert!(result.contains("test output"));
         assert!(result.contains("a.rs"));
@@ -1030,6 +1092,7 @@ mod tests {
             previous_diff: Some("diff".to_string()),
             previous_test_output: None,
             files_modified: vec![],
+            previous_failure_reason: Some("tests failed".to_string()),
         };
         let answered = vec![AnsweredQuestion {
             question: "Which DB?".to_string(),

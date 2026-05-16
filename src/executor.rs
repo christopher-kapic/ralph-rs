@@ -18,7 +18,9 @@ use crate::harness::{self, HarnessOutput};
 use crate::hooks::{self, HookContext};
 use crate::io_util;
 use crate::output::ChunkStream;
-use crate::plan::{ChangePolicy, Phase, Plan, Step, StepStatus, TerminationReason, TestStatus};
+use crate::plan::{
+    ChangePolicy, Phase, Plan, RetryStrategy, Step, StepStatus, TerminationReason, TestStatus,
+};
 use crate::prompt::{self, Prompts, RetryContext};
 use crate::run_lock::process_start_token;
 use crate::signal::{CancelReason, CancelState};
@@ -1007,10 +1009,21 @@ pub async fn execute_step(
         json_output: exec_opts.json_output,
     };
 
+    // Resolve the step's retry strategy once: it's static for the lifetime
+    // of this step execution (step > plan > default `Keep`; Step 21/22).
+    //  - `Rollback`: a failed attempt reverts the working tree before the
+    //    retry, and the rolled-back diff/files are fed into the next prompt
+    //    so the agent can learn from — without inheriting — that work.
+    //  - `Keep` (default): a failed attempt leaves the dirty tree in place;
+    //    the next attempt sees the prior work directly on disk (`git diff`),
+    //    so the prompt OMITS the now-redundant diff/files sections.
+    let retry_strategy = step.effective_retry_strategy(plan);
+
     // Previous attempt context for retries.
     let mut prev_diff: Option<String> = None;
     let mut prev_test_output: Option<String> = None;
     let mut prev_files_modified: Vec<String> = Vec::new();
+    let mut prev_failure_reason: Option<String> = None;
 
     let mut attempt = step.attempts;
 
@@ -1039,13 +1052,26 @@ pub async fn execute_step(
         set_step_attempts(conn, &step.id, attempt)?;
 
         // Build retry context if this is not the first attempt.
+        //
+        // The diff/files are strategy-scoped (Step 22): under `Rollback` the
+        // prior work was reverted, so we re-send it for the agent to learn
+        // from; under `Keep` it's still on disk, so re-sending it is
+        // redundant and confusing — collapse the context to just
+        // attempt/max + previous test output + previous failure reason.
         let retry_context = if attempt > 1 {
+            let (previous_diff, files_modified) = match retry_strategy {
+                RetryStrategy::Rollback => {
+                    (prev_diff.clone(), prev_files_modified.clone())
+                }
+                RetryStrategy::Keep => (None, Vec::new()),
+            };
             Some(RetryContext {
                 attempt,
                 max_attempts,
-                previous_diff: prev_diff.clone(),
+                previous_diff,
                 previous_test_output: prev_test_output.clone(),
-                files_modified: prev_files_modified.clone(),
+                files_modified,
+                previous_failure_reason: prev_failure_reason.clone(),
             })
         } else {
             None
@@ -1172,6 +1198,7 @@ pub async fn execute_step(
                 });
             }
             prev_test_output = Some(format!("pre-step hook failed: {e}"));
+            prev_failure_reason = Some("pre-step hook failed".to_string());
             write_phase(
                 conn,
                 plan,
@@ -1435,34 +1462,55 @@ pub async fn execute_step(
                         .await;
                     }
 
-                    // Retry path: roll back partial changes, log the attempt
-                    // with HarnessFailed + NotRun, then loop back for the
-                    // next attempt. The retry log row carries full
-                    // observability (diff, stdout, stderr) rather than a
-                    // null-everything placeholder.
-                    if has_changes {
-                        write_phase(
-                            conn,
-                            plan,
-                            &step.id,
-                            step_num,
-                            attempt,
-                            max_attempts,
-                            Some(exec_log.id),
-                            Phase::Rollback,
-                            None,
-                            ChildUpdate::Clear,
-                            exec_opts.json_output,
-                        )?;
-                        git::rollback_except(workdir, &pre_existing_untracked)?;
-                    }
+                    // Retry path. Whether we revert the tree depends on the
+                    // step's retry strategy (Step 22):
+                    //  - `Rollback`: revert partial changes before the retry
+                    //    (today's behavior, now opt-in).
+                    //  - `Keep`: leave the dirty tree so the next attempt
+                    //    builds on it. EDGE CASE: if the crashed harness had
+                    //    already committed (agent_committed_clean), leaving
+                    //    that commit in HEAD would orphan it AND let the
+                    //    eventual success path add a *second* step commit on
+                    //    top. Mixed-reset back to the pre-attempt HEAD so the
+                    //    work survives as uncommitted changes (Keep's
+                    //    contract) with no orphan commit — see the detailed
+                    //    rationale on the test-failed retry branch below.
+                    let rolled_back = match retry_strategy {
+                        RetryStrategy::Rollback => {
+                            if has_changes {
+                                write_phase(
+                                    conn,
+                                    plan,
+                                    &step.id,
+                                    step_num,
+                                    attempt,
+                                    max_attempts,
+                                    Some(exec_log.id),
+                                    Phase::Rollback,
+                                    None,
+                                    ChildUpdate::Clear,
+                                    exec_opts.json_output,
+                                )?;
+                                git::rollback_except(workdir, &pre_existing_untracked)?;
+                            }
+                            has_changes
+                        }
+                        RetryStrategy::Keep => {
+                            if agent_committed_clean
+                                && let Some(before) = &head_before_harness
+                            {
+                                git::reset_mixed_to(workdir, before)?;
+                            }
+                            false
+                        }
+                    };
                     storage::update_execution_log(
                         conn,
                         exec_log.id,
                         Some(duration_secs),
                         diff.as_deref(),
                         &test_results,
-                        has_changes, // rolled_back iff there were changes
+                        rolled_back,
                         false,
                         None,
                         Some(&output.stdout),
@@ -1477,6 +1525,7 @@ pub async fn execute_step(
                     prev_diff = diff;
                     prev_test_output = Some(test_results.join("\n"));
                     prev_files_modified = changed_files;
+                    prev_failure_reason = Some("harness exited non-zero".to_string());
                     continue;
                 }
 
@@ -1935,23 +1984,89 @@ pub async fn execute_step(
                     .await;
                 }
 
-                // Retry: rollback, log failure, stash context for next attempt.
-                if has_changes {
-                    write_phase(
-                        conn,
-                        plan,
-                        &step.id,
-                        step_num,
-                        attempt,
-                        max_attempts,
-                        Some(exec_log.id),
-                        Phase::Rollback,
-                        None,
-                        ChildUpdate::Clear,
-                        exec_opts.json_output,
-                    )?;
-                    git::rollback_except(workdir, &pre_existing_untracked)?;
-                }
+                // Retry path. Reverting the tree is now strategy-gated
+                // (Step 22):
+                //
+                //  - `Rollback` (opt-in): revert the failed attempt's diff
+                //    before retrying — exactly today's behavior. The
+                //    rolled-back diff/files are fed into the next prompt via
+                //    `RetryContext` so the agent can learn from work it no
+                //    longer sees on disk.
+                //
+                //  - `Keep` (default): do NOT revert. The dirty tree carries
+                //    forward so the next attempt builds directly on the prior
+                //    work (which it reads via `git diff`, not the prompt).
+                //
+                // EDGE CASE — `agent_committed_clean` under `Keep`
+                // (review will scrutinize this): if the agent committed its
+                // own work, the worktree is clean but HEAD advanced. Under
+                // `Keep` we must NOT discard that work, but we also must NOT
+                // leave the agent's commit sitting in HEAD, because:
+                //   1. It would be an orphan, off-contract commit (ralph owns
+                //      step commits; provenance metadata would be missing).
+                //   2. When a later attempt succeeds, the success path
+                //      (`stage_except` + `commit_staged`) would add a SECOND
+                //      commit on top of the agent's — a double-commit for one
+                //      step.
+                //   3. If instead the later attempt produced no *new* changes
+                //      (the agent had already committed everything), the
+                //      success path's `has_changes` gate would be false and
+                //      we'd loop on `agent_committed_clean` forever, never
+                //      succeeding.
+                // Fix: `git reset --mixed` back to the pre-attempt HEAD
+                // (`head_before_harness`). That un-commits the agent's commit
+                // but leaves every changed file on disk as uncommitted work —
+                // precisely `Keep`'s contract. The next attempt sees the
+                // carried-forward changes via `git diff`; whichever attempt
+                // ultimately passes runs the normal single `stage_except` +
+                // `commit_staged`, yielding exactly ONE coherent `ralph:`
+                // step commit with no orphan and no "nothing to commit"
+                // failure. The final-success commit logic is therefore
+                // unchanged — it always operates on an un-committed dirty
+                // tree, regardless of whether a prior Keep attempt's agent
+                // had committed.
+                let rolled_back = match retry_strategy {
+                    RetryStrategy::Rollback => {
+                        if has_changes {
+                            write_phase(
+                                conn,
+                                plan,
+                                &step.id,
+                                step_num,
+                                attempt,
+                                max_attempts,
+                                Some(exec_log.id),
+                                Phase::Rollback,
+                                None,
+                                ChildUpdate::Clear,
+                                exec_opts.json_output,
+                            )?;
+                            git::rollback_except(workdir, &pre_existing_untracked)?;
+                        }
+                        has_changes
+                    }
+                    RetryStrategy::Keep => {
+                        if agent_committed_clean
+                            && let Some(before) = &head_before_harness
+                        {
+                            write_phase(
+                                conn,
+                                plan,
+                                &step.id,
+                                step_num,
+                                attempt,
+                                max_attempts,
+                                Some(exec_log.id),
+                                Phase::Rollback,
+                                None,
+                                ChildUpdate::Clear,
+                                exec_opts.json_output,
+                            )?;
+                            git::reset_mixed_to(workdir, before)?;
+                        }
+                        false
+                    }
+                };
                 let test_output_summary = test_result_strings.join("\n");
                 // This row describes *this* attempt's termination even though
                 // the step will retry — record why this attempt failed. Same
@@ -1973,7 +2088,7 @@ pub async fn execute_step(
                     Some(duration_secs),
                     diff.as_deref(),
                     &test_result_strings,
-                    has_changes, // rolled_back only if there were changes
+                    rolled_back, // strategy-gated (see retry branch above)
                     false,       // not committed
                     None,
                     Some(&output.stdout),
@@ -1988,6 +2103,20 @@ pub async fn execute_step(
                 prev_diff = diff;
                 prev_test_output = Some(test_output_summary);
                 prev_files_modified = changed_files;
+                // Human-readable reason mirrors the termination classification
+                // so the Keep prompt (which omits the diff) still states what
+                // went wrong.
+                prev_failure_reason = Some(
+                    match retry_term {
+                        TerminationReason::NoChanges if agent_committed_clean => {
+                            "agent committed its own work instead of leaving \
+                             changes for ralph (worktree clean, HEAD advanced)"
+                        }
+                        TerminationReason::NoChanges => "no changes produced",
+                        _ => "tests failed",
+                    }
+                    .to_string(),
+                );
             }
 
             WaitResult::Timeout { stdout, stderr } => {
@@ -5591,6 +5720,430 @@ mod tests {
             logs[0].test_results,
         );
         assert!(!logs[0].committed);
+    }
+
+    // ---- Step 22: RetryStrategy honored in the retry loop ----
+
+    /// Count the commits reachable from HEAD (for double-commit assertions).
+    #[cfg(test)]
+    fn commit_count(workdir: &std::path::Path) -> usize {
+        use std::process::Command;
+        let out = Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(workdir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// `Keep` (the default) must NOT roll back between failed attempts: the
+    /// dirty tree carries forward so the next attempt builds on it. The
+    /// harness appends one line to a tracked file per invocation; the
+    /// deterministic test only passes once the file has TWO lines. With Keep,
+    /// attempt 1's line survives into attempt 2 (no rollback), attempt 2
+    /// appends the second line, the test passes, and exactly ONE step commit
+    /// results.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_keep_strategy_preserves_dirty_tree_between_attempts() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        // Seed a tracked file the harness will append to.
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "seed"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base_commits = commit_count(&dir);
+
+        // Harness: append exactly one line per invocation. No commit.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("append-harness.sh");
+        let script = format!(
+            "#!/bin/sh\necho line >> {0}/acc.txt\nexit 0\n",
+            dir.to_string_lossy()
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        // Test passes only when acc.txt has exactly two lines — i.e. attempt
+        // 1's append survived (no rollback) AND attempt 2 appended again.
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        // max_retries = 1 → 2 attempts. retry_strategy left None on both
+        // levels → resolves to the default `Keep`.
+        let (mut step, _) = storage::create_step(
+            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+        )
+        .unwrap();
+        assert_eq!(
+            step.effective_retry_strategy(&plan),
+            RetryStrategy::Keep,
+            "default strategy must be Keep"
+        );
+        step.retry_strategy = None;
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Success,
+            "Keep must carry attempt 1's append into attempt 2 so the \
+             2-line test passes on attempt 2",
+        );
+        assert_eq!(result.attempts_used, 2);
+        // Exactly one new commit (the step commit) — the carried-forward
+        // line + the new line collapse into a single coherent commit.
+        assert_eq!(
+            commit_count(&dir),
+            base_commits + 1,
+            "exactly one step commit; no double-commit"
+        );
+        let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
+        assert_eq!(
+            final_lines.lines().count(),
+            2,
+            "both attempts' appends are present (no rollback under Keep)"
+        );
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        // Attempt 1 failed and did NOT roll back under Keep.
+        let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
+        assert!(
+            !a1.rolled_back,
+            "Keep must not roll back the failed attempt"
+        );
+    }
+
+    /// `Rollback` preserves today's behavior: the failed attempt's tree is
+    /// reverted before the retry, and the rolled-back diff is fed into the
+    /// next attempt's prompt. Same harness/test as the Keep test; because
+    /// attempt 1 is rolled back, attempt 2 starts clean, can only reach ONE
+    /// line, the 2-line test never passes, and the step fails terminally.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_rollback_strategy_clears_tree_and_feeds_diff() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "seed"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("append-harness.sh");
+        let script = format!(
+            "#!/bin/sh\necho line >> {0}/acc.txt\nexit 0\n",
+            dir.to_string_lossy()
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (mut step, _) = storage::create_step(
+            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+        )
+        .unwrap();
+        // Force the step-level strategy to Rollback.
+        step.retry_strategy = Some(RetryStrategy::Rollback);
+        assert_eq!(
+            step.effective_retry_strategy(&plan),
+            RetryStrategy::Rollback
+        );
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Failed,
+            "Rollback reverts attempt 1, so attempt 2 can only reach one \
+             line and the 2-line test never passes",
+        );
+        assert_eq!(result.attempts_used, 2);
+        // acc.txt is back to its committed (empty) state — rolled back.
+        let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
+        assert_eq!(
+            final_lines.lines().count(),
+            0,
+            "Rollback must revert the failed attempt's tree"
+        );
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
+        assert!(
+            a1.rolled_back,
+            "Rollback must roll back the failed attempt"
+        );
+        // Attempt 2's prompt must carry the rolled-back diff (so the agent
+        // can learn from work it no longer sees on disk).
+        let a2 = logs.iter().find(|l| l.attempt == 2).unwrap();
+        let a2_prompt = a2.prompt_text.as_deref().unwrap_or("");
+        assert!(
+            a2_prompt.contains("# Retry Context"),
+            "attempt 2 prompt must include the retry context"
+        );
+        assert!(
+            a2_prompt.contains("## Previous Diff"),
+            "Rollback must feed the rolled-back diff into the next prompt; \
+             got prompt:\n{a2_prompt}"
+        );
+    }
+
+    /// EDGE CASE (Step 22): under `Keep`, attempt 1's agent commits its own
+    /// work and the test then fails (agent_committed_clean). We must NOT roll
+    /// back (Keep), but we also must NOT leave the agent's commit in HEAD —
+    /// otherwise the eventual success commit would be a SECOND commit on top
+    /// of it. The fix mixed-resets to the pre-attempt HEAD, so attempt 1's
+    /// work survives as uncommitted changes; attempt 2 adds its line and the
+    /// success path produces exactly ONE coherent step commit (no
+    /// double-commit, no orphan agent commit, no "nothing to commit").
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_keep_agent_committed_clean_single_final_commit() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "seed"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base_commits = commit_count(&dir);
+        let base_head = crate::git::get_commit_hash(&dir).unwrap();
+
+        // A counter so the harness behaves differently per invocation.
+        let shared = TempDir::new().unwrap();
+        let count_path = shared.path().join("n.txt");
+
+        // Invocation 1: append line1 AND commit it (agent_committed_clean).
+        // Invocation 2+: append another line, do NOT commit.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("commit-then-dirty.sh");
+        let script = format!(
+            "#!/bin/sh\n\
+             echo x >> {count}\n\
+             N=$(wc -l < {count})\n\
+             echo line >> {acc}\n\
+             if [ \"$N\" -eq 1 ]; then\n\
+               cd {dir}\n\
+               git add -A\n\
+               git -c user.email=a@a -c user.name=a commit -m 'agent commit' >/dev/null\n\
+             fi\n\
+             exit 0\n",
+            count = count_path.to_string_lossy(),
+            acc = dir.join("acc.txt").to_string_lossy(),
+            dir = dir.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        // Passes only when acc.txt has two lines (attempt 1's carried-forward
+        // line + attempt 2's new line).
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+        )
+        .unwrap();
+        // Default → Keep.
+        assert_eq!(step.effective_retry_strategy(&plan), RetryStrategy::Keep);
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Success,
+            "attempt 2 should pass once attempt 1's (un-committed) line is \
+             carried forward and a second line is added",
+        );
+        assert_eq!(result.attempts_used, 2);
+        // THE key assertion: exactly ONE new commit total. The agent's
+        // attempt-1 commit was mixed-reset away (un-committed but kept on
+        // disk), so the only new commit is the single ralph step commit.
+        assert_eq!(
+            commit_count(&dir),
+            base_commits + 1,
+            "exactly one step commit — no double-commit, no orphan agent commit"
+        );
+        // The single new commit is ralph's step commit, parented on base.
+        let head = crate::git::get_commit_hash(&dir).unwrap();
+        assert_ne!(head, base_head);
+        assert_eq!(
+            result.commit_hash.as_deref(),
+            Some(head.as_str()),
+            "the success commit is the step commit ralph created"
+        );
+        let msg = {
+            let out = std::process::Command::new("git")
+                .args(["log", "-1", "--pretty=%s"])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert!(
+            msg.starts_with("ralph: Acc"),
+            "the final commit must be ralph's step commit, not the agent's \
+             orphan 'agent commit'; got: {msg}"
+        );
+        // Attempt 1 failed as agent_committed_clean → classified NoChanges,
+        // and Keep did NOT roll back (the mixed-reset is not a rollback of
+        // the working tree — the line is still there).
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
+        assert_eq!(a1.termination_reason, Some(TerminationReason::NoChanges));
+        let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
+        assert_eq!(
+            final_lines.lines().count(),
+            2,
+            "both attempts' lines are present in the final tree"
+        );
     }
 
     /// Optional policy + no tests configured + no changes → Success with
