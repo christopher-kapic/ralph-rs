@@ -2085,6 +2085,88 @@ pub fn topo_sort_plans(conn: &Connection, plan_ids: &[String]) -> Result<Vec<Str
 }
 
 // ---------------------------------------------------------------------------
+// Step dependency operations
+// ---------------------------------------------------------------------------
+
+/// Record that `step_id` depends on `depends_on_step_id`.
+///
+/// A direct structural clone of [`add_plan_dependency`] against the V25
+/// `step_dependencies` table (docs/dag-redesign.md §3.1). Bails with a
+/// user-friendly error if the two IDs are the same (mirroring the table's
+/// self-edge `CHECK`). Cycle rejection is intentionally *not* performed here —
+/// the cycle-safe variant lands in the next step via `would_create_step_cycle`.
+///
+/// The CLI/scheduler callers land in later DAG-redesign steps (`ralph step
+/// dependency`, `--depends-on`, the topological scheduler); until then tests
+/// are the only consumers, so `#[allow(dead_code)]` marks the binary surface
+/// area, not the function itself.
+#[allow(dead_code)]
+pub fn add_step_dependency(
+    conn: &Connection,
+    step_id: &str,
+    depends_on_step_id: &str,
+) -> Result<()> {
+    if step_id == depends_on_step_id {
+        anyhow::bail!("A step cannot depend on itself");
+    }
+
+    conn.execute(
+        "INSERT INTO step_dependencies (step_id, depends_on_step_id) VALUES (?1, ?2)",
+        params![step_id, depends_on_step_id],
+    )
+    .with_context(|| {
+        format!("Failed to add dependency {step_id} -> {depends_on_step_id}")
+    })?;
+
+    Ok(())
+}
+
+/// Remove a specific step-dependency edge. No-op if the row does not exist.
+#[allow(dead_code)] // CLI/scheduler callers land in later DAG-redesign steps.
+pub fn remove_step_dependency(
+    conn: &Connection,
+    step_id: &str,
+    depends_on_step_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM step_dependencies WHERE step_id = ?1 AND depends_on_step_id = ?2",
+        params![step_id, depends_on_step_id],
+    )
+    .with_context(|| {
+        format!("Failed to remove dependency {step_id} -> {depends_on_step_id}")
+    })?;
+    Ok(())
+}
+
+/// List the step IDs that `step_id` directly depends on.
+#[allow(dead_code)] // CLI/scheduler callers land in later DAG-redesign steps.
+pub fn list_step_dependencies(conn: &Connection, step_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT depends_on_step_id FROM step_dependencies WHERE step_id = ?1 ORDER BY depends_on_step_id ASC",
+    )?;
+    let rows = stmt.query_map(params![step_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// List the step IDs that directly depend on `step_id` (reverse edges).
+#[allow(dead_code)] // CLI/scheduler callers land in later DAG-redesign steps.
+pub fn list_step_dependents(conn: &Connection, step_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT step_id FROM step_dependencies WHERE depends_on_step_id = ?1 ORDER BY step_id ASC",
+    )?;
+    let rows = stmt.query_map(params![step_id], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Step hook operations
 // ---------------------------------------------------------------------------
 
@@ -4683,6 +4765,112 @@ mod tests {
         add_plan_dependency(&conn, &ids[0], &ids[1]).unwrap();
 
         assert!(!would_create_cycle(&conn, &ids[0], &ids[2]).unwrap());
+    }
+
+    // -- Step dependency tests --
+
+    /// Create one plan plus `n` steps named s1..sn in it; return the step IDs.
+    fn make_steps(conn: &Connection, n: usize) -> Vec<String> {
+        let plan = create_plan(conn, "sp", "/proj", "branch", "desc", None, None, &[])
+            .expect("create_plan");
+        (1..=n)
+            .map(|i| {
+                create_step(
+                    conn,
+                    &plan.id,
+                    &format!("s{i}"),
+                    "d",
+                    None,
+                    None,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("create_step")
+                .0
+                .id
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_add_step_dependency_happy_path() {
+        let conn = setup();
+        let ids = make_steps(&conn, 2);
+
+        add_step_dependency(&conn, &ids[0], &ids[1]).expect("add dep");
+
+        let deps = list_step_dependencies(&conn, &ids[0]).unwrap();
+        assert_eq!(deps, vec![ids[1].clone()]);
+    }
+
+    #[test]
+    fn test_add_step_dependency_rejects_self_reference() {
+        let conn = setup();
+        let ids = make_steps(&conn, 1);
+
+        let err = add_step_dependency(&conn, &ids[0], &ids[0]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("cannot depend on itself"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_remove_step_dependency() {
+        let conn = setup();
+        let ids = make_steps(&conn, 2);
+
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        assert_eq!(list_step_dependencies(&conn, &ids[0]).unwrap().len(), 1);
+
+        remove_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        assert!(list_step_dependencies(&conn, &ids[0]).unwrap().is_empty());
+
+        // Removing a non-existent edge is a no-op.
+        remove_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+    }
+
+    #[test]
+    fn test_list_step_dependencies_and_dependents() {
+        let conn = setup();
+        let ids = make_steps(&conn, 3);
+
+        // s1 depends on s2 and s3.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_step_dependency(&conn, &ids[0], &ids[2]).unwrap();
+
+        let mut deps = list_step_dependencies(&conn, &ids[0]).unwrap();
+        deps.sort();
+        let mut expected = vec![ids[1].clone(), ids[2].clone()];
+        expected.sort();
+        assert_eq!(deps, expected);
+
+        // s2 and s3 should both see s1 as a dependent.
+        let dependents_s2 = list_step_dependents(&conn, &ids[1]).unwrap();
+        assert_eq!(dependents_s2, vec![ids[0].clone()]);
+
+        let dependents_s3 = list_step_dependents(&conn, &ids[2]).unwrap();
+        assert_eq!(dependents_s3, vec![ids[0].clone()]);
+
+        // s1 has no dependents.
+        assert!(list_step_dependents(&conn, &ids[0]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_step_dependency_cascades_on_step_delete() {
+        let conn = setup();
+        let ids = make_steps(&conn, 2);
+
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        assert_eq!(list_step_dependencies(&conn, &ids[0]).unwrap().len(), 1);
+
+        // V25's ON DELETE CASCADE drops dependent edges with the step.
+        delete_step(&conn, &ids[1]).unwrap();
+        assert!(list_step_dependencies(&conn, &ids[0]).unwrap().is_empty());
     }
 
     #[test]
