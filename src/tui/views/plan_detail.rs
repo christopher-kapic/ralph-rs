@@ -937,6 +937,8 @@ mod tests {
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
         }
     }
 

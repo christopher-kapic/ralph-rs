@@ -2845,8 +2845,10 @@ pub(crate) fn plan_detail_apply_skip(
 /// Decides whether to open the [`crate::tui::skip_dialog`] before skipping.
 ///
 /// Case A — the step is currently running (status `InProgress` and a run is
-/// live for this plan): the skip is routed through the cancel ladder
-/// ([`runner::skip_step`] → `request_skip_in_flight`), killing the harness.
+/// live for this plan): the skip is routed through [`runner::skip_step`],
+/// which (since the runner is a separate subprocess from the TUI) writes the
+/// cross-process skip-request row the runner polls mid-attempt and funnels
+/// into the cancel ladder, killing the harness.
 /// If the tree is clean (or holds only the user's pre-existing untracked
 /// scratch) the step is just marked Skipped with no dialog. If the tree is
 /// dirty with step-attributable work, the dialog opens
@@ -7222,6 +7224,8 @@ mod plan_detail_init_tests {
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
         }
     }
 
@@ -8068,6 +8072,8 @@ mod step_detail_dispatcher_tests {
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -9027,6 +9033,8 @@ mod sub_view_routing_tests {
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
         };
         let steps = vec![Step {
             id: "step-1".to_string(),
@@ -9448,6 +9456,8 @@ mod mouse_routing_tests {
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
         };
         PlanDetailApp::new(plan, Vec::new(), &Config::default())
     }
@@ -9470,6 +9480,8 @@ mod mouse_routing_tests {
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
         };
         let step = Step {
             id: "step-1".to_string(),

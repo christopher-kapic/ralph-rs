@@ -538,6 +538,33 @@ pub enum ParkStrategyKind {
     Cancel,
 }
 
+impl ParkStrategyKind {
+    /// Stable lowercase token used to serialize the kind into
+    /// `plans.skip_changes` for the cross-process skip bridge. Round-trips
+    /// with [`ParkStrategyKind::from_token`].
+    pub fn as_token(&self) -> &'static str {
+        match self {
+            ParkStrategyKind::Stash => "stash",
+            ParkStrategyKind::Commit => "commit",
+            ParkStrategyKind::Discard => "discard",
+            ParkStrategyKind::Cancel => "cancel",
+        }
+    }
+
+    /// Parse a token written by [`ParkStrategyKind::as_token`]. An
+    /// unrecognized value resolves to `Stash` so a corrupt/forward-compat
+    /// `skip_changes` value can never make a skip silently destroy work.
+    pub fn from_token(s: &str) -> ParkStrategyKind {
+        match s {
+            "commit" => ParkStrategyKind::Commit,
+            "discard" => ParkStrategyKind::Discard,
+            "cancel" => ParkStrategyKind::Cancel,
+            // "stash" and anything unexpected → the non-destructive default.
+            _ => ParkStrategyKind::Stash,
+        }
+    }
+}
+
 /// How [`park_changes`] should dispose of the working-tree changes left
 /// behind when a step is skipped mid-run.
 #[derive(Debug, Clone, PartialEq, Eq)]

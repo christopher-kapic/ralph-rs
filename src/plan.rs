@@ -415,13 +415,14 @@ impl std::str::FromStr for TestStatus {
 /// Matches the physical table layout after all migrations: V1 defined every
 /// column through `updated_at`, V5 appended `plan_harness`,
 /// V16 appended `questions_enabled`, V18 appended `pause_requested`,
-/// V19 appended `last_run_branch`, and V20 appended `last_run_started_at`
+/// V19 appended `last_run_branch`, V20 appended `last_run_started_at`,
+/// and V23 appended `skip_requested_step_id` + `skip_changes`
 /// via `ALTER TABLE ... ADD COLUMN`. V10's `prompt_prefix`/`prompt_suffix`
 /// and V14's `context_prepend` were dropped again by V21 (preserving the
 /// physical order of the remaining columns). Every `Plan`-returning query
 /// MUST use this list so [`Plan::from_row`]'s indices line up — a raw
 /// `SELECT *` would otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at";
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -471,6 +472,22 @@ pub struct Plan {
     /// `questions_enabled` or `pause_requested`). `None` for never-run plans.
     #[serde(default)]
     pub last_run_started_at: Option<String>,
+    /// Step UUID of a pending cross-process skip request, or `None` when no
+    /// skip is pending. Written by `ralph skip` / the TUI skip dialog (a
+    /// *different* process from the runner that owns the in-flight harness);
+    /// the runner reads + clears it mid-attempt and, when it matches the
+    /// in-flight step, funnels into the same executor skip path the
+    /// same-process cancel registry uses. Scoped to a step id (not a bare
+    /// boolean) so a stale request can never skip the wrong step.
+    #[serde(default)]
+    pub skip_requested_step_id: Option<String>,
+    /// Serialized [`crate::git::ParkStrategyKind`]
+    /// (`stash`|`commit`|`discard`|`cancel`) the operator chose for the
+    /// pending skip. `None` when no skip is pending; an unrecognized value
+    /// is treated as the safe `Stash` default by the consumer so a skip
+    /// never silently destroys work.
+    #[serde(default)]
+    pub skip_changes: Option<String>,
 }
 
 impl Plan {
@@ -480,7 +497,7 @@ impl Plan {
     /// id, slug, project, branch_name, description, status, harness, agent,
     /// deterministic_tests, created_at, updated_at, plan_harness,
     /// questions_enabled, pause_requested, last_run_branch,
-    /// last_run_started_at
+    /// last_run_started_at, skip_requested_step_id, skip_changes
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -525,6 +542,8 @@ impl Plan {
             pause_requested: pause_requested_int != 0,
             last_run_branch: row.get(14)?,
             last_run_started_at: row.get(15)?,
+            skip_requested_step_id: row.get(16)?,
+            skip_changes: row.get(17)?,
         })
     }
 }

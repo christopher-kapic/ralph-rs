@@ -339,6 +339,17 @@ async fn finalize_failure(
     termination_reason: TerminationReason,
     test_status: TestStatus,
 ) -> Result<StepResult> {
+    // Fix 3 (defensive, general): every non-skip terminal failure funnels
+    // through here (Timeout, HarnessFailed, terminal test failure, the
+    // `WaitResult::Aborted` arm). If a `Skipped` reason was pending but the
+    // attempt finalized via one of these non-skip arms (e.g. a Skipped that
+    // raced and lost the `select!` to a timeout), the global park-kind slot
+    // + cancel channel would still carry it and bleed into the next
+    // attempt/step. Clear it here. A no-op unless a stale `Skipped` is
+    // latched, and it deliberately never disturbs a pending `Aborted` (the
+    // legitimate whole-run shutdown must survive this call).
+    crate::signal::clear_pending_skip_state();
+
     // Rollback any uncommitted changes, preserving pre-existing untracked files.
     let rolled_back = if git::has_uncommitted_changes(ctx.workdir)? {
         // Record the rollback phase before invoking git so an external
@@ -688,6 +699,75 @@ async fn finalize_skipped(
     })
 }
 
+/// Outcome of [`handle_skipped_attempt`].
+enum SkipDisposition {
+    /// The step was finalized (Skipped). Bubble this `StepResult` straight
+    /// out of `execute_step`.
+    Finalized(StepResult),
+    /// The TUI skip dialog's Esc/cancel path: the attempt was undone with no
+    /// retry budget consumed. The caller must step `attempt` back by one and
+    /// re-enter the loop at the same attempt number.
+    Reenter,
+}
+
+/// Shared skip handling for a `Skipped` cancel reason — used both by the
+/// `WaitResult::Skipped` arm (the harness was killed by the cancel ladder)
+/// and by the natural-exit-vs-skip race branch in `WaitResult::Completed`
+/// (the harness exited on its own in the very `select!` poll a `Skipped`
+/// cancel landed in, so `select!` picked `child.wait()` and we never got a
+/// `WaitResult::Skipped`). Routing both through one function guarantees the
+/// race resolves to *skip this step and advance* — never the whole-run
+/// `Aborted` path — and that there is exactly one `execution_logs` row.
+///
+/// Authoritatively consumes the requested park kind exactly once (the single
+/// `take` happens-after the cancel watch fired, so the stored value is
+/// visible). `Cancel` → undo the attempt with no budget consumed (re-enter);
+/// `Stash`/`Commit`/`Discard` (or a `None` slot → `Stash`) → finalize the
+/// step Skipped.
+async fn handle_skipped_attempt(
+    ctx: &ExecCtx<'_>,
+    conn: &Connection,
+    exec_log_id: i64,
+    duration_secs: f64,
+    attempt: i32,
+    stdout: &str,
+    stderr: &str,
+) -> Result<SkipDisposition> {
+    let requested_kind = crate::signal::take_requested_park_kind();
+    if requested_kind == Some(crate::git::ParkStrategyKind::Cancel) {
+        cancel_skipped_attempt(ctx, exec_log_id, attempt)?;
+        // Reset the persisted attempt counter — `set_step_attempts` was
+        // bumped before the harness spawned; leaving it would make a later
+        // resume think the budget was consumed.
+        set_step_attempts(conn, &ctx.step.id, attempt - 1)?;
+        storage::update_step_status(conn, &ctx.step.id, StepStatus::InProgress)?;
+        return Ok(SkipDisposition::Reenter);
+    }
+    // A `None` slot (cross-process skip that couldn't record a choice)
+    // resolves to `Stash` so a skip never silently destroys work.
+    let park_kind = requested_kind.unwrap_or(crate::git::ParkStrategyKind::Stash);
+    let result = finalize_skipped(
+        ctx,
+        exec_log_id,
+        duration_secs,
+        attempt,
+        stdout,
+        stderr,
+        park_kind,
+    )
+    .await?;
+    // Reset the cancel watch channel now that this step is terminally
+    // Skipped. The skip tripped the channel to `Some(Skipped)`; without
+    // resetting it, the *next* step's pre-attempt cancel check
+    // (`finalize_precancel`) would observe the still-latched `Skipped` and
+    // immediately skip that step too (the cross-process-run regression:
+    // every subsequent step would skip in milliseconds). `cancel_skipped_attempt`
+    // already does this for the Esc/cancel path; the terminal-skip path
+    // needs it just the same.
+    crate::signal::clear_cancel_state();
+    Ok(SkipDisposition::Finalized(result))
+}
+
 /// Finalize an attempt that paused because the harness left unanswered
 /// `step_questions` rows behind (TUI-plan.md §17 "Runner integration").
 ///
@@ -942,7 +1022,15 @@ pub async fn execute_step(
         // that StepResult reports and the cancel has a visible audit trail.
         // `Aborted` (Ctrl+C) terminates the whole run; `Skipped` (a same-
         // process `ralph skip` of this step) drops only this step.
-        if let Some(reason) = *abort_rx.borrow() {
+        // Copy the reason out and DROP the borrow before calling
+        // `finalize_precancel`. Holding the `watch::Receiver::borrow()` read
+        // guard across the call would deadlock: `finalize_precancel` may
+        // reset the cancel channel (`clear_pending_skip_state` →
+        // `clear_cancel_state` → `Sender::send`), and `send` needs the watch
+        // *write* lock, which can never be acquired while this read guard is
+        // still alive on the same thread.
+        let pending_reason = *abort_rx.borrow();
+        if let Some(reason) = pending_reason {
             return finalize_precancel(conn, &step.id, attempt, reason);
         }
 
@@ -1197,13 +1285,68 @@ pub async fn execute_step(
                 max_bytes: exec_opts.chunk_max_bytes,
             });
         let emitters = build_chunk_emitters(chunk_emit);
-        let wait_result =
-            wait_with_timeout_and_abort(child, timeout, abort_rx.clone(), emitters).await;
+        // Race the harness wait against a DB poll for a *cross-process* skip
+        // request (the production path: `ralph skip` / the TUI run in a
+        // different process from this runner, so the same-process cancel
+        // registry can never reach us). When the poll sees a pending
+        // `plans.skip_requested_step_id` matching the step we have in-flight,
+        // it injects `CancelReason::Skipped` into our own cancel channel —
+        // the exact signal the same-process fast path uses — so the existing
+        // `wait_with_timeout_and_abort` → `WaitResult::Skipped` →
+        // `finalize_skipped`/`cancel_skipped_attempt` handling runs UNCHANGED.
+        // The poll future then parks forever so the wait future is the one
+        // that resolves the `select!` with the real `WaitResult`.
+        let wait_fut = wait_with_timeout_and_abort(child, timeout, abort_rx.clone(), emitters);
+        let poll_fut = poll_cross_process_skip(conn, &plan.id, &step.id);
+        tokio::pin!(wait_fut);
+        let wait_result = tokio::select! {
+            r = &mut wait_fut => r,
+            // poll_cross_process_skip only returns if polling errors out
+            // (e.g. the plan row vanished); in that case stop polling and
+            // just wait normally for the harness.
+            _ = poll_fut => wait_fut.await,
+        };
         let duration_secs = started_at.elapsed().as_secs_f64();
 
         match wait_result {
             WaitResult::Completed(output) => {
                 let output = output.context("Harness process failed")?;
+
+                // Natural-exit-vs-skip race (Fix 2). If a `Skipped` cancel
+                // landed in the very `select!` poll where `child.wait()` also
+                // became ready, `select!` may have picked the wait arm and
+                // produced `Completed` instead of `Skipped`. If we fell
+                // through to the test phase, the test runner would see the
+                // tripped cancel channel and abort, and `test_aborted` would
+                // route us into `finalize_failure(Aborted, UserInterrupted)`
+                // → `StepOutcome::Aborted` → the runner tears down the WHOLE
+                // run. That violates the invariant "Aborted ends the whole
+                // run; Skipped advances." So before any test work, inspect
+                // the cancel reason: a pending `Skipped` is routed through
+                // the exact same skip handling as `WaitResult::Skipped`
+                // (consume the park kind, finalize_skipped /
+                // cancel_skipped_attempt). Only a pending `Aborted` is left
+                // to drive the whole-run abort below.
+                if *abort_rx.borrow() == Some(CancelReason::Skipped) {
+                    match handle_skipped_attempt(
+                        &ctx,
+                        conn,
+                        exec_log.id,
+                        duration_secs,
+                        attempt,
+                        &output.stdout,
+                        &output.stderr,
+                    )
+                    .await?
+                    {
+                        SkipDisposition::Finalized(result) => return Ok(result),
+                        SkipDisposition::Reenter => {
+                            attempt -= 1;
+                            continue;
+                        }
+                    }
+                }
+
                 let parsed = parse_harness_json(&output.stdout);
 
                 // Check for changes.
@@ -1487,11 +1630,56 @@ pub async fn execute_step(
                     (test_passed, test_result_strings, test_aborted)
                 };
 
+                // If a cancel landed mid-test, the test runner will have
+                // killed its child and set `test_aborted`. The test runner
+                // can't tell *why* it was cancelled — it treats any reason
+                // as abort. But the disposition differs (Fix 2): a `Skipped`
+                // reason that landed during the test phase (after the
+                // top-of-arm check) must skip THIS step and advance, not
+                // tear the whole run down. Inspect the cancel reason and
+                // route a pending `Skipped` through the same skip handling
+                // as `WaitResult::Skipped`; only a pending `Aborted` (or no
+                // reason at all — a bare test-runner abort) drives the
+                // UserInterrupted whole-run abort below.
+                if test_aborted
+                    && *abort_rx.borrow() == Some(CancelReason::Skipped)
+                {
+                    // The test runner already rolled its own child; roll
+                    // back the worktree before parking so finalize_skipped's
+                    // park sees a consistent tree (mirrors the Aborted arm's
+                    // pre-finalize rollback intent).
+                    match handle_skipped_attempt(
+                        &ctx,
+                        conn,
+                        exec_log.id,
+                        duration_secs,
+                        attempt,
+                        &output.stdout,
+                        &output.stderr,
+                    )
+                    .await?
+                    {
+                        SkipDisposition::Finalized(result) => return Ok(result),
+                        SkipDisposition::Reenter => {
+                            attempt -= 1;
+                            continue;
+                        }
+                    }
+                }
+
                 // If Ctrl+C landed mid-test, the test runner will have killed
                 // its child; surface this as Aborted rather than a retry-worthy
                 // test failure. Capture partial test_results so the log row
                 // reflects what actually ran before the abort landed.
                 if test_aborted {
+                    // A `Skipped` reason was already handled above; reaching
+                    // here means `Aborted` (or a bare test-runner abort) —
+                    // the whole-run teardown path. Defensively clear any
+                    // pending-skip slot/cancel-state so a `Skipped` that
+                    // raced and lost can't bleed into a later attempt
+                    // (Fix 3). A no-op unless a stale `Skipped` is latched;
+                    // never disturbs the `Aborted` reason.
+                    crate::signal::clear_pending_skip_state();
                     if has_changes {
                         write_phase(
                             conn,
@@ -1528,6 +1716,18 @@ pub async fn execute_step(
                     )
                     .await;
                 }
+
+                // Fix 3 (defensive, general): past both `test_aborted`
+                // skip/abort checks, every remaining disposition of this
+                // `Completed` attempt is non-skip — success (returns just
+                // below), terminal failure (via `finalize_failure`, which
+                // also clears), or a retry (`continue`). If a `Skipped`
+                // reason raced in *after* the top-of-arm check but the step
+                // "beat" it (harness/tests finished first), it would
+                // otherwise leak its park kind into the next attempt/step.
+                // Clear it now. No-op unless a stale `Skipped` is latched;
+                // never disturbs a pending `Aborted`.
+                crate::signal::clear_pending_skip_state();
 
                 if test_passed && !has_changes {
                     // Optional-policy success path: tests either ran and
@@ -1873,39 +2073,30 @@ pub async fn execute_step(
                 // no `UNIQUE(step_id, attempt)` row.
                 //
                 // Authoritatively consume the requested park kind exactly
-                // once here, then branch / thread it down. Doing the single
-                // `take` at this point (after the cancel watch fired, which
-                // happens-after `request_skip_in_flight`'s store) guarantees
-                // we observe the stored value; `finalize_skipped` no longer
-                // does an independent second read that could race the store.
-                let requested_kind = crate::signal::take_requested_park_kind();
-                if requested_kind == Some(crate::git::ParkStrategyKind::Cancel) {
-                    cancel_skipped_attempt(&ctx, exec_log.id, attempt)?;
-                    // Re-enter at the SAME attempt: the loop bumps `attempt`
-                    // at the top, so step back one to neutralize that bump.
-                    attempt -= 1;
-                    // Reset the persisted attempt counter too — `set_step_attempts`
-                    // was bumped before the harness spawned; leaving it would
-                    // make a later resume think the budget was consumed.
-                    set_step_attempts(conn, &step.id, attempt)?;
-                    storage::update_step_status(conn, &step.id, StepStatus::InProgress)?;
-                    continue;
-                }
-                // A `None` slot (cross-process SIGTERM-style skip that
-                // couldn't record a choice) resolves to `Stash` so a skip
-                // never silently destroys work.
-                let park_kind =
-                    requested_kind.unwrap_or(crate::git::ParkStrategyKind::Stash);
-                return finalize_skipped(
+                // once here (inside `handle_skipped_attempt`), then branch /
+                // thread it down. Doing the single `take` at this point
+                // (after the cancel watch fired, which happens-after the
+                // park-kind store) guarantees we observe the stored value.
+                match handle_skipped_attempt(
                     &ctx,
+                    conn,
                     exec_log.id,
                     duration_secs,
                     attempt,
                     &stdout,
                     &stderr,
-                    park_kind,
                 )
-                .await;
+                .await?
+                {
+                    SkipDisposition::Finalized(result) => return Ok(result),
+                    SkipDisposition::Reenter => {
+                        // Re-enter at the SAME attempt: the loop bumps
+                        // `attempt` at the top, so step back one to
+                        // neutralize that bump.
+                        attempt -= 1;
+                        continue;
+                    }
+                }
             }
         }
     }
@@ -2185,6 +2376,64 @@ async fn wait_for_abort(rx: &mut watch::Receiver<CancelState>) -> CancelReason {
     }
 }
 
+/// How often the executor polls the DB for a cross-process skip request
+/// while a harness is in-flight. 250 ms is well under any human's
+/// skip→react expectation while adding negligible DB load (one indexed
+/// single-row `SELECT` per tick against the local SQLite file).
+const SKIP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Poll `plans.skip_requested_step_id` for a *cross-process* skip targeting
+/// the step we currently have in-flight, and — when found — funnel it into
+/// this process's own cancel channel so the existing
+/// `WaitResult::Skipped` machinery handles it unchanged.
+///
+/// This is the production half of the skip bridge. `ralph skip` and the TUI
+/// skip dialog run in a different process from the runner; they cannot reach
+/// the same-process cancel registry, so they write a durable request
+/// (`storage::request_skip`) that the runner — the process that actually
+/// owns the harness child — polls here.
+///
+/// On a match it `take`s the request (atomic read-and-clear) and calls
+/// [`crate::signal::inject_skip_with_kind`], which records the park kind and
+/// sends `CancelReason::Skipped` into the cancel watch channel
+/// `wait_with_timeout_and_abort` is already listening on. We then `pending()`
+/// forever so the *wait* future is the one that resolves the caller's
+/// `select!` (producing the real `WaitResult::Skipped` with captured
+/// output). A request that targets a *different* step is left in place
+/// (peek, not take) so it is honored when that step runs rather than wrongly
+/// consumed against the in-flight one.
+///
+/// Returns only on a polling error (e.g. the plan row vanished mid-run); the
+/// caller then falls back to a plain wait. A clean tree / no request just
+/// keeps ticking.
+async fn poll_cross_process_skip(conn: &Connection, plan_id: &str, step_id: &str) {
+    loop {
+        tokio::time::sleep(SKIP_POLL_INTERVAL).await;
+        match storage::peek_skip_request(conn, plan_id) {
+            Ok(Some((target_step_id, _))) if target_step_id == step_id => {
+                // The pending request targets the step we have in-flight.
+                // Consume it (read-and-clear) and inject into our own cancel
+                // channel; from here the existing same-process skip path
+                // takes over verbatim.
+                match storage::take_skip_request(conn, plan_id) {
+                    Ok(Some((taken_id, kind))) if taken_id == step_id => {
+                        crate::signal::inject_skip_with_kind(kind);
+                        // Let the wait future resolve the select!.
+                        std::future::pending::<()>().await;
+                    }
+                    // Lost a race to another consumer or it changed between
+                    // peek and take — keep polling.
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+            // No request, or it targets a different step — keep polling.
+            Ok(_) => {}
+            Err(_) => return,
+        }
+    }
+}
+
 /// Send a signal to the process group led by `pid`.
 ///
 /// `libc::kill` treats a negative pid as "send to process group <-pid>"; this
@@ -2354,6 +2603,16 @@ fn finalize_precancel(
         Some(TestStatus::NotRun),
     )?;
     storage::update_step_status(conn, step_id, step_status)?;
+    // Fix 3 (cross-process leak): a `Skipped` reason caught here at the
+    // pre-attempt check finalized THIS step without ever reaching the
+    // skip-handling arm that would normally clear the channel. Left
+    // latched, the next step's pre-attempt check would observe the same
+    // stale `Skipped` and skip it too (and the one after, …). Reset it now.
+    // An `Aborted` reason must NOT be cleared — the runner's between-step
+    // check still needs to see it to tear the whole run down.
+    if reason == CancelReason::Skipped {
+        crate::signal::clear_pending_skip_state();
+    }
     Ok(StepResult {
         outcome,
         step_id: step_id.to_string(),
@@ -3767,6 +4026,319 @@ mod tests {
         assert!(
             !logs[0].committed,
             "no work was kept on the skip path (committed must be false)"
+        );
+    }
+
+    /// Fix 2 — natural-exit vs skip race. If the harness exits *on its own*
+    /// in the same `select!` poll a `Skipped` cancel is already latched, the
+    /// `select!` may pick `child.wait()` → `WaitResult::Completed` instead of
+    /// `WaitResult::Skipped`. The test phase would then see the tripped
+    /// cancel channel, abort, and (pre-fix) drive
+    /// `finalize_failure(Aborted, UserInterrupted)` →
+    /// `StepOutcome::Aborted` → the runner tears down the WHOLE run.
+    ///
+    /// With the fix, *regardless* of which arm `select!` picks, the outcome
+    /// must be `Skipped` (this step only) — never `Aborted` — and there must
+    /// be exactly one execution_logs row (no finalize_failure +
+    /// finalize_skipped double-write). The cancel reason is set BEFORE
+    /// `execute_step` and the harness exits 0 immediately, so the race is
+    /// genuinely exercised; a deterministic test command + a produced change
+    /// make the pre-fix Aborted path the one that would otherwise be taken.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_natural_exit_with_pending_skip_resolves_to_skip_not_abort() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        // Serialize against other tests that mutate the process-global
+        // cancel registry / park-kind slot (same rationale as the signal
+        // module tests; current_thread runtime rules out guard transfer).
+        let _registry_guard = crate::signal::lock_exit_cleanup_test();
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let shared = TempDir::new().unwrap();
+        let marker_path = shared.path().join("started.marker");
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("quick-harness.sh");
+        // Announce we've started (so the skip task knows execute_step is
+        // past its pre-attempt cancel check and the harness is genuinely
+        // spawned), produce a change, then exit 0 after a tiny sleep —
+        // racing the harness's natural exit against the skip the task is
+        // about to fire. Whichever side of the `select!` wins, the invariant
+        // must hold: outcome Skipped, never Aborted, exactly one log row.
+        let script = format!(
+            "#!/bin/sh\n\
+             cat >/dev/null 2>&1 || true\n\
+             echo 'edit' >> {readme}\n\
+             : > {marker}\n\
+             sleep 0.2\n\
+             exit 0\n",
+            readme = dir.join("README.md").to_string_lossy(),
+            marker = marker_path.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        // Configure a deterministic test so the pre-fix Completed path would
+        // reach the test phase → test_aborted → Aborted.
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &["true".to_string()],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Step", "desc", None, None, &[], Some(0), None, None, None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "skip".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+
+        // Register the cancel channel + a park kind (mimicking
+        // `request_skip_in_flight`), but do NOT latch `Skipped` yet — that
+        // would trip the *pre-attempt* check and never exercise the
+        // natural-exit race. A task fires `Skipped` only once the harness
+        // has actually started (marker present), i.e. past the pre-attempt
+        // check, so the skip lands concurrently with the harness's exit.
+        let (tx, rx) = watch::channel(None);
+        crate::signal::install_skip_channel_for_test(tx.clone());
+        crate::signal::set_requested_park_kind_for_test(crate::git::ParkStrategyKind::Discard);
+
+        let marker_clone = marker_path.clone();
+        let tx_skip = tx.clone();
+        let skip_task = tokio::spawn(async move {
+            for _ in 0..200 {
+                if marker_clone.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = tx_skip.send(Some(CancelReason::Skipped));
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx.clone(),
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 10s")
+        .unwrap();
+
+        skip_task.await.ok();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Skipped,
+            "natural-exit-vs-skip race must resolve to Skipped (advance one step)"
+        );
+        assert_ne!(
+            result.outcome,
+            StepOutcome::Aborted,
+            "must NOT misclassify the race as a whole-run Aborted"
+        );
+
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Skipped);
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(
+            logs.len(),
+            1,
+            "exactly one execution_logs row (no finalize_failure + finalize_skipped double-write)"
+        );
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped),
+            "must record user_skipped, not user_interrupted"
+        );
+
+        // Fix 3: the terminal skip must have reset the cancel channel so a
+        // following step would NOT be swept by a stale `Skipped`.
+        assert!(
+            rx.borrow().is_none(),
+            "cancel channel must be cleared after a terminal skip so it \
+             does not bleed into the next step"
+        );
+        // …and the park-kind slot must be empty (consumed exactly once).
+        assert!(
+            crate::signal::take_requested_park_kind().is_none(),
+            "park-kind slot must be consumed exactly once on the skip path"
+        );
+    }
+
+    /// Fix 3 — park-kind slot leak on non-skip terminal arms. If a `Skipped`
+    /// reason was pending but the attempt finalized via a non-skip terminal
+    /// arm (here: the harness exits non-zero with no changes → terminal
+    /// `Failed`), the global park-kind slot and the cancel channel must be
+    /// cleared so they can't bleed into a later attempt/step. A pending
+    /// `Aborted`, by contrast, must survive (whole-run shutdown).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_non_skip_terminal_clears_pending_skip_state() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let _registry_guard = crate::signal::lock_exit_cleanup_test();
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("fail-harness.sh");
+        // Exit non-zero, no changes → HarnessFailed, terminal Failed (one
+        // attempt, max_retries 0). A genuinely non-skip terminal arm.
+        let script = "#!/bin/sh\nexit 3\n".to_string();
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Step", "desc", None, None, &[],
+            Some(0), // max_retries = 0 → a single attempt, terminal on failure
+            None, None, None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "skip".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+
+        // A `Skipped` reason that "raced and lost": latched, plus a stale
+        // park kind, but the attempt will finalize via the Failed terminal
+        // arm (the harness exits non-zero before any skip handling).
+        let (tx, rx) = watch::channel(None);
+        crate::signal::install_skip_channel_for_test(tx.clone());
+        crate::signal::set_requested_park_kind_for_test(crate::git::ParkStrategyKind::Commit);
+        tx.send(Some(CancelReason::Skipped)).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx.clone(),
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 10s")
+        .unwrap();
+
+        // The harness exits non-zero; depending on the select! race this is
+        // either a clean HarnessFailed or routed through the skip path. In
+        // BOTH cases the defensive cleanup must leave NO stale skip state.
+        assert!(
+            matches!(result.outcome, StepOutcome::Failed | StepOutcome::Skipped),
+            "expected Failed or Skipped, got {:?}",
+            result.outcome
+        );
+        assert!(
+            rx.borrow().is_none(),
+            "a non-skip terminal arm (or the skip path) must clear the \
+             latched Skipped so it can't leak into the next attempt/step"
+        );
+        assert!(
+            crate::signal::take_requested_park_kind().is_none(),
+            "the stale park-kind slot must be cleared on a non-skip terminal arm"
         );
     }
 

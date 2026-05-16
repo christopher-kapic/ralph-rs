@@ -32,6 +32,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v20,
     migrate_v21,
     migrate_v22,
+    migrate_v23,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -708,6 +709,37 @@ fn migrate_v22(conn: &Connection) -> Result<()> {
 
         ALTER TABLE project_settings DROP COLUMN prompt_prefix;
         ALTER TABLE project_settings DROP COLUMN prompt_suffix;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V23: cross-process skip bridge columns on plans
+// ---------------------------------------------------------------------------
+
+fn migrate_v23(conn: &Connection) -> Result<()> {
+    // `ralph skip` (and the TUI skip dialog) run in a *different process*
+    // from the runner that actually owns the in-flight harness child. The
+    // process-global cancel registry in `signal.rs` only works same-process,
+    // so a cross-process skip needs a durable hand-off the runner can poll —
+    // exactly like `plans.pause_requested` (added V18), but pause is a
+    // boolean and a skip must identify *which* step it targets so a stale
+    // request left behind by a race can't skip the wrong (next) step.
+    //
+    // `skip_requested_step_id` holds the step UUID the skip targets (NULL ==
+    // no pending skip). `skip_changes` holds the serialized
+    // `ParkStrategyKind` (`stash` | `commit` | `discard` | `cancel`) the
+    // operator chose via `--changes` / the TUI dialog. The runner reads +
+    // clears both atomically mid-attempt; on a match it funnels into the
+    // same executor skip path the same-process registry uses.
+    //
+    // Both nullable with no backfill: every pre-V23 plan reports NULL (no
+    // pending skip), which is the correct default.
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN skip_requested_step_id TEXT;
+        ALTER TABLE plans ADD COLUMN skip_changes TEXT;
         ",
     )?;
     Ok(())
@@ -2123,6 +2155,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lrs2.as_deref(), Some("2026-05-05T00:00:00.000Z"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v23_adds_skip_bridge_columns_to_plans() {
+        // Seed a pre-V23 DB with a plans row, run V23, and verify the
+        // existing row defaults both skip-bridge columns to NULL (no pending
+        // skip — the correct default), and that fresh values round-trip.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v22.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v22 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(22) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V23 applies. Pre-V23 row must default both columns NULL.
+        let conn = open_at(&path).unwrap();
+        let (sid, sch): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT skip_requested_step_id, skip_changes FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            sid.is_none() && sch.is_none(),
+            "pre-V23 plans must default skip-bridge columns to NULL (got {sid:?}, {sch:?})"
+        );
+
+        // Fresh inserts can carry explicit values; they round-trip.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, \
+             skip_requested_step_id, skip_changes) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", "step-uuid", "discard"],
+        )
+        .unwrap();
+        let (sid2, sch2): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT skip_requested_step_id, skip_changes FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sid2.as_deref(), Some("step-uuid"));
+        assert_eq!(sch2.as_deref(), Some("discard"));
 
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))

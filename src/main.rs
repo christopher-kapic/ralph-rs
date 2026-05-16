@@ -503,15 +503,21 @@ fn main() -> Result<()> {
             step: step_num,
             reason,
             changes,
-            force,
+            force: _force,
         } => {
             let plan = resolve_plan(&conn, plan_slug, &project, false)?;
 
-            // Acquire the same per-project run lock that `ralph run` uses, so
-            // skip can't race a concurrent run or resume.
-            let _run_lock =
-                run_lock::acquire(&conn, &project, Some(&plan.slug), Some(&plan.id), force)?;
-
+            // Deliberately NOT gated behind the per-project run lock. A live
+            // `ralph run` holds that lock for its entire duration; acquiring
+            // it here would make it impossible to skip the *currently
+            // running* step — the headline use case. `runner::skip_step`
+            // routes an in-flight skip through the cross-process DB bridge
+            // (`plans.skip_requested_step_id`), which the running runner
+            // polls and consumes mid-attempt; a non-running step is a plain
+            // synchronous DB flip. Both are single-row writes safe to race a
+            // concurrent run (same lock-free model as `ralph pause`). The
+            // legacy `--force` flag is accepted for compatibility but no
+            // longer has a lock to steal.
             runner::skip_step(&conn, &plan, step_num, reason.as_deref(), changes.into())?;
             Ok(())
         }

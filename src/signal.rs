@@ -79,6 +79,25 @@ fn register_active_cancel_tx(tx: watch::Sender<CancelState>) {
     *ACTIVE_CANCEL_TX.lock().unwrap() = Some(tx);
 }
 
+/// Test-only: publish a caller-owned cancel `Sender` into the process-global
+/// registry so executor code that reaches for `ACTIVE_CANCEL_TX`
+/// (`clear_cancel_state`, `clear_pending_skip_state`) operates on the very
+/// channel the test handed `execute_step`. Mirrors what
+/// `spawn_signal_listener` does for a real run, without spawning the signal
+/// listener task.
+#[cfg(test)]
+pub fn install_skip_channel_for_test(tx: watch::Sender<CancelState>) {
+    register_active_cancel_tx(tx);
+}
+
+/// Test-only: seed the park-kind slot exactly as `request_skip_in_flight`
+/// would, so a test can assert it is consumed/cleared on the skip and
+/// non-skip terminal paths.
+#[cfg(test)]
+pub fn set_requested_park_kind_for_test(kind: crate::git::ParkStrategyKind) {
+    *REQUESTED_PARK_KIND.lock().unwrap() = Some(kind);
+}
+
 /// Mark a step as in-flight (or not) for the in-process runner. Returns a
 /// guard-free toggle — the runner sets `true` immediately before
 /// `execute_step` and `false` immediately after.
@@ -138,6 +157,53 @@ pub fn request_skip_in_flight(park_kind: crate::git::ParkStrategyKind) -> bool {
             true
         }
         None => false,
+    }
+}
+
+/// Drive a skip into *this* process's own cancel channel.
+///
+/// This is the cross-process bridge's funnel point. `request_skip_in_flight`
+/// is for the *same-process* path (a `ralph skip` that shares a process with
+/// the blocking runner — only unit tests, in practice). In production the
+/// runner is its own process: it polls `plans.skip_requested_step_id` (see
+/// [`crate::storage::take_skip_request`]) mid-attempt and, when the pending
+/// request targets the step it currently has in-flight, calls this to record
+/// the park kind and inject [`CancelReason::Skipped`] into the very channel
+/// its own executor wait loop is listening on. From that point on, *all* of
+/// the existing, tested `WaitResult::Skipped` →
+/// `finalize_skipped`/`cancel_skipped_attempt` handling runs unchanged.
+///
+/// Unlike [`request_skip_in_flight`] there is no `step_in_flight()` gate: the
+/// caller is the runner itself, which by construction is mid-attempt for the
+/// step it just matched. Returns `true` if a cancel sender was registered
+/// (always the case for a real run), `false` otherwise.
+pub fn inject_skip_with_kind(park_kind: crate::git::ParkStrategyKind) -> bool {
+    let guard = ACTIVE_CANCEL_TX.lock().unwrap();
+    match guard.as_ref() {
+        Some(tx) => {
+            *REQUESTED_PARK_KIND.lock().unwrap() = Some(park_kind);
+            let _ = tx.send(Some(CancelReason::Skipped));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Clear a stale `Skipped` cancel reason **and** the park-kind slot, but
+/// only when a skip is what's latched — never disturb a pending
+/// `Aborted` (whole-run shutdown must survive). Defensive cleanup used by
+/// the executor's non-skip terminal arms so a `Skipped` that raced and lost
+/// can't leak into the next attempt/step (Fix 3).
+pub fn clear_pending_skip_state() {
+    let is_skip = {
+        let guard = ACTIVE_CANCEL_TX.lock().unwrap();
+        matches!(guard.as_ref(), Some(tx) if *tx.borrow() == Some(CancelReason::Skipped))
+    };
+    if is_skip {
+        // Drop any recorded park kind first so even if the channel reset
+        // races a fresh request, the slot doesn't carry a stale value.
+        let _ = REQUESTED_PARK_KIND.lock().unwrap().take();
+        clear_cancel_state();
     }
 }
 

@@ -1226,26 +1226,51 @@ pub fn skip_step(
         }
     }
 
-    // If the target is the step currently running in *this* process, route
-    // through the cancel ladder: signalling `Skipped` kicks the existing
-    // SIGTERM→SIGKILL ladder against the harness child, and the executor's
-    // wait loop then marks the step `Skipped` and writes the
-    // `user_skipped` execution-log row itself. We must NOT also flip the
-    // status here — that's the executor's job on this path, and a double
-    // write would race the in-flight attempt.
+    // If the target is the step currently running, the skip must interrupt
+    // the live harness — not just flip a DB status the running runner
+    // ignores. There are two transports, tried in order:
     //
-    // For any other case (the step isn't in-flight, or the runner is a
-    // different process entirely so no cancel sender is registered here),
-    // `request_skip_in_flight` returns false and we keep the original
-    // synchronous DB-flip behavior.
-    if step.status == StepStatus::InProgress
-        && crate::signal::request_skip_in_flight(changes)
-    {
-        eprintln!(
-            "Skipping in-flight step {} '{}' — interrupting the harness…",
-            actual_num, step.title
-        );
-        return Ok(actual_num);
+    //  1. Same-process fast path (`request_skip_in_flight`): only fires when
+    //     the skip and the blocking runner share a process. In production
+    //     they never do (the runner is always a separate subprocess from
+    //     `ralph skip` / the TUI), so this is effectively a unit-test-only
+    //     path — but it must keep working for those tests.
+    //
+    //  2. Cross-process DB bridge (`storage::request_skip`): the production
+    //     path. We write `plans.skip_requested_step_id` + `skip_changes`;
+    //     the runner that owns the in-flight harness polls it mid-attempt
+    //     (see `executor::poll_cross_process_skip`) and funnels it into the
+    //     SAME executor skip handling. Modeled on `plans.pause_requested`.
+    //     Crucially this write is NOT gated behind the per-project run lock
+    //     (a live run holds that lock for its whole duration), so it always
+    //     succeeds even while a run is in progress.
+    //
+    // On either in-flight path we must NOT flip the status here — the
+    // executor owns that on the skip path, and a double write would race the
+    // in-flight attempt.
+    if step.status == StepStatus::InProgress {
+        if crate::signal::request_skip_in_flight(changes) {
+            eprintln!(
+                "Skipping in-flight step {} '{}' — interrupting the harness…",
+                actual_num, step.title
+            );
+            return Ok(actual_num);
+        }
+
+        // Not same-process. If a run is genuinely live for this project,
+        // hand the skip off to it via the DB bridge.
+        let live = storage::get_live_run(conn, &plan.project)?;
+        if live.is_some() {
+            storage::request_skip(conn, &plan.id, &step.id, changes)?;
+            eprintln!(
+                "Requested skip of in-flight step {} '{}' — interrupting the harness…",
+                actual_num, step.title
+            );
+            return Ok(actual_num);
+        }
+        // No live run despite an InProgress status: this is a stale status
+        // (e.g. a crashed prior run). Fall through to the synchronous
+        // DB-flip below so the user's skip still takes effect.
     }
 
     // Not running here: the working tree's changes (if any) aren't causally
@@ -1843,6 +1868,8 @@ mod tests {
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
         }
     }
 
@@ -2984,6 +3011,8 @@ mod tests {
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -3021,6 +3050,8 @@ mod tests {
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -3607,6 +3638,8 @@ mod tests {
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -3667,6 +3700,8 @@ mod tests {
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");

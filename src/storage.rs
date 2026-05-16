@@ -460,6 +460,140 @@ pub fn take_plan_pause_requested(conn: &Connection, plan_id: &str) -> Result<boo
     Ok(was_set)
 }
 
+// ---------------------------------------------------------------------------
+// Cross-process skip bridge (V23)
+// ---------------------------------------------------------------------------
+//
+// `ralph skip` and the TUI skip dialog run in a *different process* from the
+// runner that owns the in-flight harness child. The process-global cancel
+// registry in `signal.rs` only works when the skip and the runner share a
+// process (e.g. unit tests). For production — where the runner is always a
+// separate subprocess from both the TUI and `ralph skip` — the skip is
+// handed off through `plans.skip_requested_step_id` / `plans.skip_changes`,
+// modeled directly on the `plans.pause_requested` precedent above. The
+// runner polls `take_skip_request` mid-attempt and, when the cleared
+// request's step id matches the in-flight step, funnels into the *same*
+// executor skip path the same-process registry uses.
+
+/// Record a pending skip for `step_id` in `plan_id` with the operator's
+/// chosen change-handling `kind`. Overwrites any prior pending request for
+/// the plan (a fresh skip supersedes a stale one). Bumps `updated_at` like
+/// the pause helper.
+///
+/// Deliberately *not* gated behind the per-project run lock: a run holds
+/// that lock for its entire duration, so requiring it here would make
+/// `ralph skip` impossible to issue against a live run — the exact case the
+/// bridge exists for. This mirrors `set_plan_pause_requested`, which is also
+/// lock-free.
+pub fn request_skip(
+    conn: &Connection,
+    plan_id: &str,
+    step_id: &str,
+    kind: crate::git::ParkStrategyKind,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET skip_requested_step_id = ?1, skip_changes = ?2, \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
+        params![step_id, kind.as_token(), plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// Atomically read the pending skip request for `plan_id` and, if present,
+/// clear it in the same transaction (read-and-clear, like
+/// [`take_plan_pause_requested`]). Returns `Some((step_id, kind))` when a
+/// request was pending on entry, `None` otherwise.
+///
+/// An unrecognized `skip_changes` token resolves to
+/// [`crate::git::ParkStrategyKind::Stash`] via
+/// [`crate::git::ParkStrategyKind::from_token`] so a corrupt value can never
+/// make a skip silently destroy work.
+pub fn take_skip_request(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<Option<(String, crate::git::ParkStrategyKind)>> {
+    let tx = conn.unchecked_transaction()?;
+    let row: Option<(Option<String>, Option<String>)> = match tx.query_row(
+        "SELECT skip_requested_step_id, skip_changes FROM plans WHERE id = ?1",
+        params![plan_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            anyhow::bail!("Plan not found: {plan_id}");
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let result = match row {
+        Some((Some(step_id), changes)) => {
+            let kind = changes
+                .as_deref()
+                .map(crate::git::ParkStrategyKind::from_token)
+                .unwrap_or(crate::git::ParkStrategyKind::Stash);
+            tx.execute(
+                "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+                params![plan_id],
+            )?;
+            Some((step_id, kind))
+        }
+        _ => None,
+    };
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Non-clearing read of the pending skip request for `plan_id`. Returns
+/// `Some((step_id, kind))` when one is pending, `None` otherwise. The runner
+/// peeks first so it only [`take_skip_request`]-consumes a request that
+/// actually targets the step it currently has in-flight — a request aimed at
+/// a different step is left in place (it'll be honored when that step runs)
+/// rather than being wrongly swallowed against the in-flight one.
+pub fn peek_skip_request(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<Option<(String, crate::git::ParkStrategyKind)>> {
+    let row: Option<(Option<String>, Option<String>)> = match conn.query_row(
+        "SELECT skip_requested_step_id, skip_changes FROM plans WHERE id = ?1",
+        params![plan_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            anyhow::bail!("Plan not found: {plan_id}");
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok(match row {
+        Some((Some(step_id), changes)) => {
+            let kind = changes
+                .as_deref()
+                .map(crate::git::ParkStrategyKind::from_token)
+                .unwrap_or(crate::git::ParkStrategyKind::Stash);
+            Some((step_id, kind))
+        }
+        _ => None,
+    })
+}
+
+/// Clear any pending skip request for `plan_id` without consuming it.
+/// Idempotent — a no-op when nothing is pending. Used to tidy a stale
+/// request the runner can no longer act on (e.g. the targeted step is no
+/// longer the in-flight one).
+#[allow(dead_code)]
+pub fn clear_skip_request(conn: &Connection, plan_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL \
+         WHERE id = ?1",
+        params![plan_id],
+    )?;
+    Ok(())
+}
+
 /// One open (unanswered) `step_questions` row enriched with the plan + step
 /// context the CLI list/show commands need to render. Driven by
 /// [`list_open_questions`].
@@ -2512,6 +2646,114 @@ mod tests {
     fn test_set_plan_pause_requested_missing_plan_errs() {
         let conn = setup();
         let err = set_plan_pause_requested(&conn, "no-such-id", true).unwrap_err();
+        assert!(err.to_string().contains("Plan not found"));
+    }
+
+    // -- cross-process skip bridge (V23) --
+
+    #[test]
+    fn test_request_skip_round_trips_and_take_clears_atomically() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+
+        // No pending skip → take returns None, peek returns None.
+        assert!(take_skip_request(&conn, &plan.id).unwrap().is_none());
+        assert!(peek_skip_request(&conn, &plan.id).unwrap().is_none());
+
+        // Request a skip; it must be visible on the plan row and via peek
+        // WITHOUT being consumed.
+        request_skip(
+            &conn,
+            &plan.id,
+            "step-uuid-1",
+            crate::git::ParkStrategyKind::Commit,
+        )
+        .unwrap();
+        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert_eq!(on.skip_requested_step_id.as_deref(), Some("step-uuid-1"));
+        assert_eq!(on.skip_changes.as_deref(), Some("commit"));
+        assert!(on.updated_at >= plan.updated_at);
+
+        let peeked = peek_skip_request(&conn, &plan.id).unwrap();
+        assert_eq!(
+            peeked,
+            Some(("step-uuid-1".to_string(), crate::git::ParkStrategyKind::Commit))
+        );
+        // Peek must NOT clear.
+        assert!(peek_skip_request(&conn, &plan.id).unwrap().is_some());
+
+        // take returns it and clears in one shot.
+        let taken = take_skip_request(&conn, &plan.id).unwrap();
+        assert_eq!(
+            taken,
+            Some(("step-uuid-1".to_string(), crate::git::ParkStrategyKind::Commit))
+        );
+        assert!(
+            take_skip_request(&conn, &plan.id).unwrap().is_none(),
+            "take must read-and-clear so the runner consumes a request once"
+        );
+        assert!(peek_skip_request(&conn, &plan.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_request_skip_overwrites_prior_and_unknown_token_defaults_stash() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+
+        request_skip(
+            &conn,
+            &plan.id,
+            "step-A",
+            crate::git::ParkStrategyKind::Discard,
+        )
+        .unwrap();
+        // A fresh request supersedes the stale one (last-writer-wins).
+        request_skip(
+            &conn,
+            &plan.id,
+            "step-B",
+            crate::git::ParkStrategyKind::Cancel,
+        )
+        .unwrap();
+        let peeked = peek_skip_request(&conn, &plan.id).unwrap();
+        assert_eq!(
+            peeked,
+            Some(("step-B".to_string(), crate::git::ParkStrategyKind::Cancel))
+        );
+
+        // A corrupt / forward-compat skip_changes token resolves to the
+        // non-destructive Stash default so a skip never silently loses work.
+        conn.execute(
+            "UPDATE plans SET skip_changes = 'bogus' WHERE id = ?1",
+            params![plan.id],
+        )
+        .unwrap();
+        let (_sid, kind) = take_skip_request(&conn, &plan.id).unwrap().unwrap();
+        assert_eq!(kind, crate::git::ParkStrategyKind::Stash);
+    }
+
+    #[test]
+    fn test_clear_skip_request_is_idempotent_noop_when_empty() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        // No-op on an empty slot.
+        clear_skip_request(&conn, &plan.id).unwrap();
+        assert!(peek_skip_request(&conn, &plan.id).unwrap().is_none());
+
+        request_skip(&conn, &plan.id, "x", crate::git::ParkStrategyKind::Stash).unwrap();
+        clear_skip_request(&conn, &plan.id).unwrap();
+        assert!(
+            peek_skip_request(&conn, &plan.id).unwrap().is_none(),
+            "clear must drop a pending request without consuming it via take"
+        );
+    }
+
+    #[test]
+    fn test_request_skip_missing_plan_errs() {
+        let conn = setup();
+        let err =
+            request_skip(&conn, "no-such-id", "step", crate::git::ParkStrategyKind::Stash)
+                .unwrap_err();
         assert!(err.to_string().contains("Plan not found"));
     }
 
