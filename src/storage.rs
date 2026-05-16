@@ -1143,6 +1143,24 @@ pub fn mint_short_id(conn: &Connection, plan_id: &str) -> Result<String> {
     }
 }
 
+/// True when `s` has the exact *shape* of a step `short_id`: precisely
+/// [`SHORT_ID_LEN`] characters, every one drawn from the base-62 alphabet
+/// (`[0-9A-Za-z]`).
+///
+/// Shape only — this never touches the DB. The shared step-selector
+/// resolver (`commands::resolve_step`) calls it to decide whether a
+/// positional token *could* be a short id before checking for an actual
+/// match, so the numeric and short-id selector forms can coexist under
+/// one deterministic rule (docs/dag-redesign.md §7). Single-sources the
+/// length/alphabet so the shape test can never drift from [`mint_short_id`].
+///
+/// Because every accepted byte is ASCII, `s.len() == SHORT_ID_LEN` here is
+/// equivalent to "exactly 8 characters": any multibyte char would push the
+/// byte length off 8 or fail the alphabet check.
+pub fn is_short_id_shaped(s: &str) -> bool {
+    s.len() == SHORT_ID_LEN && s.bytes().all(|b| SHORT_ID_ALPHABET.contains(&b))
+}
+
 /// Create a new step appended at the end of the plan's step list.
 ///
 /// Automatically generates a sort_key after the last existing step.

@@ -296,7 +296,7 @@ fn main() -> Result<()> {
                     &conn,
                     &p.slug,
                     &project,
-                    step,
+                    step.as_deref(),
                     step_id.as_deref(),
                     force,
                     &out,
@@ -326,7 +326,7 @@ fn main() -> Result<()> {
                     &conn,
                     &p.slug,
                     &project,
-                    step,
+                    step.as_deref(),
                     step_id.as_deref(),
                     title.as_deref(),
                     description.as_deref(),
@@ -356,7 +356,7 @@ fn main() -> Result<()> {
                     &conn,
                     &p.slug,
                     &project,
-                    step,
+                    step.as_deref(),
                     step_id.as_deref(),
                     force,
                     &out,
@@ -369,7 +369,15 @@ fn main() -> Result<()> {
                 plan,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::step_move(&conn, &p.slug, &project, step, step_id.as_deref(), to, &out)
+                commands::step_move(
+                    &conn,
+                    &p.slug,
+                    &project,
+                    step.as_deref(),
+                    step_id.as_deref(),
+                    to,
+                    &out,
+                )
             }
             StepCommand::SetHook {
                 step,
@@ -383,7 +391,7 @@ fn main() -> Result<()> {
                     &conn,
                     &p.slug,
                     &project,
-                    step,
+                    step.as_deref(),
                     step_id.as_deref(),
                     lifecycle,
                     &hook,
@@ -402,7 +410,7 @@ fn main() -> Result<()> {
                     &conn,
                     &p.slug,
                     &project,
-                    step,
+                    step.as_deref(),
                     step_id.as_deref(),
                     lifecycle,
                     &hook,

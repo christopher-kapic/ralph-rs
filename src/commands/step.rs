@@ -409,7 +409,7 @@ pub fn step_remove(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: Option<usize>,
+    step_sel: Option<&str>,
     step_id: Option<&str>,
     force: bool,
     out: &OutputContext,
@@ -417,7 +417,7 @@ pub fn step_remove(
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
-    let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
+    let (step, display_num) = resolve_step(conn, &plan.id, step_sel, step_id)?;
 
     if !force {
         let prompt = format!("Remove step #{} '{}'?", display_num, step.title);
@@ -442,7 +442,7 @@ pub fn step_edit(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: Option<usize>,
+    step_sel: Option<&str>,
     step_id: Option<&str>,
     title: Option<&str>,
     description: Option<&str>,
@@ -463,7 +463,7 @@ pub fn step_edit(
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
-    let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
+    let (step, display_num) = resolve_step(conn, &plan.id, step_sel, step_id)?;
 
     if title.is_none()
         && description.is_none()
@@ -569,7 +569,7 @@ pub fn step_reset(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: Option<usize>,
+    step_sel: Option<&str>,
     step_id: Option<&str>,
     force: bool,
     out: &OutputContext,
@@ -577,7 +577,7 @@ pub fn step_reset(
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
-    let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
+    let (step, display_num) = resolve_step(conn, &plan.id, step_sel, step_id)?;
 
     // Before flipping the step back to pending, undo any `[ralph wip]`
     // skip commit(s) we parked on the plan branch for this step. We revert
@@ -721,7 +721,7 @@ pub fn step_move(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: Option<usize>,
+    step_sel: Option<&str>,
     step_id: Option<&str>,
     to: usize,
     out: &OutputContext,
@@ -731,31 +731,10 @@ pub fn step_move(
 
     let steps = storage::list_steps(conn, &plan.id)?;
 
-    // Resolve the step and its current 1-based position.
-    let (step, display_num) = if let Some(id) = step_id {
-        let s = storage::get_step_by_id(conn, id)?
-            .with_context(|| format!("Step not found with id: {id}"))?;
-        if s.plan_id != plan.id {
-            bail!("Step {id} does not belong to this plan");
-        }
-        let pos = steps
-            .iter()
-            .position(|x| x.id == s.id)
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        (s, pos)
-    } else if let Some(num) = step_num {
-        if num == 0 || num > steps.len() {
-            bail!(
-                "Step {} is out of range (plan has {} steps)",
-                num,
-                steps.len()
-            );
-        }
-        (steps[num - 1].clone(), num)
-    } else {
-        bail!("Provide either a step number or --step-id");
-    };
+    // Resolve the step and its current 1-based position via the shared
+    // selector resolver so `<num>` and `<short_id>` disambiguate the same
+    // way they do for every other step command.
+    let (step, display_num) = resolve_step(conn, &plan.id, step_sel, step_id)?;
 
     if to == 0 || to > steps.len() {
         bail!(
@@ -825,7 +804,7 @@ pub fn cmd_step_set_hook(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: Option<usize>,
+    step_sel: Option<&str>,
     step_id: Option<&str>,
     lifecycle: Lifecycle,
     hook_name: &str,
@@ -842,7 +821,7 @@ pub fn cmd_step_set_hook(
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
-    let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
+    let (step, display_num) = resolve_step(conn, &plan.id, step_sel, step_id)?;
 
     storage::attach_hook_to_step(conn, &plan.id, &step.id, lifecycle.as_str(), hook_name)?;
     println!("Attached hook '{hook_name}' to step {display_num} of '{plan_slug}' at {lifecycle}");
@@ -854,7 +833,7 @@ pub fn cmd_step_unset_hook(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
-    step_num: Option<usize>,
+    step_sel: Option<&str>,
     step_id: Option<&str>,
     lifecycle: Lifecycle,
     hook_name: &str,
@@ -863,7 +842,7 @@ pub fn cmd_step_unset_hook(
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
-    let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
+    let (step, display_num) = resolve_step(conn, &plan.id, step_sel, step_id)?;
 
     let removed = storage::detach_hook(
         conn,
@@ -1271,7 +1250,7 @@ mod tests {
             &conn,
             "bulk-plan",
             &project,
-            Some(1),
+            Some("1"),
             None,
             None,
             None,
@@ -1308,7 +1287,7 @@ mod tests {
             &conn,
             "bulk-plan",
             &project,
-            Some(1),
+            Some("1"),
             None,
             None,
             None,
@@ -1367,7 +1346,7 @@ mod tests {
             &conn,
             "bulk-plan",
             &project,
-            Some(1),
+            Some("1"),
             None,
             None,
             None,
@@ -1406,7 +1385,7 @@ mod tests {
             &conn,
             "bulk-plan",
             &project,
-            Some(1),
+            Some("1"),
             None,
             Some("new title"),
             None,
@@ -1574,7 +1553,7 @@ mod tests {
         park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
         assert!(dir.join("wip.txt").exists());
 
-        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+        step_reset(&conn, "p", &project, Some("1"), None, true, &test_out()).unwrap();
 
         // Revert happened (no prompt because force) and the step is pending.
         assert!(!dir.join("wip.txt").exists(), "WIP reverted");
@@ -1594,7 +1573,7 @@ mod tests {
         std::fs::write(dir.join("wip.txt"), "wip").unwrap();
         park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
 
-        step_reset(&conn, "p", &project, Some(1), None, false, &test_out()).unwrap();
+        step_reset(&conn, "p", &project, Some("1"), None, false, &test_out()).unwrap();
 
         assert!(
             dir.join("wip.txt").exists(),
@@ -1611,7 +1590,7 @@ mod tests {
         );
         // Mark it failed then re-confirm the abort really skipped reset.
         storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
-        step_reset(&conn, "p", &project, Some(1), None, false, &test_out()).unwrap();
+        step_reset(&conn, "p", &project, Some("1"), None, false, &test_out()).unwrap();
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(
             steps[0].status,
@@ -1631,7 +1610,7 @@ mod tests {
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
 
-        step_reset(&conn, "p", &project, Some(1), None, false, &test_out()).unwrap();
+        step_reset(&conn, "p", &project, Some("1"), None, false, &test_out()).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Pending);
@@ -1646,7 +1625,7 @@ mod tests {
         std::fs::write(dir.join("later.txt"), "later").unwrap();
         crate::git::commit_changes(&dir, "step 2 done").unwrap();
 
-        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+        step_reset(&conn, "p", &project, Some("1"), None, true, &test_out()).unwrap();
 
         assert!(!dir.join("wip.txt").exists(), "WIP reverted");
         assert!(dir.join("later.txt").exists(), "later work preserved");
@@ -1664,7 +1643,7 @@ mod tests {
         }
 
         // step_reset should detect the already-reverted state and not error.
-        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+        step_reset(&conn, "p", &project, Some("1"), None, true, &test_out()).unwrap();
 
         assert!(!crate::git::has_uncommitted_changes(&dir).unwrap());
         let plan = storage::get_plan_by_slug(&conn, "p", &project)
@@ -1682,7 +1661,7 @@ mod tests {
         std::fs::write(dir.join("f.txt"), "v1\nv2\n").unwrap();
         park_wip(&dir, "[ralph wip] skipped step 1: a again", &step_id);
 
-        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+        step_reset(&conn, "p", &project, Some("1"), None, true, &test_out()).unwrap();
 
         // Both WIP layers undone (newest-first reverts applied cleanly).
         assert!(!dir.join("f.txt").exists());
@@ -1888,7 +1867,7 @@ mod tests {
             &conn,
             "bulk-plan",
             &project,
-            Some(1),
+            Some("1"),
             None,
             None,
             None,
@@ -1954,7 +1933,7 @@ mod tests {
             &conn,
             "bulk-plan",
             &project,
-            Some(1),
+            Some("1"),
             None,
             None,
             None,

@@ -696,13 +696,14 @@ pub enum StepCommand {
 
     /// Remove a step from a plan.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive; numbers are convenient
-    /// for humans, UUIDs are stable across concurrent edits.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive;
+    /// numbers are convenient for humans, short ids are stable across step
+    /// reordering, UUIDs are stable across concurrent edits.
     Remove {
-        /// Step number (1-based). Conflicts with --step-id.
+        /// Step number (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -718,12 +719,12 @@ pub enum StepCommand {
 
     /// Edit a step's title, description, agent, harness, criteria, or max-retries.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive.
     Edit {
-        /// Step number (1-based). Conflicts with --step-id.
+        /// Step number (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -812,12 +813,12 @@ pub enum StepCommand {
 
     /// Reset a step's status back to pending.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive.
     Reset {
-        /// Step number (1-based). Conflicts with --step-id.
+        /// Step number (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -834,12 +835,12 @@ pub enum StepCommand {
 
     /// Move a step to a different position.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive.
     Move {
-        /// Step number to move (1-based). Conflicts with --step-id.
+        /// Step number to move (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -855,12 +856,12 @@ pub enum StepCommand {
 
     /// Attach a library hook to a specific step at a lifecycle event.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive.
     SetHook {
-        /// Step number (1-based). Conflicts with --step-id.
+        /// Step number (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -880,12 +881,12 @@ pub enum StepCommand {
 
     /// Detach a previously-attached hook from a step.
     ///
-    /// Identify the step by positional number (1-based) **or** by UUID via
-    /// `--step-id`. The two are mutually exclusive.
+    /// Identify the step by positional number (1-based) or 8-char short id
+    /// **or** by UUID via `--step-id`. The selectors are mutually exclusive.
     UnsetHook {
-        /// Step number (1-based). Conflicts with --step-id.
+        /// Step number (1-based) or 8-char short id. Conflicts with --step-id.
         #[arg(conflicts_with = "step_id")]
-        step: Option<usize>,
+        step: Option<String>,
 
         /// Step UUID. Conflicts with positional step number.
         #[arg(long)]
@@ -1890,7 +1891,7 @@ mod tests {
     fn test_step_move() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "move", "3", "--to", "1"]).unwrap();
         if let Command::Step(StepCommand::Move { step, to, .. }) = cli.command.unwrap() {
-            assert_eq!(step, Some(3));
+            assert_eq!(step.as_deref(), Some("3"));
             assert_eq!(to, 1);
         } else {
             panic!("Expected Step Move");
@@ -1901,7 +1902,7 @@ mod tests {
     fn test_step_reset() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "reset", "2"]).unwrap();
         if let Command::Step(StepCommand::Reset { step, .. }) = cli.command.unwrap() {
-            assert_eq!(step, Some(2));
+            assert_eq!(step.as_deref(), Some("2"));
         } else {
             panic!("Expected Step Reset");
         }
@@ -1911,7 +1912,7 @@ mod tests {
     fn test_step_remove() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "remove", "1", "--force"]).unwrap();
         if let Command::Step(StepCommand::Remove { step, force, .. }) = cli.command.unwrap() {
-            assert_eq!(step, Some(1));
+            assert_eq!(step.as_deref(), Some("1"));
             assert!(force);
         } else {
             panic!("Expected Step Remove");
@@ -1945,7 +1946,7 @@ mod tests {
     fn test_step_remove_yes_alias() {
         let cli = Cli::try_parse_from(["ralph-rs", "step", "remove", "1", "--yes"]).unwrap();
         if let Command::Step(StepCommand::Remove { step, force, .. }) = cli.command.unwrap() {
-            assert_eq!(step, Some(1));
+            assert_eq!(step.as_deref(), Some("1"));
             assert!(force);
         } else {
             panic!("Expected Step Remove");

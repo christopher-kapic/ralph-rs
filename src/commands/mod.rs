@@ -151,25 +151,64 @@ pub fn resolve_resume_plan(
     }
 }
 
-/// Resolve a step reference: either a 1-based positional number within the
-/// plan's step list, or a UUID string looked up via `storage::get_step_by_id`.
+/// Resolve a step reference from the two shared selector forms.
 ///
-/// Exactly one of `step_num` / `step_id` must be `Some`; the caller (clap
-/// `conflicts_with`) guarantees they are mutually exclusive, and this function
-/// checks that at least one is present.
+/// A step can be named two ways on the CLI:
 ///
-/// Returns `(step, step_display_num)` where `step_display_num` is the 1-based
-/// position in the plan's step list (used for user-facing messages).
+/// * the positional selector `<num|short_id>` (`step_sel`), and
+/// * the `--step-id <uuid>` flag (`step_id`).
+///
+/// Exactly one must be `Some`; clap's `conflicts_with` guarantees they are
+/// mutually exclusive and this function rejects the "neither" case.
+///
+/// ## Positional selector disambiguation (docs/dag-redesign.md §7)
+///
+/// Every `<num>` selector also accepts a step `short_id`. The rule is
+/// deterministic, with the short-id branch requiring an *actual* match so
+/// it can never shadow a number:
+///
+/// 1. If the token is **exactly [`storage::is_short_id_shaped`]-shaped**
+///    (8 base-62 chars) **and equals the `short_id` of some step in this
+///    plan**, it resolves as that step.
+/// 2. Otherwise the token is parsed as a **1-based step number** (range
+///    error if out of bounds, parse error if non-numeric).
+///
+/// Because branch 1 fires only on a concrete match, a purely numeric token
+/// keeps its historical numeric meaning. An 8-digit numeric like
+/// `"00000001"` is short-id-*shaped* but, absent a step whose short_id is
+/// literally that string, falls through to the numeric branch and parses
+/// as `1` — so linear-plan behavior stays byte-identical (minted short_ids
+/// are random 8-char base-62 strings; a collision with a literal position
+/// string is both astronomically unlikely and still resolves to the same
+/// step the number would have).
+///
+/// Returns `(step, step_display_num)` where `step_display_num` is the
+/// 1-based position in the plan's step list (used for user-facing messages).
 pub fn resolve_step(
     conn: &Connection,
     plan_id: &str,
-    step_num: Option<usize>,
+    step_sel: Option<&str>,
     step_id: Option<&str>,
 ) -> Result<(Step, usize)> {
     let steps = storage::list_steps(conn, plan_id)?;
 
-    match (step_num, step_id) {
-        (Some(num), None) => {
+    match (step_sel, step_id) {
+        (Some(tok), None) => {
+            // 1. short_id form: correctly shaped AND an existing match in
+            //    this plan. Requiring a hit means a coincidentally
+            //    8-char-numeric token still parses as a number below.
+            if storage::is_short_id_shaped(tok)
+                && let Some(idx) = steps.iter().position(|s| s.short_id == tok)
+            {
+                return Ok((steps.into_iter().nth(idx).unwrap(), idx + 1));
+            }
+            // 2. numeric form (1-based).
+            let num: usize = tok.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid step selector '{tok}': expected a 1-based step number \
+                     or an 8-character short id"
+                )
+            })?;
             if num == 0 || num > steps.len() {
                 bail!(
                     "Step {} is out of range (plan has {} steps)",
@@ -195,11 +234,11 @@ pub fn resolve_step(
             Ok((step, pos))
         }
         (None, None) => {
-            bail!("Provide either a step number or --step-id");
+            bail!("Provide either a step number/short id or --step-id");
         }
         (Some(_), Some(_)) => {
             // Should be prevented by clap conflicts_with, but guard anyway.
-            bail!("Cannot specify both a step number and --step-id");
+            bail!("Cannot specify both a step number/short id and --step-id");
         }
     }
 }
@@ -1307,7 +1346,7 @@ mod tests {
         )
         .unwrap();
 
-        step_remove(&conn, "my-plan", &project, Some(2), None, true, &test_out()).unwrap();
+        step_remove(&conn, "my-plan", &project, Some("2"), None, true, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1358,7 +1397,7 @@ mod tests {
             &conn,
             "my-plan",
             &project,
-            Some(1),
+            Some("1"),
             None,
             Some("New title"),
             Some("New desc"),
@@ -1429,7 +1468,7 @@ mod tests {
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
 
-        step_reset(&conn, "my-plan", &project, Some(1), None, true, &test_out()).unwrap();
+        step_reset(&conn, "my-plan", &project, Some("1"), None, true, &test_out()).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Pending);
@@ -1510,7 +1549,7 @@ mod tests {
         .unwrap();
 
         // Move step 3 (C) to position 1
-        step_move(&conn, "my-plan", &project, Some(3), None, 1, &test_out()).unwrap();
+        step_move(&conn, "my-plan", &project, Some("3"), None, 1, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1595,7 +1634,7 @@ mod tests {
         .unwrap();
 
         // Move step 1 (A) to position 3
-        step_move(&conn, "my-plan", &project, Some(1), None, 3, &test_out()).unwrap();
+        step_move(&conn, "my-plan", &project, Some("1"), None, 3, &test_out()).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1978,7 +2017,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = step_remove(&conn, "my-plan", &project, Some(5), None, true, &test_out());
+        let result = step_remove(&conn, "my-plan", &project, Some("5"), None, true, &test_out());
         assert!(result.is_err());
     }
 
@@ -2189,5 +2228,127 @@ mod tests {
 
         let resolved = resolve_resume_plan(&conn, None, &project, &dir).unwrap();
         assert_eq!(resolved.slug, "fresh");
+    }
+
+    // -- resolve_step: numeric vs short_id selector (docs/dag-redesign.md §7) --
+
+    /// Build a plan with `n` appended steps titled `Step {i}` (0-based).
+    /// Returns `(plan_id, short_ids_in_order)`.
+    fn plan_with_steps(conn: &Connection, project: &str, n: usize) -> (String, Vec<String>) {
+        let plan =
+            storage::create_plan(conn, "sel", project, "b", "d", None, None, &[]).unwrap();
+        let mut sids = Vec::with_capacity(n);
+        for i in 0..n {
+            let (s, _) = storage::create_step(
+                conn,
+                &plan.id,
+                &format!("Step {i}"),
+                "",
+                None,
+                None,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            sids.push(s.short_id);
+        }
+        (plan.id, sids)
+    }
+
+    #[test]
+    fn test_resolve_step_numeric_selector_still_works() {
+        let (conn, project) = setup();
+        let (plan_id, _sids) = plan_with_steps(&conn, &project, 3);
+
+        let (step, pos) = resolve_step(&conn, &plan_id, Some("2"), None).unwrap();
+        assert_eq!(pos, 2);
+        // Titles are 0-based: position 2 is "Step 1".
+        assert_eq!(step.title, "Step 1");
+    }
+
+    #[test]
+    fn test_resolve_step_short_id_resolves_same_step_as_number() {
+        let (conn, project) = setup();
+        let (plan_id, sids) = plan_with_steps(&conn, &project, 3);
+
+        // The 2nd step's short_id must resolve to exactly the same step and
+        // display position as the numeric selector "2".
+        let by_num = resolve_step(&conn, &plan_id, Some("2"), None).unwrap();
+        let by_sid = resolve_step(&conn, &plan_id, Some(sids[1].as_str()), None).unwrap();
+        assert_eq!(by_num.0.id, by_sid.0.id, "both forms resolve the same step");
+        assert_eq!(by_num.1, by_sid.1, "both forms report the same position");
+        assert_eq!(by_sid.0.short_id, sids[1]);
+    }
+
+    #[test]
+    fn test_resolve_step_ambiguous_looking_but_numeric() {
+        let (conn, project) = setup();
+        let (plan_id, _sids) = plan_with_steps(&conn, &project, 3);
+
+        // "00000001" is short_id-SHAPED (8 base-62 chars) but no step owns
+        // it, so it falls through to the numeric branch and resolves step 1
+        // — byte-identical to passing "1".
+        let shaped = resolve_step(&conn, &plan_id, Some("00000001"), None).unwrap();
+        let plain = resolve_step(&conn, &plan_id, Some("1"), None).unwrap();
+        assert_eq!(shaped.0.id, plain.0.id);
+        assert_eq!(shaped.1, 1);
+
+        // A short numeric like "3" is never short-id-shaped → numeric.
+        let (s3, p3) = resolve_step(&conn, &plan_id, Some("3"), None).unwrap();
+        assert_eq!(p3, 3);
+        assert_eq!(s3.title, "Step 2");
+    }
+
+    #[test]
+    fn test_resolve_step_unknown_short_id_errors_cleanly() {
+        let (conn, project) = setup();
+        let (plan_id, _sids) = plan_with_steps(&conn, &project, 2);
+
+        // 8-char base-62 token matching no short_id and not numeric: a
+        // clean, actionable error — never a panic or silent fallback.
+        let err = resolve_step(&conn, &plan_id, Some("zzzzABCD"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Invalid step selector") && err.contains("zzzzABCD"),
+            "unknown short id must error cleanly, got: {err}"
+        );
+
+        // Out-of-range numeric still yields the historical range error.
+        let oor = resolve_step(&conn, &plan_id, Some("9"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(oor.contains("out of range"), "got: {oor}");
+    }
+
+    #[test]
+    fn test_resolve_step_short_id_scoped_to_plan() {
+        // A short_id is plan-unique, not global: plan-A's short_id must
+        // never resolve to plan-A's step when used against plan B. (It
+        // either errors as a non-numeric token or, in the astronomically
+        // unlikely all-digit case, resolves a *plan-B* position — never
+        // crossing the plan boundary.)
+        let (conn, project) = setup();
+        let (_plan_a, a_sids) = plan_with_steps(&conn, &project, 1);
+        let a_step = resolve_step(&conn, &_plan_a, Some(a_sids[0].as_str()), None)
+            .unwrap()
+            .0;
+        let plan_b = storage::create_plan(&conn, "other", &project, "b", "d", None, None, &[])
+            .unwrap();
+        storage::create_step(
+            &conn, &plan_b.id, "B0", "", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        match resolve_step(&conn, &plan_b.id, Some(a_sids[0].as_str()), None) {
+            Err(_) => {} // non-numeric token → clean error (the common case).
+            Ok((step, _)) => assert_ne!(
+                step.id, a_step.id,
+                "plan-A short id must never resolve to plan-A's step in plan B"
+            ),
+        }
     }
 }
