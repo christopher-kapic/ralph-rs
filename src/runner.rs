@@ -1260,7 +1260,7 @@ pub fn skip_step(
         // Not same-process. If a run is genuinely live for this project,
         // hand the skip off to it via the DB bridge.
         let live = storage::get_live_run(conn, &plan.project)?;
-        if live.is_some() {
+        if live.as_ref().and_then(|r| r.plan_id.as_deref()) == Some(plan.id.as_str()) {
             storage::request_skip(conn, &plan.id, &step.id, changes)?;
             eprintln!(
                 "Requested skip of in-flight step {} '{}' — interrupting the harness…",
@@ -2204,7 +2204,14 @@ mod tests {
         )
         .unwrap();
 
-        let skipped = skip_step(&conn, &plan, Some(2), None, crate::git::ParkStrategyKind::Stash).unwrap();
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(2),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         assert_eq!(skipped, 2);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2247,7 +2254,14 @@ mod tests {
         // Mark first as complete so current is "Second".
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
 
-        let skipped = skip_step(&conn, &plan, None, None, crate::git::ParkStrategyKind::Stash).unwrap();
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            None,
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         assert_eq!(skipped, 2);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2273,7 +2287,17 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
@@ -2283,7 +2307,14 @@ mod tests {
         let (_handle, mut rx) = crate::signal::install_and_spawn_with_handle();
         let _in_flight = crate::signal::StepInFlightGuard::enter();
 
-        let skipped = skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Stash).unwrap();
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         assert_eq!(skipped, 1);
 
         // The cancel channel received the Skipped reason (distinct from
@@ -2312,12 +2343,29 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
 
-        let skipped = skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Stash).unwrap();
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         assert_eq!(skipped, 1);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2325,6 +2373,63 @@ mod tests {
             steps[0].status,
             StepStatus::Skipped,
             "no in-flight step → plain DB flip"
+        );
+    }
+
+    #[test]
+    fn test_skip_step_stale_in_progress_ignores_other_plan_live_run() {
+        let _guard = crate::signal::lock_exit_cleanup_test();
+        crate::signal::set_step_in_flight(false);
+
+        let conn = setup();
+        let project = "/p";
+        let plan =
+            storage::create_plan(&conn, "target", project, "b", "d", None, None, &[]).unwrap();
+        let other =
+            storage::create_plan(&conn, "other", project, "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
+
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![project, 42_i64, other.id, other.slug],
+        )
+        .unwrap();
+
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
+        assert_eq!(skipped, 1);
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].status,
+            StepStatus::Skipped,
+            "a run lock for a different plan must not turn stale InProgress into a DB skip request"
+        );
+        assert!(
+            storage::peek_skip_request(&conn, &plan.id)
+                .unwrap()
+                .is_none(),
+            "no runner is polling this plan, so skip_step must not leave an orphaned request"
         );
     }
 
@@ -2348,7 +2453,13 @@ mod tests {
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
 
-        let result = skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Stash);
+        let result = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        );
         assert!(result.is_err());
     }
 
@@ -2371,7 +2482,13 @@ mod tests {
         )
         .unwrap();
 
-        let result = skip_step(&conn, &plan, Some(5), None, crate::git::ParkStrategyKind::Stash);
+        let result = skip_step(
+            &conn,
+            &plan,
+            Some(5),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        );
         assert!(result.is_err());
     }
 
@@ -2431,7 +2548,14 @@ mod tests {
         )
         .unwrap();
 
-        skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Stash).unwrap();
+        skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Skipped);
@@ -2492,7 +2616,14 @@ mod tests {
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Failed).unwrap();
 
-        let skipped = skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Stash).unwrap();
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         assert_eq!(skipped, 1);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2516,11 +2647,29 @@ mod tests {
         let before = git::get_all_changed_files(&dir).unwrap();
 
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "s", &dir.to_string_lossy(), "b", "d", None, None, &[])
-                .unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "s",
+            &dir.to_string_lossy(),
+            "b",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         // Pending (NOT in-flight). request_skip_in_flight will be a no-op
@@ -2529,9 +2678,14 @@ mod tests {
 
         // A non-default --changes: discard. It must have NO effect because
         // the step isn't running.
-        let skipped =
-            skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Discard)
-                .unwrap();
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Discard,
+        )
+        .unwrap();
         assert_eq!(skipped, 1);
 
         // DB flipped…

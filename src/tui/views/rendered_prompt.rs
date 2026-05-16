@@ -135,9 +135,7 @@ pub fn build_retry_context_for_attempt(
     // Rollback re-sends the (now reverted) diff/files; Keep omits them
     // because the work is still on disk for the agent to `git diff`.
     let (previous_diff, files_modified) = match strategy {
-        RetryStrategy::Rollback => {
-            (prev.diff.clone(), files_from_diff(prev.diff.as_deref()))
-        }
+        RetryStrategy::Rollback => (prev.diff.clone(), files_from_diff(prev.diff.as_deref())),
         RetryStrategy::Keep => (None, Vec::new()),
     };
 
@@ -300,12 +298,7 @@ impl RenderedPromptApp {
         // scopes the diff/files exactly as the executor would (Step 22).
         let strategy = step.effective_retry_strategy(plan);
         for log in logs {
-            let retry = build_retry_context_for_attempt(
-                log.attempt,
-                max_attempts,
-                logs,
-                strategy,
-            );
+            let retry = build_retry_context_for_attempt(log.attempt, max_attempts, logs, strategy);
             let prompt = prompt::build_step_prompt(
                 plan,
                 step,
@@ -413,10 +406,7 @@ impl RenderedPromptApp {
 
         match key.code {
             // Pop back to step-detail.
-            KeyCode::Esc
-            | KeyCode::Char('q')
-            | KeyCode::Char('h')
-            | KeyCode::Left => Outcome::Pop,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => Outcome::Pop,
 
             // Attempt navigation. j/k (and ↑/↓) move between attempts when
             // there is more than one; with a single attempt they fall
@@ -505,10 +495,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut RenderedPromptApp) {
         return;
     }
 
-    let title = format!(
-        " Rendered prompt — {} / {} ",
-        app.plan_slug, app.step_label
-    );
+    let title = format!(" Rendered prompt — {} / {} ", app.plan_slug, app.step_label);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -703,13 +690,8 @@ mod tests {
 
     #[test]
     fn attempt_one_has_no_retry_context() {
-        assert!(
-            build_retry_context_for_attempt(1, 4, &[], RetryStrategy::Keep).is_none()
-        );
-        assert!(
-            build_retry_context_for_attempt(1, 4, &[], RetryStrategy::Rollback)
-                .is_none()
-        );
+        assert!(build_retry_context_for_attempt(1, 4, &[], RetryStrategy::Keep).is_none());
+        assert!(build_retry_context_for_attempt(1, 4, &[], RetryStrategy::Rollback).is_none());
     }
 
     #[test]
@@ -717,17 +699,14 @@ mod tests {
         // Under Rollback the reverted diff/files are re-sent so the agent
         // can learn from work it no longer sees on disk.
         let mut l1 = make_log(1, Utc::now());
-        l1.diff = Some(
-            "diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string(),
-        );
+        l1.diff = Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string());
         l1.test_results = vec!["FAIL test_a".to_string(), "error: boom".to_string()];
         l1.termination_reason = Some(TerminationReason::TestFailed);
         let l2 = make_log(2, Utc::now());
         let logs = vec![l1, l2];
 
-        let ctx =
-            build_retry_context_for_attempt(2, 4, &logs, RetryStrategy::Rollback)
-                .expect("retry ctx for attempt 2");
+        let ctx = build_retry_context_for_attempt(2, 4, &logs, RetryStrategy::Rollback)
+            .expect("retry ctx for attempt 2");
         assert_eq!(ctx.attempt, 2);
         assert_eq!(ctx.max_attempts, 4);
         assert_eq!(
@@ -741,10 +720,7 @@ mod tests {
         );
         // files_modified parsed from the diff's `diff --git ... b/<path>`.
         assert_eq!(ctx.files_modified, vec!["src/foo.rs".to_string()]);
-        assert_eq!(
-            ctx.previous_failure_reason.as_deref(),
-            Some("tests failed")
-        );
+        assert_eq!(ctx.previous_failure_reason.as_deref(), Some("tests failed"));
     }
 
     #[test]
@@ -753,9 +729,7 @@ mod tests {
         // mirrors the executor by omitting diff/files but keeping the test
         // output and a reconstructed failure reason.
         let mut l1 = make_log(1, Utc::now());
-        l1.diff = Some(
-            "diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string(),
-        );
+        l1.diff = Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string());
         l1.test_results = vec!["FAIL test_a".to_string()];
         l1.termination_reason = Some(TerminationReason::TestFailed);
         let l2 = make_log(2, Utc::now());
@@ -772,14 +746,8 @@ mod tests {
             ctx.files_modified.is_empty(),
             "Keep must not re-send the file list"
         );
-        assert_eq!(
-            ctx.previous_test_output.as_deref(),
-            Some("FAIL test_a")
-        );
-        assert_eq!(
-            ctx.previous_failure_reason.as_deref(),
-            Some("tests failed")
-        );
+        assert_eq!(ctx.previous_test_output.as_deref(), Some("FAIL test_a"));
+        assert_eq!(ctx.previous_failure_reason.as_deref(), Some("tests failed"));
     }
 
     #[test]
@@ -803,16 +771,23 @@ mod tests {
         let prompts = prompts_for(&plan);
 
         let attempts = RenderedPromptApp::build_attempts(
-            &plan, &step, &all, None, true, &prompts, &[], 4, &[],
+            &plan,
+            &step,
+            &all,
+            None,
+            true,
+            &prompts,
+            &[],
+            4,
+            &[],
         );
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].attempt, 1);
         assert!(attempts[0].started_at.is_none());
 
         // Byte-identical to a direct build_step_prompt call with no retry ctx.
-        let expected = prompt::build_step_prompt(
-            &plan, &step, &all, None, None, true, &prompts, &[],
-        );
+        let expected =
+            prompt::build_step_prompt(&plan, &step, &all, None, None, true, &prompts, &[]);
         assert_eq!(attempts[0].prompt, expected);
     }
 
@@ -830,14 +805,20 @@ mod tests {
         let logs = vec![l1, l2];
 
         let attempts = RenderedPromptApp::build_attempts(
-            &plan, &step, &all, None, true, &prompts, &[], 4, &logs,
+            &plan,
+            &step,
+            &all,
+            None,
+            true,
+            &prompts,
+            &[],
+            4,
+            &logs,
         );
         assert_eq!(attempts.len(), 2);
 
         // Attempt 1: no retry context.
-        let exp1 = prompt::build_step_prompt(
-            &plan, &step, &all, None, None, true, &prompts, &[],
-        );
+        let exp1 = prompt::build_step_prompt(&plan, &step, &all, None, None, true, &prompts, &[]);
         assert_eq!(attempts[0].prompt, exp1);
         assert!(!attempts[0].prompt.contains("# Retry Context"));
 
@@ -845,16 +826,11 @@ mod tests {
         // `build_attempts` resolves the strategy via
         // `step.effective_retry_strategy(plan)`; make_step/make_plan both
         // leave it None → default `Keep`, so mirror that here.
-        let ctx = build_retry_context_for_attempt(
-            2,
-            4,
-            &logs,
-            step.effective_retry_strategy(&plan),
-        )
-        .unwrap();
-        let exp2 = prompt::build_step_prompt(
-            &plan, &step, &all, None, Some(&ctx), true, &prompts, &[],
-        );
+        let ctx =
+            build_retry_context_for_attempt(2, 4, &logs, step.effective_retry_strategy(&plan))
+                .unwrap();
+        let exp2 =
+            prompt::build_step_prompt(&plan, &step, &all, None, Some(&ctx), true, &prompts, &[]);
         assert_eq!(attempts[1].prompt, exp2);
         assert!(attempts[1].prompt.contains("# Retry Context"));
         assert!(attempts[1].prompt.contains("attempt 2 of 4"));
@@ -1005,7 +981,10 @@ mod tests {
         assert_eq!(relative_time(now - Duration::seconds(5), now), "5s ago");
         assert_eq!(relative_time(now - Duration::seconds(125), now), "2m ago");
         assert_eq!(relative_time(now - Duration::seconds(7200), now), "2h ago");
-        assert_eq!(relative_time(now - Duration::seconds(180_000), now), "2d ago");
+        assert_eq!(
+            relative_time(now - Duration::seconds(180_000), now),
+            "2d ago"
+        );
         // Future timestamp clamps to "just now".
         assert_eq!(relative_time(now + Duration::seconds(30), now), "just now");
     }

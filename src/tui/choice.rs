@@ -159,7 +159,9 @@ pub fn render<T: ChoiceItem>(frame: &mut Frame, area: Rect, title: &str, choice:
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::CURSOR));
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     frame.render_widget(para, horiz);
 }
 
@@ -229,7 +231,10 @@ mod tests {
     #[test]
     fn j_and_down_move_focus_down_and_clamp_at_bottom() {
         let mut c = picks();
-        assert_eq!(c.handle_key(key(KeyCode::Char('j'))), ChoiceOutcome::Pending);
+        assert_eq!(
+            c.handle_key(key(KeyCode::Char('j'))),
+            ChoiceOutcome::Pending
+        );
         assert_eq!(c.focused_index(), 1);
         assert_eq!(c.handle_key(key(KeyCode::Down)), ChoiceOutcome::Pending);
         assert_eq!(c.focused_index(), 2);
@@ -242,7 +247,10 @@ mod tests {
     #[test]
     fn k_and_up_move_focus_up_and_clamp_at_top() {
         let mut c = Choice::new(vec![Pick::A, Pick::B, Pick::C], 2);
-        assert_eq!(c.handle_key(key(KeyCode::Char('k'))), ChoiceOutcome::Pending);
+        assert_eq!(
+            c.handle_key(key(KeyCode::Char('k'))),
+            ChoiceOutcome::Pending
+        );
         assert_eq!(c.focused_index(), 1);
         assert_eq!(c.handle_key(key(KeyCode::Up)), ChoiceOutcome::Pending);
         assert_eq!(c.focused_index(), 0);

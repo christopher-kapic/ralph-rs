@@ -2497,7 +2497,10 @@ mod tests {
         assert!(app.dragging_split, "press on divider arms the drag");
         // Drag left over the tile column — must resize, not select.
         app.handle_mouse(mouse_event(20, 14, MouseEventKind::Drag(MouseButton::Left)));
-        assert_eq!(app.split_pct, 25, "armed drag keeps resizing over the tiles");
+        assert_eq!(
+            app.split_pct, 25,
+            "armed drag keeps resizing over the tiles"
+        );
         assert_eq!(app.selected_index, 0, "drag must not move the cursor");
         assert!(app.open_request.is_none());
         app.handle_mouse(mouse_event(20, 14, MouseEventKind::Up(MouseButton::Left)));

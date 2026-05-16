@@ -1623,9 +1623,12 @@ mod tests {
 
         // Querying a dropped column must now error.
         assert!(
-            conn.query_row("SELECT prompt_prefix FROM plans WHERE id = ?1", ["p1"], |r| r
-                .get::<_, Option<String>>(0))
-                .is_err(),
+            conn.query_row(
+                "SELECT prompt_prefix FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get::<_, Option<String>>(0)
+            )
+            .is_err(),
             "selecting a dropped column should fail"
         );
 

@@ -141,7 +141,11 @@ pub fn cmd_prompt_set(
 
     if !out.quiet {
         let icon = output::check_icon(out.color);
-        let verb = if value.is_some() { "Updated" } else { "Cleared" };
+        let verb = if value.is_some() {
+            "Updated"
+        } else {
+            "Cleared"
+        };
         eprintln!("{icon} {verb} {} prompt", scope_name(scope));
     }
     Ok(())
@@ -200,9 +204,9 @@ fn scope_name(s: PromptScope) -> &'static str {
 /// `config.json`. `path` is always `<config_dir>/config.json`, so its
 /// parent is the directory `save_at` writes into.
 fn write_config(cfg: &Config, path: &std::path::Path) -> Result<()> {
-    let dir = path.parent().with_context(|| {
-        format!("Config path {} has no parent directory", path.display())
-    })?;
+    let dir = path
+        .parent()
+        .with_context(|| format!("Config path {} has no parent directory", path.display()))?;
     cfg.save_at(dir)
         .with_context(|| format!("Failed to write config to {}", path.display()))
 }
@@ -280,7 +284,11 @@ mod tests {
                 .as_deref(),
             Some("db content")
         );
-        assert!(storage::read_project_prompt_file(&project).unwrap().is_none());
+        assert!(
+            storage::read_project_prompt_file(&project)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// `prompt set --scope project` writes through to the file when the
@@ -306,7 +314,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            storage::read_project_prompt_file(&project).unwrap().as_deref(),
+            storage::read_project_prompt_file(&project)
+                .unwrap()
+                .as_deref(),
             Some("updated via file")
         );
         // DB column untouched.

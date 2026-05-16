@@ -456,11 +456,12 @@ async fn finalize_failure(
 /// A clean tree, or a tree whose only changes are files the user already
 /// had untracked before the run started, returns `false`: nothing the skip
 /// is responsible for, so parking would clobber the user's own scratch.
-fn has_step_attributable_changes(workdir: &Path, pre_existing_untracked: &[String]) -> Result<bool> {
+fn has_step_attributable_changes(
+    workdir: &Path,
+    pre_existing_untracked: &[String],
+) -> Result<bool> {
     let changed = git::get_all_changed_files(workdir)?;
-    Ok(changed
-        .iter()
-        .any(|f| !pre_existing_untracked.contains(f)))
+    Ok(changed.iter().any(|f| !pre_existing_untracked.contains(f)))
 }
 
 /// Undo an in-flight attempt that the TUI skip dialog *cancelled* (Esc),
@@ -502,11 +503,7 @@ fn attempt_cancelled_event(ctx: &ExecCtx<'_>, attempt: i32) -> crate::output::Ru
     }
 }
 
-fn cancel_skipped_attempt(
-    ctx: &ExecCtx<'_>,
-    exec_log_id: i64,
-    attempt: i32,
-) -> Result<()> {
+fn cancel_skipped_attempt(ctx: &ExecCtx<'_>, exec_log_id: i64, attempt: i32) -> Result<()> {
     // 1. Roll back the killed harness's work, preserving the user's
     //    pre-existing untracked files. A clean tree makes this a no-op.
     if git::has_uncommitted_changes(ctx.workdir)? {
@@ -1060,9 +1057,7 @@ pub async fn execute_step(
         // attempt/max + previous test output + previous failure reason.
         let retry_context = if attempt > 1 {
             let (previous_diff, files_modified) = match retry_strategy {
-                RetryStrategy::Rollback => {
-                    (prev_diff.clone(), prev_files_modified.clone())
-                }
+                RetryStrategy::Rollback => (prev_diff.clone(), prev_files_modified.clone()),
                 RetryStrategy::Keep => (None, Vec::new()),
             };
             Some(RetryContext {
@@ -1373,6 +1368,7 @@ pub async fn execute_step(
                         }
                     }
                 }
+                storage::clear_skip_request(conn, &plan.id)?;
 
                 let parsed = parse_harness_json(&output.stdout);
 
@@ -1496,9 +1492,7 @@ pub async fn execute_step(
                             has_changes
                         }
                         RetryStrategy::Keep => {
-                            if agent_committed_clean
-                                && let Some(before) = &head_before_harness
-                            {
+                            if agent_committed_clean && let Some(before) = &head_before_harness {
                                 git::reset_mixed_to(workdir, before)?;
                             }
                             false
@@ -1690,9 +1684,7 @@ pub async fn execute_step(
                 // as `WaitResult::Skipped`; only a pending `Aborted` (or no
                 // reason at all — a bare test-runner abort) drives the
                 // UserInterrupted whole-run abort below.
-                if test_aborted
-                    && *abort_rx.borrow() == Some(CancelReason::Skipped)
-                {
+                if test_aborted && *abort_rx.borrow() == Some(CancelReason::Skipped) {
                     // The test runner already rolled its own child; roll
                     // back the worktree before parking so finalize_skipped's
                     // park sees a consistent tree (mirrors the Aborted arm's
@@ -2046,9 +2038,7 @@ pub async fn execute_step(
                         has_changes
                     }
                     RetryStrategy::Keep => {
-                        if agent_committed_clean
-                            && let Some(before) = &head_before_harness
-                        {
+                        if agent_committed_clean && let Some(before) = &head_before_harness {
                             write_phase(
                                 conn,
                                 plan,
@@ -4234,7 +4224,17 @@ mod tests {
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Step", "desc", None, None, &[], Some(0), None, None, None,
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -4393,9 +4393,17 @@ mod tests {
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Step", "desc", None, None, &[],
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
             Some(0), // max_retries = 0 → a single attempt, terminal on failure
-            None, None, None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -4468,6 +4476,122 @@ mod tests {
         assert!(
             crate::signal::take_requested_park_kind().is_none(),
             "the stale park-kind slot must be cleared on a non-skip terminal arm"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fast_completed_attempt_clears_unconsumed_db_skip_request() {
+        use crate::config::HarnessConfig;
+        use crate::plan::ChangePolicy;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("fast-harness.sh");
+        fs::write(
+            &harness_path,
+            "#!/bin/sh\ncat >/dev/null 2>&1 || true\nexit 0\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("fast"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            Some(ChangePolicy::Optional),
+            None,
+        )
+        .unwrap();
+
+        storage::request_skip(
+            &conn,
+            &plan.id,
+            &step.id,
+            crate::git::ParkStrategyKind::Discard,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "fast".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 10s")
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        assert!(
+            storage::peek_skip_request(&conn, &plan.id)
+                .unwrap()
+                .is_none(),
+            "a DB skip request that loses the race to natural completion must not survive"
         );
     }
 
@@ -4560,7 +4684,16 @@ mod tests {
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Wire the thing", "desc", None, None, &[], Some(0), None, None,
+            &conn,
+            &plan.id,
+            "Wire the thing",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -4631,9 +4764,7 @@ mod tests {
                     && fs::read_to_string(&pid_path_clone)
                         .map(|s| !s.trim().is_empty())
                         .unwrap_or(false);
-                if pid_ready
-                    && crate::git::has_uncommitted_changes(&dir_clone).unwrap_or(false)
-                {
+                if pid_ready && crate::git::has_uncommitted_changes(&dir_clone).unwrap_or(false) {
                     dirtied = true;
                     break;
                 }
@@ -4880,7 +5011,16 @@ mod tests {
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Wire the thing", "desc", None, None, &[], Some(0), None, None,
+            &conn,
+            &plan.id,
+            "Wire the thing",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -4917,7 +5057,11 @@ mod tests {
 
         // Wait until the counter file shows `target` invocations, then
         // return once the harness has (re-)published a pid for that run.
-        async fn wait_for_invocation(count_path: &std::path::Path, pid_path: &std::path::Path, target: usize) {
+        async fn wait_for_invocation(
+            count_path: &std::path::Path,
+            pid_path: &std::path::Path,
+            target: usize,
+        ) {
             for _ in 0..240 {
                 let n = std::fs::read_to_string(count_path)
                     .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
@@ -5061,7 +5205,16 @@ mod tests {
         )
         .unwrap();
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Wire the thing", "desc", None, None, &[], Some(0), None, None,
+            &conn,
+            &plan.id,
+            "Wire the thing",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -5100,9 +5253,10 @@ mod tests {
         }
 
         // The event must serialize to the documented tag/casing too.
-        let val: serde_json::Value =
-            serde_json::from_str(&serde_json::to_string(&attempt_cancelled_event(&ctx, 1)).unwrap())
-                .unwrap();
+        let val: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&attempt_cancelled_event(&ctx, 1)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(val["event"], "attempt_cancelled");
         assert_eq!(val["step_id"], step.id);
         assert_eq!(val["step_num"], 4);
@@ -5768,10 +5922,7 @@ mod tests {
             .current_dir(workdir)
             .output()
             .unwrap();
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse()
-            .unwrap()
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
     }
 
     /// `Keep` (the default) must NOT roll back between failed attempts: the
@@ -5798,7 +5949,15 @@ mod tests {
             .output()
             .unwrap();
         std::process::Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "seed"])
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
             .current_dir(&dir)
             .output()
             .unwrap();
@@ -5838,7 +5997,17 @@ mod tests {
         // max_retries = 1 → 2 attempts. retry_strategy left None on both
         // levels → resolves to the default `Keep`.
         let (mut step, _) = storage::create_step(
-            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -5921,7 +6090,15 @@ mod tests {
             .output()
             .unwrap();
         std::process::Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "seed"])
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
             .current_dir(&dir)
             .output()
             .unwrap();
@@ -5955,7 +6132,17 @@ mod tests {
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (mut step, _) = storage::create_step(
-            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
         )
         .unwrap();
         // Force the step-level strategy to Rollback.
@@ -6004,10 +6191,7 @@ mod tests {
         );
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
         let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
-        assert!(
-            a1.rolled_back,
-            "Rollback must roll back the failed attempt"
-        );
+        assert!(a1.rolled_back, "Rollback must roll back the failed attempt");
         // Attempt 2's prompt must carry the rolled-back diff (so the agent
         // can learn from work it no longer sees on disk).
         let a2 = logs.iter().find(|l| l.attempt == 2).unwrap();
@@ -6047,7 +6231,15 @@ mod tests {
             .output()
             .unwrap();
         std::process::Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "seed"])
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
             .current_dir(&dir)
             .output()
             .unwrap();
@@ -6102,7 +6294,17 @@ mod tests {
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
         )
         .unwrap();
         // Default → Keep.

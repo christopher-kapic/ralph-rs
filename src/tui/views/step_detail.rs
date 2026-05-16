@@ -1290,8 +1290,7 @@ impl StepDetailApp {
     where
         E: FnOnce(&str) -> Result<Option<String>>,
     {
-        let (resolved, source) =
-            storage::resolve_project_prompt(conn, &self.plan.project)?;
+        let (resolved, source) = storage::resolve_project_prompt(conn, &self.plan.project)?;
         let initial = format_prompt_pane(resolved.prompt.as_deref());
         let new_text = match edit_fn(&initial)? {
             None => return Ok(EditOutcome::NoEditor),
@@ -1303,9 +1302,7 @@ impl StepDetailApp {
         }
         match source {
             ProjectPromptSource::File(_) => match new_prompt.as_deref() {
-                Some(content) => {
-                    storage::write_project_prompt_file(&self.plan.project, content)?
-                }
+                Some(content) => storage::write_project_prompt_file(&self.plan.project, content)?,
                 // Clearing a file-backed prompt removes the file so the DB
                 // (or nothing) becomes the active source again.
                 None => storage::delete_project_prompt_file(&self.plan.project)?,
@@ -1322,11 +1319,7 @@ impl StepDetailApp {
     /// `plan.description` — through `$EDITOR` and persist via
     /// [`storage::update_plan_description`]. The in-memory `plan` mirror is
     /// refreshed so the pane re-renders without a reload.
-    pub fn edit_plan_prompt_pane<E>(
-        &mut self,
-        conn: &Connection,
-        edit_fn: E,
-    ) -> Result<EditOutcome>
+    pub fn edit_plan_prompt_pane<E>(&mut self, conn: &Connection, edit_fn: E) -> Result<EditOutcome>
     where
         E: FnOnce(&str) -> Result<Option<String>>,
     {
@@ -3610,11 +3603,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("ed.sh");
         // Editor writes a known prompt, ignoring the seeded file contents.
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nprintf 'MOCK PROMPT\\n' > \"$1\"\n",
-        )
-        .unwrap();
+        std::fs::write(&script, "#!/bin/sh\nprintf 'MOCK PROMPT\\n' > \"$1\"\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut config = Config {
@@ -3763,7 +3752,9 @@ mod tests {
 
         // File got the edit; DB column is unchanged.
         assert_eq!(
-            storage::read_project_prompt_file(&project).unwrap().as_deref(),
+            storage::read_project_prompt_file(&project)
+                .unwrap()
+                .as_deref(),
             Some("new file value")
         );
         assert_eq!(

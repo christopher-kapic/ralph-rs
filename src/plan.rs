@@ -1538,8 +1538,7 @@ mod tests {
         );
         // (step Some, plan None) -> step
         assert_eq!(
-            make_step(Some(RetryStrategy::Rollback))
-                .effective_retry_strategy(&make_plan(None)),
+            make_step(Some(RetryStrategy::Rollback)).effective_retry_strategy(&make_plan(None)),
             RetryStrategy::Rollback,
         );
         // (step None, plan Some) -> plan

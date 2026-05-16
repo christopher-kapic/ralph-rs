@@ -647,16 +647,7 @@ mod tests {
             plan: Some(plan.description.clone()),
         };
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &prompts,
-            &[],
-        );
+        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
 
         assert_eq!(
             prompt.matches("ZZZ_UNIQUE_PLAN_DESCRIPTION_MARKER").count(),
@@ -720,16 +711,7 @@ mod tests {
             plan: None,
         };
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &prompts,
-            &[],
-        );
+        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
 
         assert!(prompt.contains("# Ralph context"));
         assert!(prompt.contains("## Introspecting the plan"));
@@ -1169,7 +1151,10 @@ mod tests {
         let pl = prompt.find("PLAN-LAYER").unwrap();
         assert!(g < p);
         assert!(p < plan_hdr);
-        assert!(plan_hdr < pl, "plan-layer text must sit inside the # Plan block");
+        assert!(
+            plan_hdr < pl,
+            "plan-layer text must sit inside the # Plan block"
+        );
 
         // Global layer is the very start; the body's focus instruction is
         // the tail — nothing is appended after it.

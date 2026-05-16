@@ -1378,8 +1378,7 @@ mod tests {
         fs::write(dir.join("agent-output.txt"), "agent junk").unwrap();
 
         let preserve = vec!["user-scratch.txt".to_string()];
-        let outcome =
-            park_changes(&dir, ParkStrategy::Discard, &preserve, "ignored").unwrap();
+        let outcome = park_changes(&dir, ParkStrategy::Discard, &preserve, "ignored").unwrap();
         assert_eq!(outcome, ParkOutcome::Discarded);
 
         // Tracked modification rolled back.

@@ -233,7 +233,12 @@ mod tests {
     #[test]
     fn unrecognized_key_is_pending_and_does_not_move() {
         let mut d = SkipDialog::new();
-        for code in [KeyCode::Char('x'), KeyCode::Tab, KeyCode::Left, KeyCode::Right] {
+        for code in [
+            KeyCode::Char('x'),
+            KeyCode::Tab,
+            KeyCode::Left,
+            KeyCode::Right,
+        ] {
             assert_eq!(d.handle_key(key(code)), SkipOutcome::Pending);
             assert_eq!(d.choice.focused_index(), 0);
         }
@@ -243,7 +248,10 @@ mod tests {
     fn confirmed_choices_map_to_park_kinds() {
         assert_eq!(SkipChoice::Stash.to_park_kind(), ParkStrategyKind::Stash);
         assert_eq!(SkipChoice::Commit.to_park_kind(), ParkStrategyKind::Commit);
-        assert_eq!(SkipChoice::Discard.to_park_kind(), ParkStrategyKind::Discard);
+        assert_eq!(
+            SkipChoice::Discard.to_park_kind(),
+            ParkStrategyKind::Discard
+        );
     }
 
     #[test]

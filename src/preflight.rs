@@ -1355,7 +1355,12 @@ mod tests {
 
     #[test]
     fn test_check_global_prompt_warns_when_none_empty_or_garbage() {
-        for prompt in [None, Some(""), Some("   \n\t "), Some("totally custom, no hints")] {
+        for prompt in [
+            None,
+            Some(""),
+            Some("   \n\t "),
+            Some("totally custom, no hints"),
+        ] {
             let cfg = config_with_prompt(prompt);
             let r = check_global_prompt(&cfg);
             assert_eq!(r.severity, CheckSeverity::Warning, "prompt={prompt:?}");

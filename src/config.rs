@@ -1077,9 +1077,8 @@ fn read_and_validate(path: &Path) -> Result<Config> {
     // effort on the parent dir — a bare relative path with no parent still
     // loads correctly in-memory; we just skip the rewrite.
     if migrated && let Some(dir) = path.parent() {
-        write_config_atomic(dir, path, &config).with_context(|| {
-            format!("Failed to rewrite migrated config at {}", path.display())
-        })?;
+        write_config_atomic(dir, path, &config)
+            .with_context(|| format!("Failed to rewrite migrated config at {}", path.display()))?;
     }
     Ok(config)
 }
@@ -2215,7 +2214,10 @@ mod tests {
         // Neither legacy key present → not a migration.
         let mut raw = serde_json::json!({ "prompt": "already new" });
         assert!(!migrate_legacy_prompt_fields(&mut raw));
-        assert_eq!(raw.get("prompt").and_then(|v| v.as_str()), Some("already new"));
+        assert_eq!(
+            raw.get("prompt").and_then(|v| v.as_str()),
+            Some("already new")
+        );
     }
 
     #[test]
@@ -2292,8 +2294,7 @@ mod tests {
         assert_eq!(
             raw.get("prompt").and_then(|v| v.as_str()),
             Some(
-                format!("{LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX}\n\nAlways run the linter.")
-                    .as_str()
+                format!("{LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX}\n\nAlways run the linter.").as_str()
             )
         );
     }

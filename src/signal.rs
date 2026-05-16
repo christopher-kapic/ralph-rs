@@ -276,8 +276,7 @@ pub(crate) static EXIT_CLEANUP_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// on cross-test scheduling (i.e. flaky under full parallel `cargo test`).
 /// Recovering the poisoned guard is always safe here.
 #[cfg(test)]
-pub(crate) fn lock_exit_cleanup_test()
--> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn lock_exit_cleanup_test() -> std::sync::MutexGuard<'static, ()> {
     EXIT_CLEANUP_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

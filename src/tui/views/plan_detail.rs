@@ -2406,7 +2406,10 @@ mod tests {
         app.selected_index = 7;
         // First inner row (y = 2) maps to offset 5 + 0 = index 5.
         app.handle_mouse(mouse_event(3, 2, MouseEventKind::Down(MouseButton::Left)));
-        assert_eq!(app.selected_index, 5, "row→index must add the scroll offset");
+        assert_eq!(
+            app.selected_index, 5,
+            "row→index must add the scroll offset"
+        );
         assert!(app.take_pending_open_step().is_none());
     }
 

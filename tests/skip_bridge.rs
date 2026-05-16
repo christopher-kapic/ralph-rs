@@ -171,18 +171,38 @@ fn setup() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
 
     run_check(
-        ralph(&proj).args(["plan", "create", "skip-plan", "-d", "exercise the skip bridge"]),
+        ralph(&proj).args([
+            "plan",
+            "create",
+            "skip-plan",
+            "-d",
+            "exercise the skip bridge",
+        ]),
         "plan create",
     );
     run_check(
         ralph(&proj).args([
-            "step", "add", "Blocking step", "skip-plan", "-d", "sleeps", "--harness", "blocker",
+            "step",
+            "add",
+            "Blocking step",
+            "skip-plan",
+            "-d",
+            "sleeps",
+            "--harness",
+            "blocker",
         ]),
         "step add 1",
     );
     run_check(
         ralph(&proj).args([
-            "step", "add", "Quick step", "skip-plan", "-d", "fast", "--harness", "quick",
+            "step",
+            "add",
+            "Quick step",
+            "skip-plan",
+            "-d",
+            "fast",
+            "--harness",
+            "quick",
         ]),
         "step add 2",
     );
