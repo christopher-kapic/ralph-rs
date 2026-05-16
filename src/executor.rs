@@ -204,12 +204,6 @@ enum FailureReason {
     /// Execution was aborted via signal (Ctrl+C / SIGTERM) — terminates the
     /// whole run.
     Aborted,
-    /// Operator ran `ralph skip` against the in-flight step. Not really a
-    /// *failure* — the step is intentionally dropped — but it shares
-    /// `finalize_failure`'s teardown (rollback of uncommitted work, log row,
-    /// post-step hook). Distinct from `Aborted` so the step is marked
-    /// `Skipped`/`UserSkipped` and the run advances instead of ending.
-    Skipped,
     /// Tests failed after exhausting all attempts.
     TestFailed,
     /// Harness produced no changes after exhausting all attempts.
@@ -222,7 +216,6 @@ impl FailureReason {
     fn to_step_status(self) -> StepStatus {
         match self {
             Self::Aborted => StepStatus::Aborted,
-            Self::Skipped => StepStatus::Skipped,
             _ => StepStatus::Failed,
         }
     }
@@ -231,7 +224,6 @@ impl FailureReason {
         match self {
             Self::Timeout => StepOutcome::Timeout,
             Self::Aborted => StepOutcome::Aborted,
-            Self::Skipped => StepOutcome::Skipped,
             _ => StepOutcome::Failed,
         }
     }
@@ -240,7 +232,6 @@ impl FailureReason {
         match self {
             Self::Timeout => "timeout",
             Self::Aborted => "aborted",
-            Self::Skipped => "skipped",
             Self::NoChanges => "no_changes",
             Self::TestFailed => "failed",
             Self::HarnessFailed => "harness_failed",
@@ -442,6 +433,181 @@ async fn finalize_failure(
         step_id: ctx.step.id.clone(),
         attempts_used: attempt,
         commit_hash: None,
+    })
+}
+
+/// True when the working tree has changes that are NOT entirely accounted
+/// for by `pre_existing_untracked` — i.e. there is work the killed harness
+/// produced (or modified) that is causally tied to this step.
+///
+/// A clean tree, or a tree whose only changes are files the user already
+/// had untracked before the run started, returns `false`: nothing the skip
+/// is responsible for, so parking would clobber the user's own scratch.
+fn has_step_attributable_changes(workdir: &Path, pre_existing_untracked: &[String]) -> Result<bool> {
+    let changed = git::get_all_changed_files(workdir)?;
+    Ok(changed
+        .iter()
+        .any(|f| !pre_existing_untracked.contains(f)))
+}
+
+/// Finalize a step that was skipped while its harness was in-flight
+/// (`WaitResult::Skipped`, reached only via the `ralph skip` → cancel-ladder
+/// path). This is step 16's terminal-skip path, extended for step 17 to
+/// *park* the killed harness's uncommitted work per the operator's
+/// `--changes` choice instead of unconditionally rolling it back.
+///
+/// Exactly one `execution_logs` row is written here (reconciling with step
+/// 16, which previously routed this case through `finalize_failure`): we no
+/// longer call `finalize_failure` for the skip arm at all, so there is no
+/// second row. `termination_reason` is always `UserSkipped`; `committed`
+/// and `commit_hash` track the parked outcome:
+///
+/// - `Commit`  → `committed = true`, `commit_hash = <wip sha>`
+/// - `Stash`   → `committed = false` (recoverable via the stash, not a commit)
+/// - `Discard` → `committed = false`
+/// - tree clean / only pre-existing untracked → no parking, `committed = false`
+///
+/// The park strategy is read from the process-global slot
+/// [`crate::signal::take_requested_park_kind`] set by `request_skip_in_flight`.
+/// A `None` there (e.g. a cross-process SIGTERM-style skip that couldn't set
+/// it) defaults to `Stash` so a skip never silently destroys work.
+#[allow(clippy::too_many_arguments)]
+async fn finalize_skipped(
+    ctx: &ExecCtx<'_>,
+    exec_log_id: i64,
+    duration_secs: f64,
+    attempt: i32,
+    stdout: &str,
+    stderr: &str,
+) -> Result<StepResult> {
+    let parsed = parse_harness_json(stdout);
+
+    // Capture the diff *before* any parking touches the tree so `ralph log`
+    // retains what the skipped attempt produced.
+    let had_changes = git::has_uncommitted_changes(ctx.workdir)?;
+    let diff = if had_changes {
+        Some(git::get_diff(ctx.workdir)?)
+    } else {
+        None
+    };
+
+    let kind = crate::signal::take_requested_park_kind()
+        .unwrap_or(crate::git::ParkStrategyKind::Stash);
+
+    let park_relevant = has_step_attributable_changes(ctx.workdir, ctx.pre_existing_untracked)?;
+
+    // Default terminal log shape: nothing committed, nothing rolled back.
+    let mut committed = false;
+    let mut commit_hash: Option<String> = None;
+    let mut rolled_back = false;
+
+    if park_relevant {
+        // Record a rollback phase only for the discard strategy (the only
+        // one that throws work away) so an external observer sees why the
+        // tree is being touched; stash/commit are non-destructive.
+        if kind == crate::git::ParkStrategyKind::Discard {
+            write_phase(
+                ctx.conn,
+                ctx.plan,
+                &ctx.step.id,
+                ctx.step_num,
+                attempt,
+                ctx.max_attempts,
+                Some(exec_log_id),
+                Phase::Rollback,
+                None,
+                ChildUpdate::Clear,
+                ctx.json_output,
+            )?;
+        }
+
+        let strategy = match kind {
+            crate::git::ParkStrategyKind::Stash => crate::git::ParkStrategy::Stash {
+                label: format!(
+                    "ralph-skip/{}/{}/{}",
+                    ctx.plan.slug,
+                    ctx.step_num,
+                    chrono::Utc::now().timestamp()
+                ),
+            },
+            crate::git::ParkStrategyKind::Commit => crate::git::ParkStrategy::Commit {
+                subject: format!(
+                    "[ralph wip] skipped step {}: {}",
+                    ctx.step_num, ctx.step.title
+                ),
+            },
+            crate::git::ParkStrategyKind::Discard => crate::git::ParkStrategy::Discard,
+        };
+
+        let outcome = git::park_changes(
+            ctx.workdir,
+            strategy,
+            ctx.pre_existing_untracked,
+            &ctx.step.id,
+        )?;
+
+        match outcome {
+            crate::git::ParkOutcome::Committed { sha } => {
+                committed = true;
+                commit_hash = Some(sha);
+            }
+            crate::git::ParkOutcome::Stashed { .. } => {}
+            crate::git::ParkOutcome::Discarded => {
+                rolled_back = true;
+            }
+        }
+    }
+
+    storage::update_execution_log(
+        ctx.conn,
+        exec_log_id,
+        Some(duration_secs),
+        diff.as_deref(),
+        &[],
+        rolled_back,
+        committed,
+        commit_hash.as_deref(),
+        Some(stdout),
+        Some(stderr),
+        parsed.cost_usd,
+        parsed.input_tokens,
+        parsed.output_tokens,
+        parsed.session_id.as_deref(),
+        Some(TerminationReason::UserSkipped),
+        Some(TestStatus::NotRun),
+    )?;
+
+    storage::update_step_status(ctx.conn, &ctx.step.id, StepStatus::Skipped)?;
+
+    write_phase(
+        ctx.conn,
+        ctx.plan,
+        &ctx.step.id,
+        ctx.step_num,
+        attempt,
+        ctx.max_attempts,
+        Some(exec_log_id),
+        Phase::PostStepHook,
+        None,
+        ChildUpdate::Clear,
+        ctx.json_output,
+    )?;
+    hooks::run_post_step(
+        ctx.conn,
+        ctx.hook_ctx,
+        ctx.plan,
+        ctx.step,
+        attempt,
+        "skipped",
+        ctx.workdir,
+    )
+    .await?;
+
+    Ok(StepResult {
+        outcome: StepOutcome::Skipped,
+        step_id: ctx.step.id.clone(),
+        attempts_used: attempt,
+        commit_hash,
     })
 }
 
@@ -1609,39 +1775,20 @@ pub async fn execute_step(
             WaitResult::Skipped { stdout, stderr } => {
                 // `ralph skip` killed the in-flight harness via the same
                 // ladder as Aborted, but only THIS step is dropped — the
-                // runner advances. Capture any partial output + parsed JSON
-                // so `ralph log` retains diagnostic context for the skipped
-                // attempt. test_status is NotRun (tests never ran), and
-                // termination_reason is UserSkipped (distinct from the
-                // UserInterrupted that Ctrl+C records). committed=false:
-                // change-handling (stash/commit/discard) lands in steps
-                // 17-18; for now finalize_failure rolls back any uncommitted
-                // work, exactly like the abort path.
-                let parsed = parse_harness_json(&stdout);
-                let has_changes = git::has_uncommitted_changes(workdir)?;
-                let diff = if has_changes {
-                    Some(git::get_diff(workdir)?)
-                } else {
-                    None
-                };
-                let skip_results: Vec<String> = Vec::new();
-                let fail_output = FailureOutput {
-                    diff: diff.as_deref(),
-                    test_results: &skip_results,
-                    stdout: &stdout,
-                    stderr: &stderr,
-                    parsed: &parsed,
-                    has_changes,
-                };
-                return finalize_failure(
+                // runner advances. STEP 17: instead of unconditionally
+                // rolling back (step 16's behavior), park the harness's
+                // uncommitted work per the operator's `--changes` choice
+                // (stash / commit / discard). `finalize_skipped` writes the
+                // single `user_skipped` execution_logs row itself — we
+                // deliberately do NOT also go through `finalize_failure`, so
+                // there is exactly one row.
+                return finalize_skipped(
                     &ctx,
                     exec_log.id,
                     duration_secs,
                     attempt,
-                    FailureReason::Skipped,
-                    Some(&fail_output),
-                    TerminationReason::UserSkipped,
-                    TestStatus::NotRun,
+                    &stdout,
+                    &stderr,
                 )
                 .await;
             }
@@ -3506,6 +3653,286 @@ mod tests {
             !logs[0].committed,
             "no work was kept on the skip path (committed must be false)"
         );
+    }
+
+    /// STEP 17 shared driver: run a step whose harness dirties the tree
+    /// (a tracked modification + a new untracked file), then skip it
+    /// in-flight with `kind`. Routes the skip through
+    /// `signal::request_skip_in_flight` (exactly as `runner::skip_step`
+    /// does) so the executor's `finalize_skipped` consumes the recorded
+    /// park strategy. Returns `(dir, conn, step_id)` for per-strategy
+    /// assertions.
+    ///
+    /// Holds `EXIT_CLEANUP_TEST_LOCK` across the `.await`s on purpose:
+    /// `install_and_spawn` registers a process-global cancel TX and
+    /// `request_skip_in_flight` mutates the global in-flight flag + park-kind
+    /// slot, so this must be serialized against the other signal-registry
+    /// tests. Each caller runs on a `current_thread` runtime, ruling out
+    /// cross-thread guard transfer (same rationale as the signal-module
+    /// tests). The guard is returned to the caller so it stays alive until
+    /// the test (and its per-strategy assertions) finishes.
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_inflight_skip_with_changes(
+        kind: crate::git::ParkStrategyKind,
+    ) -> (
+        std::path::PathBuf,
+        tempfile::TempDir,
+        Connection,
+        String,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let registry_guard = crate::signal::EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let shared = TempDir::new().unwrap();
+        let pid_path = shared.path().join("pid.txt");
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("skip-harness.sh");
+        // Dirty the repo (tracked edit + new untracked file), THEN announce
+        // our pid and block so the skip lands with real work in the tree.
+        let script = format!(
+            "#!/bin/sh\n\
+             echo 'harness edit' >> {readme}\n\
+             echo 'agent output' > {agent}\n\
+             echo \"$$\" > {pid}\n\
+             sleep 60\n",
+            readme = dir.join("README.md").to_string_lossy(),
+            agent = dir.join("agent-new.txt").to_string_lossy(),
+            pid = pid_path.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "demo-plan",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Wire the thing", "desc", None, None, &[], Some(0), None, None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "skip".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+
+        // Register a real cancel TX/RX pair in the process-global registry
+        // (as the signal listener would for a live run) so
+        // request_skip_in_flight injects into the channel execute_step
+        // listens on.
+        let (_handle, rx) = crate::signal::install_and_spawn_with_handle();
+
+        let pid_path_clone = pid_path.clone();
+        let skip_task = tokio::spawn(async move {
+            for _ in 0..120 {
+                if pid_path_clone.exists()
+                    && fs::read_to_string(&pid_path_clone)
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // Mark a step in-flight and request the skip exactly like
+            // runner::skip_step's in-flight branch.
+            let _g = crate::signal::StepInFlightGuard::enter();
+            assert!(
+                crate::signal::request_skip_in_flight(kind),
+                "request_skip_in_flight must signal when a step is in-flight"
+            );
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 15s on skip")
+        .unwrap();
+
+        skip_task.await.ok();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Skipped,
+            "skip must yield StepOutcome::Skipped"
+        );
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Skipped);
+
+        (dir, tmp, conn, step.id, registry_guard)
+    }
+
+    /// STEP 17: `--changes stash` parks the in-flight work in a
+    /// `git stash` (labelled `ralph-skip/<slug>/<num>/<ts>`), leaves the
+    /// tree clean of the harness's edits, and records committed=false.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_skip_changes_stash_parks_to_stash() {
+        let (dir, _tmp, conn, step_id, _registry_guard) =
+            run_inflight_skip_with_changes(crate::git::ParkStrategyKind::Stash).await;
+
+        // The harness's tracked edit is gone from the worktree…
+        assert!(
+            !crate::git::has_uncommitted_changes(&dir).unwrap(),
+            "stash must leave the tree clean of the skipped step's changes"
+        );
+        // …and recoverable from a ralph-skip-labelled stash entry.
+        let stash_list = std::process::Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&stash_list.stdout);
+        assert!(
+            listing.contains("ralph-skip/demo-plan/1/"),
+            "stash list missing ralph-skip label: {listing}"
+        );
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step_id).unwrap();
+        assert_eq!(logs.len(), 1, "exactly one execution_log row");
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped)
+        );
+        assert!(!logs[0].committed, "stash is not a commit");
+        assert!(logs[0].commit_hash.is_none());
+    }
+
+    /// STEP 17: `--changes commit` parks the work as a WIP commit carrying
+    /// the `Ralph-Skipped-Step: <step-id>` trailer; the log row is
+    /// committed=true with the commit SHA in commit_hash.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_skip_changes_commit_makes_wip_commit_with_trailer() {
+        let (dir, _tmp, conn, step_id, _registry_guard) =
+            run_inflight_skip_with_changes(crate::git::ParkStrategyKind::Commit).await;
+
+        // Tree is clean (everything was committed).
+        assert!(!crate::git::has_uncommitted_changes(&dir).unwrap());
+
+        let body = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let body = String::from_utf8_lossy(&body.stdout);
+        assert!(
+            body.contains("[ralph wip] skipped step 1: Wire the thing"),
+            "WIP commit subject wrong: {body}"
+        );
+        assert!(
+            body.contains(&format!("Ralph-Skipped-Step: {step_id}")),
+            "WIP commit missing step-id trailer: {body}"
+        );
+
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step_id).unwrap();
+        assert_eq!(logs.len(), 1, "exactly one execution_log row");
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped)
+        );
+        assert!(logs[0].committed, "commit strategy must set committed=true");
+        assert_eq!(
+            logs[0].commit_hash.as_deref(),
+            Some(head_sha.as_str()),
+            "commit_hash must be the WIP commit SHA"
+        );
+    }
+
+    /// STEP 17: `--changes discard` throws the in-flight work away; the
+    /// tree returns to the last commit and the log row is committed=false.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_skip_changes_discard_drops_the_work() {
+        let (dir, _tmp, conn, step_id, _registry_guard) =
+            run_inflight_skip_with_changes(crate::git::ParkStrategyKind::Discard).await;
+
+        assert!(
+            !crate::git::has_uncommitted_changes(&dir).unwrap(),
+            "discard must restore a clean tree"
+        );
+        // The tracked file is back to its committed contents and the
+        // harness's new untracked file is gone.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "init"
+        );
+        assert!(!dir.join("agent-new.txt").exists());
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step_id).unwrap();
+        assert_eq!(logs.len(), 1, "exactly one execution_log row");
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped)
+        );
+        assert!(!logs[0].committed);
+        assert!(logs[0].commit_hash.is_none());
+        assert!(logs[0].rolled_back, "discard records rolled_back=true");
     }
 
     /// Complements `test_abort_kills_harness_process_group` with the

@@ -233,6 +233,12 @@ pub enum Command {
         #[arg(long)]
         reason: Option<String>,
 
+        /// How to dispose of the in-flight harness's uncommitted changes when
+        /// skipping a *currently-running* step. Ignored for steps that aren't
+        /// running (their changes aren't causally tied to the skip).
+        #[arg(long, value_enum, default_value_t = ChangeHandling::Stash)]
+        changes: ChangeHandling,
+
         /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
         #[arg(long)]
         force: bool,
@@ -927,6 +933,33 @@ pub enum QuestionCommand {
         /// 1-based index from `ralph question list`.
         num: usize,
     },
+}
+
+/// How `ralph skip` disposes of a currently-running step's uncommitted
+/// work after the harness is killed. Mirrors [`crate::git::ParkStrategy`]
+/// at the CLI surface (the label/subject/trailer are filled in later from
+/// the skipped step's identity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum ChangeHandling {
+    /// `git stash push --include-untracked` — recoverable later (default).
+    Stash,
+    /// `git add -A && git commit` a WIP commit carrying a
+    /// `Ralph-Skipped-Step` trailer.
+    Commit,
+    /// Throw the in-flight changes away (pre-existing untracked files are
+    /// preserved).
+    Discard,
+}
+
+impl From<ChangeHandling> for crate::git::ParkStrategyKind {
+    fn from(c: ChangeHandling) -> Self {
+        match c {
+            ChangeHandling::Stash => crate::git::ParkStrategyKind::Stash,
+            ChangeHandling::Commit => crate::git::ParkStrategyKind::Commit,
+            ChangeHandling::Discard => crate::git::ParkStrategyKind::Discard,
+        }
+    }
 }
 
 /// `on` / `off` value enum for `ralph plan questions`.

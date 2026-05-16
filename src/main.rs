@@ -493,6 +493,7 @@ fn main() -> Result<()> {
             plan: plan_slug,
             step: step_num,
             reason,
+            changes,
             force,
         } => {
             let plan = resolve_plan(&conn, plan_slug, &project, false)?;
@@ -502,7 +503,7 @@ fn main() -> Result<()> {
             let _run_lock =
                 run_lock::acquire(&conn, &project, Some(&plan.slug), Some(&plan.id), force)?;
 
-            runner::skip_step(&conn, &plan, step_num, reason.as_deref())?;
+            runner::skip_step(&conn, &plan, step_num, reason.as_deref(), changes.into())?;
             Ok(())
         }
 

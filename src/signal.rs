@@ -60,6 +60,15 @@ pub type CancelState = Option<CancelReason>;
 /// rather than spawning a parallel one. Cleared on a fresh install.
 static ACTIVE_CANCEL_TX: Mutex<Option<watch::Sender<CancelState>>> = Mutex::new(None);
 
+/// The change-handling strategy the most recent in-flight `ralph skip`
+/// requested via `--changes`. `request_skip_in_flight` stashes it here just
+/// before tripping the cancel channel so the executor's skip-finalize path
+/// (a different call frame, reached via the kill ladder) knows whether to
+/// stash / commit / discard the harness's uncommitted work. Read-once:
+/// [`take_requested_park_kind`] consumes it so a stale value can't leak into
+/// a later, unrelated skip.
+static REQUESTED_PARK_KIND: Mutex<Option<crate::git::ParkStrategyKind>> = Mutex::new(None);
+
 /// `true` while the runner in this process is inside `execute_step` for a
 /// step. `skip_step` consults this to decide whether to route through the
 /// cancel ladder (a step is in-flight here) or just flip the DB status (no
@@ -102,26 +111,45 @@ impl Drop for StepInFlightGuard {
     }
 }
 
-/// Request that the in-flight step be skipped: inject
-/// [`CancelReason::Skipped`] into this process's cancel channel, kicking the
-/// existing SIGTERM→SIGKILL ladder against the harness child.
+/// Request that the in-flight step be skipped: record the requested
+/// change-handling strategy, then inject [`CancelReason::Skipped`] into this
+/// process's cancel channel, kicking the existing SIGTERM→SIGKILL ladder
+/// against the harness child.
+///
+/// `park_kind` is the user's `--changes` choice; it's stashed in a
+/// process-global slot the executor consumes via
+/// [`take_requested_park_kind`] when it reaches the skip-finalize path
+/// (a separate call frame reached only through the kill ladder, so it can't
+/// be threaded as a normal argument).
 ///
 /// Returns `true` if a cancel sender was registered and a step is in-flight
 /// (so the caller should expect the executor to mark the step `Skipped`),
 /// `false` if there's nothing running here to interrupt (the caller should
 /// fall back to a plain DB status flip).
-pub fn request_skip_in_flight() -> bool {
+pub fn request_skip_in_flight(park_kind: crate::git::ParkStrategyKind) -> bool {
     if !step_in_flight() {
         return false;
     }
     let guard = ACTIVE_CANCEL_TX.lock().unwrap();
     match guard.as_ref() {
         Some(tx) => {
+            *REQUESTED_PARK_KIND.lock().unwrap() = Some(park_kind);
             let _ = tx.send(Some(CancelReason::Skipped));
             true
         }
         None => false,
     }
+}
+
+/// Consume the park strategy a prior [`request_skip_in_flight`] recorded.
+///
+/// Returns `None` when no in-flight skip set one (e.g. the skip arrived as
+/// a cross-process SIGTERM, or this is an `Aborted` cancel, not a skip) —
+/// the executor then falls back to its default (stash) so a skip never
+/// silently loses the harness's work. Taking it (rather than peeking) keeps
+/// a value from one skip from leaking into a later unrelated one.
+pub fn take_requested_park_kind() -> Option<crate::git::ParkStrategyKind> {
+    REQUESTED_PARK_KIND.lock().unwrap().take()
 }
 
 // ---------------------------------------------------------------------------
@@ -587,7 +615,7 @@ mod tests {
     fn test_request_skip_no_step_in_flight_is_noop() {
         let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
         set_step_in_flight(false);
-        assert!(!request_skip_in_flight());
+        assert!(!request_skip_in_flight(crate::git::ParkStrategyKind::Stash));
     }
 
     /// When a step is in-flight, `request_skip_in_flight` injects exactly
@@ -608,13 +636,29 @@ mod tests {
         assert!(rx.borrow().is_none());
 
         set_step_in_flight(true);
-        assert!(request_skip_in_flight(), "should signal when in-flight");
+        assert!(
+            request_skip_in_flight(crate::git::ParkStrategyKind::Commit),
+            "should signal when in-flight"
+        );
 
         rx.changed().await.unwrap();
         assert_eq!(
             *rx.borrow(),
             Some(CancelReason::Skipped),
             "skip must inject Skipped, not Aborted"
+        );
+
+        // The requested park kind is recorded for the executor and consumed
+        // exactly once.
+        assert_eq!(
+            take_requested_park_kind(),
+            Some(crate::git::ParkStrategyKind::Commit),
+            "request_skip_in_flight must stash the --changes choice"
+        );
+        assert_eq!(
+            take_requested_park_kind(),
+            None,
+            "take must consume the value (no leak into a later skip)"
         );
 
         set_step_in_flight(false);

@@ -516,6 +516,18 @@ fn has_conflict_marker(porcelain_out: &str) -> bool {
 // Parking changes (skip handling)
 // ---------------------------------------------------------------------------
 
+/// The *kind* of [`ParkStrategy`] without its per-step payload (label /
+/// subject). `Copy`, so it can ride through the cancel registry alongside
+/// [`crate::signal::CancelReason`]: the skip command only knows the user's
+/// `--changes` choice; the executor reconstitutes the full [`ParkStrategy`]
+/// from the skipped step's identity at park time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkStrategyKind {
+    Stash,
+    Commit,
+    Discard,
+}
+
 /// How [`park_changes`] should dispose of the working-tree changes left
 /// behind when a step is skipped mid-run.
 #[derive(Debug, Clone, PartialEq, Eq)]

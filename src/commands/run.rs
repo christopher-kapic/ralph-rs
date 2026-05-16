@@ -3347,7 +3347,13 @@ pub(crate) fn plan_detail_apply_palette_action(
             // resolves the step number, validates status, and writes the
             // skipped row. None means "skip the current step".
             let plan = app.plan.clone();
-            match crate::runner::skip_step(conn, &plan, step_num.map(|n| n as usize), None) {
+            match crate::runner::skip_step(
+                conn,
+                &plan,
+                step_num.map(|n| n as usize),
+                None,
+                crate::git::ParkStrategyKind::Stash,
+            ) {
                 Ok(actual_num) => {
                     app.refresh_steps(storage::list_steps(conn, &app.plan.id)?);
                     app.toasts.push(
@@ -4649,7 +4655,13 @@ pub(crate) fn step_detail_apply_palette_action(
         }
         PaletteAction::SkipStep { step_num, .. } => {
             let plan = app.plan.clone();
-            match crate::runner::skip_step(conn, &plan, step_num.map(|n| n as usize), None) {
+            match crate::runner::skip_step(
+                conn,
+                &plan,
+                step_num.map(|n| n as usize),
+                None,
+                crate::git::ParkStrategyKind::Stash,
+            ) {
                 Ok(actual_num) => {
                     app.steps = storage::list_steps(conn, &app.plan.id)?;
                     app.toasts.push(

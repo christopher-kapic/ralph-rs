@@ -1183,11 +1183,19 @@ pub async fn resume_plan(
 /// Marks the step as skipped and returns the step number that was skipped.
 /// The optional `reason` is persisted on the step so it appears in
 /// `ralph status -v` and `ralph log`.
+///
+/// `changes` is the user's `--changes` choice. It only matters when the
+/// target step is *currently running in this process*: in that case the
+/// executor (reached through the cancel/kill ladder) parks the harness's
+/// uncommitted work per this strategy. For any non-running step the
+/// changes in the tree aren't causally tied to the skip, so the strategy
+/// is ignored and a one-line note is emitted.
 pub fn skip_step(
     conn: &Connection,
     plan: &Plan,
     step_num: Option<usize>,
     reason: Option<&str>,
+    changes: crate::git::ParkStrategyKind,
 ) -> Result<usize> {
     let steps = storage::list_steps(conn, &plan.id)?;
 
@@ -1230,12 +1238,25 @@ pub fn skip_step(
     // different process entirely so no cancel sender is registered here),
     // `request_skip_in_flight` returns false and we keep the original
     // synchronous DB-flip behavior.
-    if step.status == StepStatus::InProgress && crate::signal::request_skip_in_flight() {
+    if step.status == StepStatus::InProgress
+        && crate::signal::request_skip_in_flight(changes)
+    {
         eprintln!(
             "Skipping in-flight step {} '{}' — interrupting the harness…",
             actual_num, step.title
         );
         return Ok(actual_num);
+    }
+
+    // Not running here: the working tree's changes (if any) aren't causally
+    // tied to *this* step, so we deliberately don't touch them. Note that
+    // the --changes choice had no effect unless it was the (no-op) default.
+    if changes != crate::git::ParkStrategyKind::Stash {
+        eprintln!(
+            "note: --changes has no effect — step {} is not running, so its \
+             working-tree changes are left untouched",
+            actual_num
+        );
     }
 
     storage::mark_step_skipped(conn, &step.id, reason)?;
@@ -2154,7 +2175,7 @@ mod tests {
         )
         .unwrap();
 
-        let skipped = skip_step(&conn, &plan, Some(2), None).unwrap();
+        let skipped = skip_step(&conn, &plan, Some(2), None, crate::git::ParkStrategyKind::Stash).unwrap();
         assert_eq!(skipped, 2);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2197,7 +2218,7 @@ mod tests {
         // Mark first as complete so current is "Second".
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
 
-        let skipped = skip_step(&conn, &plan, None, None).unwrap();
+        let skipped = skip_step(&conn, &plan, None, None, crate::git::ParkStrategyKind::Stash).unwrap();
         assert_eq!(skipped, 2);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2233,7 +2254,7 @@ mod tests {
         let (_handle, mut rx) = crate::signal::install_and_spawn_with_handle();
         let _in_flight = crate::signal::StepInFlightGuard::enter();
 
-        let skipped = skip_step(&conn, &plan, Some(1), None).unwrap();
+        let skipped = skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Stash).unwrap();
         assert_eq!(skipped, 1);
 
         // The cancel channel received the Skipped reason (distinct from
@@ -2267,7 +2288,7 @@ mod tests {
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
 
-        let skipped = skip_step(&conn, &plan, Some(1), None).unwrap();
+        let skipped = skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Stash).unwrap();
         assert_eq!(skipped, 1);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2298,7 +2319,7 @@ mod tests {
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
 
-        let result = skip_step(&conn, &plan, Some(1), None);
+        let result = skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Stash);
         assert!(result.is_err());
     }
 
@@ -2321,7 +2342,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = skip_step(&conn, &plan, Some(5), None);
+        let result = skip_step(&conn, &plan, Some(5), None, crate::git::ParkStrategyKind::Stash);
         assert!(result.is_err());
     }
 
@@ -2344,7 +2365,14 @@ mod tests {
         )
         .unwrap();
 
-        let skipped = skip_step(&conn, &plan, Some(1), Some("redundant after H7")).unwrap();
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            Some("redundant after H7"),
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         assert_eq!(skipped, 1);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2374,7 +2402,7 @@ mod tests {
         )
         .unwrap();
 
-        skip_step(&conn, &plan, Some(1), None).unwrap();
+        skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Stash).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Skipped);
@@ -2400,7 +2428,14 @@ mod tests {
         )
         .unwrap();
 
-        skip_step(&conn, &plan, Some(1), Some("because")).unwrap();
+        skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            Some("because"),
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         storage::reset_step(&conn, &s1.id).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2428,11 +2463,74 @@ mod tests {
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Failed).unwrap();
 
-        let skipped = skip_step(&conn, &plan, Some(1), None).unwrap();
+        let skipped = skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Stash).unwrap();
         assert_eq!(skipped, 1);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Skipped);
+    }
+
+    /// STEP 17: skipping a step that is NOT currently running must leave
+    /// the working tree completely alone — those changes aren't causally
+    /// tied to the skip — even when a non-default `--changes` is passed.
+    /// Only the DB status flips.
+    #[test]
+    fn test_skip_non_running_step_ignores_changes_and_leaves_tree() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+
+        // A dirty working tree the user has unrelated to any step.
+        fs::write(dir.join("README.md"), "# locally edited").unwrap();
+        fs::write(dir.join("scratch.txt"), "user scratch").unwrap();
+        assert!(git::has_uncommitted_changes(&dir).unwrap());
+        let before = git::get_all_changed_files(&dir).unwrap();
+
+        let conn = setup();
+        let plan =
+            storage::create_plan(&conn, "s", &dir.to_string_lossy(), "b", "d", None, None, &[])
+                .unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        // Pending (NOT in-flight). request_skip_in_flight will be a no-op
+        // because no step is in-flight in this process.
+        assert_eq!(s1.status, StepStatus::Pending);
+
+        // A non-default --changes: discard. It must have NO effect because
+        // the step isn't running.
+        let skipped =
+            skip_step(&conn, &plan, Some(1), None, crate::git::ParkStrategyKind::Discard)
+                .unwrap();
+        assert_eq!(skipped, 1);
+
+        // DB flipped…
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Skipped);
+
+        // …but the working tree is byte-for-byte untouched: no rollback,
+        // no stash, no commit.
+        assert!(git::has_uncommitted_changes(&dir).unwrap());
+        assert_eq!(git::get_all_changed_files(&dir).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# locally edited"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("scratch.txt")).unwrap(),
+            "user scratch"
+        );
+        // No ralph-skip stash was created.
+        let stash = std::process::Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&stash.stdout).trim().is_empty(),
+            "non-running skip must not create a stash"
+        );
     }
 
     // -- step_number_in_plan tests --
