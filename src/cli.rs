@@ -323,11 +323,14 @@ pub enum Command {
     #[command(subcommand)]
     Hooks(HooksCommand),
 
-    /// Configure prompt prefixes/suffixes at global or project scope.
+    /// Configure the global or project prompt layer.
     ///
-    /// Each scope's prefix is prepended and suffix appended to every step
-    /// prompt; prefixes stack outermost (global) to innermost (project) at
-    /// the top, suffixes stack innermost to outermost at the bottom.
+    /// Each scope holds a single prompt blob (no prefix/suffix split). The
+    /// four layers — global, project, plan (the plan description), step —
+    /// stack top-to-bottom to form each step prompt; this command edits the
+    /// global and project layers (`--scope universal` aliases global; the
+    /// project layer reads `<project>/.ralph/prompt.md` when present, else
+    /// the DB).
     #[command(subcommand)]
     Prompt(PromptCommand),
 

@@ -171,7 +171,9 @@ Four layers, assembled outermost → innermost by `prompt::build_step_prompt`
    set/clear/show --scope project` is file-vs-DB aware.
 3. **Plan** — the plan's `description`, rendered once into the `# Plan:
    {slug}` context block. There is **no** per-plan prefix/suffix and no
-   per-plan `context_prepend` (legacy columns dropped in migrations V21/V22).
+   per-plan `context_prepend` (legacy per-plan columns dropped in
+   migration V21; the project-scope prefix/suffix pair was collapsed into
+   `project_settings.prompt` in V22).
 4. **Step** — the step body (title / description / acceptance criteria).
 
 There is no suffix concept; layers stack as prefix sections only.
@@ -205,7 +207,7 @@ ralph step list [<slug>]
 ralph step add <title> [<slug>] [-d <desc>] [--after <num>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--max-retries <n>] [--retry-strategy <keep|rollback>] [--import-json <FILE|->]
 ralph step remove <num>|--step-id <uuid> [<slug>] [--force/-y]
 ralph step edit <num>|--step-id <uuid> [<slug>] [--title <t>] [--description <d>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--clear-criteria] [--max-retries <n>] [--clear-max-retries] [--retry-strategy <keep|rollback>] [--clear-retry-strategy]
-ralph step reset <num>|--step-id <uuid> [<slug>]
+ralph step reset <num>|--step-id <uuid> [<slug>] [--force/-y]
 ralph step move <num>|--step-id <uuid> --to <n> [<slug>]
 ralph step set-hook <num>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --hook <name>
 ralph step unset-hook <num>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --hook <name>
@@ -213,7 +215,6 @@ ralph step unset-hook <num>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --
 ralph run [<slug>] [--one/--single] [--all] [--from <n>] [--to <m>] [--dry-run] [--skip-preflight] [--current-branch] [--auto-stash] [--harness <h>] [--force]
 ralph resume [<slug>]
 ralph skip [<slug>] [--step <n>] [--reason <reason>] [--changes <stash|commit|discard>] [--force]
-ralph step reset <num>|--step-id <uuid> [<slug>] [--force/-y]
 
 ralph export <slug> [-o <file>]
 ralph import <file> [--slug <name>] [--branch <name>] [--strict]
