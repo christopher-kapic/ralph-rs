@@ -239,9 +239,8 @@ async fn run_plan_inner(
     // translate them to sort_key bounds so later filtering tolerates inserts.
     let window = resolve_window(&initial_steps, options)?;
 
-    // Snapshot of currently-actionable steps in the window. Used to capture
-    // the `--one` target (earliest actionable step) before we start mutating
-    // state. If the window contains NO steps at all (e.g. a bogus
+    // Steps that fall inside the run window. Used to bail early when the
+    // window is empty. If the window contains NO steps at all (e.g. a bogus
     // `--from`/`--to` range), bail — but if the window contains steps that
     // just happen to all be Complete/Skipped, fall through and let the final
     // status computation report Complete. That mirrors the pre-fix behavior
@@ -253,11 +252,6 @@ async fn run_plan_inner(
     if window_steps.is_empty() {
         bail!("No pending steps to run in plan '{}'", effective_plan.slug);
     }
-    let initial_actionable: Vec<Step> = window_steps
-        .iter()
-        .filter(|s| is_actionable(s.status))
-        .map(|s| (*s).clone())
-        .collect();
 
     // Dry-run mode: just print what would happen.
     if options.dry_run {
@@ -342,13 +336,25 @@ async fn run_plan_inner(
     let chunk_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     // For `--one`, we need to stop after the first step actually executed;
-    // capture its ID at the start (the earliest actionable step in the
-    // window) and exit after it completes. Positions can shift due to
-    // inserts, but the ID is stable. If `--one` is requested but nothing
-    // is actionable, bail — mirrors the pre-fix behavior of `select_steps`
-    // returning an empty slice in that case.
+    // capture its ID at the start (the step the topological scheduler would
+    // pick first) and exit after it completes. Positions can shift due to
+    // inserts, but the ID is stable. If `--one` is requested but nothing is
+    // runnable, bail — mirrors the pre-fix behavior of `select_steps`
+    // returning an empty slice in that case. Computing the target via
+    // `pick_next_step` (not `initial_actionable.first()`) makes `--one`
+    // honor dependencies under the DAG: a step whose prerequisite is not
+    // yet `Complete` is not the first pick even if it has the lowest
+    // sort_key. With no edges this is identical to the old behavior.
     let one_target_id: Option<String> = if options.one {
-        match initial_actionable.first() {
+        let deps_of = storage::list_step_dependency_edges(conn, &effective_plan.id)?;
+        let depths = compute_step_depths(&initial_steps, &deps_of);
+        match pick_next_step(
+            &initial_steps,
+            &deps_of,
+            &depths,
+            &window,
+            &HashSet::new(),
+        ) {
             Some(s) => Some(s.id.clone()),
             None => bail!("No pending steps to run in plan '{}'", effective_plan.slug),
         }
@@ -410,20 +416,27 @@ async fn run_plan_inner(
 
         let total_now = all_steps.len();
 
-        // Find the next step to execute in the window: first actionable step
-        // whose ID we haven't already executed in this invocation.
-        let next = all_steps
-            .iter()
-            .find(|s| {
-                window.contains_key(&s.sort_key)
-                    && is_actionable(s.status)
-                    && !executed_step_ids.contains(&s.id)
-            })
-            .cloned();
+        // Topological scheduler tick (docs/dag-redesign.md §3.5). Re-read
+        // the dependency edges every iteration so a step inserted mid-run
+        // with `--depends-on` is scheduled correctly. `pick_next_step`
+        // returns the runnable step with the smallest
+        // `(topological depth, sort_key, short_id)`; with no edges every
+        // depth is 0 and this is exactly the old "first actionable step by
+        // sort_key" behavior.
+        let deps_of = storage::list_step_dependency_edges(conn, &effective_plan.id)?;
+        let depths = compute_step_depths(&all_steps, &deps_of);
+        let next = pick_next_step(
+            &all_steps,
+            &deps_of,
+            &depths,
+            &window,
+            &executed_step_ids,
+        )
+        .cloned();
 
         let current_step = match next {
             Some(s) => s,
-            None => break, // no more actionable steps in the window
+            None => break, // no more runnable steps in the window
         };
 
         // `--one`: once we've executed the captured target, stop. We also
@@ -1726,6 +1739,150 @@ fn resolve_window(all_steps: &[Step], options: &RunOptions) -> Result<RunWindow>
     let to_key = options.to.map(|n| all_steps[n - 1].sort_key.clone());
 
     Ok(RunWindow { from_key, to_key })
+}
+
+// ---------------------------------------------------------------------------
+// Topological scheduler (docs/dag-redesign.md §3.5)
+// ---------------------------------------------------------------------------
+//
+// A plan is a DAG of steps (§3.1). The runner no longer walks a flat
+// sort_key list; each tick it computes the *runnable set* and picks the
+// next step by a deterministic tie-break. Phase 1 implements scheduling
+// only — interruptions (Phase 2), reviews/concurrency (Phase 3) layer on
+// later. With no dependency edges every step has topological depth 0, so
+// the tie-break collapses to sort_key order and a linear plan executes
+// byte-identically to today.
+
+/// Topological depth of every step in `steps`.
+///
+/// `depth(s) = 0` when `s` has no in-scope dependencies; otherwise
+/// `1 + max(depth(d))` over the in-scope deps `d`. Edges pointing outside
+/// `steps` (e.g. a deleted prerequisite — `ON DELETE CASCADE` prevents
+/// this in the DB, but tests and defensive code may hit it) are ignored
+/// for depth. Memoized; the DAG-acyclicity hard invariant
+/// (`storage::would_create_step_cycle` on every edge mutation, V25
+/// backfill is a chain) guarantees termination, but a `visiting` guard
+/// still bounds recursion to 0 if acyclicity is ever violated.
+fn compute_step_depths(
+    steps: &[Step],
+    deps_of: &HashMap<String, Vec<String>>,
+) -> HashMap<String, usize> {
+    fn depth_of(
+        id: &str,
+        deps_of: &HashMap<String, Vec<String>>,
+        in_scope: &HashSet<String>,
+        memo: &mut HashMap<String, usize>,
+        visiting: &mut HashSet<String>,
+    ) -> usize {
+        if let Some(d) = memo.get(id) {
+            return *d;
+        }
+        if !visiting.insert(id.to_string()) {
+            // Cycle guard: acyclicity is a hard invariant; never recurse
+            // forever if it is somehow violated.
+            return 0;
+        }
+        let depth = deps_of
+            .get(id)
+            .map(|deps| {
+                deps.iter()
+                    .filter(|d| in_scope.contains(d.as_str()))
+                    .map(|d| 1 + depth_of(d, deps_of, in_scope, memo, visiting))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        visiting.remove(id);
+        memo.insert(id.to_string(), depth);
+        depth
+    }
+
+    let in_scope: HashSet<String> = steps.iter().map(|s| s.id.clone()).collect();
+    let mut memo: HashMap<String, usize> = HashMap::new();
+    let mut visiting: HashSet<String> = HashSet::new();
+    for s in steps {
+        depth_of(&s.id, deps_of, &in_scope, &mut memo, &mut visiting);
+    }
+    memo
+}
+
+/// True when every dependency of `step_id` that is *in the run window* is
+/// `Complete`.
+///
+/// `window_status` holds only steps whose sort_key falls inside the run
+/// window. A dependency absent from it is treated as **satisfied** — that
+/// covers two cases that must both be non-blocking:
+///
+///  - The dep is outside the `--from`/`--to` window: the user explicitly
+///    bounded the run and is asserting the excluded steps' preconditions
+///    hold. This is exactly today's `--from`/`--to` behavior (the old
+///    linear loop never checked whether earlier steps were done) and is a
+///    hard parity requirement of this step.
+///  - The dep is out-of-scope / deleted: the graph must not deadlock on a
+///    prerequisite that no longer exists. `ON DELETE CASCADE` makes this
+///    unreachable from the DB; it only matters for the pure unit tests and
+///    as defense-in-depth.
+///
+/// (§3.1: runnable ⇔ every dependency `Complete`. Reviews/§10 come in
+/// Phase 3 and are not consulted here. A non-`Complete` terminal dep
+/// inside the window — e.g. `Skipped` — does *not* satisfy the edge; the
+/// skip-with-dependents semantics are the deferred §14 open question and
+/// are intentionally not special-cased here.)
+fn deps_satisfied(
+    step_id: &str,
+    deps_of: &HashMap<String, Vec<String>>,
+    window_status: &HashMap<&str, StepStatus>,
+) -> bool {
+    let Some(deps) = deps_of.get(step_id) else {
+        return true;
+    };
+    deps.iter().all(|d| match window_status.get(d.as_str()) {
+        Some(status) => *status == StepStatus::Complete,
+        None => true,
+    })
+}
+
+/// One scheduler tick: pick the next step to execute, or `None` when the
+/// runnable set is empty.
+///
+/// Runnable ⇔ in the run window, an actionable status (not terminal —
+/// [`is_actionable`]), not already executed this invocation, and every
+/// dependency `Complete` ([`deps_satisfied`]). Among runnable steps the
+/// deterministic tie-break is `(topological depth, sort_key, short_id)`
+/// (§3.5 item 4): depth first so a prerequisite always outranks its
+/// dependents, then the authored sort_key, then short_id as a stable
+/// final discriminator. Concurrency (§3.5 items 2–3) is Phase 3 — this
+/// returns a single step.
+fn pick_next_step<'a>(
+    all_steps: &'a [Step],
+    deps_of: &HashMap<String, Vec<String>>,
+    depths: &HashMap<String, usize>,
+    window: &RunWindow,
+    executed_step_ids: &HashSet<String>,
+) -> Option<&'a Step> {
+    // Status of every step *inside the run window* only — deps outside the
+    // window must not gate (preserves `--from`/`--to`; see `deps_satisfied`).
+    let window_status: HashMap<&str, StepStatus> = all_steps
+        .iter()
+        .filter(|s| window.contains_key(&s.sort_key))
+        .map(|s| (s.id.as_str(), s.status))
+        .collect();
+
+    all_steps
+        .iter()
+        .filter(|s| {
+            window.contains_key(&s.sort_key)
+                && is_actionable(s.status)
+                && !executed_step_ids.contains(&s.id)
+                && deps_satisfied(&s.id, deps_of, &window_status)
+        })
+        .min_by(|a, b| {
+            let da = depths.get(&a.id).copied().unwrap_or(0);
+            let db = depths.get(&b.id).copied().unwrap_or(0);
+            da.cmp(&db)
+                .then_with(|| a.sort_key.cmp(&b.sort_key))
+                .then_with(|| a.short_id.cmp(&b.short_id))
+        })
 }
 
 /// Sweep any stale InProgress step rows and emit a log line if the sweep
@@ -4458,5 +4615,254 @@ mod tests {
         assert!(is_actionable(StepStatus::Aborted));
         assert!(!is_actionable(StepStatus::Complete));
         assert!(!is_actionable(StepStatus::Skipped));
+    }
+
+    // -- topological scheduler (docs/dag-redesign.md §3.5) --
+
+    /// Unbounded run window (no `--from`/`--to`).
+    fn full_window() -> RunWindow {
+        RunWindow {
+            from_key: None,
+            to_key: None,
+        }
+    }
+
+    /// Build `deps_of` from index edges. `(a, b)` ⇒ `steps[a]` depends on
+    /// `steps[b]` (matches `add_step_dependency(step, depends_on)`).
+    fn deps_map(steps: &[Step], edges: &[(usize, usize)]) -> HashMap<String, Vec<String>> {
+        let mut m: HashMap<String, Vec<String>> = HashMap::new();
+        for &(a, b) in edges {
+            m.entry(steps[a].id.clone())
+                .or_default()
+                .push(steps[b].id.clone());
+        }
+        m
+    }
+
+    /// Drive the scheduler to quiescence: each tick pick the next step,
+    /// mark it `Complete`, and record the order. Mirrors the real runner
+    /// loop (re-derives depths every tick, tracks `executed_step_ids`).
+    fn schedule_order(
+        steps: &mut [Step],
+        edges: &[(usize, usize)],
+        window: &RunWindow,
+    ) -> Vec<String> {
+        let deps_of = deps_map(steps, edges);
+        let mut order: Vec<String> = Vec::new();
+        let mut executed: HashSet<String> = HashSet::new();
+        loop {
+            let depths = compute_step_depths(steps, &deps_of);
+            let pick = pick_next_step(steps, &deps_of, &depths, window, &executed)
+                .map(|s| s.id.clone());
+            let Some(id) = pick else { break };
+            order.push(id.clone());
+            for s in steps.iter_mut() {
+                if s.id == id {
+                    s.status = StepStatus::Complete;
+                }
+            }
+            executed.insert(id);
+        }
+        order
+    }
+
+    #[test]
+    fn test_scheduler_linear_chain() {
+        // s0 <- s1 <- s2 <- s3 (each depends on the previous).
+        let mut steps = make_steps(4);
+        let edges = [(1, 0), (2, 1), (3, 2)];
+        let deps_of = deps_map(&steps, &edges);
+
+        // Depth grows along the chain.
+        let depths = compute_step_depths(&steps, &deps_of);
+        assert_eq!(depths["s0"], 0);
+        assert_eq!(depths["s1"], 1);
+        assert_eq!(depths["s2"], 2);
+        assert_eq!(depths["s3"], 3);
+
+        // Only the root is runnable until it completes.
+        let executed = HashSet::new();
+        let pick = pick_next_step(&steps, &deps_of, &depths, &full_window(), &executed);
+        assert_eq!(pick.unwrap().id, "s0");
+
+        // Full walk reproduces the authored order.
+        let order = schedule_order(&mut steps, &edges, &full_window());
+        assert_eq!(order, vec!["s0", "s1", "s2", "s3"]);
+    }
+
+    #[test]
+    fn test_scheduler_no_edges_is_authored_sort_key_order() {
+        // The linear-plan parity claim: with no dependency edges every
+        // step has depth 0, so the tie-break collapses to sort_key — a
+        // linear plan executes byte-identically to the pre-DAG loop.
+        let mut steps = make_steps(5);
+        let deps_of = deps_map(&steps, &[]);
+        let depths = compute_step_depths(&steps, &deps_of);
+        assert!(steps.iter().all(|s| depths[&s.id] == 0));
+
+        let order = schedule_order(&mut steps, &[], &full_window());
+        assert_eq!(order, vec!["s0", "s1", "s2", "s3", "s4"]);
+    }
+
+    #[test]
+    fn test_scheduler_multi_root_dag() {
+        // Two roots; s2 depends on s0, s3 on s1, s4 on both s2 and s3.
+        //   s0 ──► s2 ─┐
+        //   s1 ──► s3 ─┴► s4
+        let mut steps = make_steps(5);
+        let edges = [(2, 0), (3, 1), (4, 2), (4, 3)];
+        let deps_of = deps_map(&steps, &edges);
+
+        let depths = compute_step_depths(&steps, &deps_of);
+        assert_eq!(depths["s0"], 0);
+        assert_eq!(depths["s1"], 0);
+        assert_eq!(depths["s2"], 1);
+        assert_eq!(depths["s3"], 1);
+        assert_eq!(depths["s4"], 2);
+
+        // Only the two roots are runnable initially (all Pending).
+        let win_status: HashMap<&str, StepStatus> =
+            steps.iter().map(|s| (s.id.as_str(), s.status)).collect();
+        let runnable_now: Vec<&str> = steps
+            .iter()
+            .filter(|s| deps_satisfied(&s.id, &deps_of, &win_status))
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(runnable_now, vec!["s0", "s1"]);
+
+        let order = schedule_order(&mut steps, &edges, &full_window());
+        // Roots first (depth 0, by sort_key), then depth-1, then the sink.
+        assert_eq!(order, vec!["s0", "s1", "s2", "s3", "s4"]);
+    }
+
+    #[test]
+    fn test_scheduler_diamond() {
+        // s0 ─┬► s1 ─┐
+        //     └► s2 ─┴► s3
+        let mut steps = make_steps(4);
+        let edges = [(1, 0), (2, 0), (3, 1), (3, 2)];
+        let deps_of = deps_map(&steps, &edges);
+
+        let depths = compute_step_depths(&steps, &deps_of);
+        assert_eq!(depths["s0"], 0);
+        assert_eq!(depths["s1"], 1);
+        assert_eq!(depths["s2"], 1);
+        assert_eq!(depths["s3"], 2); // 1 + max(depth(s1), depth(s2))
+
+        // The sink stays blocked until BOTH mid steps are Complete.
+        let mut work = steps.clone();
+        for s in work.iter_mut() {
+            if s.id == "s0" || s.id == "s1" {
+                s.status = StepStatus::Complete;
+            }
+        }
+        let win_status: HashMap<&str, StepStatus> =
+            work.iter().map(|s| (s.id.as_str(), s.status)).collect();
+        assert!(
+            !deps_satisfied("s3", &deps_of, &win_status),
+            "s3 must wait for s2 even though s1 is Complete"
+        );
+
+        let order = schedule_order(&mut steps, &edges, &full_window());
+        assert_eq!(order, vec!["s0", "s1", "s2", "s3"]);
+    }
+
+    #[test]
+    fn test_deps_satisfied_only_complete_unblocks() {
+        let steps = make_steps(2);
+        let deps_of = deps_map(&steps, &[(1, 0)]); // s1 depends on s0
+
+        for blocking in [
+            StepStatus::Pending,
+            StepStatus::InProgress,
+            StepStatus::Failed,
+            StepStatus::Aborted,
+            StepStatus::Skipped, // §14 open question: Skipped does NOT unblock
+        ] {
+            let win_status: HashMap<&str, StepStatus> =
+                [("s0", blocking)].into_iter().collect();
+            assert!(
+                !deps_satisfied("s1", &deps_of, &win_status),
+                "{blocking:?} dep must block its dependent"
+            );
+        }
+
+        let win_status: HashMap<&str, StepStatus> =
+            [("s0", StepStatus::Complete)].into_iter().collect();
+        assert!(deps_satisfied("s1", &deps_of, &win_status));
+
+        // A dep absent from window_status (out of window / deleted) does
+        // not block — keeps the graph from deadlocking and preserves
+        // `--from`/`--to`.
+        assert!(deps_satisfied("s1", &deps_of, &HashMap::new()));
+    }
+
+    #[test]
+    fn test_scheduler_short_id_breaks_sort_key_ties() {
+        // Force a depth + sort_key tie; short_id is the final, stable
+        // discriminator (§3.5 item 4).
+        let mut steps = make_steps(2);
+        steps[0].sort_key = "a0".to_string();
+        steps[1].sort_key = "a0".to_string();
+        steps[0].short_id = "zzzzzzzz".to_string();
+        steps[1].short_id = "aaaaaaaa".to_string();
+        let deps_of = deps_map(&steps, &[]);
+        let depths = compute_step_depths(&steps, &deps_of);
+
+        let pick = pick_next_step(&steps, &deps_of, &depths, &full_window(), &HashSet::new());
+        assert_eq!(pick.unwrap().id, "s1"); // lower short_id wins the tie
+    }
+
+    #[test]
+    fn test_scheduler_window_excludes_out_of_window_dep() {
+        // `--from`-style window on a V25-style linear chain: the excluded
+        // prerequisite must NOT gate the first in-window step, so the
+        // windowed steps run in chain order exactly as the pre-DAG loop.
+        let mut steps = make_steps(4); // s0<-s1<-s2<-s3, sort_keys a0..a3
+        let edges = [(1, 0), (2, 1), (3, 2)];
+        // Window starts at s2 (sort_key "a2"); s0/s1 are excluded.
+        let window = RunWindow {
+            from_key: Some("a2".to_string()),
+            to_key: None,
+        };
+
+        let deps_of = deps_map(&steps, &edges);
+        let depths = compute_step_depths(&steps, &deps_of);
+        // s2's dep (s1) is out of window ⇒ s2 is the first pick.
+        let pick = pick_next_step(&steps, &deps_of, &depths, &window, &HashSet::new());
+        assert_eq!(pick.unwrap().id, "s2");
+
+        let order = schedule_order(&mut steps, &edges, &window);
+        assert_eq!(order, vec!["s2", "s3"]);
+    }
+
+    #[test]
+    fn test_scheduler_skips_executed_and_is_deterministic() {
+        let steps = make_steps(3);
+        let deps_of = deps_map(&steps, &[]);
+        let depths = compute_step_depths(&steps, &deps_of);
+
+        // Determinism: repeated ticks on identical state pick the same step.
+        let a = pick_next_step(&steps, &deps_of, &depths, &full_window(), &HashSet::new());
+        let b = pick_next_step(&steps, &deps_of, &depths, &full_window(), &HashSet::new());
+        assert_eq!(a.unwrap().id, "s0");
+        assert_eq!(b.unwrap().id, "s0");
+
+        // A step already executed this invocation is not re-picked.
+        let mut executed = HashSet::new();
+        executed.insert("s0".to_string());
+        let pick = pick_next_step(&steps, &deps_of, &depths, &full_window(), &executed);
+        assert_eq!(pick.unwrap().id, "s1");
+
+        // Nothing runnable ⇒ None.
+        let mut done = make_steps(2);
+        for s in done.iter_mut() {
+            s.status = StepStatus::Complete;
+        }
+        let deps_of = deps_map(&done, &[]);
+        let depths = compute_step_depths(&done, &deps_of);
+        assert!(
+            pick_next_step(&done, &deps_of, &depths, &full_window(), &HashSet::new()).is_none()
+        );
     }
 }

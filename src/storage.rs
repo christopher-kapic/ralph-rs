@@ -2230,6 +2230,40 @@ pub fn would_create_step_cycle(
     Ok(false)
 }
 
+/// Load every step-dependency edge for `plan_id` as an adjacency map
+/// `step_id -> [depends_on_step_id, ...]`.
+///
+/// One query for the whole plan instead of N calls to
+/// [`list_step_dependencies`]; the topological scheduler
+/// (docs/dag-redesign.md §3.5) re-reads this every tick so a step added
+/// mid-run with `--depends-on` is picked up. Steps with no outgoing edges
+/// are simply absent from the map (callers treat a missing key as
+/// "no dependencies"). Edges are scoped to the plan via a join on
+/// `steps.plan_id`, so a returned `depends_on_step_id` always belongs to
+/// the same plan.
+pub fn list_step_dependency_edges(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<std::collections::HashMap<String, Vec<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT sd.step_id, sd.depends_on_step_id \
+         FROM step_dependencies sd \
+         JOIN steps s ON s.id = sd.step_id \
+         WHERE s.plan_id = ?1 \
+         ORDER BY sd.step_id ASC, sd.depends_on_step_id ASC",
+    )?;
+    let rows = stmt.query_map(params![plan_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut edges: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (step_id, dep_id) = row?;
+        edges.entry(step_id).or_default().push(dep_id);
+    }
+    Ok(edges)
+}
+
 // ---------------------------------------------------------------------------
 // Step hook operations
 // ---------------------------------------------------------------------------
@@ -4935,6 +4969,63 @@ mod tests {
         // V25's ON DELETE CASCADE drops dependent edges with the step.
         delete_step(&conn, &ids[1]).unwrap();
         assert!(list_step_dependencies(&conn, &ids[0]).unwrap().is_empty());
+    }
+
+    /// Create a plan with `n` steps; return `(plan_id, step_ids)`.
+    fn make_plan_with_steps(conn: &Connection, slug: &str, n: usize) -> (String, Vec<String>) {
+        let plan = create_plan(conn, slug, "/proj", "branch", "desc", None, None, &[])
+            .expect("create_plan");
+        let ids = (1..=n)
+            .map(|i| {
+                create_step(
+                    conn,
+                    &plan.id,
+                    &format!("s{i}"),
+                    "d",
+                    None,
+                    None,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("create_step")
+                .0
+                .id
+            })
+            .collect();
+        (plan.id, ids)
+    }
+
+    #[test]
+    fn test_list_step_dependency_edges() {
+        let conn = setup();
+        let (plan_id, ids) = make_plan_with_steps(&conn, "edges", 4);
+
+        // Diamond: s1 -> s2, s1 -> s3, s2 -> s4, s3 -> s4.
+        add_step_dependency(&conn, &ids[0], &ids[1]).unwrap();
+        add_step_dependency(&conn, &ids[0], &ids[2]).unwrap();
+        add_step_dependency(&conn, &ids[1], &ids[3]).unwrap();
+        add_step_dependency(&conn, &ids[2], &ids[3]).unwrap();
+
+        let edges = list_step_dependency_edges(&conn, &plan_id).unwrap();
+
+        let mut s1 = edges.get(&ids[0]).cloned().unwrap_or_default();
+        s1.sort();
+        let mut expected_s1 = vec![ids[1].clone(), ids[2].clone()];
+        expected_s1.sort();
+        assert_eq!(s1, expected_s1);
+        assert_eq!(edges.get(&ids[1]).cloned().unwrap(), vec![ids[3].clone()]);
+        assert_eq!(edges.get(&ids[2]).cloned().unwrap(), vec![ids[3].clone()]);
+        // The sink has no outgoing edges → absent from the map.
+        assert!(!edges.contains_key(&ids[3]));
+
+        // Edges are plan-scoped: a second plan's edges don't leak in.
+        let (_other_plan, other_ids) = make_plan_with_steps(&conn, "other", 2);
+        add_step_dependency(&conn, &other_ids[0], &other_ids[1]).unwrap();
+        let edges = list_step_dependency_edges(&conn, &plan_id).unwrap();
+        assert!(!edges.contains_key(&other_ids[0]));
     }
 
     #[test]
