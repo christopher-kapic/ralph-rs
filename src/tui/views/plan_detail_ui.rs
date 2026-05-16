@@ -162,6 +162,9 @@ fn render_toast_overlay(frame: &mut Frame, area: Rect, text: &str, color: ratatu
 // ---------------------------------------------------------------------------
 
 fn draw_step_list(frame: &mut Frame, app: &mut PlanDetailApp, area: Rect) {
+    // Record the bordered list area so `handle_mouse` can hit-test a click
+    // row to a step index (it accounts for the Block border + scroll offset).
+    app.step_list_area = area;
     let cursor = if app.steps.is_empty() {
         None
     } else {

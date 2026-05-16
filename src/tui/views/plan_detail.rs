@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 
 use chrono::{DateTime, Utc};
 use crossterm::event::MouseEvent;
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use crate::config::Config;
@@ -183,6 +184,19 @@ pub struct PlanDetailApp {
     /// True while a left-mouse drag started on the divider column is
     /// active. Cleared on `MouseEventKind::Up(Left)`.
     pub dragging_split: bool,
+
+    /// The bordered `Rect` the step list was drawn into during the most
+    /// recent `draw()` — the *outer* area passed to `step_list::render`
+    /// (`Block::borders(ALL)` consumes one cell on each side). Used by
+    /// [`Self::handle_mouse`] to hit-test a click row to a step index.
+    /// Zero-sized before the first frame; mouse hit-testing no-ops then.
+    pub step_list_area: Rect,
+
+    /// Set by [`Self::handle_mouse`] when a left click lands on the
+    /// already-highlighted step row: the dispatcher consumes this and
+    /// opens step-detail (the same effect as pressing `Enter`), then
+    /// clears it. `None` means no pending mouse-driven open.
+    pub pending_open_step: Option<String>,
 }
 
 impl PlanDetailApp {
@@ -222,6 +236,8 @@ impl PlanDetailApp {
             split_pct: 40,
             last_body_width: 0,
             dragging_split: false,
+            step_list_area: Rect::default(),
+            pending_open_step: None,
         }
     }
 
@@ -255,14 +271,73 @@ impl PlanDetailApp {
         }
     }
 
+    /// Map a click at `(column, row)` to a step index in the left-pane
+    /// list, accounting for the persistent chrome (the `step_list_area`
+    /// already excludes the top/bottom chrome rows because it's the
+    /// post-`chrome::render` body), the `Block::borders(ALL)` 1-cell frame
+    /// the `step_list` widget draws, and the scroll-aware `ListState`
+    /// offset. Returns `None` for clicks on the border or outside the list,
+    /// or before the first draw. Single-line rows, so the row delta maps
+    /// 1:1 to the visible item.
+    fn step_at(&self, column: u16, row: u16) -> Option<usize> {
+        use ratatui::layout::Position;
+
+        let area = self.step_list_area;
+        if area.width <= 2 || area.height <= 2 {
+            // Nothing rendered yet, or no room inside the border.
+            return None;
+        }
+        // The `step_list` widget wraps the list in a bordered Block, so the
+        // actual list content lives one cell inside the outer area.
+        let inner = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width - 2,
+            height: area.height - 2,
+        };
+        if !inner.contains(Position::new(column, row)) {
+            return None;
+        }
+        let visible_row = (row - inner.y) as usize;
+        let idx = self.list_state.offset() + visible_row;
+        if idx < self.steps.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
     /// Mouse-event entry point routed from the dispatcher's event loop.
-    /// Implements draggable resize of the horizontal split between the step
-    /// list and the right pane: a left-button press within ±1 column of the
-    /// current divider arms a drag, subsequent drags recompute `split_pct`
-    /// from `cursor_column / last_body_width` (clamped 20..=80), and
-    /// release clears the drag flag.
+    ///
+    /// State-machine precedence: an in-flight divider drag (`dragging_split`)
+    /// owns every event until release so a drag that strays over the step
+    /// list doesn't get reinterpreted as a row click. Otherwise:
+    ///
+    /// * a left press within ±1 column of the divider arms a resize drag;
+    /// * a left press on a step row selects it, and a second press on the
+    ///   *already-highlighted* row drills into step-detail (the same effect
+    ///   as `Enter`) via [`Self::pending_open_step`];
+    /// * the scroll wheel maps to `k` / `j` (cursor up / down).
+    ///
+    /// Subsequent drags recompute `split_pct` from
+    /// `cursor_column / last_body_width` (clamped 20..=80); release clears
+    /// the drag flag.
     pub fn handle_mouse(&mut self, event: MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+
+        // Scroll wheel works regardless of body width / draw state and is
+        // independent of the divider drag — mirror `k` / `j`.
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                self.navigate_up();
+                return;
+            }
+            MouseEventKind::ScrollDown => {
+                self.navigate_down();
+                return;
+            }
+            _ => {}
+        }
 
         if self.last_body_width == 0 {
             return;
@@ -271,21 +346,40 @@ impl PlanDetailApp {
         let divider_col = (body_width * self.split_pct as u32 / 100) as i32;
 
         match event.kind {
+            // An armed divider drag takes precedence over row hit-testing
+            // so a drag that wanders over the step list keeps resizing.
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_split => {
+                let pct = (event.column as u32 * 100) / body_width.max(1);
+                self.split_pct = pct.clamp(20, 80) as u16;
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let col = event.column as i32;
                 if (col - divider_col).abs() <= 1 {
                     self.dragging_split = true;
+                    return;
                 }
-            }
-            MouseEventKind::Drag(MouseButton::Left) if self.dragging_split => {
-                let pct = (event.column as u32 * 100) / body_width.max(1);
-                self.split_pct = pct.clamp(20, 80) as u16;
+                if let Some(idx) = self.step_at(event.column, event.row) {
+                    if idx == self.selected_index {
+                        // Click on the highlighted row → same as Enter.
+                        self.pending_open_step = Some(self.steps[idx].id.clone());
+                    } else {
+                        // Click on a different row → just move the cursor.
+                        self.selected_index = idx;
+                    }
+                }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.dragging_split = false;
             }
             _ => {}
         }
+    }
+
+    /// Consume a pending mouse-driven step-detail open, if any. The
+    /// dispatcher calls this after [`Self::handle_mouse`] and routes the
+    /// returned step id exactly like `InputAction::OpenStepDetail`.
+    pub fn take_pending_open_step(&mut self) -> Option<String> {
+        self.pending_open_step.take()
     }
 
     /// Replace the cached open-question list (after a DB poll). Drives the
@@ -2224,5 +2318,128 @@ mod tests {
 
         app.handle_mouse(mouse_event(0, 0, MouseEventKind::Down(MouseButton::Left)));
         assert!(!app.dragging_split);
+    }
+
+    // -- Mouse: click-to-select / click-again-to-enter (step 25) ----------
+
+    /// A bordered step-list area mirroring what `draw_step_list` records:
+    /// the body sits below the 1-row top chrome (`y = 1`), and the
+    /// `step_list` widget draws a `Borders::ALL` frame so content starts at
+    /// `(x+1, y+1)`. With offset 0, row `y+1` is step 0, `y+2` is step 1, …
+    fn list_app(n: usize) -> PlanDetailApp {
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(n), &Config::default());
+        // Wide enough that the divider (40% of 100) sits at col 40, far
+        // from the rows we click in these tests.
+        app.last_body_width = 100;
+        app.step_list_area = ratatui::layout::Rect {
+            x: 0,
+            y: 1,
+            width: 40,
+            height: 20,
+        };
+        app
+    }
+
+    #[test]
+    fn click_on_highlighted_step_enters_detail() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = list_app(4);
+        app.selected_index = 2;
+        // Inner list row for index 2 is y = 1 (area.y) + 1 (border) + 2.
+        app.handle_mouse(mouse_event(5, 4, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(
+            app.take_pending_open_step(),
+            Some("s2".to_string()),
+            "click on the highlighted row should request opening that step"
+        );
+        assert_eq!(app.selected_index, 2, "selection unchanged");
+        assert!(!app.dragging_split);
+    }
+
+    #[test]
+    fn click_on_other_step_selects_only() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = list_app(4);
+        app.selected_index = 0;
+        // Row for index 3: y = 1 + 1 + 3 = 5.
+        app.handle_mouse(mouse_event(5, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 3, "click moves the cursor");
+        assert!(
+            app.take_pending_open_step().is_none(),
+            "a non-highlighted click must not enter detail"
+        );
+    }
+
+    #[test]
+    fn click_accounts_for_scroll_offset() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = list_app(20);
+        // Scrolled so the first visible item is index 5.
+        app.list_state.select(Some(7));
+        *app.list_state.offset_mut() = 5;
+        app.selected_index = 7;
+        // First inner row (y = 2) maps to offset 5 + 0 = index 5.
+        app.handle_mouse(mouse_event(3, 2, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 5, "row→index must add the scroll offset");
+        assert!(app.take_pending_open_step().is_none());
+    }
+
+    #[test]
+    fn click_on_border_or_outside_is_ignored() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = list_app(4);
+        app.selected_index = 1;
+        // The top border row (y == area.y == 1) is not a content row.
+        app.handle_mouse(mouse_event(5, 1, MouseEventKind::Down(MouseButton::Left)));
+        // A click well past the last step (only 4 steps) is also ignored.
+        app.handle_mouse(mouse_event(5, 18, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 1, "out-of-list clicks change nothing");
+        assert!(app.take_pending_open_step().is_none());
+    }
+
+    #[test]
+    fn scroll_wheel_maps_to_k_and_j() {
+        use crossterm::event::MouseEventKind;
+        let mut app = list_app(5);
+        assert_eq!(app.selected_index, 0);
+        app.handle_mouse(mouse_event(5, 4, MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_index, 1, "ScrollDown behaves like j");
+        app.handle_mouse(mouse_event(5, 4, MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_index, 2);
+        app.handle_mouse(mouse_event(5, 4, MouseEventKind::ScrollUp));
+        assert_eq!(app.selected_index, 1, "ScrollUp behaves like k");
+    }
+
+    #[test]
+    fn divider_drag_takes_precedence_over_step_click() {
+        // dragging_split must win the state machine: a Drag while armed
+        // resizes the split even though the cursor is over the step list,
+        // and never gets reinterpreted as a row click.
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = list_app(5);
+        app.selected_index = 0;
+
+        // Arm the drag on the divider (col 40 = 40% of 100).
+        app.handle_mouse(mouse_event(40, 5, MouseEventKind::Down(MouseButton::Left)));
+        assert!(app.dragging_split, "press on divider arms the drag");
+
+        // Drag left into the step-list rows. It must resize, not select.
+        app.handle_mouse(mouse_event(25, 4, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 25, "armed drag keeps resizing over the list");
+        assert_eq!(app.selected_index, 0, "drag must not move the cursor");
+        assert!(app.take_pending_open_step().is_none());
+
+        app.handle_mouse(mouse_event(25, 4, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_split, "release clears the drag flag");
+    }
+
+    #[test]
+    fn step_click_before_first_draw_is_safe() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanDetailApp::new(make_plan(), make_steps(3), &Config::default());
+        // No draw yet: step_list_area is zero-sized.
+        app.handle_mouse(mouse_event(2, 2, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 0);
+        assert!(app.take_pending_open_step().is_none());
     }
 }

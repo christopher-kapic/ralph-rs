@@ -164,6 +164,14 @@ pub struct PlanListApp {
     /// True while a left-mouse drag started on the divider column is
     /// active. Cleared on `MouseEventKind::Up(Left)`.
     pub dragging_split: bool,
+
+    /// The `Rect` the tile column was drawn into during the most recent
+    /// `draw()` — the left pane returned by the body split, which already
+    /// excludes the top/bottom chrome rows and has no border. Used by
+    /// [`Self::handle_mouse`] to map a click row to a tile slot
+    /// (`TILE_HEIGHT` rows each) and then to a navigable index via
+    /// `scroll_offset`. Zero-sized before the first frame.
+    pub tile_area: Rect,
 }
 
 impl PlanListApp {
@@ -196,6 +204,7 @@ impl PlanListApp {
             split_pct: 40,
             last_body_width: 0,
             dragging_split: false,
+            tile_area: Rect::default(),
         }
     }
 
@@ -215,14 +224,60 @@ impl PlanListApp {
         self.palette_bar.is_some()
     }
 
+    /// Map a click at `(column, row)` to a navigable tile index. Each tile
+    /// is [`TILE_HEIGHT`] rows tall and the left pane has no border, so the
+    /// slot is `(row - tile_area.y) / TILE_HEIGHT` and the index is
+    /// `scroll_offset + slot`. `tile_area` already excludes the top/bottom
+    /// chrome rows (it's the post-`chrome::render` body, left half). Returns
+    /// `None` for clicks outside the tile column, below the last tile, or
+    /// before the first draw.
+    fn tile_at(&self, column: u16, row: u16) -> Option<usize> {
+        use ratatui::layout::Position;
+
+        let area = self.tile_area;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        if !area.contains(Position::new(column, row)) {
+            return None;
+        }
+        let slot = ((row - area.y) / TILE_HEIGHT) as usize;
+        let idx = self.scroll_offset + slot;
+        if idx < self.navigable_count() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
     /// Mouse-event entry point routed from the dispatcher's event loop.
-    /// Implements draggable resize of the horizontal split between the tile
-    /// column and the step-list preview pane: a left-button press within ±1
-    /// column of the current divider arms a drag, subsequent drags recompute
-    /// `split_pct` from `cursor_column / last_body_width` (clamped 20..=80),
-    /// and release clears the drag flag.
+    ///
+    /// State-machine precedence: an in-flight divider drag (`dragging_split`)
+    /// owns every event until release. Otherwise:
+    ///
+    /// * a left press within ±1 column of the divider arms a resize drag;
+    /// * a left press on a tile selects it, and a second press on the
+    ///   *already-highlighted* tile opens it (the same effect as `Enter`)
+    ///   by setting `open_request` via [`Self::request_open`];
+    /// * the scroll wheel maps to `k` / `j` (cursor up / down).
+    ///
+    /// Subsequent drags recompute `split_pct` from
+    /// `cursor_column / last_body_width` (clamped 20..=80); release clears
+    /// the drag flag.
     pub fn handle_mouse(&mut self, event: MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+
+        match event.kind {
+            MouseEventKind::ScrollUp => {
+                self.navigate_up();
+                return;
+            }
+            MouseEventKind::ScrollDown => {
+                self.navigate_down();
+                return;
+            }
+            _ => {}
+        }
 
         if self.last_body_width == 0 {
             return;
@@ -231,15 +286,26 @@ impl PlanListApp {
         let divider_col = (body_width * self.split_pct as u32 / 100) as i32;
 
         match event.kind {
+            // An armed divider drag takes precedence over tile hit-testing.
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_split => {
+                let pct = (event.column as u32 * 100) / body_width.max(1);
+                self.split_pct = pct.clamp(20, 80) as u16;
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 let col = event.column as i32;
                 if (col - divider_col).abs() <= 1 {
                     self.dragging_split = true;
+                    return;
                 }
-            }
-            MouseEventKind::Drag(MouseButton::Left) if self.dragging_split => {
-                let pct = (event.column as u32 * 100) / body_width.max(1);
-                self.split_pct = pct.clamp(20, 80) as u16;
+                if let Some(idx) = self.tile_at(event.column, event.row) {
+                    if idx == self.selected_index {
+                        // Click on the highlighted tile → same as Enter.
+                        self.request_open();
+                    } else {
+                        // Click on a different tile → just move the cursor.
+                        self.selected_index = idx;
+                    }
+                }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.dragging_split = false;
@@ -571,6 +637,9 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
     let right = panes[1];
 
     update_scroll(app, left.height);
+    // Record the tile column so `handle_mouse` can hit-test a click row to
+    // a tile slot (TILE_HEIGHT rows each) + `scroll_offset`.
+    app.tile_area = left;
     render_tiles(frame.buffer_mut(), left, app);
     render_step_preview(frame, right, app);
 
@@ -2309,5 +2378,139 @@ mod tests {
             "┌",
             "col 32 should no longer hold a pane border after the drag"
         );
+    }
+
+    // -- Mouse: click-to-select / click-again-to-enter (step 25) ----------
+
+    /// A `PlanListApp` with a recorded tile column mirroring what `draw`
+    /// stores: the body starts below the 1-row top chrome (`y = 1`), the
+    /// left pane has no border, and each tile is `TILE_HEIGHT` rows tall.
+    /// `last_body_width` is set wide so the divider (40% of 80 = col 32)
+    /// stays clear of the columns these tests click.
+    fn tile_app(n: usize) -> PlanListApp {
+        let mut app = PlanListApp::new(make_tiles(n), "/proj", "UTC");
+        app.last_body_width = 80;
+        app.tile_area = Rect {
+            x: 0,
+            y: 1,
+            width: 30,
+            height: 30,
+        };
+        app
+    }
+
+    #[test]
+    fn click_on_highlighted_tile_opens_it() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = tile_app(3);
+        app.selected_index = 1;
+        // Tile 1 spans rows y=1 + 1*6 .. +6, i.e. rows 7..=12.
+        app.handle_mouse(mouse_event(4, 8, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(
+            app.open_request,
+            Some(OpenRequest::Plan("plan-1".to_string())),
+            "click on the highlighted tile should request opening it"
+        );
+        assert_eq!(app.selected_index, 1, "selection unchanged");
+        assert!(!app.dragging_split);
+    }
+
+    #[test]
+    fn click_on_other_tile_selects_only() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = tile_app(4);
+        app.selected_index = 0;
+        // Tile 2 spans rows y=1 + 2*6 .. , i.e. rows 13..=18.
+        app.handle_mouse(mouse_event(4, 14, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 2, "click moves the cursor");
+        assert!(
+            app.open_request.is_none(),
+            "a non-highlighted click must not open a plan"
+        );
+    }
+
+    #[test]
+    fn click_accounts_for_scroll_offset_in_tiles() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = tile_app(10);
+        app.scroll_offset = 4;
+        app.selected_index = 0;
+        // First on-screen slot (rows 1..=6) maps to scroll_offset + 0 = 4.
+        app.handle_mouse(mouse_event(2, 3, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 4, "slot→index must add scroll_offset");
+        assert!(app.open_request.is_none());
+    }
+
+    #[test]
+    fn click_on_archived_sentinel_selects_it() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanListApp::new(make_tiles(2), "/proj", "UTC").with_archived_count(3);
+        app.last_body_width = 80;
+        app.tile_area = Rect {
+            x: 0,
+            y: 1,
+            width: 30,
+            height: 30,
+        };
+        // Sentinel is the 3rd navigable slot (index 2): rows 13..=18.
+        app.handle_mouse(mouse_event(2, 14, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 2);
+        assert!(app.is_archived_cursor());
+        assert!(app.open_request.is_none());
+        // A second click on the now-highlighted sentinel opens the
+        // archived list (same as Enter on the sentinel).
+        app.handle_mouse(mouse_event(2, 14, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.open_request, Some(OpenRequest::Archived));
+    }
+
+    #[test]
+    fn click_below_last_tile_is_ignored() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = tile_app(2);
+        app.selected_index = 1;
+        // Only 2 tiles (rows 1..=12); click at row 20 is past the last.
+        app.handle_mouse(mouse_event(4, 20, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 1, "out-of-list click changes nothing");
+        assert!(app.open_request.is_none());
+    }
+
+    #[test]
+    fn scroll_wheel_maps_to_k_and_j_in_plan_list() {
+        use crossterm::event::MouseEventKind;
+        let mut app = tile_app(4);
+        assert_eq!(app.selected_index, 0);
+        app.handle_mouse(mouse_event(4, 5, MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_index, 1, "ScrollDown behaves like j");
+        app.handle_mouse(mouse_event(4, 5, MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_index, 2);
+        app.handle_mouse(mouse_event(4, 5, MouseEventKind::ScrollUp));
+        assert_eq!(app.selected_index, 1, "ScrollUp behaves like k");
+    }
+
+    #[test]
+    fn divider_drag_takes_precedence_over_tile_click() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = tile_app(4);
+        app.selected_index = 0;
+        // Arm the drag on the divider (col 32 = 40% of 80).
+        app.handle_mouse(mouse_event(32, 8, MouseEventKind::Down(MouseButton::Left)));
+        assert!(app.dragging_split, "press on divider arms the drag");
+        // Drag left over the tile column — must resize, not select.
+        app.handle_mouse(mouse_event(20, 14, MouseEventKind::Drag(MouseButton::Left)));
+        assert_eq!(app.split_pct, 25, "armed drag keeps resizing over the tiles");
+        assert_eq!(app.selected_index, 0, "drag must not move the cursor");
+        assert!(app.open_request.is_none());
+        app.handle_mouse(mouse_event(20, 14, MouseEventKind::Up(MouseButton::Left)));
+        assert!(!app.dragging_split);
+    }
+
+    #[test]
+    fn tile_click_before_first_draw_is_safe() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
+        // No draw yet: tile_area is zero-sized, last_body_width is 0.
+        app.handle_mouse(mouse_event(2, 3, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 0);
+        assert!(app.open_request.is_none());
     }
 }

@@ -593,6 +593,35 @@ pub fn run_plan_list_tui(
             let event = event::read()?;
             if let Event::Mouse(m) = &event {
                 app.handle_mouse(*m);
+                // A click on the already-highlighted tile opens it — the
+                // mouse handler routes through `request_open()`, so honor
+                // the resulting `open_request` exactly like the `Enter`
+                // keybinding's arm below.
+                match app.open_request.take() {
+                    Some(crate::tui::views::plan_list::OpenRequest::Archived) => {
+                        run_archived_list_tui(
+                            &mut terminal,
+                            conn,
+                            project,
+                            &config.display_timezone,
+                            &config.default_harness,
+                        )?;
+                        refresh_plan_list_state(conn, project, &mut app)?;
+                    }
+                    Some(crate::tui::views::plan_list::OpenRequest::Plan(slug)) => {
+                        run_plan_detail_tui(
+                            &mut terminal,
+                            conn,
+                            config,
+                            project,
+                            &slug,
+                            None,
+                            &mut subscription,
+                        )?;
+                        refresh_plan_list_state(conn, project, &mut app)?;
+                    }
+                    None => {}
+                }
                 continue;
             }
             if let Event::Key(key) = event
@@ -1864,6 +1893,17 @@ where
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Mouse(m) => {
                 app.handle_mouse(m);
+                // A click on the already-highlighted tile triggers the
+                // same path as `Enter` (unarchive the cursor target).
+                if app.take_pending_enter() {
+                    let targets = app.action_targets();
+                    if !targets.is_empty() {
+                        archived_list_apply_unarchive(conn, project, &mut app, &targets)?;
+                    }
+                }
+                if app.should_pop {
+                    return Ok(());
+                }
                 continue;
             }
             _ => continue,
@@ -2505,6 +2545,15 @@ where
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Mouse(m) => {
                 app.handle_mouse(m);
+                // A click on the already-highlighted row drills into
+                // step-detail — same effect as the `Enter` keybinding's
+                // `InputAction::OpenStepDetail` arm below.
+                if let Some(step_id) = app.take_pending_open_step() {
+                    run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
+                    if app.should_pop {
+                        return Ok(());
+                    }
+                }
                 continue;
             }
             _ => continue,

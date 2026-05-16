@@ -51,6 +51,19 @@ pub struct ArchivedListApp {
     /// bar is open; the dispatcher routes every key through
     /// [`PaletteBarState::on_key`] before any view bindings fire.
     pub palette_bar: Option<PaletteBarState>,
+
+    /// The `Rect` the tile column was drawn into during the most recent
+    /// `draw()` — the post-`chrome::render` body (no border, no split).
+    /// Used by [`Self::handle_mouse`] to map a click row to a tile slot
+    /// ([`TILE_HEIGHT`] rows each) + `scroll_offset`. Zero-sized before the
+    /// first frame.
+    pub tile_area: Rect,
+
+    /// Set by [`Self::handle_mouse`] when a left click lands on the
+    /// already-highlighted tile: the dispatcher consumes this and applies
+    /// the same effect as `Enter` (unarchive the cursor target), then
+    /// clears it.
+    pub pending_enter: bool,
 }
 
 impl ArchivedListApp {
@@ -71,6 +84,8 @@ impl ArchivedListApp {
             should_pop: false,
             help: HelpState::new(),
             palette_bar: None,
+            tile_area: Rect::default(),
+            pending_enter: false,
         }
     }
 
@@ -90,10 +105,68 @@ impl ArchivedListApp {
         self.palette_bar.is_some()
     }
 
+    /// Map a click at `(column, row)` to a tile index. Each tile is
+    /// [`TILE_HEIGHT`] rows tall and the column has no border, so the slot
+    /// is `(row - tile_area.y) / TILE_HEIGHT` and the index is
+    /// `scroll_offset + slot`. `tile_area` already excludes the top/bottom
+    /// chrome rows (it's the post-`chrome::render` body). Returns `None`
+    /// for clicks outside the column, below the last tile, or before the
+    /// first draw.
+    fn tile_at(&self, column: u16, row: u16) -> Option<usize> {
+        use ratatui::layout::Position;
+
+        let area = self.tile_area;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        if !area.contains(Position::new(column, row)) {
+            return None;
+        }
+        let slot = ((row - area.y) / TILE_HEIGHT) as usize;
+        let idx = self.scroll_offset + slot;
+        if idx < self.tiles.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
     /// Mouse-event entry point routed from the dispatcher's event loop.
-    /// No-op by default — see [`super::plan_list::PlanListApp::handle_mouse`]
-    /// for the rationale. Per-view drag handling is added in later steps.
-    pub fn handle_mouse(&mut self, _event: MouseEvent) {}
+    ///
+    /// There is no divider here (the archived list is a single full-width
+    /// tile column), so:
+    ///
+    /// * a left press on a tile selects it, and a second press on the
+    ///   *already-highlighted* tile triggers the same effect as `Enter`
+    ///   (unarchive the cursor target) via [`Self::pending_enter`];
+    /// * the scroll wheel maps to `k` / `j` (cursor up / down).
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        match event.kind {
+            MouseEventKind::ScrollUp => self.navigate_up(),
+            MouseEventKind::ScrollDown => self.navigate_down(),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = self.tile_at(event.column, event.row) {
+                    if idx == self.selected_index {
+                        // Click on the highlighted tile → same as Enter.
+                        self.pending_enter = true;
+                    } else {
+                        // Click on a different tile → just move the cursor.
+                        self.selected_index = idx;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Consume a pending mouse-driven `Enter` (unarchive), if any. The
+    /// dispatcher calls this after [`Self::handle_mouse`] and runs the same
+    /// path as the `Enter` keybinding.
+    pub fn take_pending_enter(&mut self) -> bool {
+        std::mem::take(&mut self.pending_enter)
+    }
 
     // -- Navigation -------------------------------------------------------
 
@@ -228,6 +301,9 @@ pub fn draw(frame: &mut Frame, app: &mut ArchivedListApp) {
         },
     );
     update_scroll(app, body.height);
+    // Record the tile column so `handle_mouse` can hit-test a click row to
+    // a tile slot (TILE_HEIGHT rows each) + `scroll_offset`.
+    app.tile_area = body;
     render_tiles(frame.buffer_mut(), body, app);
 
     if let Some(toast) = app.toasts.current() {
@@ -664,5 +740,109 @@ mod tests {
             crate::tui::palette::parse(&input),
             Ok(PaletteCommand::PlanUnarchive("foo".to_string()))
         );
+    }
+
+    // -- Mouse: click-to-select / click-again-to-enter (step 25) ----------
+
+    /// Construct a [`MouseEvent`] at `(column, row)` with the given kind.
+    fn mouse_event(
+        column: u16,
+        row: u16,
+        kind: crossterm::event::MouseEventKind,
+    ) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    /// An `ArchivedListApp` with a recorded tile column mirroring `draw`:
+    /// the body starts below the 1-row top chrome (`y = 1`), no border, no
+    /// split, and each tile is `TILE_HEIGHT` rows tall.
+    fn tile_app(n: usize) -> ArchivedListApp {
+        let mut app = ArchivedListApp::new(make_tiles(n), "/proj", "UTC");
+        app.tile_area = Rect {
+            x: 0,
+            y: 1,
+            width: 60,
+            height: 30,
+        };
+        app
+    }
+
+    #[test]
+    fn click_on_highlighted_tile_requests_enter() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = tile_app(3);
+        app.selected_index = 1;
+        // Tile 1 spans rows y=1 + 1*6 .. , i.e. rows 7..=12.
+        app.handle_mouse(mouse_event(4, 8, MouseEventKind::Down(MouseButton::Left)));
+        assert!(
+            app.take_pending_enter(),
+            "click on the highlighted tile should request enter (unarchive)"
+        );
+        assert_eq!(app.selected_index, 1, "selection unchanged");
+    }
+
+    #[test]
+    fn click_on_other_tile_selects_only() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = tile_app(4);
+        app.selected_index = 0;
+        // Tile 3: rows y=1 + 3*6 .. , i.e. rows 19..=24.
+        app.handle_mouse(mouse_event(4, 20, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 3, "click moves the cursor");
+        assert!(
+            !app.take_pending_enter(),
+            "a non-highlighted click must not request enter"
+        );
+    }
+
+    #[test]
+    fn click_accounts_for_scroll_offset() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = tile_app(10);
+        app.scroll_offset = 3;
+        app.selected_index = 0;
+        // First on-screen slot (rows 1..=6) maps to scroll_offset + 0 = 3.
+        app.handle_mouse(mouse_event(2, 4, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 3, "slot→index must add scroll_offset");
+        assert!(!app.take_pending_enter());
+    }
+
+    #[test]
+    fn click_below_last_tile_is_ignored() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = tile_app(2);
+        app.selected_index = 1;
+        // Only 2 tiles (rows 1..=12); row 20 is past the last.
+        app.handle_mouse(mouse_event(4, 20, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 1, "out-of-list click changes nothing");
+        assert!(!app.take_pending_enter());
+    }
+
+    #[test]
+    fn scroll_wheel_maps_to_k_and_j() {
+        use crossterm::event::MouseEventKind;
+        let mut app = tile_app(4);
+        assert_eq!(app.selected_index, 0);
+        app.handle_mouse(mouse_event(4, 5, MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_index, 1, "ScrollDown behaves like j");
+        app.handle_mouse(mouse_event(4, 5, MouseEventKind::ScrollDown));
+        assert_eq!(app.selected_index, 2);
+        app.handle_mouse(mouse_event(4, 5, MouseEventKind::ScrollUp));
+        assert_eq!(app.selected_index, 1, "ScrollUp behaves like k");
+    }
+
+    #[test]
+    fn tile_click_before_first_draw_is_safe() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let mut app = ArchivedListApp::new(make_tiles(3), "/proj", "UTC");
+        // No draw yet: tile_area is zero-sized.
+        app.handle_mouse(mouse_event(2, 3, MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(app.selected_index, 0);
+        assert!(!app.take_pending_enter());
     }
 }
