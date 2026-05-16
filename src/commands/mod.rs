@@ -1064,6 +1064,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1081,6 +1082,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )
@@ -1128,6 +1130,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1145,6 +1148,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )
@@ -1164,6 +1168,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )
@@ -1213,6 +1218,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1259,6 +1265,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1277,6 +1284,7 @@ mod tests {
             Some(2),
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )
@@ -1324,6 +1332,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1341,6 +1350,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )
@@ -1388,6 +1398,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )
@@ -1458,6 +1469,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1508,6 +1520,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1526,6 +1539,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1543,6 +1557,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )
@@ -1593,6 +1608,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1611,6 +1627,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1628,6 +1645,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )
@@ -2086,6 +2104,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )

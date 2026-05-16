@@ -616,6 +616,11 @@ pub enum StepCommand {
     /// flags are mutually exclusive with `--import-json`. When `--import-json`
     /// is used, the first positional is interpreted as the plan slug (since
     /// no title is meaningful for a bulk import).
+    ///
+    /// `--depends-on` is the *interactive* path for declaring a DAG edge as
+    /// the step is created; it is rejected together with `--import-json` (the
+    /// bulk JSON form carries no dependency field — declare those afterward
+    /// with `ralph step dependency add`).
     #[command(after_help = AUTHORING_TIP_COMMITS)]
     Add {
         /// Step title. Required unless `--import-json` is used. With
@@ -684,6 +689,19 @@ pub enum StepCommand {
         /// are rejected.
         #[arg(long = "tag", value_name = "TAG", conflicts_with = "import_json")]
         tags: Vec<String>,
+
+        /// Make the new step depend on an existing step in the same plan,
+        /// identified by 1-based number or 8-char short id (repeatable).
+        /// Each edge is resolved and attached after the step is created;
+        /// self-edges and cycles are rejected. This is the interactive path
+        /// for declaring DAG edges — the `--import-json` bulk form has no
+        /// dependency field, so it conflicts with this flag.
+        #[arg(
+            long = "depends-on",
+            value_name = "SHORT_ID|NUM",
+            conflicts_with = "import_json"
+        )]
+        depends_on: Vec<String>,
 
         /// Bulk-insert steps from a JSON file or stdin (use `-` for stdin).
         /// Accepts a JSON array of step objects, or a single object. Each
@@ -1411,6 +1429,66 @@ mod tests {
     fn test_parse_step_add_requires_title_without_import() {
         let result = Cli::try_parse_from(["ralph-rs", "step", "add"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_step_add_with_depends_on() {
+        // Repeatable --depends-on accumulates raw selectors (number or
+        // short id) in argv order; resolution happens in the handler.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "Wire it up",
+            "my-feature",
+            "--depends-on",
+            "1",
+            "--depends-on",
+            "abc12345",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Add {
+            title,
+            plan,
+            depends_on,
+            ..
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(title.as_deref(), Some("Wire it up"));
+            assert_eq!(plan.as_deref(), Some("my-feature"));
+            assert_eq!(depends_on, vec!["1".to_string(), "abc12345".to_string()]);
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_depends_on_conflicts_with_import_json() {
+        // The bulk JSON form carries no dependency field, so --depends-on
+        // must be rejected together with --import-json.
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "--import-json",
+            "-",
+            "--depends-on",
+            "1",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_step_add_without_depends_on_is_empty() {
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "step", "add", "Solo step"]).unwrap();
+        if let Command::Step(StepCommand::Add { depends_on, .. }) = cli.command.unwrap()
+        {
+            assert!(depends_on.is_empty());
+        } else {
+            panic!("Expected Step Add");
+        }
     }
 
     #[test]

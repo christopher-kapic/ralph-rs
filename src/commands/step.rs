@@ -192,10 +192,23 @@ pub fn step_add(
     change_policy: Option<ChangePolicy>,
     retry_strategy: Option<RetryStrategy>,
     tags: &[String],
+    depends_on: &[String],
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
+
+    // Resolve each dependency selector to an existing step BEFORE creating
+    // the new step so a bad selector fails fast without leaving a
+    // half-created step behind — mirroring how `plan_create` resolves
+    // `--depends-on` slugs into `resolved_deps` before `create_plan`. Deps
+    // are plan-internal pre-existing steps, so resolving them ahead of
+    // creation is correct (the new step has no number/short id yet anyway).
+    let mut resolved_deps: Vec<(String, String)> = Vec::with_capacity(depends_on.len());
+    for dep_sel in depends_on {
+        let (dep, _) = resolve_step(conn, &plan.id, Some(dep_sel.as_str()), None)?;
+        resolved_deps.push((dep_sel.clone(), dep.id));
+    }
 
     let desc = description.unwrap_or("");
     let normalized_tags = normalize_tag_inputs(tags)?;
@@ -277,6 +290,14 @@ pub fn step_add(
         storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
     }
 
+    // Attach each resolved dependency. The new step has no edges yet, so a
+    // cycle is impossible here; `add_step_dependency` still guards
+    // self-edges and cycles defensively (docs/dag-redesign.md §6/§7).
+    for (dep_sel, dep_id) in &resolved_deps {
+        storage::add_step_dependency(conn, &step.id, dep_id)
+            .with_context(|| format!("Failed to add dependency on '{dep_sel}'"))?;
+    }
+
     eprintln!(
         "{} Added step #{} [{}]: {}",
         output::check_icon(out.color),
@@ -284,6 +305,10 @@ pub fn step_add(
         step.short_id,
         output::bold(&step.title, out.color),
     );
+    if !resolved_deps.is_empty() {
+        let sels: Vec<&str> = resolved_deps.iter().map(|(s, _)| s.as_str()).collect();
+        eprintln!("  Depends on: {}", sels.join(", "));
+    }
     Ok(())
 }
 
@@ -1202,6 +1227,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1243,6 +1269,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1274,6 +1301,7 @@ mod tests {
             None, // no max_retries override — falls back to config default.
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )
@@ -1313,6 +1341,7 @@ mod tests {
             None,
             None,
             tags,
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1351,6 +1380,7 @@ mod tests {
             None,
             None,
             &tags,
+            &[],
             &test_out(),
         )
         .unwrap_err();
@@ -1376,6 +1406,7 @@ mod tests {
             None,
             None,
             &tags,
+            &[],
             &test_out(),
         )
         .unwrap_err();
@@ -1481,6 +1512,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )
@@ -1844,6 +1876,7 @@ mod tests {
             None,
             Some(crate::plan::RetryStrategy::Rollback),
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1878,6 +1911,7 @@ mod tests {
             None,
             None,
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1886,6 +1920,97 @@ mod tests {
             .unwrap();
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert!(steps[0].retry_strategy.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // `ralph step add --depends-on` (docs/dag-redesign.md §7): resolve
+    // each selector to an existing step and attach the edge after create.
+    // -----------------------------------------------------------------
+
+    /// Add a step with a single `--depends-on <num>` selector — the new
+    /// step gains exactly that dependency edge.
+    fn add_plain(conn: &Connection, project: &str, title: &str, depends_on: &[String]) {
+        step_add(
+            conn,
+            "bulk-plan",
+            project,
+            title,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            depends_on,
+            &test_out(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_step_add_with_depends_on_attaches_edges() {
+        let (conn, project) = setup_with_plan();
+        add_plain(&conn, &project, "a", &[]);
+        add_plain(&conn, &project, "b", &[]);
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let (a, b) = (&steps[0], &steps[1]);
+
+        // c depends on step #1 (by number) and step b (by short id).
+        add_plain(
+            &conn,
+            &project,
+            "c",
+            &["1".to_string(), b.short_id.clone()],
+        );
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let c = steps.iter().find(|s| s.title == "c").unwrap();
+        let mut deps = storage::list_step_dependencies(&conn, &c.id).unwrap();
+        deps.sort();
+        let mut expected = vec![a.id.clone(), b.id.clone()];
+        expected.sort();
+        assert_eq!(deps, expected);
+    }
+
+    #[test]
+    fn test_step_add_depends_on_bad_selector_fails_fast() {
+        // An unresolvable selector aborts before the step is created — no
+        // half-created step is left behind (mirrors plan_create's
+        // resolve-before-create ordering).
+        let (conn, project) = setup_with_plan();
+        let err = step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "orphan",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &["99".to_string()],
+            &test_out(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        assert!(storage::list_steps(&conn, &plan.id).unwrap().is_empty());
     }
 
     /// Provenance: a step that sets its own strategy reports `(step-level)`;
@@ -1922,6 +2047,7 @@ mod tests {
             None,
             Some(crate::plan::RetryStrategy::Keep),
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -1940,6 +2066,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )
@@ -2010,6 +2137,7 @@ mod tests {
             None,
             Some(crate::plan::RetryStrategy::Keep),
             &[],
+            &[],
             &test_out(),
         )
         .unwrap();
@@ -2077,6 +2205,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
             &[],
             &test_out(),
         )

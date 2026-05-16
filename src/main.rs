@@ -243,6 +243,7 @@ fn main() -> Result<()> {
                 change_policy,
                 retry_strategy,
                 tags,
+                depends_on,
                 import_json,
             } => {
                 // Precedence: per-subcommand --harness overrides the global
@@ -282,6 +283,7 @@ fn main() -> Result<()> {
                         change_policy,
                         retry_strategy,
                         &tags,
+                        &depends_on,
                         &out,
                     )
                 }
