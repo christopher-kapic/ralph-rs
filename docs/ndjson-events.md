@@ -39,6 +39,7 @@ The events fall into two groups:
 | `stale_steps_swept`| lifecycle | Once at run start when orphaned `in_progress` rows exist   |
 | `plan_grew`        | lifecycle | After each runner-loop iteration when new steps appeared   |
 | `prompt_prepared`  | lifecycle | Once per attempt, immediately before harness spawn         |
+| `attempt_cancelled`| lifecycle | When the TUI skip dialog's Esc/cancel undoes an in-flight attempt |
 | `harness_chunk`    | streaming | Per newline of harness stdout/stderr during the harness phase |
 | `test_chunk`       | streaming | Per newline of test stdout/stderr during the tests phase   |
 | `phase_changed`    | streaming | On every `run_locks.phase` transition                      |
@@ -271,6 +272,55 @@ Payload:
   "prompt_preview": "You are running as part of a `ralph` plan…"
 }
 ```
+
+### `attempt_cancelled`
+
+Emitted when the **TUI skip dialog's Esc/cancel path** undoes an
+in-flight attempt (the user pressed `s` on a running step, the harness
+was killed, and they then cancelled the change-handling dialog instead
+of choosing stash/commit/discard).
+
+Unlike `step_finished`, this is **not** terminal for the step. Before
+emitting it the runner has:
+
+- rolled the working tree back (preserving the user's pre-existing
+  untracked files),
+- written **no** `execution_logs` row for the cancelled attempt
+  (the row created with the prompt before the harness spawned is
+  deleted), and
+- reset the cancel channel and the persisted attempt counter so it can
+  re-enter the retry loop at the **same** `attempt` number.
+
+Net effect: the cancelled attempt consumes **no** retry budget and
+leaves **no** `UNIQUE(step_id, attempt)` row behind. Another
+`prompt_prepared` / `phase_changed` for the same `step_id` at the same
+`attempt` number follows.
+
+Payload:
+
+| Field      | Type               | Notes                                              |
+|------------|--------------------|----------------------------------------------------|
+| `step_id`  | `string`           | UUID of the step whose attempt was cancelled.      |
+| `step_num` | `integer`          | 1-based position in the plan at emit time.         |
+| `attempt`  | `integer`          | 1-based number of the attempt that was cancelled.  |
+| `at`       | `string` (RFC3339) | UTC instant the cancellation was processed.        |
+
+```json
+{
+  "event": "attempt_cancelled",
+  "step_id": "9b8c4…",
+  "step_num": 3,
+  "attempt": 2,
+  "at": "2026-05-16T09:30:00Z"
+}
+```
+
+Consumer expectations: do **not** treat this as a step terminating.
+Decrement any "attempts used" counter you derived from
+`prompt_prepared`, and expect the same `step_id`/`attempt` to reappear.
+It is only emitted on the TUI-spawned runner stream — CLI `ralph skip
+--changes …` never produces it (those choices always finalize the
+step).
 
 ---
 

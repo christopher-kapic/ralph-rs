@@ -30,6 +30,10 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v18,
     migrate_v19,
     migrate_v20,
+    migrate_v21,
+    migrate_v22,
+    migrate_v23,
+    migrate_v24,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -59,6 +63,15 @@ fn open_at<P: AsRef<std::path::Path>>(path: P) -> Result<Connection> {
     let path = path.as_ref();
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open database at {}", path.display()))?;
+
+    // Wait (rather than fail immediately with SQLITE_BUSY) when another
+    // process holds a write lock. The cross-process skip bridge has the
+    // `ralph skip`/TUI process and the runner process contending on this
+    // same file during a live run; without this, a momentary collision
+    // would fail `ralph skip` outright or disable the runner's skip poll.
+    // 5s mirrors the run-lock connection (`run_lock.rs`).
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .with_context(|| format!("Failed to set busy_timeout on {}", path.display()))?;
 
     // Restrict to owner-only on Unix — the DB holds session ids, harness
     // output, diffs, and cost data that shouldn't be world-readable. Windows
@@ -642,6 +655,124 @@ fn migrate_v20(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         ALTER TABLE plans ADD COLUMN last_run_started_at TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V21: drop the legacy per-plan prompt-wrap columns
+// ---------------------------------------------------------------------------
+
+fn migrate_v21(conn: &Connection) -> Result<()> {
+    // The prompt model is collapsing to a strict four-layer
+    // (Global/Project/Plan/Step) shape. Per-plan `prompt_prefix` /
+    // `prompt_suffix` (added V10) and `context_prepend` (added V14) no longer
+    // exist in that model — the plan layer is sourced from the plan itself,
+    // not a separate wrap, and the introspection block now lives in the
+    // global prompt seed. Drop all three columns outright; the data they held
+    // is intentionally not migrated anywhere.
+    //
+    // The bundled SQLite (libsqlite3-sys 0.37 → SQLite 3.50.x) is well past
+    // 3.35.0, where `ALTER TABLE ... DROP COLUMN` was introduced, so no
+    // table-recreate dance is needed. None of these columns participate in an
+    // index or constraint, so DROP COLUMN succeeds directly. Dropping
+    // preserves the physical order of the remaining columns, so
+    // `plan::PLAN_COLUMNS` / `Plan::from_row` only need their indices shifted.
+    conn.execute_batch(
+        "
+        ALTER TABLE plans DROP COLUMN prompt_prefix;
+        ALTER TABLE plans DROP COLUMN prompt_suffix;
+        ALTER TABLE plans DROP COLUMN context_prepend;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V22: collapse project_settings prompt prefix/suffix into `prompt`
+// ---------------------------------------------------------------------------
+
+fn migrate_v22(conn: &Connection) -> Result<()> {
+    // The prompt model collapsed to a strict four-layer
+    // (Global/Project/Plan/Step) shape with ONE content blob per layer. The
+    // project layer kept a `prompt_prefix` / `prompt_suffix` pair (added
+    // V10); fold them into a single `prompt` column.
+    //
+    // Backfill concatenates the two with a blank line between them, skipping
+    // whichever side is NULL, so no user-set project prompt is lost. SQLite
+    // 3.50.x (bundled) supports `ALTER TABLE ... DROP COLUMN`, and neither
+    // column participates in an index or constraint (the table's only key is
+    // `project`), so the drops succeed directly.
+    conn.execute_batch(
+        "
+        ALTER TABLE project_settings ADD COLUMN prompt TEXT;
+
+        UPDATE project_settings
+        SET prompt = CASE
+            WHEN prompt_prefix IS NOT NULL AND prompt_suffix IS NOT NULL
+                THEN prompt_prefix || char(10) || char(10) || prompt_suffix
+            WHEN prompt_prefix IS NOT NULL THEN prompt_prefix
+            WHEN prompt_suffix IS NOT NULL THEN prompt_suffix
+            ELSE NULL
+        END;
+
+        ALTER TABLE project_settings DROP COLUMN prompt_prefix;
+        ALTER TABLE project_settings DROP COLUMN prompt_suffix;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V23: cross-process skip bridge columns on plans
+// ---------------------------------------------------------------------------
+
+fn migrate_v23(conn: &Connection) -> Result<()> {
+    // `ralph skip` (and the TUI skip dialog) run in a *different process*
+    // from the runner that actually owns the in-flight harness child. The
+    // process-global cancel registry in `signal.rs` only works same-process,
+    // so a cross-process skip needs a durable hand-off the runner can poll —
+    // exactly like `plans.pause_requested` (added V18), but pause is a
+    // boolean and a skip must identify *which* step it targets so a stale
+    // request left behind by a race can't skip the wrong (next) step.
+    //
+    // `skip_requested_step_id` holds the step UUID the skip targets (NULL ==
+    // no pending skip). `skip_changes` holds the serialized
+    // `ParkStrategyKind` (`stash` | `commit` | `discard` | `cancel`) the
+    // operator chose via `--changes` / the TUI dialog. The runner reads +
+    // clears both atomically mid-attempt; on a match it funnels into the
+    // same executor skip path the same-process registry uses.
+    //
+    // Both nullable with no backfill: every pre-V23 plan reports NULL (no
+    // pending skip), which is the correct default.
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN skip_requested_step_id TEXT;
+        ALTER TABLE plans ADD COLUMN skip_changes TEXT;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V24: retry_strategy columns on plans and steps
+// ---------------------------------------------------------------------------
+
+fn migrate_v24(conn: &Connection) -> Result<()> {
+    // Per-plan / per-step opt-in for how a step's working tree is treated
+    // between failed attempts (`keep` vs `rollback`). Resolution is
+    // step > plan > built-in default (`keep`), implemented by
+    // `plan::Step::effective_retry_strategy`.
+    //
+    // Both columns are nullable TEXT with NO non-null default: NULL means
+    // "inherit from the parent / use the built-in default" rather than
+    // pinning every pre-V24 row to an explicit value. A non-null value is a
+    // serialized `plan::RetryStrategy` (`keep` | `rollback`).
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN retry_strategy TEXT;
+        ALTER TABLE steps ADD COLUMN retry_strategy TEXT;
         ",
     )?;
     Ok(())
@@ -1396,15 +1527,16 @@ mod tests {
 
     #[test]
     fn test_migration_v14_adds_context_prepend_column() {
-        // Seed a pre-V14 database, populate a plan, then let V14 apply and
-        // verify the new `context_prepend` column exists and defaults to NULL.
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("old_v13.db");
-        let conn = Connection::open(&path).unwrap();
+        // V14 added `context_prepend`; V21 later drops it again. This test
+        // pins V14's behavior in isolation — it applies migrations only
+        // through v14 (NOT via `open_at`, which would run the full chain and
+        // drop the column at v21) and verifies the column exists, defaults to
+        // NULL, and round-trips an explicit value at that schema version.
+        let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
-        // Apply migrations v1..=v13 only.
-        for (i, migration) in MIGRATIONS.iter().enumerate().take(13) {
+        // Apply migrations v1..=v14 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(14) {
             let version = (i as u32) + 1;
             conn.execute_batch("BEGIN;").unwrap();
             migration(&conn).unwrap();
@@ -1412,18 +1544,12 @@ mod tests {
             conn.execute_batch("COMMIT;").unwrap();
         }
 
+        // A plan inserted without the column defaults to NULL.
         conn.execute(
             "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params!["p1", "slug", "/proj", "b", "d"],
         )
         .unwrap();
-
-        drop(conn);
-
-        // Re-open — V14 applies and adds the column. Pre-V14 rows must
-        // default to NULL.
-        let conn = open_at(&path).unwrap();
-
         let prepend: Option<String> = conn
             .query_row(
                 "SELECT context_prepend FROM plans WHERE id = ?1",
@@ -1433,7 +1559,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             prepend, None,
-            "pre-V14 rows should default to NULL context_prepend"
+            "rows inserted at v14 should default to NULL context_prepend"
         );
 
         // New inserts with an explicit value are preserved.
@@ -1451,14 +1577,168 @@ mod tests {
             )
             .unwrap();
         assert_eq!(p2.as_deref(), Some("custom prepend"));
+    }
+
+    #[test]
+    fn test_migration_v21_drops_plan_prompt_wrap_columns() {
+        // Seed a pre-V21 DB, populate a plan with values in all three
+        // soon-to-be-dropped columns, then run V21 and verify the columns are
+        // gone while the rest of the row (and the preserved columns) survive.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v20.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v20 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(20) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        // The three columns still exist at v20 — populate them so we can
+        // prove the row's other data survives the drop.
+        conn.execute(
+            "INSERT INTO plans
+                (id, slug, project, branch_name, description,
+                 prompt_prefix, prompt_suffix, context_prepend, last_run_branch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                "p1", "old", "/proj", "feat/x", "desc", "PRE", "SUF", "CTX", "feat/x"
+            ],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V21 applies and drops the three columns.
+        let conn = open_at(&path).unwrap();
+
+        let cols: Vec<String> = conn
+            .prepare("SELECT * FROM plans LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        for dropped in ["prompt_prefix", "prompt_suffix", "context_prepend"] {
+            assert!(
+                !cols.iter().any(|c| c == dropped),
+                "column {dropped} should have been dropped by V21 (cols: {cols:?})"
+            );
+        }
+
+        // Querying a dropped column must now error.
+        assert!(
+            conn.query_row(
+                "SELECT prompt_prefix FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get::<_, Option<String>>(0)
+            )
+            .is_err(),
+            "selecting a dropped column should fail"
+        );
+
+        // The rest of the row survived the table rewrite.
+        let (slug, desc, lrb): (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT slug, description, last_run_branch FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(slug, "old");
+        assert_eq!(desc, "desc");
+        assert_eq!(lrb.as_deref(), Some("feat/x"));
 
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_VERSION);
 
-        // Second open must not reapply (ALTER TABLE would fail on duplicate
-        // column).
+        // Re-open is a no-op (DROP COLUMN must not run twice).
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v22_collapses_project_settings_prompt_columns() {
+        // Seed a pre-V22 DB, populate project_settings rows exercising every
+        // prefix/suffix NULL combination, then run V22 and verify the
+        // concatenation backfill and the dropped columns.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v21.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v21 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(21) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        // Four rows: both, prefix-only, suffix-only, neither.
+        conn.execute_batch(
+            "
+            INSERT INTO project_settings (project, prompt_prefix, prompt_suffix)
+                VALUES ('/both', 'PRE', 'SUF');
+            INSERT INTO project_settings (project, prompt_prefix, prompt_suffix)
+                VALUES ('/preonly', 'ONLY-PRE', NULL);
+            INSERT INTO project_settings (project, prompt_prefix, prompt_suffix)
+                VALUES ('/sufonly', NULL, 'ONLY-SUF');
+            INSERT INTO project_settings (project, prompt_prefix, prompt_suffix)
+                VALUES ('/neither', NULL, NULL);
+            ",
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V22 applies, backfills `prompt`, drops the old columns.
+        let conn = open_at(&path).unwrap();
+
+        let cols: Vec<String> = conn
+            .prepare("SELECT * FROM project_settings LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        for dropped in ["prompt_prefix", "prompt_suffix"] {
+            assert!(
+                !cols.iter().any(|c| c == dropped),
+                "column {dropped} should have been dropped by V22 (cols: {cols:?})"
+            );
+        }
+        assert!(cols.iter().any(|c| c == "prompt"));
+
+        let prompt_for = |project: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT prompt FROM project_settings WHERE project = ?1",
+                [project],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(prompt_for("/both").as_deref(), Some("PRE\n\nSUF"));
+        assert_eq!(prompt_for("/preonly").as_deref(), Some("ONLY-PRE"));
+        assert_eq!(prompt_for("/sufonly").as_deref(), Some("ONLY-SUF"));
+        assert_eq!(prompt_for("/neither"), None);
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op (DROP COLUMN must not run twice).
         let conn = open_at(&path).expect("re-open must not reapply migrations");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -1911,6 +2191,191 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lrs2.as_deref(), Some("2026-05-05T00:00:00.000Z"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v23_adds_skip_bridge_columns_to_plans() {
+        // Seed a pre-V23 DB with a plans row, run V23, and verify the
+        // existing row defaults both skip-bridge columns to NULL (no pending
+        // skip — the correct default), and that fresh values round-trip.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v22.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v22 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(22) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V23 applies. Pre-V23 row must default both columns NULL.
+        let conn = open_at(&path).unwrap();
+        let (sid, sch): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT skip_requested_step_id, skip_changes FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            sid.is_none() && sch.is_none(),
+            "pre-V23 plans must default skip-bridge columns to NULL (got {sid:?}, {sch:?})"
+        );
+
+        // Fresh inserts can carry explicit values; they round-trip.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, \
+             skip_requested_step_id, skip_changes) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", "step-uuid", "discard"],
+        )
+        .unwrap();
+        let (sid2, sch2): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT skip_requested_step_id, skip_changes FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(sid2.as_deref(), Some("step-uuid"));
+        assert_eq!(sch2.as_deref(), Some("discard"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v24_adds_retry_strategy_to_plans_and_steps() {
+        // Seed a pre-V24 DB with a plans row + a steps row, run V24, and
+        // verify the existing rows default `retry_strategy` to NULL (inherit
+        // / use default — the correct behavior), and that fresh values
+        // round-trip on both tables.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v23.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v23 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(23) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V24 applies. Pre-V24 rows must default the column NULL on
+        // both tables.
+        let conn = open_at(&path).unwrap();
+        let plan_rs: Option<String> = conn
+            .query_row(
+                "SELECT retry_strategy FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let step_rs: Option<String> = conn
+            .query_row(
+                "SELECT retry_strategy FROM steps WHERE id = ?1",
+                ["s1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            plan_rs.is_none() && step_rs.is_none(),
+            "pre-V24 rows must default retry_strategy to NULL (got plan={plan_rs:?}, step={step_rs:?})"
+        );
+
+        // Confirm the schema actually carries the column on both tables.
+        for table in ["plans", "steps"] {
+            let cols: Vec<String> = conn
+                .prepare(&format!("SELECT * FROM {table} LIMIT 0"))
+                .unwrap()
+                .column_names()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            assert!(
+                cols.iter().any(|c| c == "retry_strategy"),
+                "{table} must have a retry_strategy column post-V24 (cols: {cols:?})"
+            );
+        }
+
+        // Fresh inserts can carry explicit values; they round-trip.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, retry_strategy) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", "rollback"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description, retry_strategy) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["s2", "p2", "a0", "Step", "d", "keep"],
+        )
+        .unwrap();
+        let plan_rs2: Option<String> = conn
+            .query_row(
+                "SELECT retry_strategy FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let step_rs2: Option<String> = conn
+            .query_row(
+                "SELECT retry_strategy FROM steps WHERE id = ?1",
+                ["s2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(plan_rs2.as_deref(), Some("rollback"));
+        assert_eq!(step_rs2.as_deref(), Some("keep"));
 
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))

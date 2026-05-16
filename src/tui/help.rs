@@ -298,6 +298,15 @@ pub fn for_step_detail() -> HelpModel {
                     ("a", "Answer focused open question"),
                 ],
             ),
+            Group::new(
+                "Prompt layers",
+                vec![
+                    ("Global (universal)", "Config.prompt — applies everywhere"),
+                    ("Project", ".ralph/prompt.md or the project DB row"),
+                    ("Plan", "The plan description"),
+                    ("Step", "This step's title / description / criteria"),
+                ],
+            ),
             Group::new("View", vec![("z", "Toggle zen mode (collapse sidebar)")]),
             Group::new(
                 "Other",
@@ -439,6 +448,41 @@ pub fn for_step_tags() -> HelpModel {
                 ],
             ),
             Group::new("Other", vec![("?", "Toggle this help")]),
+        ],
+    )
+}
+
+/// Help model for the rendered-prompt preview sub-view (prompt-overhaul,
+/// step 14).
+pub fn for_rendered_prompt() -> HelpModel {
+    HelpModel::new(
+        "Help — Rendered prompt",
+        vec![
+            Group::new(
+                "Attempts",
+                vec![
+                    ("j / ↓", "Next (newer) attempt"),
+                    ("k / ↑", "Previous (older) attempt"),
+                ],
+            ),
+            Group::new(
+                "Scroll",
+                vec![
+                    ("J", "Scroll down one line"),
+                    ("K", "Scroll up one line"),
+                    ("space / PgDn", "Page down"),
+                    ("PgUp", "Page up"),
+                    ("g / Home", "Jump to top"),
+                    ("G / End", "Jump to bottom"),
+                ],
+            ),
+            Group::new(
+                "Other",
+                vec![
+                    ("?", "Toggle this help"),
+                    ("q / <esc> / h / ← / Ctrl-C", "Back to step detail"),
+                ],
+            ),
         ],
     )
 }

@@ -641,7 +641,46 @@ pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
     //    out a user mid-step (25 GB target/ filled the FS, SQLite wedged).
     checks.push(check_disk_space(workdir));
 
+    // 6. Global prompt sanity. The post-collapse single `config.prompt`
+    //    field is where `ralph init` seeds ralph's built-in CLI-hints block
+    //    (`prompt::DEFAULT_CONTEXT_PREPEND`, which always carries the
+    //    `ralph status` marker). If the global prompt is absent, blank, or a
+    //    custom value that dropped the hints, the agent loses ralph's
+    //    self-introspection guidance — worth surfacing, but NON-FATAL: a
+    //    user may have deliberately replaced it.
+    checks.push(check_global_prompt(config));
+
     checks
+}
+
+/// Verify the global prompt still carries ralph's CLI-hints marker.
+///
+/// Pulled out so unit tests can drive both the present and missing paths
+/// without standing up a full config. Always `Pass` or `Warning` — never
+/// `Error` — so `ralph doctor` keeps returning success regardless.
+fn check_global_prompt(config: &Config) -> CheckResult {
+    const MARKER: &str = "ralph status";
+
+    let has_hints = config
+        .prompt
+        .as_deref()
+        .map(|p| !p.trim().is_empty() && p.contains(MARKER))
+        .unwrap_or(false);
+
+    if has_hints {
+        CheckResult {
+            name: "global-prompt".to_string(),
+            severity: CheckSeverity::Pass,
+            message: "ralph CLI hints present".to_string(),
+        }
+    } else {
+        CheckResult {
+            name: "global-prompt".to_string(),
+            severity: CheckSeverity::Warning,
+            message: "missing ralph CLI hints (run `ralph init --restore-prompts` to restore)"
+                .to_string(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -903,8 +942,7 @@ mod tests {
             timeout_secs: Some(300),
             hook_timeout_secs: 120,
             auto_stash: true,
-            prompt_prefix: None,
-            prompt_suffix: None,
+            prompt: None,
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
@@ -924,13 +962,13 @@ mod tests {
             plan_harness: None,
             created_at: now,
             updated_at: now,
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
         };
         let results = run_preflight_checks(&plan, &[], &config, tmp.path()).unwrap();
         let auth = results
@@ -983,6 +1021,7 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         }
     }
 
@@ -1101,8 +1140,7 @@ mod tests {
             timeout_secs: Some(300),
             hook_timeout_secs: 120,
             auto_stash: true,
-            prompt_prefix: None,
-            prompt_suffix: None,
+            prompt: None,
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
@@ -1137,8 +1175,7 @@ mod tests {
             timeout_secs: None,
             hook_timeout_secs: 120,
             auto_stash: true,
-            prompt_prefix: None,
-            prompt_suffix: None,
+            prompt: None,
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
@@ -1197,8 +1234,7 @@ mod tests {
             timeout_secs: None,
             hook_timeout_secs: 120,
             auto_stash: true,
-            prompt_prefix: None,
-            prompt_suffix: None,
+            prompt: None,
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
@@ -1285,6 +1321,94 @@ mod tests {
     #[test]
     fn test_is_binary_not_available() {
         assert!(!is_binary_available("definitely_not_a_real_binary_xyz"));
+    }
+
+    // -----------------------------------------------------------------
+    // global-prompt doctor check
+    // -----------------------------------------------------------------
+
+    /// Minimal Config with a given global prompt, no harnesses (keeps the
+    /// doctor run fast and isolates the global-prompt signal).
+    fn config_with_prompt(prompt: Option<&str>) -> Config {
+        Config {
+            default_harness: "claude".to_string(),
+            max_retries_per_step: 3,
+            timeout_secs: Some(300),
+            hook_timeout_secs: 120,
+            auto_stash: true,
+            prompt: prompt.map(str::to_string),
+            min_free_disk_mb: 1024,
+            display_timezone: "UTC".to_string(),
+            harness_chunk_max_bytes: 4096,
+            harnesses: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn test_check_global_prompt_pass_when_hints_present() {
+        // The real seed (`DEFAULT_CONTEXT_PREPEND`) carries `ralph status`.
+        let cfg = config_with_prompt(Some(crate::prompt::DEFAULT_CONTEXT_PREPEND));
+        let r = check_global_prompt(&cfg);
+        assert_eq!(r.name, "global-prompt");
+        assert_eq!(r.severity, CheckSeverity::Pass);
+    }
+
+    #[test]
+    fn test_check_global_prompt_warns_when_none_empty_or_garbage() {
+        for prompt in [
+            None,
+            Some(""),
+            Some("   \n\t "),
+            Some("totally custom, no hints"),
+        ] {
+            let cfg = config_with_prompt(prompt);
+            let r = check_global_prompt(&cfg);
+            assert_eq!(r.severity, CheckSeverity::Warning, "prompt={prompt:?}");
+            assert!(
+                r.message.contains("ralph init --restore-prompts"),
+                "warning must point at the fix, got: {}",
+                r.message
+            );
+        }
+    }
+
+    #[test]
+    fn test_doctor_global_prompt_warning_is_non_fatal() {
+        // Garbage global prompt → a Warning row appears, but no Error rows
+        // are introduced by this check, so doctor still returns success
+        // (the dispatcher only fails on CheckSeverity::Error).
+        let cfg = config_with_prompt(Some("no hints here"));
+        let tmp = tempfile::tempdir().unwrap();
+        let checks = run_doctor_checks(&cfg, tmp.path());
+
+        let gp = checks
+            .iter()
+            .find(|c| c.name == "global-prompt")
+            .expect("global-prompt check must be present");
+        assert_eq!(gp.severity, CheckSeverity::Warning);
+
+        // The global-prompt check itself never escalates to Error.
+        let results = PreflightResults {
+            checks: vec![gp.clone()],
+        };
+        assert!(
+            results.is_ok(),
+            "global-prompt warning must not be treated as a failure"
+        );
+    }
+
+    #[test]
+    fn test_doctor_global_prompt_pass_when_seeded() {
+        // With the built-in seed present, the row passes and doctor stays
+        // green.
+        let cfg = config_with_prompt(Some(crate::prompt::DEFAULT_CONTEXT_PREPEND));
+        let tmp = tempfile::tempdir().unwrap();
+        let checks = run_doctor_checks(&cfg, tmp.path());
+        let gp = checks
+            .iter()
+            .find(|c| c.name == "global-prompt")
+            .expect("global-prompt check must be present");
+        assert_eq!(gp.severity, CheckSeverity::Pass);
     }
 
     // -----------------------------------------------------------------

@@ -11,6 +11,7 @@ use tokio::sync::watch;
 
 use crate::io_util;
 use crate::output::ChunkStream;
+use crate::signal::CancelState;
 
 /// Per-stream cap for concurrent test-command pipe drainers. Tests are usually
 /// chattier than harness invocations but shorter-lived, so 1 MiB per stream is
@@ -92,7 +93,7 @@ const TAIL_LINES: usize = 50;
 pub async fn run_tests(
     tests: &[String],
     cwd: &Path,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     chunk_cfg: Option<TestChunkConfig>,
 ) -> TestResults {
     let mut results: Vec<TestResult> = Vec::with_capacity(tests.len());
@@ -101,7 +102,9 @@ pub async fn run_tests(
     let mut aborted = false;
 
     for (i, cmd) in tests.iter().enumerate() {
-        if *abort_rx.borrow() {
+        // Any cancel reason (Aborted *or* Skipped) stops the test phase —
+        // the harness it was validating is being torn down either way.
+        if abort_rx.borrow().is_some() {
             aborted = true;
             all_passed = false;
             break;
@@ -175,7 +178,7 @@ fn build_test_emitters(
 async fn run_single_test(
     cmd: &str,
     cwd: &Path,
-    mut abort_rx: watch::Receiver<bool>,
+    mut abort_rx: watch::Receiver<CancelState>,
     emitters: (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>),
 ) -> (TestResult, bool) {
     let mut command = Command::new("sh");
@@ -306,17 +309,17 @@ async fn run_single_test(
     }
 }
 
-/// Block until the abort watch channel signals `true`.
-async fn wait_for_abort(rx: &mut watch::Receiver<bool>) {
-    if *rx.borrow() {
+/// Block until the cancel watch channel is tripped (by any reason — a skip
+/// tears down the harness-under-test just like an abort does).
+async fn wait_for_abort(rx: &mut watch::Receiver<CancelState>) {
+    if rx.borrow().is_some() {
         return;
     }
     loop {
         if rx.changed().await.is_err() {
             std::future::pending::<()>().await;
-            return;
         }
-        if *rx.borrow() {
+        if rx.borrow().is_some() {
             return;
         }
     }
@@ -363,11 +366,11 @@ mod tests {
         std::env::current_dir().expect("current dir")
     }
 
-    fn never_abort() -> watch::Receiver<bool> {
+    fn never_abort() -> watch::Receiver<CancelState> {
         // Leak the sender: `wait_for_abort` already handles a closed channel
         // by pending forever, but a live sender keeps semantics identical to
         // the real abort channel the runner passes in.
-        let (tx, rx) = watch::channel(false);
+        let (tx, rx) = watch::channel(None);
         Box::leak(Box::new(tx));
         rx
     }
@@ -477,12 +480,12 @@ mod tests {
     async fn test_abort_signal_interrupts_running_test() {
         // A long-running test that would take 30 seconds to finish normally.
         let tests = vec!["sleep 30".to_string()];
-        let (tx, rx) = watch::channel(false);
+        let (tx, rx) = watch::channel(None);
 
         // Fire the abort after a short delay, while the test is still running.
         let abort_handle = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = tx.send(true);
+            let _ = tx.send(Some(crate::signal::CancelReason::Aborted));
         });
 
         let start = std::time::Instant::now();
@@ -506,8 +509,8 @@ mod tests {
     async fn test_abort_before_start() {
         // Abort already set before run_tests is called: no test should run.
         let tests = vec!["echo should_not_run".to_string()];
-        let (tx, rx) = watch::channel(false);
-        let _ = tx.send(true);
+        let (tx, rx) = watch::channel(None);
+        let _ = tx.send(Some(crate::signal::CancelReason::Aborted));
 
         let res = run_tests(&tests, &cwd(), rx, None).await;
         assert!(res.aborted);

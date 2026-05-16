@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use crate::frac_index;
 use crate::plan::{
-    AnsweredQuestion, ChangePolicy, ExecutionLog, PLAN_COLUMNS, Phase, Plan, PlanStatus, Step,
-    StepStatus,
+    AnsweredQuestion, ChangePolicy, ExecutionLog, PLAN_COLUMNS, Phase, Plan, PlanStatus,
+    RetryStrategy, Step, StepStatus,
 };
 use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 
@@ -18,7 +18,7 @@ use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 /// can index by column position. Kept as a single shared constant so adding a
 /// new column (V13+ tags etc.) only requires editing one place instead of the
 /// dozen scattered SELECTs.
-const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags";
+const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy";
 
 // ---------------------------------------------------------------------------
 // Plan operations
@@ -39,9 +39,15 @@ pub fn create_plan(
     let id = Uuid::new_v4().to_string();
     let tests_json = serde_json::to_string(deterministic_tests)?;
 
+    // `questions_enabled` is set explicitly to 1 here rather than relying on
+    // the V16 column `DEFAULT 0`. New plans opt INTO the pause-for-question
+    // feature by default; existing rows are untouched (no migration), so only
+    // plans created via this path get the new default. The SQL column default
+    // stays 0 so a bare INSERT (e.g. an import path that omits the column)
+    // still behaves as before.
     conn.execute(
-        "INSERT INTO plans (id, slug, project, branch_name, description, harness, agent, deterministic_tests)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT INTO plans (id, slug, project, branch_name, description, harness, agent, deterministic_tests, questions_enabled)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
         params![id, slug, project, branch_name, description, harness, agent, tests_json],
     )
     .with_context(|| format!("Failed to insert plan '{slug}' for project '{project}'"))?;
@@ -460,6 +466,205 @@ pub fn take_plan_pause_requested(conn: &Connection, plan_id: &str) -> Result<boo
     Ok(was_set)
 }
 
+// ---------------------------------------------------------------------------
+// Cross-process skip bridge (V23)
+// ---------------------------------------------------------------------------
+//
+// `ralph skip` and the TUI skip dialog run in a *different process* from the
+// runner that owns the in-flight harness child. The process-global cancel
+// registry in `signal.rs` only works when the skip and the runner share a
+// process (e.g. unit tests). For production — where the runner is always a
+// separate subprocess from both the TUI and `ralph skip` — the skip is
+// handed off through `plans.skip_requested_step_id` / `plans.skip_changes`,
+// modeled directly on the `plans.pause_requested` precedent above. The
+// runner polls `take_skip_request` mid-attempt and, when the cleared
+// request's step id matches the in-flight step, funnels into the *same*
+// executor skip path the same-process registry uses.
+
+/// Record a pending skip for `step_id` in `plan_id` with the operator's
+/// chosen change-handling `kind`. Overwrites any prior pending request for
+/// the plan (a fresh skip supersedes a stale one). Bumps `updated_at` like
+/// the pause helper.
+///
+/// Deliberately *not* gated behind the per-project run lock: a run holds
+/// that lock for its entire duration, so requiring it here would make
+/// `ralph skip` impossible to issue against a live run — the exact case the
+/// bridge exists for. This mirrors `set_plan_pause_requested`, which is also
+/// lock-free.
+pub fn request_skip(
+    conn: &Connection,
+    plan_id: &str,
+    step_id: &str,
+    kind: crate::git::ParkStrategyKind,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET skip_requested_step_id = ?1, skip_changes = ?2, \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
+        params![step_id, kind.as_token(), plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// Atomically read the pending skip request for `plan_id` and, if present,
+/// clear it in the same transaction (read-and-clear, like
+/// [`take_plan_pause_requested`]). Returns `Some((step_id, kind))` when a
+/// request was pending on entry, `None` otherwise.
+///
+/// An unrecognized `skip_changes` token resolves to
+/// [`crate::git::ParkStrategyKind::Stash`] via
+/// [`crate::git::ParkStrategyKind::from_token`] so a corrupt value can never
+/// make a skip silently destroy work.
+///
+/// Prefer [`take_skip_request_for_step`] from the runner poll loop: this
+/// unconditional take, if paired with a separate `peek`, has a TOCTOU window
+/// where a second `ralph skip` targeting a *different* step that lands
+/// between the peek and the take is consumed and silently discarded.
+#[allow(dead_code)]
+pub fn take_skip_request(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<Option<(String, crate::git::ParkStrategyKind)>> {
+    let tx = conn.unchecked_transaction()?;
+    let row: Option<(Option<String>, Option<String>)> = match tx.query_row(
+        "SELECT skip_requested_step_id, skip_changes FROM plans WHERE id = ?1",
+        params![plan_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            anyhow::bail!("Plan not found: {plan_id}");
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let result = match row {
+        Some((Some(step_id), changes)) => {
+            let kind = changes
+                .as_deref()
+                .map(crate::git::ParkStrategyKind::from_token)
+                .unwrap_or(crate::git::ParkStrategyKind::Stash);
+            tx.execute(
+                "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+                params![plan_id],
+            )?;
+            Some((step_id, kind))
+        }
+        _ => None,
+    };
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Atomically consume the pending skip request for `plan_id` **only when it
+/// targets `step_id`**, in a single predicate-guarded transaction. Returns
+/// `Some(kind)` when a request for exactly this step was pending (and is now
+/// cleared); `None` when nothing was pending or it targeted a *different*
+/// step — in which case that request is left untouched so it is honored when
+/// its own step runs.
+///
+/// This is the runner-poll-safe replacement for a separate
+/// [`peek_skip_request`] + [`take_skip_request`]: the read and the clear
+/// share the same `skip_requested_step_id = ?step_id` predicate inside one
+/// transaction, so a concurrent `ralph skip` re-targeting a different step
+/// can no longer slip in between and have its request swallowed against the
+/// in-flight one.
+///
+/// An unrecognized `skip_changes` token resolves to
+/// [`crate::git::ParkStrategyKind::Stash`] (non-destructive default), same as
+/// [`take_skip_request`].
+pub fn take_skip_request_for_step(
+    conn: &Connection,
+    plan_id: &str,
+    step_id: &str,
+) -> Result<Option<crate::git::ParkStrategyKind>> {
+    let tx = conn.unchecked_transaction()?;
+    // Read the change token for *this* step's pending request. The
+    // `skip_requested_step_id = ?2` predicate means a row only comes back
+    // when the pending request is for exactly the in-flight step.
+    let changes: Option<Option<String>> = match tx.query_row(
+        "SELECT skip_changes FROM plans WHERE id = ?1 AND skip_requested_step_id = ?2",
+        params![plan_id, step_id],
+        |r| r.get(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let result = match changes {
+        Some(changes) => {
+            let kind = changes
+                .as_deref()
+                .map(crate::git::ParkStrategyKind::from_token)
+                .unwrap_or(crate::git::ParkStrategyKind::Stash);
+            // Clear under the same predicate so we never null out a request
+            // that a concurrent writer just re-pointed at another step.
+            tx.execute(
+                "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE id = ?1 AND skip_requested_step_id = ?2",
+                params![plan_id, step_id],
+            )?;
+            Some(kind)
+        }
+        None => None,
+    };
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Non-clearing read of the pending skip request for `plan_id`. Returns
+/// `Some((step_id, kind))` when one is pending, `None` otherwise.
+///
+/// The runner poll loop no longer peeks-then-takes (that had a TOCTOU
+/// window); it uses the atomic predicate-guarded
+/// [`take_skip_request_for_step`] instead. This read-only accessor is
+/// retained for tests and external state inspection.
+#[allow(dead_code)]
+pub fn peek_skip_request(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<Option<(String, crate::git::ParkStrategyKind)>> {
+    let row: Option<(Option<String>, Option<String>)> = match conn.query_row(
+        "SELECT skip_requested_step_id, skip_changes FROM plans WHERE id = ?1",
+        params![plan_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            anyhow::bail!("Plan not found: {plan_id}");
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok(match row {
+        Some((Some(step_id), changes)) => {
+            let kind = changes
+                .as_deref()
+                .map(crate::git::ParkStrategyKind::from_token)
+                .unwrap_or(crate::git::ParkStrategyKind::Stash);
+            Some((step_id, kind))
+        }
+        _ => None,
+    })
+}
+
+/// Clear any pending skip request for `plan_id` without consuming it.
+/// Idempotent — a no-op when nothing is pending. Used to tidy a stale
+/// request the runner can no longer act on (e.g. the targeted step is no
+/// longer the in-flight one) and, at run start, to drop a request a prior
+/// run left behind so it can't spuriously skip the same step on this run.
+pub fn clear_skip_request(conn: &Connection, plan_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL \
+         WHERE id = ?1",
+        params![plan_id],
+    )?;
+    Ok(())
+}
+
 /// One open (unanswered) `step_questions` row enriched with the plan + step
 /// context the CLI list/show commands need to render. Driven by
 /// [`list_open_questions`].
@@ -668,15 +873,23 @@ pub fn set_plan_harness_gen(conn: &Connection, plan_id: &str, harness: Option<&s
     Ok(())
 }
 
-/// Set the plan-scope prompt prefix. Pass `None` to clear.
-pub fn set_plan_prompt_prefix(
+/// Set (or clear) the plan-level retry-strategy override and bump
+/// `updated_at`.
+///
+/// `Some(strategy)` records a plan-wide default; `None` writes SQL NULL,
+/// meaning "no plan-level override" — resolution then falls through to the
+/// global default ([`RetryStrategy::Keep`]) unless a step overrides it.
+/// Kept as a dedicated setter (rather than threaded through `create_plan`)
+/// to mirror [`set_plan_harness_gen`] and avoid churning every existing
+/// `create_plan` callsite.
+pub fn set_plan_retry_strategy(
     conn: &Connection,
     plan_id: &str,
-    prefix: Option<&str>,
+    strategy: Option<RetryStrategy>,
 ) -> Result<()> {
     let affected = conn.execute(
-        "UPDATE plans SET prompt_prefix = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![prefix, plan_id],
+        "UPDATE plans SET retry_strategy = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![strategy.map(|s| s.as_str()), plan_id],
     )?;
     if affected == 0 {
         anyhow::bail!("Plan not found: {plan_id}");
@@ -684,34 +897,13 @@ pub fn set_plan_prompt_prefix(
     Ok(())
 }
 
-/// Set the plan-scope prompt suffix. Pass `None` to clear.
-pub fn set_plan_prompt_suffix(
-    conn: &Connection,
-    plan_id: &str,
-    suffix: Option<&str>,
-) -> Result<()> {
+/// Update a plan's description and bump `updated_at`. The plan description
+/// IS the Plan layer of the four-layer prompt model, so this is the write
+/// path behind the step-detail "Plan prompt" pane editor.
+pub fn update_plan_description(conn: &Connection, plan_id: &str, description: &str) -> Result<()> {
     let affected = conn.execute(
-        "UPDATE plans SET prompt_suffix = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![suffix, plan_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Plan not found: {plan_id}");
-    }
-    Ok(())
-}
-
-/// Set the plan-scope context prepend override. Pass `None` to fall back to
-/// [`crate::prompt::DEFAULT_CONTEXT_PREPEND`]. An empty-string argument is
-/// stored verbatim and means "no prepend at all" for this plan — see
-/// [`crate::plan::Plan::context_prepend`] for the precedence rules.
-pub fn set_plan_context_prepend(
-    conn: &Connection,
-    plan_id: &str,
-    prepend: Option<&str>,
-) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE plans SET context_prepend = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![prepend, plan_id],
+        "UPDATE plans SET description = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![description, plan_id],
     )?;
     if affected == 0 {
         anyhow::bail!("Plan not found: {plan_id}");
@@ -739,26 +931,73 @@ pub fn set_plan_deterministic_tests(
 }
 
 // ---------------------------------------------------------------------------
-// Project settings (prompt prefix/suffix at project scope)
+// Project settings (the Project layer of the four-layer prompt model)
 // ---------------------------------------------------------------------------
 
-/// Prefix and suffix pair loaded from the `project_settings` table. Both
-/// fields `None` represents "no project-scope wrap configured".
+/// The project-scope prompt — one content blob, the Project layer of the
+/// four-layer prompt model. `None` represents "no project-scope prompt
+/// configured".
+///
+/// The value can be sourced from a checked-in file at
+/// `<project>/.ralph/prompt.md` (so teams can share it via version control)
+/// or from the `project_settings.prompt` DB column (the solo-user default).
+/// **The file wins on read**; see [`resolve_project_prompt`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectSettings {
-    pub prompt_prefix: Option<String>,
-    pub prompt_suffix: Option<String>,
+    pub prompt: Option<String>,
 }
 
-/// Read project-scope settings for `project`. Returns a zero-value struct
-/// when no row exists — callers treat missing rows identically to NULLs.
-pub fn get_project_settings(conn: &Connection, project: &str) -> Result<ProjectSettings> {
-    let mut stmt = conn
-        .prepare("SELECT prompt_prefix, prompt_suffix FROM project_settings WHERE project = ?1")?;
+/// Where a resolved project-scope prompt came from. `prompt set`/`clear`
+/// route their writes by inspecting this so the file, when present, stays
+/// the source of truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectPromptSource {
+    /// Sourced from `<project>/.ralph/prompt.md` (path carried for messaging).
+    File(std::path::PathBuf),
+    /// Sourced from (or destined for) the `project_settings.prompt` column.
+    Db,
+}
+
+/// Path to the optional checked-in project-prompt file for `project`.
+/// `project` is the project workdir (an absolute path string, as produced
+/// by [`crate::commands::resolve_project`]).
+pub fn project_prompt_file_path(project: &str) -> std::path::PathBuf {
+    std::path::Path::new(project)
+        .join(".ralph")
+        .join("prompt.md")
+}
+
+/// Read `<project>/.ralph/prompt.md` if it exists and has non-whitespace
+/// content. An empty / whitespace-only file is treated as "not present" so
+/// an accidentally-blank file can't shadow a valid DB value.
+///
+/// Anything that isn't a usable regular file — missing, a *directory* at
+/// that path, or any other read error (permissions, IsADirectory, etc.) —
+/// is treated the same as absent (`Ok(None)`) so the DB fallback applies.
+/// Otherwise a `.ralph/prompt.md` directory (or an unreadable file) would
+/// make *every* `ralph run` hard-fail instead of degrading gracefully. A
+/// genuinely present, readable, non-empty file still wins as before.
+pub fn read_project_prompt_file(project: &str) -> Result<Option<String>> {
+    let path = project_prompt_file_path(project);
+    match std::fs::read_to_string(&path) {
+        Ok(s) if s.trim().is_empty() => Ok(None),
+        Ok(s) => Ok(Some(s)),
+        // Missing, a directory, or otherwise not readable as a file: fall
+        // back to the DB rather than aborting the run. (Reading a directory
+        // surfaces as `IsADirectory` on Linux and `PermissionDenied` /
+        // other kinds elsewhere — none of them mean "use this as a prompt".)
+        Err(_) => Ok(None),
+    }
+}
+
+/// Read the DB-only project-scope prompt for `project` (the raw
+/// `project_settings.prompt` column), ignoring any checked-in file. Returns
+/// a zero-value struct when no row exists.
+pub fn get_project_settings_db(conn: &Connection, project: &str) -> Result<ProjectSettings> {
+    let mut stmt = conn.prepare("SELECT prompt FROM project_settings WHERE project = ?1")?;
     let mut rows = stmt.query_map(params![project], |row| {
         Ok(ProjectSettings {
-            prompt_prefix: row.get(0)?,
-            prompt_suffix: row.get(1)?,
+            prompt: row.get(0)?,
         })
     })?;
     match rows.next() {
@@ -767,41 +1006,84 @@ pub fn get_project_settings(conn: &Connection, project: &str) -> Result<ProjectS
     }
 }
 
-/// Upsert the project-scope prompt prefix. Pass `None` to clear the column.
-pub fn set_project_prompt_prefix(
+/// Resolve the effective project-scope prompt for `project`, file-first.
+///
+/// Returns the resolved content (if any) plus which source supplied it.
+/// When the checked-in file has usable content the file wins; otherwise we
+/// fall back to the DB column. The reported source reflects which path is
+/// *active* for writes: if the file exists with content it's [`File`], else
+/// [`Db`] even when both are empty.
+///
+/// [`File`]: ProjectPromptSource::File
+/// [`Db`]: ProjectPromptSource::Db
+pub fn resolve_project_prompt(
     conn: &Connection,
     project: &str,
-    prefix: Option<&str>,
-) -> Result<()> {
-    // ON CONFLICT … DO UPDATE keeps the sibling suffix untouched so a
-    // standalone "set prefix" call never silently wipes a previously-set
-    // suffix on the same project row.
+) -> Result<(ProjectSettings, ProjectPromptSource)> {
+    if let Some(content) = read_project_prompt_file(project)? {
+        let path = project_prompt_file_path(project);
+        return Ok((
+            ProjectSettings {
+                prompt: Some(content),
+            },
+            ProjectPromptSource::File(path),
+        ));
+    }
+    let db = get_project_settings_db(conn, project)?;
+    Ok((db, ProjectPromptSource::Db))
+}
+
+/// Read project-scope settings for `project`, file-first.
+///
+/// This is the central read used by the prompt-assembly path
+/// ([`crate::prompt::build_step_prompt`] callers). It checks
+/// `<project>/.ralph/prompt.md` before the DB column so a checked-in file
+/// transparently overrides per-machine DB state.
+pub fn get_project_settings(conn: &Connection, project: &str) -> Result<ProjectSettings> {
+    Ok(resolve_project_prompt(conn, project)?.0)
+}
+
+/// Upsert the project-scope prompt into the DB column. Pass `None` to clear
+/// the column. This writes the DB unconditionally — callers that want
+/// file-aware routing should consult [`resolve_project_prompt`] first (see
+/// `commands::prompt`).
+pub fn set_project_prompt(conn: &Connection, project: &str, prompt: Option<&str>) -> Result<()> {
     conn.execute(
-        "INSERT INTO project_settings (project, prompt_prefix)
+        "INSERT INTO project_settings (project, prompt)
          VALUES (?1, ?2)
          ON CONFLICT(project) DO UPDATE SET
-             prompt_prefix = excluded.prompt_prefix,
+             prompt = excluded.prompt,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-        params![project, prefix],
+        params![project, prompt],
     )?;
     Ok(())
 }
 
-/// Upsert the project-scope prompt suffix. Pass `None` to clear the column.
-pub fn set_project_prompt_suffix(
-    conn: &Connection,
-    project: &str,
-    suffix: Option<&str>,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO project_settings (project, prompt_suffix)
-         VALUES (?1, ?2)
-         ON CONFLICT(project) DO UPDATE SET
-             prompt_suffix = excluded.prompt_suffix,
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-        params![project, suffix],
-    )?;
+/// Write the project-scope prompt to the checked-in file, creating the
+/// `.ralph/` directory as needed. Used by `prompt set --scope project`
+/// when the file is the active source.
+pub fn write_project_prompt_file(project: &str, content: &str) -> Result<()> {
+    let path = project_prompt_file_path(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&path, content)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(())
+}
+
+/// Delete the checked-in project-prompt file. A missing file is benign
+/// (the clear is idempotent).
+pub fn delete_project_prompt_file(project: &str) -> Result<()> {
+    let path = project_prompt_file_path(project);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            Err(anyhow::Error::new(e).context(format!("Failed to delete {}", path.display())))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,6 +1398,31 @@ pub fn update_step_fields_ext(
     Ok(())
 }
 
+/// Set (or clear) the step-level retry-strategy override and bump
+/// `updated_at`.
+///
+/// `Some(strategy)` records a per-step override; `None` writes SQL NULL,
+/// meaning "no step-level override" — resolution falls through to the
+/// plan's value and then the global default ([`RetryStrategy::Keep`]).
+/// Kept as a dedicated setter (rather than a new field on
+/// [`update_step_fields_ext`]) so the ~100 `create_step` callsites and the
+/// existing `update_step_fields_ext` callers stay untouched, mirroring how
+/// `plan_harness` is set via [`set_plan_harness_gen`] after `create_plan`.
+pub fn set_step_retry_strategy(
+    conn: &Connection,
+    step_id: &str,
+    strategy: Option<RetryStrategy>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE steps SET retry_strategy = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![strategy.map(|s| s.as_str()), step_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
 /// Reset a step's status to pending and zero out attempts.
 ///
 /// Also deletes the step's `execution_logs` rows — otherwise the zeroed
@@ -1225,6 +1532,20 @@ pub fn create_execution_log(
 
     let id = conn.last_insert_rowid();
     get_execution_log_by_id(conn, id)
+}
+
+/// Delete a single `execution_logs` row by id.
+///
+/// Used by the executor's TUI-skip *cancel* path (step 18): the retry loop
+/// creates the `execution_logs` row (with the prompt) *before* spawning the
+/// harness, so a cancelled attempt must delete that row to honor the
+/// guarantee that a cancelled attempt leaves no `UNIQUE(step_id, attempt)`
+/// row behind and consumes no retry budget. Idempotent — deleting a missing
+/// id is a no-op.
+pub fn delete_execution_log(conn: &Connection, log_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM execution_logs WHERE id = ?1", params![log_id])
+        .with_context(|| format!("Failed to delete execution log {log_id}"))?;
+    Ok(())
 }
 
 /// Get the latest (highest attempt) execution log for a step.
@@ -2378,16 +2699,16 @@ mod tests {
     fn test_set_plan_questions_enabled_flips_column() {
         let conn = setup();
         let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        assert!(!plan.questions_enabled, "default should be off");
-
-        set_plan_questions_enabled(&conn, &plan.id, true).unwrap();
-        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
-        assert!(on.questions_enabled);
-        assert!(on.updated_at >= plan.updated_at);
+        assert!(plan.questions_enabled, "new plans default to on");
 
         set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
         let off = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
         assert!(!off.questions_enabled);
+        assert!(off.updated_at >= plan.updated_at);
+
+        set_plan_questions_enabled(&conn, &plan.id, true).unwrap();
+        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert!(on.questions_enabled);
     }
 
     #[test]
@@ -2434,6 +2755,185 @@ mod tests {
     fn test_set_plan_pause_requested_missing_plan_errs() {
         let conn = setup();
         let err = set_plan_pause_requested(&conn, "no-such-id", true).unwrap_err();
+        assert!(err.to_string().contains("Plan not found"));
+    }
+
+    // -- cross-process skip bridge (V23) --
+
+    #[test]
+    fn test_request_skip_round_trips_and_take_clears_atomically() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+
+        // No pending skip → take returns None, peek returns None.
+        assert!(take_skip_request(&conn, &plan.id).unwrap().is_none());
+        assert!(peek_skip_request(&conn, &plan.id).unwrap().is_none());
+
+        // Request a skip; it must be visible on the plan row and via peek
+        // WITHOUT being consumed.
+        request_skip(
+            &conn,
+            &plan.id,
+            "step-uuid-1",
+            crate::git::ParkStrategyKind::Commit,
+        )
+        .unwrap();
+        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
+        assert_eq!(on.skip_requested_step_id.as_deref(), Some("step-uuid-1"));
+        assert_eq!(on.skip_changes.as_deref(), Some("commit"));
+        assert!(on.updated_at >= plan.updated_at);
+
+        let peeked = peek_skip_request(&conn, &plan.id).unwrap();
+        assert_eq!(
+            peeked,
+            Some((
+                "step-uuid-1".to_string(),
+                crate::git::ParkStrategyKind::Commit
+            ))
+        );
+        // Peek must NOT clear.
+        assert!(peek_skip_request(&conn, &plan.id).unwrap().is_some());
+
+        // take returns it and clears in one shot.
+        let taken = take_skip_request(&conn, &plan.id).unwrap();
+        assert_eq!(
+            taken,
+            Some((
+                "step-uuid-1".to_string(),
+                crate::git::ParkStrategyKind::Commit
+            ))
+        );
+        assert!(
+            take_skip_request(&conn, &plan.id).unwrap().is_none(),
+            "take must read-and-clear so the runner consumes a request once"
+        );
+        assert!(peek_skip_request(&conn, &plan.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_request_skip_overwrites_prior_and_unknown_token_defaults_stash() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+
+        request_skip(
+            &conn,
+            &plan.id,
+            "step-A",
+            crate::git::ParkStrategyKind::Discard,
+        )
+        .unwrap();
+        // A fresh request supersedes the stale one (last-writer-wins).
+        request_skip(
+            &conn,
+            &plan.id,
+            "step-B",
+            crate::git::ParkStrategyKind::Cancel,
+        )
+        .unwrap();
+        let peeked = peek_skip_request(&conn, &plan.id).unwrap();
+        assert_eq!(
+            peeked,
+            Some(("step-B".to_string(), crate::git::ParkStrategyKind::Cancel))
+        );
+
+        // A corrupt / forward-compat skip_changes token resolves to the
+        // non-destructive Stash default so a skip never silently loses work.
+        conn.execute(
+            "UPDATE plans SET skip_changes = 'bogus' WHERE id = ?1",
+            params![plan.id],
+        )
+        .unwrap();
+        let (_sid, kind) = take_skip_request(&conn, &plan.id).unwrap().unwrap();
+        assert_eq!(kind, crate::git::ParkStrategyKind::Stash);
+    }
+
+    #[test]
+    fn test_clear_skip_request_is_idempotent_noop_when_empty() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        // No-op on an empty slot.
+        clear_skip_request(&conn, &plan.id).unwrap();
+        assert!(peek_skip_request(&conn, &plan.id).unwrap().is_none());
+
+        request_skip(&conn, &plan.id, "x", crate::git::ParkStrategyKind::Stash).unwrap();
+        clear_skip_request(&conn, &plan.id).unwrap();
+        assert!(
+            peek_skip_request(&conn, &plan.id).unwrap().is_none(),
+            "clear must drop a pending request without consuming it via take"
+        );
+    }
+
+    #[test]
+    fn test_take_skip_request_for_step_is_targeted_and_atomic() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+
+        // Nothing pending → None for any step.
+        assert!(
+            take_skip_request_for_step(&conn, &plan.id, "step-A")
+                .unwrap()
+                .is_none()
+        );
+
+        // A request targeting step-B must NOT be consumed when the in-flight
+        // step is step-A (this is the TOCTOU the targeted take closes: the
+        // old peek-then-take would have cleared and discarded it here).
+        request_skip(
+            &conn,
+            &plan.id,
+            "step-B",
+            crate::git::ParkStrategyKind::Commit,
+        )
+        .unwrap();
+        assert!(
+            take_skip_request_for_step(&conn, &plan.id, "step-A")
+                .unwrap()
+                .is_none(),
+            "a request for a different step must be left untouched"
+        );
+        // …and it's still pending for step-B to honor when it runs.
+        assert_eq!(
+            peek_skip_request(&conn, &plan.id).unwrap(),
+            Some(("step-B".to_string(), crate::git::ParkStrategyKind::Commit))
+        );
+
+        // The matching step consumes-and-clears in one shot.
+        assert_eq!(
+            take_skip_request_for_step(&conn, &plan.id, "step-B").unwrap(),
+            Some(crate::git::ParkStrategyKind::Commit)
+        );
+        assert!(
+            take_skip_request_for_step(&conn, &plan.id, "step-B")
+                .unwrap()
+                .is_none(),
+            "take must read-and-clear so a request is consumed exactly once"
+        );
+        assert!(peek_skip_request(&conn, &plan.id).unwrap().is_none());
+
+        // Corrupt / forward-compat token resolves to the non-destructive
+        // Stash default, same contract as take_skip_request.
+        request_skip(&conn, &plan.id, "step-C", crate::git::ParkStrategyKind::Discard).unwrap();
+        conn.execute(
+            "UPDATE plans SET skip_changes = 'bogus' WHERE id = ?1",
+            params![plan.id],
+        )
+        .unwrap();
+        assert_eq!(
+            take_skip_request_for_step(&conn, &plan.id, "step-C").unwrap(),
+            Some(crate::git::ParkStrategyKind::Stash)
+        );
+    }
+
+    #[test]
+    fn test_request_skip_missing_plan_errs() {
+        let conn = setup();
+        let err = request_skip(
+            &conn,
+            "no-such-id",
+            "step",
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("Plan not found"));
     }
 
@@ -4788,36 +5288,6 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_context_prepend_round_trip() {
-        let conn = setup();
-        let plan = create_plan(&conn, "ctx", "/proj", "b", "d", None, None, &[]).unwrap();
-
-        // Newly-created plans have `None` context_prepend — callers fall back
-        // to the system default via `prompt::effective_context_prepend`.
-        assert_eq!(plan.context_prepend, None);
-
-        // Set to Some("custom"), read back.
-        set_plan_context_prepend(&conn, &plan.id, Some("custom")).unwrap();
-        let reloaded = get_plan_by_slug(&conn, "ctx", "/proj").unwrap().unwrap();
-        assert_eq!(reloaded.context_prepend.as_deref(), Some("custom"));
-
-        // Empty string is a real value — power-user escape hatch for "no
-        // prepend at all". Must survive the round trip distinct from None.
-        set_plan_context_prepend(&conn, &plan.id, Some("")).unwrap();
-        let reloaded = get_plan_by_slug(&conn, "ctx", "/proj").unwrap().unwrap();
-        assert_eq!(
-            reloaded.context_prepend.as_deref(),
-            Some(""),
-            "empty string override must round-trip as Some(\"\"), not None"
-        );
-
-        // Clear back to None.
-        set_plan_context_prepend(&conn, &plan.id, None).unwrap();
-        let reloaded = get_plan_by_slug(&conn, "ctx", "/proj").unwrap().unwrap();
-        assert_eq!(reloaded.context_prepend, None);
-    }
-
-    #[test]
     fn test_set_plan_deterministic_tests_round_trip() {
         let conn = setup();
         let plan = create_plan(
@@ -4858,6 +5328,163 @@ mod tests {
         assert!(
             err.to_string().contains("Plan not found"),
             "unexpected error: {err}"
+        );
+    }
+
+    // -- Project-scope prompt: file-vs-db precedence --
+
+    /// `<project>/.ralph/prompt.md` content wins over the DB column on read.
+    #[test]
+    fn test_project_prompt_file_wins_over_db() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        set_project_prompt(&conn, &project, Some("from db")).unwrap();
+        write_project_prompt_file(&project, "from file").unwrap();
+
+        let (settings, source) = resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt.as_deref(), Some("from file"));
+        assert!(matches!(source, ProjectPromptSource::File(_)));
+        // The central assembly read also returns the file content.
+        assert_eq!(
+            get_project_settings(&conn, &project)
+                .unwrap()
+                .prompt
+                .as_deref(),
+            Some("from file")
+        );
+    }
+
+    /// File absent → DB column is used and the source is `Db`.
+    #[test]
+    fn test_project_prompt_db_used_when_file_absent() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        set_project_prompt(&conn, &project, Some("only db")).unwrap();
+
+        let (settings, source) = resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt.as_deref(), Some("only db"));
+        assert_eq!(source, ProjectPromptSource::Db);
+    }
+
+    /// An empty / whitespace-only file must NOT shadow a valid DB value.
+    #[test]
+    fn test_project_prompt_blank_file_does_not_shadow_db() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        set_project_prompt(&conn, &project, Some("real db value")).unwrap();
+        write_project_prompt_file(&project, "   \n\t  \n").unwrap();
+
+        let (settings, source) = resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt.as_deref(), Some("real db value"));
+        assert_eq!(source, ProjectPromptSource::Db);
+        assert!(read_project_prompt_file(&project).unwrap().is_none());
+    }
+
+    /// Nothing configured anywhere → `None` / `Db`.
+    #[test]
+    fn test_project_prompt_none_when_unconfigured() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        let (settings, source) = resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt, None);
+        assert_eq!(source, ProjectPromptSource::Db);
+    }
+
+    /// Write helper creates `.ralph/` and the file with exact content;
+    /// delete helper removes it and is idempotent on a missing file.
+    #[test]
+    fn test_project_prompt_file_write_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        write_project_prompt_file(&project, "hello").unwrap();
+        let path = project_prompt_file_path(&project);
+        assert!(path.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+
+        delete_project_prompt_file(&project).unwrap();
+        assert!(!path.exists());
+        // Idempotent: deleting a now-missing file is benign.
+        delete_project_prompt_file(&project).unwrap();
+    }
+
+    /// A `.ralph/prompt.md` that is actually a *directory* must not abort
+    /// the run: the read degrades to "absent" so the DB value is used.
+    #[test]
+    fn test_project_prompt_dir_at_path_falls_back_to_db() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        set_project_prompt(&conn, &project, Some("db survives")).unwrap();
+
+        // Create `<project>/.ralph/prompt.md` as a directory.
+        let path = project_prompt_file_path(&project);
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(path.is_dir());
+
+        // No error, treated as absent.
+        assert!(read_project_prompt_file(&project).unwrap().is_none());
+
+        let (settings, source) = resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt.as_deref(), Some("db survives"));
+        assert_eq!(source, ProjectPromptSource::Db);
+        // The central assembly read also degrades gracefully.
+        assert_eq!(
+            get_project_settings(&conn, &project)
+                .unwrap()
+                .prompt
+                .as_deref(),
+            Some("db survives")
+        );
+    }
+
+    /// `get_project_settings_db` ignores the file even when it exists.
+    #[test]
+    fn test_get_project_settings_db_ignores_file() {
+        let conn = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        set_project_prompt(&conn, &project, Some("db only")).unwrap();
+        write_project_prompt_file(&project, "file wins on resolve").unwrap();
+
+        assert_eq!(
+            get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt
+                .as_deref(),
+            Some("db only")
+        );
+    }
+
+    /// `STEP_COLUMNS` must enumerate columns in the order SQLite stores them
+    /// so `Step::from_row` indices line up even under `SELECT *`. Mirrors
+    /// `test_plan_columns_matches_physical_table_order` for the steps table —
+    /// added when step 21 appended `retry_strategy` to `STEP_COLUMNS`.
+    #[test]
+    fn test_step_columns_matches_physical_table_order() {
+        let conn = setup();
+        let physical: Vec<String> = conn
+            .prepare("SELECT * FROM steps LIMIT 0")
+            .expect("prepare")
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let canonical: Vec<&str> = STEP_COLUMNS.split(", ").collect();
+        assert_eq!(
+            physical.iter().map(String::as_str).collect::<Vec<_>>(),
+            canonical,
+            "STEP_COLUMNS drifted from the physical steps table layout"
         );
     }
 }

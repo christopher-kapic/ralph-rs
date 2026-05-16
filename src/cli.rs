@@ -5,7 +5,7 @@ use clap_complete::Shell;
 use std::path::PathBuf;
 
 use crate::hook_library::Lifecycle;
-use crate::plan::{ChangePolicy, PlanStatus};
+use crate::plan::{ChangePolicy, PlanStatus, RetryStrategy};
 
 /// Authoring tip surfaced via `--help` on plan/step creation commands and
 /// the top-level binary, so plan authors learn ralph's commit-ownership
@@ -86,6 +86,12 @@ pub enum Command {
         /// config is preserved and init will not re-prompt.
         #[arg(long)]
         force: bool,
+
+        /// Re-seed the global prompt with ralph's built-in default,
+        /// overwriting any existing customization. Without this flag the
+        /// global prompt is only seeded when it is missing or blank.
+        #[arg(long)]
+        restore_prompts: bool,
     },
 
     /// Manage plans.
@@ -227,6 +233,12 @@ pub enum Command {
         #[arg(long)]
         reason: Option<String>,
 
+        /// How to dispose of the in-flight harness's uncommitted changes when
+        /// skipping a *currently-running* step. Ignored for steps that aren't
+        /// running (their changes aren't causally tied to the skip).
+        #[arg(long, value_enum, default_value_t = ChangeHandling::Stash)]
+        changes: ChangeHandling,
+
         /// Reclaim a held run lock even if the previous runner still appears alive (use only if you know the other process is gone).
         #[arg(long)]
         force: bool,
@@ -311,11 +323,14 @@ pub enum Command {
     #[command(subcommand)]
     Hooks(HooksCommand),
 
-    /// Configure prompt prefixes/suffixes at global, project, or plan scope.
+    /// Configure the global or project prompt layer.
     ///
-    /// Each scope's prefix is prepended and suffix appended to every step
-    /// prompt; prefixes stack outermost (global) to innermost (plan) at the
-    /// top, suffixes stack innermost to outermost at the bottom.
+    /// Each scope holds a single prompt blob (no prefix/suffix split). The
+    /// four layers — global, project, plan (the plan description), step —
+    /// stack top-to-bottom to form each step prompt; this command edits the
+    /// global and project layers (`--scope universal` aliases global; the
+    /// project layer reads `<project>/.ralph/prompt.md` when present, else
+    /// the DB).
     #[command(subcommand)]
     Prompt(PromptCommand),
 
@@ -416,6 +431,19 @@ pub enum PlanCommand {
         #[arg(long)]
         agent: Option<String>,
 
+        /// Plan-level default retry strategy for failed step attempts.
+        /// Effective value is resolved step > plan > default `keep`:
+        /// a step's own `--retry-strategy` wins, then this plan-level
+        /// default, then the built-in default (`keep`). `keep` = a failed
+        /// attempt leaves the working tree as-is so the next attempt
+        /// builds on it directly; `rollback` = a failed attempt rolls the
+        /// working tree back and feeds the prior diff into the next
+        /// attempt's prompt instead. Omit to leave the plan with no
+        /// override (steps then fall through to the global `keep`
+        /// default).
+        #[arg(long, value_name = "STRATEGY")]
+        retry_strategy: Option<RetryStrategy>,
+
         /// Deterministic test command(s) to validate each step.
         #[arg(long = "test")]
         tests: Vec<String>,
@@ -515,11 +543,6 @@ pub enum PlanCommand {
     /// Manage the plan-generation harness.
     #[command(subcommand)]
     Harness(PlanHarnessCommand),
-
-    /// Manage the plan's context-prepend override (the block injected at the
-    /// top of every step's prompt).
-    #[command(subcommand)]
-    Prepend(PlanPrependCommand),
 
     /// Toggle the pause-for-question feature for a plan.
     ///
@@ -638,9 +661,21 @@ pub enum StepCommand {
         /// fails when the harness exits with an empty diff — appropriate for
         /// implementation steps. `optional` allows a clean harness exit with
         /// no diff — appropriate for review, audit, or check steps where the
-        /// prompt directs the harness not to modify code.
+        /// prompt directs the harness not to modify code. Omit to leave the
+        /// step at the default (`required`).
         #[arg(long, value_name = "POLICY", conflicts_with = "import_json")]
         change_policy: Option<ChangePolicy>,
+
+        /// Step-level retry strategy for failed attempts. Effective value
+        /// is resolved step > plan > default `keep`: this step-level
+        /// override wins, then the plan's `--retry-strategy`, then the
+        /// built-in default (`keep`). `keep` = a failed attempt leaves the
+        /// working tree as-is so the next attempt builds on it directly;
+        /// `rollback` = a failed attempt rolls the working tree back and
+        /// feeds the prior diff into the next attempt's prompt instead.
+        /// Omit to inherit the plan/global value.
+        #[arg(long, value_name = "STRATEGY", conflicts_with = "import_json")]
+        retry_strategy: Option<RetryStrategy>,
 
         /// Attach a free-form tag to the new step (repeatable). Tags are
         /// user-defined labels for filtering with `ralph step list --tag`;
@@ -735,10 +770,32 @@ pub enum StepCommand {
         #[arg(long)]
         clear_max_retries: bool,
 
-        /// Update the step's change policy (`required` or `optional`). Omit
-        /// to leave the existing policy unchanged.
+        /// Update the step's change policy. `required` fails the step when
+        /// the harness exits with an empty diff; `optional` allows a clean
+        /// no-diff exit (for review/audit/check steps). Omit to leave the
+        /// existing policy unchanged. `change_policy` is NOT NULL, so there
+        /// is no clear form — you always substitute one valid policy for
+        /// another.
         #[arg(long, value_name = "POLICY")]
         change_policy: Option<ChangePolicy>,
+
+        /// Update the step-level retry strategy. Effective value is
+        /// resolved step > plan > default `keep`: this step-level override
+        /// wins, then the plan's `--retry-strategy`, then the built-in
+        /// default (`keep`). `keep` = a failed attempt leaves the working
+        /// tree as-is so the next attempt builds on it directly;
+        /// `rollback` = a failed attempt rolls the working tree back and
+        /// feeds the prior diff into the next attempt's prompt instead.
+        /// Omit to leave the existing override unchanged; use
+        /// `--clear-retry-strategy` to revert to plan/global inheritance.
+        #[arg(long, value_name = "STRATEGY")]
+        retry_strategy: Option<RetryStrategy>,
+
+        /// Explicitly clear the step-level retry-strategy override (sets to
+        /// NULL so the step inherits the plan/global default). Mirrors
+        /// `--clear-max-retries`; conflicts with `--retry-strategy`.
+        #[arg(long, conflicts_with = "retry_strategy")]
+        clear_retry_strategy: bool,
 
         /// Replace the step's tag list with these values (repeatable). Omit
         /// to leave existing tags unchanged; pass at least once to overwrite.
@@ -768,6 +825,11 @@ pub enum StepCommand {
 
         /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
+
+        /// Skip the confirmation prompt shown before reverting any
+        /// `[ralph wip]` skip commit(s) belonging to this step.
+        #[arg(long, short, alias = "yes")]
+        force: bool,
     },
 
     /// Move a step to a different position.
@@ -878,57 +940,6 @@ pub enum PlanHarnessCommand {
 }
 
 // ---------------------------------------------------------------------------
-// Plan prepend subcommands (nested under `plan prepend`)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Subcommand)]
-pub enum PlanPrependCommand {
-    /// Set the plan's context-prepend override.
-    ///
-    /// Exactly one of `--text`, `--file`, or `--stdin` is required. The
-    /// stored string replaces the built-in default for this plan — it is not
-    /// concatenated with it. An empty string (e.g. `--text ""`) is valid and
-    /// means "no prepend at all" for this plan.
-    Set {
-        /// Plan slug. Defaults to the active plan.
-        plan: Option<String>,
-
-        /// Literal text to store as the prepend override.
-        #[arg(long, conflicts_with_all = ["file", "stdin"])]
-        text: Option<String>,
-
-        /// Path to a file whose contents will be stored verbatim.
-        #[arg(long, conflicts_with_all = ["text", "stdin"])]
-        file: Option<PathBuf>,
-
-        /// Read the prepend text from standard input.
-        #[arg(long, conflicts_with_all = ["text", "file"])]
-        stdin: bool,
-    },
-
-    /// Show the effective context-prepend text for a plan.
-    ///
-    /// Without `--default`, prints the plan's override if set or the system
-    /// default otherwise. With `--default`, always prints the built-in
-    /// default regardless of the plan's setting.
-    Show {
-        /// Plan slug. Defaults to the active plan.
-        plan: Option<String>,
-
-        /// Print the system default, ignoring any plan override.
-        #[arg(long)]
-        default: bool,
-    },
-
-    /// Clear the plan's context-prepend override (fall back to the system
-    /// default).
-    Clear {
-        /// Plan slug. Defaults to the active plan.
-        plan: Option<String>,
-    },
-}
-
-// ---------------------------------------------------------------------------
 // Question subcommands
 // ---------------------------------------------------------------------------
 
@@ -977,6 +988,33 @@ pub enum QuestionCommand {
         /// 1-based index from `ralph question list`.
         num: usize,
     },
+}
+
+/// How `ralph skip` disposes of a currently-running step's uncommitted
+/// work after the harness is killed. Mirrors [`crate::git::ParkStrategy`]
+/// at the CLI surface (the label/subject/trailer are filled in later from
+/// the skipped step's identity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum ChangeHandling {
+    /// `git stash push --include-untracked` — recoverable later (default).
+    Stash,
+    /// `git add -A && git commit` a WIP commit carrying a
+    /// `Ralph-Skipped-Step` trailer.
+    Commit,
+    /// Throw the in-flight changes away (pre-existing untracked files are
+    /// preserved).
+    Discard,
+}
+
+impl From<ChangeHandling> for crate::git::ParkStrategyKind {
+    fn from(c: ChangeHandling) -> Self {
+        match c {
+            ChangeHandling::Stash => crate::git::ParkStrategyKind::Stash,
+            ChangeHandling::Commit => crate::git::ParkStrategyKind::Commit,
+            ChangeHandling::Discard => crate::git::ParkStrategyKind::Discard,
+        }
+    }
 }
 
 /// `on` / `off` value enum for `ralph plan questions`.
@@ -1107,79 +1145,53 @@ pub enum HooksCommand {
 // Prompt subcommands
 // ---------------------------------------------------------------------------
 
-/// Which scope a prompt prefix/suffix command targets.
+/// Which layer of the four-layer prompt model a prompt command targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub enum PromptScope {
-    /// Global wrap stored in `~/.config/ralph-rs/config.json`.
+    /// Global layer stored in `~/.config/ralph-rs/config.json`. Accepts
+    /// `universal` as an alias — both resolve to this single variant, so
+    /// every prompt subcommand path treats them identically.
+    #[value(alias = "universal")]
     Global,
-    /// Project wrap stored in SQLite keyed on the current project path.
+    /// Project layer stored in SQLite keyed on the current project path.
     Project,
-    /// Plan wrap stored on a single plan row (requires `--plan <slug>`,
-    /// defaults to the active plan).
-    Plan,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum PromptCommand {
-    /// Show the prompt prefix/suffix configured for one or all scopes.
+    /// Show the prompt configured for one or all scopes.
     ///
-    /// With no `--scope`, displays global, project, and plan entries for the
-    /// current (or specified) plan. Use `--resolved` to print the fully
-    /// layered wrap exactly as it would appear around a step prompt.
+    /// With no `--scope`, displays the global and project entries. Use
+    /// `--resolved` to print the composed prompt (global + project joined by
+    /// a blank line) exactly as it would lead a step prompt.
     Show {
-        /// Plan slug for plan-scope entries. Defaults to the active plan.
-        plan: Option<String>,
-
         /// Limit output to a single scope.
         #[arg(long)]
         scope: Option<PromptScope>,
 
-        /// Show the final composed prefix/suffix (global + project + plan)
-        /// rather than each scope's individual contribution.
+        /// Show the final composed prompt (global + project) rather than
+        /// each scope's individual contribution.
         #[arg(long)]
         resolved: bool,
     },
 
-    /// Set a prompt prefix and/or suffix at the given scope. At least one of
-    /// `--prefix` / `--suffix` must be provided; omitted values leave the
-    /// sibling field untouched. Pass an empty string to blank a value.
+    /// Set the prompt at the given scope, replacing any existing value.
+    /// Pass an empty string to blank it (equivalent to `prompt clear`).
     Set {
-        /// Target scope. Plan scope uses `<plan>` or the active plan.
-        #[arg(long)]
-        scope: PromptScope,
-
-        /// New prefix text. Omit to leave the stored prefix unchanged.
-        #[arg(long)]
-        prefix: Option<String>,
-
-        /// New suffix text. Omit to leave the stored suffix unchanged.
-        #[arg(long)]
-        suffix: Option<String>,
-
-        /// Plan slug (only used with `--scope plan`). Defaults to the
-        /// active plan.
-        plan: Option<String>,
-    },
-
-    /// Clear a prompt prefix and/or suffix at the given scope. Pass at least
-    /// one of `--prefix` / `--suffix` to specify which fields to clear.
-    Clear {
         /// Target scope.
         #[arg(long)]
         scope: PromptScope,
 
-        /// Clear the prefix for this scope.
-        #[arg(long)]
-        prefix: bool,
+        /// The prompt content for this scope.
+        content: String,
+    },
 
-        /// Clear the suffix for this scope.
+    /// Clear the prompt at the given scope.
+    Clear {
+        /// Target scope.
         #[arg(long)]
-        suffix: bool,
-
-        /// Plan slug (only used with `--scope plan`). Defaults to the
-        /// active plan.
-        plan: Option<String>,
+        scope: PromptScope,
     },
 }
 
@@ -2091,6 +2103,150 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_plan_create_retry_strategy() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "plan",
+            "create",
+            "my-plan",
+            "--retry-strategy",
+            "rollback",
+        ])
+        .unwrap();
+        if let Command::Plan(PlanCommand::Create { retry_strategy, .. }) = cli.command.unwrap() {
+            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Rollback));
+        } else {
+            panic!("Expected Plan Create");
+        }
+    }
+
+    #[test]
+    fn test_parse_plan_create_retry_strategy_default_none() {
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "create", "my-plan"]).unwrap();
+        if let Command::Plan(PlanCommand::Create { retry_strategy, .. }) = cli.command.unwrap() {
+            assert!(retry_strategy.is_none());
+        } else {
+            panic!("Expected Plan Create");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_retry_strategy() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "Implement",
+            "--retry-strategy",
+            "keep",
+        ])
+        .unwrap();
+        if let Command::Step(StepCommand::Add { retry_strategy, .. }) = cli.command.unwrap() {
+            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Keep));
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_retry_strategy_invalid_rejected() {
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "Implement",
+            "--retry-strategy",
+            "discard",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_step_edit_retry_strategy() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "edit",
+            "1",
+            "--retry-strategy",
+            "rollback",
+        ])
+        .unwrap();
+        if let Command::Step(StepCommand::Edit {
+            retry_strategy,
+            clear_retry_strategy,
+            ..
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Rollback));
+            assert!(!clear_retry_strategy);
+        } else {
+            panic!("Expected Step Edit");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_edit_clear_retry_strategy() {
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "edit", "1", "--clear-retry-strategy"])
+            .unwrap();
+        if let Command::Step(StepCommand::Edit {
+            retry_strategy,
+            clear_retry_strategy,
+            ..
+        }) = cli.command.unwrap()
+        {
+            assert!(retry_strategy.is_none());
+            assert!(clear_retry_strategy);
+        } else {
+            panic!("Expected Step Edit");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_edit_set_and_clear_retry_strategy_conflict() {
+        // Mirrors how `--criteria` + `--clear-criteria` conflict: clap must
+        // reject passing both `--retry-strategy` and `--clear-retry-strategy`
+        // in the same invocation.
+        let result = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "edit",
+            "1",
+            "--retry-strategy",
+            "keep",
+            "--clear-retry-strategy",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_retry_strategy_help_explains_precedence() {
+        // Render the long help for `step add` and assert the precedence rule
+        // and both value meanings are documented (acceptance criterion:
+        // "help text explains the precedence"). We introspect the clap
+        // Command rather than shelling out so the test is hermetic.
+        let mut cmd = Cli::command();
+        let mut step_add = cmd
+            .find_subcommand_mut("step")
+            .and_then(|s| s.find_subcommand_mut("add"))
+            .expect("step add subcommand")
+            .clone();
+        let help = step_add.render_long_help().to_string();
+        assert!(
+            help.contains("step > plan > default"),
+            "help should state the step>plan>default precedence; got:\n{help}"
+        );
+        assert!(
+            help.contains("keep") && help.contains("rollback"),
+            "help should explain both keep and rollback; got:\n{help}"
+        );
+        assert!(
+            help.to_lowercase().contains("rolls the working tree back"),
+            "help should explain rollback semantics; got:\n{help}"
+        );
+    }
+
+    #[test]
     fn test_parse_question_ask_positional() {
         let cli = Cli::try_parse_from([
             "ralph-rs",
@@ -2240,5 +2396,64 @@ mod tests {
         } else {
             panic!("Expected Plan SetHook");
         }
+    }
+
+    #[test]
+    fn test_parse_prompt_scope_universal_resolves_to_global() {
+        // `--scope universal` is a clap value alias for `global`; the enum
+        // maps it onto the single `Global` variant so every downstream
+        // prompt subcommand path treats them identically.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "prompt",
+            "set",
+            "--scope",
+            "universal",
+            "hello world",
+        ])
+        .unwrap();
+        if let Command::Prompt(PromptCommand::Set { scope, content }) = cli.command.unwrap() {
+            assert_eq!(scope, PromptScope::Global);
+            assert_eq!(content, "hello world");
+        } else {
+            panic!("Expected Prompt Set");
+        }
+
+        // Same for `clear` and `show`.
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "prompt", "clear", "--scope", "universal"]).unwrap();
+        if let Command::Prompt(PromptCommand::Clear { scope }) = cli.command.unwrap() {
+            assert_eq!(scope, PromptScope::Global);
+        } else {
+            panic!("Expected Prompt Clear");
+        }
+
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "prompt", "show", "--scope", "universal"]).unwrap();
+        if let Command::Prompt(PromptCommand::Show { scope, .. }) = cli.command.unwrap() {
+            assert_eq!(scope, Some(PromptScope::Global));
+        } else {
+            panic!("Expected Prompt Show");
+        }
+    }
+
+    #[test]
+    fn test_parse_prompt_scope_global_and_universal_are_indistinguishable() {
+        // The two spellings must parse to the exact same variant — there's
+        // no separate "Universal" variant to diverge later.
+        let from_global =
+            Cli::try_parse_from(["ralph-rs", "prompt", "clear", "--scope", "global"]).unwrap();
+        let from_universal =
+            Cli::try_parse_from(["ralph-rs", "prompt", "clear", "--scope", "universal"]).unwrap();
+        let g = match from_global.command.unwrap() {
+            Command::Prompt(PromptCommand::Clear { scope }) => scope,
+            _ => panic!("Expected Prompt Clear"),
+        };
+        let u = match from_universal.command.unwrap() {
+            Command::Prompt(PromptCommand::Clear { scope }) => scope,
+            _ => panic!("Expected Prompt Clear"),
+        };
+        assert_eq!(g, u);
+        assert_eq!(g, PromptScope::Global);
     }
 }

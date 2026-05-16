@@ -187,6 +187,58 @@ impl std::str::FromStr for ChangePolicy {
 }
 
 // ---------------------------------------------------------------------------
+// RetryStrategy enum
+// ---------------------------------------------------------------------------
+
+/// How a step's working tree is treated between failed attempts.
+///
+/// Resolved per-step via [`Step::effective_retry_strategy`] with the
+/// precedence step > plan > default ([`RetryStrategy::Keep`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "kebab-case")]
+pub enum RetryStrategy {
+    /// Failed attempts leave the working tree as-is; the next attempt sees
+    /// the prior work directly via `git diff`. The retry context therefore
+    /// omits the diff (the changes are already on disk for the agent to
+    /// inspect and build on).
+    #[default]
+    Keep,
+    /// Failed attempts roll back the working tree before retrying; the prior
+    /// attempt's diff is fed into the next attempt's prompt via the retry
+    /// context so the agent can learn from — but doesn't inherit — the
+    /// rolled-back work.
+    Rollback,
+}
+
+impl RetryStrategy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Rollback => "rollback",
+        }
+    }
+}
+
+impl std::fmt::Display for RetryStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for RetryStrategy {
+    type Err = ParseStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "keep" => Ok(Self::Keep),
+            "rollback" => Ok(Self::Rollback),
+            other => Err(ParseStatusError(other.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase enum
 // ---------------------------------------------------------------------------
 
@@ -293,6 +345,12 @@ pub enum TerminationReason {
     /// (harness-driven pause) so the history reflects exactly which
     /// pause path triggered.
     PausedByUser,
+    /// Operator ran `ralph skip` (or the TUI skip binding) while this step
+    /// was the in-flight step in the runner process. The harness was killed
+    /// via the cancel ladder and the step was marked `Skipped`. Distinct
+    /// from `UserInterrupted` (Ctrl+C, which terminates the *whole* run)
+    /// because a skip only drops the current step and lets the run advance.
+    UserSkipped,
     Unknown,
 }
 
@@ -311,6 +369,7 @@ impl TerminationReason {
             Self::InsufficientDiskSpace => "insufficient_disk_space",
             Self::PausedForQuestion => "paused_for_question",
             Self::PausedByUser => "paused_by_user",
+            Self::UserSkipped => "user_skipped",
             Self::Unknown => "unknown",
         }
     }
@@ -339,6 +398,7 @@ impl std::str::FromStr for TerminationReason {
             "insufficient_disk_space" => Ok(Self::InsufficientDiskSpace),
             "paused_for_question" => Ok(Self::PausedForQuestion),
             "paused_by_user" => Ok(Self::PausedByUser),
+            "user_skipped" => Ok(Self::UserSkipped),
             "unknown" => Ok(Self::Unknown),
             other => Err(ParseStatusError(other.to_string())),
         }
@@ -405,14 +465,17 @@ impl std::str::FromStr for TestStatus {
 /// Canonical column list for `SELECT` queries against the `plans` table.
 ///
 /// Matches the physical table layout after all migrations: V1 defined every
-/// column through `updated_at`, V5 appended `plan_harness`, V10 appended
-/// `prompt_prefix` and `prompt_suffix`, V14 appended `context_prepend`,
+/// column through `updated_at`, V5 appended `plan_harness`,
 /// V16 appended `questions_enabled`, V18 appended `pause_requested`,
-/// V19 appended `last_run_branch`, and V20 appended `last_run_started_at`
-/// via `ALTER TABLE ... ADD COLUMN`. Every `Plan`-returning query MUST use
-/// this list so [`Plan::from_row`]'s indices line up — a raw `SELECT *`
-/// would otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, prompt_prefix, prompt_suffix, context_prepend, questions_enabled, pause_requested, last_run_branch, last_run_started_at";
+/// V19 appended `last_run_branch`, V20 appended `last_run_started_at`,
+/// V23 appended `skip_requested_step_id` + `skip_changes`, and V24
+/// appended `retry_strategy` via `ALTER TABLE ... ADD COLUMN`. V10's
+/// `prompt_prefix`/`prompt_suffix` and V14's `context_prepend` were
+/// dropped again by V21 (preserving the physical order of the remaining
+/// columns). Every `Plan`-returning query MUST use this list so
+/// [`Plan::from_row`]'s indices line up — a raw `SELECT *` would
+/// otherwise swap columns.
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, retry_strategy";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -429,16 +492,6 @@ pub struct Plan {
     pub plan_harness: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    #[serde(default)]
-    pub prompt_prefix: Option<String>,
-    #[serde(default)]
-    pub prompt_suffix: Option<String>,
-    /// Per-plan override for the default "how to introspect this plan"
-    /// prepend text injected at the top of every step's prompt. `None`
-    /// means "use [`crate::prompt::DEFAULT_CONTEXT_PREPEND`]". `Some("")`
-    /// is an explicit escape hatch meaning "no prepend at all".
-    #[serde(default)]
-    pub context_prepend: Option<String>,
     /// Per-plan opt-in for the pause-for-question feature. When `false`
     /// (default), `ralph question ask` invocations from a harness against a
     /// step in this plan are rejected and no `step_questions` rows are
@@ -472,6 +525,28 @@ pub struct Plan {
     /// `questions_enabled` or `pause_requested`). `None` for never-run plans.
     #[serde(default)]
     pub last_run_started_at: Option<String>,
+    /// Step UUID of a pending cross-process skip request, or `None` when no
+    /// skip is pending. Written by `ralph skip` / the TUI skip dialog (a
+    /// *different* process from the runner that owns the in-flight harness);
+    /// the runner reads + clears it mid-attempt and, when it matches the
+    /// in-flight step, funnels into the same executor skip path the
+    /// same-process cancel registry uses. Scoped to a step id (not a bare
+    /// boolean) so a stale request can never skip the wrong step.
+    #[serde(default)]
+    pub skip_requested_step_id: Option<String>,
+    /// Serialized [`crate::git::ParkStrategyKind`]
+    /// (`stash`|`commit`|`discard`|`cancel`) the operator chose for the
+    /// pending skip. `None` when no skip is pending; an unrecognized value
+    /// is treated as the safe `Stash` default by the consumer so a skip
+    /// never silently destroys work.
+    #[serde(default)]
+    pub skip_changes: Option<String>,
+    /// Plan-level default retry strategy. `None` means "no plan-level
+    /// override" — the effective value falls through to the global default
+    /// ([`RetryStrategy::Keep`]) unless a step overrides it. Resolved via
+    /// [`Step::effective_retry_strategy`].
+    #[serde(default)]
+    pub retry_strategy: Option<RetryStrategy>,
 }
 
 impl Plan {
@@ -480,8 +555,9 @@ impl Plan {
     /// Expected column order matches [`PLAN_COLUMNS`]:
     /// id, slug, project, branch_name, description, status, harness, agent,
     /// deterministic_tests, created_at, updated_at, plan_harness,
-    /// prompt_prefix, prompt_suffix, context_prepend, questions_enabled,
-    /// pause_requested, last_run_branch, last_run_started_at
+    /// questions_enabled, pause_requested, last_run_branch,
+    /// last_run_started_at, skip_requested_step_id, skip_changes,
+    /// retry_strategy
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -506,8 +582,23 @@ impl Plan {
         // `questions_enabled` and `pause_requested` are INTEGER NOT NULL
         // DEFAULT 0 on disk; SQLite has no native bool, so read as i64 and
         // coerce.
-        let questions_enabled_int: i64 = row.get(15)?;
-        let pause_requested_int: i64 = row.get(16)?;
+        let questions_enabled_int: i64 = row.get(12)?;
+        let pause_requested_int: i64 = row.get(13)?;
+
+        // `retry_strategy` is a nullable TEXT column (V24). NULL means "no
+        // plan-level override" — resolution falls through to the global
+        // default. A non-null value must parse to a known variant.
+        let retry_strategy_str: Option<String> = row.get(18)?;
+        let retry_strategy = match retry_strategy_str {
+            Some(s) => Some(s.parse::<RetryStrategy>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    18,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?),
+            None => None,
+        };
 
         Ok(Plan {
             id: row.get(0)?,
@@ -522,13 +613,13 @@ impl Plan {
             plan_harness: row.get(11)?,
             created_at,
             updated_at,
-            prompt_prefix: row.get(12)?,
-            prompt_suffix: row.get(13)?,
-            context_prepend: row.get(14)?,
             questions_enabled: questions_enabled_int != 0,
             pause_requested: pause_requested_int != 0,
-            last_run_branch: row.get(17)?,
-            last_run_started_at: row.get(18)?,
+            last_run_branch: row.get(14)?,
+            last_run_started_at: row.get(15)?,
+            skip_requested_step_id: row.get(16)?,
+            skip_changes: row.get(17)?,
+            retry_strategy,
         })
     }
 }
@@ -574,6 +665,12 @@ pub struct Step {
     /// exported plan JSON that lacks the field.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Step-level retry-strategy override. `None` means "no step-level
+    /// override" — resolution falls through to the plan's value and then
+    /// the global default ([`RetryStrategy::Keep`]). Resolved via
+    /// [`Step::effective_retry_strategy`].
+    #[serde(default)]
+    pub retry_strategy: Option<RetryStrategy>,
 }
 
 impl Step {
@@ -582,7 +679,8 @@ impl Step {
     /// Expected column order:
     /// id, plan_id, sort_key, title, description, agent, harness,
     /// acceptance_criteria, status, attempts, max_retries, created_at,
-    /// updated_at, model, skipped_reason, change_policy, tags
+    /// updated_at, model, skipped_reason, change_policy, tags,
+    /// retry_strategy
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let criteria_json: String = row.get(7)?;
         let acceptance_criteria: Vec<String> =
@@ -631,6 +729,21 @@ impl Step {
             })?,
         };
 
+        // `retry_strategy` is a nullable TEXT column (V24) at index 17. NULL
+        // means "no step-level override"; a non-null value must parse to a
+        // known variant.
+        let retry_strategy_str: Option<String> = row.get(17)?;
+        let retry_strategy = match retry_strategy_str {
+            Some(s) => Some(s.parse::<RetryStrategy>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    17,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?),
+            None => None,
+        };
+
         Ok(Step {
             id: row.get(0)?,
             plan_id: row.get(1)?,
@@ -649,7 +762,21 @@ impl Step {
             skipped_reason: row.get(14)?,
             change_policy,
             tags,
+            retry_strategy,
         })
+    }
+
+    /// Resolve the effective retry strategy for this step.
+    ///
+    /// Precedence is **step > plan > default**: a step-level override wins
+    /// over a plan-level default, which in turn wins over the built-in
+    /// default ([`RetryStrategy::Keep`]). `None` at a level means "defer to
+    /// the next level down".
+    #[allow(dead_code)] // consumed by the executor retry loop in a later step
+    pub fn effective_retry_strategy(&self, plan: &Plan) -> RetryStrategy {
+        self.retry_strategy
+            .or(plan.retry_strategy)
+            .unwrap_or(RetryStrategy::Keep)
     }
 }
 
@@ -980,7 +1107,7 @@ mod tests {
 
         let step = conn
             .query_row(
-                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags FROM steps WHERE id = ?1",
+                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy FROM steps WHERE id = ?1",
                 ["s1"],
                 Step::from_row,
             )
@@ -1141,6 +1268,7 @@ mod tests {
             TerminationReason::InsufficientDiskSpace,
             TerminationReason::PausedForQuestion,
             TerminationReason::PausedByUser,
+            TerminationReason::UserSkipped,
             TerminationReason::Unknown,
         ];
         for r in &reasons {
@@ -1312,5 +1440,117 @@ mod tests {
         }"#;
         let step: Step = serde_json::from_str(json).unwrap();
         assert_eq!(step.change_policy, ChangePolicy::Optional);
+    }
+
+    #[test]
+    fn test_retry_strategy_roundtrip() {
+        let strategies = [RetryStrategy::Keep, RetryStrategy::Rollback];
+        for s in &strategies {
+            let token = s.as_str();
+            let parsed: RetryStrategy = token.parse().unwrap();
+            assert_eq!(*s, parsed);
+        }
+    }
+
+    #[test]
+    fn test_retry_strategy_default_is_keep() {
+        assert_eq!(RetryStrategy::default(), RetryStrategy::Keep);
+    }
+
+    #[test]
+    fn test_retry_strategy_display() {
+        assert_eq!(RetryStrategy::Keep.to_string(), "keep");
+        assert_eq!(RetryStrategy::Rollback.to_string(), "rollback");
+    }
+
+    #[test]
+    fn test_retry_strategy_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&RetryStrategy::Keep).unwrap(),
+            r#""keep""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&RetryStrategy::Rollback).unwrap(),
+            r#""rollback""#,
+        );
+    }
+
+    #[test]
+    fn test_invalid_retry_strategy() {
+        let result: Result<RetryStrategy, _> = "discard".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_effective_retry_strategy_precedence() {
+        // Build a minimal Plan/Step pair and vary only the two
+        // retry_strategy fields across all four combinations.
+        fn make_plan(rs: Option<RetryStrategy>) -> Plan {
+            Plan {
+                id: "p1".into(),
+                slug: "s".into(),
+                project: "/p".into(),
+                branch_name: "b".into(),
+                description: "d".into(),
+                status: PlanStatus::Planning,
+                harness: None,
+                agent: None,
+                deterministic_tests: vec![],
+                plan_harness: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                questions_enabled: false,
+                pause_requested: false,
+                last_run_branch: None,
+                last_run_started_at: None,
+                skip_requested_step_id: None,
+                skip_changes: None,
+                retry_strategy: rs,
+            }
+        }
+        fn make_step(rs: Option<RetryStrategy>) -> Step {
+            Step {
+                id: "st1".into(),
+                plan_id: "p1".into(),
+                sort_key: "a0".into(),
+                title: "t".into(),
+                description: "d".into(),
+                agent: None,
+                harness: None,
+                acceptance_criteria: vec![],
+                status: StepStatus::Pending,
+                attempts: 0,
+                max_retries: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                model: None,
+                skipped_reason: None,
+                change_policy: ChangePolicy::Required,
+                tags: vec![],
+                retry_strategy: rs,
+            }
+        }
+
+        // (step None, plan None) -> default Keep
+        assert_eq!(
+            make_step(None).effective_retry_strategy(&make_plan(None)),
+            RetryStrategy::Keep,
+        );
+        // (step Some, plan None) -> step
+        assert_eq!(
+            make_step(Some(RetryStrategy::Rollback)).effective_retry_strategy(&make_plan(None)),
+            RetryStrategy::Rollback,
+        );
+        // (step None, plan Some) -> plan
+        assert_eq!(
+            make_step(None).effective_retry_strategy(&make_plan(Some(RetryStrategy::Rollback))),
+            RetryStrategy::Rollback,
+        );
+        // (step Some, plan Some) -> step wins
+        assert_eq!(
+            make_step(Some(RetryStrategy::Keep))
+                .effective_retry_strategy(&make_plan(Some(RetryStrategy::Rollback))),
+            RetryStrategy::Keep,
+        );
     }
 }

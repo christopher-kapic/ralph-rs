@@ -593,6 +593,35 @@ pub fn run_plan_list_tui(
             let event = event::read()?;
             if let Event::Mouse(m) = &event {
                 app.handle_mouse(*m);
+                // A click on the already-highlighted tile opens it — the
+                // mouse handler routes through `request_open()`, so honor
+                // the resulting `open_request` exactly like the `Enter`
+                // keybinding's arm below.
+                match app.open_request.take() {
+                    Some(crate::tui::views::plan_list::OpenRequest::Archived) => {
+                        run_archived_list_tui(
+                            &mut terminal,
+                            conn,
+                            project,
+                            &config.display_timezone,
+                            &config.default_harness,
+                        )?;
+                        refresh_plan_list_state(conn, project, &mut app)?;
+                    }
+                    Some(crate::tui::views::plan_list::OpenRequest::Plan(slug)) => {
+                        run_plan_detail_tui(
+                            &mut terminal,
+                            conn,
+                            config,
+                            project,
+                            &slug,
+                            None,
+                            &mut subscription,
+                        )?;
+                        refresh_plan_list_state(conn, project, &mut app)?;
+                    }
+                    None => {}
+                }
                 continue;
             }
             if let Event::Key(key) = event
@@ -1180,6 +1209,39 @@ where
         {
             match dialog.handle_key(key) {
                 Outcome::Pending => continue,
+                other => return Ok(other),
+            }
+        }
+    }
+}
+
+/// Drive the STEP-18 skip dialog over a custom background until the user
+/// confirms a choice or cancels. Mirrors [`run_dialog_loop_with_bg`]; the
+/// caller maps the terminal [`SkipOutcome`] onto the skip plumbing.
+pub(crate) fn skip_dialog_loop_with_bg<B, F>(
+    terminal: &mut ratatui::Terminal<B>,
+    mut draw_bg: F,
+) -> Result<crate::tui::skip_dialog::SkipOutcome>
+where
+    B: ratatui::backend::Backend,
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+    F: FnMut(&mut ratatui::Frame<'_>),
+{
+    use crate::tui::skip_dialog::{self, SkipDialog, SkipOutcome};
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let mut dialog = SkipDialog::new();
+    loop {
+        terminal.draw(|f| {
+            draw_bg(f);
+            let area = f.area();
+            skip_dialog::render(f, area, &dialog);
+        })?;
+        if let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            match dialog.handle_key(key) {
+                SkipOutcome::Pending => continue,
                 other => return Ok(other),
             }
         }
@@ -1831,6 +1893,17 @@ where
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Mouse(m) => {
                 app.handle_mouse(m);
+                // A click on the already-highlighted tile triggers the
+                // same path as `Enter` (unarchive the cursor target).
+                if app.take_pending_enter() {
+                    let targets = app.action_targets();
+                    if !targets.is_empty() {
+                        archived_list_apply_unarchive(conn, project, &mut app, &targets)?;
+                    }
+                }
+                if app.should_pop {
+                    return Ok(());
+                }
                 continue;
             }
             _ => continue,
@@ -2420,6 +2493,21 @@ where
         if let Ok(opens) = storage::list_open_questions(conn, project, Some(slug)) {
             app.set_open_questions(opens);
         }
+        // Step 26: refresh the execution-log cache for the selected step
+        // when it's in a terminal (Complete/Failed) status so the right
+        // pane can show the total + per-attempt duration breakdown. Scoped
+        // to the cursor's step to keep the poll cheap; Running steps keep
+        // the live elapsed timer (derived from LiveRun.phase_started_at).
+        if let Some(sel) = app.steps.get(app.selected_index)
+            && matches!(
+                sel.status,
+                crate::plan::StepStatus::Complete | crate::plan::StepStatus::Failed
+            )
+            && let Ok(logs) = storage::list_execution_logs_for_step(conn, &sel.id)
+        {
+            let sel_id = sel.id.clone();
+            app.set_execution_logs(&sel_id, logs);
+        }
 
         // -- §13.2 read-only attach poll -------------------------------
         //
@@ -2472,6 +2560,15 @@ where
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Mouse(m) => {
                 app.handle_mouse(m);
+                // A click on the already-highlighted row drills into
+                // step-detail — same effect as the `Enter` keybinding's
+                // `InputAction::OpenStepDetail` arm below.
+                if let Some(step_id) = app.take_pending_open_step() {
+                    run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
+                    if app.should_pop {
+                        return Ok(());
+                    }
+                }
                 continue;
             }
             _ => continue,
@@ -2644,7 +2741,7 @@ where
                 plan_detail_apply_add(conn, &mut app, pos, &title)?;
             }
             InputAction::SkipStep(step_id) => {
-                plan_detail_apply_skip(conn, &mut app, &step_id)?;
+                plan_detail_skip_with_dialog(terminal, conn, &mut app, &step_id)?;
             }
             InputAction::Delete(targets) => {
                 plan_detail_apply_delete(terminal, conn, &mut app, &targets)?;
@@ -2795,6 +2892,121 @@ pub(crate) fn plan_detail_apply_skip(
             app.refresh_steps(storage::list_steps(conn, &plan_id)?);
             app.toasts
                 .push("Step skipped.", ToastKind::Success, Instant::now());
+        }
+        Err(e) => {
+            app.toasts.push(
+                format!("Failed to skip step: {e}"),
+                ToastKind::Error,
+                Instant::now(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// STEP 18 — `s` on a step in the plan-detail step list.
+///
+/// Decides whether to open the [`crate::tui::skip_dialog`] before skipping.
+///
+/// Case A — the step is currently running (status `InProgress` and a run is
+/// live for this plan): the skip is routed through [`runner::skip_step`],
+/// which (since the runner is a separate subprocess from the TUI) writes the
+/// cross-process skip-request row the runner polls mid-attempt and funnels
+/// into the cancel ladder, killing the harness.
+/// If the tree is clean (or holds only the user's pre-existing untracked
+/// scratch) the step is just marked Skipped with no dialog. If the tree is
+/// dirty with step-attributable work, the dialog opens
+/// (`Stash`/`Commit`/`Discard`, default `Stash`): `Enter` parks per the
+/// chosen strategy; `Esc` maps to [`ParkStrategyKind::Cancel`], so the
+/// executor rolls the tree back, emits `attempt_cancelled`, and re-enters at
+/// the *same* attempt (no retry budget consumed, no `execution_logs` row
+/// written for the cancelled attempt).
+///
+/// Case B — the step is not running: the dialog opens only when the step is
+/// `Failed` *and* there are uncommitted changes from its last attempt;
+/// otherwise it's just marked Skipped with no dialog. Here `Esc` simply
+/// dismisses the dialog (no skip, no cancel semantics — there is no
+/// in-flight attempt to re-enter).
+fn plan_detail_skip_with_dialog<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    step_id: &str,
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
+    use crate::plan::StepStatus;
+    use crate::tui::skip_dialog::SkipOutcome;
+    use crate::tui::toast::ToastKind;
+    use std::path::Path;
+    use std::time::Instant;
+
+    let Some(step) = app.steps.iter().find(|s| s.id == step_id).cloned() else {
+        return Ok(());
+    };
+    let is_running = step.status == StepStatus::InProgress && app.is_run_live();
+    let is_failed = step.status == StepStatus::Failed;
+
+    // A dirty tree is only *attributable* to this step if at least one
+    // changed file isn't already part of the user's pre-existing untracked
+    // scratch. We can't cheaply reconstruct the runner's pre-existing set
+    // here, so use "any uncommitted change" as the gate — the executor's
+    // park path re-checks attribution precisely (`has_step_attributable_changes`).
+    let workdir = Path::new(&app.plan.project);
+    let dirty = crate::git::has_uncommitted_changes(workdir).unwrap_or(false);
+
+    // Open the dialog when: running+dirty, OR a failed step left a dirty
+    // tree. Everything else is a plain skip with no dialog.
+    let needs_dialog = dirty && (is_running || is_failed);
+
+    if !needs_dialog {
+        plan_detail_apply_skip(conn, app, step_id)?;
+        return Ok(());
+    }
+
+    let outcome = skip_dialog_loop_with_bg(terminal, |f| {
+        crate::tui::views::plan_detail_ui::draw(f, app);
+    })?;
+
+    // Map the dialog outcome onto a park strategy kind. For a *running*
+    // step, Esc is the spec's cancel-restart path (ParkStrategyKind::Cancel).
+    // For a non-running failed step there is no in-flight attempt to
+    // re-enter, so Esc just dismisses the dialog.
+    let kind = match outcome {
+        SkipOutcome::Pending => unreachable!("loop only returns terminal outcomes"),
+        SkipOutcome::Confirmed(choice) => choice.to_park_kind(),
+        SkipOutcome::Cancelled => {
+            if is_running {
+                crate::git::ParkStrategyKind::Cancel
+            } else {
+                app.toasts
+                    .push("Skip cancelled.", ToastKind::Info, Instant::now());
+                return Ok(());
+            }
+        }
+    };
+
+    // Route through the same plumbing the CLI / palette use. For an
+    // in-flight step this trips the cancel ladder (kills the harness) and
+    // hands `kind` to the executor via the registry; otherwise it's a
+    // synchronous DB flip (the `kind` is irrelevant there and skip_step
+    // notes that).
+    let plan = app.plan.clone();
+    let step_num = app
+        .steps
+        .iter()
+        .position(|s| s.id == step_id)
+        .map(|i| i + 1);
+    match crate::runner::skip_step(conn, &plan, step_num, None, kind) {
+        Ok(actual_num) => {
+            app.refresh_steps(storage::list_steps(conn, &app.plan.id)?);
+            let msg = if kind == crate::git::ParkStrategyKind::Cancel {
+                format!("Cancelled in-flight attempt for step {actual_num} (no retry consumed).")
+            } else {
+                format!("Skipped step {actual_num}.")
+            };
+            app.toasts.push(msg, ToastKind::Success, Instant::now());
         }
         Err(e) => {
             app.toasts.push(
@@ -3347,7 +3559,13 @@ pub(crate) fn plan_detail_apply_palette_action(
             // resolves the step number, validates status, and writes the
             // skipped row. None means "skip the current step".
             let plan = app.plan.clone();
-            match crate::runner::skip_step(conn, &plan, step_num.map(|n| n as usize), None) {
+            match crate::runner::skip_step(
+                conn,
+                &plan,
+                step_num.map(|n| n as usize),
+                None,
+                crate::git::ParkStrategyKind::Stash,
+            ) {
                 Ok(actual_num) => {
                     app.refresh_steps(storage::list_steps(conn, &app.plan.id)?);
                     app.toasts.push(
@@ -4148,6 +4366,113 @@ fn list_agent_names() -> Vec<String> {
     names
 }
 
+/// Rendered-prompt preview sub-view dispatcher (prompt-overhaul, step 14).
+///
+/// Mirrors the [`run_step_hooks_tui`] / [`run_step_tags_tui`] shape: reuses
+/// the parent terminal + raw-mode session, owns its own crossterm event loop,
+/// and pops back to step-detail when the [`RenderedPromptApp`] state machine
+/// returns [`rendered_prompt::Outcome::Pop`]. There are no storage
+/// write-throughs — the prompts are assembled once up front.
+///
+/// The per-attempt prompts are built by reconstructing the inputs the
+/// executor passes to [`crate::prompt::build_step_prompt`]:
+///   * agent name: `step.agent` → `plan.agent` (same as `execute_step`),
+///   * `harness_supports_agent_file`: from the resolved harness config,
+///   * the four-layer `Prompts` (Global from `config.prompt`, Project from
+///     the `project_settings` row, Plan = `plan.description`),
+///   * answered questions for the step,
+///   * `max_attempts = step.max_retries.unwrap_or(config.max_retries_per_step) + 1`,
+///   * the step's execution logs (chronological) for per-attempt retry ctx.
+///
+/// This is a "what would be sent now" preview: the inputs above are read
+/// from *current* state, so a historical attempt reflects later edits to the
+/// plan/project/step text or answered questions rather than the point-in-time
+/// values the agent actually received (those are persisted verbatim in
+/// `execution_logs.prompt_text`, which this view intentionally does not use).
+fn run_rendered_prompt_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    plan: &crate::plan::Plan,
+    step: &crate::plan::Step,
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
+    use crate::tui::views::rendered_prompt::{Outcome, RenderedPromptApp, render};
+    use crossterm::event::{self, Event, KeyEventKind};
+
+    let all_steps = storage::list_steps(conn, &plan.id)?;
+    let step_num = all_steps
+        .iter()
+        .position(|s| s.id == step.id)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let step_label = format!("#{step_num} — {}", step.title);
+
+    // Resolve the agent name exactly as the executor does (step → plan).
+    let agent_name = step.agent.as_deref().or(plan.agent.as_deref());
+
+    // Resolve the harness so we know whether the agent file is delivered
+    // natively (drives whether build_step_prompt emits the agent pointer).
+    let supports_agent_file = match crate::harness::resolve_harness(step, plan, config) {
+        Ok((_, hc)) => hc.supports_agent_file,
+        // Unknown harness: fall back to the executor's parameter default for
+        // a preview (it would error at run time, but the preview should
+        // still render rather than abort the TUI).
+        Err(_) => false,
+    };
+
+    // The four-layer prompt model — identical wiring to src/executor.rs.
+    let project_settings = storage::get_project_settings(conn, project)?;
+    let prompts = crate::prompt::Prompts {
+        global: config.prompt.clone(),
+        project: project_settings.prompt.clone(),
+        plan: Some(plan.description.clone()),
+    };
+
+    let answered_questions = storage::list_answered_questions_for_step(conn, &step.id)?;
+
+    // max_attempts resolution mirrors execute_step in src/executor.rs.
+    let max_attempts = step
+        .max_retries
+        .unwrap_or(config.max_retries_per_step as i32)
+        + 1;
+
+    let logs = storage::list_execution_logs_for_step(conn, &step.id)?;
+
+    let attempts = RenderedPromptApp::build_attempts(
+        plan,
+        step,
+        &all_steps,
+        agent_name,
+        supports_agent_file,
+        &prompts,
+        &answered_questions,
+        max_attempts,
+        &logs,
+    );
+
+    let mut app = RenderedPromptApp::new(plan.slug.clone(), step_label, attempts);
+
+    loop {
+        terminal.draw(|f| render(f, f.area(), &mut app))?;
+
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+        match app.handle_key(key) {
+            Outcome::Pending => {}
+            Outcome::Pop => return Ok(()),
+        }
+    }
+}
+
 fn run_step_detail_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
@@ -4428,6 +4753,16 @@ where
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => app.handle_left(),
+            // §14: from the Step-prompt pane, `l`/`→` drills into the
+            // rendered-prompt preview sub-view (the fully-assembled prompt
+            // the agent receives). Other panes keep their `l`/`→` behavior
+            // (Appended pagination / bottom-row focus / no-op).
+            KeyCode::Char('l') | KeyCode::Right if app.focused_pane == Pane::StepPrompt => {
+                if let Some(step) = app.current_step().cloned() {
+                    let plan = app.plan.clone();
+                    run_rendered_prompt_tui(terminal, conn, config, project, &plan, &step)?;
+                }
+            }
             KeyCode::Char('l') | KeyCode::Right => app.handle_right(),
             KeyCode::Char('z') => {
                 app.toggle_zen();
@@ -4532,7 +4867,13 @@ pub(crate) fn step_detail_apply_palette_action(
         }
         PaletteAction::SkipStep { step_num, .. } => {
             let plan = app.plan.clone();
-            match crate::runner::skip_step(conn, &plan, step_num.map(|n| n as usize), None) {
+            match crate::runner::skip_step(
+                conn,
+                &plan,
+                step_num.map(|n| n as usize),
+                None,
+                crate::git::ParkStrategyKind::Stash,
+            ) {
                 Ok(actual_num) => {
                     app.steps = storage::list_steps(conn, &app.plan.id)?;
                     app.toasts.push(
@@ -4682,17 +5023,16 @@ pub(crate) fn step_detail_observe_read_only(
 /// dispatch the editor handoff for the focused pane and toast the result.
 ///
 /// Routes by `app.focused_pane`:
-/// - `UniversalPrompt` / `ProjectPrompt` / `PlanContextPrepend` /
-///   `PlanPrefix` / `PlanSuffix` / `StepPrompt` / `Tests` → the matching
-///   `edit_*_pane` method on `StepDetailApp`.
+/// - `GlobalPrompt` / `ProjectPrompt` / `PlanPrompt` / `StepPrompt` /
+///   `Tests` → the matching `edit_*_pane` method on `StepDetailApp`.
 /// - `Appended` / `OpenQuestions` → no-op (those panes are read-only).
 /// - `BottomRow` → no-op here; the focused cell's picker is opened by
 ///   `step_detail_handle_bottom_row_c` instead.
 ///
 /// `config` is cloned locally so the pane's `&mut Config` can be persisted
 /// via `save_at`; the on-disk file is the source of truth, and the app's
-/// in-memory mirrors (`config_prompt_prefix` / `config_prompt_suffix`) are
-/// updated by `edit_universal_pane` so the pane re-renders without a reload.
+/// in-memory mirror (`config_prompt`) is updated by `edit_universal_pane`
+/// so the pane re-renders without a reload.
 fn step_detail_handle_c<E>(
     app: &mut crate::tui::views::step_detail::StepDetailApp,
     conn: &Connection,
@@ -4710,14 +5050,12 @@ where
     use std::time::Instant;
 
     let outcome = match app.focused_pane {
-        Pane::UniversalPrompt => {
+        Pane::GlobalPrompt => {
             let mut local = config.clone();
             app.edit_universal_pane(&mut local, config_dir, edit_fn)?
         }
         Pane::ProjectPrompt => app.edit_project_pane(conn, edit_fn)?,
-        Pane::PlanContextPrepend => app.edit_plan_context_prepend_pane(conn, edit_fn)?,
-        Pane::PlanPrefix => app.edit_plan_prefix_pane(conn, edit_fn)?,
-        Pane::PlanSuffix => app.edit_plan_suffix_pane(conn, edit_fn)?,
+        Pane::PlanPrompt => app.edit_plan_prompt_pane(conn, edit_fn)?,
         Pane::StepPrompt => app.edit_step_prompt_pane(conn, edit_fn)?,
         Pane::Tests => app.edit_tests_pane(conn, edit_fn)?,
         Pane::Appended | Pane::OpenQuestions | Pane::BottomRow => return Ok(()),
@@ -5145,6 +5483,10 @@ fn render_status_plain(
                 output::colored_status(step.status, out.color),
                 step.attempts,
             );
+            println!(
+                "       Retry strategy: {}",
+                crate::commands::step::retry_strategy_provenance(step, plan),
+            );
             if step.status == StepStatus::Skipped
                 && let Some(reason) = step.skipped_reason.as_deref()
             {
@@ -5152,7 +5494,6 @@ fn render_status_plain(
             }
         }
     }
-    let _ = plan; // quiet unused-param warning; kept for future plan-level fields.
 }
 
 /// Render the plain-text `Current:` block for the live-run snapshot. Lines
@@ -5327,9 +5668,28 @@ pub fn cmd_log(
             .filter(|s| s.status == StepStatus::Skipped)
             .collect();
 
-        if entries.is_empty() && skipped_with_reason.is_empty() {
+        // Skip-WIP commits parked on the plan branch (ParkStrategy::Commit).
+        // These don't have an execution_logs row, so surface them from git.
+        let wip_skips = collect_skip_wip_commits(conn, &plan);
+
+        if entries.is_empty() && skipped_with_reason.is_empty() && wip_skips.is_empty() {
             eprintln!("No execution logs for plan '{}'.", plan.slug);
             return Ok(());
+        }
+
+        if !wip_skips.is_empty() {
+            eprintln!("WIP-committed skips for plan '{}':", plan.slug);
+            eprintln!();
+            for (num, short_sha) in &wip_skips {
+                let line = format!("  ~ step {num} skipped (WIP committed: {short_sha})");
+                if out.color {
+                    // Dim/yellow to distinguish from normal log rows.
+                    println!("\x1b[33m{line}\x1b[0m");
+                } else {
+                    println!("{line}");
+                }
+            }
+            println!();
         }
 
         if !skipped_with_reason.is_empty() {
@@ -5366,6 +5726,48 @@ pub fn cmd_log(
     }
 
     Ok(())
+}
+
+/// Scan the plan branch for `[ralph wip]` skip commits and resolve each one's
+/// `Ralph-Skipped-Step` trailer step-id back to a 1-based step number.
+///
+/// Returns `(step_number, short_sha)` pairs, newest commit first. Best-effort:
+/// any git failure (project not a repo, branch absent) yields an empty list so
+/// `ralph log` never hard-errors just because the WIP scan couldn't run.
+fn collect_skip_wip_commits(conn: &Connection, plan: &crate::plan::Plan) -> Vec<(usize, String)> {
+    let workdir = Path::new(&plan.project);
+    if !crate::git::branch_exists(workdir, &plan.branch_name).unwrap_or(false) {
+        return Vec::new();
+    }
+    let commits = match crate::git::list_skip_wip_commits(workdir, &plan.branch_name) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    if commits.is_empty() {
+        return Vec::new();
+    }
+    let steps = storage::list_steps(conn, &plan.id).unwrap_or_default();
+    commits
+        .into_iter()
+        .map(|c| {
+            // Resolve the trailer step-id back to a step. Prefer the ordered
+            // position in this plan; fall back to get_step_by_id so a step
+            // since-removed from the list still renders something sane.
+            let num = steps
+                .iter()
+                .position(|s| s.id == c.step_id)
+                .map(|i| i + 1)
+                .or_else(|| {
+                    storage::get_step_by_id(conn, &c.step_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| steps.iter().position(|x| x.id == s.id).map(|i| i + 1))
+                })
+                .unwrap_or(0);
+            let short = c.sha[..c.sha.len().min(8)].to_string();
+            (num, short)
+        })
+        .collect()
 }
 
 fn print_log_entry(step_title: &str, log: &ExecutionLog, output_mode: &LogOutputMode, color: bool) {
@@ -6514,6 +6916,7 @@ mod status_live_view_tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         };
         let rendered = render_live_block(&live, std::slice::from_ref(&fake_step));
         assert!(rendered.contains("Current:"));
@@ -6596,6 +6999,100 @@ mod status_live_view_tests {
             !json.contains("child_pid"),
             "cleared child_pid must be absent from status JSON: {json}"
         );
+    }
+
+    // ----- ralph log surfaces skip-WIP commits (STEP 19) -----
+
+    #[test]
+    fn test_collect_skip_wip_commits_resolves_step_and_short_sha() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        }
+        fs::write(dir.join("README.md"), "# hi").unwrap();
+        crate::git::commit_changes(&dir, "init").unwrap();
+        let branch = crate::git::get_current_branch(&dir).unwrap();
+        let project = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let conn = db::open_memory().unwrap();
+        let plan =
+            storage::create_plan(&conn, "logp", &project, &branch, "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step one",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (_s2, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step two",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // An ordinary commit (no trailer) — must NOT appear.
+        fs::write(dir.join("ord.txt"), "x").unwrap();
+        crate::git::commit_changes(&dir, "ordinary work").unwrap();
+        // A skip-WIP commit for step 1.
+        fs::write(dir.join("wip.txt"), "wip").unwrap();
+        let s1_id = s1.id;
+        let msg = format!("[ralph wip] skipped step 1: Step one\n\nRalph-Skipped-Step: {s1_id}\n");
+        crate::git::commit_changes(&dir, &msg).unwrap();
+        let full = crate::git::get_commit_hash(&dir).unwrap();
+
+        let got = collect_skip_wip_commits(&conn, &plan);
+        assert_eq!(got.len(), 1, "ordinary commit excluded");
+        let (num, short) = &got[0];
+        assert_eq!(*num, 1, "trailer step-id resolved to step #1");
+        assert_eq!(*short, full[..8], "short SHA is first 8 chars");
+
+        // The prefix format used by cmd_log for this row.
+        let line = format!("  ~ step {num} skipped (WIP committed: {short})");
+        assert!(line.contains("~ step 1 skipped (WIP committed: "));
+    }
+
+    #[test]
+    fn test_collect_skip_wip_commits_empty_when_no_repo() {
+        let conn = db::open_memory().unwrap();
+        // Project path that isn't a git repo → best-effort empty, no panic.
+        let plan = storage::create_plan(
+            &conn,
+            "norepo",
+            "/tmp/definitely-not-a-git-repo-xyz",
+            "br",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(collect_skip_wip_commits(&conn, &plan).is_empty());
     }
 }
 
@@ -6811,13 +7308,13 @@ mod plan_detail_init_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
         }
     }
 
@@ -7034,6 +7531,20 @@ mod plan_list_action_tests {
         (conn, app)
     }
 
+    /// Like `seed_app` but forces `questions_enabled = false` on every seeded
+    /// plan. New plans now default to questions-on; the toggle-mechanics tests
+    /// below need a known-off starting point so their on→off round-trips and
+    /// "non-cursor untouched" assertions stay meaningful.
+    fn seed_app_questions_off(project: &str) -> (Connection, PlanListApp) {
+        let (conn, _) = seed_app(project);
+        for p in storage::list_plans(&conn, project, false).unwrap() {
+            storage::set_plan_questions_enabled(&conn, &p.id, false).unwrap();
+        }
+        let tiles = build_plan_tiles(&conn, project).unwrap();
+        let app = PlanListApp::new(tiles, project, "UTC");
+        (conn, app)
+    }
+
     #[test]
     fn approve_cursor_flips_planning_to_ready() {
         let project = "/tmp/approve-flow";
@@ -7093,7 +7604,7 @@ mod plan_list_action_tests {
     #[test]
     fn toggle_questions_flips_column_and_toasts_new_state() {
         let project = "/tmp/questions-toggle";
-        let (conn, mut app) = seed_app(project);
+        let (conn, mut app) = seed_app_questions_off(project);
         let target_slug = app.cursor_plan().unwrap().slug.clone();
         assert!(!app.cursor_plan().unwrap().questions_enabled);
 
@@ -7119,7 +7630,7 @@ mod plan_list_action_tests {
     #[test]
     fn toggle_questions_does_not_touch_non_cursor_tiles() {
         let project = "/tmp/questions-cursor-only";
-        let (conn, mut app) = seed_app(project);
+        let (conn, mut app) = seed_app_questions_off(project);
         let cursor_slug = app.cursor_plan().unwrap().slug.clone();
         // The other tile.
         let other_slug = app
@@ -7660,13 +8171,13 @@ mod step_detail_dispatcher_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -7686,6 +8197,7 @@ mod step_detail_dispatcher_tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         }];
         StepDetailApp::new(
             plan,
@@ -7754,7 +8266,7 @@ mod step_detail_dispatcher_tests {
 
     use crate::tui::views::step_detail::{
         NO_CHANGES_TOAST, NO_EDITOR_TOAST, PARSE_ERROR_TOAST_PREFIX, Pane, SAVED_TOAST,
-        format_step_pane, format_tests_pane, format_wrap_pane,
+        format_prompt_pane, format_step_pane, format_tests_pane,
     };
 
     /// Build a step-detail app whose plan + first step are materialized in
@@ -7836,10 +8348,13 @@ mod step_detail_dispatcher_tests {
     }
 
     #[test]
-    fn c_on_plan_prefix_persists_value() {
+    fn c_on_plan_prompt_pane_persists_plan_description() {
+        // The Plan layer IS `plan.description`; `c` on the Plan pane must
+        // round-trip through the editor and persist via
+        // `storage::update_plan_description`.
         let conn = crate::db::open_memory().unwrap();
         let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::PlanPrefix;
+        app.focused_pane = Pane::PlanPrompt;
 
         let dir = tempfile::tempdir().unwrap();
         step_detail_handle_c(
@@ -7847,32 +8362,14 @@ mod step_detail_dispatcher_tests {
             &conn,
             &Config::default(),
             dir.path(),
-            fake_editor(Some("PRE".to_string())),
+            fake_editor(Some("NEW PLAN DESCRIPTION".to_string())),
         )
         .unwrap();
 
-        assert_eq!(app.plan.prompt_prefix.as_deref(), Some("PRE"));
         assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
-    }
-
-    #[test]
-    fn c_on_plan_suffix_persists_value() {
-        let conn = crate::db::open_memory().unwrap();
-        let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::PlanSuffix;
-
-        let dir = tempfile::tempdir().unwrap();
-        step_detail_handle_c(
-            &mut app,
-            &conn,
-            &Config::default(),
-            dir.path(),
-            fake_editor(Some("SUF".to_string())),
-        )
-        .unwrap();
-
-        assert_eq!(app.plan.prompt_suffix.as_deref(), Some("SUF"));
-        assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
+        assert_eq!(app.plan.description, "NEW PLAN DESCRIPTION");
+        let reloaded = storage::get_plan_by_id(&conn, &app.plan.id).unwrap();
+        assert_eq!(reloaded.description, "NEW PLAN DESCRIPTION");
     }
 
     #[test]
@@ -7882,10 +8379,10 @@ mod step_detail_dispatcher_tests {
         // real config.
         let conn = crate::db::open_memory().unwrap();
         let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::UniversalPrompt;
+        app.focused_pane = Pane::GlobalPrompt;
 
         let dir = tempfile::tempdir().unwrap();
-        let buffer = format_wrap_pane(Some("UP"), Some("US"));
+        let buffer = format_prompt_pane(Some("UNIVERSAL PROMPT"));
         step_detail_handle_c(
             &mut app,
             &conn,
@@ -7896,19 +8393,17 @@ mod step_detail_dispatcher_tests {
         .unwrap();
 
         assert_eq!(app.toasts.current().unwrap().text, SAVED_TOAST);
-        assert_eq!(app.config_prompt_prefix.as_deref(), Some("UP"));
-        assert_eq!(app.config_prompt_suffix.as_deref(), Some("US"));
+        assert_eq!(app.config_prompt.as_deref(), Some("UNIVERSAL PROMPT"));
         let written = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
         let reloaded: Config = serde_json::from_str(&written).unwrap();
-        assert_eq!(reloaded.prompt_prefix.as_deref(), Some("UP"));
-        assert_eq!(reloaded.prompt_suffix.as_deref(), Some("US"));
+        assert_eq!(reloaded.prompt.as_deref(), Some("UNIVERSAL PROMPT"));
     }
 
     #[test]
     fn c_with_no_editor_toasts_no_editor() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::PlanPrefix;
+        app.focused_pane = Pane::ProjectPrompt;
 
         let dir = tempfile::tempdir().unwrap();
         step_detail_handle_c(
@@ -7927,10 +8422,10 @@ mod step_detail_dispatcher_tests {
     fn c_with_unchanged_buffer_toasts_no_changes() {
         let conn = crate::db::open_memory().unwrap();
         let mut app = db_app(&conn, "/proj");
-        app.focused_pane = Pane::PlanPrefix;
+        app.focused_pane = Pane::ProjectPrompt;
 
         let dir = tempfile::tempdir().unwrap();
-        let unchanged = app.plan.prompt_prefix.clone().unwrap_or_default();
+        let unchanged = format_prompt_pane(app.project_settings.prompt.as_deref());
         step_detail_handle_c(
             &mut app,
             &conn,
@@ -8127,6 +8622,19 @@ mod palette_action_tests {
         (conn, app)
     }
 
+    /// Like `seed_app` but forces `questions_enabled = false` on every seeded
+    /// plan. New plans now default to questions-on; the questions-toggle test
+    /// needs a known-off starting point for its on round-trip assertion.
+    fn seed_app_questions_off(project: &str) -> (Connection, PlanListApp) {
+        let (conn, _) = seed_app(project);
+        for p in storage::list_plans(&conn, project, false).unwrap() {
+            storage::set_plan_questions_enabled(&conn, &p.id, false).unwrap();
+        }
+        let tiles = build_plan_tiles(&conn, project).unwrap();
+        let app = PlanListApp::new(tiles, project, "UTC");
+        (conn, app)
+    }
+
     // -- Toast path -----------------------------------------------------
 
     #[test]
@@ -8209,7 +8717,7 @@ mod palette_action_tests {
         // updates the in-memory tile so the next render reflects the new
         // state without a full refresh.
         let project = "/tmp/palette-questions";
-        let (conn, mut app) = seed_app(project);
+        let (conn, mut app) = seed_app_questions_off(project);
         let target_slug = app.cursor_plan().unwrap().slug.clone();
         assert!(!app.cursor_plan().unwrap().questions_enabled);
 
@@ -8639,13 +9147,13 @@ mod sub_view_routing_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
         };
         let steps = vec![Step {
             id: "step-1".to_string(),
@@ -8665,6 +9173,7 @@ mod sub_view_routing_tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         }];
         StepDetailApp::new(
             plan,
@@ -9063,13 +9572,13 @@ mod mouse_routing_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
         };
         PlanDetailApp::new(plan, Vec::new(), &Config::default())
     }
@@ -9088,13 +9597,13 @@ mod mouse_routing_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
         };
         let step = Step {
             id: "step-1".to_string(),
@@ -9114,6 +9623,7 @@ mod mouse_routing_tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         };
         StepDetailApp::new(
             plan,

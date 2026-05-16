@@ -18,9 +18,12 @@ use crate::harness::{self, HarnessOutput};
 use crate::hooks::{self, HookContext};
 use crate::io_util;
 use crate::output::ChunkStream;
-use crate::plan::{ChangePolicy, Phase, Plan, Step, StepStatus, TerminationReason, TestStatus};
-use crate::prompt::{self, PromptWrap, PromptWraps, RetryContext};
+use crate::plan::{
+    ChangePolicy, Phase, Plan, RetryStrategy, Step, StepStatus, TerminationReason, TestStatus,
+};
+use crate::prompt::{self, Prompts, RetryContext};
 use crate::run_lock::process_start_token;
+use crate::signal::{CancelReason, CancelState};
 use crate::storage::{self, ChildUpdate};
 use crate::test_runner;
 
@@ -42,8 +45,15 @@ pub enum StepOutcome {
     Success,
     /// Tests failed (or harness exited non-zero) after exhausting attempts.
     Failed,
-    /// Execution was aborted via signal.
+    /// Execution was aborted via signal (Ctrl+C / SIGTERM). Terminates the
+    /// whole run.
     Aborted,
+    /// The operator ran `ralph skip` (or the TUI skip binding) against this
+    /// step while it was executing in this process. The harness was killed
+    /// via the cancel ladder and the step marked `Skipped`. Distinct from
+    /// [`StepOutcome::Aborted`]: a skip drops only this step; the runner
+    /// continues to the next one.
+    Skipped,
     /// The harness process exceeded the timeout.
     Timeout,
     /// The harness called `ralph question ask` during the attempt, leaving one
@@ -193,7 +203,8 @@ pub(crate) const NO_CHANGES_AGENT_COMMITTED_HINT: &str = "no changes (worktree c
 enum FailureReason {
     /// Harness exceeded timeout.
     Timeout,
-    /// Execution was aborted via signal.
+    /// Execution was aborted via signal (Ctrl+C / SIGTERM) — terminates the
+    /// whole run.
     Aborted,
     /// Tests failed after exhausting all attempts.
     TestFailed,
@@ -330,6 +341,17 @@ async fn finalize_failure(
     termination_reason: TerminationReason,
     test_status: TestStatus,
 ) -> Result<StepResult> {
+    // Fix 3 (defensive, general): every non-skip terminal failure funnels
+    // through here (Timeout, HarnessFailed, terminal test failure, the
+    // `WaitResult::Aborted` arm). If a `Skipped` reason was pending but the
+    // attempt finalized via one of these non-skip arms (e.g. a Skipped that
+    // raced and lost the `select!` to a timeout), the global park-kind slot
+    // + cancel channel would still carry it and bleed into the next
+    // attempt/step. Clear it here. A no-op unless a stale `Skipped` is
+    // latched, and it deliberately never disturbs a pending `Aborted` (the
+    // legitimate whole-run shutdown must survive this call).
+    crate::signal::clear_pending_skip_state();
+
     // Rollback any uncommitted changes, preserving pre-existing untracked files.
     let rolled_back = if git::has_uncommitted_changes(ctx.workdir)? {
         // Record the rollback phase before invoking git so an external
@@ -425,6 +447,328 @@ async fn finalize_failure(
         attempts_used: attempt,
         commit_hash: None,
     })
+}
+
+/// True when the working tree has changes that are NOT entirely accounted
+/// for by `pre_existing_untracked` — i.e. there is work the killed harness
+/// produced (or modified) that is causally tied to this step.
+///
+/// A clean tree, or a tree whose only changes are files the user already
+/// had untracked before the run started, returns `false`: nothing the skip
+/// is responsible for, so parking would clobber the user's own scratch.
+fn has_step_attributable_changes(
+    workdir: &Path,
+    pre_existing_untracked: &[String],
+) -> Result<bool> {
+    let changed = git::get_all_changed_files(workdir)?;
+    Ok(changed.iter().any(|f| !pre_existing_untracked.contains(f)))
+}
+
+/// Undo an in-flight attempt that the TUI skip dialog *cancelled* (Esc),
+/// without finalizing the step (STEP 18).
+///
+/// Reached only from the `WaitResult::Skipped` arm when the registry slot
+/// carried [`crate::git::ParkStrategyKind::Cancel`]. The harness child is
+/// already dead (the cancel ladder killed it before we got here). This
+/// function makes the cancelled attempt a no-op from the step's point of
+/// view:
+///
+/// 1. Roll back the killed harness's working-tree changes via
+///    [`git::rollback_except`], preserving the user's `pre_existing_untracked`
+///    scratch (same preservation rule as the `Discard` park strategy).
+/// 2. Emit a [`crate::output::RunEvent::AttemptCancelled`] NDJSON event so
+///    a subscribed TUI/log shipper knows the attempt was undone (and that
+///    another attempt at the *same* number is coming).
+/// 3. Delete the `execution_logs` row this attempt created — it was inserted
+///    (with the prompt) *before* the harness spawned, so leaving it would
+///    both leak a `UNIQUE(step_id, attempt)` row and make a later resume
+///    think the budget was consumed.
+/// 4. Clear the process cancel channel so the re-entered attempt isn't
+///    immediately swept through `finalize_precancel`.
+///
+/// The caller (`execute_step`'s retry loop) then steps `attempt` back by one
+/// and `continue`s, so the next loop iteration re-runs the *same* attempt
+/// number — consuming no retry budget.
+/// Build the [`crate::output::RunEvent::AttemptCancelled`] event the
+/// executor emits when the TUI skip dialog's Esc/cancel path undoes an
+/// in-flight attempt (step 18). Pure (no I/O) so the exact payload — field
+/// shape, `step_num` derivation from the i32 `ctx.step_num` — is
+/// unit-testable without capturing stdout.
+fn attempt_cancelled_event(ctx: &ExecCtx<'_>, attempt: i32) -> crate::output::RunEvent {
+    crate::output::RunEvent::AttemptCancelled {
+        step_id: ctx.step.id.clone(),
+        step_num: ctx.step_num.max(0) as usize,
+        attempt,
+        at: chrono::Utc::now(),
+    }
+}
+
+fn cancel_skipped_attempt(ctx: &ExecCtx<'_>, exec_log_id: i64, attempt: i32) -> Result<()> {
+    // 1. Roll back the killed harness's work, preserving the user's
+    //    pre-existing untracked files. A clean tree makes this a no-op.
+    if git::has_uncommitted_changes(ctx.workdir)? {
+        git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)
+            .context("could not roll back cancelled skip attempt")?;
+    }
+
+    // 2. Emit the NDJSON event (best-effort: a dropped event must not break
+    //    the run — the durable state is the absence of the log row).
+    if ctx.json_output {
+        let _ = crate::output::emit_ndjson(&attempt_cancelled_event(ctx, attempt));
+    }
+
+    // 3. Delete the execution_logs row this attempt created.
+    storage::delete_execution_log(ctx.conn, exec_log_id)?;
+
+    // 4. Reset the cancel channel so the re-entered attempt runs for real.
+    crate::signal::clear_cancel_state();
+
+    Ok(())
+}
+
+/// Finalize a step that was skipped while its harness was in-flight
+/// (`WaitResult::Skipped`, reached only via the `ralph skip` → cancel-ladder
+/// path). This is step 16's terminal-skip path, extended for step 17 to
+/// *park* the killed harness's uncommitted work per the operator's
+/// `--changes` choice instead of unconditionally rolling it back.
+///
+/// Exactly one `execution_logs` row is written here (reconciling with step
+/// 16, which previously routed this case through `finalize_failure`): we no
+/// longer call `finalize_failure` for the skip arm at all, so there is no
+/// second row. `termination_reason` is always `UserSkipped`; `committed`
+/// and `commit_hash` track the parked outcome:
+///
+/// - `Commit`  → `committed = true`, `commit_hash = <wip sha>`
+/// - `Stash`   → `committed = false` (recoverable via the stash, not a commit)
+/// - `Discard` → `committed = false`
+/// - tree clean / only pre-existing untracked → no parking, `committed = false`
+///
+/// The park strategy is decided *once* by the caller (the
+/// `WaitResult::Skipped` arm) from the process-global slot set by
+/// `request_skip_in_flight`, and passed in as `kind`. A `None` slot (e.g. a
+/// cross-process SIGTERM-style skip that couldn't set it) is resolved to
+/// `Stash` by the caller so a skip never silently destroys work. Threading it
+/// as an argument — rather than re-reading the global slot here — removes a
+/// store/take race: under load the independent second read could observe the
+/// slot before `request_skip_in_flight`'s store landed, silently falling back
+/// to `Stash` (which, like `Discard`, also cleans the tree, so only the
+/// `rolled_back` bookkeeping diverged — a subtle, load-dependent bug).
+#[allow(clippy::too_many_arguments)]
+async fn finalize_skipped(
+    ctx: &ExecCtx<'_>,
+    exec_log_id: i64,
+    duration_secs: f64,
+    attempt: i32,
+    stdout: &str,
+    stderr: &str,
+    kind: crate::git::ParkStrategyKind,
+) -> Result<StepResult> {
+    let parsed = parse_harness_json(stdout);
+
+    // Capture the diff *before* any parking touches the tree so `ralph log`
+    // retains what the skipped attempt produced.
+    let had_changes = git::has_uncommitted_changes(ctx.workdir)?;
+    let diff = if had_changes {
+        Some(git::get_diff(ctx.workdir)?)
+    } else {
+        None
+    };
+
+    let park_relevant = has_step_attributable_changes(ctx.workdir, ctx.pre_existing_untracked)?;
+
+    // Default terminal log shape: nothing committed, nothing rolled back.
+    let mut committed = false;
+    let mut commit_hash: Option<String> = None;
+    let mut rolled_back = false;
+
+    if park_relevant {
+        // Record a rollback phase only for the discard strategy (the only
+        // one that throws work away) so an external observer sees why the
+        // tree is being touched; stash/commit are non-destructive.
+        if kind == crate::git::ParkStrategyKind::Discard {
+            write_phase(
+                ctx.conn,
+                ctx.plan,
+                &ctx.step.id,
+                ctx.step_num,
+                attempt,
+                ctx.max_attempts,
+                Some(exec_log_id),
+                Phase::Rollback,
+                None,
+                ChildUpdate::Clear,
+                ctx.json_output,
+            )?;
+        }
+
+        let strategy = match kind {
+            crate::git::ParkStrategyKind::Stash => crate::git::ParkStrategy::Stash {
+                label: format!(
+                    "ralph-skip/{}/{}/{}",
+                    ctx.plan.slug,
+                    ctx.step_num,
+                    // Millisecond resolution: a 1-second timestamp collides
+                    // when the same step is skipped twice within a second,
+                    // which would make label-based stash recovery
+                    // (`find_stash_by_message`) match the wrong entry.
+                    chrono::Utc::now().timestamp_millis()
+                ),
+            },
+            crate::git::ParkStrategyKind::Commit => crate::git::ParkStrategy::Commit {
+                subject: format!(
+                    "[ralph wip] skipped step {}: {}",
+                    ctx.step_num, ctx.step.title
+                ),
+            },
+            crate::git::ParkStrategyKind::Discard => crate::git::ParkStrategy::Discard,
+            // Unreachable: the `WaitResult::Skipped` arm peels off `Cancel`
+            // (and re-enters the loop) *before* `finalize_skipped` is ever
+            // called, so the registry slot can't carry `Cancel` here.
+            // Fall back to Discard rather than panic so a future refactor
+            // that lets it through still doesn't destroy nothing/lose work
+            // silently — it just throws the killed harness's work away.
+            crate::git::ParkStrategyKind::Cancel => crate::git::ParkStrategy::Discard,
+        };
+
+        let outcome = git::park_changes(
+            ctx.workdir,
+            strategy,
+            ctx.pre_existing_untracked,
+            &ctx.step.id,
+        )?;
+
+        match outcome {
+            crate::git::ParkOutcome::Committed { sha } => {
+                committed = true;
+                commit_hash = Some(sha);
+            }
+            crate::git::ParkOutcome::Stashed { .. } => {}
+            crate::git::ParkOutcome::Discarded => {
+                rolled_back = true;
+            }
+        }
+    }
+
+    storage::update_execution_log(
+        ctx.conn,
+        exec_log_id,
+        Some(duration_secs),
+        diff.as_deref(),
+        &[],
+        rolled_back,
+        committed,
+        commit_hash.as_deref(),
+        Some(stdout),
+        Some(stderr),
+        parsed.cost_usd,
+        parsed.input_tokens,
+        parsed.output_tokens,
+        parsed.session_id.as_deref(),
+        Some(TerminationReason::UserSkipped),
+        Some(TestStatus::NotRun),
+    )?;
+
+    storage::update_step_status(ctx.conn, &ctx.step.id, StepStatus::Skipped)?;
+
+    write_phase(
+        ctx.conn,
+        ctx.plan,
+        &ctx.step.id,
+        ctx.step_num,
+        attempt,
+        ctx.max_attempts,
+        Some(exec_log_id),
+        Phase::PostStepHook,
+        None,
+        ChildUpdate::Clear,
+        ctx.json_output,
+    )?;
+    hooks::run_post_step(
+        ctx.conn,
+        ctx.hook_ctx,
+        ctx.plan,
+        ctx.step,
+        attempt,
+        "skipped",
+        ctx.workdir,
+    )
+    .await?;
+
+    Ok(StepResult {
+        outcome: StepOutcome::Skipped,
+        step_id: ctx.step.id.clone(),
+        attempts_used: attempt,
+        commit_hash,
+    })
+}
+
+/// Outcome of [`handle_skipped_attempt`].
+enum SkipDisposition {
+    /// The step was finalized (Skipped). Bubble this `StepResult` straight
+    /// out of `execute_step`.
+    Finalized(StepResult),
+    /// The TUI skip dialog's Esc/cancel path: the attempt was undone with no
+    /// retry budget consumed. The caller must step `attempt` back by one and
+    /// re-enter the loop at the same attempt number.
+    Reenter,
+}
+
+/// Shared skip handling for a `Skipped` cancel reason — used both by the
+/// `WaitResult::Skipped` arm (the harness was killed by the cancel ladder)
+/// and by the natural-exit-vs-skip race branch in `WaitResult::Completed`
+/// (the harness exited on its own in the very `select!` poll a `Skipped`
+/// cancel landed in, so `select!` picked `child.wait()` and we never got a
+/// `WaitResult::Skipped`). Routing both through one function guarantees the
+/// race resolves to *skip this step and advance* — never the whole-run
+/// `Aborted` path — and that there is exactly one `execution_logs` row.
+///
+/// Authoritatively consumes the requested park kind exactly once (the single
+/// `take` happens-after the cancel watch fired, so the stored value is
+/// visible). `Cancel` → undo the attempt with no budget consumed (re-enter);
+/// `Stash`/`Commit`/`Discard` (or a `None` slot → `Stash`) → finalize the
+/// step Skipped.
+async fn handle_skipped_attempt(
+    ctx: &ExecCtx<'_>,
+    conn: &Connection,
+    exec_log_id: i64,
+    duration_secs: f64,
+    attempt: i32,
+    stdout: &str,
+    stderr: &str,
+) -> Result<SkipDisposition> {
+    let requested_kind = crate::signal::take_requested_park_kind();
+    if requested_kind == Some(crate::git::ParkStrategyKind::Cancel) {
+        cancel_skipped_attempt(ctx, exec_log_id, attempt)?;
+        // Reset the persisted attempt counter — `set_step_attempts` was
+        // bumped before the harness spawned; leaving it would make a later
+        // resume think the budget was consumed.
+        set_step_attempts(conn, &ctx.step.id, attempt - 1)?;
+        storage::update_step_status(conn, &ctx.step.id, StepStatus::InProgress)?;
+        return Ok(SkipDisposition::Reenter);
+    }
+    // A `None` slot (cross-process skip that couldn't record a choice)
+    // resolves to `Stash` so a skip never silently destroys work.
+    let park_kind = requested_kind.unwrap_or(crate::git::ParkStrategyKind::Stash);
+    let result = finalize_skipped(
+        ctx,
+        exec_log_id,
+        duration_secs,
+        attempt,
+        stdout,
+        stderr,
+        park_kind,
+    )
+    .await?;
+    // Reset the cancel watch channel now that this step is terminally
+    // Skipped. The skip tripped the channel to `Some(Skipped)`; without
+    // resetting it, the *next* step's pre-attempt cancel check
+    // (`finalize_precancel`) would observe the still-latched `Skipped` and
+    // immediately skip that step too (the cross-process-run regression:
+    // every subsequent step would skip in milliseconds). `cancel_skipped_attempt`
+    // already does this for the Esc/cancel path; the terminal-skip path
+    // needs it just the same.
+    crate::signal::clear_cancel_state();
+    Ok(SkipDisposition::Finalized(result))
 }
 
 /// Finalize an attempt that paused because the harness left unanswered
@@ -545,7 +889,7 @@ pub async fn execute_step(
     config: &Config,
     workdir: &Path,
     hook_ctx: &HookContext,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     exec_opts: ExecuteOptions,
 ) -> Result<StepResult> {
     let max_retries = step
@@ -666,47 +1010,42 @@ pub async fn execute_step(
         json_output: exec_opts.json_output,
     };
 
+    // Resolve the step's retry strategy once: it's static for the lifetime
+    // of this step execution (step > plan > default `Keep`; Step 21/22).
+    //  - `Rollback`: a failed attempt reverts the working tree before the
+    //    retry, and the rolled-back diff/files are fed into the next prompt
+    //    so the agent can learn from — without inheriting — that work.
+    //  - `Keep` (default): a failed attempt leaves the dirty tree in place;
+    //    the next attempt sees the prior work directly on disk (`git diff`),
+    //    so the prompt OMITS the now-redundant diff/files sections.
+    let retry_strategy = step.effective_retry_strategy(plan);
+
     // Previous attempt context for retries.
     let mut prev_diff: Option<String> = None;
     let mut prev_test_output: Option<String> = None;
     let mut prev_files_modified: Vec<String> = Vec::new();
+    let mut prev_failure_reason: Option<String> = None;
 
     let mut attempt = step.attempts;
 
     while attempt < max_attempts {
         attempt += 1;
 
-        // Check abort before starting. Persist the bumped attempt count and
+        // Check cancel before starting. Persist the bumped attempt count and
         // drop an execution-log row so the DB reflects the same attempt number
-        // that StepResult reports and the abort has a visible audit trail.
-        if *abort_rx.borrow() {
-            set_step_attempts(conn, &step.id, attempt)?;
-            let exec_log = storage::create_execution_log(conn, &step.id, attempt, None, None)?;
-            storage::update_execution_log(
-                conn,
-                exec_log.id,
-                Some(0.0),
-                None,
-                &[],
-                false,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(TerminationReason::UserInterrupted),
-                Some(TestStatus::NotRun),
-            )?;
-            storage::update_step_status(conn, &step.id, StepStatus::Aborted)?;
-            return Ok(StepResult {
-                outcome: StepOutcome::Aborted,
-                step_id: step.id.clone(),
-                attempts_used: attempt,
-                commit_hash: None,
-            });
+        // that StepResult reports and the cancel has a visible audit trail.
+        // `Aborted` (Ctrl+C) terminates the whole run; `Skipped` (a same-
+        // process `ralph skip` of this step) drops only this step.
+        // Copy the reason out and DROP the borrow before calling
+        // `finalize_precancel`. Holding the `watch::Receiver::borrow()` read
+        // guard across the call would deadlock: `finalize_precancel` may
+        // reset the cancel channel (`clear_pending_skip_state` →
+        // `clear_cancel_state` → `Sender::send`), and `send` needs the watch
+        // *write* lock, which can never be acquired while this read guard is
+        // still alive on the same thread.
+        let pending_reason = *abort_rx.borrow();
+        if let Some(reason) = pending_reason {
+            return finalize_precancel(conn, &step.id, attempt, reason);
         }
 
         // Mark step as in-progress and bump attempts.
@@ -714,13 +1053,24 @@ pub async fn execute_step(
         set_step_attempts(conn, &step.id, attempt)?;
 
         // Build retry context if this is not the first attempt.
+        //
+        // The diff/files are strategy-scoped (Step 22): under `Rollback` the
+        // prior work was reverted, so we re-send it for the agent to learn
+        // from; under `Keep` it's still on disk, so re-sending it is
+        // redundant and confusing — collapse the context to just
+        // attempt/max + previous test output + previous failure reason.
         let retry_context = if attempt > 1 {
+            let (previous_diff, files_modified) = match retry_strategy {
+                RetryStrategy::Rollback => (prev_diff.clone(), prev_files_modified.clone()),
+                RetryStrategy::Keep => (None, Vec::new()),
+            };
             Some(RetryContext {
                 attempt,
                 max_attempts,
-                previous_diff: prev_diff.clone(),
+                previous_diff,
                 previous_test_output: prev_test_output.clone(),
-                files_modified: prev_files_modified.clone(),
+                files_modified,
+                previous_failure_reason: prev_failure_reason.clone(),
             })
         } else {
             None
@@ -730,19 +1080,15 @@ pub async fn execute_step(
         // prompts when the harness can't take an agent file directly).
         let agent_name = step.agent.as_deref().or(plan.agent.as_deref());
 
-        // Collect prompt prefix/suffix layers. Project-scope settings are
-        // looked up by project path; a missing row is treated as "no wrap".
+        // Collect the four-layer prompt model's configurable layers. The
+        // Global layer comes from config, the Project layer from the
+        // `project_settings` row (a missing row is treated as "no project
+        // prompt"), and the Plan layer is the plan's own description.
         let project_settings = storage::get_project_settings(conn, &plan.project)?;
-        let wraps = PromptWraps {
-            global: PromptWrap::from_opts(
-                config.prompt_prefix.as_ref(),
-                config.prompt_suffix.as_ref(),
-            ),
-            project: PromptWrap::from_opts(
-                project_settings.prompt_prefix.as_ref(),
-                project_settings.prompt_suffix.as_ref(),
-            ),
-            plan: PromptWrap::from_opts(plan.prompt_prefix.as_ref(), plan.prompt_suffix.as_ref()),
+        let prompts = Prompts {
+            global: config.prompt.clone(),
+            project: project_settings.prompt.clone(),
+            plan: Some(plan.description.clone()),
         };
 
         // Fetch any answered questions for this step so the next-attempt
@@ -760,7 +1106,7 @@ pub async fn execute_step(
             agent_name,
             retry_context.as_ref(),
             harness_config.supports_agent_file,
-            &wraps,
+            &prompts,
             &answered_questions,
         );
 
@@ -851,6 +1197,7 @@ pub async fn execute_step(
                 });
             }
             prev_test_output = Some(format!("pre-step hook failed: {e}"));
+            prev_failure_reason = Some("pre-step hook failed".to_string());
             write_phase(
                 conn,
                 plan,
@@ -964,13 +1311,69 @@ pub async fn execute_step(
                 max_bytes: exec_opts.chunk_max_bytes,
             });
         let emitters = build_chunk_emitters(chunk_emit);
-        let wait_result =
-            wait_with_timeout_and_abort(child, timeout, abort_rx.clone(), emitters).await;
+        // Race the harness wait against a DB poll for a *cross-process* skip
+        // request (the production path: `ralph skip` / the TUI run in a
+        // different process from this runner, so the same-process cancel
+        // registry can never reach us). When the poll sees a pending
+        // `plans.skip_requested_step_id` matching the step we have in-flight,
+        // it injects `CancelReason::Skipped` into our own cancel channel —
+        // the exact signal the same-process fast path uses — so the existing
+        // `wait_with_timeout_and_abort` → `WaitResult::Skipped` →
+        // `finalize_skipped`/`cancel_skipped_attempt` handling runs UNCHANGED.
+        // The poll future then parks forever so the wait future is the one
+        // that resolves the `select!` with the real `WaitResult`.
+        let wait_fut = wait_with_timeout_and_abort(child, timeout, abort_rx.clone(), emitters);
+        let poll_fut = poll_cross_process_skip(conn, &plan.id, &step.id);
+        tokio::pin!(wait_fut);
+        let wait_result = tokio::select! {
+            r = &mut wait_fut => r,
+            // poll_cross_process_skip only returns if polling errors out
+            // (e.g. the plan row vanished); in that case stop polling and
+            // just wait normally for the harness.
+            _ = poll_fut => wait_fut.await,
+        };
         let duration_secs = started_at.elapsed().as_secs_f64();
 
         match wait_result {
             WaitResult::Completed(output) => {
                 let output = output.context("Harness process failed")?;
+
+                // Natural-exit-vs-skip race (Fix 2). If a `Skipped` cancel
+                // landed in the very `select!` poll where `child.wait()` also
+                // became ready, `select!` may have picked the wait arm and
+                // produced `Completed` instead of `Skipped`. If we fell
+                // through to the test phase, the test runner would see the
+                // tripped cancel channel and abort, and `test_aborted` would
+                // route us into `finalize_failure(Aborted, UserInterrupted)`
+                // → `StepOutcome::Aborted` → the runner tears down the WHOLE
+                // run. That violates the invariant "Aborted ends the whole
+                // run; Skipped advances." So before any test work, inspect
+                // the cancel reason: a pending `Skipped` is routed through
+                // the exact same skip handling as `WaitResult::Skipped`
+                // (consume the park kind, finalize_skipped /
+                // cancel_skipped_attempt). Only a pending `Aborted` is left
+                // to drive the whole-run abort below.
+                if *abort_rx.borrow() == Some(CancelReason::Skipped) {
+                    match handle_skipped_attempt(
+                        &ctx,
+                        conn,
+                        exec_log.id,
+                        duration_secs,
+                        attempt,
+                        &output.stdout,
+                        &output.stderr,
+                    )
+                    .await?
+                    {
+                        SkipDisposition::Finalized(result) => return Ok(result),
+                        SkipDisposition::Reenter => {
+                            attempt -= 1;
+                            continue;
+                        }
+                    }
+                }
+                storage::clear_skip_request(conn, &plan.id)?;
+
                 let parsed = parse_harness_json(&output.stdout);
 
                 // Check for changes.
@@ -1059,34 +1462,53 @@ pub async fn execute_step(
                         .await;
                     }
 
-                    // Retry path: roll back partial changes, log the attempt
-                    // with HarnessFailed + NotRun, then loop back for the
-                    // next attempt. The retry log row carries full
-                    // observability (diff, stdout, stderr) rather than a
-                    // null-everything placeholder.
-                    if has_changes {
-                        write_phase(
-                            conn,
-                            plan,
-                            &step.id,
-                            step_num,
-                            attempt,
-                            max_attempts,
-                            Some(exec_log.id),
-                            Phase::Rollback,
-                            None,
-                            ChildUpdate::Clear,
-                            exec_opts.json_output,
-                        )?;
-                        git::rollback_except(workdir, &pre_existing_untracked)?;
-                    }
+                    // Retry path. Whether we revert the tree depends on the
+                    // step's retry strategy (Step 22):
+                    //  - `Rollback`: revert partial changes before the retry
+                    //    (today's behavior, now opt-in).
+                    //  - `Keep`: leave the dirty tree so the next attempt
+                    //    builds on it. EDGE CASE: if the crashed harness had
+                    //    already committed (agent_committed_clean), leaving
+                    //    that commit in HEAD would orphan it AND let the
+                    //    eventual success path add a *second* step commit on
+                    //    top. Mixed-reset back to the pre-attempt HEAD so the
+                    //    work survives as uncommitted changes (Keep's
+                    //    contract) with no orphan commit — see the detailed
+                    //    rationale on the test-failed retry branch below.
+                    let rolled_back = match retry_strategy {
+                        RetryStrategy::Rollback => {
+                            if has_changes {
+                                write_phase(
+                                    conn,
+                                    plan,
+                                    &step.id,
+                                    step_num,
+                                    attempt,
+                                    max_attempts,
+                                    Some(exec_log.id),
+                                    Phase::Rollback,
+                                    None,
+                                    ChildUpdate::Clear,
+                                    exec_opts.json_output,
+                                )?;
+                                git::rollback_except(workdir, &pre_existing_untracked)?;
+                            }
+                            has_changes
+                        }
+                        RetryStrategy::Keep => {
+                            if agent_committed_clean && let Some(before) = &head_before_harness {
+                                git::reset_mixed_to(workdir, before)?;
+                            }
+                            false
+                        }
+                    };
                     storage::update_execution_log(
                         conn,
                         exec_log.id,
                         Some(duration_secs),
                         diff.as_deref(),
                         &test_results,
-                        has_changes, // rolled_back iff there were changes
+                        rolled_back,
                         false,
                         None,
                         Some(&output.stdout),
@@ -1101,6 +1523,7 @@ pub async fn execute_step(
                     prev_diff = diff;
                     prev_test_output = Some(test_results.join("\n"));
                     prev_files_modified = changed_files;
+                    prev_failure_reason = Some("harness exited non-zero".to_string());
                     continue;
                 }
 
@@ -1254,11 +1677,54 @@ pub async fn execute_step(
                     (test_passed, test_result_strings, test_aborted)
                 };
 
+                // If a cancel landed mid-test, the test runner will have
+                // killed its child and set `test_aborted`. The test runner
+                // can't tell *why* it was cancelled — it treats any reason
+                // as abort. But the disposition differs (Fix 2): a `Skipped`
+                // reason that landed during the test phase (after the
+                // top-of-arm check) must skip THIS step and advance, not
+                // tear the whole run down. Inspect the cancel reason and
+                // route a pending `Skipped` through the same skip handling
+                // as `WaitResult::Skipped`; only a pending `Aborted` (or no
+                // reason at all — a bare test-runner abort) drives the
+                // UserInterrupted whole-run abort below.
+                if test_aborted && *abort_rx.borrow() == Some(CancelReason::Skipped) {
+                    // The test runner already rolled its own child; roll
+                    // back the worktree before parking so finalize_skipped's
+                    // park sees a consistent tree (mirrors the Aborted arm's
+                    // pre-finalize rollback intent).
+                    match handle_skipped_attempt(
+                        &ctx,
+                        conn,
+                        exec_log.id,
+                        duration_secs,
+                        attempt,
+                        &output.stdout,
+                        &output.stderr,
+                    )
+                    .await?
+                    {
+                        SkipDisposition::Finalized(result) => return Ok(result),
+                        SkipDisposition::Reenter => {
+                            attempt -= 1;
+                            continue;
+                        }
+                    }
+                }
+
                 // If Ctrl+C landed mid-test, the test runner will have killed
                 // its child; surface this as Aborted rather than a retry-worthy
                 // test failure. Capture partial test_results so the log row
                 // reflects what actually ran before the abort landed.
                 if test_aborted {
+                    // A `Skipped` reason was already handled above; reaching
+                    // here means `Aborted` (or a bare test-runner abort) —
+                    // the whole-run teardown path. Defensively clear any
+                    // pending-skip slot/cancel-state so a `Skipped` that
+                    // raced and lost can't bleed into a later attempt
+                    // (Fix 3). A no-op unless a stale `Skipped` is latched;
+                    // never disturbs the `Aborted` reason.
+                    crate::signal::clear_pending_skip_state();
                     if has_changes {
                         write_phase(
                             conn,
@@ -1295,6 +1761,18 @@ pub async fn execute_step(
                     )
                     .await;
                 }
+
+                // Fix 3 (defensive, general): past both `test_aborted`
+                // skip/abort checks, every remaining disposition of this
+                // `Completed` attempt is non-skip — success (returns just
+                // below), terminal failure (via `finalize_failure`, which
+                // also clears), or a retry (`continue`). If a `Skipped`
+                // reason raced in *after* the top-of-arm check but the step
+                // "beat" it (harness/tests finished first), it would
+                // otherwise leak its park kind into the next attempt/step.
+                // Clear it now. No-op unless a stale `Skipped` is latched;
+                // never disturbs a pending `Aborted`.
+                crate::signal::clear_pending_skip_state();
 
                 if test_passed && !has_changes {
                     // Optional-policy success path: tests either ran and
@@ -1502,23 +1980,87 @@ pub async fn execute_step(
                     .await;
                 }
 
-                // Retry: rollback, log failure, stash context for next attempt.
-                if has_changes {
-                    write_phase(
-                        conn,
-                        plan,
-                        &step.id,
-                        step_num,
-                        attempt,
-                        max_attempts,
-                        Some(exec_log.id),
-                        Phase::Rollback,
-                        None,
-                        ChildUpdate::Clear,
-                        exec_opts.json_output,
-                    )?;
-                    git::rollback_except(workdir, &pre_existing_untracked)?;
-                }
+                // Retry path. Reverting the tree is now strategy-gated
+                // (Step 22):
+                //
+                //  - `Rollback` (opt-in): revert the failed attempt's diff
+                //    before retrying — exactly today's behavior. The
+                //    rolled-back diff/files are fed into the next prompt via
+                //    `RetryContext` so the agent can learn from work it no
+                //    longer sees on disk.
+                //
+                //  - `Keep` (default): do NOT revert. The dirty tree carries
+                //    forward so the next attempt builds directly on the prior
+                //    work (which it reads via `git diff`, not the prompt).
+                //
+                // EDGE CASE — `agent_committed_clean` under `Keep`
+                // (review will scrutinize this): if the agent committed its
+                // own work, the worktree is clean but HEAD advanced. Under
+                // `Keep` we must NOT discard that work, but we also must NOT
+                // leave the agent's commit sitting in HEAD, because:
+                //   1. It would be an orphan, off-contract commit (ralph owns
+                //      step commits; provenance metadata would be missing).
+                //   2. When a later attempt succeeds, the success path
+                //      (`stage_except` + `commit_staged`) would add a SECOND
+                //      commit on top of the agent's — a double-commit for one
+                //      step.
+                //   3. If instead the later attempt produced no *new* changes
+                //      (the agent had already committed everything), the
+                //      success path's `has_changes` gate would be false and
+                //      we'd loop on `agent_committed_clean` forever, never
+                //      succeeding.
+                // Fix: `git reset --mixed` back to the pre-attempt HEAD
+                // (`head_before_harness`). That un-commits the agent's commit
+                // but leaves every changed file on disk as uncommitted work —
+                // precisely `Keep`'s contract. The next attempt sees the
+                // carried-forward changes via `git diff`; whichever attempt
+                // ultimately passes runs the normal single `stage_except` +
+                // `commit_staged`, yielding exactly ONE coherent `ralph:`
+                // step commit with no orphan and no "nothing to commit"
+                // failure. The final-success commit logic is therefore
+                // unchanged — it always operates on an un-committed dirty
+                // tree, regardless of whether a prior Keep attempt's agent
+                // had committed.
+                let rolled_back = match retry_strategy {
+                    RetryStrategy::Rollback => {
+                        if has_changes {
+                            write_phase(
+                                conn,
+                                plan,
+                                &step.id,
+                                step_num,
+                                attempt,
+                                max_attempts,
+                                Some(exec_log.id),
+                                Phase::Rollback,
+                                None,
+                                ChildUpdate::Clear,
+                                exec_opts.json_output,
+                            )?;
+                            git::rollback_except(workdir, &pre_existing_untracked)?;
+                        }
+                        has_changes
+                    }
+                    RetryStrategy::Keep => {
+                        if agent_committed_clean && let Some(before) = &head_before_harness {
+                            write_phase(
+                                conn,
+                                plan,
+                                &step.id,
+                                step_num,
+                                attempt,
+                                max_attempts,
+                                Some(exec_log.id),
+                                Phase::Rollback,
+                                None,
+                                ChildUpdate::Clear,
+                                exec_opts.json_output,
+                            )?;
+                            git::reset_mixed_to(workdir, before)?;
+                        }
+                        false
+                    }
+                };
                 let test_output_summary = test_result_strings.join("\n");
                 // This row describes *this* attempt's termination even though
                 // the step will retry — record why this attempt failed. Same
@@ -1540,7 +2082,7 @@ pub async fn execute_step(
                     Some(duration_secs),
                     diff.as_deref(),
                     &test_result_strings,
-                    has_changes, // rolled_back only if there were changes
+                    rolled_back, // strategy-gated (see retry branch above)
                     false,       // not committed
                     None,
                     Some(&output.stdout),
@@ -1555,6 +2097,20 @@ pub async fn execute_step(
                 prev_diff = diff;
                 prev_test_output = Some(test_output_summary);
                 prev_files_modified = changed_files;
+                // Human-readable reason mirrors the termination classification
+                // so the Keep prompt (which omits the diff) still states what
+                // went wrong.
+                prev_failure_reason = Some(
+                    match retry_term {
+                        TerminationReason::NoChanges if agent_committed_clean => {
+                            "agent committed its own work instead of leaving \
+                             changes for ralph (worktree clean, HEAD advanced)"
+                        }
+                        TerminationReason::NoChanges => "no changes produced",
+                        _ => "tests failed",
+                    }
+                    .to_string(),
+                );
             }
 
             WaitResult::Timeout { stdout, stderr } => {
@@ -1602,7 +2158,7 @@ pub async fn execute_step(
             WaitResult::Aborted => {
                 // Harness was killed before we ever reached the test phase,
                 // so test_status is NotRun (the test runner itself was never
-                // invoked on this attempt).
+                // invoked on this attempt). Aborted terminates the WHOLE run.
                 return finalize_failure(
                     &ctx,
                     exec_log.id,
@@ -1614,6 +2170,56 @@ pub async fn execute_step(
                     TestStatus::NotRun,
                 )
                 .await;
+            }
+
+            WaitResult::Skipped { stdout, stderr } => {
+                // `ralph skip` killed the in-flight harness via the same
+                // ladder as Aborted, but only THIS step is dropped — the
+                // runner advances. STEP 17: instead of unconditionally
+                // rolling back (step 16's behavior), park the harness's
+                // uncommitted work per the operator's `--changes` choice
+                // (stash / commit / discard). `finalize_skipped` writes the
+                // single `user_skipped` execution_logs row itself — we
+                // deliberately do NOT also go through `finalize_failure`, so
+                // there is exactly one row.
+                //
+                // STEP 18: the TUI skip dialog adds a fourth choice — Esc
+                // (cancel). It rides the same cancel ladder + registry slot
+                // but carries `ParkStrategyKind::Cancel`. On cancel we must
+                // NOT finalize the step: roll back the killed harness's work
+                // (preserving the user's pre-existing untracked scratch),
+                // emit an `attempt_cancelled` NDJSON event, delete the
+                // execution_logs row this attempt created (the row is created
+                // with the prompt *before* the harness spawns), and re-enter
+                // the retry loop at the *same* attempt number. Net effect:
+                // the cancelled attempt consumes no retry budget and leaves
+                // no `UNIQUE(step_id, attempt)` row.
+                //
+                // Authoritatively consume the requested park kind exactly
+                // once here (inside `handle_skipped_attempt`), then branch /
+                // thread it down. Doing the single `take` at this point
+                // (after the cancel watch fired, which happens-after the
+                // park-kind store) guarantees we observe the stored value.
+                match handle_skipped_attempt(
+                    &ctx,
+                    conn,
+                    exec_log.id,
+                    duration_secs,
+                    attempt,
+                    &stdout,
+                    &stderr,
+                )
+                .await?
+                {
+                    SkipDisposition::Finalized(result) => return Ok(result),
+                    SkipDisposition::Reenter => {
+                        // Re-enter at the SAME attempt: the loop bumps
+                        // `attempt` at the top, so step back one to
+                        // neutralize that bump.
+                        attempt -= 1;
+                        continue;
+                    }
+                }
             }
         }
     }
@@ -1695,8 +2301,17 @@ enum WaitResult {
     /// captured before the kill are surfaced so the execution log retains
     /// diagnostic context for the failed attempt.
     Timeout { stdout: String, stderr: String },
-    /// Abort signal received.
+    /// Abort signal received (Ctrl+C / SIGTERM). Terminates the whole run.
+    /// Carries no output — the abort path drops the drain tasks.
     Aborted,
+    /// `ralph skip` of the in-flight step tripped the cancel channel with
+    /// [`CancelReason::Skipped`]. The harness was killed via the same ladder
+    /// as `Aborted`, but only this step is dropped — the run continues.
+    /// Distinct variant so the executor records `UserSkipped` (not
+    /// `UserInterrupted`) and returns [`StepOutcome::Skipped`]. Partial
+    /// stdout/stderr is captured so the skipped attempt's log row retains
+    /// diagnostic context.
+    Skipped { stdout: String, stderr: String },
 }
 
 /// Wait for a child process, racing against an optional timeout and an abort signal.
@@ -1719,7 +2334,7 @@ enum WaitResult {
 async fn wait_with_timeout_and_abort(
     mut child: tokio::process::Child,
     timeout: Option<Duration>,
-    mut abort_rx: watch::Receiver<bool>,
+    mut abort_rx: watch::Receiver<CancelState>,
     emitters: (Option<io_util::ChunkEmitter>, Option<io_util::ChunkEmitter>),
 ) -> WaitResult {
     // Take stdout/stderr handles before entering select! so we can still
@@ -1784,18 +2399,9 @@ async fn wait_with_timeout_and_abort(
                     let stderr = io_util::join_drain_string(stderr_task).await;
                     WaitResult::Timeout { stdout, stderr }
                 }
-                _ = wait_for_abort(&mut abort_rx) => {
+                reason = wait_for_abort(&mut abort_rx) => {
                     graceful_shutdown(&mut child).await;
-                    // Abort the drain tasks rather than awaiting them.
-                    // A harness that spawned a grandchild inheriting
-                    // stdout/stderr will leave those pipes open past
-                    // SIGKILL (the grandchild is reparented to init),
-                    // and the drain loop would block on `read` until it
-                    // exits. WaitResult::Aborted doesn't carry output,
-                    // so we have nothing to lose by dropping the tasks.
-                    stdout_task.abort();
-                    stderr_task.abort();
-                    WaitResult::Aborted
+                    finish_cancelled(reason, stdout_task, stderr_task).await
                 }
             }
         }
@@ -1821,33 +2427,137 @@ async fn wait_with_timeout_and_abort(
                         }
                     }
                 }
-                _ = wait_for_abort(&mut abort_rx) => {
+                reason = wait_for_abort(&mut abort_rx) => {
                     graceful_shutdown(&mut child).await;
-                    // See matching comment in the timeout arm above.
-                    stdout_task.abort();
-                    stderr_task.abort();
-                    WaitResult::Aborted
+                    finish_cancelled(reason, stdout_task, stderr_task).await
                 }
             }
         }
     }
 }
 
-/// Block until the abort watch channel signals `true`.
-async fn wait_for_abort(rx: &mut watch::Receiver<bool>) {
-    // If already aborted, return immediately.
-    if *rx.borrow() {
-        return;
+/// Turn a tripped cancel channel into the matching [`WaitResult`] after the
+/// kill ladder has already run.
+///
+/// - [`CancelReason::Aborted`] → [`WaitResult::Aborted`]. The drain tasks are
+///   aborted rather than awaited: a harness that spawned a grandchild
+///   inheriting stdout/stderr leaves those pipes open past SIGKILL (the
+///   grandchild reparents to init) and the drain loop would block on `read`
+///   until it exits. `Aborted` carries no output, so dropping the tasks
+///   loses nothing.
+/// - [`CancelReason::Skipped`] → [`WaitResult::Skipped`]. We *do* want the
+///   partial output for the skipped attempt's log row, but we still can't
+///   block indefinitely on a reparented grandchild's pipe — so the drain is
+///   best-effort with a short timeout, then the tasks are aborted.
+async fn finish_cancelled(
+    reason: CancelReason,
+    stdout_task: tokio::task::JoinHandle<Vec<u8>>,
+    stderr_task: tokio::task::JoinHandle<Vec<u8>>,
+) -> WaitResult {
+    match reason {
+        CancelReason::Aborted => {
+            stdout_task.abort();
+            stderr_task.abort();
+            WaitResult::Aborted
+        }
+        CancelReason::Skipped => {
+            // Best-effort: collect whatever the drainers captured before the
+            // kill, but cap the wait so a grandchild holding the pipe open
+            // can't wedge the skip path.
+            let grace = Duration::from_millis(500);
+            let stdout = tokio::time::timeout(grace, io_util::join_drain_string(stdout_task))
+                .await
+                .unwrap_or_default();
+            let stderr = tokio::time::timeout(grace, io_util::join_drain_string(stderr_task))
+                .await
+                .unwrap_or_default();
+            WaitResult::Skipped { stdout, stderr }
+        }
     }
-    // Wait for a change that sets abort to true.
+}
+
+/// Block until the cancel watch channel is tripped, returning *why*.
+///
+/// The reason distinguishes a whole-run abort ([`CancelReason::Aborted`],
+/// Ctrl+C) from a single-step skip ([`CancelReason::Skipped`],
+/// `ralph skip`). Both drive the same kill ladder; the caller branches on
+/// the returned reason to decide what to do *after* the child is dead.
+async fn wait_for_abort(rx: &mut watch::Receiver<CancelState>) -> CancelReason {
+    // If already cancelled, return immediately.
+    if let Some(reason) = *rx.borrow() {
+        return reason;
+    }
+    // Wait for a change that sets a cancel reason.
     loop {
         if rx.changed().await.is_err() {
-            // Sender dropped — treat as "never abort" by pending forever.
+            // Sender dropped — treat as "never cancel" by pending forever.
             std::future::pending::<()>().await;
-            return;
         }
-        if *rx.borrow() {
-            return;
+        if let Some(reason) = *rx.borrow() {
+            return reason;
+        }
+    }
+}
+
+/// How often the executor polls the DB for a cross-process skip request
+/// while a harness is in-flight. 250 ms is well under any human's
+/// skip→react expectation while adding negligible DB load (one indexed
+/// single-row `SELECT` per tick against the local SQLite file).
+const SKIP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Poll `plans.skip_requested_step_id` for a *cross-process* skip targeting
+/// the step we currently have in-flight, and — when found — funnel it into
+/// this process's own cancel channel so the existing
+/// `WaitResult::Skipped` machinery handles it unchanged.
+///
+/// This is the production half of the skip bridge. `ralph skip` and the TUI
+/// skip dialog run in a different process from the runner; they cannot reach
+/// the same-process cancel registry, so they write a durable request
+/// (`storage::request_skip`) that the runner — the process that actually
+/// owns the harness child — polls here.
+///
+/// On a match it `take`s the request (atomic read-and-clear) and calls
+/// [`crate::signal::inject_skip_with_kind`], which records the park kind and
+/// sends `CancelReason::Skipped` into the cancel watch channel
+/// `wait_with_timeout_and_abort` is already listening on. We then `pending()`
+/// forever so the *wait* future is the one that resolves the caller's
+/// `select!` (producing the real `WaitResult::Skipped` with captured
+/// output). A request that targets a *different* step is left in place
+/// (peek, not take) so it is honored when that step runs rather than wrongly
+/// consumed against the in-flight one.
+///
+/// Returns only on a polling error (e.g. the plan row vanished mid-run); the
+/// caller then falls back to a plain wait. A clean tree / no request just
+/// keeps ticking.
+async fn poll_cross_process_skip(conn: &Connection, plan_id: &str, step_id: &str) {
+    loop {
+        tokio::time::sleep(SKIP_POLL_INTERVAL).await;
+        // Single predicate-guarded read-and-clear: consumes the pending
+        // request only if it still targets the step we have in-flight, and
+        // leaves a request aimed at a different step untouched (it'll be
+        // honored when that step runs). No separate peek, so there is no
+        // window for a concurrently re-targeted `ralph skip` to be swallowed.
+        match storage::take_skip_request_for_step(conn, plan_id, step_id) {
+            Ok(Some(kind)) => {
+                // The request targeted the in-flight step and is now cleared.
+                // Funnel it into our own cancel channel; from here the
+                // existing same-process skip path takes over verbatim.
+                if crate::signal::inject_skip_with_kind(kind) {
+                    // Skip was injected: let the wait future resolve the
+                    // select! with the real `WaitResult::Skipped`.
+                    std::future::pending::<()>().await;
+                } else {
+                    // A whole-run abort (Ctrl+C) was already latched, so the
+                    // injector refused to downgrade it to a step skip. The
+                    // request is consumed (correct — the run is tearing down
+                    // anyway). Stop polling; the wait future will resolve via
+                    // the abort path.
+                    return;
+                }
+            }
+            // No request, or it targets a different step — keep polling.
+            Ok(None) => {}
+            Err(_) => return,
         }
     }
 }
@@ -1965,6 +2675,78 @@ fn set_step_attempts(conn: &Connection, step_id: &str, attempts: i32) -> Result<
         rusqlite::params![attempts, step_id],
     ).context("Failed to update step attempts")?;
     Ok(())
+}
+
+/// Finalize an attempt that was cancelled *before* the harness ran (the
+/// cancel flag was already set when we checked it at the top of the loop).
+///
+/// Persists the bumped attempt count, drops an execution-log row (so the DB
+/// reflects the same attempt number `StepResult` reports and the cancel has a
+/// visible audit trail), flips the step status, and returns the matching
+/// outcome:
+///
+/// - [`CancelReason::Aborted`] → step `Aborted`, log `UserInterrupted`,
+///   outcome [`StepOutcome::Aborted`] (the runner ends the whole run).
+/// - [`CancelReason::Skipped`] → step `Skipped`, log `UserSkipped`, outcome
+///   [`StepOutcome::Skipped`] (the runner advances to the next step).
+///
+/// `committed` is always `false` here — no work ran. Change-handling
+/// (stash/commit/discard) for the skip case lands in steps 17-18.
+fn finalize_precancel(
+    conn: &Connection,
+    step_id: &str,
+    attempt: i32,
+    reason: CancelReason,
+) -> Result<StepResult> {
+    let (step_status, term_reason, outcome) = match reason {
+        CancelReason::Aborted => (
+            StepStatus::Aborted,
+            TerminationReason::UserInterrupted,
+            StepOutcome::Aborted,
+        ),
+        CancelReason::Skipped => (
+            StepStatus::Skipped,
+            TerminationReason::UserSkipped,
+            StepOutcome::Skipped,
+        ),
+    };
+    set_step_attempts(conn, step_id, attempt)?;
+    let exec_log = storage::create_execution_log(conn, step_id, attempt, None, None)?;
+    storage::update_execution_log(
+        conn,
+        exec_log.id,
+        Some(0.0),
+        None,
+        &[],
+        false, // not committed — no work ran (steps 17-18 add change-handling)
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(term_reason),
+        Some(TestStatus::NotRun),
+    )?;
+    storage::update_step_status(conn, step_id, step_status)?;
+    // Fix 3 (cross-process leak): a `Skipped` reason caught here at the
+    // pre-attempt check finalized THIS step without ever reaching the
+    // skip-handling arm that would normally clear the channel. Left
+    // latched, the next step's pre-attempt check would observe the same
+    // stale `Skipped` and skip it too (and the one after, …). Reset it now.
+    // An `Aborted` reason must NOT be cleared — the runner's between-step
+    // check still needs to see it to tear the whole run down.
+    if reason == CancelReason::Skipped {
+        crate::signal::clear_pending_skip_state();
+    }
+    Ok(StepResult {
+        outcome,
+        step_id: step_id.to_string(),
+        attempts_used: attempt,
+        commit_hash: None,
+    })
 }
 
 /// Print the per-attempt start header to stderr:
@@ -2330,8 +3112,8 @@ mod tests {
         .unwrap();
         assert_eq!(step.attempts, 0);
 
-        let (tx, rx) = watch::channel(false);
-        tx.send(true).unwrap();
+        let (tx, rx) = watch::channel(None);
+        tx.send(Some(crate::signal::CancelReason::Aborted)).unwrap();
 
         let config = Config::default();
         let hook_ctx = HookContext {
@@ -2515,7 +3297,7 @@ mod tests {
             hook_timeout_secs: 30,
         };
 
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let config = Config::default();
         let result = execute_step(
@@ -2614,7 +3396,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = execute_step(
             &conn,
@@ -2750,7 +3532,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         // Cap the whole test at 30s so a regression hangs fast rather than
         // stalling the suite forever.
@@ -2868,7 +3650,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let _result = tokio::time::timeout(
             Duration::from_secs(60),
@@ -2983,7 +3765,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
@@ -3127,7 +3909,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (tx, rx) = watch::channel(false);
+        let (tx, rx) = watch::channel(None);
 
         // In a concurrent task: wait until the pids file appears (harness
         // has spawned its grandchild), then signal abort. The main task
@@ -3146,7 +3928,7 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let _ = tx.send(true);
+            let _ = tx.send(Some(crate::signal::CancelReason::Aborted));
         });
 
         let result = tokio::time::timeout(
@@ -3193,6 +3975,1302 @@ mod tests {
             "grandchild sleep (pid {grandchild}) survived the abort — \
              process-group kill did not fan out",
         );
+    }
+
+    /// STEP 16: a `Skipped` cancel reason must (a) kill the in-flight
+    /// harness child via the SAME ladder Ctrl+C uses, (b) leave the step
+    /// `Skipped` (not `Aborted`), and (c) write an execution_logs row with
+    /// `termination_reason = user_skipped` and `committed = false` — while
+    /// the run as a whole is NOT torn down (StepOutcome::Skipped, distinct
+    /// from StepOutcome::Aborted which the runner turns into a whole-run
+    /// abort).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_skip_kills_harness_and_marks_skipped() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let shared = TempDir::new().unwrap();
+        let pid_path = shared.path().join("pid.txt");
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("skip-harness.sh");
+        // Record our pid, then block for a long time so the skip lands
+        // while the harness is mid-flight.
+        let script = format!(
+            "#!/bin/sh\necho \"$$\" > {pid}\nsleep 60\n",
+            pid = pid_path.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "skip".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (tx, rx) = watch::channel(None);
+
+        // Once the harness has written its pid, trip the cancel channel
+        // with `Skipped` (NOT `Aborted`) — same channel, same ladder.
+        let pid_path_clone = pid_path.clone();
+        let skip_task = tokio::spawn(async move {
+            for _ in 0..60 {
+                if pid_path_clone.exists()
+                    && fs::read_to_string(&pid_path_clone)
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let _ = tx.send(Some(CancelReason::Skipped));
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 10s on skip")
+        .unwrap();
+
+        skip_task.await.ok();
+
+        // (Aborted vs Skipped kept distinct) — a skip must NOT surface as
+        // Aborted (which the runner would turn into a whole-run abort).
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Skipped,
+            "skip must yield StepOutcome::Skipped, not Aborted"
+        );
+        assert_ne!(result.outcome, StepOutcome::Aborted);
+
+        // (a) the harness child was killed.
+        let harness_pid: i32 = fs::read_to_string(&pid_path)
+            .expect("pid file should exist")
+            .trim()
+            .parse()
+            .expect("pid should parse");
+        let mut alive = true;
+        for _ in 0..40 {
+            // SAFETY: libc::kill with signo=0 is a pure liveness probe.
+            let r = unsafe { libc::kill(harness_pid, 0) };
+            if r != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !alive,
+            "harness (pid {harness_pid}) survived the skip — \
+             the cancel ladder did not fire"
+        );
+
+        // (b) the step is Skipped (not Aborted).
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Skipped);
+        assert_ne!(updated.status, StepStatus::Aborted);
+
+        // (c) an execution_logs row exists with termination_reason
+        //     user_skipped and committed = false.
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1, "exactly one execution_log row for the skip");
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped),
+            "skip must record user_skipped, not user_interrupted",
+        );
+        assert!(
+            !logs[0].committed,
+            "no work was kept on the skip path (committed must be false)"
+        );
+    }
+
+    /// Fix 2 — natural-exit vs skip race. If the harness exits *on its own*
+    /// in the same `select!` poll a `Skipped` cancel is already latched, the
+    /// `select!` may pick `child.wait()` → `WaitResult::Completed` instead of
+    /// `WaitResult::Skipped`. The test phase would then see the tripped
+    /// cancel channel, abort, and (pre-fix) drive
+    /// `finalize_failure(Aborted, UserInterrupted)` →
+    /// `StepOutcome::Aborted` → the runner tears down the WHOLE run.
+    ///
+    /// With the fix, *regardless* of which arm `select!` picks, the outcome
+    /// must be `Skipped` (this step only) — never `Aborted` — and there must
+    /// be exactly one execution_logs row (no finalize_failure +
+    /// finalize_skipped double-write). The cancel reason is set BEFORE
+    /// `execute_step` and the harness exits 0 immediately, so the race is
+    /// genuinely exercised; a deterministic test command + a produced change
+    /// make the pre-fix Aborted path the one that would otherwise be taken.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_natural_exit_with_pending_skip_resolves_to_skip_not_abort() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        // Serialize against other tests that mutate the process-global
+        // cancel registry / park-kind slot (same rationale as the signal
+        // module tests; current_thread runtime rules out guard transfer).
+        let _registry_guard = crate::signal::lock_exit_cleanup_test();
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let shared = TempDir::new().unwrap();
+        let marker_path = shared.path().join("started.marker");
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("quick-harness.sh");
+        // Announce we've started (so the skip task knows execute_step is
+        // past its pre-attempt cancel check and the harness is genuinely
+        // spawned), produce a change, then exit 0 after a tiny sleep —
+        // racing the harness's natural exit against the skip the task is
+        // about to fire. Whichever side of the `select!` wins, the invariant
+        // must hold: outcome Skipped, never Aborted, exactly one log row.
+        let script = format!(
+            "#!/bin/sh\n\
+             cat >/dev/null 2>&1 || true\n\
+             echo 'edit' >> {readme}\n\
+             : > {marker}\n\
+             sleep 0.2\n\
+             exit 0\n",
+            readme = dir.join("README.md").to_string_lossy(),
+            marker = marker_path.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        // Configure a deterministic test so the pre-fix Completed path would
+        // reach the test phase → test_aborted → Aborted.
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &["true".to_string()],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "skip".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+
+        // Register the cancel channel + a park kind (mimicking
+        // `request_skip_in_flight`), but do NOT latch `Skipped` yet — that
+        // would trip the *pre-attempt* check and never exercise the
+        // natural-exit race. A task fires `Skipped` only once the harness
+        // has actually started (marker present), i.e. past the pre-attempt
+        // check, so the skip lands concurrently with the harness's exit.
+        let (tx, rx) = watch::channel(None);
+        crate::signal::install_skip_channel_for_test(tx.clone());
+        crate::signal::set_requested_park_kind_for_test(crate::git::ParkStrategyKind::Discard);
+
+        let marker_clone = marker_path.clone();
+        let tx_skip = tx.clone();
+        let skip_task = tokio::spawn(async move {
+            for _ in 0..200 {
+                if marker_clone.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = tx_skip.send(Some(CancelReason::Skipped));
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx.clone(),
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 10s")
+        .unwrap();
+
+        skip_task.await.ok();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Skipped,
+            "natural-exit-vs-skip race must resolve to Skipped (advance one step)"
+        );
+        assert_ne!(
+            result.outcome,
+            StepOutcome::Aborted,
+            "must NOT misclassify the race as a whole-run Aborted"
+        );
+
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Skipped);
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(
+            logs.len(),
+            1,
+            "exactly one execution_logs row (no finalize_failure + finalize_skipped double-write)"
+        );
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped),
+            "must record user_skipped, not user_interrupted"
+        );
+
+        // Fix 3: the terminal skip must have reset the cancel channel so a
+        // following step would NOT be swept by a stale `Skipped`.
+        assert!(
+            rx.borrow().is_none(),
+            "cancel channel must be cleared after a terminal skip so it \
+             does not bleed into the next step"
+        );
+        // …and the park-kind slot must be empty (consumed exactly once).
+        assert!(
+            crate::signal::take_requested_park_kind().is_none(),
+            "park-kind slot must be consumed exactly once on the skip path"
+        );
+    }
+
+    /// Fix 3 — park-kind slot leak on non-skip terminal arms. If a `Skipped`
+    /// reason was pending but the attempt finalized via a non-skip terminal
+    /// arm (here: the harness exits non-zero with no changes → terminal
+    /// `Failed`), the global park-kind slot and the cancel channel must be
+    /// cleared so they can't bleed into a later attempt/step. A pending
+    /// `Aborted`, by contrast, must survive (whole-run shutdown).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_non_skip_terminal_clears_pending_skip_state() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let _registry_guard = crate::signal::lock_exit_cleanup_test();
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("fail-harness.sh");
+        // Exit non-zero, no changes → HarnessFailed, terminal Failed (one
+        // attempt, max_retries 0). A genuinely non-skip terminal arm.
+        let script = "#!/bin/sh\nexit 3\n".to_string();
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0), // max_retries = 0 → a single attempt, terminal on failure
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "skip".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+
+        // A `Skipped` reason that "raced and lost": latched, plus a stale
+        // park kind, but the attempt will finalize via the Failed terminal
+        // arm (the harness exits non-zero before any skip handling).
+        let (tx, rx) = watch::channel(None);
+        crate::signal::install_skip_channel_for_test(tx.clone());
+        crate::signal::set_requested_park_kind_for_test(crate::git::ParkStrategyKind::Commit);
+        tx.send(Some(CancelReason::Skipped)).unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx.clone(),
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 10s")
+        .unwrap();
+
+        // The harness exits non-zero; depending on the select! race this is
+        // either a clean HarnessFailed or routed through the skip path. In
+        // BOTH cases the defensive cleanup must leave NO stale skip state.
+        assert!(
+            matches!(result.outcome, StepOutcome::Failed | StepOutcome::Skipped),
+            "expected Failed or Skipped, got {:?}",
+            result.outcome
+        );
+        assert!(
+            rx.borrow().is_none(),
+            "a non-skip terminal arm (or the skip path) must clear the \
+             latched Skipped so it can't leak into the next attempt/step"
+        );
+        assert!(
+            crate::signal::take_requested_park_kind().is_none(),
+            "the stale park-kind slot must be cleared on a non-skip terminal arm"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_fast_completed_attempt_clears_unconsumed_db_skip_request() {
+        use crate::config::HarnessConfig;
+        use crate::plan::ChangePolicy;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("fast-harness.sh");
+        fs::write(
+            &harness_path,
+            "#!/bin/sh\ncat >/dev/null 2>&1 || true\nexit 0\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("fast"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            Some(ChangePolicy::Optional),
+            None,
+        )
+        .unwrap();
+
+        storage::request_skip(
+            &conn,
+            &plan.id,
+            &step.id,
+            crate::git::ParkStrategyKind::Discard,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "fast".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 10s")
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        assert!(
+            storage::peek_skip_request(&conn, &plan.id)
+                .unwrap()
+                .is_none(),
+            "a DB skip request that loses the race to natural completion must not survive"
+        );
+    }
+
+    /// STEP 17 shared driver: run a step whose harness dirties the tree
+    /// (a tracked modification + a new untracked file), then skip it
+    /// in-flight with `kind`. Routes the skip through
+    /// `signal::request_skip_in_flight` (exactly as `runner::skip_step`
+    /// does) so the executor's `finalize_skipped` consumes the recorded
+    /// park strategy. Returns `(dir, conn, step_id)` for per-strategy
+    /// assertions.
+    ///
+    /// The skip trigger runs on a dedicated **OS thread** (`std::thread::spawn`
+    /// with blocking `std::thread::sleep`), NOT a `tokio::spawn` co-located
+    /// with `execute_step` on the test's `current_thread` runtime. Under heavy
+    /// parallel `cargo test` load a single cooperative scheduler can starve a
+    /// co-located skip future's timed poll loop long enough that
+    /// `execute_step`'s 15s timeout fires first (`WaitResult::Timeout` instead
+    /// of `Skipped` → rare spurious failure that always passes in isolation).
+    /// A real thread is OS-preempted regardless of runtime load, so the
+    /// readiness gate and skip request are immune to that starvation. This is
+    /// a test-runtime artifact only: production runs the signal listener on a
+    /// dedicated thread of a multi-threaded runtime.
+    ///
+    /// Holds `EXIT_CLEANUP_TEST_LOCK` across the `.await`s on purpose:
+    /// `install_and_spawn` registers a process-global cancel TX and
+    /// `request_skip_in_flight` mutates the global in-flight flag + park-kind
+    /// slot, so this must be serialized against the other signal-registry
+    /// tests. The non-`Send` `registry_guard` is acquired on, used by, and
+    /// returned from the test's own runtime thread — only the skip *trigger*
+    /// moves to the OS thread, so the guard never transfers across threads and
+    /// switching to a `multi_thread` flavor (which would risk exactly that)
+    /// stays unnecessary. The guard is returned to the caller so it stays
+    /// alive until the test (and its per-strategy assertions) finishes.
+    #[cfg(unix)]
+    #[allow(clippy::await_holding_lock)]
+    async fn run_inflight_skip_with_changes(
+        kind: crate::git::ParkStrategyKind,
+    ) -> (
+        std::path::PathBuf,
+        tempfile::TempDir,
+        Connection,
+        String,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let registry_guard = crate::signal::lock_exit_cleanup_test();
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let shared = TempDir::new().unwrap();
+        let pid_path = shared.path().join("pid.txt");
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("skip-harness.sh");
+        // Dirty the repo (tracked edit + new untracked file), THEN announce
+        // our pid and block so the skip lands with real work in the tree.
+        let script = format!(
+            "#!/bin/sh\n\
+             echo 'harness edit' >> {readme}\n\
+             echo 'agent output' > {agent}\n\
+             echo \"$$\" > {pid}\n\
+             sleep 60\n",
+            readme = dir.join("README.md").to_string_lossy(),
+            agent = dir.join("agent-new.txt").to_string_lossy(),
+            pid = pid_path.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "demo-plan",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Wire the thing",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "skip".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+
+        // Register a real cancel TX/RX pair in the process-global registry
+        // (as the signal listener would for a live run) so
+        // request_skip_in_flight injects into the channel execute_step
+        // listens on.
+        let (_handle, rx) = crate::signal::install_and_spawn_with_handle();
+
+        let pid_path_clone = pid_path.clone();
+        let dir_clone = dir.clone();
+        // Drive the skip trigger on a REAL OS thread with BLOCKING sleeps,
+        // not a `tokio::spawn` on `execute_step`'s `current_thread` runtime.
+        // Rationale: `execute_step` and a co-located skip future share one
+        // cooperative scheduler, so under heavy parallel `cargo test` load
+        // the runtime can starve the skip future's `tokio::time::sleep` poll
+        // loop long enough that `execute_step`'s 15s `tokio::time::timeout`
+        // fires first → `WaitResult::Timeout` instead of `Skipped` → a rare
+        // spurious failure (always passes in isolation). A dedicated thread
+        // with `std::thread::sleep` is preempted by the OS regardless of
+        // runtime load, so the readiness gate and skip request are immune to
+        // single-runtime starvation. We deliberately do NOT switch the test
+        // to the `multi_thread` flavor: the non-`Send` `EXIT_CLEANUP_TEST_LOCK`
+        // `registry_guard` must not transfer across threads, and it stays
+        // acquired on (and returned from) the test's own runtime thread —
+        // only the skip trigger moves off it, so that invariant is preserved.
+        let skip_thread = std::thread::spawn(move || {
+            // Wait for the harness to have ACTUALLY dirtied the worktree, not
+            // merely for it to have written its pid. The pid file alone is a
+            // racy proxy: gating on a genuinely dirty tree ensures the skip
+            // lands with real work present (so `park_relevant` is true and
+            // the discard path's `rolled_back=true` is actually recorded).
+            // The bound is generous (≈30s of attempts) because the only
+            // failure mode worth surfacing is the harness never running at
+            // all, which the outer 15s `execute_step` timeout already covers.
+            let mut dirtied = false;
+            for _ in 0..600 {
+                let pid_ready = pid_path_clone.exists()
+                    && fs::read_to_string(&pid_path_clone)
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false);
+                if pid_ready && crate::git::has_uncommitted_changes(&dir_clone).unwrap_or(false) {
+                    dirtied = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                dirtied,
+                "harness never dirtied the worktree before skip — test setup race"
+            );
+            // Mark a step in-flight and request the skip exactly like
+            // runner::skip_step's in-flight branch. Both calls are synchronous
+            // and operate on process-global atomics/mutexes, so running them
+            // on this OS thread is behaviorally identical to the prior
+            // `tokio::spawn` — just immune to cooperative starvation.
+            let _g = crate::signal::StepInFlightGuard::enter();
+            assert!(
+                crate::signal::request_skip_in_flight(kind),
+                "request_skip_in_flight must signal when a step is in-flight"
+            );
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 15s on skip")
+        .unwrap();
+
+        // Join the OS-thread skip trigger. `.join()` returns `Err` if the
+        // thread panicked; resume-unwind so the in-thread `dirtied` /
+        // `request_skip_in_flight` assertions still fail the test loudly
+        // (they previously surfaced via the tokio `JoinError` path).
+        if let Err(panic) = skip_thread.join() {
+            std::panic::resume_unwind(panic);
+        }
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Skipped,
+            "skip must yield StepOutcome::Skipped"
+        );
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Skipped);
+
+        (dir, tmp, conn, step.id, registry_guard)
+    }
+
+    /// STEP 17: `--changes stash` parks the in-flight work in a
+    /// `git stash` (labelled `ralph-skip/<slug>/<num>/<ts>`), leaves the
+    /// tree clean of the harness's edits, and records committed=false.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_skip_changes_stash_parks_to_stash() {
+        let (dir, _tmp, conn, step_id, _registry_guard) =
+            run_inflight_skip_with_changes(crate::git::ParkStrategyKind::Stash).await;
+
+        // The harness's tracked edit is gone from the worktree…
+        assert!(
+            !crate::git::has_uncommitted_changes(&dir).unwrap(),
+            "stash must leave the tree clean of the skipped step's changes"
+        );
+        // …and recoverable from a ralph-skip-labelled stash entry.
+        let stash_list = std::process::Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&stash_list.stdout);
+        assert!(
+            listing.contains("ralph-skip/demo-plan/1/"),
+            "stash list missing ralph-skip label: {listing}"
+        );
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step_id).unwrap();
+        assert_eq!(logs.len(), 1, "exactly one execution_log row");
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped)
+        );
+        assert!(!logs[0].committed, "stash is not a commit");
+        assert!(logs[0].commit_hash.is_none());
+    }
+
+    /// STEP 17: `--changes commit` parks the work as a WIP commit carrying
+    /// the `Ralph-Skipped-Step: <step-id>` trailer; the log row is
+    /// committed=true with the commit SHA in commit_hash.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_skip_changes_commit_makes_wip_commit_with_trailer() {
+        let (dir, _tmp, conn, step_id, _registry_guard) =
+            run_inflight_skip_with_changes(crate::git::ParkStrategyKind::Commit).await;
+
+        // Tree is clean (everything was committed).
+        assert!(!crate::git::has_uncommitted_changes(&dir).unwrap());
+
+        let body = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let body = String::from_utf8_lossy(&body.stdout);
+        assert!(
+            body.contains("[ralph wip] skipped step 1: Wire the thing"),
+            "WIP commit subject wrong: {body}"
+        );
+        assert!(
+            body.contains(&format!("Ralph-Skipped-Step: {step_id}")),
+            "WIP commit missing step-id trailer: {body}"
+        );
+
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let head_sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step_id).unwrap();
+        assert_eq!(logs.len(), 1, "exactly one execution_log row");
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped)
+        );
+        assert!(logs[0].committed, "commit strategy must set committed=true");
+        assert_eq!(
+            logs[0].commit_hash.as_deref(),
+            Some(head_sha.as_str()),
+            "commit_hash must be the WIP commit SHA"
+        );
+    }
+
+    /// STEP 17: `--changes discard` throws the in-flight work away; the
+    /// tree returns to the last commit and the log row is committed=false.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_skip_changes_discard_drops_the_work() {
+        let (dir, _tmp, conn, step_id, _registry_guard) =
+            run_inflight_skip_with_changes(crate::git::ParkStrategyKind::Discard).await;
+
+        assert!(
+            !crate::git::has_uncommitted_changes(&dir).unwrap(),
+            "discard must restore a clean tree"
+        );
+        // The tracked file is back to its committed contents and the
+        // harness's new untracked file is gone.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "init"
+        );
+        assert!(!dir.join("agent-new.txt").exists());
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step_id).unwrap();
+        assert_eq!(logs.len(), 1, "exactly one execution_log row");
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped)
+        );
+        assert!(!logs[0].committed);
+        assert!(logs[0].commit_hash.is_none());
+        assert!(logs[0].rolled_back, "discard records rolled_back=true");
+    }
+
+    /// STEP 18: the TUI skip dialog's Esc/cancel path. A skip request
+    /// carrying [`crate::git::ParkStrategyKind::Cancel`] must:
+    ///   - kill the in-flight harness (same cancel ladder),
+    ///   - roll the tree back (preserving pre-existing untracked scratch),
+    ///   - write NO `execution_logs` row for the cancelled attempt,
+    ///   - re-enter the executor at the *SAME* attempt number (no retry
+    ///     budget consumed).
+    ///
+    /// Mechanism under test: the harness records every invocation. The skip
+    /// task issues `Cancel` on invocation #1 (executor rolls back, deletes
+    /// the attempt-1 log row, resets the cancel channel + attempt counter,
+    /// re-enters), then `Skipped`(Stash) on invocation #2 so the re-entered
+    /// attempt finalizes and the test terminates. Final assertions prove the
+    /// re-entry happened at attempt 1 (budget untouched) and the cancelled
+    /// attempt left no log row behind.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_tui_skip_cancel_reenters_same_attempt_no_budget_no_log_row() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let _registry_guard = crate::signal::lock_exit_cleanup_test();
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        // A pre-existing untracked file the user had *before* the run. The
+        // cancel rollback must preserve it.
+        fs::write(dir.join("user-scratch.txt"), "user data").unwrap();
+
+        let shared = TempDir::new().unwrap();
+        let count_path = shared.path().join("invocations.txt");
+        let pid_path = shared.path().join("pid.txt");
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("cancel-harness.sh");
+        // Every invocation: append a marker to the counter file, dirty the
+        // tree (tracked edit + new untracked file), publish our pid, block.
+        let script = format!(
+            "#!/bin/sh\n\
+             echo x >> {count}\n\
+             echo 'harness edit' >> {readme}\n\
+             echo 'agent output' > {agent}\n\
+             echo \"$$\" > {pid}\n\
+             sleep 60\n",
+            count = count_path.to_string_lossy(),
+            readme = dir.join("README.md").to_string_lossy(),
+            agent = dir.join("agent-new.txt").to_string_lossy(),
+            pid = pid_path.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "demo-plan",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Wire the thing",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "skip".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+
+        let (_handle, rx) = crate::signal::install_and_spawn_with_handle();
+
+        // Wait until the counter file shows `target` invocations, then
+        // return once the harness has (re-)published a pid for that run.
+        async fn wait_for_invocation(
+            count_path: &std::path::Path,
+            pid_path: &std::path::Path,
+            target: usize,
+        ) {
+            for _ in 0..240 {
+                let n = std::fs::read_to_string(count_path)
+                    .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+                    .unwrap_or(0);
+                if n >= target
+                    && pid_path.exists()
+                    && std::fs::read_to_string(pid_path)
+                        .map(|s| !s.trim().is_empty())
+                        .unwrap_or(false)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("harness never reached invocation {target}");
+        }
+
+        let count_clone = count_path.clone();
+        let pid_clone = pid_path.clone();
+        let skip_task = tokio::spawn(async move {
+            // Invocation #1 → request CANCEL.
+            wait_for_invocation(&count_clone, &pid_clone, 1).await;
+            let _g = crate::signal::StepInFlightGuard::enter();
+            assert!(
+                crate::signal::request_skip_in_flight(crate::git::ParkStrategyKind::Cancel),
+                "Cancel skip must signal when a step is in-flight"
+            );
+            // Invocation #2 (the re-entered SAME attempt) → finalize with a
+            // real Skipped(Discard) so the test terminates. Discard is used
+            // (not Stash) because Stash's `--include-untracked` would also
+            // sweep up the user's pre-existing scratch, masking the
+            // preservation assertion below; Discard routes through
+            // `rollback_except(pre_existing_untracked)`, the same
+            // preservation contract the cancel rollback uses.
+            wait_for_invocation(&count_clone, &pid_clone, 2).await;
+            assert!(
+                crate::signal::request_skip_in_flight(crate::git::ParkStrategyKind::Discard),
+                "second skip must signal when the re-entered attempt is in-flight"
+            );
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            execute_step(
+                &conn,
+                &plan,
+                &step,
+                &config,
+                &dir,
+                &hook_ctx,
+                rx,
+                ExecuteOptions::default(),
+            ),
+        )
+        .await
+        .expect("execute_step did not return within 20s on cancel+skip")
+        .unwrap();
+
+        skip_task.await.ok();
+
+        // The harness ran exactly twice: the cancelled attempt and the
+        // re-entered same-numbered attempt.
+        let invocations = std::fs::read_to_string(&count_path)
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        assert_eq!(
+            invocations, 2,
+            "harness must run twice (cancelled attempt + re-entered same attempt)"
+        );
+
+        // The step finalized as Skipped at attempt 1 — the cancelled
+        // attempt consumed NO retry budget (otherwise this would be 2).
+        assert_eq!(result.outcome, StepOutcome::Skipped);
+        assert_eq!(
+            result.attempts_used, 1,
+            "re-entry must reuse the SAME attempt number (no budget consumed)"
+        );
+        let updated = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(updated.status, StepStatus::Skipped);
+        assert_eq!(
+            updated.attempts, 1,
+            "persisted attempt counter must not advance for the cancelled attempt"
+        );
+
+        // Exactly ONE execution_logs row exists — the cancelled attempt's
+        // row (created with the prompt before the harness spawned) was
+        // deleted, so there is no UNIQUE(step_id, attempt) leak and no row
+        // for the cancelled attempt.
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(
+            logs.len(),
+            1,
+            "the cancelled attempt must leave NO execution_logs row; only the \
+             final Skipped row should remain (got {logs:?})"
+        );
+        assert_eq!(logs[0].attempt, 1, "the surviving row is attempt 1");
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::UserSkipped),
+            "the surviving row is the final Skipped(Stash) finalize"
+        );
+
+        // The user's pre-existing untracked scratch survived the cancel
+        // rollback untouched.
+        assert!(
+            dir.join("user-scratch.txt").exists(),
+            "cancel rollback must preserve pre-existing untracked files"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "user data"
+        );
+    }
+
+    /// STEP 18: the executor's cancel path constructs exactly the documented
+    /// `attempt_cancelled` NDJSON event (event tag, `step_id`, `step_num`
+    /// derived from the i32 `ExecCtx.step_num`, `attempt`). Pairs with the
+    /// `output.rs` serde-shape tests (casing / field names) and the
+    /// integration test (the cancel branch is actually taken). Building the
+    /// event is the seam `cancel_skipped_attempt` emits through, so this
+    /// proves the executor emits the right payload without flaky stdout
+    /// capture.
+    #[test]
+    fn test_attempt_cancelled_event_payload_from_exec_ctx() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "demo-plan",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Wire the thing",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let pre: Vec<String> = vec![];
+        let ctx = ExecCtx {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            workdir: &dir,
+            pre_existing_untracked: &pre,
+            hook_ctx: &hook_ctx,
+            step_num: 4,
+            max_attempts: 3,
+            json_output: true,
+        };
+
+        let evt = attempt_cancelled_event(&ctx, 2);
+        match evt {
+            crate::output::RunEvent::AttemptCancelled {
+                step_id,
+                step_num,
+                attempt,
+                ..
+            } => {
+                assert_eq!(step_id, step.id);
+                assert_eq!(step_num, 4, "i32 step_num maps to usize");
+                assert_eq!(attempt, 2, "carries the cancelled attempt number");
+            }
+            other => panic!("expected AttemptCancelled, got {other:?}"),
+        }
+
+        // The event must serialize to the documented tag/casing too.
+        let val: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&attempt_cancelled_event(&ctx, 1)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(val["event"], "attempt_cancelled");
+        assert_eq!(val["step_id"], step.id);
+        assert_eq!(val["step_num"], 4);
+        assert_eq!(val["attempt"], 1);
+        assert!(val.get("at").is_some(), "timestamp field present");
     }
 
     /// Complements `test_abort_kills_harness_process_group` with the
@@ -3294,7 +5372,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (tx, rx) = watch::channel(false);
+        let (tx, rx) = watch::channel(None);
 
         // Abort once the harness has registered its pids.
         let pids_path_clone = pids_path.clone();
@@ -3309,7 +5387,7 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let _ = tx.send(true);
+            let _ = tx.send(Some(crate::signal::CancelReason::Aborted));
         });
 
         // Whole test capped at 10s — if the grandchild survives we want a
@@ -3465,7 +5543,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -3574,7 +5652,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -3699,7 +5777,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -3800,7 +5878,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -3840,6 +5918,478 @@ mod tests {
             logs[0].test_results,
         );
         assert!(!logs[0].committed);
+    }
+
+    // ---- Step 22: RetryStrategy honored in the retry loop ----
+
+    /// Count the commits reachable from HEAD (for double-commit assertions).
+    #[cfg(test)]
+    fn commit_count(workdir: &std::path::Path) -> usize {
+        use std::process::Command;
+        let out = Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(workdir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// `Keep` (the default) must NOT roll back between failed attempts: the
+    /// dirty tree carries forward so the next attempt builds on it. The
+    /// harness appends one line to a tracked file per invocation; the
+    /// deterministic test only passes once the file has TWO lines. With Keep,
+    /// attempt 1's line survives into attempt 2 (no rollback), attempt 2
+    /// appends the second line, the test passes, and exactly ONE step commit
+    /// results.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_keep_strategy_preserves_dirty_tree_between_attempts() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        // Seed a tracked file the harness will append to.
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base_commits = commit_count(&dir);
+
+        // Harness: append exactly one line per invocation. No commit.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("append-harness.sh");
+        let script = format!(
+            "#!/bin/sh\necho line >> {0}/acc.txt\nexit 0\n",
+            dir.to_string_lossy()
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        // Test passes only when acc.txt has exactly two lines — i.e. attempt
+        // 1's append survived (no rollback) AND attempt 2 appended again.
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        // max_retries = 1 → 2 attempts. retry_strategy left None on both
+        // levels → resolves to the default `Keep`.
+        let (mut step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            step.effective_retry_strategy(&plan),
+            RetryStrategy::Keep,
+            "default strategy must be Keep"
+        );
+        step.retry_strategy = None;
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Success,
+            "Keep must carry attempt 1's append into attempt 2 so the \
+             2-line test passes on attempt 2",
+        );
+        assert_eq!(result.attempts_used, 2);
+        // Exactly one new commit (the step commit) — the carried-forward
+        // line + the new line collapse into a single coherent commit.
+        assert_eq!(
+            commit_count(&dir),
+            base_commits + 1,
+            "exactly one step commit; no double-commit"
+        );
+        let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
+        assert_eq!(
+            final_lines.lines().count(),
+            2,
+            "both attempts' appends are present (no rollback under Keep)"
+        );
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        // Attempt 1 failed and did NOT roll back under Keep.
+        let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
+        assert!(
+            !a1.rolled_back,
+            "Keep must not roll back the failed attempt"
+        );
+    }
+
+    /// `Rollback` preserves today's behavior: the failed attempt's tree is
+    /// reverted before the retry, and the rolled-back diff is fed into the
+    /// next attempt's prompt. Same harness/test as the Keep test; because
+    /// attempt 1 is rolled back, attempt 2 starts clean, can only reach ONE
+    /// line, the 2-line test never passes, and the step fails terminally.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_rollback_strategy_clears_tree_and_feeds_diff() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("append-harness.sh");
+        let script = format!(
+            "#!/bin/sh\necho line >> {0}/acc.txt\nexit 0\n",
+            dir.to_string_lossy()
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (mut step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Force the step-level strategy to Rollback.
+        step.retry_strategy = Some(RetryStrategy::Rollback);
+        assert_eq!(
+            step.effective_retry_strategy(&plan),
+            RetryStrategy::Rollback
+        );
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Failed,
+            "Rollback reverts attempt 1, so attempt 2 can only reach one \
+             line and the 2-line test never passes",
+        );
+        assert_eq!(result.attempts_used, 2);
+        // acc.txt is back to its committed (empty) state — rolled back.
+        let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
+        assert_eq!(
+            final_lines.lines().count(),
+            0,
+            "Rollback must revert the failed attempt's tree"
+        );
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
+        assert!(a1.rolled_back, "Rollback must roll back the failed attempt");
+        // Attempt 2's prompt must carry the rolled-back diff (so the agent
+        // can learn from work it no longer sees on disk).
+        let a2 = logs.iter().find(|l| l.attempt == 2).unwrap();
+        let a2_prompt = a2.prompt_text.as_deref().unwrap_or("");
+        assert!(
+            a2_prompt.contains("# Retry Context"),
+            "attempt 2 prompt must include the retry context"
+        );
+        assert!(
+            a2_prompt.contains("## Previous Diff"),
+            "Rollback must feed the rolled-back diff into the next prompt; \
+             got prompt:\n{a2_prompt}"
+        );
+    }
+
+    /// EDGE CASE (Step 22): under `Keep`, attempt 1's agent commits its own
+    /// work and the test then fails (agent_committed_clean). We must NOT roll
+    /// back (Keep), but we also must NOT leave the agent's commit in HEAD —
+    /// otherwise the eventual success commit would be a SECOND commit on top
+    /// of it. The fix mixed-resets to the pre-attempt HEAD, so attempt 1's
+    /// work survives as uncommitted changes; attempt 2 adds its line and the
+    /// success path produces exactly ONE coherent step commit (no
+    /// double-commit, no orphan agent commit, no "nothing to commit").
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_keep_agent_committed_clean_single_final_commit() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base_commits = commit_count(&dir);
+        let base_head = crate::git::get_commit_hash(&dir).unwrap();
+
+        // A counter so the harness behaves differently per invocation.
+        let shared = TempDir::new().unwrap();
+        let count_path = shared.path().join("n.txt");
+
+        // Invocation 1: append line1 AND commit it (agent_committed_clean).
+        // Invocation 2+: append another line, do NOT commit.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("commit-then-dirty.sh");
+        let script = format!(
+            "#!/bin/sh\n\
+             echo x >> {count}\n\
+             N=$(wc -l < {count})\n\
+             echo line >> {acc}\n\
+             if [ \"$N\" -eq 1 ]; then\n\
+               cd {dir}\n\
+               git add -A\n\
+               git -c user.email=a@a -c user.name=a commit -m 'agent commit' >/dev/null\n\
+             fi\n\
+             exit 0\n",
+            count = count_path.to_string_lossy(),
+            acc = dir.join("acc.txt").to_string_lossy(),
+            dir = dir.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        // Passes only when acc.txt has two lines (attempt 1's carried-forward
+        // line + attempt 2's new line).
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Default → Keep.
+        assert_eq!(step.effective_retry_strategy(&plan), RetryStrategy::Keep);
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Success,
+            "attempt 2 should pass once attempt 1's (un-committed) line is \
+             carried forward and a second line is added",
+        );
+        assert_eq!(result.attempts_used, 2);
+        // THE key assertion: exactly ONE new commit total. The agent's
+        // attempt-1 commit was mixed-reset away (un-committed but kept on
+        // disk), so the only new commit is the single ralph step commit.
+        assert_eq!(
+            commit_count(&dir),
+            base_commits + 1,
+            "exactly one step commit — no double-commit, no orphan agent commit"
+        );
+        // The single new commit is ralph's step commit, parented on base.
+        let head = crate::git::get_commit_hash(&dir).unwrap();
+        assert_ne!(head, base_head);
+        assert_eq!(
+            result.commit_hash.as_deref(),
+            Some(head.as_str()),
+            "the success commit is the step commit ralph created"
+        );
+        let msg = {
+            let out = std::process::Command::new("git")
+                .args(["log", "-1", "--pretty=%s"])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert!(
+            msg.starts_with("ralph: Acc"),
+            "the final commit must be ralph's step commit, not the agent's \
+             orphan 'agent commit'; got: {msg}"
+        );
+        // Attempt 1 failed as agent_committed_clean → classified NoChanges,
+        // and Keep did NOT roll back (the mixed-reset is not a rollback of
+        // the working tree — the line is still there).
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
+        assert_eq!(a1.termination_reason, Some(TerminationReason::NoChanges));
+        let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
+        assert_eq!(
+            final_lines.lines().count(),
+            2,
+            "both attempts' lines are present in the final tree"
+        );
     }
 
     /// Optional policy + no tests configured + no changes → Success with
@@ -3893,7 +6443,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -3974,7 +6524,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4050,7 +6600,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4127,7 +6677,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4233,7 +6783,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4317,7 +6867,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4402,7 +6952,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4489,7 +7039,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = execute_step(
             &conn,
             &plan,
@@ -4599,7 +7149,7 @@ mod tests {
         });
         let emitters = build_chunk_emitters_with_sink(cfg, sink);
 
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             wait_with_timeout_and_abort(child, None, rx, emitters),
@@ -4612,6 +7162,7 @@ mod tests {
             WaitResult::Completed(Err(e)) => panic!("harness errored: {e}"),
             WaitResult::Timeout { .. } => panic!("unexpected Timeout"),
             WaitResult::Aborted => panic!("unexpected Aborted"),
+            WaitResult::Skipped { .. } => panic!("unexpected Skipped"),
         }
 
         let mut events = collected.lock().unwrap().clone();
@@ -4672,7 +7223,7 @@ mod tests {
             .stdin(std::process::Stdio::null());
         let child = cmd.spawn().expect("spawn sh");
 
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             wait_with_timeout_and_abort(child, None, rx, (None, None)),
@@ -4689,6 +7240,7 @@ mod tests {
             WaitResult::Completed(Err(e)) => panic!("harness errored: {e}"),
             WaitResult::Timeout { .. } => panic!("unexpected Timeout"),
             WaitResult::Aborted => panic!("unexpected Aborted"),
+            WaitResult::Skipped { .. } => panic!("unexpected Skipped"),
         }
     }
 
@@ -4796,7 +7348,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = execute_step(
             &conn,
@@ -4898,7 +7450,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = execute_step(
             &conn,
@@ -4987,7 +7539,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = execute_step(
             &conn,
@@ -5075,7 +7627,7 @@ mod tests {
             project_dir: dir.clone(),
             hook_timeout_secs: 30,
         };
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
 
         let result = execute_step(
             &conn,

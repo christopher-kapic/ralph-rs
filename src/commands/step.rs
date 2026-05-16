@@ -9,7 +9,7 @@ use crate::frac_index;
 use crate::hook_library::{self, Lifecycle};
 use crate::import::ImportedStep;
 use crate::output::{self, OutputContext, OutputFormat};
-use crate::plan::{ChangePolicy, Step, StepStatus};
+use crate::plan::{ChangePolicy, RetryStrategy, Step, StepStatus};
 use crate::storage;
 
 use super::resolve_step;
@@ -53,6 +53,27 @@ pub(crate) fn render_tags_inline(step: &Step) -> String {
         s.push(']');
     }
     s
+}
+
+/// Render the effective retry strategy for a step *with provenance*, for
+/// human-readable step detail output (`ralph status --verbose`).
+///
+/// Resolution mirrors [`crate::plan::Step::effective_retry_strategy`]
+/// (step > plan > default `keep`) but the returned string also reports
+/// *where* the effective value came from so the operator can tell an
+/// inherited value apart from an explicit per-step one:
+///
+/// - step sets it          → `"<value> (step-level)"`
+/// - only the plan sets it → `"<value> (inherited from plan)"`
+/// - neither sets it       → `"<unset — default keep>"`
+pub(crate) fn retry_strategy_provenance(step: &Step, plan: &crate::plan::Plan) -> String {
+    if let Some(rs) = step.retry_strategy {
+        format!("{rs} (step-level)")
+    } else if let Some(rs) = plan.retry_strategy {
+        format!("{rs} (inherited from plan)")
+    } else {
+        "<unset — default keep>".to_string()
+    }
 }
 
 pub fn step_list(
@@ -169,6 +190,7 @@ pub fn step_add(
     criteria: &[String],
     max_retries: Option<i32>,
     change_policy: Option<ChangePolicy>,
+    retry_strategy: Option<RetryStrategy>,
     tags: &[String],
     out: &OutputContext,
 ) -> Result<()> {
@@ -246,6 +268,14 @@ pub fn step_add(
             tags_arg,
         )?
     };
+
+    // Persist a step-level retry-strategy override when the user supplied
+    // one. `None` is the column default (inherit plan/global) so we skip
+    // the write entirely in that case — mirroring how the plan-level
+    // override is set after `create_plan`.
+    if let Some(rs) = retry_strategy {
+        storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
+    }
 
     eprintln!(
         "{} Added step #{}: {}",
@@ -422,6 +452,8 @@ pub fn step_edit(
     max_retries: Option<i32>,
     clear_max_retries: bool,
     change_policy: Option<ChangePolicy>,
+    retry_strategy: Option<RetryStrategy>,
+    clear_retry_strategy: bool,
     tags: &[String],
     clear_tags: bool,
     out: &OutputContext,
@@ -441,11 +473,13 @@ pub fn step_edit(
         && max_retries.is_none()
         && !clear_max_retries
         && change_policy.is_none()
+        && retry_strategy.is_none()
+        && !clear_retry_strategy
         && tags.is_empty()
         && !clear_tags
     {
         bail!(
-            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --clear-criteria, --max-retries, --clear-max-retries, --change-policy, --tag, or --clear-tags"
+            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --clear-criteria, --max-retries, --clear-max-retries, --change-policy, --retry-strategy, --clear-retry-strategy, --tag, or --clear-tags"
         );
     }
 
@@ -508,6 +542,17 @@ pub fn step_edit(
         tags_update,
     )?;
 
+    // Retry strategy lives on its own dedicated setter (kept off
+    // `update_step_fields_ext` to avoid churning that call surface).
+    // `--clear-retry-strategy` writes NULL (inherit plan/global);
+    // `--retry-strategy V` writes V; absence of both leaves the stored
+    // value untouched. clap already rejects passing both at once.
+    if clear_retry_strategy {
+        storage::set_step_retry_strategy(conn, &step.id, None)?;
+    } else if let Some(rs) = retry_strategy {
+        storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
+    }
+
     eprintln!(
         "{} Updated step #{}: {}",
         output::check_icon(out.color),
@@ -517,18 +562,149 @@ pub fn step_edit(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn step_reset(
     conn: &Connection,
     plan_slug: &str,
     project: &str,
     step_num: Option<usize>,
     step_id: Option<&str>,
+    force: bool,
     out: &OutputContext,
 ) -> Result<()> {
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
     let (step, display_num) = resolve_step(conn, &plan.id, step_num, step_id)?;
+
+    // Before flipping the step back to pending, undo any `[ralph wip]`
+    // skip commit(s) we parked on the plan branch for this step. We revert
+    // (never `reset --hard`) so branch history is preserved even when later
+    // steps committed on top of the WIP.
+    let workdir = std::path::Path::new(project);
+    // Only scan when the plan branch actually exists in this repo. A clean
+    // `Ok(false)` (the project dir isn't a git repo, or the branch was never
+    // created) means there can't be a skip-WIP commit to revert — reset
+    // proceeds as a plain status flip. An *error* is different: silently
+    // treating it as "absent" would orphan any parked `[ralph wip]` commits
+    // with no hint, so we warn before degrading to the plain flip.
+    let branch_present = match crate::git::branch_exists(workdir, &plan.branch_name) {
+        Ok(present) => present,
+        Err(e) => {
+            eprintln!(
+                "{} could not check whether branch '{}' exists ({e}); skipping \
+                 skip-WIP revert — any parked `[ralph wip]` commits for this \
+                 step will remain on the branch",
+                output::severity_icon("warning", out.color),
+                plan.branch_name
+            );
+            false
+        }
+    };
+    let wip_shas = if branch_present {
+        crate::git::skip_wip_commits_for_step(workdir, &plan.branch_name, &step.id).with_context(
+            || {
+                format!(
+                    "could not scan branch '{}' for skip-WIP commits",
+                    plan.branch_name
+                )
+            },
+        )?
+    } else {
+        Vec::new()
+    };
+
+    if !wip_shas.is_empty() {
+        // `git revert` operates on the *currently checked-out* HEAD. Unlike
+        // a run (which checks out `plan.branch_name`), `step reset` is a
+        // standalone command with no branch guarantee — so if the user is on
+        // a different branch the revert commits would land on the wrong
+        // branch and the WIP SHAs may not even be in its history (confusing
+        // conflict / misplaced revert). Refuse rather than misplace commits.
+        let current = crate::git::get_current_branch(workdir).with_context(|| {
+            format!(
+                "could not determine the current branch before reverting \
+                 skip-WIP commits for step #{display_num}"
+            )
+        })?;
+        if current != plan.branch_name {
+            bail!(
+                "Step #{display_num} has {} parked skip-WIP commit(s) on \
+                 branch '{}', but the working tree is on '{}'. Reverting here \
+                 would misplace the revert commits. Check out '{}' first \
+                 (e.g. `git checkout {}`), then re-run `ralph step reset`.",
+                wip_shas.len(),
+                plan.branch_name,
+                current,
+                plan.branch_name,
+                plan.branch_name
+            );
+        }
+        if !force {
+            let plural = if wip_shas.len() == 1 { "" } else { "s" };
+            let shorts: Vec<String> = wip_shas
+                .iter()
+                .map(|s| s[..s.len().min(8)].to_string())
+                .collect();
+            let prompt = format!(
+                "Resetting step #{display_num} will revert {} skip-WIP commit{plural} ({}) on branch '{}'. This adds revert commit(s). Continue?",
+                wip_shas.len(),
+                shorts.join(", "),
+                plan.branch_name
+            );
+            if !output::confirm(&prompt)? {
+                eprintln!("Aborted; step not reset.");
+                return Ok(());
+            }
+        }
+
+        // `wip_shas` is newest-first; revert in that order so each revert
+        // applies cleanly on top of the previous one. We attempt *every*
+        // commit and collect failures rather than `?`-bailing on the first:
+        // a `revert_commit` error leaves the tree clean (the in-progress
+        // revert is aborted), so continuing is safe, and the user gets one
+        // summary of exactly what was and wasn't reverted instead of a
+        // silently half-applied operation.
+        let mut failed: Vec<String> = Vec::new();
+        for sha in &wip_shas {
+            let short = &sha[..sha.len().min(8)];
+            match crate::git::revert_commit(workdir, sha) {
+                Ok(crate::git::RevertOutcome::Reverted { revert_sha }) => {
+                    eprintln!(
+                        "{} Reverted skip-WIP commit {short} (revert {})",
+                        output::check_icon(out.color),
+                        &revert_sha[..revert_sha.len().min(8)]
+                    );
+                }
+                Ok(crate::git::RevertOutcome::AlreadyReverted) => {
+                    eprintln!("  skip-WIP commit {short} was already reverted — skipping");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{} Could not revert skip-WIP commit {short}: {e}",
+                        output::severity_icon("warning", out.color)
+                    );
+                    failed.push(short.to_string());
+                }
+            }
+        }
+        if !failed.is_empty() {
+            // Don't flip the step to pending while WIP commits are still
+            // live on the branch. The successful reverts above stay applied,
+            // so a later `ralph step reset` retry skips them as
+            // `AlreadyReverted` and only retries the stragglers.
+            bail!(
+                "Reverted what it could, but {} skip-WIP commit(s) ({}) could \
+                 not be reverted (likely a genuine conflict with later work). \
+                 Step #{display_num} was left unchanged — resolve the \
+                 conflict(s) or revert those commits manually, then re-run \
+                 `ralph step reset`.",
+                failed.len(),
+                failed.join(", ")
+            );
+        }
+    }
+
     storage::reset_step(conn, &step.id)?;
     eprintln!(
         "{} Reset step #{} '{}' to pending (0 attempts)",
@@ -731,6 +907,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -890,6 +1067,7 @@ mod tests {
             &[],
             Some(3),
             None,
+            None,
             &[],
             &test_out(),
         )
@@ -930,6 +1108,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             &[],
             &test_out(),
         )
@@ -960,6 +1139,7 @@ mod tests {
             None,
             &[],
             None, // no max_retries override — falls back to config default.
+            None,
             None,
             &[],
             &test_out(),
@@ -996,6 +1176,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             tags,
@@ -1035,6 +1216,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             &tags,
             &test_out(),
         )
@@ -1057,6 +1239,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &tags,
@@ -1098,6 +1281,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            false,
             &new_tags,
             false,
             &test_out(),
@@ -1133,6 +1318,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            false,
             &[],
             true, // clear_tags
             &test_out(),
@@ -1158,6 +1345,7 @@ mod tests {
             None,
             None,
             &initial_criteria,
+            None,
             None,
             None,
             &[],
@@ -1189,6 +1377,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            false,
             &[],
             false,
             &test_out(),
@@ -1226,6 +1416,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            false,
             &[],
             false,
             &test_out(),
@@ -1313,5 +1505,479 @@ mod tests {
 
         assert_eq!(render_tags_inline(&steps[0]), "[FIX][REGRESSION]");
         assert_eq!(render_tags_inline(&steps[1]), "");
+    }
+
+    // ----- step_reset reverts skip-WIP commits (STEP 19) -----
+
+    /// A git repo + plan + one step, with the plan's branch_name pointing at
+    /// the repo's actual branch. Returns (conn, project, dir, step_id, branch).
+    fn reset_fixture() -> (
+        Connection,
+        String,
+        std::path::PathBuf,
+        String,
+        String,
+        tempfile::TempDir,
+    ) {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        }
+        fs::write(dir.join("README.md"), "# hi").unwrap();
+        crate::git::commit_changes(&dir, "init").unwrap();
+        let branch = crate::git::get_current_branch(&dir).unwrap();
+        let project = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let conn = db::open_memory().unwrap();
+        let plan =
+            storage::create_plan(&conn, "p", &project, &branch, "d", None, None, &[]).unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Wire it",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        (conn, project, dir, step.id, branch, tmp)
+    }
+
+    /// Park a WIP commit the way `park_changes(Commit)` does.
+    fn park_wip(dir: &std::path::Path, subject: &str, step_id: &str) -> String {
+        let msg = format!("{subject}\n\nRalph-Skipped-Step: {step_id}\n");
+        crate::git::commit_changes(dir, &msg).unwrap();
+        crate::git::get_commit_hash(dir).unwrap()
+    }
+
+    #[test]
+    fn test_step_reset_force_reverts_wip() {
+        let (conn, project, dir, step_id, _branch, _tmp) = reset_fixture();
+        std::fs::write(dir.join("wip.txt"), "wip").unwrap();
+        park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
+        assert!(dir.join("wip.txt").exists());
+
+        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+
+        // Revert happened (no prompt because force) and the step is pending.
+        assert!(!dir.join("wip.txt").exists(), "WIP reverted");
+        let plan = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn test_step_reset_without_force_prompt_declined_no_revert() {
+        // Under `cargo test` stdin is at EOF, so `confirm` returns false:
+        // exercises the prompt path. The WIP must be left intact and the
+        // step NOT reset.
+        let (conn, project, dir, step_id, _branch, _tmp) = reset_fixture();
+        std::fs::write(dir.join("wip.txt"), "wip").unwrap();
+        park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
+
+        step_reset(&conn, "p", &project, Some(1), None, false, &test_out()).unwrap();
+
+        assert!(
+            dir.join("wip.txt").exists(),
+            "declined prompt must not revert"
+        );
+        let plan = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].status,
+            StepStatus::Pending,
+            "step starts pending; reset aborted leaves it unchanged"
+        );
+        // Mark it failed then re-confirm the abort really skipped reset.
+        storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
+        step_reset(&conn, "p", &project, Some(1), None, false, &test_out()).unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].status,
+            StepStatus::Failed,
+            "aborted reset must not flip status"
+        );
+    }
+
+    #[test]
+    fn test_step_reset_no_wip_still_resets() {
+        // No skip-WIP commit at all: reset is a plain status flip even
+        // without --force (no prompt should appear).
+        let (conn, project, _dir, _step_id, _branch, _tmp) = reset_fixture();
+        let plan = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
+
+        step_reset(&conn, "p", &project, Some(1), None, false, &test_out()).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn test_step_reset_wip_not_on_head() {
+        let (conn, project, dir, step_id, _branch, _tmp) = reset_fixture();
+        std::fs::write(dir.join("wip.txt"), "wip").unwrap();
+        park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
+        // A later step lands on top of the WIP.
+        std::fs::write(dir.join("later.txt"), "later").unwrap();
+        crate::git::commit_changes(&dir, "step 2 done").unwrap();
+
+        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+
+        assert!(!dir.join("wip.txt").exists(), "WIP reverted");
+        assert!(dir.join("later.txt").exists(), "later work preserved");
+    }
+
+    #[test]
+    fn test_step_reset_already_reverted_clean() {
+        let (conn, project, dir, step_id, _branch, _tmp) = reset_fixture();
+        std::fs::write(dir.join("wip.txt"), "wip").unwrap();
+        let wip = park_wip(&dir, "[ralph wip] skipped step 1: Wire it", &step_id);
+        // Manually revert it already.
+        match crate::git::revert_commit(&dir, &wip).unwrap() {
+            crate::git::RevertOutcome::Reverted { .. } => {}
+            o => panic!("setup revert failed: {o:?}"),
+        }
+
+        // step_reset should detect the already-reverted state and not error.
+        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+
+        assert!(!crate::git::has_uncommitted_changes(&dir).unwrap());
+        let plan = storage::get_plan_by_slug(&conn, "p", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn test_step_reset_multiple_wip_commits_reverted() {
+        let (conn, project, dir, step_id, _branch, _tmp) = reset_fixture();
+        std::fs::write(dir.join("f.txt"), "v1\n").unwrap();
+        park_wip(&dir, "[ralph wip] skipped step 1: a", &step_id);
+        std::fs::write(dir.join("f.txt"), "v1\nv2\n").unwrap();
+        park_wip(&dir, "[ralph wip] skipped step 1: a again", &step_id);
+
+        step_reset(&conn, "p", &project, Some(1), None, true, &test_out()).unwrap();
+
+        // Both WIP layers undone (newest-first reverts applied cleanly).
+        assert!(!dir.join("f.txt").exists());
+        assert!(!crate::git::has_uncommitted_changes(&dir).unwrap());
+    }
+
+    // -----------------------------------------------------------------
+    // Retry strategy: CLI handler round-trip + provenance (Step 23)
+    // -----------------------------------------------------------------
+
+    /// Add a step via `step_add` with an explicit retry strategy and read
+    /// it back, asserting the override was persisted at the step level.
+    #[test]
+    fn test_step_add_persists_retry_strategy() {
+        let (conn, project) = setup_with_plan();
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "rollback step",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some(crate::plan::RetryStrategy::Rollback),
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].retry_strategy,
+            Some(crate::plan::RetryStrategy::Rollback)
+        );
+    }
+
+    /// `step_add` without `--retry-strategy` leaves the column NULL so the
+    /// step inherits the plan/global value.
+    #[test]
+    fn test_step_add_without_retry_strategy_is_none() {
+        let (conn, project) = setup_with_plan();
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "plain",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert!(steps[0].retry_strategy.is_none());
+    }
+
+    /// Provenance: a step that sets its own strategy reports `(step-level)`;
+    /// a step that inherits from the plan reports `(inherited from plan)`;
+    /// a step where neither is set reports the default-keep marker.
+    #[test]
+    fn test_retry_strategy_provenance_all_three_states() {
+        let (conn, project) = setup_with_plan();
+
+        // Plan-level default = rollback so the inherited case is observable.
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        storage::set_plan_retry_strategy(
+            &conn,
+            &plan.id,
+            Some(crate::plan::RetryStrategy::Rollback),
+        )
+        .unwrap();
+
+        // step 1: explicit step-level keep (wins over plan rollback).
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "explicit",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some(crate::plan::RetryStrategy::Keep),
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+        // step 2: no step-level override -> inherits plan rollback.
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "inherits",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+
+        assert_eq!(
+            retry_strategy_provenance(&steps[0], &plan),
+            "keep (step-level)"
+        );
+        assert_eq!(
+            retry_strategy_provenance(&steps[1], &plan),
+            "rollback (inherited from plan)"
+        );
+
+        // Now clear the plan default: step 2 falls through to the global
+        // default-keep marker.
+        storage::set_plan_retry_strategy(&conn, &plan.id, None).unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            retry_strategy_provenance(&steps[1], &plan),
+            "<unset — default keep>"
+        );
+        // Effective resolution must agree with the displayed provenance.
+        assert_eq!(
+            steps[1].effective_retry_strategy(&plan),
+            crate::plan::RetryStrategy::Keep
+        );
+    }
+
+    /// `--clear-retry-strategy` on `step edit` reverts a step-level override
+    /// back to NULL so the step re-inherits the plan/global value.
+    #[test]
+    fn test_step_edit_clear_retry_strategy_reverts_to_inheritance() {
+        let (conn, project) = setup_with_plan();
+
+        // Plan default = rollback.
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        storage::set_plan_retry_strategy(
+            &conn,
+            &plan.id,
+            Some(crate::plan::RetryStrategy::Rollback),
+        )
+        .unwrap();
+
+        // Step starts with an explicit keep override.
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "s",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            Some(crate::plan::RetryStrategy::Keep),
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+
+        // Clear it via step_edit.
+        step_edit(
+            &conn,
+            "bulk-plan",
+            &project,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+            None,
+            false,
+            None,
+            None, // retry_strategy
+            true, // clear_retry_strategy
+            &[],
+            false,
+            &test_out(),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert!(
+            steps[0].retry_strategy.is_none(),
+            "clear must NULL out the step-level override"
+        );
+        // Now reports inherited-from-plan, and effective resolves to rollback.
+        assert_eq!(
+            retry_strategy_provenance(&steps[0], &plan),
+            "rollback (inherited from plan)"
+        );
+        assert_eq!(
+            steps[0].effective_retry_strategy(&plan),
+            crate::plan::RetryStrategy::Rollback
+        );
+    }
+
+    /// `step edit --retry-strategy V` sets a fresh step-level override on a
+    /// step that previously had none.
+    #[test]
+    fn test_step_edit_sets_retry_strategy() {
+        let (conn, project) = setup_with_plan();
+        step_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "s",
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+        step_edit(
+            &conn,
+            "bulk-plan",
+            &project,
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            false,
+            None,
+            false,
+            None,
+            Some(crate::plan::RetryStrategy::Rollback),
+            false,
+            &[],
+            false,
+            &test_out(),
+        )
+        .unwrap();
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].retry_strategy,
+            Some(crate::plan::RetryStrategy::Rollback)
+        );
     }
 }

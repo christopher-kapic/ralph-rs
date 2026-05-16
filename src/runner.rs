@@ -22,6 +22,7 @@ use crate::hooks::HookContext;
 use crate::output::{self, OutputContext, OutputFormat, RunEvent};
 use crate::plan::{Plan, PlanStatus, Step, StepStatus};
 use crate::run_lock;
+use crate::signal::CancelState;
 use crate::storage;
 
 // ---------------------------------------------------------------------------
@@ -95,7 +96,7 @@ pub async fn run_plan(
     config: &Config,
     workdir: &Path,
     options: &RunOptions,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
 ) -> Result<PlanRunResult> {
     // 1. Validate plan status.
@@ -220,7 +221,7 @@ async fn run_plan_inner(
     config: &Config,
     workdir: &Path,
     options: &RunOptions,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
 ) -> Result<PlanRunResult> {
     let effective_plan = effective_plan.clone();
@@ -289,6 +290,16 @@ async fn run_plan_inner(
         storage::update_plan_status(conn, &effective_plan.id, PlanStatus::InProgress)?;
     }
 
+    // Discard any leftover cross-process skip request before iterating.
+    // `request_skip` is only ever written while a run is genuinely live for
+    // this plan (see `runner::skip_step`), and its sole consume/clear site is
+    // the executor's `Completed` arm — so a request that times out, is
+    // aborted, or whose run ends before the targeted step runs would persist
+    // with a stable step UUID and silently skip that same step (with the
+    // stale `--changes`) on *this* fresh run. Clearing here at run start is
+    // safe (no legitimate pre-run skip request exists) and closes that gap.
+    storage::clear_skip_request(conn, &effective_plan.id)?;
+
     // Anchor the elapsed-timer for NDJSON consumers (the TUI's in-process
     // attach path, log shippers): emit `run_started` with the wall-clock
     // start instant before the first step's phase transitions begin
@@ -346,8 +357,14 @@ async fn run_plan_inner(
     };
 
     loop {
-        // Check abort signal between steps.
-        if *abort_rx.borrow() {
+        // Check the cancel signal between steps. Only `Aborted` (Ctrl+C)
+        // terminates the whole run here; a `Skipped` reason only ever
+        // targets the in-flight step (consumed inside the executor) and
+        // must NOT end the run — fall through and pick the next step.
+        if matches!(
+            *abort_rx.borrow(),
+            Some(crate::signal::CancelReason::Aborted)
+        ) {
             eprintln!("Aborted");
             storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
             result.final_status = PlanStatus::Aborted;
@@ -458,6 +475,12 @@ async fn run_plan_inner(
 
         let started = Instant::now();
 
+        // Mark this step in-flight for the duration of `execute_step` so a
+        // same-process `ralph skip` (CLI or TUI) routes through the cancel
+        // ladder instead of just flipping the DB status. The guard clears
+        // the flag on drop — covering the `?`-early-return path too.
+        let _in_flight = crate::signal::StepInFlightGuard::enter();
+
         // Execute the step.
         let step_result = executor::execute_step(
             conn,
@@ -478,6 +501,7 @@ async fn run_plan_inner(
             },
         )
         .await?;
+        drop(_in_flight);
 
         let elapsed = started.elapsed();
         result.steps_executed += 1;
@@ -488,6 +512,7 @@ async fn run_plan_inner(
             StepOutcome::Success => "success",
             StepOutcome::Failed => "failed",
             StepOutcome::Aborted => "aborted",
+            StepOutcome::Skipped => "skipped",
             StepOutcome::Timeout => "timeout",
             StepOutcome::PausedForQuestion => "paused_for_question",
         };
@@ -552,6 +577,20 @@ async fn run_plan_inner(
                 result.final_status = PlanStatus::Aborted;
                 result.step_results.push(step_result);
                 return Ok(result);
+            }
+            StepOutcome::Skipped => {
+                // `ralph skip` killed the in-flight harness for THIS step
+                // only. Unlike Aborted, the run does NOT end — count the
+                // skip and fall through so the loop advances to the next
+                // actionable step.
+                result.steps_skipped += 1;
+                emit_finished(outcome_str)?;
+                if out.format != OutputFormat::Json {
+                    eprintln!(
+                        "[{}/{}] > {} ... SKIPPED",
+                        step_num, total_now, current_step.title
+                    );
+                }
             }
             StepOutcome::Timeout => {
                 result.steps_failed += 1;
@@ -743,7 +782,7 @@ pub async fn run_all_plans(
     config: &Config,
     workdir: &Path,
     options: &RunOptions,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
 ) -> Result<Vec<PlanRunResult>> {
     // 1. Load runnable plans.
@@ -843,7 +882,7 @@ async fn run_all_plans_inner(
     config: &Config,
     workdir: &Path,
     options: &RunOptions,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
     topo_order: Vec<String>,
     plan_by_id: HashMap<String, Plan>,
@@ -878,8 +917,12 @@ async fn run_all_plans_inner(
     let total = topo_order.len();
 
     for (i, plan_id) in topo_order.iter().enumerate() {
-        // Abort check between plans.
-        if *abort_rx.borrow() {
+        // Abort check between plans. Only Ctrl+C (`Aborted`) tears the
+        // multi-plan run down; a leftover `Skipped` reason is step-scoped.
+        if matches!(
+            *abort_rx.borrow(),
+            Some(crate::signal::CancelReason::Aborted)
+        ) {
             eprintln!("Aborted before plan {}/{}", i + 1, total);
             return Ok(results);
         }
@@ -1098,7 +1141,7 @@ pub async fn resume_plan(
     plan: &Plan,
     config: &Config,
     workdir: &Path,
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
 ) -> Result<PlanRunResult> {
     // Validate status early so the sweep never fires on a plan the caller
@@ -1150,11 +1193,19 @@ pub async fn resume_plan(
 /// Marks the step as skipped and returns the step number that was skipped.
 /// The optional `reason` is persisted on the step so it appears in
 /// `ralph status -v` and `ralph log`.
+///
+/// `changes` is the user's `--changes` choice. It only matters when the
+/// target step is *currently running in this process*: in that case the
+/// executor (reached through the cancel/kill ladder) parks the harness's
+/// uncommitted work per this strategy. For any non-running step the
+/// changes in the tree aren't causally tied to the skip, so the strategy
+/// is ignored and a one-line note is emitted.
 pub fn skip_step(
     conn: &Connection,
     plan: &Plan,
     step_num: Option<usize>,
     reason: Option<&str>,
+    changes: crate::git::ParkStrategyKind,
 ) -> Result<usize> {
     let steps = storage::list_steps(conn, &plan.id)?;
 
@@ -1183,6 +1234,64 @@ pub fn skip_step(
         StepStatus::Aborted => {
             // Allow skipping aborted steps too.
         }
+    }
+
+    // If the target is the step currently running, the skip must interrupt
+    // the live harness — not just flip a DB status the running runner
+    // ignores. There are two transports, tried in order:
+    //
+    //  1. Same-process fast path (`request_skip_in_flight`): only fires when
+    //     the skip and the blocking runner share a process. In production
+    //     they never do (the runner is always a separate subprocess from
+    //     `ralph skip` / the TUI), so this is effectively a unit-test-only
+    //     path — but it must keep working for those tests.
+    //
+    //  2. Cross-process DB bridge (`storage::request_skip`): the production
+    //     path. We write `plans.skip_requested_step_id` + `skip_changes`;
+    //     the runner that owns the in-flight harness polls it mid-attempt
+    //     (see `executor::poll_cross_process_skip`) and funnels it into the
+    //     SAME executor skip handling. Modeled on `plans.pause_requested`.
+    //     Crucially this write is NOT gated behind the per-project run lock
+    //     (a live run holds that lock for its whole duration), so it always
+    //     succeeds even while a run is in progress.
+    //
+    // On either in-flight path we must NOT flip the status here — the
+    // executor owns that on the skip path, and a double write would race the
+    // in-flight attempt.
+    if step.status == StepStatus::InProgress {
+        if crate::signal::request_skip_in_flight(changes) {
+            eprintln!(
+                "Skipping in-flight step {} '{}' — interrupting the harness…",
+                actual_num, step.title
+            );
+            return Ok(actual_num);
+        }
+
+        // Not same-process. If a run is genuinely live for this project,
+        // hand the skip off to it via the DB bridge.
+        let live = storage::get_live_run(conn, &plan.project)?;
+        if live.as_ref().and_then(|r| r.plan_id.as_deref()) == Some(plan.id.as_str()) {
+            storage::request_skip(conn, &plan.id, &step.id, changes)?;
+            eprintln!(
+                "Requested skip of in-flight step {} '{}' — interrupting the harness…",
+                actual_num, step.title
+            );
+            return Ok(actual_num);
+        }
+        // No live run despite an InProgress status: this is a stale status
+        // (e.g. a crashed prior run). Fall through to the synchronous
+        // DB-flip below so the user's skip still takes effect.
+    }
+
+    // Not running here: the working tree's changes (if any) aren't causally
+    // tied to *this* step, so we deliberately don't touch them. Note that
+    // the --changes choice had no effect unless it was the (no-op) default.
+    if changes != crate::git::ParkStrategyKind::Stash {
+        eprintln!(
+            "note: --changes has no effect — step {} is not running, so its \
+             working-tree changes are left untouched",
+            actual_num
+        );
     }
 
     storage::mark_step_skipped(conn, &step.id, reason)?;
@@ -1765,13 +1874,13 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
         }
     }
 
@@ -1847,6 +1956,7 @@ mod tests {
                 skipped_reason: None,
                 change_policy: crate::plan::ChangePolicy::Required,
                 tags: vec![],
+                retry_strategy: None,
             })
             .collect()
     }
@@ -2104,7 +2214,14 @@ mod tests {
         )
         .unwrap();
 
-        let skipped = skip_step(&conn, &plan, Some(2), None).unwrap();
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(2),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         assert_eq!(skipped, 2);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2147,11 +2264,183 @@ mod tests {
         // Mark first as complete so current is "Second".
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
 
-        let skipped = skip_step(&conn, &plan, None, None).unwrap();
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            None,
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         assert_eq!(skipped, 2);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[1].status, StepStatus::Skipped);
+    }
+
+    /// STEP 16: `skip_step` against a step that is in-flight in THIS
+    /// process must route through the cancel channel (signalling
+    /// `Skipped`, which kicks the kill ladder) rather than flipping the DB
+    /// status itself — the executor owns the status/log write on that
+    /// path. The step must therefore stay `InProgress` here (no executor
+    /// is running in this unit test to consume the signal), and the cancel
+    /// channel must receive exactly `Some(CancelReason::Skipped)`.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_skip_step_in_flight_routes_through_cancel_channel() {
+        // Holding the std::Mutex guard across .await serializes the
+        // process-wide cancel registry / in-flight flag against the
+        // signal-module tests that touch the same globals. The
+        // current_thread runtime rules out cross-thread guard transfer.
+        let _guard = crate::signal::lock_exit_cleanup_test();
+
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
+
+        // Register a cancel sender for this process (as the signal listener
+        // would for a real run) and mark a step in-flight.
+        let (_handle, mut rx) = crate::signal::install_and_spawn_with_handle();
+        let _in_flight = crate::signal::StepInFlightGuard::enter();
+
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
+        assert_eq!(skipped, 1);
+
+        // The cancel channel received the Skipped reason (distinct from
+        // the Aborted the SIGINT/SIGTERM listener would send).
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), Some(crate::signal::CancelReason::Skipped));
+
+        // skip_step must NOT have flipped the status — the executor owns
+        // that on the in-flight path.
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].status,
+            StepStatus::InProgress,
+            "in-flight skip must defer the status flip to the executor"
+        );
+    }
+
+    /// Counterpart: with NO step in-flight (the common `ralph skip` case
+    /// where the runner is a different process, or nothing is running),
+    /// `skip_step` keeps the original synchronous DB-flip behavior.
+    #[test]
+    fn test_skip_step_not_in_flight_flips_db() {
+        let _guard = crate::signal::lock_exit_cleanup_test();
+        crate::signal::set_step_in_flight(false);
+
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
+
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
+        assert_eq!(skipped, 1);
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].status,
+            StepStatus::Skipped,
+            "no in-flight step → plain DB flip"
+        );
+    }
+
+    #[test]
+    fn test_skip_step_stale_in_progress_ignores_other_plan_live_run() {
+        let _guard = crate::signal::lock_exit_cleanup_test();
+        crate::signal::set_step_in_flight(false);
+
+        let conn = setup();
+        let project = "/p";
+        let plan =
+            storage::create_plan(&conn, "target", project, "b", "d", None, None, &[]).unwrap();
+        let other =
+            storage::create_plan(&conn, "other", project, "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
+
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![project, 42_i64, other.id, other.slug],
+        )
+        .unwrap();
+
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
+        assert_eq!(skipped, 1);
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps[0].status,
+            StepStatus::Skipped,
+            "a run lock for a different plan must not turn stale InProgress into a DB skip request"
+        );
+        assert!(
+            storage::peek_skip_request(&conn, &plan.id)
+                .unwrap()
+                .is_none(),
+            "no runner is polling this plan, so skip_step must not leave an orphaned request"
+        );
     }
 
     #[test]
@@ -2174,7 +2463,13 @@ mod tests {
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
 
-        let result = skip_step(&conn, &plan, Some(1), None);
+        let result = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        );
         assert!(result.is_err());
     }
 
@@ -2197,7 +2492,13 @@ mod tests {
         )
         .unwrap();
 
-        let result = skip_step(&conn, &plan, Some(5), None);
+        let result = skip_step(
+            &conn,
+            &plan,
+            Some(5),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        );
         assert!(result.is_err());
     }
 
@@ -2220,7 +2521,14 @@ mod tests {
         )
         .unwrap();
 
-        let skipped = skip_step(&conn, &plan, Some(1), Some("redundant after H7")).unwrap();
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            Some("redundant after H7"),
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         assert_eq!(skipped, 1);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2250,7 +2558,14 @@ mod tests {
         )
         .unwrap();
 
-        skip_step(&conn, &plan, Some(1), None).unwrap();
+        skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Skipped);
@@ -2276,7 +2591,14 @@ mod tests {
         )
         .unwrap();
 
-        skip_step(&conn, &plan, Some(1), Some("because")).unwrap();
+        skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            Some("because"),
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         storage::reset_step(&conn, &s1.id).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
@@ -2304,11 +2626,104 @@ mod tests {
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Failed).unwrap();
 
-        let skipped = skip_step(&conn, &plan, Some(1), None).unwrap();
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Stash,
+        )
+        .unwrap();
         assert_eq!(skipped, 1);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Skipped);
+    }
+
+    /// STEP 17: skipping a step that is NOT currently running must leave
+    /// the working tree completely alone — those changes aren't causally
+    /// tied to the skip — even when a non-default `--changes` is passed.
+    /// Only the DB status flips.
+    #[test]
+    fn test_skip_non_running_step_ignores_changes_and_leaves_tree() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+
+        // A dirty working tree the user has unrelated to any step.
+        fs::write(dir.join("README.md"), "# locally edited").unwrap();
+        fs::write(dir.join("scratch.txt"), "user scratch").unwrap();
+        assert!(git::has_uncommitted_changes(&dir).unwrap());
+        let before = git::get_all_changed_files(&dir).unwrap();
+
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            "s",
+            &dir.to_string_lossy(),
+            "b",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let (s1, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Pending (NOT in-flight). request_skip_in_flight will be a no-op
+        // because no step is in-flight in this process.
+        assert_eq!(s1.status, StepStatus::Pending);
+
+        // A non-default --changes: discard. It must have NO effect because
+        // the step isn't running.
+        let skipped = skip_step(
+            &conn,
+            &plan,
+            Some(1),
+            None,
+            crate::git::ParkStrategyKind::Discard,
+        )
+        .unwrap();
+        assert_eq!(skipped, 1);
+
+        // DB flipped…
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(steps[0].status, StepStatus::Skipped);
+
+        // …but the working tree is byte-for-byte untouched: no rollback,
+        // no stash, no commit.
+        assert!(git::has_uncommitted_changes(&dir).unwrap());
+        assert_eq!(git::get_all_changed_files(&dir).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# locally edited"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("scratch.txt")).unwrap(),
+            "user scratch"
+        );
+        // No ralph-skip stash was created.
+        let stash = std::process::Command::new("git")
+            .args(["stash", "list"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&stash.stdout).trim().is_empty(),
+            "non-running skip must not create a stash"
+        );
     }
 
     // -- step_number_in_plan tests --
@@ -2583,7 +2998,7 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let workdir = std::path::Path::new("/tmp");
         let options = RunOptions {
             all_plans: true,
@@ -2611,7 +3026,7 @@ mod tests {
 
         let conn = setup();
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let workdir = std::path::Path::new("/tmp");
         let options = RunOptions {
             all_plans: true,
@@ -2758,13 +3173,13 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -2798,13 +3213,13 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -2883,7 +3298,7 @@ mod tests {
             .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: true,
@@ -2951,7 +3366,7 @@ mod tests {
             .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: true,
@@ -3039,7 +3454,7 @@ mod tests {
             .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: true,
@@ -3114,7 +3529,7 @@ mod tests {
         assert!(plan.last_run_branch.is_none());
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: true,
@@ -3174,7 +3589,7 @@ mod tests {
             .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: false,
@@ -3277,7 +3692,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, false, false);
         let options = RunOptions {
             current_branch: true,
@@ -3387,13 +3802,13 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -3450,13 +3865,13 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
-            context_prepend: None,
             questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");
@@ -3547,7 +3962,7 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, true, true);
         // current_branch=false so run_plan drives the stash/branch/teardown
         // path; auto_stash=true mirrors the CLI default.
@@ -3621,7 +4036,7 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let (_tx, rx) = watch::channel(false);
+        let (_tx, rx) = watch::channel(None);
         let out = OutputContext::from_cli(false, true, true);
         let options = RunOptions {
             auto_stash: true,
@@ -3914,6 +4329,7 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
+            retry_strategy: None,
         };
         grown.insert(1, new_step.clone());
         // The inserted step becomes step 2; what was step 2 (s1) is now

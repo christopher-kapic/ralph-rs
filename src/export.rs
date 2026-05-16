@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::path::Path;
 
-use crate::plan::{ChangePolicy, Plan, Step};
+use crate::plan::{ChangePolicy, Plan, RetryStrategy, Step};
 use crate::storage;
 
 // ---------------------------------------------------------------------------
@@ -41,11 +41,12 @@ pub struct ExportedPlanMeta {
     pub depends_on: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_harness: Option<String>,
-    /// Per-plan context-prepend override. Omitted from the JSON when the
-    /// plan is using the system default so pre-V14 export output is
-    /// unchanged for plans that didn't customize their prepend.
+    /// Plan-level retry-strategy override. Omitted from the JSON when the
+    /// plan has no override (`None`) so an unset plan exports identically
+    /// to pre-V24 output; a `Some` value round-trips back via the matching
+    /// `#[serde(default)]` field on [`crate::import::ImportedPlanMeta`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_prepend: Option<String>,
+    pub retry_strategy: Option<RetryStrategy>,
 }
 
 /// Step stripped of internal fields.
@@ -67,6 +68,12 @@ pub struct ExportedStep {
     /// tags so pre-V13 export output is unchanged for untagged steps.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Step-level retry-strategy override. Omitted from the JSON when the
+    /// step has no override (`None`) so an unset step exports identically
+    /// to pre-V24 output; a `Some` value round-trips back via the matching
+    /// `#[serde(default)]` field on [`crate::import::ImportedStep`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_strategy: Option<RetryStrategy>,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +101,7 @@ pub fn build_exported_plan(
         deterministic_tests: plan.deterministic_tests.clone(),
         depends_on: depends_on_slugs,
         plan_harness: plan.plan_harness.clone(),
-        context_prepend: plan.context_prepend.clone(),
+        retry_strategy: plan.retry_strategy,
     };
 
     let exported_steps: Vec<ExportedStep> = steps
@@ -109,6 +116,7 @@ pub fn build_exported_plan(
             model: s.model.clone(),
             change_policy: s.change_policy,
             tags: s.tags.clone(),
+            retry_strategy: s.retry_strategy,
         })
         .collect();
 

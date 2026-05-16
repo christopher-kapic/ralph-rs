@@ -218,6 +218,11 @@ pub struct InitOptions {
     /// Overwrite an existing config file. Without this, an existing config
     /// is preserved and init is a no-op for the config itself.
     pub force: bool,
+    /// Re-seed the global prompt (`config.prompt`) with
+    /// [`crate::prompt::DEFAULT_CONTEXT_PREPEND`] unconditionally, even when
+    /// the user has customized it. Without this, the global prompt is only
+    /// seeded when it is missing or blank.
+    pub restore_prompts: bool,
 }
 
 pub fn cmd_init(opts: &InitOptions, out: &OutputContext) -> Result<()> {
@@ -275,6 +280,15 @@ pub fn cmd_init(opts: &InitOptions, out: &OutputContext) -> Result<()> {
             config_path.display()
         );
     }
+
+    // 4b. Seed the global prompt. `ralph init` is the canonical source of
+    //     ralph's built-in introspection block (`DEFAULT_CONTEXT_PREPEND`):
+    //     a fresh or blank `config.prompt` is filled with it, and
+    //     `--restore-prompts` re-seeds it unconditionally even over a
+    //     user-customized value. An existing non-empty custom prompt is
+    //     otherwise never touched. Persisted via the same atomic
+    //     tmp-file + rename path as every other config mutation.
+    seed_global_prompt(&config_dir, opts.restore_prompts, out)?;
 
     // 5. Initialize database (idempotent — `db::open` runs migrations).
     let _conn = db::open()?;
@@ -384,6 +398,61 @@ fn migrate_existing_config(config_path: &Path, out: &OutputContext) -> Result<()
     }
     eprintln!("  Saved to: {}", config_path.display());
 
+    Ok(())
+}
+
+/// Seed the global prompt (`config.prompt`) from
+/// [`crate::prompt::DEFAULT_CONTEXT_PREPEND`].
+///
+/// `ralph init` is the canonical seed source for ralph's built-in
+/// introspection block. The rule:
+///
+/// - `config.prompt` is `None` or empty/whitespace-only → seed it.
+/// - `restore_prompts` is `true` → seed it unconditionally, overwriting any
+///   existing customization.
+/// - Otherwise → leave an existing non-empty custom prompt untouched.
+///
+/// When a write is needed it goes through `Config::save_at`, which uses the
+/// same atomic tmp-file + rename as every other config mutation, so a
+/// concurrent reader never observes a half-written file. A no-op (custom
+/// prompt preserved, or already equal to the seed) does not rewrite the file.
+fn seed_global_prompt(config_dir: &Path, restore_prompts: bool, out: &OutputContext) -> Result<()> {
+    let icon = output::check_icon(out.color);
+
+    // Load the config that `cmd_init` just created/migrated. This respects
+    // the same `$XDG_CONFIG_HOME` that produced `config_dir`, so it reads the
+    // file we wrote a few steps earlier.
+    let mut cfg = config::load_or_create_config()
+        .context("Failed to load config for global-prompt seeding")?;
+
+    let is_blank = cfg
+        .prompt
+        .as_deref()
+        .map(|p| p.trim().is_empty())
+        .unwrap_or(true);
+
+    if !restore_prompts && !is_blank {
+        // Existing customization is preserved verbatim — never clobbered
+        // without an explicit --restore-prompts.
+        return Ok(());
+    }
+
+    let seed = crate::prompt::DEFAULT_CONTEXT_PREPEND.to_string();
+    if cfg.prompt.as_deref() == Some(seed.as_str()) {
+        // Already exactly the seed (e.g. a no-op re-run) — skip the write so
+        // we don't churn the file's mtime.
+        return Ok(());
+    }
+
+    cfg.prompt = Some(seed);
+    cfg.save_at(config_dir)
+        .context("Failed to persist seeded global prompt")?;
+
+    if restore_prompts && !is_blank {
+        eprintln!("{icon} Restored global prompt to ralph's built-in default.");
+    } else {
+        eprintln!("{icon} Seeded global prompt with ralph's built-in default.");
+    }
     Ok(())
 }
 
@@ -579,6 +648,123 @@ mod tests {
         (conn, project)
     }
 
+    // -- global-prompt seeding (`ralph init`) -----------------------------
+
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serialize tests that mutate `$XDG_CONFIG_HOME`. Same pattern as the
+    /// config_cmd test module — a process-wide env var can't be raced.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct XdgGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl Drop for XdgGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+                None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            }
+        }
+    }
+    fn set_xdg(path: &Path) -> XdgGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: guarded by ENV_LOCK for the duration of the returned guard.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", path) };
+        XdgGuard { _lock: lock, prev }
+    }
+
+    #[test]
+    fn test_seed_global_prompt_seeds_when_missing() {
+        // Fresh config (Config::default has prompt: None) → seeded with the
+        // built-in introspection block, which contains `ralph status`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = set_xdg(tmp.path());
+        let config_dir = config::config_dir().expect("config_dir");
+
+        // A default config has no prompt.
+        let fresh = config::load_or_create_config().expect("load fresh");
+        assert!(fresh.prompt.is_none(), "default config must have no prompt");
+
+        seed_global_prompt(&config_dir, false, &test_out()).expect("seed ok");
+
+        let reloaded = config::load_or_create_config().expect("reload");
+        let prompt = reloaded.prompt.expect("prompt seeded");
+        assert_eq!(prompt, crate::prompt::DEFAULT_CONTEXT_PREPEND);
+        assert!(
+            prompt.contains("ralph status"),
+            "seeded prompt must contain the ralph-CLI hint"
+        );
+    }
+
+    #[test]
+    fn test_seed_global_prompt_seeds_when_blank() {
+        // Whitespace-only `config.prompt` is treated as unset → seeded.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = set_xdg(tmp.path());
+        let config_dir = config::config_dir().expect("config_dir");
+
+        let mut cfg = config::load_or_create_config().expect("load");
+        cfg.prompt = Some("   \n\t  ".to_string());
+        cfg.save_at(&config_dir).expect("save blank");
+
+        seed_global_prompt(&config_dir, false, &test_out()).expect("seed ok");
+
+        let reloaded = config::load_or_create_config().expect("reload");
+        assert_eq!(
+            reloaded.prompt.as_deref(),
+            Some(crate::prompt::DEFAULT_CONTEXT_PREPEND)
+        );
+        assert!(reloaded.prompt.unwrap().contains("ralph status"));
+    }
+
+    #[test]
+    fn test_seed_global_prompt_preserves_customization_without_flag() {
+        // Re-running init WITHOUT --restore-prompts must never clobber a
+        // user-customized prompt.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = set_xdg(tmp.path());
+        let config_dir = config::config_dir().expect("config_dir");
+
+        let custom = "MY CUSTOM GLOBAL PROMPT — do not touch";
+        let mut cfg = config::load_or_create_config().expect("load");
+        cfg.prompt = Some(custom.to_string());
+        cfg.save_at(&config_dir).expect("save custom");
+
+        seed_global_prompt(&config_dir, false, &test_out()).expect("seed ok");
+
+        let reloaded = config::load_or_create_config().expect("reload");
+        assert_eq!(
+            reloaded.prompt.as_deref(),
+            Some(custom),
+            "customization must be preserved without --restore-prompts"
+        );
+    }
+
+    #[test]
+    fn test_seed_global_prompt_restore_overwrites_customization() {
+        // --restore-prompts re-seeds unconditionally, even over a
+        // user-customized prompt.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = set_xdg(tmp.path());
+        let config_dir = config::config_dir().expect("config_dir");
+
+        let custom = "MY CUSTOM GLOBAL PROMPT — should be replaced";
+        let mut cfg = config::load_or_create_config().expect("load");
+        cfg.prompt = Some(custom.to_string());
+        cfg.save_at(&config_dir).expect("save custom");
+
+        seed_global_prompt(&config_dir, true, &test_out()).expect("seed ok");
+
+        let reloaded = config::load_or_create_config().expect("reload");
+        let prompt = reloaded.prompt.expect("prompt present");
+        assert_ne!(prompt, custom, "--restore-prompts must overwrite");
+        assert_eq!(prompt, crate::prompt::DEFAULT_CONTEXT_PREPEND);
+        assert!(prompt.contains("ralph status"));
+    }
+
     fn test_out() -> OutputContext {
         OutputContext {
             format: OutputFormat::Plain,
@@ -685,6 +871,7 @@ mod tests {
             Some("feat/test"),
             None,
             None,
+            None,
             &["cargo build".to_string()],
             &[],
             &test_out(),
@@ -698,6 +885,36 @@ mod tests {
         assert_eq!(plan.description, "A test plan");
         assert_eq!(plan.branch_name, "feat/test");
         assert_eq!(plan.deterministic_tests, vec!["cargo build"]);
+        // No --retry-strategy given -> plan has no override (None).
+        assert!(plan.retry_strategy.is_none());
+    }
+
+    #[test]
+    fn test_plan_create_persists_retry_strategy() {
+        let (conn, project) = setup();
+
+        plan_create(
+            &conn,
+            "rs-plan",
+            &project,
+            None,
+            None,
+            None,
+            None,
+            Some(crate::plan::RetryStrategy::Rollback),
+            &[],
+            &[],
+            &test_out(),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "rs-plan", &project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.retry_strategy,
+            Some(crate::plan::RetryStrategy::Rollback)
+        );
     }
 
     #[test]
@@ -708,6 +925,7 @@ mod tests {
             &conn,
             "my-plan",
             &project,
+            None,
             None,
             None,
             None,
@@ -737,6 +955,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -757,6 +976,7 @@ mod tests {
             &conn,
             "my-plan",
             &project,
+            None,
             None,
             None,
             None,
@@ -784,6 +1004,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -802,6 +1023,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             &[],
             &test_out(),
         )
@@ -817,6 +1039,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &[],
@@ -845,6 +1068,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -861,6 +1085,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &[],
@@ -880,6 +1105,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             &[],
             &test_out(),
         )
@@ -896,6 +1122,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &[],
@@ -925,6 +1152,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -943,6 +1171,7 @@ mod tests {
             None,
             &criteria,
             Some(5),
+            None,
             None,
             &[],
             &test_out(),
@@ -970,6 +1199,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -986,6 +1216,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &[],
@@ -1005,6 +1236,7 @@ mod tests {
             None,
             &criteria,
             Some(2),
+            None,
             None,
             &[],
             &test_out(),
@@ -1032,6 +1264,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1050,6 +1283,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             &[],
             &test_out(),
         )
@@ -1065,6 +1299,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &[],
@@ -1094,6 +1329,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1110,6 +1346,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &[],
@@ -1133,6 +1370,8 @@ mod tests {
             None,
             false,
             None,
+            None,
+            false,
             &[],
             false,
             &test_out(),
@@ -1159,6 +1398,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1177,6 +1417,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             &[],
             &test_out(),
         )
@@ -1188,7 +1429,7 @@ mod tests {
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
 
-        step_reset(&conn, "my-plan", &project, Some(1), None, &test_out()).unwrap();
+        step_reset(&conn, "my-plan", &project, Some(1), None, true, &test_out()).unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Pending);
@@ -1203,6 +1444,7 @@ mod tests {
             &conn,
             "my-plan",
             &project,
+            None,
             None,
             None,
             None,
@@ -1225,6 +1467,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             &[],
             &test_out(),
         )
@@ -1242,6 +1485,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             &[],
             &test_out(),
         )
@@ -1257,6 +1501,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &[],
@@ -1288,6 +1533,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1304,6 +1550,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &[],
@@ -1323,6 +1570,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
             &[],
             &test_out(),
         )
@@ -1338,6 +1586,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &[],
@@ -1371,6 +1620,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1384,6 +1634,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1393,6 +1644,7 @@ mod tests {
             &conn,
             "plan-c",
             &project,
+            None,
             None,
             None,
             None,
@@ -1430,6 +1682,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &["nonexistent".to_string()],
             &test_out(),
@@ -1453,6 +1706,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1462,6 +1716,7 @@ mod tests {
             &conn,
             "plan-b",
             &project,
+            None,
             None,
             None,
             None,
@@ -1500,6 +1755,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1528,6 +1784,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1537,6 +1794,7 @@ mod tests {
             &conn,
             "plan-b",
             &project,
+            None,
             None,
             None,
             None,
@@ -1579,6 +1837,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1588,6 +1847,7 @@ mod tests {
             &conn,
             "plan-b",
             &project,
+            None,
             None,
             None,
             None,
@@ -1632,6 +1892,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1645,6 +1906,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &["plan-a".to_string()],
             &test_out(),
@@ -1654,6 +1916,7 @@ mod tests {
             &conn,
             "plan-c",
             &project,
+            None,
             None,
             None,
             None,
@@ -1690,6 +1953,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1706,6 +1970,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
             &[],

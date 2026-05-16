@@ -17,6 +17,257 @@ use anyhow::Result;
 use tokio::sync::watch;
 
 // ---------------------------------------------------------------------------
+// CancelReason
+// ---------------------------------------------------------------------------
+
+/// Why the harness cancel channel was tripped.
+///
+/// The abort/cancel watch channel carries `Option<CancelReason>`: `None` while
+/// the run is healthy, `Some(reason)` once something asked the in-flight
+/// harness child to die. Both reasons drive the *same* SIGTERM→SIGKILL ladder
+/// in [`crate::executor`]; the reason only changes what the executor does
+/// *after* the child is dead:
+///
+/// - [`CancelReason::Aborted`] — operator Ctrl+C / SIGTERM. Terminates the
+///   **whole run** (the existing two-stage shutdown behavior).
+/// - [`CancelReason::Skipped`] — operator ran `ralph skip` (or the TUI skip
+///   binding) against the step that is currently executing in *this* process.
+///   Only the current step is dropped; the run advances to the next step.
+///
+/// They are deliberately distinct: conflating them would make a skip kill the
+/// entire run, which is the opposite of what the user asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// Ctrl+C / SIGTERM — abort the whole run.
+    Aborted,
+    /// `ralph skip` against the in-flight step — drop this step, keep running.
+    Skipped,
+}
+
+/// Payload carried by the cancel watch channel. `None` == not cancelled.
+pub type CancelState = Option<CancelReason>;
+
+// ---------------------------------------------------------------------------
+// In-process cancel registry (for `ralph skip` of the in-flight step)
+// ---------------------------------------------------------------------------
+
+/// The cancel `Sender` for the run active in *this* process, if any.
+///
+/// `signal::install_and_spawn*` registers the sender it hands the runner here
+/// so a same-process `ralph skip` (a free function with no channel handle of
+/// its own) can inject [`CancelReason::Skipped`] into the exact channel the
+/// executor's wait loop is listening on — reusing the existing kill ladder
+/// rather than spawning a parallel one. Cleared on a fresh install.
+static ACTIVE_CANCEL_TX: Mutex<Option<watch::Sender<CancelState>>> = Mutex::new(None);
+
+/// The change-handling strategy the most recent in-flight `ralph skip`
+/// requested via `--changes`. `request_skip_in_flight` stashes it here just
+/// before tripping the cancel channel so the executor's skip-finalize path
+/// (a different call frame, reached via the kill ladder) knows whether to
+/// stash / commit / discard the harness's uncommitted work. Read-once:
+/// [`take_requested_park_kind`] consumes it so a stale value can't leak into
+/// a later, unrelated skip.
+static REQUESTED_PARK_KIND: Mutex<Option<crate::git::ParkStrategyKind>> = Mutex::new(None);
+
+/// `true` while the runner in this process is inside `execute_step` for a
+/// step. `skip_step` consults this to decide whether to route through the
+/// cancel ladder (a step is in-flight here) or just flip the DB status (no
+/// in-flight step, or the runner is a different process entirely).
+static STEP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+fn register_active_cancel_tx(tx: watch::Sender<CancelState>) {
+    *ACTIVE_CANCEL_TX.lock().unwrap() = Some(tx);
+}
+
+/// Test-only: publish a caller-owned cancel `Sender` into the process-global
+/// registry so executor code that reaches for `ACTIVE_CANCEL_TX`
+/// (`clear_cancel_state`, `clear_pending_skip_state`) operates on the very
+/// channel the test handed `execute_step`. Mirrors what
+/// `spawn_signal_listener` does for a real run, without spawning the signal
+/// listener task.
+#[cfg(test)]
+pub fn install_skip_channel_for_test(tx: watch::Sender<CancelState>) {
+    register_active_cancel_tx(tx);
+}
+
+/// Test-only: seed the park-kind slot exactly as `request_skip_in_flight`
+/// would, so a test can assert it is consumed/cleared on the skip and
+/// non-skip terminal paths.
+#[cfg(test)]
+pub fn set_requested_park_kind_for_test(kind: crate::git::ParkStrategyKind) {
+    *REQUESTED_PARK_KIND.lock().unwrap() = Some(kind);
+}
+
+/// Mark a step as in-flight (or not) for the in-process runner. Returns a
+/// guard-free toggle — the runner sets `true` immediately before
+/// `execute_step` and `false` immediately after.
+pub fn set_step_in_flight(in_flight: bool) {
+    STEP_IN_FLIGHT.store(in_flight, Ordering::SeqCst);
+}
+
+/// Whether a step is currently executing in this process's runner.
+pub fn step_in_flight() -> bool {
+    STEP_IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+/// RAII guard: sets the in-flight flag on construction, clears it on drop
+/// (including the `?`-early-return / panic paths in the runner loop). While
+/// it's alive, a same-process `ralph skip` routes through the cancel ladder.
+pub struct StepInFlightGuard {
+    _private: (),
+}
+
+impl StepInFlightGuard {
+    pub fn enter() -> Self {
+        set_step_in_flight(true);
+        Self { _private: () }
+    }
+}
+
+impl Drop for StepInFlightGuard {
+    fn drop(&mut self) {
+        set_step_in_flight(false);
+    }
+}
+
+/// Request that the in-flight step be skipped: record the requested
+/// change-handling strategy, then inject [`CancelReason::Skipped`] into this
+/// process's cancel channel, kicking the existing SIGTERM→SIGKILL ladder
+/// against the harness child.
+///
+/// `park_kind` is the user's `--changes` choice; it's stashed in a
+/// process-global slot the executor consumes via
+/// [`take_requested_park_kind`] when it reaches the skip-finalize path
+/// (a separate call frame reached only through the kill ladder, so it can't
+/// be threaded as a normal argument).
+///
+/// Returns `true` if a cancel sender was registered and a step is in-flight
+/// (so the caller should expect the executor to mark the step `Skipped`),
+/// `false` if there's nothing running here to interrupt (the caller should
+/// fall back to a plain DB status flip) — including the case where a
+/// whole-run [`CancelReason::Aborted`] is already latched and the skip is
+/// therefore declined (see [`inject_skip_with_kind`] for the rationale).
+pub fn request_skip_in_flight(park_kind: crate::git::ParkStrategyKind) -> bool {
+    if !step_in_flight() {
+        return false;
+    }
+    let guard = ACTIVE_CANCEL_TX.lock().unwrap();
+    match guard.as_ref() {
+        Some(tx) => inject_skip_into(tx, park_kind),
+        None => false,
+    }
+}
+
+/// Send a `Skipped` cancel into `tx` **unless** a whole-run
+/// [`CancelReason::Aborted`] is already latched on it.
+///
+/// A Ctrl+C / SIGTERM that has already requested whole-run shutdown
+/// outranks a single-step skip: the signal handler deliberately overrides a
+/// pending `Skipped` with `Aborted` (see the `run` loop), so we enforce the
+/// symmetric invariant here — never downgrade a latched `Aborted` back to a
+/// `Skipped`, which would let the run silently continue past a Ctrl+C when a
+/// skip request happened to be in flight. Returns `true` when the skip was
+/// injected, `false` when it was declined because an abort already won.
+fn inject_skip_into(
+    tx: &watch::Sender<CancelState>,
+    park_kind: crate::git::ParkStrategyKind,
+) -> bool {
+    if *tx.borrow() == Some(CancelReason::Aborted) {
+        return false;
+    }
+    *REQUESTED_PARK_KIND.lock().unwrap() = Some(park_kind);
+    let _ = tx.send(Some(CancelReason::Skipped));
+    true
+}
+
+/// Drive a skip into *this* process's own cancel channel.
+///
+/// This is the cross-process bridge's funnel point. `request_skip_in_flight`
+/// is for the *same-process* path (a `ralph skip` that shares a process with
+/// the blocking runner — only unit tests, in practice). In production the
+/// runner is its own process: it polls `plans.skip_requested_step_id` (see
+/// [`crate::storage::take_skip_request`]) mid-attempt and, when the pending
+/// request targets the step it currently has in-flight, calls this to record
+/// the park kind and inject [`CancelReason::Skipped`] into the very channel
+/// its own executor wait loop is listening on. From that point on, *all* of
+/// the existing, tested `WaitResult::Skipped` →
+/// `finalize_skipped`/`cancel_skipped_attempt` handling runs unchanged.
+///
+/// Unlike [`request_skip_in_flight`] there is no `step_in_flight()` gate: the
+/// caller is the runner itself, which by construction is mid-attempt for the
+/// step it just matched. Returns `true` if the skip was injected, `false`
+/// when no cancel sender was registered **or** a whole-run `Aborted` was
+/// already latched and the skip was therefore declined (the caller's poll
+/// then stops and lets the abort tear the run down).
+pub fn inject_skip_with_kind(park_kind: crate::git::ParkStrategyKind) -> bool {
+    let guard = ACTIVE_CANCEL_TX.lock().unwrap();
+    match guard.as_ref() {
+        Some(tx) => inject_skip_into(tx, park_kind),
+        None => false,
+    }
+}
+
+/// Clear a stale `Skipped` cancel reason **and** the park-kind slot, but
+/// only when a skip is what's latched — never disturb a pending
+/// `Aborted` (whole-run shutdown must survive). Defensive cleanup used by
+/// the executor's non-skip terminal arms so a `Skipped` that raced and lost
+/// can't leak into the next attempt/step (Fix 3).
+pub fn clear_pending_skip_state() {
+    let is_skip = {
+        let guard = ACTIVE_CANCEL_TX.lock().unwrap();
+        matches!(guard.as_ref(), Some(tx) if *tx.borrow() == Some(CancelReason::Skipped))
+    };
+    if is_skip {
+        // Drop any recorded park kind first so even if the channel reset
+        // races a fresh request, the slot doesn't carry a stale value.
+        let _ = REQUESTED_PARK_KIND.lock().unwrap().take();
+        clear_cancel_state();
+    }
+}
+
+/// Consume the park strategy a prior [`request_skip_in_flight`] recorded.
+///
+/// Returns `None` when no in-flight skip set one (e.g. the skip arrived as
+/// a cross-process SIGTERM, or this is an `Aborted` cancel, not a skip) —
+/// the executor then falls back to its default (stash) so a skip never
+/// silently loses the harness's work. Taking it (rather than peeking) keeps
+/// a value from one skip from leaking into a later unrelated one.
+pub fn take_requested_park_kind() -> Option<crate::git::ParkStrategyKind> {
+    REQUESTED_PARK_KIND.lock().unwrap().take()
+}
+
+// NOTE: an earlier design `peek`ed the park-kind slot in the executor's
+// `WaitResult::Skipped` arm and then `take`-d it again inside
+// `finalize_skipped`. That second, independent read could race the
+// `request_skip_in_flight` store under load (silently defaulting to `Stash`).
+// The executor now does a single authoritative `take` at the `Skipped` arm
+// and threads the kind down, so a separate peek accessor is no longer needed.
+
+/// Clear (reset to `None`) the process's cancel watch channel.
+///
+/// Used only by the executor's TUI-skip *cancel* path (step 18): after a
+/// cancelled attempt is rolled back, the channel still holds
+/// `Some(CancelReason::Skipped)`. Without clearing it, the retry loop's
+/// pre-attempt cancel check would immediately route the re-entered attempt
+/// through `finalize_precancel` (marking the step Skipped) — defeating the
+/// "re-enter at the same attempt" guarantee. Resetting it to `None` lets the
+/// loop genuinely re-run the attempt. Sends through the registered sender so
+/// every cloned receiver sees the reset.
+///
+/// Returns `true` if a cancel sender was registered (the reset was applied),
+/// `false` otherwise (no in-process runner — nothing to reset).
+pub fn clear_cancel_state() -> bool {
+    let guard = ACTIVE_CANCEL_TX.lock().unwrap();
+    match guard.as_ref() {
+        Some(tx) => {
+            let _ = tx.send(None);
+            true
+        }
+        None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Forced-exit cleanup registry
 // ---------------------------------------------------------------------------
 
@@ -32,6 +283,22 @@ static EXIT_CLEANUP: Mutex<Option<ExitCleanup>> = Mutex::new(None);
 /// same binary don't race on the global slot.
 #[cfg(test)]
 pub(crate) static EXIT_CLEANUP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire [`EXIT_CLEANUP_TEST_LOCK`], tolerating poisoning.
+///
+/// The guard protects nothing but *execution ordering* — there is no shared
+/// invariant a panicking test could leave half-updated. Without this, one
+/// asserting test that panics while holding the guard poisons the mutex, and
+/// every subsequently-serialized signal test then fails with `PoisonError`
+/// instead of running — a cascade of false failures whose appearance depends
+/// on cross-test scheduling (i.e. flaky under full parallel `cargo test`).
+/// Recovering the poisoned guard is always safe here.
+#[cfg(test)]
+pub(crate) fn lock_exit_cleanup_test() -> std::sync::MutexGuard<'static, ()> {
+    EXIT_CLEANUP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Register a cleanup to run before `exit(130)` on forced shutdown. Replaces
 /// any previously-registered cleanup.
@@ -62,7 +329,7 @@ pub(crate) fn run_exit_cleanup() {
 /// same effect as receiving a first Ctrl+C. Cheap to clone.
 #[derive(Clone)]
 pub struct ShutdownHandle {
-    abort_tx: watch::Sender<bool>,
+    abort_tx: watch::Sender<CancelState>,
 }
 
 impl ShutdownHandle {
@@ -70,14 +337,14 @@ impl ShutdownHandle {
     /// finishes its lifecycle, then the runner exits. Idempotent.
     #[allow(dead_code)]
     pub fn shutdown(&self) {
-        let _ = self.abort_tx.send(true);
+        let _ = self.abort_tx.send(Some(CancelReason::Aborted));
     }
 
     /// Whether shutdown has already been requested (by signal or by a prior
     /// [`shutdown`](Self::shutdown) call).
     #[allow(dead_code)]
     pub fn is_shutdown_requested(&self) -> bool {
-        *self.abort_tx.borrow()
+        self.abort_tx.borrow().is_some()
     }
 }
 
@@ -88,10 +355,11 @@ impl ShutdownHandle {
 /// Pass [`ShutdownController::abort_rx`] to the runner/executor.
 #[allow(dead_code)]
 pub struct ShutdownController {
-    /// Sends `true` on first signal to request graceful abort.
-    abort_tx: watch::Sender<bool>,
+    /// Sends `Some(CancelReason::Aborted)` on first signal to request a
+    /// graceful abort of the whole run.
+    abort_tx: watch::Sender<CancelState>,
     /// Receivers cloned from here are handed to runner/executor.
-    abort_rx: watch::Receiver<bool>,
+    abort_rx: watch::Receiver<CancelState>,
     /// `true` once the first signal has been received. Per-instance so
     /// concurrent tests don't race on a shared global slot.
     first_signal_received: Arc<AtomicBool>,
@@ -104,7 +372,7 @@ impl ShutdownController {
     /// controllers in parallel (e.g. across test threads) does not contend on
     /// shared state.
     pub fn new() -> Self {
-        let (abort_tx, abort_rx) = watch::channel(false);
+        let (abort_tx, abort_rx) = watch::channel(None);
         Self {
             abort_tx,
             abort_rx,
@@ -115,7 +383,7 @@ impl ShutdownController {
     /// Obtain a cloneable receiver for the abort flag.
     ///
     /// Hand this to [`runner::run_plan`] / [`executor::execute_step`].
-    pub fn abort_rx(&self) -> watch::Receiver<bool> {
+    pub fn abort_rx(&self) -> watch::Receiver<CancelState> {
         self.abort_rx.clone()
     }
 
@@ -128,11 +396,15 @@ impl ShutdownController {
     ///
     /// Returns a [`ShutdownHandle`] for triggering shutdown programmatically
     /// and a receiver for the abort flag.
-    pub fn spawn_signal_listener(self) -> (ShutdownHandle, watch::Receiver<bool>) {
+    pub fn spawn_signal_listener(self) -> (ShutdownHandle, watch::Receiver<CancelState>) {
         let rx = self.abort_rx.clone();
         let handle = ShutdownHandle {
             abort_tx: self.abort_tx.clone(),
         };
+        // Publish this run's cancel sender so a same-process `ralph skip`
+        // can inject `Skipped` into the very channel the executor's wait
+        // loop is listening on (reusing the existing kill ladder).
+        register_active_cancel_tx(self.abort_tx.clone());
         tokio::spawn(async move {
             Self::listen(self.abort_tx, self.first_signal_received).await;
         });
@@ -140,7 +412,7 @@ impl ShutdownController {
     }
 
     /// Internal listener loop.
-    async fn listen(abort_tx: watch::Sender<bool>, first_received: Arc<AtomicBool>) {
+    async fn listen(abort_tx: watch::Sender<CancelState>, first_received: Arc<AtomicBool>) {
         loop {
             // Wait for either SIGINT (Ctrl+C) or SIGTERM (`ralph cancel`
             // delivers the latter, and external process supervisors often
@@ -155,8 +427,11 @@ impl ShutdownController {
                     "\n{signal_name} received — finishing current step. \
                      Send again to force-quit."
                 );
-                // Tell the executor to abort after the current lifecycle phase.
-                let _ = abort_tx.send(true);
+                // Tell the executor to abort after the current lifecycle
+                // phase. `Aborted` (distinct from `Skipped`) terminates the
+                // whole run; it also overrides any pending skip request so a
+                // Ctrl+C after a skip still tears the run down.
+                let _ = abort_tx.send(Some(CancelReason::Aborted));
             } else {
                 // --- Second signal (grace period active) ---
                 eprintln!("\nForce-quit — killing harness and exiting.");
@@ -171,7 +446,7 @@ impl ShutdownController {
     /// Check whether the shutdown flag is currently set.
     #[allow(dead_code)]
     pub fn is_shutdown_requested(&self) -> bool {
-        *self.abort_rx.borrow()
+        self.abort_rx.borrow().is_some()
     }
 }
 
@@ -234,7 +509,7 @@ async fn next_signal() -> &'static str {
 /// rt.block_on(runner::run_plan(&conn, &plan, &cfg, workdir, &opts, abort_rx))?;
 /// ```
 #[allow(dead_code)]
-pub fn install() -> Result<(ShutdownController, watch::Receiver<bool>)> {
+pub fn install() -> Result<(ShutdownController, watch::Receiver<CancelState>)> {
     let controller = ShutdownController::new();
     let rx = controller.abort_rx();
     Ok((controller, rx))
@@ -243,7 +518,7 @@ pub fn install() -> Result<(ShutdownController, watch::Receiver<bool>)> {
 /// Install signal handlers and spawn the listener task.
 ///
 /// Must be called from within an active tokio runtime.
-pub fn install_and_spawn() -> watch::Receiver<bool> {
+pub fn install_and_spawn() -> watch::Receiver<CancelState> {
     let (_handle, rx) = install_and_spawn_with_handle();
     rx
 }
@@ -253,7 +528,7 @@ pub fn install_and_spawn() -> watch::Receiver<bool> {
 ///
 /// Must be called from within an active tokio runtime.
 #[allow(dead_code)]
-pub fn install_and_spawn_with_handle() -> (ShutdownHandle, watch::Receiver<bool>) {
+pub fn install_and_spawn_with_handle() -> (ShutdownHandle, watch::Receiver<CancelState>) {
     ShutdownController::new().spawn_signal_listener()
 }
 
@@ -269,7 +544,7 @@ mod tests {
     fn test_shutdown_controller_initial_state() {
         let controller = ShutdownController::new();
         assert!(!controller.is_shutdown_requested());
-        assert!(!*controller.abort_rx().borrow());
+        assert!(controller.abort_rx().borrow().is_none());
     }
 
     #[test]
@@ -287,11 +562,14 @@ mod tests {
     fn test_abort_tx_propagates() {
         let controller = ShutdownController::new();
         let rx = controller.abort_rx();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
 
-        // Simulate first signal: send true.
-        controller.abort_tx.send(true).unwrap();
-        assert!(*rx.borrow());
+        // Simulate first signal: send the abort reason.
+        controller
+            .abort_tx
+            .send(Some(CancelReason::Aborted))
+            .unwrap();
+        assert_eq!(*rx.borrow(), Some(CancelReason::Aborted));
         assert!(controller.is_shutdown_requested());
     }
 
@@ -301,9 +579,12 @@ mod tests {
         let rx1 = controller.abort_rx();
         let rx2 = controller.abort_rx();
 
-        controller.abort_tx.send(true).unwrap();
-        assert!(*rx1.borrow());
-        assert!(*rx2.borrow());
+        controller
+            .abort_tx
+            .send(Some(CancelReason::Aborted))
+            .unwrap();
+        assert_eq!(*rx1.borrow(), Some(CancelReason::Aborted));
+        assert_eq!(*rx2.borrow(), Some(CancelReason::Aborted));
     }
 
     #[test]
@@ -330,8 +611,8 @@ mod tests {
     async fn test_spawn_signal_listener_returns_handle_and_rx() {
         let controller = ShutdownController::new();
         let (handle, rx) = controller.spawn_signal_listener();
-        // Initially false.
-        assert!(!*rx.borrow());
+        // Initially not cancelled.
+        assert!(rx.borrow().is_none());
         assert!(!handle.is_shutdown_requested());
     }
 
@@ -342,39 +623,39 @@ mod tests {
         // spawn_signal_listener itself consumes the controller.
         let controller = ShutdownController::new();
         let (handle, mut rx) = controller.spawn_signal_listener();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
 
         handle.shutdown();
 
         // Wait for the value to propagate through the watch channel.
         rx.changed().await.unwrap();
-        assert!(*rx.borrow());
+        assert_eq!(*rx.borrow(), Some(CancelReason::Aborted));
         assert!(handle.is_shutdown_requested());
     }
 
     #[tokio::test]
     async fn test_install_and_spawn_with_handle() {
         let (handle, rx) = install_and_spawn_with_handle();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
         assert!(!handle.is_shutdown_requested());
     }
 
     #[tokio::test]
     async fn test_install_and_spawn() {
         let rx = install_and_spawn();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
     }
 
     #[test]
     fn test_install_returns_controller_and_rx() {
         let (controller, rx) = install().unwrap();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
         assert!(!controller.is_shutdown_requested());
     }
 
     #[test]
     fn test_exit_cleanup_runs_once_and_is_cleared() {
-        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _guard = lock_exit_cleanup_test();
         clear_exit_cleanup();
 
         let ran = std::sync::Arc::new(AtomicBool::new(false));
@@ -408,10 +689,10 @@ mod tests {
         // (listener setup + raise + flag check) against other tests that
         // mutate process-wide state. The test runs on a current_thread
         // runtime, so there's no risk of cross-thread guard transfer.
-        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _guard = lock_exit_cleanup_test();
         let controller = ShutdownController::new();
         let (_handle, mut rx) = controller.spawn_signal_listener();
-        assert!(!*rx.borrow());
+        assert!(rx.borrow().is_none());
 
         // Give the listener a moment to register its SIGTERM handler
         // before we deliver the signal. Without this wait, we'd race the
@@ -429,12 +710,16 @@ mod tests {
             .await
             .expect("abort flag never flipped after SIGTERM")
             .expect("watch sender dropped");
-        assert!(*rx.borrow(), "abort flag should be true after SIGTERM");
+        assert_eq!(
+            *rx.borrow(),
+            Some(CancelReason::Aborted),
+            "SIGTERM must set the cancel reason to Aborted (whole-run abort)"
+        );
     }
 
     #[test]
     fn test_clear_exit_cleanup_prevents_run() {
-        let _guard = EXIT_CLEANUP_TEST_LOCK.lock().unwrap();
+        let _guard = lock_exit_cleanup_test();
         clear_exit_cleanup();
 
         let ran = std::sync::Arc::new(AtomicBool::new(false));
@@ -445,5 +730,105 @@ mod tests {
         clear_exit_cleanup();
         run_exit_cleanup();
         assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// `CancelReason::Skipped` must be a distinct value from
+    /// `CancelReason::Aborted` — the executor branches on this to decide
+    /// "drop one step" vs "tear the whole run down".
+    #[test]
+    fn test_cancel_reasons_are_distinct() {
+        assert_ne!(CancelReason::Aborted, CancelReason::Skipped);
+    }
+
+    /// With no step in-flight, `request_skip_in_flight` is a no-op and
+    /// reports `false` so the caller falls back to a plain DB status flip.
+    #[test]
+    fn test_request_skip_no_step_in_flight_is_noop() {
+        let _guard = lock_exit_cleanup_test();
+        set_step_in_flight(false);
+        assert!(!request_skip_in_flight(crate::git::ParkStrategyKind::Stash));
+    }
+
+    /// When a step is in-flight, `request_skip_in_flight` injects exactly
+    /// `Some(CancelReason::Skipped)` into the registered cancel channel —
+    /// the same channel the executor's wait loop listens on — and returns
+    /// `true`. Distinct from the `Aborted` value the signal listener sends.
+    #[tokio::test(flavor = "current_thread")]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_request_skip_in_flight_signals_skipped() {
+        // Holding the std::Mutex guard across .await is intentional and
+        // safe: this serializes the process-wide cancel registry +
+        // in-flight flag against other tests that mutate the same globals,
+        // and the current_thread runtime rules out cross-thread guard
+        // transfer (same rationale as test_sigterm_triggers_graceful_shutdown).
+        let _guard = lock_exit_cleanup_test();
+        let controller = ShutdownController::new();
+        let (_handle, mut rx) = controller.spawn_signal_listener();
+        assert!(rx.borrow().is_none());
+
+        set_step_in_flight(true);
+        assert!(
+            request_skip_in_flight(crate::git::ParkStrategyKind::Commit),
+            "should signal when in-flight"
+        );
+
+        rx.changed().await.unwrap();
+        assert_eq!(
+            *rx.borrow(),
+            Some(CancelReason::Skipped),
+            "skip must inject Skipped, not Aborted"
+        );
+
+        // The requested park kind is recorded for the executor and consumed
+        // exactly once.
+        assert_eq!(
+            take_requested_park_kind(),
+            Some(crate::git::ParkStrategyKind::Commit),
+            "request_skip_in_flight must stash the --changes choice"
+        );
+        assert_eq!(
+            take_requested_park_kind(),
+            None,
+            "take must consume the value (no leak into a later skip)"
+        );
+
+        set_step_in_flight(false);
+    }
+
+    /// A latched whole-run `Aborted` (Ctrl+C) must never be downgraded to a
+    /// step `Skipped` by a racing skip request — neither via the
+    /// same-process fast path (`request_skip_in_flight`) nor the
+    /// cross-process bridge funnel (`inject_skip_with_kind`). This is the
+    /// symmetric half of the invariant the signal listener already enforces
+    /// in the other direction (a later `Aborted` overrides a pending
+    /// `Skipped`). Regression guard for the skip-clobbers-abort race.
+    #[test]
+    fn test_skip_injectors_decline_when_abort_latched() {
+        let _guard = lock_exit_cleanup_test();
+        // Drain any park kind a prior serialized test may have left so the
+        // "no leak" assertion below is order-independent.
+        let _ = take_requested_park_kind();
+
+        let (tx, rx) = watch::channel(Some(CancelReason::Aborted));
+        install_skip_channel_for_test(tx);
+
+        set_step_in_flight(true);
+        assert!(
+            !request_skip_in_flight(crate::git::ParkStrategyKind::Commit),
+            "request_skip_in_flight must decline while Aborted is latched"
+        );
+        assert!(
+            !inject_skip_with_kind(crate::git::ParkStrategyKind::Discard),
+            "inject_skip_with_kind must decline while Aborted is latched"
+        );
+
+        // The abort is still the latched reason — not downgraded to Skipped,
+        // so the runner's between-steps `Aborted` check still tears the run
+        // down instead of silently continuing past the Ctrl+C.
+        assert_eq!(*rx.borrow(), Some(CancelReason::Aborted));
+        // A declined skip must not have stashed its --changes choice.
+        assert_eq!(take_requested_park_kind(), None);
+
+        set_step_in_flight(false);
     }
 }

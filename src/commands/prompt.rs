@@ -1,98 +1,81 @@
-// Prompt prefix/suffix commands.
+// Prompt commands.
 //
-// Three scopes share a single CLI noun (`ralph prompt ...`): global lives in
-// config.json, project lives in `project_settings`, plan lives on the plan row.
-// All three read/write paths share the same `PromptScope` enum dispatched here.
+// The four-layer prompt model has ONE content blob per layer. Two scopes
+// share a single CLI noun (`ralph prompt ...`): the Global layer lives in
+// config.json, the Project layer lives in `project_settings`. Both read/write
+// paths share the same `PromptScope` enum dispatched here.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::cli::PromptScope;
 use crate::config::{self, Config};
 use crate::output::{self, OutputContext, OutputFormat};
-use crate::prompt::{PromptWrap, PromptWraps};
-use crate::storage;
+use crate::storage::{self, ProjectPromptSource};
 
-/// Serializable view of a single scope's prefix/suffix pair for JSON output.
+/// Serializable view of a single scope's prompt for JSON output.
 #[derive(Debug, serde::Serialize)]
 struct ScopeView<'a> {
     scope: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    prefix: Option<&'a str>,
+    prompt: Option<&'a str>,
+    /// Active source for the Project scope: `"file"` or `"db"`. Omitted for
+    /// the Global scope (always config.json).
     #[serde(skip_serializing_if = "Option::is_none")]
-    suffix: Option<&'a str>,
+    source: Option<&'static str>,
 }
 
-/// Composed (fully-layered) wrap for `--resolved` output.
+/// Composed (fully-layered) prompt for `--resolved` output.
 #[derive(Debug, serde::Serialize)]
 struct ResolvedView {
     #[serde(skip_serializing_if = "Option::is_none")]
-    prefix: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    suffix: Option<String>,
+    prompt: Option<String>,
 }
 
-/// `ralph prompt show` — display configured prompt wraps.
+/// `ralph prompt show` — display configured prompts.
 pub fn cmd_prompt_show(
     conn: &Connection,
     config: &Config,
     project: &str,
-    plan_slug: Option<&str>,
     scope: Option<PromptScope>,
     resolved: bool,
     out: &OutputContext,
 ) -> Result<()> {
-    // Plan lookup is only needed when plan-scope is requested (or in the
-    // "all scopes" default). Skip the DB hit when the user targeted a single
-    // non-plan scope. When plan is implicit (no slug, no active plan), treat
-    // it as "no plan wrap configured" rather than bailing — lets users see
-    // their global/project setup before any plan exists.
-    let plan = match scope {
-        Some(PromptScope::Global) | Some(PromptScope::Project) => None,
-        Some(PromptScope::Plan) => Some(resolve_plan_for_prompt(conn, plan_slug, project)?),
-        None => match plan_slug {
-            Some(s) => Some(resolve_plan_for_prompt(conn, Some(s), project)?),
-            None => storage::find_active_plan(conn, project, true)?,
-        },
-    };
-
-    let project_settings = storage::get_project_settings(conn, project)?;
+    let (project_settings, project_source) = storage::resolve_project_prompt(conn, project)?;
 
     if resolved {
-        let wraps = PromptWraps {
-            global: PromptWrap::from_opts(
-                config.prompt_prefix.as_ref(),
-                config.prompt_suffix.as_ref(),
-            ),
-            project: PromptWrap::from_opts(
-                project_settings.prompt_prefix.as_ref(),
-                project_settings.prompt_suffix.as_ref(),
-            ),
-            plan: plan.as_ref().map_or(PromptWrap::default(), |p| {
-                PromptWrap::from_opts(p.prompt_prefix.as_ref(), p.prompt_suffix.as_ref())
-            }),
-        };
-        return print_resolved(&wraps, out);
+        // Compose exactly how build_step_prompt stacks the layers, but
+        // without a step body — the user sees the leading text a harness
+        // receives. There's no plan in this command's context, so only the
+        // global and project layers participate.
+        let composed = join_layers([config.prompt.as_deref(), project_settings.prompt.as_deref()]);
+        let view = ResolvedView { prompt: composed };
+        if out.format == OutputFormat::Json {
+            println!("{}", serde_json::to_string(&view)?);
+        } else {
+            match &view.prompt {
+                Some(p) => println!("prompt:\n{}", indent(p, "  ")),
+                None => println!("prompt: <none>"),
+            }
+        }
+        return Ok(());
     }
 
-    let plan_prefix = plan.as_ref().and_then(|p| p.prompt_prefix.as_deref());
-    let plan_suffix = plan.as_ref().and_then(|p| p.prompt_suffix.as_deref());
+    let project_source_label = match &project_source {
+        ProjectPromptSource::File(_) => "file",
+        ProjectPromptSource::Db => "db",
+    };
 
     let all_views = [
         ScopeView {
             scope: "global",
-            prefix: config.prompt_prefix.as_deref(),
-            suffix: config.prompt_suffix.as_deref(),
+            prompt: config.prompt.as_deref(),
+            source: None,
         },
         ScopeView {
             scope: "project",
-            prefix: project_settings.prompt_prefix.as_deref(),
-            suffix: project_settings.prompt_suffix.as_deref(),
-        },
-        ScopeView {
-            scope: "plan",
-            prefix: plan_prefix,
-            suffix: plan_suffix,
+            prompt: project_settings.prompt.as_deref(),
+            source: Some(project_source_label),
         },
     ];
 
@@ -114,121 +97,89 @@ pub fn cmd_prompt_show(
     Ok(())
 }
 
-/// `ralph prompt set` — upsert prefix and/or suffix at one scope.
-#[allow(clippy::too_many_arguments)]
+/// `ralph prompt set` — replace the prompt at one scope. An empty string
+/// clears it (stored as "unset" so the layer contributes nothing).
 pub fn cmd_prompt_set(
     conn: &Connection,
     config_path: &std::path::Path,
     project: &str,
     scope: PromptScope,
-    plan_slug: Option<&str>,
-    prefix: Option<&str>,
-    suffix: Option<&str>,
+    content: &str,
     out: &OutputContext,
 ) -> Result<()> {
-    if prefix.is_none() && suffix.is_none() {
-        bail!("Provide at least one of --prefix / --suffix");
-    }
+    let value = if content.is_empty() {
+        None
+    } else {
+        Some(content)
+    };
 
     match scope {
         PromptScope::Global => {
             // Load from disk (not the preloaded `Config`) so we only rewrite
-            // the fields we own — preserving any manual edits the user made
+            // the field we own — preserving any manual edits the user made
             // between this process starting and the set call.
             let mut cfg = config::load_or_create_config()?;
-            if let Some(p) = prefix {
-                cfg.prompt_prefix = Some(p.to_string());
-            }
-            if let Some(s) = suffix {
-                cfg.prompt_suffix = Some(s.to_string());
-            }
+            cfg.prompt = value.map(str::to_string);
             write_config(&cfg, config_path)?;
         }
-        PromptScope::Project => {
-            if let Some(p) = prefix {
-                storage::set_project_prompt_prefix(conn, project, Some(p))?;
+        PromptScope::Project => match value {
+            // Empty content means "clear" — route through the exact
+            // delete-file + null-DB path `cmd_prompt_clear` uses. Just
+            // writing an empty file would leave a stale
+            // `project_settings.prompt` to resurface on the next read
+            // (file blank → DB fallback), so `set ""` would otherwise be a
+            // partial no-op and break the documented "empty clears" contract.
+            None => clear_project_layer(conn, project)?,
+            // Non-empty: the checked-in file, when it already exists, is the
+            // source of truth — write through to it so a shared file stays
+            // canonical. Otherwise fall back to the per-machine DB column
+            // (solo users aren't forced onto the file path).
+            Some(content) => {
+                let (_, source) = storage::resolve_project_prompt(conn, project)?;
+                match source {
+                    ProjectPromptSource::File(_) => {
+                        storage::write_project_prompt_file(project, content)?;
+                    }
+                    ProjectPromptSource::Db => {
+                        storage::set_project_prompt(conn, project, Some(content))?;
+                    }
+                }
             }
-            if let Some(s) = suffix {
-                storage::set_project_prompt_suffix(conn, project, Some(s))?;
-            }
-        }
-        PromptScope::Plan => {
-            let plan = resolve_plan_for_prompt(conn, plan_slug, project)?;
-            if let Some(p) = prefix {
-                storage::set_plan_prompt_prefix(conn, &plan.id, Some(p))?;
-            }
-            if let Some(s) = suffix {
-                storage::set_plan_prompt_suffix(conn, &plan.id, Some(s))?;
-            }
-        }
+        },
     }
 
     if !out.quiet {
         let icon = output::check_icon(out.color);
-        eprintln!(
-            "{icon} Updated {} prompt wrap{}{}",
-            scope_name(scope),
-            prefix.map_or("", |_| " (prefix)"),
-            suffix.map_or("", |_| " (suffix)"),
-        );
+        let verb = if value.is_some() {
+            "Updated"
+        } else {
+            "Cleared"
+        };
+        eprintln!("{icon} {verb} {} prompt", scope_name(scope));
     }
     Ok(())
 }
 
-/// `ralph prompt clear` — null out prefix and/or suffix at one scope.
-#[allow(clippy::too_many_arguments)]
+/// `ralph prompt clear` — null out the prompt at one scope.
 pub fn cmd_prompt_clear(
     conn: &Connection,
     config_path: &std::path::Path,
     project: &str,
     scope: PromptScope,
-    plan_slug: Option<&str>,
-    clear_prefix: bool,
-    clear_suffix: bool,
     out: &OutputContext,
 ) -> Result<()> {
-    if !clear_prefix && !clear_suffix {
-        bail!("Pass at least one of --prefix / --suffix to specify what to clear");
-    }
-
     match scope {
         PromptScope::Global => {
             let mut cfg = config::load_or_create_config()?;
-            if clear_prefix {
-                cfg.prompt_prefix = None;
-            }
-            if clear_suffix {
-                cfg.prompt_suffix = None;
-            }
+            cfg.prompt = None;
             write_config(&cfg, config_path)?;
         }
-        PromptScope::Project => {
-            if clear_prefix {
-                storage::set_project_prompt_prefix(conn, project, None)?;
-            }
-            if clear_suffix {
-                storage::set_project_prompt_suffix(conn, project, None)?;
-            }
-        }
-        PromptScope::Plan => {
-            let plan = resolve_plan_for_prompt(conn, plan_slug, project)?;
-            if clear_prefix {
-                storage::set_plan_prompt_prefix(conn, &plan.id, None)?;
-            }
-            if clear_suffix {
-                storage::set_plan_prompt_suffix(conn, &plan.id, None)?;
-            }
-        }
+        PromptScope::Project => clear_project_layer(conn, project)?,
     }
 
     if !out.quiet {
         let icon = output::check_icon(out.color);
-        eprintln!(
-            "{icon} Cleared {} prompt wrap{}{}",
-            scope_name(scope),
-            if clear_prefix { " (prefix)" } else { "" },
-            if clear_suffix { " (suffix)" } else { "" },
-        );
+        eprintln!("{icon} Cleared {} prompt", scope_name(scope));
     }
     Ok(())
 }
@@ -237,71 +188,55 @@ pub fn cmd_prompt_clear(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Empty the project layer in one shot. When the checked-in file is the
+/// active source we delete it **and** null the DB row: otherwise a stale
+/// `project_settings.prompt` value would resurface on the very next read
+/// (file gone → DB fallback), so a single clear wouldn't actually empty the
+/// project layer. When no file is active there's nothing to delete and we
+/// just clear the DB row. Shared by `prompt clear --scope project` and
+/// `prompt set --scope project ""` so both honor the same contract.
+fn clear_project_layer(conn: &Connection, project: &str) -> Result<()> {
+    let (_, source) = storage::resolve_project_prompt(conn, project)?;
+    if let ProjectPromptSource::File(_) = source {
+        storage::delete_project_prompt_file(project)?;
+    }
+    storage::set_project_prompt(conn, project, None)?;
+    Ok(())
+}
+
 fn scope_name(s: PromptScope) -> &'static str {
     match s {
         PromptScope::Global => "global",
         PromptScope::Project => "project",
-        PromptScope::Plan => "plan",
     }
 }
 
-fn resolve_plan_for_prompt(
-    conn: &Connection,
-    slug: Option<&str>,
-    project: &str,
-) -> Result<crate::plan::Plan> {
-    match slug {
-        Some("") => bail!(
-            "Plan slug cannot be empty. Specify a non-empty slug or omit the argument to use the active plan."
-        ),
-        Some(s) => storage::get_plan_by_slug(conn, s, project)?
-            .with_context(|| format!("Plan not found: {s}")),
-        // include_complete=true: let users read/edit prompt wraps on a plan
-        // even after it has finished, mirroring `ralph plan show`'s behavior.
-        None => storage::find_active_plan(conn, project, true)?
-            .context("No active plan found. Specify a plan slug as a positional argument."),
-    }
-}
-
+/// Persist `cfg` to `path` atomically (tmp-file + rename) via the shared
+/// `Config::save_at` helper, so a crash mid-write can't truncate
+/// `config.json`. `path` is always `<config_dir>/config.json`, so its
+/// parent is the directory `save_at` writes into.
 fn write_config(cfg: &Config, path: &std::path::Path) -> Result<()> {
-    let json = serde_json::to_string_pretty(cfg)?;
-    std::fs::write(path, json)
-        .with_context(|| format!("Failed to write config to {}", path.display()))?;
-    Ok(())
+    let dir = path
+        .parent()
+        .with_context(|| format!("Config path {} has no parent directory", path.display()))?;
+    cfg.save_at(dir)
+        .with_context(|| format!("Failed to write config to {}", path.display()))
 }
 
 fn print_scope_plain(view: &ScopeView<'_>) {
-    println!("[{}]", view.scope);
-    match view.prefix {
-        Some(p) => println!("  prefix:\n{}", indent(p, "    ")),
-        None => println!("  prefix: <unset>"),
+    match view.source {
+        // Project scope: surface which source is active so users know
+        // whether `prompt set`/`clear` will touch the checked-in file or
+        // the per-machine DB row.
+        Some("file") => println!("[{}] (file: .ralph/prompt.md)", view.scope),
+        Some(_) => println!("[{}] (db)", view.scope),
+        None => println!("[{}]", view.scope),
     }
-    match view.suffix {
-        Some(s) => println!("  suffix:\n{}", indent(s, "    ")),
-        None => println!("  suffix: <unset>"),
+    match view.prompt {
+        Some(p) => println!("  prompt:\n{}", indent(p, "    ")),
+        None => println!("  prompt: <unset>"),
     }
     println!();
-}
-
-fn print_resolved(wraps: &PromptWraps<'_>, out: &OutputContext) -> Result<()> {
-    // Compose prefix/suffix exactly how build_step_prompt would, but without
-    // the body in between — the user sees the actual text a harness receives.
-    let prefix = join_layers([wraps.global.prefix, wraps.project.prefix, wraps.plan.prefix]);
-    let suffix = join_layers([wraps.plan.suffix, wraps.project.suffix, wraps.global.suffix]);
-    let view = ResolvedView { prefix, suffix };
-    if out.format == OutputFormat::Json {
-        println!("{}", serde_json::to_string(&view)?);
-    } else {
-        match &view.prefix {
-            Some(p) => println!("prefix:\n{}\n", indent(p, "  ")),
-            None => println!("prefix: <none>\n"),
-        }
-        match &view.suffix {
-            Some(s) => println!("suffix:\n{}", indent(s, "  ")),
-            None => println!("suffix: <none>"),
-        }
-    }
-    Ok(())
 }
 
 fn join_layers<const N: usize>(layers: [Option<&str>; N]) -> Option<String> {
@@ -321,4 +256,276 @@ fn indent(text: &str, prefix: &str) -> String {
         .map(|l| format!("{prefix}{l}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage;
+
+    fn quiet_out() -> OutputContext {
+        OutputContext {
+            format: OutputFormat::Plain,
+            quiet: true,
+            color: false,
+        }
+    }
+
+    /// `prompt set --scope project` writes to the DB when no file exists.
+    #[test]
+    fn project_set_targets_db_when_file_absent() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        let cfg_path = dir.path().join("config.json");
+
+        cmd_prompt_set(
+            &conn,
+            &cfg_path,
+            &project,
+            PromptScope::Project,
+            "db content",
+            &quiet_out(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt
+                .as_deref(),
+            Some("db content")
+        );
+        assert!(
+            storage::read_project_prompt_file(&project)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// `prompt set --scope project` writes through to the file when the
+    /// file already exists (a team's checked-in shared prompt stays canonical).
+    #[test]
+    fn project_set_targets_file_when_file_present() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        let cfg_path = dir.path().join("config.json");
+
+        // File pre-exists with some content → it's the active source.
+        storage::write_project_prompt_file(&project, "original").unwrap();
+
+        cmd_prompt_set(
+            &conn,
+            &cfg_path,
+            &project,
+            PromptScope::Project,
+            "updated via file",
+            &quiet_out(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            storage::read_project_prompt_file(&project)
+                .unwrap()
+                .as_deref(),
+            Some("updated via file")
+        );
+        // DB column untouched.
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt,
+            None
+        );
+    }
+
+    /// `prompt set --scope project ""` must honor the documented "empty
+    /// string clears it" contract even when a checked-in file is the active
+    /// source: it has to delete the file AND null the DB row, exactly like
+    /// `prompt clear`. Otherwise it would write an empty file, the next read
+    /// would fall back to the stale DB value, and the layer wouldn't be
+    /// empty — a partial no-op.
+    #[test]
+    fn project_set_empty_clears_file_and_db_when_file_active() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        let cfg_path = dir.path().join("config.json");
+
+        // Stale DB value + active file (the file is the active source).
+        storage::set_project_prompt(&conn, &project, Some("stale db value")).unwrap();
+        storage::write_project_prompt_file(&project, "shared").unwrap();
+        assert!(matches!(
+            storage::resolve_project_prompt(&conn, &project).unwrap().1,
+            ProjectPromptSource::File(_)
+        ));
+
+        cmd_prompt_set(
+            &conn,
+            &cfg_path,
+            &project,
+            PromptScope::Project,
+            "", // empty == clear
+            &quiet_out(),
+        )
+        .unwrap();
+
+        // File gone, DB row nulled, effective layer genuinely empty.
+        assert!(!storage::project_prompt_file_path(&project).exists());
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt,
+            None
+        );
+        let (settings, _) = storage::resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt, None);
+    }
+
+    /// `prompt clear --scope project` with the file active deletes the file
+    /// AND nulls the DB row, so the project layer is genuinely empty after
+    /// one clear — a stale DB value must not resurface on the next read.
+    #[test]
+    fn project_clear_deletes_file_and_clears_db_when_file_active() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        let cfg_path = dir.path().join("config.json");
+
+        // Both a stale DB value and the active file are present; the file
+        // is the active source.
+        storage::set_project_prompt(&conn, &project, Some("stale db value")).unwrap();
+        storage::write_project_prompt_file(&project, "shared").unwrap();
+        assert!(matches!(
+            storage::resolve_project_prompt(&conn, &project).unwrap().1,
+            ProjectPromptSource::File(_)
+        ));
+
+        cmd_prompt_clear(
+            &conn,
+            &cfg_path,
+            &project,
+            PromptScope::Project,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        // File gone.
+        assert!(!storage::project_prompt_file_path(&project).exists());
+        // DB row cleared too — no resurrection.
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt,
+            None
+        );
+        // The effective project layer is genuinely empty.
+        let (settings, _) = storage::resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt, None);
+    }
+
+    /// `--scope universal` (clap alias for `global`) drives the exact same
+    /// global config.json path as `--scope global` through `cmd_prompt_set`.
+    /// We parse the CLI so the alias-resolution is exercised end to end, then
+    /// assert the handler wrote `config.prompt`.
+    #[test]
+    fn universal_alias_sets_global_prompt_like_global() {
+        use crate::cli::{Cli, Command, PromptCommand};
+        use clap::Parser;
+
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+
+        // Resolve the scope through clap's alias machinery, exactly as the
+        // real CLI dispatch does.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "prompt",
+            "set",
+            "--scope",
+            "universal",
+            "from universal alias",
+        ])
+        .unwrap();
+        let scope = match cli.command.unwrap() {
+            Command::Prompt(PromptCommand::Set { scope, .. }) => scope,
+            _ => panic!("expected prompt set"),
+        };
+        assert_eq!(scope, PromptScope::Global);
+
+        // Point config loading at the isolated temp dir so we don't touch
+        // the user's real config. The Global path in `cmd_prompt_set`
+        // round-trips through `config::load_or_create_config()` /
+        // `config::config_dir()`, so the config_path we pass must be the
+        // XDG-resolved one (not an arbitrary tempfile).
+        let _xdg = set_xdg(dir.path());
+        let cfg_path = crate::config::config_dir().unwrap().join("config.json");
+
+        cmd_prompt_set(
+            &conn,
+            &cfg_path,
+            &project,
+            scope,
+            "from universal alias",
+            &quiet_out(),
+        )
+        .unwrap();
+
+        let cfg = crate::config::load_or_create_config().unwrap();
+        assert_eq!(cfg.prompt.as_deref(), Some("from universal alias"));
+    }
+
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serialize tests that mutate `$XDG_CONFIG_HOME` (process-wide env).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct XdgGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl Drop for XdgGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+                None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            }
+        }
+    }
+    fn set_xdg(path: &std::path::Path) -> XdgGuard {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: guarded by ENV_LOCK for the lifetime of the returned guard.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", path) };
+        XdgGuard { _lock: lock, prev }
+    }
+
+    /// `prompt clear --scope project` clears the DB row when no file exists.
+    #[test]
+    fn project_clear_clears_db_when_file_absent() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        let cfg_path = dir.path().join("config.json");
+
+        storage::set_project_prompt(&conn, &project, Some("db value")).unwrap();
+
+        cmd_prompt_clear(
+            &conn,
+            &cfg_path,
+            &project,
+            PromptScope::Project,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt,
+            None
+        );
+    }
 }

@@ -106,6 +106,21 @@ pub enum RunEvent {
         phase: Phase,
         phase_started_at: DateTime<Utc>,
     },
+    /// Emitted when an in-flight attempt is cancelled via the TUI skip
+    /// dialog's Esc/cancel path (step 18). Unlike `step_finished`, this is
+    /// **not** terminal for the step: the runner rolled back the killed
+    /// harness's work, wrote no `execution_logs` row, and is re-entering the
+    /// retry loop at the *same* `attempt` number — so the cancelled attempt
+    /// consumes no retry budget. Consumers should treat it as "the attempt
+    /// was undone; expect another `prompt_prepared`/`phase_changed` for the
+    /// same `step_id` at the same `attempt`". `attempt` is the 1-based number
+    /// of the attempt that was cancelled.
+    AttemptCancelled {
+        step_id: String,
+        step_num: usize,
+        attempt: i32,
+        at: DateTime<Utc>,
+    },
     /// Emitted when the runner exits cleanly because the operator set
     /// `plans.pause_requested` (TUI `[P]` keybinding or `ralph pause`).
     /// Distinct from `plan_complete`/`summary` so the TUI can surface the
@@ -308,7 +323,8 @@ pub fn colored_termination_reason(reason: TerminationReason, color: bool) -> Str
         | TerminationReason::InsufficientDiskSpace => "\x1b[31m",
         TerminationReason::NoChanges
         | TerminationReason::PausedForQuestion
-        | TerminationReason::PausedByUser => "\x1b[33m",
+        | TerminationReason::PausedByUser
+        | TerminationReason::UserSkipped => "\x1b[33m",
         TerminationReason::Unknown => "\x1b[90m",
     };
     format!("{code}{}\x1b[0m", reason.as_str())
@@ -513,6 +529,35 @@ pub fn log_status_icon(committed: bool, rolled_back: bool, color: bool) -> &'sta
     }
 }
 
+/// Format a duration in seconds as a collapsing `Hh Mm Ss` string.
+///
+/// The largest non-zero unit is the leftmost shown; smaller units are always
+/// present once a larger one appears (so minutes/seconds aren't dropped):
+/// - `< 60s` → `Ns` (e.g. `45s`)
+/// - `< 1h`  → `Mm Ss` (e.g. `2m 3s`, `1m 0s`)
+/// - `≥ 1h`  → `Hh Mm Ss` (e.g. `1h 6m 40s`)
+///
+/// Input is `f64` seconds (matching [`ExecutionLog::duration_secs`]). The
+/// value is truncated toward zero to whole seconds; negative inputs clamp
+/// to `0`.
+pub fn format_duration_secs(secs: f64) -> String {
+    let total = if secs.is_finite() && secs > 0.0 {
+        secs.floor() as u64
+    } else {
+        0
+    };
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Interactive confirmation
 // ---------------------------------------------------------------------------
@@ -563,10 +608,6 @@ pub struct PlanSummary {
     pub plan_harness: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_prefix: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prompt_suffix: Option<String>,
 }
 
 impl From<&Plan> for PlanSummary {
@@ -584,8 +625,6 @@ impl From<&Plan> for PlanSummary {
             plan_harness: p.plan_harness.clone(),
             created_at: p.created_at,
             updated_at: p.updated_at,
-            prompt_prefix: p.prompt_prefix.clone(),
-            prompt_suffix: p.prompt_suffix.clone(),
         }
     }
 }
@@ -907,6 +946,29 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    // -- format_duration_secs ----------------------------------------------
+
+    #[test]
+    fn test_format_duration_secs_boundaries() {
+        assert_eq!(format_duration_secs(0.0), "0s");
+        assert_eq!(format_duration_secs(0.5), "0s"); // sub-second truncates down
+        assert_eq!(format_duration_secs(1.0), "1s");
+        assert_eq!(format_duration_secs(59.0), "59s");
+        assert_eq!(format_duration_secs(59.9), "59s"); // still < 60 after trunc
+        assert_eq!(format_duration_secs(60.0), "1m 0s");
+        assert_eq!(format_duration_secs(61.0), "1m 1s");
+        assert_eq!(format_duration_secs(3599.0), "59m 59s");
+        assert_eq!(format_duration_secs(3600.0), "1h 0m 0s");
+        assert_eq!(format_duration_secs(3661.0), "1h 1m 1s");
+        assert_eq!(format_duration_secs(7322.0), "2h 2m 2s");
+    }
+
+    #[test]
+    fn test_format_duration_secs_negative_clamps_to_zero() {
+        assert_eq!(format_duration_secs(-1.0), "0s");
+        assert_eq!(format_duration_secs(-3661.0), "0s");
+    }
+
     // -- emit_ndjson --------------------------------------------------------
 
     #[test]
@@ -1123,8 +1185,6 @@ mod tests {
             plan_harness: Some("goose".into()),
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            prompt_prefix: None,
-            prompt_suffix: None,
         };
         let json = serde_json::to_string(&summary).unwrap();
         // Verify snake_case keys
@@ -1697,6 +1757,55 @@ mod tests {
             "cost_usd must be omitted when None, got {json}"
         );
         assert!(json.contains("\"event\":\"summary\""));
+    }
+
+    #[test]
+    fn test_attempt_cancelled_event_json_shape() {
+        // STEP 18: schema documented in docs/ndjson-events.md. Field
+        // names/casing must match the sibling lifecycle events
+        // (`step_id`, `step_num`, `attempt`, snake_case `at` timestamp).
+        let at: DateTime<Utc> = "2026-05-16T09:30:00Z".parse().unwrap();
+        let evt = RunEvent::AttemptCancelled {
+            step_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            step_num: 3,
+            attempt: 2,
+            at,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let val: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(val["event"], "attempt_cancelled");
+        assert_eq!(val["step_id"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(val["step_num"], 3);
+        assert_eq!(val["attempt"], 2);
+        assert_eq!(val["at"], "2026-05-16T09:30:00Z");
+    }
+
+    #[test]
+    fn test_attempt_cancelled_roundtrips_through_deserialize() {
+        // The TUI subscriber path requires Deserialize alongside Serialize.
+        let at: DateTime<Utc> = "2026-05-16T10:00:00Z".parse().unwrap();
+        let evt = RunEvent::AttemptCancelled {
+            step_id: "abc".to_string(),
+            step_num: 1,
+            attempt: 1,
+            at,
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        let back: RunEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            RunEvent::AttemptCancelled {
+                step_id,
+                step_num,
+                attempt,
+                at: at_back,
+            } => {
+                assert_eq!(step_id, "abc");
+                assert_eq!(step_num, 1);
+                assert_eq!(attempt, 1);
+                assert_eq!(at_back, at);
+            }
+            other => panic!("expected AttemptCancelled, got {other:?}"),
+        }
     }
 
     #[test]

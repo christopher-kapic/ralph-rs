@@ -219,12 +219,41 @@ pub fn commit_staged(workdir: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// Mixed-reset HEAD back to `sha`, **keeping the working tree intact**.
+///
+/// `git reset --mixed <sha>` moves the branch ref and unstages the index but
+/// leaves every file on disk exactly as it was. Used by the executor's
+/// `RetryStrategy::Keep` path when a prior attempt's agent committed on its
+/// own: we un-commit that orphan commit so it can't become a second,
+/// duplicate step commit, while still carrying the agent's work forward as
+/// uncommitted changes (Keep's contract). A later successful attempt then
+/// produces exactly one coherent `ralph:` step commit.
+pub fn reset_mixed_to(workdir: &Path, sha: &str) -> Result<()> {
+    git(workdir, &["reset", "--mixed", sha])
+        .with_context(|| format!("git reset --mixed {sha} failed"))?;
+    Ok(())
+}
+
 /// Rollback changes while preserving specified untracked files.
 ///
-/// Restores tracked files via `git restore .`, then selectively removes
-/// only untracked files that are NOT in the `preserve` list. Requires git >= 2.23.
+/// Unstages the index back to HEAD, restores tracked files via
+/// `git restore .`, then selectively removes only untracked files that are
+/// NOT in the `preserve` list. Requires git >= 2.23.
 pub fn rollback_except(workdir: &Path, preserve: &[String]) -> Result<()> {
-    // Restore tracked files.
+    // Unstage everything first (index → HEAD; the working tree is left
+    // alone by `git reset`). Without this, a file the harness *created and
+    // `git add`-ed* stays in the index: `git restore .` only syncs the
+    // worktree from the index (so it keeps that file), and
+    // `git ls-files --others` excludes staged paths (so the cleanup below
+    // misses it) — the new file would survive a Discard/Cancel rollback.
+    // After the reset that path is untracked (cleaned below, unless
+    // preserved), and staged modifications to tracked files become unstaged
+    // so the following `git restore .` reverts them to HEAD. Pre-existing
+    // untracked files were never staged, so the reset doesn't change their
+    // status and `preserve` still protects them.
+    git(workdir, &["reset", "-q", "HEAD"]).context("git reset -q HEAD failed")?;
+
+    // Restore tracked files to HEAD content.
     git(workdir, &["restore", "."]).context("git restore . failed")?;
 
     let untracked = get_untracked_files(workdir)?;
@@ -513,6 +542,301 @@ fn has_conflict_marker(porcelain_out: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Parking changes (skip handling)
+// ---------------------------------------------------------------------------
+
+/// The *kind* of [`ParkStrategy`] without its per-step payload (label /
+/// subject). `Copy`, so it can ride through the cancel registry alongside
+/// [`crate::signal::CancelReason`]: the skip command only knows the user's
+/// `--changes` choice; the executor reconstitutes the full [`ParkStrategy`]
+/// from the skipped step's identity at park time.
+///
+/// [`ParkStrategyKind::Cancel`] is **not** a park strategy at all — it's the
+/// TUI skip dialog's Esc/cancel signal threaded through the same registry
+/// slot (step 18). When the executor consumes it in `finalize_skipped`, it
+/// rolls back the killed harness's work, emits an `attempt_cancelled` NDJSON
+/// event, writes **no** `execution_logs` row, and re-enters the retry loop at
+/// the *same* attempt number so the cancelled attempt consumes no retry
+/// budget. It never reaches [`park_changes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkStrategyKind {
+    Stash,
+    Commit,
+    Discard,
+    /// TUI-only: the user pressed Esc on the skip dialog. See the type doc.
+    Cancel,
+}
+
+impl ParkStrategyKind {
+    /// Stable lowercase token used to serialize the kind into
+    /// `plans.skip_changes` for the cross-process skip bridge. Round-trips
+    /// with [`ParkStrategyKind::from_token`].
+    pub fn as_token(&self) -> &'static str {
+        match self {
+            ParkStrategyKind::Stash => "stash",
+            ParkStrategyKind::Commit => "commit",
+            ParkStrategyKind::Discard => "discard",
+            ParkStrategyKind::Cancel => "cancel",
+        }
+    }
+
+    /// Parse a token written by [`ParkStrategyKind::as_token`]. An
+    /// unrecognized value resolves to `Stash` so a corrupt/forward-compat
+    /// `skip_changes` value can never make a skip silently destroy work.
+    pub fn from_token(s: &str) -> ParkStrategyKind {
+        match s {
+            "commit" => ParkStrategyKind::Commit,
+            "discard" => ParkStrategyKind::Discard,
+            "cancel" => ParkStrategyKind::Cancel,
+            // "stash" and anything unexpected → the non-destructive default.
+            _ => ParkStrategyKind::Stash,
+        }
+    }
+}
+
+/// How [`park_changes`] should dispose of the working-tree changes left
+/// behind when a step is skipped mid-run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // wired into the skip flow in a later step
+pub enum ParkStrategy {
+    /// `git stash push --include-untracked -m <label>` — recoverable later.
+    Stash { label: String },
+    /// `git add -A && git commit` with a `Ralph-Skipped-Step` trailer —
+    /// preserves the WIP as a real commit.
+    Commit { subject: String },
+    /// Throw the changes away (delegates to [`rollback_except`]).
+    Discard,
+}
+
+/// What [`park_changes`] actually did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the skip flow in a later step
+pub enum ParkOutcome {
+    /// Changes were stashed; `stash_ref` recovers them.
+    Stashed { stash_ref: StashRef },
+    /// Changes were committed; `sha` is the new commit.
+    Committed { sha: String },
+    /// Changes were discarded.
+    Discarded,
+}
+
+/// Dispose of the current working-tree changes per `strategy`.
+///
+/// A single entry point behind the three skip change-handling modes:
+///
+/// - [`ParkStrategy::Stash`] → `git stash push --include-untracked -m
+///   <label>`. The returned [`StashRef`] is stable across later stash
+///   pushes/drops. Errors if the tree is clean (nothing to stash).
+/// - [`ParkStrategy::Commit`] → `git add -A && git commit` with a
+///   `Ralph-Skipped-Step: <trailer_id>` trailer appended in git's standard
+///   trailer format (a blank line, then `Token: value`). This stages
+///   everything — including `pre_existing_untracked` — by design: a WIP
+///   commit is meant to be a complete snapshot.
+/// - [`ParkStrategy::Discard`] → [`rollback_except`], preserving
+///   `pre_existing_untracked`.
+///
+/// `trailer_id` is only consulted for `Commit`; `pre_existing_untracked`
+/// only for `Discard`.
+#[allow(dead_code)] // called by the skip flow in a later step
+pub fn park_changes(
+    workdir: &Path,
+    strategy: ParkStrategy,
+    pre_existing_untracked: &[String],
+    trailer_id: &str,
+) -> Result<ParkOutcome> {
+    match strategy {
+        ParkStrategy::Stash { label } => match stash_push_with_untracked(workdir, &label)? {
+            Some(stash_ref) => Ok(ParkOutcome::Stashed { stash_ref }),
+            None => bail!("nothing to stash: working tree is clean"),
+        },
+        ParkStrategy::Commit { subject } => {
+            // Blank line before the trailer block so git's trailer parser
+            // (`%(trailers)`, `git interpret-trailers`) recognizes it.
+            let message = format!("{subject}\n\nRalph-Skipped-Step: {trailer_id}\n");
+            commit_changes(workdir, &message).context("could not commit skipped-step WIP")?;
+            let sha = get_commit_hash(workdir)?;
+            Ok(ParkOutcome::Committed { sha })
+        }
+        ParkStrategy::Discard => {
+            rollback_except(workdir, pre_existing_untracked)
+                .context("could not discard changes on skip")?;
+            Ok(ParkOutcome::Discarded)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Skipped-step WIP commit discovery & revert
+// ---------------------------------------------------------------------------
+
+/// The git trailer key written by [`park_changes`] for `ParkStrategy::Commit`.
+pub const SKIPPED_STEP_TRAILER: &str = "Ralph-Skipped-Step";
+
+/// A skip-WIP commit discovered on a branch: its SHA plus the step id pulled
+/// out of the `Ralph-Skipped-Step` trailer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkipWipCommit {
+    pub sha: String,
+    pub step_id: String,
+}
+
+/// Extract the `Ralph-Skipped-Step` trailer value from a single commit.
+///
+/// Uses `git interpret-trailers --parse` fed the commit's raw message so we
+/// only ever match a *real* trailer line (git's own parser decides what
+/// counts as the trailer block) — never the words happening to appear in a
+/// commit body or a quoted diff. Returns `None` when the commit carries no
+/// such trailer.
+pub fn parse_skipped_step_trailer(workdir: &Path, sha: &str) -> Result<Option<String>> {
+    let raw = git(workdir, &["log", "-1", "--format=%B", sha])
+        .with_context(|| format!("could not read commit message for {sha}"))?;
+
+    // `git interpret-trailers --parse` prints only the trailer block, one
+    // `Key: value` per line. We feed the raw message on stdin.
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .args(["interpret-trailers", "--parse"])
+        .current_dir(workdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn git interpret-trailers")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(raw.as_bytes())
+            .context("failed to write commit message to git interpret-trailers")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("git interpret-trailers --parse failed to run")?;
+    if !output.status.success() {
+        bail!(
+            "git interpret-trailers --parse failed (exit {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let parsed = String::from_utf8_lossy(&output.stdout);
+    for line in parsed.lines() {
+        // Anchor on the trailer key at the start of a parsed trailer line so
+        // a body sentence mentioning the token can't false-match.
+        if let Some((key, value)) = line.split_once(':')
+            && key.trim().eq_ignore_ascii_case(SKIPPED_STEP_TRAILER)
+        {
+            let v = value.trim();
+            if !v.is_empty() {
+                return Ok(Some(v.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Walk the commits reachable from `branch` and return every skip-WIP commit
+/// (one carrying a `Ralph-Skipped-Step` trailer), **newest first** — i.e. in
+/// reverse-chronological / `git log` order.
+///
+/// `branch` is resolved with `git rev-list`, so it works whether or not the
+/// branch is currently checked out. Commits without the trailer are ignored.
+pub fn list_skip_wip_commits(workdir: &Path, branch: &str) -> Result<Vec<SkipWipCommit>> {
+    // `git rev-list` already yields newest-first.
+    let shas = git(workdir, &["rev-list", branch])
+        .with_context(|| format!("could not list commits on branch '{branch}'"))?;
+    let mut out = Vec::new();
+    for sha in shas.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(step_id) = parse_skipped_step_trailer(workdir, sha)? {
+            out.push(SkipWipCommit {
+                sha: sha.to_string(),
+                step_id,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Skip-WIP commits on `branch` whose trailer step id equals `step_id`,
+/// newest-first. Convenience filter over [`list_skip_wip_commits`].
+pub fn skip_wip_commits_for_step(
+    workdir: &Path,
+    branch: &str,
+    step_id: &str,
+) -> Result<Vec<String>> {
+    Ok(list_skip_wip_commits(workdir, branch)?
+        .into_iter()
+        .filter(|c| c.step_id == step_id)
+        .map(|c| c.sha)
+        .collect())
+}
+
+/// Outcome of attempting to `git revert --no-edit` a single skip-WIP commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevertOutcome {
+    /// A new revert commit was created.
+    Reverted { revert_sha: String },
+    /// The revert was an effective no-op (the change is already gone — the
+    /// WIP commit was manually reverted earlier). No revert commit created.
+    AlreadyReverted,
+}
+
+/// `git revert --no-edit <sha>`.
+///
+/// Handles the "already reverted" edge case: when the commit's changes are
+/// already absent, `git revert` either reports "nothing to commit" (empty
+/// revert) or conflicts. In both cases we abort the in-progress revert with
+/// `git revert --abort` (so the worktree/index is left clean) and return
+/// [`RevertOutcome::AlreadyReverted`] instead of a hard error. A genuine
+/// merge conflict from *unrelated* later work is still surfaced as an error
+/// after aborting.
+pub fn revert_commit(workdir: &Path, sha: &str) -> Result<RevertOutcome> {
+    let output = Command::new("git")
+        .args(["revert", "--no-edit", sha])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git revert {sha}"))?;
+
+    if output.status.success() {
+        let revert_sha = get_commit_hash(workdir)?;
+        return Ok(RevertOutcome::Reverted { revert_sha });
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}{stderr}");
+
+    // `git revert` leaves a revert-in-progress on failure; clean it up so the
+    // tree isn't wedged regardless of which failure path we took.
+    let revert_in_progress = workdir.join(".git").join("REVERT_HEAD").exists();
+    if revert_in_progress {
+        // Best-effort abort; ignore its own failure (nothing left to abort).
+        let _ = Command::new("git")
+            .args(["revert", "--abort"])
+            .current_dir(workdir)
+            .output();
+    }
+
+    // Effective no-op: the change is already gone. git phrases this as
+    // "nothing to commit" / "previous cherry-pick/revert is now empty" / a
+    // conflict where every hunk is already applied.
+    let lc = combined.to_lowercase();
+    if lc.contains("nothing to commit")
+        || lc.contains("nothing added to commit")
+        || lc.contains("is now empty")
+        || lc.contains("no changes")
+        || lc.contains("the previous cherry-pick is now empty")
+    {
+        return Ok(RevertOutcome::AlreadyReverted);
+    }
+
+    bail!(
+        "git revert {sha} failed (exit {}): {}",
+        output.status,
+        combined.trim()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -682,6 +1006,52 @@ mod tests {
         );
         // Untracked file removed.
         assert!(!dir.join("extra.txt").exists());
+    }
+
+    /// `rollback_except` must drop a file the harness created **and**
+    /// `git add`-ed (staged-new): `git restore .` alone keeps it (worktree
+    /// ← index) and `git ls-files --others` excludes staged paths, so before
+    /// the index-unstage step such a file survived a Discard/Cancel. It must
+    /// also revert a staged modification to a tracked file, while preserving
+    /// a genuinely pre-existing untracked file named in `preserve`.
+    #[test]
+    fn test_rollback_except_drops_staged_new_files_keeps_preserved() {
+        let (_tmp, dir) = init_repo();
+
+        // Pre-existing untracked file (existed before the "harness" ran) —
+        // must be preserved.
+        fs::write(dir.join("user-scratch.txt"), "keep me").unwrap();
+        let preserve = vec!["user-scratch.txt".to_string()];
+
+        // Harness work: a new file it created and staged, plus a staged
+        // modification to a tracked file.
+        fs::write(dir.join("harness-new.rs"), "fn generated() {}").unwrap();
+        fs::write(dir.join("README.md"), "clobbered by harness").unwrap();
+        git(&dir, &["add", "harness-new.rs", "README.md"]).unwrap();
+        assert!(has_uncommitted_changes(&dir).unwrap());
+
+        rollback_except(&dir, &preserve).unwrap();
+
+        // Staged-new harness file is gone.
+        assert!(
+            !dir.join("harness-new.rs").exists(),
+            "a harness-staged new file must not survive rollback"
+        );
+        // Tracked file reverted to HEAD content.
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
+        // Pre-existing untracked file preserved.
+        assert!(dir.join("user-scratch.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "keep me"
+        );
+        // Nothing tracked left dirty (the preserved untracked file is the
+        // only remaining change).
+        let staged = list_staged_files(&dir).unwrap();
+        assert!(staged.is_empty(), "index must be clean after rollback");
     }
 
     #[test]
@@ -949,5 +1319,290 @@ mod tests {
         // Merging A into B should fail with conflicts.
         let result = merge_sha(&dir, &a_sha);
         assert!(result.is_err());
+    }
+
+    // ----- park_changes -----
+
+    #[test]
+    fn test_park_changes_stash_label_recoverable() {
+        let (_tmp, dir) = init_repo();
+        // Tracked modification + untracked file — --include-untracked picks
+        // up both.
+        fs::write(dir.join("README.md"), "# modified").unwrap();
+        fs::write(dir.join("scratch.txt"), "wip").unwrap();
+
+        let label = "ralph: skipped step 3 wip";
+        let outcome = park_changes(
+            &dir,
+            ParkStrategy::Stash {
+                label: label.to_string(),
+            },
+            &[],
+            "trailer-id-irrelevant-for-stash",
+        )
+        .unwrap();
+
+        let stash_ref = match outcome {
+            ParkOutcome::Stashed { stash_ref } => stash_ref,
+            other => panic!("expected Stashed, got {other:?}"),
+        };
+        assert_eq!(stash_ref.as_str().len(), 40);
+
+        // Stashing left the tree clean.
+        assert!(!has_uncommitted_changes(&dir).unwrap());
+
+        // The label is recoverable via `git stash list`.
+        let list = git(&dir, &["stash", "list"]).unwrap();
+        assert!(list.contains(label), "stash list missing label: {list}");
+
+        // And the returned ref resolves back to that stash.
+        let found = find_stash_by_message(&dir, label).unwrap().expect("found");
+        assert_eq!(found, stash_ref);
+    }
+
+    #[test]
+    fn test_park_changes_stash_clean_tree_errors() {
+        let (_tmp, dir) = init_repo();
+        let result = park_changes(
+            &dir,
+            ParkStrategy::Stash {
+                label: "ralph: nothing here".to_string(),
+            },
+            &[],
+            "ignored",
+        );
+        assert!(result.is_err(), "clean tree should error, got {result:?}");
+    }
+
+    #[test]
+    fn test_park_changes_commit_trailer_greppable() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("README.md"), "# modified").unwrap();
+        fs::write(dir.join("new.txt"), "added on skip").unwrap();
+
+        let trailer_id = "9f3c2a10-dead-beef-0000-000000000001";
+        let outcome = park_changes(
+            &dir,
+            ParkStrategy::Commit {
+                subject: "WIP: skipped step 7".to_string(),
+            },
+            &[],
+            trailer_id,
+        )
+        .unwrap();
+
+        let sha = match outcome {
+            ParkOutcome::Committed { sha } => sha,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+        assert_eq!(sha, get_commit_hash(&dir).unwrap());
+
+        // Everything got committed — tree is clean.
+        assert!(!has_uncommitted_changes(&dir).unwrap());
+
+        // The trailer is grep-pable in the raw commit body.
+        let body = git(&dir, &["log", "-1", "--format=%B"]).unwrap();
+        assert!(
+            body.contains(&format!("Ralph-Skipped-Step: {trailer_id}")),
+            "commit body missing trailer: {body}"
+        );
+
+        // git's own trailer parser also recognizes it as a real trailer.
+        let parsed = git(
+            &dir,
+            &[
+                "log",
+                "-1",
+                "--format=%(trailers:key=Ralph-Skipped-Step,valueonly)",
+            ],
+        )
+        .unwrap();
+        assert!(
+            parsed.contains(trailer_id),
+            "git did not parse trailer: {parsed:?}"
+        );
+
+        // The new file is tracked now.
+        let tracked = git(&dir, &["ls-files"]).unwrap();
+        assert!(tracked.contains("new.txt"), "new.txt not committed");
+    }
+
+    #[test]
+    fn test_park_changes_discard_preserves_pre_existing_untracked() {
+        let (_tmp, dir) = init_repo();
+
+        // A pre-existing untracked file the user had before the run.
+        fs::write(dir.join("user-scratch.txt"), "user data").unwrap();
+        // The harness's work: a tracked modification + a new untracked file.
+        fs::write(dir.join("README.md"), "# clobbered by harness").unwrap();
+        fs::write(dir.join("agent-output.txt"), "agent junk").unwrap();
+
+        let preserve = vec!["user-scratch.txt".to_string()];
+        let outcome = park_changes(&dir, ParkStrategy::Discard, &preserve, "ignored").unwrap();
+        assert_eq!(outcome, ParkOutcome::Discarded);
+
+        // Tracked modification rolled back.
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
+        // The harness's untracked file is gone.
+        assert!(!dir.join("agent-output.txt").exists());
+        // The user's pre-existing untracked file is preserved untouched.
+        assert!(dir.join("user-scratch.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "user data"
+        );
+    }
+
+    // ----- skip-WIP discovery & revert (STEP 19) -----
+
+    /// Stage everything and write a WIP commit carrying the trailer, the same
+    /// way `park_changes(Commit)` does. Returns the new commit SHA.
+    fn commit_wip(dir: &Path, subject: &str, step_id: &str) -> String {
+        let message = format!("{subject}\n\nRalph-Skipped-Step: {step_id}\n");
+        commit_changes(dir, &message).unwrap();
+        get_commit_hash(dir).unwrap()
+    }
+
+    #[test]
+    fn test_parse_skipped_step_trailer_detects_only_real_trailer() {
+        let (_tmp, dir) = init_repo();
+
+        // A commit whose *body* merely mentions the token must NOT match.
+        fs::write(dir.join("a.txt"), "1").unwrap();
+        commit_changes(
+            &dir,
+            "normal commit\n\nWe discussed Ralph-Skipped-Step: not-a-trailer here in prose.\n",
+        )
+        .unwrap();
+        let body_sha = get_commit_hash(&dir).unwrap();
+        assert_eq!(
+            parse_skipped_step_trailer(&dir, &body_sha).unwrap(),
+            None,
+            "prose mention must not be parsed as a trailer"
+        );
+
+        // A real trailer commit matches.
+        fs::write(dir.join("b.txt"), "2").unwrap();
+        let sha = commit_wip(&dir, "[ralph wip] skipped step 2: foo", "step-uuid-2");
+        assert_eq!(
+            parse_skipped_step_trailer(&dir, &sha).unwrap(),
+            Some("step-uuid-2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_list_skip_wip_commits_newest_first() {
+        let (_tmp, dir) = init_repo();
+        let branch = get_current_branch(&dir).unwrap();
+
+        fs::write(dir.join("x.txt"), "1").unwrap();
+        let first = commit_wip(&dir, "[ralph wip] skipped step 1: a", "step-A");
+        // An ordinary commit in between — must be ignored.
+        fs::write(dir.join("y.txt"), "2").unwrap();
+        commit_changes(&dir, "ordinary work").unwrap();
+        fs::write(dir.join("z.txt"), "3").unwrap();
+        let second = commit_wip(&dir, "[ralph wip] skipped step 2: b", "step-B");
+
+        let wips = list_skip_wip_commits(&dir, &branch).unwrap();
+        assert_eq!(wips.len(), 2, "ordinary commit should be excluded");
+        // Newest first.
+        assert_eq!(wips[0].sha, second);
+        assert_eq!(wips[0].step_id, "step-B");
+        assert_eq!(wips[1].sha, first);
+        assert_eq!(wips[1].step_id, "step-A");
+
+        // Filtered convenience accessor.
+        let only_a = skip_wip_commits_for_step(&dir, &branch, "step-A").unwrap();
+        assert_eq!(only_a, vec![first]);
+    }
+
+    #[test]
+    fn test_revert_commit_success() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("wip.txt"), "wip content").unwrap();
+        let sha = commit_wip(&dir, "[ralph wip] skipped step 1: t", "step-1");
+        assert!(dir.join("wip.txt").exists());
+
+        match revert_commit(&dir, &sha).unwrap() {
+            RevertOutcome::Reverted { revert_sha } => {
+                assert_eq!(revert_sha, get_commit_hash(&dir).unwrap());
+            }
+            other => panic!("expected Reverted, got {other:?}"),
+        }
+        // The WIP file is gone, history preserved (3 commits: init, wip, revert).
+        assert!(!dir.join("wip.txt").exists());
+        let log = git(&dir, &["rev-list", "--count", "HEAD"]).unwrap();
+        assert_eq!(log.trim(), "3");
+    }
+
+    #[test]
+    fn test_revert_commit_not_on_head() {
+        // Edge case: a later step committed on top of the WIP. Revert must
+        // still work and must NOT touch the later commit's file.
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("wip.txt"), "wip").unwrap();
+        let wip = commit_wip(&dir, "[ralph wip] skipped step 1: t", "step-1");
+        fs::write(dir.join("later.txt"), "later step output").unwrap();
+        commit_changes(&dir, "step 2 done").unwrap();
+
+        assert!(matches!(
+            revert_commit(&dir, &wip).unwrap(),
+            RevertOutcome::Reverted { .. }
+        ));
+        assert!(!dir.join("wip.txt").exists(), "WIP change reverted");
+        assert!(
+            dir.join("later.txt").exists(),
+            "later step's work preserved"
+        );
+    }
+
+    #[test]
+    fn test_revert_commit_already_reverted_is_noop() {
+        // Edge case: the WIP was already manually reverted. A second revert is
+        // an effective no-op — detect and report cleanly, no hard error, tree
+        // left clean.
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("wip.txt"), "wip").unwrap();
+        let wip = commit_wip(&dir, "[ralph wip] skipped step 1: t", "step-1");
+
+        assert!(matches!(
+            revert_commit(&dir, &wip).unwrap(),
+            RevertOutcome::Reverted { .. }
+        ));
+        // Second revert: already gone.
+        let outcome = revert_commit(&dir, &wip).unwrap();
+        assert_eq!(outcome, RevertOutcome::AlreadyReverted);
+        // Tree is clean and no revert-in-progress is wedged.
+        assert!(!has_uncommitted_changes(&dir).unwrap());
+        assert!(!dir.join(".git").join("REVERT_HEAD").exists());
+    }
+
+    #[test]
+    fn test_revert_multiple_wip_commits_newest_first() {
+        // Edge case: the same step was skipped+committed more than once.
+        // Reverting newest-first applies each revert cleanly.
+        let (_tmp, dir) = init_repo();
+        let branch = get_current_branch(&dir).unwrap();
+
+        fs::write(dir.join("f.txt"), "v1\n").unwrap();
+        let first = commit_wip(&dir, "[ralph wip] skipped step 1: a", "step-1");
+        fs::write(dir.join("f.txt"), "v1\nv2\n").unwrap();
+        let second = commit_wip(&dir, "[ralph wip] skipped step 1: a again", "step-1");
+
+        let shas = skip_wip_commits_for_step(&dir, &branch, "step-1").unwrap();
+        assert_eq!(shas, vec![second.clone(), first.clone()], "newest first");
+
+        for sha in &shas {
+            assert!(matches!(
+                revert_commit(&dir, sha).unwrap(),
+                RevertOutcome::Reverted { .. }
+            ));
+        }
+        // Both layers undone; f.txt no longer exists (back to init state).
+        assert!(!dir.join("f.txt").exists());
+        assert!(!has_uncommitted_changes(&dir).unwrap());
     }
 }

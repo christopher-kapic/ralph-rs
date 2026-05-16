@@ -30,8 +30,7 @@ use clap::Parser;
 
 use crate::cli::{
     AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
-    PlanHarnessCommand, PlanPrependCommand, PromptCommand, QuestionCommand, QuestionsState,
-    StepCommand,
+    PlanHarnessCommand, PromptCommand, QuestionCommand, QuestionsState, StepCommand,
 };
 
 use crate::commands::{resolve_plan, resolve_project};
@@ -41,29 +40,6 @@ use crate::output::OutputContext;
 /// accepted input sources. Clap's `conflicts_with_all` guarantees at most
 /// one of `text` / `file` / `stdin` is set; this helper enforces the
 /// "at least one" half and normalises to a `String`.
-fn resolve_prepend_input(
-    text: Option<String>,
-    file: Option<std::path::PathBuf>,
-    stdin: bool,
-) -> Result<String> {
-    use std::io::Read;
-    match (text, file, stdin) {
-        (Some(t), None, false) => Ok(t),
-        (None, Some(path), false) => std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read prepend source file: {}", path.display())),
-        (None, None, true) => {
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .context("Failed to read prepend text from stdin")?;
-            Ok(buf)
-        }
-        _ => anyhow::bail!(
-            "Exactly one of --text, --file, or --stdin is required for `ralph plan prepend set`"
-        ),
-    }
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -110,11 +86,13 @@ fn main() -> Result<()> {
             non_interactive,
             default_harness,
             force,
+            restore_prompts,
         } => {
             let opts = commands::InitOptions {
                 non_interactive,
                 default_harness,
                 force,
+                restore_prompts,
             };
             commands::cmd_init(&opts, &out)?;
             Ok(())
@@ -128,6 +106,7 @@ fn main() -> Result<()> {
                 branch,
                 harness,
                 agent,
+                retry_strategy,
                 tests,
                 depends_on,
             } => {
@@ -143,6 +122,7 @@ fn main() -> Result<()> {
                     branch.as_deref(),
                     h,
                     agent.as_deref(),
+                    retry_strategy,
                     &tests,
                     &depends_on,
                     &out,
@@ -241,26 +221,6 @@ fn main() -> Result<()> {
                 let enabled = matches!(state, QuestionsState::On);
                 commands::cmd_plan_questions(&conn, &slug, &project, enabled, &out)
             }
-            PlanCommand::Prepend(prepend_cmd) => match prepend_cmd {
-                PlanPrependCommand::Set {
-                    plan,
-                    text,
-                    file,
-                    stdin,
-                } => {
-                    let p = resolve_plan(&conn, plan, &project, true)?;
-                    let body = resolve_prepend_input(text, file, stdin)?;
-                    commands::plan_prepend_set(&conn, &p, &body, &out)
-                }
-                PlanPrependCommand::Show { plan, default } => {
-                    let p = resolve_plan(&conn, plan, &project, true)?;
-                    commands::plan_prepend_show(&conn, &p, default, &out)
-                }
-                PlanPrependCommand::Clear { plan } => {
-                    let p = resolve_plan(&conn, plan, &project, true)?;
-                    commands::plan_prepend_clear(&conn, &p, &out)
-                }
-            },
         },
 
         // -- Step --
@@ -280,6 +240,7 @@ fn main() -> Result<()> {
                 criteria,
                 max_retries,
                 change_policy,
+                retry_strategy,
                 tags,
                 import_json,
             } => {
@@ -318,6 +279,7 @@ fn main() -> Result<()> {
                         &criteria,
                         max_retries,
                         change_policy,
+                        retry_strategy,
                         &tags,
                         &out,
                     )
@@ -354,6 +316,8 @@ fn main() -> Result<()> {
                 max_retries,
                 clear_max_retries,
                 change_policy,
+                retry_strategy,
+                clear_retry_strategy,
                 tags,
                 clear_tags,
             } => {
@@ -374,6 +338,8 @@ fn main() -> Result<()> {
                     max_retries,
                     clear_max_retries,
                     change_policy,
+                    retry_strategy,
+                    clear_retry_strategy,
                     &tags,
                     clear_tags,
                     &out,
@@ -383,9 +349,18 @@ fn main() -> Result<()> {
                 step,
                 step_id,
                 plan,
+                force,
             } => {
                 let p = resolve_plan(&conn, plan, &project, false)?;
-                commands::step_reset(&conn, &p.slug, &project, step, step_id.as_deref(), &out)
+                commands::step_reset(
+                    &conn,
+                    &p.slug,
+                    &project,
+                    step,
+                    step_id.as_deref(),
+                    force,
+                    &out,
+                )
             }
             StepCommand::Move {
                 step,
@@ -535,16 +510,23 @@ fn main() -> Result<()> {
             plan: plan_slug,
             step: step_num,
             reason,
-            force,
+            changes,
+            force: _force,
         } => {
             let plan = resolve_plan(&conn, plan_slug, &project, false)?;
 
-            // Acquire the same per-project run lock that `ralph run` uses, so
-            // skip can't race a concurrent run or resume.
-            let _run_lock =
-                run_lock::acquire(&conn, &project, Some(&plan.slug), Some(&plan.id), force)?;
-
-            runner::skip_step(&conn, &plan, step_num, reason.as_deref())?;
+            // Deliberately NOT gated behind the per-project run lock. A live
+            // `ralph run` holds that lock for its entire duration; acquiring
+            // it here would make it impossible to skip the *currently
+            // running* step — the headline use case. `runner::skip_step`
+            // routes an in-flight skip through the cross-process DB bridge
+            // (`plans.skip_requested_step_id`), which the running runner
+            // polls and consumes mid-attempt; a non-running step is a plain
+            // synchronous DB flip. Both are single-row writes safe to race a
+            // concurrent run (same lock-free model as `ralph pause`). The
+            // legacy `--force` flag is accepted for compatibility but no
+            // longer has a lock to steal.
+            runner::skip_step(&conn, &plan, step_num, reason.as_deref(), changes.into())?;
             Ok(())
         }
 
@@ -701,49 +683,15 @@ fn main() -> Result<()> {
         Command::Prompt(subcmd) => {
             let config_path = config::config_dir()?.join("config.json");
             match subcmd {
-                PromptCommand::Show {
-                    plan,
-                    scope,
-                    resolved,
-                } => commands::cmd_prompt_show(
-                    &conn,
-                    &config,
-                    &project,
-                    plan.as_deref(),
-                    scope,
-                    resolved,
-                    &out,
-                ),
-                PromptCommand::Set {
-                    scope,
-                    prefix,
-                    suffix,
-                    plan,
-                } => commands::cmd_prompt_set(
-                    &conn,
-                    &config_path,
-                    &project,
-                    scope,
-                    plan.as_deref(),
-                    prefix.as_deref(),
-                    suffix.as_deref(),
-                    &out,
-                ),
-                PromptCommand::Clear {
-                    scope,
-                    prefix,
-                    suffix,
-                    plan,
-                } => commands::cmd_prompt_clear(
-                    &conn,
-                    &config_path,
-                    &project,
-                    scope,
-                    plan.as_deref(),
-                    prefix,
-                    suffix,
-                    &out,
-                ),
+                PromptCommand::Show { scope, resolved } => {
+                    commands::cmd_prompt_show(&conn, &config, &project, scope, resolved, &out)
+                }
+                PromptCommand::Set { scope, content } => {
+                    commands::cmd_prompt_set(&conn, &config_path, &project, scope, &content, &out)
+                }
+                PromptCommand::Clear { scope } => {
+                    commands::cmd_prompt_clear(&conn, &config_path, &project, scope, &out)
+                }
             }
         }
 

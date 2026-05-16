@@ -26,11 +26,37 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use super::choice::{Choice, ChoiceItem, ChoiceOutcome};
 use super::theme;
 
 // ---------------------------------------------------------------------------
 // State machine
 // ---------------------------------------------------------------------------
+
+/// The three rows of the branch-choice list, top to bottom. Rendered by
+/// the generic [`Choice`] primitive with focus pinned at row 0 (`/run`
+/// opts out of the primitive's vertical navigation — see
+/// [`RunDialog::handle_choosing`]); `RunDialog` maps a confirmed
+/// `RunChoice` back onto its public [`Outcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunChoice {
+    /// Run in the cwd's currently-checked-out branch.
+    Current,
+    /// Switch to the text-input phase to name a branch.
+    NewBranch,
+    /// Dismiss the dialog.
+    Cancel,
+}
+
+impl ChoiceItem for RunChoice {
+    fn label(&self) -> String {
+        match self {
+            RunChoice::Current => "Use current branch  [Enter]".to_string(),
+            RunChoice::NewBranch => "New branch          [n]".to_string(),
+            RunChoice::Cancel => "Cancel              [Esc]".to_string(),
+        }
+    }
+}
 
 /// Where the dialog is in its two-phase flow.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +99,11 @@ pub struct RunDialog {
     /// always force `--current-branch`; that decision lives in
     /// [`dispatch_outcome`], not in the dialog itself.
     pub plan_count: usize,
+    /// The generic branch-choice list backing the `Choosing` phase. The
+    /// `Choosing` `DialogState` stays a unit variant so callers can still
+    /// `assert_eq!(d.state, DialogState::Choosing)`; the navigable list
+    /// lives here.
+    pub choice: Choice<RunChoice>,
 }
 
 impl RunDialog {
@@ -81,6 +112,10 @@ impl RunDialog {
             state: DialogState::Choosing,
             default_branch: default_branch.into(),
             plan_count,
+            choice: Choice::new(
+                vec![RunChoice::Current, RunChoice::NewBranch, RunChoice::Cancel],
+                0,
+            ),
         }
     }
 
@@ -101,22 +136,47 @@ impl RunDialog {
     }
 
     fn handle_choosing(&mut self, key: KeyEvent) -> Outcome {
-        match key.code {
-            KeyCode::Esc => Outcome::Cancelled,
-            // Default action: use current branch.
-            KeyCode::Enter => Outcome::Current,
-            // 'n' / 'N': switch to NamingBranch with the default pre-filled.
-            KeyCode::Char('n') | KeyCode::Char('N') => {
+        // 'n' / 'N' is a direct shortcut to the naming phase regardless of
+        // which row is focused — preserved from the pre-primitive dialog.
+        if matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N')) {
+            self.state = DialogState::NamingBranch {
+                buffer: self.default_branch.clone(),
+            };
+            return Outcome::Pending;
+        }
+        // `/run` opts OUT of the generic primitive's vertical navigation.
+        // Pre-generalization, `j`/`k`/`↑`/`↓` (and every other non-Esc /
+        // non-Enter / non-`n` key) were INERT in the Choosing phase: focus
+        // never moved off "Use current branch", so a later `Enter` always
+        // resolved to `Current`. We restore that contract by swallowing
+        // navigation keys here BEFORE they reach `Choice::handle_key`,
+        // keeping focus pinned at row 0. `Choice<T>` itself is unmodified —
+        // skip/retry dialogs that delegate every key still navigate.
+        if matches!(
+            key.code,
+            KeyCode::Char('j') | KeyCode::Char('k') | KeyCode::Down | KeyCode::Up
+        ) {
+            self.state = DialogState::Choosing;
+            return Outcome::Pending;
+        }
+        // Terminal/other keys (Enter, Esc, unrecognized) go to the generic
+        // primitive; map its terminal outcome back onto ours. Because focus
+        // is pinned at row 0, `Enter` always confirms `RunChoice::Current`.
+        match self.choice.handle_key(key) {
+            ChoiceOutcome::Pending => {
+                // Unrecognized key — stay in Choosing.
+                self.state = DialogState::Choosing;
+                Outcome::Pending
+            }
+            ChoiceOutcome::Cancelled => Outcome::Cancelled,
+            ChoiceOutcome::Confirmed(RunChoice::Current) => Outcome::Current,
+            ChoiceOutcome::Confirmed(RunChoice::NewBranch) => {
                 self.state = DialogState::NamingBranch {
                     buffer: self.default_branch.clone(),
                 };
                 Outcome::Pending
             }
-            // Anything else stays in Choosing — preserve state.
-            _ => {
-                self.state = DialogState::Choosing;
-                Outcome::Pending
-            }
+            ChoiceOutcome::Confirmed(RunChoice::Cancel) => Outcome::Cancelled,
         }
     }
 
@@ -289,14 +349,11 @@ pub fn render(frame: &mut Frame, area: Rect, dialog: &RunDialog) {
         format!(" Run {} plans ", dialog.plan_count)
     };
     match &dialog.state {
-        DialogState::Choosing => render_choosing(frame, area, &title),
+        DialogState::Choosing => {
+            super::choice::render(frame, area, &title, &dialog.choice);
+        }
         DialogState::NamingBranch { buffer } => render_naming(frame, area, &title, buffer),
     }
-}
-
-fn render_choosing(frame: &mut Frame, area: Rect, title: &str) {
-    let body = "Use current branch  [Enter]\nNew branch          [n]\nCancel              [Esc]";
-    draw_box(frame, area, title, body);
 }
 
 fn render_naming(frame: &mut Frame, area: Rect, title: &str, buffer: &str) {
@@ -405,6 +462,78 @@ mod tests {
         let out = d.handle_key(key(KeyCode::Char('x')));
         assert_eq!(out, Outcome::Pending);
         assert_eq!(d.state, DialogState::Choosing);
+    }
+
+    // -- Choosing phase: /run opts OUT of vertical navigation -----------
+    //
+    // Pre-generalization, `j`/`k`/`↑`/`↓` were INERT in the Choosing phase
+    // (focus never left "Use current branch"), so a later `Enter` always
+    // resolved to `Current`. STEP 31 restores that contract while keeping
+    // the generic `Choice<T>` primitive intact for skip/retry dialogs.
+
+    #[test]
+    fn j_is_inert_and_later_enter_still_picks_current() {
+        let mut d = RunDialog::new("feature-x", 1);
+        // j is swallowed: stays in Choosing, focus pinned at row 0.
+        assert_eq!(d.handle_key(key(KeyCode::Char('j'))), Outcome::Pending);
+        assert_eq!(d.state, DialogState::Choosing);
+        assert_eq!(d.choice.focused(), Some(&RunChoice::Current));
+        // Enter still resolves to Current (no naming phase).
+        assert_eq!(d.handle_key(key(KeyCode::Enter)), Outcome::Current);
+    }
+
+    #[test]
+    fn down_twice_is_inert_and_later_enter_still_picks_current() {
+        let mut d = RunDialog::new("main", 1);
+        assert_eq!(d.handle_key(key(KeyCode::Down)), Outcome::Pending);
+        assert_eq!(d.handle_key(key(KeyCode::Down)), Outcome::Pending);
+        // Focus never moved off Current — no jump to Cancel.
+        assert_eq!(d.choice.focused(), Some(&RunChoice::Current));
+        assert_eq!(d.state, DialogState::Choosing);
+        assert_eq!(d.handle_key(key(KeyCode::Enter)), Outcome::Current);
+    }
+
+    #[test]
+    fn k_and_up_are_inert_and_enter_still_picks_current() {
+        let mut d = RunDialog::new("main", 1);
+        assert_eq!(d.handle_key(key(KeyCode::Char('k'))), Outcome::Pending);
+        assert_eq!(d.handle_key(key(KeyCode::Up)), Outcome::Pending);
+        assert_eq!(d.choice.focused(), Some(&RunChoice::Current));
+        assert_eq!(d.state, DialogState::Choosing);
+        assert_eq!(d.handle_key(key(KeyCode::Enter)), Outcome::Current);
+    }
+
+    #[test]
+    fn mixed_navigation_then_enter_is_still_current() {
+        // A realistic fat-finger sequence: j, Down, k, Up, j — every one
+        // inert, Enter still picks Current (pre-generalization parity).
+        let mut d = RunDialog::new("main", 1);
+        for code in [
+            KeyCode::Char('j'),
+            KeyCode::Down,
+            KeyCode::Char('k'),
+            KeyCode::Up,
+            KeyCode::Char('j'),
+        ] {
+            assert_eq!(d.handle_key(key(code)), Outcome::Pending);
+            assert_eq!(d.state, DialogState::Choosing);
+            assert_eq!(d.choice.focused(), Some(&RunChoice::Current));
+        }
+        assert_eq!(d.handle_key(key(KeyCode::Enter)), Outcome::Current);
+    }
+
+    #[test]
+    fn navigation_then_n_still_enters_naming_phase() {
+        // `n` shortcut is unaffected by prior inert navigation keys.
+        let mut d = RunDialog::new("feature-x", 1);
+        d.handle_key(key(KeyCode::Char('j')));
+        d.handle_key(key(KeyCode::Down));
+        let out = d.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(out, Outcome::Pending);
+        match &d.state {
+            DialogState::NamingBranch { buffer } => assert_eq!(buffer, "feature-x"),
+            other => panic!("unexpected state {other:?}"),
+        }
     }
 
     #[test]
