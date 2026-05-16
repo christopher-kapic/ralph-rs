@@ -31,6 +31,7 @@ use clap::Parser;
 use crate::cli::{
     AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
     PlanHarnessCommand, PromptCommand, QuestionCommand, QuestionsState, StepCommand,
+    StepDependencyCommand,
 };
 
 use crate::commands::{resolve_plan, resolve_project};
@@ -417,6 +418,42 @@ fn main() -> Result<()> {
                     &out,
                 )
             }
+            StepCommand::Dependency(dep_cmd) => match dep_cmd {
+                StepDependencyCommand::Add {
+                    step,
+                    plan,
+                    depends_on,
+                } => {
+                    let p = resolve_plan(&conn, plan, &project, false)?;
+                    commands::step_dependency_add(
+                        &conn,
+                        &p.slug,
+                        &project,
+                        &step,
+                        &depends_on,
+                        &out,
+                    )
+                }
+                StepDependencyCommand::Remove {
+                    step,
+                    plan,
+                    depends_on,
+                } => {
+                    let p = resolve_plan(&conn, plan, &project, false)?;
+                    commands::step_dependency_remove(
+                        &conn,
+                        &p.slug,
+                        &project,
+                        &step,
+                        &depends_on,
+                        &out,
+                    )
+                }
+                StepDependencyCommand::List { step, plan } => {
+                    let p = resolve_plan(&conn, plan, &project, true)?;
+                    commands::step_dependency_list(&conn, &p.slug, &project, &step, &out)
+                }
+            },
         },
 
         // -- Run --

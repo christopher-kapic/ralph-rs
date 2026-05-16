@@ -913,6 +913,15 @@ pub struct DependencyListSummary {
     pub depended_on_by: Vec<String>,
 }
 
+/// JSON output for the `step dependency list` command. Step analogue of
+/// [`DependencyListSummary`]; identifiers are step short ids.
+#[derive(Debug, Clone, Serialize)]
+pub struct StepDependencyListSummary {
+    pub short_id: String,
+    pub depends_on: Vec<String>,
+    pub depended_on_by: Vec<String>,
+}
+
 /// JSON output for the `plan show` command (plan + steps).
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanShowSummary {

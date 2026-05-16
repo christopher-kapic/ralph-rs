@@ -903,6 +903,56 @@ pub enum StepCommand {
         #[arg(long)]
         hook: String,
     },
+
+    /// Manage step-to-step dependency edges within a plan.
+    #[command(subcommand)]
+    Dependency(StepDependencyCommand),
+}
+
+// ---------------------------------------------------------------------------
+// Step dependency subcommands (nested under `step dependency`)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum StepDependencyCommand {
+    /// Add one or more dependency edges to a step.
+    ///
+    /// Selectors accept a 1-based step number or an 8-char short id, scoped
+    /// to the same plan (the same disambiguation as every other step
+    /// command). Cycles and self-edges are rejected.
+    Add {
+        /// Step number (1-based) or 8-char short id to add dependencies to.
+        step: String,
+
+        /// Plan slug. Defaults to the active plan.
+        plan: Option<String>,
+
+        /// A step (number or short id) this step depends on (repeatable).
+        #[arg(long = "depends-on", num_args = 1.., required = true)]
+        depends_on: Vec<String>,
+    },
+
+    /// Remove one or more dependency edges from a step.
+    Remove {
+        /// Step number (1-based) or 8-char short id to remove dependencies from.
+        step: String,
+
+        /// Plan slug. Defaults to the active plan.
+        plan: Option<String>,
+
+        /// A dependency step (number or short id) to remove (repeatable).
+        #[arg(long = "depends-on", num_args = 1.., required = true)]
+        depends_on: Vec<String>,
+    },
+
+    /// List a step's direct dependencies and dependents.
+    List {
+        /// Step number (1-based) or 8-char short id.
+        step: String,
+
+        /// Plan slug. Defaults to the active plan.
+        plan: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,6 +1608,86 @@ mod tests {
             assert_eq!(slug, "foo");
         } else {
             panic!("Expected Plan Dependency List");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "3",
+            "my-plan",
+            "--depends-on",
+            "1",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add {
+            step,
+            plan,
+            depends_on,
+        })) = cli.command.unwrap()
+        {
+            assert_eq!(step, "3");
+            assert_eq!(plan, Some("my-plan".to_string()));
+            assert_eq!(depends_on, vec!["1".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_requires_depends_on() {
+        // Missing --depends-on should error because of num_args = 1..
+        let result = Cli::try_parse_from(["ralph-rs", "step", "dependency", "add", "3"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_step_dependency_remove() {
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "remove",
+            "abc12345",
+            "--depends-on",
+            "1",
+            "--depends-on",
+            "2",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Remove {
+            step,
+            plan,
+            depends_on,
+        })) = cli.command.unwrap()
+        {
+            assert_eq!(step, "abc12345");
+            assert_eq!(plan, None);
+            assert_eq!(depends_on, vec!["1".to_string(), "2".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Remove");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_list() {
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "step", "dependency", "list", "2"]).unwrap();
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::List {
+            step,
+            plan,
+        })) = cli.command.unwrap()
+        {
+            assert_eq!(step, "2");
+            assert_eq!(plan, None);
+        } else {
+            panic!("Expected Step Dependency List");
         }
     }
 

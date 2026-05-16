@@ -859,6 +859,158 @@ pub fn cmd_step_unset_hook(
 }
 
 // ---------------------------------------------------------------------------
+// Step dependency commands (docs/dag-redesign.md §7)
+//
+// Structural step-scoped clones of `plan_dependency_add/remove/list`. Every
+// selector — the subject step and each `--depends-on` value — is resolved via
+// the shared [`resolve_step`] disambiguator, so `<num>` and `<short_id>`
+// behave exactly as they do for every other step command. Dependencies are
+// plan-internal: both endpoints are resolved against the same plan.
+// ---------------------------------------------------------------------------
+
+/// Add one or more step-dependency edges to the step named by `step_sel`.
+///
+/// Cycle/self-edge rejection lives in [`storage::add_step_dependency`]
+/// (docs/dag-redesign.md §6), so this layer only resolves selectors and
+/// reports.
+pub fn step_dependency_add(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    step_sel: &str,
+    depends_on_sels: &[String],
+    out: &OutputContext,
+) -> Result<()> {
+    if depends_on_sels.is_empty() {
+        bail!("At least one --depends-on step is required");
+    }
+
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+
+    let (step, _) = resolve_step(conn, &plan.id, Some(step_sel), None)?;
+
+    for dep_sel in depends_on_sels {
+        let (dep, _) = resolve_step(conn, &plan.id, Some(dep_sel.as_str()), None)?;
+        storage::add_step_dependency(conn, &step.id, &dep.id)?;
+        eprintln!(
+            "{} Added dependency: {} -> {}",
+            output::check_icon(out.color),
+            step.short_id,
+            dep.short_id
+        );
+    }
+
+    Ok(())
+}
+
+/// Remove one or more step-dependency edges from the step named by `step_sel`.
+pub fn step_dependency_remove(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    step_sel: &str,
+    depends_on_sels: &[String],
+    out: &OutputContext,
+) -> Result<()> {
+    if depends_on_sels.is_empty() {
+        bail!("At least one --depends-on step is required");
+    }
+
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+
+    let (step, _) = resolve_step(conn, &plan.id, Some(step_sel), None)?;
+
+    for dep_sel in depends_on_sels {
+        let (dep, _) = resolve_step(conn, &plan.id, Some(dep_sel.as_str()), None)?;
+        storage::remove_step_dependency(conn, &step.id, &dep.id)?;
+        eprintln!(
+            "{} Removed dependency: {} -> {}",
+            output::check_icon(out.color),
+            step.short_id,
+            dep.short_id
+        );
+    }
+
+    Ok(())
+}
+
+/// Print the direct dependencies and dependents of the step named by
+/// `step_sel`. Mirrors `plan_dependency_list`: a `StepDependencyListSummary`
+/// under `--json`, an indented two-section listing otherwise. Each related
+/// step is rendered `<short_id>  <title>`, ordered by short id.
+pub fn step_dependency_list(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    step_sel: &str,
+    out: &OutputContext,
+) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+
+    let (step, _) = resolve_step(conn, &plan.id, Some(step_sel), None)?;
+
+    let dep_ids = storage::list_step_dependencies(conn, &step.id)?;
+    let dependent_ids = storage::list_step_dependents(conn, &step.id)?;
+
+    // Build display labels (`<short_id>  <title>`), sorted by short id so the
+    // output is deterministic regardless of storage row order.
+    let label = |id: &str| -> Result<Option<(String, String)>> {
+        Ok(storage::get_step_by_id(conn, id)?
+            .map(|s| (s.short_id.clone(), format!("{}  {}", s.short_id, s.title))))
+    };
+    let collect = |ids: &[String]| -> Result<Vec<(String, String)>> {
+        let mut v: Vec<(String, String)> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(pair) = label(id)? {
+                v.push(pair);
+            }
+        }
+        v.sort();
+        Ok(v)
+    };
+
+    let deps = collect(&dep_ids)?;
+    let dependents = collect(&dependent_ids)?;
+
+    if out.format == OutputFormat::Json {
+        let summary = output::StepDependencyListSummary {
+            short_id: step.short_id.clone(),
+            depends_on: deps.iter().map(|(sid, _)| sid.clone()).collect(),
+            depended_on_by: dependents.iter().map(|(sid, _)| sid.clone()).collect(),
+        };
+        println!("{}", serde_json::to_string(&summary)?);
+        return Ok(());
+    }
+
+    println!(
+        "{}  {}",
+        output::bold(&step.short_id, out.color),
+        step.title
+    );
+    println!("  depends on:");
+    if deps.is_empty() {
+        println!("    (none)");
+    } else {
+        for (_, line) in &deps {
+            println!("    - {line}");
+        }
+    }
+    println!("  depended on by:");
+    if dependents.is_empty() {
+        println!("    (none)");
+    } else {
+        for (_, line) in &dependents {
+            println!("    - {line}");
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

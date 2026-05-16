@@ -1980,6 +1980,80 @@ mod tests {
         plan_dependency_list(&conn, "plan-b", &project, &test_out()).unwrap();
     }
 
+    // -- step dependency add/remove/list (docs/dag-redesign.md §7) --
+
+    #[test]
+    fn test_step_dependency_add_remove_list_end_to_end() {
+        let (conn, project) = setup();
+        // `plan_with_steps` creates plan slug "sel" with `n` appended steps.
+        let (_plan_id, sids) = plan_with_steps(&conn, &project, 3);
+
+        // Add via a numeric selector (step 3) depending on a short_id
+        // selector (step 1) — both forms must resolve through resolve_step.
+        step_dependency_add(
+            &conn,
+            "sel",
+            &project,
+            "3",
+            &[sids[0].clone()],
+            &test_out(),
+        )
+        .unwrap();
+
+        let s3 = resolve_step(&conn, &_plan_id, Some(sids[2].as_str()), None)
+            .unwrap()
+            .0;
+        let s1 = resolve_step(&conn, &_plan_id, Some(sids[0].as_str()), None)
+            .unwrap()
+            .0;
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &s3.id).unwrap(),
+            vec![s1.id.clone()]
+        );
+        // Reverse edge is visible from the dependency's side.
+        assert_eq!(
+            storage::list_step_dependents(&conn, &s1.id).unwrap(),
+            vec![s3.id.clone()]
+        );
+
+        // list runs without error in both human and JSON modes.
+        step_dependency_list(&conn, "sel", &project, "3", &test_out()).unwrap();
+        let mut json_out = test_out();
+        json_out.format = OutputFormat::Json;
+        step_dependency_list(&conn, "sel", &project, &sids[2], &json_out).unwrap();
+
+        // Self-edge is rejected by the storage layer.
+        assert!(
+            step_dependency_add(&conn, "sel", &project, "1", &["1".to_string()], &test_out())
+                .is_err()
+        );
+
+        // Remove drops the edge; a second remove is a harmless no-op.
+        step_dependency_remove(
+            &conn,
+            "sel",
+            &project,
+            &sids[2],
+            &[sids[0].clone()],
+            &test_out(),
+        )
+        .unwrap();
+        assert!(
+            storage::list_step_dependencies(&conn, &s3.id)
+                .unwrap()
+                .is_empty()
+        );
+        step_dependency_remove(
+            &conn,
+            "sel",
+            &project,
+            "3",
+            &["1".to_string()],
+            &test_out(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_step_out_of_range() {
         let (conn, project) = setup();
