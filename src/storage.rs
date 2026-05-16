@@ -5333,4 +5333,26 @@ mod tests {
             Some("db only")
         );
     }
+
+    /// `STEP_COLUMNS` must enumerate columns in the order SQLite stores them
+    /// so `Step::from_row` indices line up even under `SELECT *`. Mirrors
+    /// `test_plan_columns_matches_physical_table_order` for the steps table —
+    /// added when step 21 appended `retry_strategy` to `STEP_COLUMNS`.
+    #[test]
+    fn test_step_columns_matches_physical_table_order() {
+        let conn = setup();
+        let physical: Vec<String> = conn
+            .prepare("SELECT * FROM steps LIMIT 0")
+            .expect("prepare")
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let canonical: Vec<&str> = STEP_COLUMNS.split(", ").collect();
+        assert_eq!(
+            physical.iter().map(String::as_str).collect::<Vec<_>>(),
+            canonical,
+            "STEP_COLUMNS drifted from the physical steps table layout"
+        );
+    }
 }
