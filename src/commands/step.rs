@@ -583,10 +583,24 @@ pub fn step_reset(
     // steps committed on top of the WIP.
     let workdir = std::path::Path::new(project);
     // Only scan when the plan branch actually exists in this repo. A clean
-    // `Ok(false)` (or any error from `branch_exists`, e.g. the project dir
-    // isn't a git repo) means there can't be a skip-WIP commit to revert —
-    // reset proceeds as a plain status flip.
-    let branch_present = crate::git::branch_exists(workdir, &plan.branch_name).unwrap_or(false);
+    // `Ok(false)` (the project dir isn't a git repo, or the branch was never
+    // created) means there can't be a skip-WIP commit to revert — reset
+    // proceeds as a plain status flip. An *error* is different: silently
+    // treating it as "absent" would orphan any parked `[ralph wip]` commits
+    // with no hint, so we warn before degrading to the plain flip.
+    let branch_present = match crate::git::branch_exists(workdir, &plan.branch_name) {
+        Ok(present) => present,
+        Err(e) => {
+            eprintln!(
+                "{} could not check whether branch '{}' exists ({e}); skipping \
+                 skip-WIP revert — any parked `[ralph wip]` commits for this \
+                 step will remain on the branch",
+                output::severity_icon("warning", out.color),
+                plan.branch_name
+            );
+            false
+        }
+    };
     let wip_shas = if branch_present {
         crate::git::skip_wip_commits_for_step(workdir, &plan.branch_name, &step.id).with_context(
             || {
@@ -601,6 +615,31 @@ pub fn step_reset(
     };
 
     if !wip_shas.is_empty() {
+        // `git revert` operates on the *currently checked-out* HEAD. Unlike
+        // a run (which checks out `plan.branch_name`), `step reset` is a
+        // standalone command with no branch guarantee — so if the user is on
+        // a different branch the revert commits would land on the wrong
+        // branch and the WIP SHAs may not even be in its history (confusing
+        // conflict / misplaced revert). Refuse rather than misplace commits.
+        let current = crate::git::get_current_branch(workdir).with_context(|| {
+            format!(
+                "could not determine the current branch before reverting \
+                 skip-WIP commits for step #{display_num}"
+            )
+        })?;
+        if current != plan.branch_name {
+            bail!(
+                "Step #{display_num} has {} parked skip-WIP commit(s) on \
+                 branch '{}', but the working tree is on '{}'. Reverting here \
+                 would misplace the revert commits. Check out '{}' first \
+                 (e.g. `git checkout {}`), then re-run `ralph step reset`.",
+                wip_shas.len(),
+                plan.branch_name,
+                current,
+                plan.branch_name,
+                plan.branch_name
+            );
+        }
         if !force {
             let plural = if wip_shas.len() == 1 { "" } else { "s" };
             let shorts: Vec<String> = wip_shas
@@ -620,21 +659,49 @@ pub fn step_reset(
         }
 
         // `wip_shas` is newest-first; revert in that order so each revert
-        // applies cleanly on top of the previous one.
+        // applies cleanly on top of the previous one. We attempt *every*
+        // commit and collect failures rather than `?`-bailing on the first:
+        // a `revert_commit` error leaves the tree clean (the in-progress
+        // revert is aborted), so continuing is safe, and the user gets one
+        // summary of exactly what was and wasn't reverted instead of a
+        // silently half-applied operation.
+        let mut failed: Vec<String> = Vec::new();
         for sha in &wip_shas {
             let short = &sha[..sha.len().min(8)];
-            match crate::git::revert_commit(workdir, sha)? {
-                crate::git::RevertOutcome::Reverted { revert_sha } => {
+            match crate::git::revert_commit(workdir, sha) {
+                Ok(crate::git::RevertOutcome::Reverted { revert_sha }) => {
                     eprintln!(
                         "{} Reverted skip-WIP commit {short} (revert {})",
                         output::check_icon(out.color),
                         &revert_sha[..revert_sha.len().min(8)]
                     );
                 }
-                crate::git::RevertOutcome::AlreadyReverted => {
+                Ok(crate::git::RevertOutcome::AlreadyReverted) => {
                     eprintln!("  skip-WIP commit {short} was already reverted — skipping");
                 }
+                Err(e) => {
+                    eprintln!(
+                        "{} Could not revert skip-WIP commit {short}: {e}",
+                        output::severity_icon("warning", out.color)
+                    );
+                    failed.push(short.to_string());
+                }
             }
+        }
+        if !failed.is_empty() {
+            // Don't flip the step to pending while WIP commits are still
+            // live on the branch. The successful reverts above stay applied,
+            // so a later `ralph step reset` retry skips them as
+            // `AlreadyReverted` and only retries the stragglers.
+            bail!(
+                "Reverted what it could, but {} skip-WIP commit(s) ({}) could \
+                 not be reverted (likely a genuine conflict with later work). \
+                 Step #{display_num} was left unchanged — resolve the \
+                 conflict(s) or revert those commits manually, then re-run \
+                 `ralph step reset`.",
+                failed.len(),
+                failed.join(", ")
+            );
         }
     }
 

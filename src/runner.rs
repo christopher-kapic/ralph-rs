@@ -290,6 +290,16 @@ async fn run_plan_inner(
         storage::update_plan_status(conn, &effective_plan.id, PlanStatus::InProgress)?;
     }
 
+    // Discard any leftover cross-process skip request before iterating.
+    // `request_skip` is only ever written while a run is genuinely live for
+    // this plan (see `runner::skip_step`), and its sole consume/clear site is
+    // the executor's `Completed` arm — so a request that times out, is
+    // aborted, or whose run ends before the targeted step runs would persist
+    // with a stable step UUID and silently skip that same step (with the
+    // stale `--changes`) on *this* fresh run. Clearing here at run start is
+    // safe (no legitimate pre-run skip request exists) and closes that gap.
+    storage::clear_skip_request(conn, &effective_plan.id)?;
+
     // Anchor the elapsed-timer for NDJSON consumers (the TUI's in-process
     // attach path, log shippers): emit `run_started` with the wall-clock
     // start instant before the first step's phase transitions begin

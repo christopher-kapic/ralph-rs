@@ -144,20 +144,40 @@ impl Drop for StepInFlightGuard {
 /// Returns `true` if a cancel sender was registered and a step is in-flight
 /// (so the caller should expect the executor to mark the step `Skipped`),
 /// `false` if there's nothing running here to interrupt (the caller should
-/// fall back to a plain DB status flip).
+/// fall back to a plain DB status flip) — including the case where a
+/// whole-run [`CancelReason::Aborted`] is already latched and the skip is
+/// therefore declined (see [`inject_skip_with_kind`] for the rationale).
 pub fn request_skip_in_flight(park_kind: crate::git::ParkStrategyKind) -> bool {
     if !step_in_flight() {
         return false;
     }
     let guard = ACTIVE_CANCEL_TX.lock().unwrap();
     match guard.as_ref() {
-        Some(tx) => {
-            *REQUESTED_PARK_KIND.lock().unwrap() = Some(park_kind);
-            let _ = tx.send(Some(CancelReason::Skipped));
-            true
-        }
+        Some(tx) => inject_skip_into(tx, park_kind),
         None => false,
     }
+}
+
+/// Send a `Skipped` cancel into `tx` **unless** a whole-run
+/// [`CancelReason::Aborted`] is already latched on it.
+///
+/// A Ctrl+C / SIGTERM that has already requested whole-run shutdown
+/// outranks a single-step skip: the signal handler deliberately overrides a
+/// pending `Skipped` with `Aborted` (see the `run` loop), so we enforce the
+/// symmetric invariant here — never downgrade a latched `Aborted` back to a
+/// `Skipped`, which would let the run silently continue past a Ctrl+C when a
+/// skip request happened to be in flight. Returns `true` when the skip was
+/// injected, `false` when it was declined because an abort already won.
+fn inject_skip_into(
+    tx: &watch::Sender<CancelState>,
+    park_kind: crate::git::ParkStrategyKind,
+) -> bool {
+    if *tx.borrow() == Some(CancelReason::Aborted) {
+        return false;
+    }
+    *REQUESTED_PARK_KIND.lock().unwrap() = Some(park_kind);
+    let _ = tx.send(Some(CancelReason::Skipped));
+    true
 }
 
 /// Drive a skip into *this* process's own cancel channel.
@@ -175,16 +195,14 @@ pub fn request_skip_in_flight(park_kind: crate::git::ParkStrategyKind) -> bool {
 ///
 /// Unlike [`request_skip_in_flight`] there is no `step_in_flight()` gate: the
 /// caller is the runner itself, which by construction is mid-attempt for the
-/// step it just matched. Returns `true` if a cancel sender was registered
-/// (always the case for a real run), `false` otherwise.
+/// step it just matched. Returns `true` if the skip was injected, `false`
+/// when no cancel sender was registered **or** a whole-run `Aborted` was
+/// already latched and the skip was therefore declined (the caller's poll
+/// then stops and lets the abort tear the run down).
 pub fn inject_skip_with_kind(park_kind: crate::git::ParkStrategyKind) -> bool {
     let guard = ACTIVE_CANCEL_TX.lock().unwrap();
     match guard.as_ref() {
-        Some(tx) => {
-            *REQUESTED_PARK_KIND.lock().unwrap() = Some(park_kind);
-            let _ = tx.send(Some(CancelReason::Skipped));
-            true
-        }
+        Some(tx) => inject_skip_into(tx, park_kind),
         None => false,
     }
 }
@@ -773,6 +791,43 @@ mod tests {
             None,
             "take must consume the value (no leak into a later skip)"
         );
+
+        set_step_in_flight(false);
+    }
+
+    /// A latched whole-run `Aborted` (Ctrl+C) must never be downgraded to a
+    /// step `Skipped` by a racing skip request — neither via the
+    /// same-process fast path (`request_skip_in_flight`) nor the
+    /// cross-process bridge funnel (`inject_skip_with_kind`). This is the
+    /// symmetric half of the invariant the signal listener already enforces
+    /// in the other direction (a later `Aborted` overrides a pending
+    /// `Skipped`). Regression guard for the skip-clobbers-abort race.
+    #[test]
+    fn test_skip_injectors_decline_when_abort_latched() {
+        let _guard = lock_exit_cleanup_test();
+        // Drain any park kind a prior serialized test may have left so the
+        // "no leak" assertion below is order-independent.
+        let _ = take_requested_park_kind();
+
+        let (tx, rx) = watch::channel(Some(CancelReason::Aborted));
+        install_skip_channel_for_test(tx);
+
+        set_step_in_flight(true);
+        assert!(
+            !request_skip_in_flight(crate::git::ParkStrategyKind::Commit),
+            "request_skip_in_flight must decline while Aborted is latched"
+        );
+        assert!(
+            !inject_skip_with_kind(crate::git::ParkStrategyKind::Discard),
+            "inject_skip_with_kind must decline while Aborted is latched"
+        );
+
+        // The abort is still the latched reason — not downgraded to Skipped,
+        // so the runner's between-steps `Aborted` check still tears the run
+        // down instead of silently continuing past the Ctrl+C.
+        assert_eq!(*rx.borrow(), Some(CancelReason::Aborted));
+        // A declined skip must not have stashed its --changes choice.
+        assert_eq!(take_requested_park_kind(), None);
 
         set_step_in_flight(false);
     }

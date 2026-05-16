@@ -64,6 +64,15 @@ fn open_at<P: AsRef<std::path::Path>>(path: P) -> Result<Connection> {
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open database at {}", path.display()))?;
 
+    // Wait (rather than fail immediately with SQLITE_BUSY) when another
+    // process holds a write lock. The cross-process skip bridge has the
+    // `ralph skip`/TUI process and the runner process contending on this
+    // same file during a live run; without this, a momentary collision
+    // would fail `ralph skip` outright or disable the runner's skip poll.
+    // 5s mirrors the run-lock connection (`run_lock.rs`).
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .with_context(|| format!("Failed to set busy_timeout on {}", path.display()))?;
+
     // Restrict to owner-only on Unix — the DB holds session ids, harness
     // output, diffs, and cost data that shouldn't be world-readable. Windows
     // relies on the user-profile directory ACL (per `dirs` crate guidance).

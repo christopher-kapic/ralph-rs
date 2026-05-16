@@ -122,21 +122,30 @@ pub fn cmd_prompt_set(
             cfg.prompt = value.map(str::to_string);
             write_config(&cfg, config_path)?;
         }
-        PromptScope::Project => {
-            // The checked-in file, when it already exists, is the source of
-            // truth — write through to it so a shared file stays canonical.
-            // Otherwise fall back to the per-machine DB column (solo users
-            // aren't forced onto the file path).
-            let (_, source) = storage::resolve_project_prompt(conn, project)?;
-            match source {
-                ProjectPromptSource::File(_) => {
-                    storage::write_project_prompt_file(project, value.unwrap_or(""))?;
-                }
-                ProjectPromptSource::Db => {
-                    storage::set_project_prompt(conn, project, value)?;
+        PromptScope::Project => match value {
+            // Empty content means "clear" — route through the exact
+            // delete-file + null-DB path `cmd_prompt_clear` uses. Just
+            // writing an empty file would leave a stale
+            // `project_settings.prompt` to resurface on the next read
+            // (file blank → DB fallback), so `set ""` would otherwise be a
+            // partial no-op and break the documented "empty clears" contract.
+            None => clear_project_layer(conn, project)?,
+            // Non-empty: the checked-in file, when it already exists, is the
+            // source of truth — write through to it so a shared file stays
+            // canonical. Otherwise fall back to the per-machine DB column
+            // (solo users aren't forced onto the file path).
+            Some(content) => {
+                let (_, source) = storage::resolve_project_prompt(conn, project)?;
+                match source {
+                    ProjectPromptSource::File(_) => {
+                        storage::write_project_prompt_file(project, content)?;
+                    }
+                    ProjectPromptSource::Db => {
+                        storage::set_project_prompt(conn, project, Some(content))?;
+                    }
                 }
             }
-        }
+        },
     }
 
     if !out.quiet {
@@ -165,20 +174,7 @@ pub fn cmd_prompt_clear(
             cfg.prompt = None;
             write_config(&cfg, config_path)?;
         }
-        PromptScope::Project => {
-            // Empty the project layer in one shot. When the file is the
-            // active source we delete it AND null the DB row: otherwise a
-            // stale `project_settings.prompt` value would resurface on the
-            // very next read (file gone → DB fallback), so a single
-            // `prompt clear` wouldn't actually empty the project layer.
-            // When no file is active there's nothing to delete and we just
-            // clear the DB row (the existing DB-only path).
-            let (_, source) = storage::resolve_project_prompt(conn, project)?;
-            if let ProjectPromptSource::File(_) = source {
-                storage::delete_project_prompt_file(project)?;
-            }
-            storage::set_project_prompt(conn, project, None)?;
-        }
+        PromptScope::Project => clear_project_layer(conn, project)?,
     }
 
     if !out.quiet {
@@ -191,6 +187,22 @@ pub fn cmd_prompt_clear(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Empty the project layer in one shot. When the checked-in file is the
+/// active source we delete it **and** null the DB row: otherwise a stale
+/// `project_settings.prompt` value would resurface on the very next read
+/// (file gone → DB fallback), so a single clear wouldn't actually empty the
+/// project layer. When no file is active there's nothing to delete and we
+/// just clear the DB row. Shared by `prompt clear --scope project` and
+/// `prompt set --scope project ""` so both honor the same contract.
+fn clear_project_layer(conn: &Connection, project: &str) -> Result<()> {
+    let (_, source) = storage::resolve_project_prompt(conn, project)?;
+    if let ProjectPromptSource::File(_) = source {
+        storage::delete_project_prompt_file(project)?;
+    }
+    storage::set_project_prompt(conn, project, None)?;
+    Ok(())
+}
 
 fn scope_name(s: PromptScope) -> &'static str {
     match s {
@@ -326,6 +338,49 @@ mod tests {
                 .prompt,
             None
         );
+    }
+
+    /// `prompt set --scope project ""` must honor the documented "empty
+    /// string clears it" contract even when a checked-in file is the active
+    /// source: it has to delete the file AND null the DB row, exactly like
+    /// `prompt clear`. Otherwise it would write an empty file, the next read
+    /// would fall back to the stale DB value, and the layer wouldn't be
+    /// empty — a partial no-op.
+    #[test]
+    fn project_set_empty_clears_file_and_db_when_file_active() {
+        let conn = crate::db::open_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().to_string_lossy().into_owned();
+        let cfg_path = dir.path().join("config.json");
+
+        // Stale DB value + active file (the file is the active source).
+        storage::set_project_prompt(&conn, &project, Some("stale db value")).unwrap();
+        storage::write_project_prompt_file(&project, "shared").unwrap();
+        assert!(matches!(
+            storage::resolve_project_prompt(&conn, &project).unwrap().1,
+            ProjectPromptSource::File(_)
+        ));
+
+        cmd_prompt_set(
+            &conn,
+            &cfg_path,
+            &project,
+            PromptScope::Project,
+            "", // empty == clear
+            &quiet_out(),
+        )
+        .unwrap();
+
+        // File gone, DB row nulled, effective layer genuinely empty.
+        assert!(!storage::project_prompt_file_path(&project).exists());
+        assert_eq!(
+            storage::get_project_settings_db(&conn, &project)
+                .unwrap()
+                .prompt,
+            None
+        );
+        let (settings, _) = storage::resolve_project_prompt(&conn, &project).unwrap();
+        assert_eq!(settings.prompt, None);
     }
 
     /// `prompt clear --scope project` with the file active deletes the file

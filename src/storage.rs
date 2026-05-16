@@ -517,6 +517,12 @@ pub fn request_skip(
 /// [`crate::git::ParkStrategyKind::Stash`] via
 /// [`crate::git::ParkStrategyKind::from_token`] so a corrupt value can never
 /// make a skip silently destroy work.
+///
+/// Prefer [`take_skip_request_for_step`] from the runner poll loop: this
+/// unconditional take, if paired with a separate `peek`, has a TOCTOU window
+/// where a second `ralph skip` targeting a *different* step that lands
+/// between the peek and the take is consumed and silently discarded.
+#[allow(dead_code)]
 pub fn take_skip_request(
     conn: &Connection,
     plan_id: &str,
@@ -553,12 +559,71 @@ pub fn take_skip_request(
     Ok(result)
 }
 
+/// Atomically consume the pending skip request for `plan_id` **only when it
+/// targets `step_id`**, in a single predicate-guarded transaction. Returns
+/// `Some(kind)` when a request for exactly this step was pending (and is now
+/// cleared); `None` when nothing was pending or it targeted a *different*
+/// step — in which case that request is left untouched so it is honored when
+/// its own step runs.
+///
+/// This is the runner-poll-safe replacement for a separate
+/// [`peek_skip_request`] + [`take_skip_request`]: the read and the clear
+/// share the same `skip_requested_step_id = ?step_id` predicate inside one
+/// transaction, so a concurrent `ralph skip` re-targeting a different step
+/// can no longer slip in between and have its request swallowed against the
+/// in-flight one.
+///
+/// An unrecognized `skip_changes` token resolves to
+/// [`crate::git::ParkStrategyKind::Stash`] (non-destructive default), same as
+/// [`take_skip_request`].
+pub fn take_skip_request_for_step(
+    conn: &Connection,
+    plan_id: &str,
+    step_id: &str,
+) -> Result<Option<crate::git::ParkStrategyKind>> {
+    let tx = conn.unchecked_transaction()?;
+    // Read the change token for *this* step's pending request. The
+    // `skip_requested_step_id = ?2` predicate means a row only comes back
+    // when the pending request is for exactly the in-flight step.
+    let changes: Option<Option<String>> = match tx.query_row(
+        "SELECT skip_changes FROM plans WHERE id = ?1 AND skip_requested_step_id = ?2",
+        params![plan_id, step_id],
+        |r| r.get(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let result = match changes {
+        Some(changes) => {
+            let kind = changes
+                .as_deref()
+                .map(crate::git::ParkStrategyKind::from_token)
+                .unwrap_or(crate::git::ParkStrategyKind::Stash);
+            // Clear under the same predicate so we never null out a request
+            // that a concurrent writer just re-pointed at another step.
+            tx.execute(
+                "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE id = ?1 AND skip_requested_step_id = ?2",
+                params![plan_id, step_id],
+            )?;
+            Some(kind)
+        }
+        None => None,
+    };
+    tx.commit()?;
+    Ok(result)
+}
+
 /// Non-clearing read of the pending skip request for `plan_id`. Returns
-/// `Some((step_id, kind))` when one is pending, `None` otherwise. The runner
-/// peeks first so it only [`take_skip_request`]-consumes a request that
-/// actually targets the step it currently has in-flight — a request aimed at
-/// a different step is left in place (it'll be honored when that step runs)
-/// rather than being wrongly swallowed against the in-flight one.
+/// `Some((step_id, kind))` when one is pending, `None` otherwise.
+///
+/// The runner poll loop no longer peeks-then-takes (that had a TOCTOU
+/// window); it uses the atomic predicate-guarded
+/// [`take_skip_request_for_step`] instead. This read-only accessor is
+/// retained for tests and external state inspection.
+#[allow(dead_code)]
 pub fn peek_skip_request(
     conn: &Connection,
     plan_id: &str,
@@ -589,8 +654,8 @@ pub fn peek_skip_request(
 /// Clear any pending skip request for `plan_id` without consuming it.
 /// Idempotent — a no-op when nothing is pending. Used to tidy a stale
 /// request the runner can no longer act on (e.g. the targeted step is no
-/// longer the in-flight one).
-#[allow(dead_code)]
+/// longer the in-flight one) and, at run start, to drop a request a prior
+/// run left behind so it can't spuriously skip the same step on this run.
 pub fn clear_skip_request(conn: &Connection, plan_id: &str) -> Result<()> {
     conn.execute(
         "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL \
@@ -2795,6 +2860,67 @@ mod tests {
         assert!(
             peek_skip_request(&conn, &plan.id).unwrap().is_none(),
             "clear must drop a pending request without consuming it via take"
+        );
+    }
+
+    #[test]
+    fn test_take_skip_request_for_step_is_targeted_and_atomic() {
+        let conn = setup();
+        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+
+        // Nothing pending → None for any step.
+        assert!(
+            take_skip_request_for_step(&conn, &plan.id, "step-A")
+                .unwrap()
+                .is_none()
+        );
+
+        // A request targeting step-B must NOT be consumed when the in-flight
+        // step is step-A (this is the TOCTOU the targeted take closes: the
+        // old peek-then-take would have cleared and discarded it here).
+        request_skip(
+            &conn,
+            &plan.id,
+            "step-B",
+            crate::git::ParkStrategyKind::Commit,
+        )
+        .unwrap();
+        assert!(
+            take_skip_request_for_step(&conn, &plan.id, "step-A")
+                .unwrap()
+                .is_none(),
+            "a request for a different step must be left untouched"
+        );
+        // …and it's still pending for step-B to honor when it runs.
+        assert_eq!(
+            peek_skip_request(&conn, &plan.id).unwrap(),
+            Some(("step-B".to_string(), crate::git::ParkStrategyKind::Commit))
+        );
+
+        // The matching step consumes-and-clears in one shot.
+        assert_eq!(
+            take_skip_request_for_step(&conn, &plan.id, "step-B").unwrap(),
+            Some(crate::git::ParkStrategyKind::Commit)
+        );
+        assert!(
+            take_skip_request_for_step(&conn, &plan.id, "step-B")
+                .unwrap()
+                .is_none(),
+            "take must read-and-clear so a request is consumed exactly once"
+        );
+        assert!(peek_skip_request(&conn, &plan.id).unwrap().is_none());
+
+        // Corrupt / forward-compat token resolves to the non-destructive
+        // Stash default, same contract as take_skip_request.
+        request_skip(&conn, &plan.id, "step-C", crate::git::ParkStrategyKind::Discard).unwrap();
+        conn.execute(
+            "UPDATE plans SET skip_changes = 'bogus' WHERE id = ?1",
+            params![plan.id],
+        )
+        .unwrap();
+        assert_eq!(
+            take_skip_request_for_step(&conn, &plan.id, "step-C").unwrap(),
+            Some(crate::git::ParkStrategyKind::Stash)
         );
     }
 

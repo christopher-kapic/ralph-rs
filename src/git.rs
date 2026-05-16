@@ -236,10 +236,24 @@ pub fn reset_mixed_to(workdir: &Path, sha: &str) -> Result<()> {
 
 /// Rollback changes while preserving specified untracked files.
 ///
-/// Restores tracked files via `git restore .`, then selectively removes
-/// only untracked files that are NOT in the `preserve` list. Requires git >= 2.23.
+/// Unstages the index back to HEAD, restores tracked files via
+/// `git restore .`, then selectively removes only untracked files that are
+/// NOT in the `preserve` list. Requires git >= 2.23.
 pub fn rollback_except(workdir: &Path, preserve: &[String]) -> Result<()> {
-    // Restore tracked files.
+    // Unstage everything first (index → HEAD; the working tree is left
+    // alone by `git reset`). Without this, a file the harness *created and
+    // `git add`-ed* stays in the index: `git restore .` only syncs the
+    // worktree from the index (so it keeps that file), and
+    // `git ls-files --others` excludes staged paths (so the cleanup below
+    // misses it) — the new file would survive a Discard/Cancel rollback.
+    // After the reset that path is untracked (cleaned below, unless
+    // preserved), and staged modifications to tracked files become unstaged
+    // so the following `git restore .` reverts them to HEAD. Pre-existing
+    // untracked files were never staged, so the reset doesn't change their
+    // status and `preserve` still protects them.
+    git(workdir, &["reset", "-q", "HEAD"]).context("git reset -q HEAD failed")?;
+
+    // Restore tracked files to HEAD content.
     git(workdir, &["restore", "."]).context("git restore . failed")?;
 
     let untracked = get_untracked_files(workdir)?;
@@ -992,6 +1006,52 @@ mod tests {
         );
         // Untracked file removed.
         assert!(!dir.join("extra.txt").exists());
+    }
+
+    /// `rollback_except` must drop a file the harness created **and**
+    /// `git add`-ed (staged-new): `git restore .` alone keeps it (worktree
+    /// ← index) and `git ls-files --others` excludes staged paths, so before
+    /// the index-unstage step such a file survived a Discard/Cancel. It must
+    /// also revert a staged modification to a tracked file, while preserving
+    /// a genuinely pre-existing untracked file named in `preserve`.
+    #[test]
+    fn test_rollback_except_drops_staged_new_files_keeps_preserved() {
+        let (_tmp, dir) = init_repo();
+
+        // Pre-existing untracked file (existed before the "harness" ran) —
+        // must be preserved.
+        fs::write(dir.join("user-scratch.txt"), "keep me").unwrap();
+        let preserve = vec!["user-scratch.txt".to_string()];
+
+        // Harness work: a new file it created and staged, plus a staged
+        // modification to a tracked file.
+        fs::write(dir.join("harness-new.rs"), "fn generated() {}").unwrap();
+        fs::write(dir.join("README.md"), "clobbered by harness").unwrap();
+        git(&dir, &["add", "harness-new.rs", "README.md"]).unwrap();
+        assert!(has_uncommitted_changes(&dir).unwrap());
+
+        rollback_except(&dir, &preserve).unwrap();
+
+        // Staged-new harness file is gone.
+        assert!(
+            !dir.join("harness-new.rs").exists(),
+            "a harness-staged new file must not survive rollback"
+        );
+        // Tracked file reverted to HEAD content.
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
+        // Pre-existing untracked file preserved.
+        assert!(dir.join("user-scratch.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "keep me"
+        );
+        // Nothing tracked left dirty (the preserved untracked file is the
+        // only remaining change).
+        let staged = list_staged_files(&dir).unwrap();
+        assert!(staged.is_empty(), "index must be clean after rollback");
     }
 
     #[test]

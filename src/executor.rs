@@ -607,7 +607,11 @@ async fn finalize_skipped(
                     "ralph-skip/{}/{}/{}",
                     ctx.plan.slug,
                     ctx.step_num,
-                    chrono::Utc::now().timestamp()
+                    // Millisecond resolution: a 1-second timestamp collides
+                    // when the same step is skipped twice within a second,
+                    // which would make label-based stash recovery
+                    // (`find_stash_by_message`) match the wrong entry.
+                    chrono::Utc::now().timestamp_millis()
                 ),
             },
             crate::git::ParkStrategyKind::Commit => crate::git::ParkStrategy::Commit {
@@ -2528,26 +2532,31 @@ const SKIP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 async fn poll_cross_process_skip(conn: &Connection, plan_id: &str, step_id: &str) {
     loop {
         tokio::time::sleep(SKIP_POLL_INTERVAL).await;
-        match storage::peek_skip_request(conn, plan_id) {
-            Ok(Some((target_step_id, _))) if target_step_id == step_id => {
-                // The pending request targets the step we have in-flight.
-                // Consume it (read-and-clear) and inject into our own cancel
-                // channel; from here the existing same-process skip path
-                // takes over verbatim.
-                match storage::take_skip_request(conn, plan_id) {
-                    Ok(Some((taken_id, kind))) if taken_id == step_id => {
-                        crate::signal::inject_skip_with_kind(kind);
-                        // Let the wait future resolve the select!.
-                        std::future::pending::<()>().await;
-                    }
-                    // Lost a race to another consumer or it changed between
-                    // peek and take — keep polling.
-                    Ok(_) => {}
-                    Err(_) => return,
+        // Single predicate-guarded read-and-clear: consumes the pending
+        // request only if it still targets the step we have in-flight, and
+        // leaves a request aimed at a different step untouched (it'll be
+        // honored when that step runs). No separate peek, so there is no
+        // window for a concurrently re-targeted `ralph skip` to be swallowed.
+        match storage::take_skip_request_for_step(conn, plan_id, step_id) {
+            Ok(Some(kind)) => {
+                // The request targeted the in-flight step and is now cleared.
+                // Funnel it into our own cancel channel; from here the
+                // existing same-process skip path takes over verbatim.
+                if crate::signal::inject_skip_with_kind(kind) {
+                    // Skip was injected: let the wait future resolve the
+                    // select! with the real `WaitResult::Skipped`.
+                    std::future::pending::<()>().await;
+                } else {
+                    // A whole-run abort (Ctrl+C) was already latched, so the
+                    // injector refused to downgrade it to a step skip. The
+                    // request is consumed (correct — the run is tearing down
+                    // anyway). Stop polling; the wait future will resolve via
+                    // the abort path.
+                    return;
                 }
             }
             // No request, or it targets a different step — keep polling.
-            Ok(_) => {}
+            Ok(None) => {}
             Err(_) => return,
         }
     }
