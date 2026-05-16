@@ -409,6 +409,7 @@ mod tests {
     fn make_step(id: &str, plan_id: &str, title: &str) -> Step {
         Step {
             id: id.to_string(),
+            short_id: String::new(),
             plan_id: plan_id.to_string(),
             sort_key: "a0".to_string(),
             title: title.to_string(),

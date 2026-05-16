@@ -632,6 +632,14 @@ impl Plan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub id: String,
+    /// Plan-unique, lifetime-stable short handle (V25). Replaces the
+    /// positional step number as the user-facing selector
+    /// (docs/dag-redesign.md §3.1); the internal UUID [`Step::id`] is
+    /// unchanged. `#[serde(default)]` so pre-V25 exported plan JSON (which
+    /// lacks the field) still deserializes — minting happens at step
+    /// creation / import-backfill, not here.
+    #[serde(default)]
+    pub short_id: String,
     pub plan_id: String,
     pub sort_key: String,
     pub title: String,
@@ -680,7 +688,7 @@ impl Step {
     /// id, plan_id, sort_key, title, description, agent, harness,
     /// acceptance_criteria, status, attempts, max_retries, created_at,
     /// updated_at, model, skipped_reason, change_policy, tags,
-    /// retry_strategy
+    /// retry_strategy, short_id
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let criteria_json: String = row.get(7)?;
         let acceptance_criteria: Vec<String> =
@@ -744,8 +752,15 @@ impl Step {
             None => None,
         };
 
+        // `short_id` is the V25 plan-unique handle on column 18. SELECTs
+        // that predate V25 omit the column and raw test inserts may leave
+        // it NULL; either case is defensively mapped to an empty string so
+        // legacy rows keep round-tripping (mirrors the `tags` handling).
+        let short_id: String = row.get::<_, String>(18).ok().unwrap_or_default();
+
         Ok(Step {
             id: row.get(0)?,
+            short_id,
             plan_id: row.get(1)?,
             sort_key: row.get(2)?,
             title: row.get(3)?,
@@ -1087,8 +1102,8 @@ mod tests {
         .expect("insert plan");
 
         conn.execute(
-            "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, short_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 "s1",
                 "p1",
@@ -1101,19 +1116,21 @@ mod tests {
                 "in_progress",
                 2,
                 3,
+                "abcd1234",
             ],
         )
         .expect("insert step");
 
         let step = conn
             .query_row(
-                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy FROM steps WHERE id = ?1",
+                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy, short_id FROM steps WHERE id = ?1",
                 ["s1"],
                 Step::from_row,
             )
             .expect("query step");
 
         assert_eq!(step.id, "s1");
+        assert_eq!(step.short_id, "abcd1234");
         assert_eq!(step.plan_id, "p1");
         assert_eq!(step.sort_key, "a0");
         assert_eq!(step.title, "Step 1");
@@ -1511,6 +1528,7 @@ mod tests {
         fn make_step(rs: Option<RetryStrategy>) -> Step {
             Step {
                 id: "st1".into(),
+                short_id: String::new(),
                 plan_id: "p1".into(),
                 sort_key: "a0".into(),
                 title: "t".into(),

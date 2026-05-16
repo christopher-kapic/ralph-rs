@@ -420,6 +420,7 @@ mod tests {
     fn make_step(id: &str) -> Step {
         Step {
             id: id.into(),
+            short_id: String::new(),
             plan_id: "p1".into(),
             sort_key: "a0".into(),
             title: format!("step {id}"),

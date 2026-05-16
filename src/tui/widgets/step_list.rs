@@ -134,6 +134,7 @@ mod tests {
     fn make_step(idx: usize, title: &str, status: StepStatus) -> Step {
         Step {
             id: format!("s{idx}"),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: format!("a{idx}"),
             title: title.to_string(),

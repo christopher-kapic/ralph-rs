@@ -608,6 +608,7 @@ mod tests {
     fn make_step(harness: Option<&str>) -> Step {
         Step {
             id: "s1".to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: "a0".to_string(),
             title: "Step 1".to_string(),

@@ -6900,6 +6900,7 @@ mod status_live_view_tests {
         // title resolves.
         let fake_step = crate::plan::Step {
             id: "step-uuid".into(),
+            short_id: String::new(),
             plan_id: "p".into(),
             sort_key: "a0".into(),
             title: "Add repository types".into(),
@@ -8181,6 +8182,7 @@ mod step_detail_dispatcher_tests {
         };
         let steps = vec![Step {
             id: "s0".to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: "a0".to_string(),
             title: "Step".to_string(),
@@ -9157,6 +9159,7 @@ mod sub_view_routing_tests {
         };
         let steps = vec![Step {
             id: "step-1".to_string(),
+            short_id: String::new(),
             plan_id: plan.id.clone(),
             sort_key: "a0".to_string(),
             title: "First step".to_string(),
@@ -9607,6 +9610,7 @@ mod mouse_routing_tests {
         };
         let step = Step {
             id: "step-1".to_string(),
+            short_id: String::new(),
             plan_id: plan.id.clone(),
             sort_key: "a0".to_string(),
             title: "Step".to_string(),

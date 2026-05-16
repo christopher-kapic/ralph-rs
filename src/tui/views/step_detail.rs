@@ -2178,6 +2178,7 @@ mod tests {
         (0..n)
             .map(|i| Step {
                 id: format!("s{i}"),
+                short_id: String::new(),
                 plan_id: "p1".to_string(),
                 sort_key: format!("a{i}"),
                 title: format!("Step {}", i + 1),

@@ -560,6 +560,7 @@ mod tests {
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
                 id: format!("s{i}"),
+                short_id: String::new(),
                 plan_id: "p1".to_string(),
                 sort_key: format!("a{i}"),
                 title: format!("Step {}", i + 1),
@@ -658,6 +659,7 @@ mod tests {
         };
         let steps = vec![Step {
             id: "s0".to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: "a0".to_string(),
             title: "Only step".to_string(),
@@ -787,6 +789,7 @@ mod tests {
         };
         let steps = vec![Step {
             id: "s0".to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: "a0".to_string(),
             title: "Write migration".to_string(),

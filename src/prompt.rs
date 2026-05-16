@@ -524,6 +524,7 @@ mod tests {
     fn make_step_with(id: &str, title: &str, status: StepStatus) -> Step {
         Step {
             id: id.to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: id.to_string(),
             title: title.to_string(),
@@ -547,6 +548,7 @@ mod tests {
     fn make_step() -> Step {
         Step {
             id: "s1".to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: "a0".to_string(),
             title: "Implement harness spawning".to_string(),

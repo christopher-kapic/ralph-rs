@@ -1067,6 +1067,7 @@ mod tests {
         (0..n)
             .map(|i| Step {
                 id: format!("s{i}"),
+                short_id: String::new(),
                 plan_id: "p1".to_string(),
                 // Use a0, a1, a2, ... so we have valid frac-index keys with
                 // room between them (a0 < a1 admits a midpoint via key_between).
@@ -1351,6 +1352,7 @@ mod tests {
 
         let new_step = Step {
             id: "s_new".to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: "a0V".to_string(),
             title: "Inserted step".to_string(),

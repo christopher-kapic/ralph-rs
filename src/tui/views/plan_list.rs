@@ -1923,6 +1923,7 @@ mod tests {
         use crate::plan::{ChangePolicy, StepStatus};
         Step {
             id: format!("{plan_id}-step-{idx}"),
+            short_id: String::new(),
             plan_id: plan_id.to_string(),
             sort_key: format!("a{idx}"),
             title: title.to_string(),

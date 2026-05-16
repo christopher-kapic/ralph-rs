@@ -1005,6 +1005,7 @@ mod tests {
         let now = chrono::Utc::now();
         Step {
             id: "id".to_string(),
+            short_id: String::new(),
             plan_id: "plan".to_string(),
             sort_key: "0".to_string(),
             title: title.to_string(),

@@ -1940,6 +1940,7 @@ mod tests {
         (0..n)
             .map(|i| Step {
                 id: format!("s{i}"),
+                short_id: String::new(),
                 plan_id: "p1".to_string(),
                 sort_key: format!("a{i}"),
                 title: format!("Step {}", i + 1),
@@ -4313,6 +4314,7 @@ mod tests {
         let mut grown = steps.clone();
         let new_step = Step {
             id: "s_new".to_string(),
+            short_id: String::new(),
             plan_id: "p1".to_string(),
             sort_key: "a05".to_string(), // between s0=a0 and s1=a1
             title: "Inserted".to_string(),
