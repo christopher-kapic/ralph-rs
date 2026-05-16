@@ -5,7 +5,7 @@
 // independent of rendering and input handling so that it can be unit-tested
 // without a terminal.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use chrono::{DateTime, Utc};
 use crossterm::event::MouseEvent;
@@ -14,7 +14,7 @@ use ratatui::widgets::ListState;
 
 use crate::config::Config;
 use crate::frac_index::{self, FracIndexError};
-use crate::plan::{Phase, Plan, Step, StepStatus};
+use crate::plan::{ExecutionLog, Phase, Plan, Step, StepStatus};
 use crate::run_lock::LiveRun;
 use crate::tui::events::{StreamMode, TAIL_BUFFER_LINES, TAIL_VISIBLE_LINES};
 use crate::tui::help::HelpState;
@@ -153,6 +153,13 @@ pub struct PlanDetailApp {
     /// banner pane and the `A` keybinding that pushes step-detail focused on
     /// the originating step. Refreshed by the dispatcher each poll tick.
     pub open_questions: Vec<crate::storage::OpenQuestion>,
+    /// Per-step cache of `execution_logs` rows, keyed by `Step.id` and
+    /// ordered by `attempt` ASC. Populated by the dispatcher each poll tick
+    /// for steps in a terminal (`Complete`/`Failed`) status so the right
+    /// pane can render the total + per-attempt duration breakdown without a
+    /// DB roundtrip during `draw`. Steps with no recorded attempts simply
+    /// have no entry (or an empty vec) and render no breakdown.
+    pub execution_logs: HashMap<String, Vec<ExecutionLog>>,
     /// Preferred plain `ralph run` mode for the `R` keybinding. Defaults to
     /// the classic branch-creating, auto-stashing flow, but when this view
     /// was entered via `ralph run --current-branch` and/or
@@ -227,6 +234,7 @@ impl PlanDetailApp {
             test_tail_scroll: 0,
             read_only: ReadOnly::Editable,
             open_questions: Vec::new(),
+            execution_logs: HashMap::new(),
             preferred_run_mode: StreamMode::Run {
                 current_branch: false,
                 no_auto_stash: false,
@@ -387,6 +395,24 @@ impl PlanDetailApp {
     /// hiding the banner.
     pub fn set_open_questions(&mut self, questions: Vec<crate::storage::OpenQuestion>) {
         self.open_questions = questions;
+    }
+
+    /// Replace the cached execution-log rows for a single step (after a DB
+    /// poll). Keyed by `Step.id`; the slice is expected to be ordered by
+    /// `attempt` ASC (as returned by
+    /// [`crate::storage::list_execution_logs_for_step`]). Drives the right
+    /// pane's total + per-attempt duration breakdown for terminal steps.
+    pub fn set_execution_logs(&mut self, step_id: &str, logs: Vec<ExecutionLog>) {
+        self.execution_logs.insert(step_id.to_string(), logs);
+    }
+
+    /// Cached execution-log rows for `step_id`, or an empty slice when none
+    /// have been loaded / the step has no recorded attempts.
+    pub fn execution_logs_for(&self, step_id: &str) -> &[ExecutionLog] {
+        self.execution_logs
+            .get(step_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Step ID containing the oldest unanswered question, or `None` when no

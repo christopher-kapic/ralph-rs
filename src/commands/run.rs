@@ -2493,6 +2493,21 @@ where
         if let Ok(opens) = storage::list_open_questions(conn, project, Some(slug)) {
             app.set_open_questions(opens);
         }
+        // Step 26: refresh the execution-log cache for the selected step
+        // when it's in a terminal (Complete/Failed) status so the right
+        // pane can show the total + per-attempt duration breakdown. Scoped
+        // to the cursor's step to keep the poll cheap; Running steps keep
+        // the live elapsed timer (derived from LiveRun.phase_started_at).
+        if let Some(sel) = app.steps.get(app.selected_index)
+            && matches!(
+                sel.status,
+                crate::plan::StepStatus::Complete | crate::plan::StepStatus::Failed
+            )
+            && let Ok(logs) = storage::list_execution_logs_for_step(conn, &sel.id)
+        {
+            let sel_id = sel.id.clone();
+            app.set_execution_logs(&sel_id, logs);
+        }
 
         // -- §13.2 read-only attach poll -------------------------------
         //

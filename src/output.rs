@@ -540,7 +540,6 @@ pub fn log_status_icon(committed: bool, rolled_back: bool, color: bool) -> &'sta
 /// Input is `f64` seconds (matching [`ExecutionLog::duration_secs`]). The
 /// value is truncated toward zero to whole seconds; negative inputs clamp
 /// to `0`.
-#[allow(dead_code)] // wired into the step_detail right pane in phase 7
 pub fn format_duration_secs(secs: f64) -> String {
     let total = if secs.is_finite() && secs > 0.0 {
         secs.floor() as u64

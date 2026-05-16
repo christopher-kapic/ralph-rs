@@ -311,6 +311,40 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
         ]));
     }
 
+    // Step 26: total + per-attempt duration breakdown for terminal steps.
+    // Only Complete/Failed steps carry meaningful attempt history here;
+    // Running steps keep the live "Elapsed" timer above (unchanged). A
+    // step with no recorded attempts renders nothing (no Total line, no
+    // breakdown) — matching how other empty metadata is simply omitted.
+    if matches!(step.status, StepStatus::Complete | StepStatus::Failed) {
+        let logs = app.execution_logs_for(&step.id);
+        if !logs.is_empty() {
+            // None duration counts as 0 toward the total (a still-running
+            // attempt shouldn't poison a terminal step's reported total).
+            let total: f64 = logs.iter().map(|l| l.duration_secs.unwrap_or(0.0)).sum();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Total duration: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(crate::output::format_duration_secs(total)),
+            ]));
+            for log in logs {
+                // `duration_secs = None` renders via the formatter the same
+                // way 0.0 does (the formatter clamps non-positive to "0s").
+                let dur = crate::output::format_duration_secs(log.duration_secs.unwrap_or(0.0));
+                let outcome = attempt_outcome_label(log);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("Attempt {}: ", log.attempt),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!("{dur} ({outcome})")),
+                ]));
+            }
+        }
+    }
+
     // Description
     if !step.description.is_empty() {
         lines.push(Line::from(""));
@@ -430,6 +464,23 @@ fn draw_open_questions_banner(frame: &mut Frame, app: &PlanDetailApp, area: Rect
 // ---------------------------------------------------------------------------
 // Phase rendering
 // ---------------------------------------------------------------------------
+
+/// Build the parenthetical outcome label for one execution-log attempt,
+/// rendered as `Attempt N: <dur> (<label>)` in the right pane (step 26).
+///
+/// A successful attempt reads `success`. A failed attempt surfaces its
+/// [`crate::plan::TerminationReason`] so the operator can tell *why* it
+/// failed at a glance (`failed: test_failed`, `failed: timeout`, …). When
+/// the reason is absent (legacy rows that predate the column) or
+/// `Unknown`, it degrades to a bare `failed`.
+fn attempt_outcome_label(log: &crate::plan::ExecutionLog) -> String {
+    use crate::plan::TerminationReason;
+    match log.termination_reason {
+        Some(TerminationReason::Success) => "success".to_string(),
+        Some(TerminationReason::Unknown) | None => "failed".to_string(),
+        Some(reason) => format!("failed: {}", reason.as_str()),
+    }
+}
 
 /// Map a [`Phase`] enum value to the user-facing label rendered in the
 /// right-pane banner. Mirrors the `Phase::as_str` snake_case identifier
@@ -982,6 +1033,161 @@ mod tests {
         assert!(
             top_row.contains("ralph › test"),
             "expected `ralph › test` on top row: {top_row:?}"
+        );
+    }
+
+    // -- Step 26: total + per-attempt duration breakdown -------------------
+
+    use crate::plan::{ExecutionLog, TerminationReason};
+
+    /// Build a minimal `ExecutionLog` for the duration-breakdown tests.
+    /// Only the fields the right pane reads (`attempt`, `duration_secs`,
+    /// `termination_reason`) are meaningful; the rest are inert defaults.
+    fn make_log(
+        attempt: i32,
+        duration_secs: Option<f64>,
+        termination_reason: Option<TerminationReason>,
+    ) -> ExecutionLog {
+        ExecutionLog {
+            id: attempt as i64,
+            step_id: "s0".to_string(),
+            attempt,
+            started_at: Utc::now(),
+            duration_secs,
+            prompt_text: None,
+            diff: None,
+            test_results: vec![],
+            rolled_back: false,
+            committed: false,
+            commit_hash: None,
+            harness_stdout: None,
+            harness_stderr: None,
+            cost_usd: None,
+            input_tokens: None,
+            output_tokens: None,
+            session_id: None,
+            termination_reason,
+            test_status: None,
+        }
+    }
+
+    #[test]
+    fn right_pane_no_breakdown_for_complete_step_with_zero_attempts() {
+        // 0 attempts: no execution-log cache entry → no Total line and no
+        // per-attempt breakdown (mirrors how other empty metadata is just
+        // omitted rather than rendered as a placeholder).
+        let mut app = app_with_step(StepStatus::Complete, 0, Some(3), None, None, None);
+        let out = rendered(&mut app, 80, 24);
+        assert!(out.contains("Status: complete"), "status missing:\n{out}");
+        assert!(
+            !out.contains("Total duration:"),
+            "no Total line expected with zero attempts:\n{out}"
+        );
+        assert!(
+            !out.contains("Attempt 1:"),
+            "no per-attempt breakdown expected with zero attempts:\n{out}"
+        );
+    }
+
+    #[test]
+    fn right_pane_single_success_attempt_shows_total_and_breakdown() {
+        let mut app = app_with_step(StepStatus::Complete, 1, Some(3), None, None, None);
+        app.set_execution_logs(
+            "s0",
+            vec![make_log(1, Some(12.0), Some(TerminationReason::Success))],
+        );
+        let out = rendered(&mut app, 80, 24);
+        assert!(
+            out.contains("Total duration: 12s"),
+            "total duration missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains("Attempt 1: 12s (success)"),
+            "single success attempt line missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn right_pane_multi_attempt_mixed_outcomes_failed_step() {
+        // A Failed step with: a test-failure, a timeout (None duration →
+        // counts as 0 and renders "0s"), and a final success. Total sums
+        // the present durations (45 + 0 + 30 = 75s → "1m 15s").
+        let mut app = app_with_step(StepStatus::Failed, 3, Some(3), None, None, None);
+        app.set_execution_logs(
+            "s0",
+            vec![
+                make_log(1, Some(45.0), Some(TerminationReason::TestFailed)),
+                make_log(2, None, Some(TerminationReason::Timeout)),
+                make_log(3, Some(30.0), Some(TerminationReason::Success)),
+            ],
+        );
+        let out = rendered(&mut app, 80, 30);
+        assert!(
+            out.contains("Total duration: 1m 15s"),
+            "total duration should sum present durations:\n{out}"
+        );
+        assert!(
+            out.contains("Attempt 1: 45s (failed: test_failed)"),
+            "attempt 1 test-failure line missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains("Attempt 2: 0s (failed: timeout)"),
+            "attempt 2 timeout line (None duration → 0s) missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains("Attempt 3: 30s (success)"),
+            "attempt 3 success line missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn right_pane_attempt_with_no_changes_and_user_skipped_reasons() {
+        // Cover the remaining failure-mode variants the task calls out:
+        // no_changes, user_skipped, harness_failed. Instant (0.0s)
+        // failures still render via the formatter as "0s".
+        let mut app = app_with_step(StepStatus::Failed, 3, Some(3), None, None, None);
+        app.set_execution_logs(
+            "s0",
+            vec![
+                make_log(1, Some(0.0), Some(TerminationReason::NoChanges)),
+                make_log(2, Some(5.0), Some(TerminationReason::HarnessFailed)),
+                make_log(3, Some(2.0), Some(TerminationReason::UserSkipped)),
+            ],
+        );
+        let out = rendered(&mut app, 80, 30);
+        assert!(
+            out.contains("Attempt 1: 0s (failed: no_changes)"),
+            "no_changes attempt line missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains("Attempt 2: 5s (failed: harness_failed)"),
+            "harness_failed attempt line missing/wrong:\n{out}"
+        );
+        assert!(
+            out.contains("Attempt 3: 2s (failed: user_skipped)"),
+            "user_skipped attempt line missing/wrong:\n{out}"
+        );
+    }
+
+    #[test]
+    fn right_pane_running_step_keeps_live_timer_not_breakdown() {
+        // §29 / step 26 boundary: a Running step keeps the live "Elapsed"
+        // timer and must NOT render the terminal duration breakdown even
+        // if execution_logs happen to be cached for it.
+        let mut app = app_with_step(StepStatus::InProgress, 1, Some(3), None, None, None);
+        app.set_execution_logs(
+            "s0",
+            vec![make_log(1, Some(9.0), Some(TerminationReason::Success))],
+        );
+        let out = rendered(&mut app, 80, 24);
+        assert!(out.contains("Elapsed:"), "live timer missing:\n{out}");
+        assert!(
+            !out.contains("Total duration:"),
+            "Running step must not show terminal Total line:\n{out}"
+        );
+        assert!(
+            !out.contains("Attempt 1:"),
+            "Running step must not show per-attempt breakdown:\n{out}"
         );
     }
 }
