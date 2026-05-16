@@ -34,6 +34,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v22,
     migrate_v23,
     migrate_v24,
+    migrate_v25,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -775,6 +776,105 @@ fn migrate_v24(conn: &Connection) -> Result<()> {
         ALTER TABLE steps ADD COLUMN retry_strategy TEXT;
         ",
     )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V25: short ids + step-level dependency DAG
+// ---------------------------------------------------------------------------
+
+fn migrate_v25(conn: &Connection) -> Result<()> {
+    // The DAG redesign (docs/dag-redesign.md §3, §6) makes a plan a
+    // dependency DAG of steps instead of a linear list. Two structural
+    // additions:
+    //
+    // 1. `steps.short_id` — a stable, plan-unique 8-char handle that
+    //    replaces the positional step number as the user-facing selector
+    //    (a DAG has no stable linear ordinal). The internal UUID
+    //    (`steps.id`) is unchanged. The unique index is on
+    //    `(plan_id, short_id)` so ids are only plan-scoped; SQLite treats
+    //    the pre-backfill NULLs as distinct, so creating the index before
+    //    the backfill is safe.
+    //
+    // 2. `step_dependencies` — a direct structural clone of
+    //    `plan_dependencies` (V2): same `ON DELETE CASCADE`, same
+    //    self-edge `CHECK`, same two directional indexes. Cycle detection
+    //    reuses the V2 `would_create_cycle` pattern via a later
+    //    `would_create_step_cycle`.
+    //
+    // Backfill makes every existing (linear) plan a degenerate chain DAG
+    // that executes identically: for each plan, walking its steps in
+    // `sort_key` order (the authored order), each step gets a random
+    // 8-char `short_id` collision-checked within the plan, and step *k*
+    // gets a synthesized `depends_on` edge to step *k−1*. This is the
+    // exact backfill `src/import.rs` mirrors for legacy bundles.
+    conn.execute_batch(
+        "
+        ALTER TABLE steps ADD COLUMN short_id TEXT;
+        CREATE UNIQUE INDEX idx_steps_short_id ON steps(plan_id, short_id);
+
+        CREATE TABLE step_dependencies (
+            step_id            TEXT NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+            depends_on_step_id TEXT NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+            created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            PRIMARY KEY (step_id, depends_on_step_id),
+            CHECK (step_id != depends_on_step_id)
+        );
+        CREATE INDEX idx_step_deps_step ON step_dependencies(step_id);
+        CREATE INDEX idx_step_deps_dep  ON step_dependencies(depends_on_step_id);
+        ",
+    )?;
+
+    let plan_ids: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM plans")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for plan_id in plan_ids {
+        let step_ids: Vec<String> = {
+            let mut stmt =
+                conn.prepare("SELECT id FROM steps WHERE plan_id = ?1 ORDER BY sort_key ASC")?;
+            let rows = stmt.query_map([&plan_id], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut assigned: Vec<String> = Vec::with_capacity(step_ids.len());
+        let mut prev_step_id: Option<&str> = None;
+        for step_id in &step_ids {
+            // Mint a plan-unique 8-char short_id. UUID v4's hex form gives
+            // ~16^8 candidates; the in-loop collision check keeps it
+            // unique within the plan even though a clash is astronomically
+            // unlikely. (Step #2 of the redesign promotes this to a shared
+            // minting helper; the migration generates inline.)
+            let short_id = loop {
+                let candidate: String = uuid::Uuid::new_v4()
+                    .simple()
+                    .to_string()
+                    .chars()
+                    .take(8)
+                    .collect();
+                if !assigned.iter().any(|a| a == &candidate) {
+                    break candidate;
+                }
+            };
+            conn.execute(
+                "UPDATE steps SET short_id = ?1 WHERE id = ?2",
+                rusqlite::params![short_id, step_id],
+            )?;
+            assigned.push(short_id);
+
+            if let Some(prev) = prev_step_id {
+                conn.execute(
+                    "INSERT INTO step_dependencies (step_id, depends_on_step_id) \
+                     VALUES (?1, ?2)",
+                    rusqlite::params![step_id, prev],
+                )?;
+            }
+            prev_step_id = Some(step_id.as_str());
+        }
+    }
+
     Ok(())
 }
 
@@ -2383,6 +2483,114 @@ mod tests {
         assert_eq!(version, CURRENT_VERSION);
 
         // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v25_adds_short_id_and_step_dependencies() {
+        // Seed a pre-V25 DB with a plan + 3 steps in sort_key order, run
+        // V25, and verify the backfill: every step gets a non-null
+        // unique-per-plan short_id, and a synthesized linear chain
+        // (step k depends_on step k-1) is written to step_dependencies so
+        // the migrated linear plan is a degenerate DAG that executes
+        // identically.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v24.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v24 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(24) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+        for (sid, sk, title) in [
+            ("s1", "a0", "Step 1"),
+            ("s2", "a1", "Step 2"),
+            ("s3", "a2", "Step 3"),
+        ] {
+            conn.execute(
+                "INSERT INTO steps (id, plan_id, sort_key, title, description) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![sid, "p1", sk, title, "d"],
+            )
+            .unwrap();
+        }
+
+        drop(conn);
+
+        // Re-open — V25 applies (backfill short_ids + linear chain edges).
+        let conn = open_at(&path).unwrap();
+
+        // (a) Every step has a non-null, unique-per-plan, 8-char short_id.
+        let pairs: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id, short_id FROM steps WHERE plan_id = ?1")
+            .unwrap()
+            .query_map(["p1"], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(pairs.len(), 3);
+        let mut short_ids: Vec<String> = Vec::new();
+        for (id, sid) in &pairs {
+            let sid = sid
+                .clone()
+                .unwrap_or_else(|| panic!("step {id} must have a non-null short_id post-V25"));
+            assert_eq!(
+                sid.chars().count(),
+                8,
+                "short_id must be 8 chars (got {sid:?})"
+            );
+            short_ids.push(sid);
+        }
+        short_ids.sort();
+        let n = short_ids.len();
+        short_ids.dedup();
+        assert_eq!(
+            n,
+            short_ids.len(),
+            "short_ids must be unique within the plan"
+        );
+
+        // (b) The synthesized linear chain edges exist: s2->s1, s3->s2.
+        let edges: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT step_id, depends_on_step_id FROM step_dependencies ORDER BY step_id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            edges,
+            vec![
+                ("s2".to_string(), "s1".to_string()),
+                ("s3".to_string(), "s2".to_string()),
+            ],
+            "V25 must synthesize a linear chain (step k depends_on step k-1)"
+        );
+
+        // (c) user_version is current.
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // (d) Re-open is a no-op (no re-backfill, version unchanged).
         let conn = open_at(&path).expect("re-open must not reapply migrations");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
