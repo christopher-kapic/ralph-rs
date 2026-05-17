@@ -247,6 +247,21 @@ impl OutlineState {
         self.cursor = if self.cursor == 0 { n - 1 } else { self.cursor - 1 };
     }
 
+    /// Park the cursor on visible row `idx` (clamped to the visible range),
+    /// no-op on an empty outline. Pure cursor move within the outline's own
+    /// index space — used by the mouse path to land the cursor on a clicked
+    /// row exactly the way `navigate_up`/`navigate_down` (the keyboard path)
+    /// or the `/focus` palette path move it, so the rendered highlight
+    /// (driven by [`Self::cursor`]) follows the click. Does **not** poke any
+    /// divergent flat index.
+    pub fn set_cursor(&mut self, idx: usize) {
+        let n = self.visible_rows().len();
+        if n == 0 {
+            return;
+        }
+        self.cursor = idx.min(n - 1);
+    }
+
     /// `z` — re-root the outline at the cursor's step: show only that step
     /// and its transitive downstream-dependents cone (§12.2). Focus *nests*:
     /// pressing `z` again on a step inside the current cone pushes another
