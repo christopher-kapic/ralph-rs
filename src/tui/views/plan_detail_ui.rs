@@ -20,14 +20,27 @@ use crate::tui::events::TAIL_VISIBLE_LINES;
 use crate::tui::help;
 use crate::tui::read_only;
 use crate::tui::theme;
+use crate::tui::widgets::outline_list;
 use crate::tui::widgets::palette_bar;
-use crate::tui::widgets::step_list;
 
 /// Render the entire plan-detail view.
 pub fn draw(frame: &mut Frame, app: &mut PlanDetailApp) {
     app.toasts.prune(Instant::now());
 
-    let crumbs: [&str; 2] = ["ralph", app.plan.slug.as_str()];
+    // docs/dag-redesign.md §12.2: the upstream context of a focused outline
+    // is carried by the breadcrumb (`<slug> › focus: c9d4 › f1a0`), never
+    // re-expanded in the body. Built once here so the borrowed `&str`s in
+    // `crumbs` outlive the chrome render call.
+    let focus_crumb = if app.outline_focused() {
+        format!("focus: {}", app.outline.focus_breadcrumb().join(" › "))
+    } else {
+        String::new()
+    };
+    let crumbs: Vec<&str> = if focus_crumb.is_empty() {
+        vec!["ralph", app.plan.slug.as_str()]
+    } else {
+        vec!["ralph", app.plan.slug.as_str(), focus_crumb.as_str()]
+    };
     let hint = hint_for(app);
     let banner = read_only::banner(app.read_only);
     // §29: surface a compact "▶ Running step N (phase) MM:SS" in the bottom
@@ -165,19 +178,29 @@ fn draw_step_list(frame: &mut Frame, app: &mut PlanDetailApp, area: Rect) {
     // Record the bordered list area so `handle_mouse` can hit-test a click
     // row to a step index (it accounts for the Block border + scroll offset).
     app.step_list_area = area;
-    let cursor = if app.steps.is_empty() {
+    // docs/dag-redesign.md §12.1: the flat positional list is replaced by
+    // the topological dependency outline. The visible rows already honor the
+    // §12.2 focus cone; the bordered title shows the focus tail so the user
+    // sees where they're re-rooted even without looking at the breadcrumb.
+    let rows = app.outline.visible_rows();
+    let cursor = if rows.is_empty() {
         None
     } else {
-        Some(app.selected_index)
+        Some(app.outline.cursor().min(rows.len() - 1))
     };
-    step_list::render(
+    let title = if app.outline_focused() {
+        format!("{}  focus: {}", app.plan.slug, app.outline.focus_breadcrumb().join(" › "))
+    } else {
+        app.plan.slug.clone()
+    };
+    outline_list::render(
         frame,
         area,
-        &app.steps,
+        &rows,
         &app.selection,
         cursor,
         app.is_run_live(),
-        app.plan.slug.as_str(),
+        &title,
         &mut app.list_state,
     );
 }
@@ -720,6 +743,10 @@ mod tests {
     fn test_list_state_persists_across_frames() {
         // Render a long list in a small viewport, scroll past the visible window,
         // and verify the list_state offset is preserved (not reset to 0 each frame).
+        // docs/dag-redesign.md §12.1 moved cursor ownership to the
+        // dependency outline; the renderer now drives `list_state.select`
+        // from `outline.cursor()`, so navigation goes through the outline
+        // (the new source of truth) rather than the flat `navigate_down`.
         let mut app = make_app(50);
         let backend = ratatui::backend::TestBackend::new(40, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -729,8 +756,9 @@ mod tests {
 
         // Scroll far enough that the selection must be off-screen on first render.
         for _ in 0..30 {
-            app.navigate_down();
+            app.outline.navigate_down();
         }
+        app.realign_selection_to_outline();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let offset_after_scroll = app.list_state.offset();
         assert_eq!(app.list_state.selected(), Some(30));

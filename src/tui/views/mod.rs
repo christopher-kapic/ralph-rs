@@ -7,6 +7,9 @@
 pub mod answer_modal;
 pub mod archived_list;
 pub mod create_plan;
+pub mod inbox;
+pub mod inbox_ui;
+pub mod outline_view;
 pub mod plan_dependencies;
 pub mod plan_detail;
 pub mod plan_detail_input;

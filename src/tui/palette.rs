@@ -87,6 +87,13 @@ pub enum PaletteCommand {
     Quit,
     /// `/help`.
     Help,
+    /// `/inbox` — open the cross-branch interruptions inbox
+    /// (docs/dag-redesign.md §12.3).
+    Inbox,
+    /// `/focus <short_id>` — re-root the plan-detail outline on a step's
+    /// downstream-dependents cone (docs/dag-redesign.md §12.2). `None`
+    /// focuses the cursor's step; `Some(id)` focuses an explicit short id.
+    Focus(Option<String>),
 }
 
 impl PaletteCommand {
@@ -121,6 +128,8 @@ impl PaletteCommand {
             PaletteCommand::Import(_) => "/import",
             PaletteCommand::Quit => "/quit",
             PaletteCommand::Help => "/help",
+            PaletteCommand::Inbox => "/inbox",
+            PaletteCommand::Focus(_) => "/focus",
         }
     }
 }
@@ -298,6 +307,15 @@ pub fn parse(input: &str) -> Result<PaletteCommand, ParseError> {
         // /help
         ["help"] => Ok(PaletteCommand::Help),
 
+        // /inbox — cross-branch interruptions inbox (§12.3)
+        ["inbox"] => Ok(PaletteCommand::Inbox),
+
+        // /focus [<short_id>] — re-root the outline (§12.2)
+        ["focus"] => Ok(PaletteCommand::Focus(None)),
+        ["focus", short_id] => {
+            Ok(PaletteCommand::Focus(Some((*short_id).to_string())))
+        }
+
         _ => Err(ParseError::Unknown(body.to_string())),
     }
 }
@@ -442,6 +460,14 @@ const VERB_SPECS: &[VerbSpec] = &[
     },
     VerbSpec {
         tokens: &["help"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["inbox"],
+        arg: ArgSource::None,
+    },
+    VerbSpec {
+        tokens: &["focus"],
         arg: ArgSource::None,
     },
 ];
@@ -1054,6 +1080,23 @@ mod tests {
         assert_eq!(parse("/quit"), Ok(PaletteCommand::Quit));
         assert_eq!(parse("/q"), Ok(PaletteCommand::Quit));
         assert_eq!(parse("/help"), Ok(PaletteCommand::Help));
+    }
+
+    #[test]
+    fn parses_inbox_and_focus() {
+        // docs/dag-redesign.md §12.3 / §12.2 palette wiring. The `:` prefix
+        // key is consumed by the palette bar before `parse`, so the parser
+        // only ever sees the slash-or-bare form (mirrors every other verb).
+        assert_eq!(parse("/inbox"), Ok(PaletteCommand::Inbox));
+        assert_eq!(parse("inbox"), Ok(PaletteCommand::Inbox));
+        assert_eq!(parse("/focus"), Ok(PaletteCommand::Focus(None)));
+        assert_eq!(
+            parse("/focus c9d4a1b2"),
+            Ok(PaletteCommand::Focus(Some("c9d4a1b2".to_string())))
+        );
+        // Labels for the help/toast surfaces.
+        assert_eq!(PaletteCommand::Inbox.label(), "/inbox");
+        assert_eq!(PaletteCommand::Focus(None).label(), "/focus");
     }
 
     #[test]

@@ -1031,6 +1031,69 @@ pub fn list_interruptions_for_step(conn: &Connection, step_id: &str) -> Result<V
     Ok(out)
 }
 
+/// One row for the cross-branch interruptions inbox (docs/dag-redesign.md
+/// §12.3): the full [`Interruption`] plus the owning plan slug and the
+/// step's short id, for display without a second lookup.
+#[derive(Debug, Clone)]
+pub struct InboxRow {
+    pub interruption: Interruption,
+    pub plan_slug: String,
+    pub step_short_id: String,
+}
+
+/// Every interruption (open **and** resolved) for `project`, joined to its
+/// plan slug + step short id, ordered so OPEN items come first (oldest
+/// first), then RESOLVED items (most-recently resolved first) which the TUI
+/// keeps visible but dimmed for recent context (§12.3). `resolved_limit`
+/// bounds the trailing resolved tail so the inbox doesn't grow unbounded.
+pub fn list_inbox_rows(
+    conn: &Connection,
+    project: &str,
+    resolved_limit: usize,
+) -> Result<Vec<InboxRow>> {
+    let cols = INTERRUPTION_COLUMNS
+        .split(", ")
+        .map(|c| format!("i.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Open first (asked_at ASC), then resolved (resolved_at DESC) capped.
+    let sql = format!(
+        "SELECT {cols}, p.slug, s.short_id, i.state, i.resolved_at \
+         FROM interruptions i \
+         JOIN steps s ON s.id = i.step_id \
+         JOIN plans p ON p.id = s.plan_id \
+         WHERE p.project = ?1 \
+         ORDER BY (i.state = 'open') DESC, \
+                  CASE WHEN i.state = 'open' THEN i.asked_at END ASC, \
+                  CASE WHEN i.state = 'resolved' THEN i.resolved_at END DESC, \
+                  i.id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let n_cols = INTERRUPTION_COLUMNS.split(", ").count();
+    let rows = stmt.query_map(params![project], |row| {
+        let interruption = Interruption::from_row(row)?;
+        let plan_slug: String = row.get(n_cols)?;
+        let step_short_id: String = row.get(n_cols + 1)?;
+        Ok(InboxRow {
+            interruption,
+            plan_slug,
+            step_short_id,
+        })
+    })?;
+    let mut open = Vec::new();
+    let mut resolved = Vec::new();
+    for row in rows {
+        let r = row?;
+        if r.interruption.state == crate::plan::InterruptionState::Open {
+            open.push(r);
+        } else if resolved.len() < resolved_limit {
+            resolved.push(r);
+        }
+    }
+    open.extend(resolved);
+    Ok(open)
+}
+
 /// The **bounded** resolved-interruption query — the centerpiece of the §4
 /// fix. Returns at most `limit` (the most-recent) *resolved* interruptions
 /// for `step_id`, **newest first**. The prompt builder feeds these into the

@@ -55,6 +55,10 @@ pub enum InputAction {
     /// — first press sets it (runner stops after the current step), second
     /// press clears it (cancels the request before the boundary fires).
     TogglePauseRequested,
+    /// The user pressed `i` (open the cross-branch interruptions inbox —
+    /// docs/dag-redesign.md §12.3). Reachable from anywhere; the dispatcher
+    /// pushes `View::Inbox` via `run_inbox_tui`.
+    OpenInbox,
 }
 
 /// True when J/K should scroll the live-run tails (TUI-plan.md §13) instead
@@ -85,16 +89,28 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
     // reason about its own edit-vs-non-edit classification.
     let locked = app.read_only.is_locked();
 
+    // docs/dag-redesign.md §12.1/§12.2: the dependency outline owns
+    // navigation (`j`/`k`), focus/re-root (`z`/`Z`, and `Esc` *only* while
+    // focused), and step-open (`enter`/`l`/`→`). Consult it first; on
+    // `Handled` we realign the flat-list `selected_index` so the existing
+    // cursor-target helpers (skip/reset/delete) stay correct. `Passthrough`
+    // falls through to the edit / run / sub-view bindings below, preserving
+    // every pre-existing keybinding (no script/muscle-memory regression).
+    {
+        use crate::tui::views::outline_view::OutlineOutcome;
+        match app.outline.handle_key(key) {
+            OutlineOutcome::Handled => {
+                app.realign_selection_to_outline();
+                return InputAction::None;
+            }
+            OutlineOutcome::OpenStep(id) => {
+                return InputAction::OpenStepDetail(id);
+            }
+            OutlineOutcome::Passthrough => {}
+        }
+    }
+
     match key.code {
-        // Navigation
-        KeyCode::Char('j') | KeyCode::Down => {
-            app.navigate_down();
-            InputAction::None
-        }
-        KeyCode::Char('k') | KeyCode::Up => {
-            app.navigate_up();
-            InputAction::None
-        }
 
         // Multi-select
         KeyCode::Char(' ') => {
@@ -197,6 +213,16 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
             Some(step_id) => InputAction::OpenQuestion(step_id),
             None => InputAction::None,
         },
+
+        // Open the cross-branch interruptions inbox (docs/dag-redesign.md
+        // §12.3). The spec's canonical key is `i`, but plan-detail's `i`
+        // already inserts a step above the cursor (a documented, tested,
+        // muscle-memory binding the redesign explicitly must not regress —
+        // §13.1 "no script regressions"); the inbox is therefore bound to
+        // `I` (Shift-i) here and in plan-list, where lowercase `i` likewise
+        // already creates a plan. Read-only navigation, allowed while
+        // locked.
+        KeyCode::Char('I') => InputAction::OpenInbox,
 
         // Flip `plans.questions_enabled` for this plan (TUI-plan.md §17
         // 'Toggle surfaces'). Mirrors plan-list's Q binding. Edit — suppressed
@@ -366,6 +392,20 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
+    /// Position the cursor on step index `idx`. docs/dag-redesign.md §12.1
+    /// moved cursor ownership from the flat `selected_index` to the
+    /// dependency outline (`OutlineState::cursor`), so tests must drive the
+    /// cursor through the outline (the new source of truth) rather than
+    /// poking `selected_index` directly — `realign_selection_to_outline`
+    /// then mirrors it back onto `selected_index` for the cursor-target
+    /// helpers. Steps in `make_app` have empty `short_id` + ascending
+    /// `sort_key`, so the outline order == construction order == `idx`.
+    fn cursor_to(app: &mut PlanDetailApp, idx: usize) {
+        for _ in 0..idx {
+            handle_key(app, key(KeyCode::Char('j')));
+        }
+    }
+
     // -- Normal mode tests --
 
     #[test]
@@ -380,7 +420,7 @@ mod tests {
     #[test]
     fn test_k_navigates_up() {
         let mut app = make_app(3);
-        app.selected_index = 2;
+        cursor_to(&mut app, 2);
         let action = handle_key(&mut app, key(KeyCode::Char('k')));
         assert_eq!(action, InputAction::None);
         assert_eq!(app.selected_index, 1);
@@ -397,7 +437,7 @@ mod tests {
     #[test]
     fn test_up_arrow_navigates_up() {
         let mut app = make_app(3);
-        app.selected_index = 1;
+        cursor_to(&mut app, 1);
         let action = handle_key(&mut app, key(KeyCode::Up));
         assert_eq!(action, InputAction::None);
         assert_eq!(app.selected_index, 0);
@@ -578,7 +618,7 @@ mod tests {
     #[test]
     fn test_enter_emits_open_step_detail_for_cursor() {
         let mut app = make_app(3);
-        app.selected_index = 1;
+        cursor_to(&mut app, 1);
         let action = handle_key(&mut app, key(KeyCode::Enter));
         assert_eq!(action, InputAction::OpenStepDetail("s1".to_string()));
     }
@@ -586,7 +626,7 @@ mod tests {
     #[test]
     fn test_right_arrow_emits_open_step_detail() {
         let mut app = make_app(3);
-        app.selected_index = 2;
+        cursor_to(&mut app, 2);
         let action = handle_key(&mut app, key(KeyCode::Right));
         assert_eq!(action, InputAction::OpenStepDetail("s2".to_string()));
     }

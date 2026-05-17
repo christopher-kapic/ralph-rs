@@ -256,6 +256,15 @@ pub enum PaletteAction {
         plan_slug: String,
         step_label: String,
     },
+    /// `/inbox` — open the cross-branch interruptions inbox
+    /// (docs/dag-redesign.md §12.3). Reachable from any view; the consumer
+    /// pushes `run_inbox_tui`.
+    OpenInbox,
+    /// `/focus [<short_id>]` — re-root the plan-detail outline on a step's
+    /// downstream-dependents cone (docs/dag-redesign.md §12.2). `short_id`
+    /// is `None` to focus the cursor's step. Only meaningful in plan-detail;
+    /// other views toast.
+    FocusStep { short_id: Option<String> },
     /// Recognized command whose palette surface isn't wired yet. Caller
     /// renders a `Coming soon — landing in step <N>` info toast. Only
     /// `/help` currently emits this — the overlay itself is reachable via
@@ -350,6 +359,17 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
 
         // -- /import <path> -----------------------------------------------
         PaletteCommand::Import(path) => PaletteAction::Import { path: path.clone() },
+
+        // -- /inbox -------------------------------------------------------
+        // docs/dag-redesign.md §12.3: the inbox is deliberately decoupled
+        // from DAG navigation and reachable from anywhere, so it needs no
+        // plan/step context resolution.
+        PaletteCommand::Inbox => PaletteAction::OpenInbox,
+
+        // -- /focus [<short_id>] ------------------------------------------
+        PaletteCommand::Focus(short_id) => PaletteAction::FocusStep {
+            short_id: short_id.clone(),
+        },
 
         // -- /quit / /q ---------------------------------------------------
         PaletteCommand::Quit => PaletteAction::Quit,
@@ -1250,6 +1270,29 @@ mod tests {
             PaletteAction::ComingSoon {
                 label: "/help",
                 target_step: 43,
+            }
+        );
+    }
+
+    // -- /inbox + /focus (docs/dag-redesign.md §12.3 / §12.2) -------------
+
+    #[test]
+    fn inbox_dispatches_to_open_inbox() {
+        let c = Ctx::new();
+        assert_eq!(dispatch_str("/inbox", &c), PaletteAction::OpenInbox);
+    }
+
+    #[test]
+    fn focus_dispatches_with_optional_short_id() {
+        let c = Ctx::new();
+        assert_eq!(
+            dispatch_str("/focus", &c),
+            PaletteAction::FocusStep { short_id: None }
+        );
+        assert_eq!(
+            dispatch_str("/focus a1b2c3d4", &c),
+            PaletteAction::FocusStep {
+                short_id: Some("a1b2c3d4".to_string())
             }
         );
     }

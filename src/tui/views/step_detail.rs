@@ -1938,6 +1938,52 @@ fn render_step_prompt(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
 
     lines.push(Line::from(Span::styled(step.title.clone(), bold)));
 
+    // docs/dag-redesign.md §12.1/§12.5: surface the step's effective status
+    // (Blocked overlay derived from an open interruption — §3.3), its
+    // `review_status` badge, and the `↳ corrects <short_id>` marker for a
+    // reviewer-inserted corrective step. All colors route through the
+    // single TUI-wide §12.5 mapping so step-detail can't drift from the
+    // outline glyph / plan-list dot.
+    {
+        let eff = crate::plan::effective_step_status(
+            step.status,
+            app.has_open_questions_for_step(),
+        );
+        let mut status_spans = vec![
+            Span::styled(
+                format!("{} ", crate::tui::widgets::outline_list::status_glyph(eff)),
+                Style::default().fg(theme::step_status_color(eff)),
+            ),
+            Span::styled(
+                format!("{} ", step.short_id),
+                Style::default().fg(theme::CHROME_DIM),
+            ),
+            Span::styled(
+                eff.as_str().to_string(),
+                Style::default().fg(theme::step_status_color(eff)),
+            ),
+        ];
+        let rs = step.review_status.unwrap_or(crate::plan::ReviewStatus::Pending);
+        if let Some((badge, color)) =
+            crate::tui::widgets::outline_list::review_badge(rs)
+        {
+            status_spans.push(Span::raw("  "));
+            status_spans.push(Span::styled(
+                badge,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(cid) = step.corrects_step_id.as_deref()
+            && let Some(corrected) = app.steps.iter().find(|s| s.id == cid)
+        {
+            status_spans.push(Span::styled(
+                format!("  ↳ corrects {}", corrected.short_id),
+                Style::default().fg(theme::CHROME_DIM),
+            ));
+        }
+        lines.push(Line::from(status_spans));
+    }
+
     if !step.description.is_empty() {
         lines.push(Line::from(""));
         for line in step.description.lines() {
@@ -2917,6 +2963,69 @@ mod tests {
         assert!(screen.contains("CRIT-A-MARK"), "{screen}");
         assert!(screen.contains("CRIT-B-MARK"), "{screen}");
         assert!(screen.contains("Acceptance:"), "{screen}");
+    }
+
+    #[test]
+    fn step_prompt_pane_surfaces_review_badge_and_corrects_marker() {
+        // docs/dag-redesign.md §12.1/§12.5: the Step pane must surface the
+        // review verdict badge and the `↳ corrects <short_id>` marker for a
+        // reviewer-inserted corrective step, colored via the §12.5 mapping.
+        let plan = make_plan();
+        let mut steps = make_steps(2);
+        steps[0].short_id = "aaaa1111".to_string();
+        steps[1].short_id = "apri0000".to_string();
+        steps[1].review_status = Some(crate::plan::ReviewStatus::Failed);
+        steps[1].corrects_step_id = Some(steps[0].id.clone());
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            1,
+            &Config::default(),
+            ProjectSettings::default(),
+            Vec::new(),
+        );
+        let screen = render_to_string(160, 100, &mut app);
+        assert!(screen.contains("review✘"), "review badge missing:\n{screen}");
+        assert!(
+            screen.contains("↳ corrects aaaa1111"),
+            "corrects marker missing:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn step_prompt_pane_shows_blocked_overlay_when_step_has_open_question() {
+        // §3.3 derived overlay: an open interruption makes the step present
+        // as Blocked in step-detail too (one concept, one color, TUI-wide).
+        let plan = make_plan();
+        let mut steps = make_steps(1);
+        steps[0].short_id = "bbbb2222".to_string();
+        steps[0].status = StepStatus::InProgress;
+        let mut app = StepDetailApp::new(
+            plan,
+            steps,
+            0,
+            &Config::default(),
+            ProjectSettings::default(),
+            Vec::new(),
+        );
+        app.set_open_questions_for_step(vec![storage::OpenQuestion {
+            id: "q1".to_string(),
+            step_id: "s0".to_string(),
+            plan_id: "p1".to_string(),
+            plan_slug: "plan".to_string(),
+            step_num: 1,
+            step_title: "t".to_string(),
+            attempt: 1,
+            question: "Q?".to_string(),
+            suggestions: vec![],
+            kind: crate::plan::InterruptionKind::Question,
+            asked_at: Utc::now().to_rfc3339(),
+        }]);
+        let screen = render_to_string(160, 100, &mut app);
+        assert!(
+            screen.contains("blocked"),
+            "blocked overlay text missing in step pane:\n{screen}"
+        );
     }
 
     #[test]

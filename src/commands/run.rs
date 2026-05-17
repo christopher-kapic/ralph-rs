@@ -741,6 +741,12 @@ pub fn run_plan_list_tui(
                                     )?;
                                     refresh_plan_list_state(conn, project, &mut app)?;
                                 }
+                                // docs/dag-redesign.md §12.3: `/inbox` opens
+                                // the cross-branch interruptions inbox.
+                                Some(PaletteAction::OpenInbox) => {
+                                    run_inbox_tui(&mut terminal, conn, project)?;
+                                    refresh_plan_list_state(conn, project, &mut app)?;
+                                }
                                 _ => {}
                             }
                         }
@@ -797,6 +803,15 @@ pub fn run_plan_list_tui(
                     }
                     KeyCode::Char('i') | KeyCode::Char('a') if !locked => {
                         plan_list_create_plan(conn, config, project, &mut terminal, &mut app)?;
+                    }
+                    // docs/dag-redesign.md §12.3: the cross-branch
+                    // interruptions inbox is reachable from anywhere. `i`
+                    // here already creates a plan (a tested binding the
+                    // redesign must not regress — §13.1), so the inbox is
+                    // `I` (Shift-i), matching plan-detail.
+                    KeyCode::Char('I') => {
+                        run_inbox_tui(&mut terminal, conn, project)?;
+                        refresh_plan_list_state(conn, project, &mut app)?;
                     }
                     KeyCode::Esc => {
                         plan_list_handle_esc(&mut app);
@@ -1577,14 +1592,26 @@ pub(crate) fn plan_list_apply_palette_action(
                 Instant::now(),
             );
         }
+        // docs/dag-redesign.md §12.2: focus is a plan-detail outline
+        // transform — there's no outline in plan-list.
+        PaletteAction::FocusStep { .. } => {
+            app.toasts.push(
+                "Open a plan first to focus its outline.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
         // Terminal-bound: hand back to the caller so it can render the
         // confirm dialog with the live plan-list view as the background.
         PaletteAction::OpenConfirmArchive { .. } | PaletteAction::OpenConfirmDelete { .. } => {
             return Ok(Some(action));
         }
-        // Terminal-bound: hand back so the caller can render the run-choice
-        // dialog (TUI-plan.md §9.1) with the live view as the background.
-        PaletteAction::OpenRunDialog { .. } | PaletteAction::RunOnBranch { .. } => {
+        // Terminal-bound: `OpenInbox` (§12.3) pushes the inbox; the
+        // run-choice dialog (TUI-plan.md §9.1) renders with the live view
+        // as the background.
+        PaletteAction::OpenInbox
+        | PaletteAction::OpenRunDialog { .. }
+        | PaletteAction::RunOnBranch { .. } => {
             return Ok(Some(action));
         }
     }
@@ -2201,6 +2228,17 @@ pub(crate) fn archived_list_apply_palette_action(
         PaletteAction::OpenConfirmDelete { .. } => {
             return Ok(Some(action));
         }
+        // docs/dag-redesign.md §12.2/§12.3: focus is a plan-detail outline
+        // transform (no outline here); the inbox is reachable from the
+        // active plan-list / plan-detail — point the user back there rather
+        // than hosting it from the archived view.
+        PaletteAction::FocusStep { .. } | PaletteAction::OpenInbox => {
+            app.toasts.push(
+                "Back out to the plan list to open the inbox or focus a plan.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
     }
     Ok(None)
 }
@@ -2488,6 +2526,20 @@ where
         if let Ok(latest_steps) = storage::list_steps(conn, &app.plan.id) {
             app.sync_steps_from_db(latest_steps);
         }
+        // docs/dag-redesign.md §12.1/§12.2: refresh the dependency-outline
+        // projection each tick — the topological edges + the
+        // open-interruption set that drives the derived `Blocked` overlay
+        // (§3.3). Edges and the blocked-step set come from the same poll so
+        // the drawn outline can never diverge from the scheduler's view.
+        {
+            let deps_of = storage::list_step_dependency_edges(conn, &app.plan.id)
+                .unwrap_or_default();
+            let blocked_ids: std::collections::HashSet<String> =
+                storage::list_open_interruptions_for_plan(conn, &app.plan.id)
+                    .map(|v| v.into_iter().map(|i| i.step_id).collect())
+                    .unwrap_or_default();
+            app.sync_outline(deps_of, blocked_ids);
+        }
         // §17: refresh the cached open-question list each tick so the
         // banner + `A` keybinding both stay current with answers applied
         // by step-detail or any out-of-band CLI/runner activity.
@@ -2720,6 +2772,12 @@ where
                         Some(PaletteAction::OpenStepTags { step_id, .. }) => {
                             run_step_tags_tui(terminal, conn, &step_id)?;
                         }
+                        // docs/dag-redesign.md §12.3: `/inbox` opens the
+                        // cross-branch interruptions inbox.
+                        Some(PaletteAction::OpenInbox) => {
+                            let project_path = app.plan.project.clone();
+                            run_inbox_tui(terminal, conn, &project_path)?;
+                        }
                         _ => {}
                     }
                 }
@@ -2786,6 +2844,14 @@ where
             }
             InputAction::TogglePauseRequested => {
                 plan_detail_apply_toggle_pause(conn, &mut app)?;
+            }
+            InputAction::OpenInbox => {
+                // docs/dag-redesign.md §12.3: the inbox is cross-branch and
+                // decoupled from DAG nav — scope it to this plan's project
+                // so the user sees every open interruption regardless of
+                // which plan/branch raised it.
+                let project_path = app.plan.project.clone();
+                run_inbox_tui(terminal, conn, &project_path)?;
             }
         }
         if app.should_pop {
@@ -3632,11 +3698,52 @@ pub(crate) fn plan_detail_apply_palette_action(
                 Instant::now(),
             );
         }
-        // Terminal-bound: hand back to the caller. `OpenRunDialog` /
-        // `RunOnBranch` (TUI-plan.md §9.1) render the run-choice dialog over
-        // the live plan-detail view; the others drive the existing
+        // docs/dag-redesign.md §12.2: `/focus [<short_id>]` re-roots the
+        // outline. Pure view transform — no DB, no scheduler effect — so
+        // it's applied here in-place rather than handed back to the caller.
+        PaletteAction::FocusStep { short_id } => {
+            let resolved = match &short_id {
+                Some(sid) => app
+                    .outline
+                    .visible_rows()
+                    .into_iter()
+                    .find(|r| r.short_id == *sid)
+                    .map(|r| r.step_id),
+                None => app.outline.selected_step_id(),
+            };
+            match resolved {
+                Some(step_id) => {
+                    // Park the outline cursor on the target then focus it.
+                    let pos = app
+                        .outline
+                        .visible_rows()
+                        .iter()
+                        .position(|r| r.step_id == step_id);
+                    if let Some(p) = pos {
+                        while app.outline.cursor() != p {
+                            if app.outline.cursor() < p {
+                                app.outline.navigate_down();
+                            } else {
+                                app.outline.navigate_up();
+                            }
+                        }
+                        app.outline.focus_cursor();
+                        app.realign_selection_to_outline();
+                    }
+                }
+                None => app.toasts.push(
+                    "No such step to focus.",
+                    ToastKind::Error,
+                    Instant::now(),
+                ),
+            }
+        }
+        // Terminal-bound: hand back to the caller. `OpenInbox` pushes the
+        // inbox dispatcher; `OpenRunDialog` / `RunOnBranch` (TUI-plan.md
+        // §9.1) render the run-choice dialog; the others drive the existing
         // archive/delete confirms.
-        PaletteAction::PushPlanDetail { .. }
+        PaletteAction::OpenInbox
+        | PaletteAction::PushPlanDetail { .. }
         | PaletteAction::OpenConfirmArchive { .. }
         | PaletteAction::OpenConfirmDelete { .. }
         | PaletteAction::OpenRunDialog { .. }
@@ -4327,6 +4434,118 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Interruptions-inbox dispatcher (docs/dag-redesign.md §12.3)
+// ---------------------------------------------------------------------------
+
+/// Run the cross-branch interruptions-inbox event loop until the user pops
+/// back. Reuses the already-open terminal + raw-mode session (the caller —
+/// plan-detail's `I` binding — owns terminal teardown). Owns its own
+/// crossterm event loop; the pure [`InboxState`] state machine decides
+/// *what* to do and this dispatcher executes the side effects: the
+/// `storage::resolve_interruption` write (the Phase-2 bounded-injection
+/// path) and the `$EDITOR` handoffs for the freeform / comment text. A
+/// resolved interruption un-shadows its step's `Blocked` overlay at the
+/// next scheduler tick (the Phase-2/§9 cross-process bridge) — no extra
+/// wiring needed here.
+fn run_inbox_tui<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    project: &str,
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
+    use crate::tui::editor::edit_in_editor;
+    use crate::tui::help::InterceptResult;
+    use crate::tui::views::inbox::{InboxItem, InboxOutcome, InboxState};
+    use crate::tui::views::inbox_ui;
+    use crossterm::event::{self, Event, KeyEventKind};
+    use std::path::Path;
+
+    // docs/dag-redesign.md §12.3: keep a bounded tail of resolved items
+    // visible (dimmed) for recent context.
+    const RESOLVED_TAIL: usize = 20;
+
+    let load = |conn: &Connection| -> Result<Vec<InboxItem>> {
+        Ok(storage::list_inbox_rows(conn, project, RESOLVED_TAIL)?
+            .into_iter()
+            .map(|r| InboxItem {
+                interruption: r.interruption,
+                plan_slug: r.plan_slug,
+                step_short_id: r.step_short_id,
+            })
+            .collect())
+    };
+
+    let mut app = InboxState::new(load(conn)?);
+    let project_path = Path::new(project).to_path_buf();
+
+    loop {
+        // Re-poll each tick so out-of-band resolutions (CLI / runner) and
+        // newly-raised interruptions stay current; cursor + an active
+        // run-through target are preserved by id inside `sync`.
+        if let Ok(items) = load(conn) {
+            app.sync(items);
+        }
+
+        terminal.draw(|f| inbox_ui::draw(f, &app, &project_path))?;
+
+        if !event::poll(std::time::Duration::from_millis(250))? {
+            continue;
+        }
+        let key = match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            _ => continue,
+        };
+
+        // §15 help overlay routing — consult before the view handler so
+        // bindings don't fire under the overlay.
+        if app.help.intercept_key(key) != InterceptResult::Passthrough {
+            continue;
+        }
+
+        match app.handle_key(key) {
+            InboxOutcome::Handled => {}
+            InboxOutcome::Pop => return Ok(()),
+            InboxOutcome::EditFreeform => {
+                if let Ok(Some(text)) = edit_in_editor("") {
+                    app.set_modal_freeform(text);
+                }
+            }
+            InboxOutcome::EditComment => {
+                if let Ok(Some(text)) = edit_in_editor("") {
+                    app.set_modal_comment(text);
+                }
+            }
+            InboxOutcome::Resolve {
+                interruption_id,
+                resolution,
+                comment,
+            } => {
+                // Phase-2 bounded-injection path (§8): the resolution +
+                // comment land in the step's next prompt; resolving drops
+                // the step's open-interruption count to zero which
+                // un-shadows its `Blocked` overlay at the next tick.
+                storage::resolve_interruption(
+                    conn,
+                    &interruption_id,
+                    &resolution,
+                    comment.as_deref(),
+                )?;
+                // Reflect it in-memory and auto-advance to the next open
+                // interruption (run-through — §12.3); a fresh DB poll on
+                // the next loop tick reconciles any drift.
+                app.resolve_and_advance(
+                    &interruption_id,
+                    &resolution,
+                    comment.as_deref(),
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Step-detail dispatcher (TUI-plan.md §8 + §17)
 // ---------------------------------------------------------------------------
 
@@ -4947,11 +5166,22 @@ pub(crate) fn step_detail_apply_palette_action(
                 Instant::now(),
             );
         }
-        // Terminal-bound: hand back to the caller. The step-detail dispatcher
-        // currently toasts a "pop back" hint for the inherited variants, so
-        // the run-choice dialog (TUI-plan.md §9.1) gets the same treatment
-        // there — the loop renders the dialog over plan-detail's parent view.
-        PaletteAction::PushPlanDetail { .. }
+        // docs/dag-redesign.md §12.2: focus is a plan-detail outline
+        // transform; step-detail has no outline, so point the user there.
+        PaletteAction::FocusStep { .. } => {
+            app.toasts.push(
+                "Pop back to plan-detail to focus the outline.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        // Terminal-bound: hand back to the caller. `OpenInbox` (§12.3)
+        // pushes the inbox; the step-detail dispatcher toasts a "pop back"
+        // hint for the inherited variants, so the run-choice dialog
+        // (TUI-plan.md §9.1) gets the same treatment there — the loop
+        // renders the dialog over plan-detail's parent view.
+        PaletteAction::OpenInbox
+        | PaletteAction::PushPlanDetail { .. }
         | PaletteAction::OpenConfirmArchive { .. }
         | PaletteAction::OpenConfirmDelete { .. }
         | PaletteAction::OpenRunDialog { .. }

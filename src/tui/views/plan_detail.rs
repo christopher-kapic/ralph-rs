@@ -19,6 +19,7 @@ use crate::run_lock::LiveRun;
 use crate::tui::events::{StreamMode, TAIL_BUFFER_LINES, TAIL_VISIBLE_LINES};
 use crate::tui::help::HelpState;
 use crate::tui::read_only::ReadOnly;
+use crate::tui::views::outline_view::OutlineState;
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
 use crate::tui::widgets::palette_bar::PaletteBarState;
@@ -204,6 +205,16 @@ pub struct PlanDetailApp {
     /// opens step-detail (the same effect as pressing `Enter`), then
     /// clears it. `None` means no pending mouse-driven open.
     pub pending_open_step: Option<String>,
+
+    /// Dependency-outline state (docs/dag-redesign.md §12.1/§12.2): the
+    /// topological projection of `steps` + the focus/re-root stack. The
+    /// dispatcher refreshes it each poll tick from
+    /// `storage::list_step_dependency_edges` + the open-interruption set;
+    /// the renderer draws `outline.visible_rows()` instead of the flat
+    /// `steps` list. `selected_index` is mirrored to/from
+    /// `outline.cursor()` so the existing skip/reset/delete cursor-target
+    /// helpers keep working against the visible row.
+    pub outline: OutlineState,
 }
 
 impl PlanDetailApp {
@@ -211,6 +222,8 @@ impl PlanDetailApp {
     pub fn new(plan: Plan, steps: Vec<Step>, config: &Config) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
+        let outline =
+            OutlineState::new(steps.clone(), Default::default(), Default::default());
         Self {
             plan,
             steps,
@@ -246,6 +259,12 @@ impl PlanDetailApp {
             dragging_split: false,
             step_list_area: Rect::default(),
             pending_open_step: None,
+            // Edges/blocked set are unknown at construction (no DB handle
+            // here); the dispatcher populates them on the first poll via
+            // [`Self::sync_outline`]. Until then the outline degrades to the
+            // bare step set with synthesized depth 0 — identical rows to the
+            // old flat list, so first-frame rendering never regresses.
+            outline,
         }
     }
 
@@ -741,6 +760,44 @@ impl PlanDetailApp {
         let valid: std::collections::HashSet<String> =
             self.steps.iter().map(|s| s.id.clone()).collect();
         self.selection.retain(|id| valid.contains(id));
+    }
+
+    /// Refresh the dependency-outline projection from a DB poll
+    /// (docs/dag-redesign.md §12.1). `deps_of` is
+    /// `storage::list_step_dependency_edges`; `blocked_ids` is the set of
+    /// step ids with ≥1 open interruption (drives the derived `Blocked`
+    /// overlay — §3.3). The focus stack + cursor are preserved by id via
+    /// [`OutlineState::sync`]. After syncing, `selected_index` is realigned
+    /// to the visible-row cursor so the existing cursor-target helpers
+    /// (`request_skip`, `reset_target`, …) operate on the row the user
+    /// actually sees.
+    pub fn sync_outline(
+        &mut self,
+        deps_of: std::collections::HashMap<String, Vec<String>>,
+        blocked_ids: std::collections::HashSet<String>,
+    ) {
+        self.outline
+            .sync(self.steps.clone(), deps_of, blocked_ids);
+        self.realign_selection_to_outline();
+    }
+
+    /// Mirror the outline's visible-row cursor onto `selected_index` so the
+    /// flat-list cursor-target helpers stay correct under the topological /
+    /// focused ordering. `selected_index` indexes `self.steps`; the outline
+    /// cursor indexes the *visible* rows, so we resolve the cursor's step id
+    /// back to its `self.steps` position.
+    pub fn realign_selection_to_outline(&mut self) {
+        if let Some(step_id) = self.outline.selected_step_id()
+            && let Some(idx) = self.steps.iter().position(|s| s.id == step_id)
+        {
+            self.selected_index = idx;
+        }
+    }
+
+    /// True while the outline is re-rooted on a focus step (§12.2). Drives
+    /// the breadcrumb suffix and the `Z`/Esc pop affordance.
+    pub fn outline_focused(&self) -> bool {
+        self.outline.focus_root().is_some()
     }
 
     // -- Live-run snapshot ------------------------------------------------
