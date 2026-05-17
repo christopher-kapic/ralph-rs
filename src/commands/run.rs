@@ -1814,8 +1814,8 @@ fn plans_into_tiles(
             None => (plan.created_at, false),
         };
         // §17: derive the open-question count + oldest-question teaser for
-        // this plan so the tile can flip to the purple `STATUS_QUESTION` dot
-        // and surface a one-line preview.
+        // this plan so the tile can flip to the §12.5 interrupted dot
+        // (orange) and surface a one-line preview.
         let opens = storage::list_open_questions(conn, &plan.project, Some(&plan.slug))?;
         let unanswered_questions = opens.len() as u32;
         let oldest_question = opens.first().map(|q| q.question.clone());

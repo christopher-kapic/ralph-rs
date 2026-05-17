@@ -39,21 +39,13 @@ pub fn status_glyph(status: StepStatus) -> &'static str {
     }
 }
 
-/// Foreground color for a row given its step status. Used by both the row
-/// styler here and the right-pane status line in plan-detail so the two
-/// stay aligned.
+/// Foreground color for a row given its step status. Delegates to the
+/// single TUI-wide §12.5 mapping ([`theme::step_status_color`]) so the row
+/// styler here, the right-pane status line in plan-detail, the DAG glyph,
+/// and the plan-list dot can never drift apart (docs/dag-redesign.md §12.5
+/// "one state, one color, TUI-wide").
 fn status_fg(status: StepStatus) -> Color {
-    match status {
-        StepStatus::Complete => theme::STATUS_COMPLETE,
-        StepStatus::InProgress => theme::STATUS_IN_PROGRESS,
-        StepStatus::Failed => theme::STATUS_FAILED,
-        StepStatus::Skipped => theme::CHROME_DIM,
-        StepStatus::Aborted => theme::STATUS_FAILED,
-        StepStatus::Pending => theme::STATUS_PENDING,
-        // §3.3 overlay; reuse the existing derived-question token (the
-        // §12.5 `STATUS_BLOCKED` rename lands with the Phase 4 TUI work).
-        StepStatus::Blocked => theme::STATUS_QUESTION,
-    }
+    theme::step_status_color(status)
 }
 
 /// Render the compact step list into `area`.

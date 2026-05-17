@@ -11,6 +11,10 @@ pub mod dialog;
 pub mod editor;
 pub mod events;
 pub mod help;
+// Pure DAG → outline projection (docs/dag-redesign.md §12.1). Data model
+// only — not yet wired into any view (the outline view is a later step);
+// declared here so its unit tests run and the later view can consume it.
+pub mod outline;
 pub mod palette;
 pub mod palette_dispatch;
 pub mod read_only;

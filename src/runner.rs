@@ -1986,7 +1986,7 @@ fn resolve_window(all_steps: &[Step], options: &RunOptions) -> Result<RunWindow>
 /// (`storage::would_create_step_cycle` on every edge mutation, V25
 /// backfill is a chain) guarantees termination, but a `visiting` guard
 /// still bounds recursion to 0 if acyclicity is ever violated.
-fn compute_step_depths(
+pub(crate) fn compute_step_depths(
     steps: &[Step],
     deps_of: &HashMap<String, Vec<String>>,
 ) -> HashMap<String, usize> {
@@ -2027,6 +2027,30 @@ fn compute_step_depths(
         depth_of(&s.id, deps_of, &in_scope, &mut memo, &mut visiting);
     }
     memo
+}
+
+/// The deterministic scheduler tie-break ordering of two steps:
+/// `(topological depth, sort_key, short_id)` (docs/dag-redesign.md §3.5
+/// item 4). Depth first so a prerequisite always outranks its dependents,
+/// then the authored `sort_key`, then `short_id` as a stable final
+/// discriminator. With no edges depth is uniformly 0 and this collapses to
+/// "sort_key order" — the exact pre-DAG linear behavior.
+///
+/// This is the SINGLE definition of scheduler order. [`pick_next_step`]
+/// (execution) and the Phase-4 outline projection
+/// (`crate::tui::outline`, presentation) both call it so the drawn outline
+/// is byte-for-byte the execution order — there is no second, divergent
+/// sort anywhere in the codebase.
+pub(crate) fn step_schedule_cmp(
+    a: &Step,
+    b: &Step,
+    depths: &HashMap<String, usize>,
+) -> std::cmp::Ordering {
+    let da = depths.get(&a.id).copied().unwrap_or(0);
+    let db = depths.get(&b.id).copied().unwrap_or(0);
+    da.cmp(&db)
+        .then_with(|| a.sort_key.cmp(&b.sort_key))
+        .then_with(|| a.short_id.cmp(&b.short_id))
 }
 
 /// True when every dependency of `step_id` that is *in the run window* is
@@ -2123,13 +2147,7 @@ fn pick_next_step<'a>(
                 && !executed_step_ids.contains(&s.id)
                 && deps_satisfied(&s.id, deps_of, &window_status)
         })
-        .min_by(|a, b| {
-            let da = depths.get(&a.id).copied().unwrap_or(0);
-            let db = depths.get(&b.id).copied().unwrap_or(0);
-            da.cmp(&db)
-                .then_with(|| a.sort_key.cmp(&b.sort_key))
-                .then_with(|| a.short_id.cmp(&b.short_id))
-        })
+        .min_by(|a, b| step_schedule_cmp(a, b, depths))
 }
 
 /// Drain finished concurrent reviews as the SOLE DAG writer

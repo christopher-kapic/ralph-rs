@@ -1538,13 +1538,15 @@ fn render_answer_modal(
     area: Rect,
     modal: &crate::tui::views::answer_modal::AnswerModal,
 ) {
+    // An open interruption is the §12.5 "blocked / interrupted" concept;
+    // style its modal via the single mapping so it matches the plan-list
+    // dot and a blocked step glyph (one concept, one color).
+    let interrupted = theme::plan_status_color(crate::plan::PlanStatus::Interrupted);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(
             "❓ ",
-            Style::default()
-                .fg(theme::STATUS_QUESTION)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(interrupted).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             modal.question.clone(),
@@ -1587,7 +1589,7 @@ fn render_answer_modal(
     let block = Block::default()
         .title(" Answer question ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::STATUS_QUESTION));
+        .border_style(Style::default().fg(interrupted));
     let para = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
@@ -1862,14 +1864,17 @@ fn render_open_questions(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
     let bold = Style::default().add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(theme::CHROME_DIM);
     let mut lines: Vec<Line> = Vec::new();
+    // Open interruptions are the §12.5 blocked/interrupted concept — color
+    // them via the single mapping (one concept, one color across screens).
+    let interrupted = theme::plan_status_color(crate::plan::PlanStatus::Interrupted);
     for (i, q) in app.open_questions_for_step.iter().enumerate() {
         let focused = i == app.selected_question_index;
         let header_style = if focused {
             Style::default()
-                .fg(theme::STATUS_QUESTION)
+                .fg(interrupted)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(theme::STATUS_QUESTION)
+            Style::default().fg(interrupted)
         };
         let mut header = vec![
             Span::styled(if focused { "▶ " } else { "  " }, header_style),
@@ -2130,18 +2135,14 @@ fn status_glyph(status: StepStatus) -> &'static str {
 }
 
 fn status_style(status: StepStatus) -> Style {
+    // Color comes from the single TUI-wide §12.5 mapping
+    // (`theme::step_status_color`). The only per-status *non-color* styling
+    // kept here is the bold emphasis on an in-progress step (a weight
+    // decision, not a color choice).
+    let style = Style::default().fg(theme::step_status_color(status));
     match status {
-        StepStatus::Complete => Style::default().fg(theme::STATUS_COMPLETE),
-        StepStatus::InProgress => Style::default()
-            .fg(theme::STATUS_IN_PROGRESS)
-            .add_modifier(Modifier::BOLD),
-        StepStatus::Failed => Style::default().fg(theme::STATUS_FAILED),
-        StepStatus::Skipped => Style::default().fg(theme::CHROME_DIM),
-        StepStatus::Aborted => Style::default().fg(theme::STATUS_FAILED),
-        StepStatus::Pending => Style::default().fg(theme::STATUS_PENDING),
-        // §3.3 overlay; reuse the existing derived-question token (the
-        // §12.5 `STATUS_BLOCKED` rename lands with the Phase 4 TUI work).
-        StepStatus::Blocked => Style::default().fg(theme::STATUS_QUESTION),
+        StepStatus::InProgress => style.add_modifier(Modifier::BOLD),
+        _ => style,
     }
 }
 

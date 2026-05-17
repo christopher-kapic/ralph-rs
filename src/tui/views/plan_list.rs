@@ -55,9 +55,9 @@ pub struct PlanTile {
     /// "Ran" vs. "Created" prefix on the timestamp line.
     pub had_run: bool,
     /// Number of open question `interruptions` across this plan's steps.
-    /// When non-zero the tile draws the purple `STATUS_QUESTION` dot
-    /// (overriding the underlying plan status) and a teaser line per
-    /// TUI-plan.md §17.
+    /// When non-zero the tile draws the §12.5 interrupted dot (orange,
+    /// `theme::plan_status_color(Interrupted)`) overriding the underlying
+    /// plan status, plus a teaser line per TUI-plan.md §17.
     pub unanswered_questions: u32,
     /// Verbatim text of the oldest unanswered question for this plan,
     /// truncated by the renderer to the tile width. Only populated when
@@ -576,19 +576,14 @@ fn collapse_spaces(s: &str) -> String {
 
 /// Status-dot color for a plan tile.
 ///
-/// Colors come from TUI-plan.md §5 status legend. `PlanStatus::Interrupted`
-/// is a derived state (docs/dag-redesign.md §3.4/§6): callers stamp it onto
+/// Colors come from the single TUI-wide §12.5 mapping
+/// ([`theme::plan_status_color`]). `PlanStatus::Interrupted` is a derived
+/// state (docs/dag-redesign.md §3.4/§6): callers stamp it onto
 /// `tile.plan.status` whenever an open interruption (question *or* blocker)
-/// exists for the plan. (The §12.5 colour-token rename to `STATUS_BLOCKED`
-/// lands with the Phase 4 TUI work; the variant rename here is colour-stable.)
+/// exists for the plan, and §12.5 maps it to the same orange a blocked
+/// step glyph uses (one concept, one color across screens).
 fn status_dot_color(status: PlanStatus) -> ratatui::style::Color {
-    match status {
-        PlanStatus::Complete => theme::STATUS_COMPLETE,
-        PlanStatus::InProgress => theme::STATUS_IN_PROGRESS,
-        PlanStatus::Planning | PlanStatus::Ready => theme::STATUS_PENDING,
-        PlanStatus::Failed | PlanStatus::Aborted | PlanStatus::Archived => theme::STATUS_FAILED,
-        PlanStatus::Interrupted => theme::STATUS_QUESTION,
-    }
+    theme::plan_status_color(status)
 }
 
 // ---------------------------------------------------------------------------
@@ -813,7 +808,10 @@ pub(crate) fn render_archived_sentinel(
     let border_style = if highlighted {
         Style::default().fg(theme::CURSOR)
     } else {
-        Style::default().fg(theme::STATUS_FAILED)
+        // The sentinel represents the archived bucket — route its border
+        // through the single §12.5 mapping (Archived shares red with
+        // failed/aborted) so it can't drift from an archived plan dot.
+        Style::default().fg(theme::plan_status_color(PlanStatus::Archived))
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -913,7 +911,7 @@ pub(crate) fn render_tile(
         let q_para = Paragraph::new(Span::styled(
             "?",
             Style::default()
-                .fg(theme::STATUS_QUESTION)
+                .fg(theme::plan_status_color(PlanStatus::Interrupted))
                 .add_modifier(Modifier::BOLD),
         ));
         let q_area = Rect {
@@ -959,10 +957,13 @@ pub(crate) fn render_tile(
             height: 1,
             ..inner
         };
-        // §17: derived `Question` status overrides the stored status whenever
-        // any unanswered question row exists for this plan.
+        // §17 / docs/dag-redesign.md §3.4: the derived interrupted status
+        // overrides the stored status whenever any open interruption
+        // (unanswered question or blocker) exists for this plan. Routed
+        // through the single §12.5 mapping so it matches a blocked step
+        // glyph exactly (one concept, one color).
         let dot_color = if tile.unanswered_questions > 0 {
-            theme::STATUS_QUESTION
+            theme::plan_status_color(PlanStatus::Interrupted)
         } else {
             status_dot_color(tile.plan.status)
         };
@@ -976,8 +977,8 @@ pub(crate) fn render_tile(
 
     // §17: when this plan has unanswered questions, render a one-line teaser
     // of the oldest question on the date row (between title and status). The
-    // teaser is dim purple to keep the tile-wide `STATUS_QUESTION` association
-    // without overpowering the title.
+    // teaser uses the §12.5 interrupted color so it keeps the tile-wide
+    // open-interruption association without overpowering the title.
     if tile.unanswered_questions > 0
         && let Some(q) = tile.oldest_question.as_deref()
         && inner.height >= 3
@@ -992,7 +993,7 @@ pub(crate) fn render_tile(
         let label = format!("? {q}");
         let para = Paragraph::new(Span::styled(
             truncate(&label, inner.width as usize),
-            Style::default().fg(theme::STATUS_QUESTION),
+            Style::default().fg(theme::plan_status_color(PlanStatus::Interrupted)),
         ));
         para.render(teaser_area, buf);
     }
@@ -1447,7 +1448,13 @@ mod tests {
         // Title row is row 1 (inner.y = 1 with single-cell border).
         // First inner column (x=1) should hold the `?`.
         assert_eq!(buf[(1, 1)].symbol(), "?");
-        assert_eq!(buf[(1, 1)].style().fg, Some(theme::STATUS_QUESTION));
+        // §12.5: the corner `?` glyph is the open-interruption concept and
+        // now routes through the single mapping (orange, not the retired
+        // purple STATUS_QUESTION).
+        assert_eq!(
+            buf[(1, 1)].style().fg,
+            Some(theme::plan_status_color(PlanStatus::Interrupted))
+        );
     }
 
     #[test]
@@ -1478,7 +1485,10 @@ mod tests {
         render_tile(&mut buf, area, &tile, false, Some(2), "UTC");
         // Top-left: `?` glyph.
         assert_eq!(buf[(1, 1)].symbol(), "?");
-        assert_eq!(buf[(1, 1)].style().fg, Some(theme::STATUS_QUESTION));
+        assert_eq!(
+            buf[(1, 1)].style().fg,
+            Some(theme::plan_status_color(PlanStatus::Interrupted))
+        );
         // Top-right: `[2]` badge somewhere on the title row.
         let row1 = (0..30).map(|x| buf[(x, 1)].symbol()).collect::<String>();
         assert!(row1.contains("[2]"), "expected [2] badge: {row1:?}");
@@ -1785,8 +1795,13 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
         let area = buf.area;
         render_archived_sentinel(&mut buf, area, 4, false);
-        // Top-left border cell carries the border style.
-        assert_eq!(buf[(0, 0)].style().fg, Some(theme::STATUS_FAILED));
+        // Top-left border cell carries the border style. Value is unchanged
+        // by §12.5 (Archived stays red), but it now routes through the
+        // single plan-status mapping — assert that, not the raw token.
+        assert_eq!(
+            buf[(0, 0)].style().fg,
+            Some(theme::plan_status_color(PlanStatus::Archived))
+        );
     }
 
     #[test]
@@ -1818,7 +1833,11 @@ mod tests {
 
     #[test]
     fn test_status_dot_color_legend() {
-        // Spot-check the §5 legend rather than re-listing every variant.
+        // docs/dag-redesign.md §12.5: the dot now routes through the single
+        // mapping. Ready/Planning moved blue→bright-white (STATUS_WAITING,
+        // the old pending-blue was reused as STATUS_REVIEWING) and
+        // Interrupted moved purple→orange (STATUS_BLOCKED, retiring the
+        // purple STATUS_QUESTION). Complete/InProgress/Failed are unchanged.
         assert_eq!(
             status_dot_color(PlanStatus::Complete),
             theme::STATUS_COMPLETE
@@ -1827,32 +1846,42 @@ mod tests {
             status_dot_color(PlanStatus::InProgress),
             theme::STATUS_IN_PROGRESS
         );
-        assert_eq!(status_dot_color(PlanStatus::Ready), theme::STATUS_PENDING);
+        assert_eq!(status_dot_color(PlanStatus::Ready), theme::STATUS_WAITING);
         assert_eq!(
             status_dot_color(PlanStatus::Planning),
-            theme::STATUS_PENDING
+            theme::STATUS_WAITING
         );
         assert_eq!(status_dot_color(PlanStatus::Failed), theme::STATUS_FAILED);
         assert_eq!(status_dot_color(PlanStatus::Aborted), theme::STATUS_FAILED);
         assert_eq!(
             status_dot_color(PlanStatus::Interrupted),
-            theme::STATUS_QUESTION
+            theme::STATUS_BLOCKED
+        );
+        // The dot legend IS the §12.5 plan mapping, verbatim.
+        assert_eq!(
+            status_dot_color(PlanStatus::Interrupted),
+            theme::plan_status_color(PlanStatus::Interrupted)
         );
     }
 
     // -- Question surfaces (TUI-plan.md §17) ---------------------------------
 
     #[test]
-    fn render_tile_with_open_questions_uses_purple_dot() {
+    fn render_tile_with_open_questions_uses_interrupted_dot() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 40, 6));
         let area = buf.area;
         let mut tile = make_tile("with-q");
         tile.unanswered_questions = 2;
         tile.oldest_question = Some("Pick a logging crate".to_string());
         render_tile(&mut buf, area, &tile, false, None, "UTC");
-        // Dot row: y=4. The dot is at inner.x = 1 (border).
+        // Dot row: y=4. The dot is at inner.x = 1 (border). §12.5: the
+        // open-interruption dot is orange (the retired STATUS_QUESTION
+        // purple), routed through the single plan-status mapping.
         assert_eq!(buf[(1, 4)].symbol(), "●");
-        assert_eq!(buf[(1, 4)].style().fg, Some(theme::STATUS_QUESTION));
+        assert_eq!(
+            buf[(1, 4)].style().fg,
+            Some(theme::plan_status_color(PlanStatus::Interrupted))
+        );
     }
 
     #[test]
@@ -1878,7 +1907,7 @@ mod tests {
         let mut tile = make_tile("no-q");
         tile.plan.status = PlanStatus::Complete;
         render_tile(&mut buf, area, &tile, false, None, "UTC");
-        // Dot at (1, 4) should be STATUS_COMPLETE, not STATUS_QUESTION.
+        // Dot at (1, 4) should be STATUS_COMPLETE, not the interrupted color.
         assert_eq!(buf[(1, 4)].symbol(), "●");
         assert_eq!(buf[(1, 4)].style().fg, Some(theme::STATUS_COMPLETE));
     }

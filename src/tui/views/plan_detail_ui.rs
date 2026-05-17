@@ -233,18 +233,11 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
         Span::raw(&step.title),
     ]));
 
-    // Status
-    let status_color = match step.status {
-        StepStatus::Complete => theme::STATUS_COMPLETE,
-        StepStatus::InProgress => theme::STATUS_IN_PROGRESS,
-        StepStatus::Failed => theme::STATUS_FAILED,
-        StepStatus::Skipped => theme::CHROME_DIM,
-        StepStatus::Aborted => theme::STATUS_FAILED,
-        StepStatus::Pending => theme::STATUS_PENDING,
-        // §3.3 derived overlay; reuse the existing derived-question token
-        // (the §12.5 `STATUS_BLOCKED` rename lands with the Phase 4 TUI work).
-        StepStatus::Blocked => theme::STATUS_QUESTION,
-    };
+    // Status — single TUI-wide §12.5 mapping (docs/dag-redesign.md §12.5);
+    // the plan-detail status line, the step-list glyph, and the plan-list
+    // dot all funnel through `theme::step_status_color` so one concept can
+    // never render two colors across screens.
+    let status_color = theme::step_status_color(step.status);
     lines.push(Line::from(vec![
         Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(step.status.as_str(), Style::default().fg(status_color)),
@@ -309,7 +302,10 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
             Span::styled("Elapsed: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!("{mins:02}:{secs:02}"),
-                Style::default().fg(theme::STATUS_IN_PROGRESS),
+                // The live timer only renders for an in-progress step, so
+                // it IS a status-derived color — route it through the
+                // single §12.5 mapping like every other status surface.
+                Style::default().fg(theme::step_status_color(StepStatus::InProgress)),
             ),
         ]));
     }
@@ -454,22 +450,23 @@ fn draw_step_detail(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
 }
 
 /// Render the open-questions banner above the right panel (TUI-plan.md §17).
-/// One bordered row reading `❓ <count> open question(s) — press [A] to answer`,
-/// styled with `STATUS_QUESTION` so the user can spot it at a glance.
+/// One bordered row reading `❓ <count> open question(s) — press [A] to answer`.
+/// Open interruptions are the §12.5 "blocked / interrupted" concept, so the
+/// banner is styled via the single plan-status mapping (orange) — matching
+/// the plan-list interrupted dot and a blocked step glyph exactly.
 fn draw_open_questions_banner(frame: &mut Frame, app: &PlanDetailApp, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let count = app.open_questions.len();
     let text = format!("❓ {count} open question(s) — press [A] to answer");
+    let interrupted = theme::plan_status_color(crate::plan::PlanStatus::Interrupted);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::STATUS_QUESTION));
+        .border_style(Style::default().fg(interrupted));
     let para = Paragraph::new(Span::styled(
         text,
-        Style::default()
-            .fg(theme::STATUS_QUESTION)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(interrupted).add_modifier(Modifier::BOLD),
     ))
     .block(block);
     frame.render_widget(para, area);

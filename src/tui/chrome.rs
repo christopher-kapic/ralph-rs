@@ -157,8 +157,12 @@ fn render_bottom(
         frame.render_widget(
             Paragraph::new(Span::styled(
                 running_text,
+                // The running indicator means "this plan is executing" —
+                // the derived in-progress plan status. Route it through the
+                // single §12.5 mapping so chrome can't drift from the
+                // plan-list dot / step glyph (docs/dag-redesign.md §12.5).
                 Style::default()
-                    .fg(theme::STATUS_IN_PROGRESS)
+                    .fg(theme::plan_status_color(crate::plan::PlanStatus::InProgress))
                     .add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Right),
