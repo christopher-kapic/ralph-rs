@@ -1129,7 +1129,11 @@ mod tests {
                 .await
                 .unwrap();
             let wts = crate::git::list_worktree_paths(dir).unwrap();
-            assert_eq!(wts.len(), 1, "passing review left an orphan worktree: {wts:?}");
+            assert_eq!(
+                wts.len(),
+                1,
+                "passing review left an orphan worktree: {wts:?}"
+            );
         }
         // (b) failing review (FAIL verdict — still a clean teardown).
         {
@@ -1143,7 +1147,11 @@ mod tests {
                 .await
                 .unwrap();
             let wts = crate::git::list_worktree_paths(dir).unwrap();
-            assert_eq!(wts.len(), 1, "failing review left an orphan worktree: {wts:?}");
+            assert_eq!(
+                wts.len(),
+                1,
+                "failing review left an orphan worktree: {wts:?}"
+            );
         }
         // (c) erroring review (the harness binary cannot be spawned — the
         // worktree is created, then the spawn `?`-errors; Drop must still

@@ -1546,7 +1546,9 @@ fn render_answer_modal(
     lines.push(Line::from(vec![
         Span::styled(
             "❓ ",
-            Style::default().fg(interrupted).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(interrupted)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             modal.question.clone(),
@@ -1945,10 +1947,8 @@ fn render_step_prompt(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
     // single TUI-wide §12.5 mapping so step-detail can't drift from the
     // outline glyph / plan-list dot.
     {
-        let eff = crate::plan::effective_step_status(
-            step.status,
-            app.has_open_questions_for_step(),
-        );
+        let eff =
+            crate::plan::effective_step_status(step.status, app.has_open_questions_for_step());
         let mut status_spans = vec![
             Span::styled(
                 format!("{} ", crate::tui::widgets::outline_list::status_glyph(eff)),
@@ -1963,10 +1963,10 @@ fn render_step_prompt(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
                 Style::default().fg(theme::step_status_color(eff)),
             ),
         ];
-        let rs = step.review_status.unwrap_or(crate::plan::ReviewStatus::Pending);
-        if let Some((badge, color)) =
-            crate::tui::widgets::outline_list::review_badge(rs)
-        {
+        let rs = step
+            .review_status
+            .unwrap_or(crate::plan::ReviewStatus::Pending);
+        if let Some((badge, color)) = crate::tui::widgets::outline_list::review_badge(rs) {
             status_spans.push(Span::raw("  "));
             status_spans.push(Span::styled(
                 badge,
@@ -2985,7 +2985,10 @@ mod tests {
             Vec::new(),
         );
         let screen = render_to_string(160, 100, &mut app);
-        assert!(screen.contains("review✘"), "review badge missing:\n{screen}");
+        assert!(
+            screen.contains("review✘"),
+            "review badge missing:\n{screen}"
+        );
         assert!(
             screen.contains("↳ corrects aaaa1111"),
             "corrects marker missing:\n{screen}"

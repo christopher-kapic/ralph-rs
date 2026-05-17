@@ -26,17 +26,12 @@ pub fn draw(frame: &mut Frame, app: &InboxState, project: &Path) {
     let badge = format!("inbox ({})", app.open_count());
     let crumbs: [&str; 2] = ["ralph", badge.as_str()];
     let hint = match app.mode() {
-        InboxMode::List => {
-            "[j/k] nav  [enter/a] answer all  [?] help  [q] back"
-        }
+        InboxMode::List => "[j/k] nav  [enter/a] answer all  [?] help  [q] back",
         InboxMode::RunThrough => {
             "[j/k] options  [tab] field  [f] freeform  [m] comment  [enter] resolve  [esc] list"
         }
     };
-    let body = chrome::render(
-        frame,
-        &Chrome::new(&crumbs, hint, project),
-    );
+    let body = chrome::render(frame, &Chrome::new(&crumbs, hint, project));
 
     draw_list(frame, app, body);
 
@@ -75,16 +70,13 @@ fn draw_list(frame: &mut Frame, app: &InboxState, area: Rect) {
             };
             let label = format!(
                 "{kind_glyph} [{}/{}] {}",
-                it.plan_slug,
-                it.step_short_id,
-                it.interruption.body
+                it.plan_slug, it.step_short_id, it.interruption.body
             );
             let style = if it.is_open() {
                 // §12.5: an open interruption is the orange
                 // blocked/interrupted concept — route through the single
                 // mapping so it reads identically to the plan dot / glyph.
-                Style::default()
-                    .fg(theme::plan_status_color(PlanStatus::Interrupted))
+                Style::default().fg(theme::plan_status_color(PlanStatus::Interrupted))
             } else {
                 // Resolved items stay visible but dimmed (§12.3).
                 Style::default()
@@ -139,8 +131,7 @@ fn render_interruption_modal(frame: &mut Frame, area: Rect, modal: &Interruption
             Style::default().add_modifier(Modifier::BOLD),
         )));
         for (i, opt) in modal.options.iter().enumerate() {
-            let selected = modal.focus == InterruptionFocus::Options
-                && i == modal.selected_option;
+            let selected = modal.focus == InterruptionFocus::Options && i == modal.selected_option;
             let marker = if selected { "▶" } else { " " };
             let style = if selected {
                 Style::default()
@@ -168,7 +159,11 @@ fn render_interruption_modal(frame: &mut Frame, area: Rect, modal: &Interruption
             "Freeform: ",
             Style::default()
                 .add_modifier(Modifier::BOLD)
-                .fg(if ff_focus { theme::CURSOR } else { ratatui::style::Color::Reset }),
+                .fg(if ff_focus {
+                    theme::CURSOR
+                } else {
+                    ratatui::style::Color::Reset
+                }),
         ),
         Span::raw(ff),
     ]));
@@ -183,7 +178,11 @@ fn render_interruption_modal(frame: &mut Frame, area: Rect, modal: &Interruption
             "Comment: ",
             Style::default()
                 .add_modifier(Modifier::BOLD)
-                .fg(if cm_focus { theme::CURSOR } else { ratatui::style::Color::Reset }),
+                .fg(if cm_focus {
+                    theme::CURSOR
+                } else {
+                    ratatui::style::Color::Reset
+                }),
         ),
         Span::raw(cm),
     ]));
@@ -193,7 +192,9 @@ fn render_interruption_modal(frame: &mut Frame, area: Rect, modal: &Interruption
         Style::default().add_modifier(Modifier::DIM),
     )));
 
-    let h = (lines.len() as u16 + 2).min(area.height).max(5.min(area.height));
+    let h = (lines.len() as u16 + 2)
+        .min(area.height)
+        .max(5.min(area.height));
     let w = 70.min(area.width).max(20.min(area.width));
     let [v] = Layout::vertical([Constraint::Length(h)])
         .flex(Flex::Center)
@@ -208,12 +209,11 @@ fn render_interruption_modal(frame: &mut Frame, area: Rect, modal: &Interruption
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(
-            Style::default()
-                .fg(theme::plan_status_color(PlanStatus::Interrupted)),
-        );
+        .border_style(Style::default().fg(theme::plan_status_color(PlanStatus::Interrupted)));
     frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
         dialog,
     );
 }
@@ -257,9 +257,7 @@ mod tests {
     fn render_to_string(app: &InboxState) -> String {
         let backend = TestBackend::new(90, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| draw(f, app, Path::new("/tmp")))
-            .unwrap();
+        terminal.draw(|f| draw(f, app, Path::new("/tmp"))).unwrap();
         let buf = terminal.backend().buffer().clone();
         (0..buf.area().height)
             .map(|y| {
@@ -280,7 +278,10 @@ mod tests {
         let out = render_to_string(&app);
         assert!(out.contains("inbox (1)"), "badge missing:\n{out}");
         assert!(out.contains("Body 1"), "open item missing:\n{out}");
-        assert!(out.contains("Body 2"), "resolved item still visible:\n{out}");
+        assert!(
+            out.contains("Body 2"),
+            "resolved item still visible:\n{out}"
+        );
     }
 
     #[test]

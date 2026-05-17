@@ -387,10 +387,7 @@ pub struct ImportOptions<'a> {
 /// not rejected even under `--strict`.
 fn bundle_requests_review(data: &ImportedPlan) -> bool {
     data.plan.review_enabled == Some(true)
-        || data
-            .steps
-            .iter()
-            .any(|s| s.review_enabled == Some(true))
+        || data.steps.iter().any(|s| s.review_enabled == Some(true))
 }
 
 /// Read and parse a portable plan JSON file.
@@ -418,10 +415,7 @@ pub fn import_plan_from_data(
     // (docs/dag-redesign.md §13.3) — consistent with `--strict` refusing a
     // bundle it cannot run as authored. Non-strict import keeps the toggle;
     // `ralph doctor` warns until a review harness is configured (STEP 44).
-    if options.strict
-        && bundle_requests_review(data)
-        && !options.review_harness_configured
-    {
+    if options.strict && bundle_requests_review(data) && !options.review_harness_configured {
         anyhow::bail!(
             "strict import rejected: this bundle enables review (plan/step \
              `review_enabled` is on) but no review harness is configured on \
@@ -1103,7 +1097,17 @@ mod tests {
         let file_path = dir.path().join("plan.json");
         std::fs::write(&file_path, json).unwrap();
 
-        import_plan(&conn, &file_path, "/tmp/proj", None, None, None, false, false).unwrap();
+        import_plan(
+            &conn,
+            &file_path,
+            "/tmp/proj",
+            None,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "file-import", "/tmp/proj")
             .unwrap()
@@ -1811,7 +1815,14 @@ mod tests {
     fn test_roundtrip_preserves_review_toggles_squash_and_max_corrections() {
         let conn = setup();
         let original = storage::create_plan(
-            &conn, "rev-rt", "/tmp/src", "branch", "desc", None, None, &[],
+            &conn,
+            "rev-rt",
+            "/tmp/src",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
         )
         .unwrap();
         // Plan-level: review ON, squash ON, cap = 5.
@@ -1821,13 +1832,33 @@ mod tests {
 
         // step 1: explicit step-level review OFF override.
         let (s1, _) = storage::create_step(
-            &conn, &original.id, "off-step", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &original.id,
+            "off-step",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         storage::set_step_review_enabled(&conn, &s1.id, Some(false)).unwrap();
         // step 2: no step-level override (inherit -> None).
         storage::create_step(
-            &conn, &original.id, "inherit-step", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &original.id,
+            "inherit-step",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -1884,11 +1915,28 @@ mod tests {
     fn test_legacy_bundle_without_review_fields_imports_to_defaults() {
         let conn = setup();
         let original = storage::create_plan(
-            &conn, "no-rev", "/tmp/src", "branch", "desc", None, None, &[],
+            &conn,
+            "no-rev",
+            "/tmp/src",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
         )
         .unwrap();
         storage::create_step(
-            &conn, &original.id, "s", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &original.id,
+            "s",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -1951,19 +1999,39 @@ mod tests {
     fn test_strict_rejects_review_bundle_without_review_harness() {
         let conn = setup();
         let original = storage::create_plan(
-            &conn, "strict-rev", "/tmp/src", "branch", "desc", None, None, &[],
+            &conn,
+            "strict-rev",
+            "/tmp/src",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
         )
         .unwrap();
         storage::set_plan_review_enabled(&conn, &original.id, Some(true)).unwrap();
         storage::create_step(
-            &conn, &original.id, "s", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &original.id,
+            "s",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let original = storage::get_plan_by_id(&conn, &original.id).unwrap();
         let steps = storage::list_steps(&conn, &original.id).unwrap();
-        let json = serde_json::to_string_pretty(
-            &export::build_exported_plan(&original, &steps, Vec::new(), &[]),
-        )
+        let json = serde_json::to_string_pretty(&export::build_exported_plan(
+            &original,
+            &steps,
+            Vec::new(),
+            &[],
+        ))
         .unwrap();
         let data: ImportedPlan = serde_json::from_str(&json).unwrap();
 
@@ -2030,19 +2098,39 @@ mod tests {
     fn test_strict_allows_review_off_bundle_without_review_harness() {
         let conn = setup();
         let original = storage::create_plan(
-            &conn, "off-rev", "/tmp/src", "branch", "desc", None, None, &[],
+            &conn,
+            "off-rev",
+            "/tmp/src",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
         )
         .unwrap();
         storage::set_plan_review_enabled(&conn, &original.id, Some(false)).unwrap();
         storage::create_step(
-            &conn, &original.id, "s", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &original.id,
+            "s",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let original = storage::get_plan_by_id(&conn, &original.id).unwrap();
         let steps = storage::list_steps(&conn, &original.id).unwrap();
-        let json = serde_json::to_string_pretty(
-            &export::build_exported_plan(&original, &steps, Vec::new(), &[]),
-        )
+        let json = serde_json::to_string_pretty(&export::build_exported_plan(
+            &original,
+            &steps,
+            Vec::new(),
+            &[],
+        ))
         .unwrap();
         let data: ImportedPlan = serde_json::from_str(&json).unwrap();
 

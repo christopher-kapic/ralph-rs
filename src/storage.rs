@@ -3697,9 +3697,20 @@ mod tests {
         assert!(!any_review_enabled(&conn).unwrap());
 
         let plan = create_plan(&conn, "rv", "/p", "b", "d", None, None, &[]).unwrap();
-        let (step, _) =
-            create_step(&conn, &plan.id, "s", "d", None, None, &[], None, None, None, None)
-                .unwrap();
+        let (step, _) = create_step(
+            &conn,
+            &plan.id,
+            "s",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         // Defaults (NULL/inherit) ⇒ still false.
         assert!(!any_review_enabled(&conn).unwrap());
 
@@ -5986,7 +5997,17 @@ mod tests {
 
         // Step A: crashed mid-review (InProgress + InFlight) — the bug case.
         let (a, _) = create_step(
-            &conn, &plan.id, "A", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "A",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         update_step_status(&conn, &a.id, StepStatus::InProgress).unwrap();
@@ -5995,7 +6016,17 @@ mod tests {
         // Step B: crashed mid-implement, review never started (InProgress +
         // Pending). Sweep flips status; review_status stays Pending.
         let (b, _) = create_step(
-            &conn, &plan.id, "B", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "B",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         update_step_status(&conn, &b.id, StepStatus::InProgress).unwrap();
@@ -6003,7 +6034,17 @@ mod tests {
         // Step C: a *completed, durably-passed* review on a still-Complete
         // step — NOT swept (status != InProgress) and verdict untouched.
         let (c, _) = create_step(
-            &conn, &plan.id, "C", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "C",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         update_step_status(&conn, &c.id, StepStatus::Complete).unwrap();

@@ -188,7 +188,10 @@ mod tests {
     #[test]
     fn step_status_color_maps_to_exact_125_hex() {
         // docs/dag-redesign.md §12.5 status-color table, step side.
-        assert_eq!(step_status_color(StepStatus::Complete), Color::Rgb(0x34, 0xd0, 0x58));
+        assert_eq!(
+            step_status_color(StepStatus::Complete),
+            Color::Rgb(0x34, 0xd0, 0x58)
+        );
         assert_eq!(
             step_status_color(StepStatus::InProgress),
             Color::Rgb(0xf7, 0xd1, 0x35)
@@ -197,8 +200,14 @@ mod tests {
             step_status_color(StepStatus::Pending),
             Color::Rgb(0xf5, 0xf7, 0xfa)
         );
-        assert_eq!(step_status_color(StepStatus::Failed), Color::Rgb(0xef, 0x44, 0x44));
-        assert_eq!(step_status_color(StepStatus::Aborted), Color::Rgb(0xef, 0x44, 0x44));
+        assert_eq!(
+            step_status_color(StepStatus::Failed),
+            Color::Rgb(0xef, 0x44, 0x44)
+        );
+        assert_eq!(
+            step_status_color(StepStatus::Aborted),
+            Color::Rgb(0xef, 0x44, 0x44)
+        );
         assert_eq!(step_status_color(StepStatus::Skipped), CHROME_DIM);
         // Retired purple #a855f7 → orange #db6d28 (question == blocker).
         assert_eq!(
@@ -210,7 +219,10 @@ mod tests {
     #[test]
     fn plan_status_color_maps_to_exact_125_hex() {
         // docs/dag-redesign.md §12.5 status-color table, plan side.
-        assert_eq!(plan_status_color(PlanStatus::Complete), Color::Rgb(0x34, 0xd0, 0x58));
+        assert_eq!(
+            plan_status_color(PlanStatus::Complete),
+            Color::Rgb(0x34, 0xd0, 0x58)
+        );
         assert_eq!(
             plan_status_color(PlanStatus::InProgress),
             Color::Rgb(0xf7, 0xd1, 0x35)
@@ -223,9 +235,18 @@ mod tests {
             plan_status_color(PlanStatus::Ready),
             Color::Rgb(0xf5, 0xf7, 0xfa)
         );
-        assert_eq!(plan_status_color(PlanStatus::Failed), Color::Rgb(0xef, 0x44, 0x44));
-        assert_eq!(plan_status_color(PlanStatus::Aborted), Color::Rgb(0xef, 0x44, 0x44));
-        assert_eq!(plan_status_color(PlanStatus::Archived), Color::Rgb(0xef, 0x44, 0x44));
+        assert_eq!(
+            plan_status_color(PlanStatus::Failed),
+            Color::Rgb(0xef, 0x44, 0x44)
+        );
+        assert_eq!(
+            plan_status_color(PlanStatus::Aborted),
+            Color::Rgb(0xef, 0x44, 0x44)
+        );
+        assert_eq!(
+            plan_status_color(PlanStatus::Archived),
+            Color::Rgb(0xef, 0x44, 0x44)
+        );
         // Derived plan-level interrupted → same orange as a blocked step.
         assert_eq!(
             plan_status_color(PlanStatus::Interrupted),

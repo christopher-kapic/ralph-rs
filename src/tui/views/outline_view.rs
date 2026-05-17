@@ -121,7 +121,10 @@ impl OutlineState {
         deps_of: HashMap<String, Vec<String>>,
         blocked_ids: HashSet<String>,
     ) {
-        let cursor_id = self.visible_rows().get(self.cursor).map(|r| r.step_id.clone());
+        let cursor_id = self
+            .visible_rows()
+            .get(self.cursor)
+            .map(|r| r.step_id.clone());
         let valid: HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
         self.focus_stack.retain(|id| valid.contains(id.as_str()));
         self.steps = steps;
@@ -154,7 +157,10 @@ impl OutlineState {
         let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
         for (step_id, deps) in &self.deps_of {
             for d in deps {
-                dependents.entry(d.as_str()).or_default().push(step_id.as_str());
+                dependents
+                    .entry(d.as_str())
+                    .or_default()
+                    .push(step_id.as_str());
             }
         }
         let mut cone: HashSet<String> = HashSet::new();
@@ -244,7 +250,11 @@ impl OutlineState {
         if n == 0 {
             return;
         }
-        self.cursor = if self.cursor == 0 { n - 1 } else { self.cursor - 1 };
+        self.cursor = if self.cursor == 0 {
+            n - 1
+        } else {
+            self.cursor - 1
+        };
     }
 
     /// Park the cursor on visible row `idx` (clamped to the visible range),
@@ -289,10 +299,7 @@ impl OutlineState {
             return false;
         };
         let rows = self.visible_rows();
-        self.cursor = rows
-            .iter()
-            .position(|r| r.step_id == popped)
-            .unwrap_or(0);
+        self.cursor = rows.iter().position(|r| r.step_id == popped).unwrap_or(0);
         true
     }
 
@@ -322,10 +329,7 @@ impl OutlineState {
         let new_top = self.focus_stack[crumb_index].clone();
         self.focus_stack.truncate(keep);
         let rows = self.visible_rows();
-        self.cursor = rows
-            .iter()
-            .position(|r| r.step_id == new_top)
-            .unwrap_or(0);
+        self.cursor = rows.iter().position(|r| r.step_id == new_top).unwrap_or(0);
         true
     }
 
@@ -360,12 +364,10 @@ impl OutlineState {
                 self.pop_focus();
                 OutlineOutcome::Handled
             }
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                match self.selected_step_id() {
-                    Some(id) => OutlineOutcome::OpenStep(id),
-                    None => OutlineOutcome::Passthrough,
-                }
-            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match self.selected_step_id() {
+                Some(id) => OutlineOutcome::OpenStep(id),
+                None => OutlineOutcome::Passthrough,
+            },
             // Ctrl-C is the caller's pop-view; never ours.
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 OutlineOutcome::Passthrough
@@ -514,11 +516,17 @@ mod tests {
         let st = OutlineState::new(steps, deps_of, HashSet::new());
         let rows = st.visible_rows();
         assert_eq!(
-            rows.iter().find(|r| r.short_id == "aaaa").unwrap().review_status,
+            rows.iter()
+                .find(|r| r.short_id == "aaaa")
+                .unwrap()
+                .review_status,
             ReviewStatus::Pending
         );
         assert_eq!(
-            rows.iter().find(|r| r.short_id == "bbbb").unwrap().review_status,
+            rows.iter()
+                .find(|r| r.short_id == "bbbb")
+                .unwrap()
+                .review_status,
             ReviewStatus::InFlight
         );
     }
@@ -645,7 +653,10 @@ mod tests {
         assert_eq!(st.focus_breadcrumb(), vec!["bbbb", "dddd"]);
         assert!(st.pop_focus_to_root());
         assert!(st.focus_breadcrumb().is_empty());
-        assert_eq!(ids(&st.visible_rows()), vec!["aaaa", "bbbb", "cccc", "dddd"]);
+        assert_eq!(
+            ids(&st.visible_rows()),
+            vec!["aaaa", "bbbb", "cccc", "dddd"]
+        );
         assert!(!st.pop_focus_to_root());
     }
 
@@ -677,15 +688,13 @@ mod tests {
         // blocked set — it's purely a draw filter. We assert the underlying
         // data is byte-identical before/after a focus + pop round-trip.
         let st0 = diamond();
-        let steps_before: Vec<String> =
-            st0.steps.iter().map(|s| s.id.clone()).collect();
+        let steps_before: Vec<String> = st0.steps.iter().map(|s| s.id.clone()).collect();
         let edges_before = st0.deps_of.clone();
         let mut st = st0;
         st.navigate_down();
         st.focus_cursor();
         st.pop_focus();
-        let steps_after: Vec<String> =
-            st.steps.iter().map(|s| s.id.clone()).collect();
+        let steps_after: Vec<String> = st.steps.iter().map(|s| s.id.clone()).collect();
         assert_eq!(steps_before, steps_after);
         assert_eq!(edges_before, st.deps_of);
         // visible_rows still spans the whole DAG (scheduler unaffected).
@@ -711,9 +720,15 @@ mod tests {
     fn z_and_shift_z_keys_drive_focus() {
         let mut st = diamond();
         st.navigate_down(); // bbbb
-        assert_eq!(st.handle_key(key(KeyCode::Char('z'))), OutlineOutcome::Handled);
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('z'))),
+            OutlineOutcome::Handled
+        );
         assert_eq!(st.focus_breadcrumb(), vec!["bbbb"]);
-        assert_eq!(st.handle_key(key(KeyCode::Char('Z'))), OutlineOutcome::Handled);
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('Z'))),
+            OutlineOutcome::Handled
+        );
         assert!(st.focus_breadcrumb().is_empty());
     }
 

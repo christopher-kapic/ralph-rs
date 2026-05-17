@@ -841,14 +841,31 @@ mod tests {
     fn test_export_emits_review_toggles_and_strips_runtime_state() {
         let conn = setup();
         let plan = storage::create_plan(
-            &conn, "rev-exp", "/tmp/proj", "branch", "desc", None, None, &[],
+            &conn,
+            "rev-exp",
+            "/tmp/proj",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
         )
         .unwrap();
         storage::set_plan_review_enabled(&conn, &plan.id, Some(true)).unwrap();
         storage::set_plan_squash_on_complete(&conn, &plan.id, true).unwrap();
         storage::set_plan_max_review_corrections(&conn, &plan.id, Some(7)).unwrap();
         let (s, _) = storage::create_step(
-            &conn, &plan.id, "S", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "S",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         storage::set_step_review_enabled(&conn, &s.id, Some(false)).unwrap();
@@ -877,17 +894,25 @@ mod tests {
         assert!(!json.contains("corrects_step_id"), "{json}");
 
         // An all-default plan omits every new key (skip_serializing_if).
-        let plain = storage::create_plan(
-            &conn, "plain", "/tmp/proj", "b", "d", None, None, &[],
-        )
-        .unwrap();
+        let plain =
+            storage::create_plan(&conn, "plain", "/tmp/proj", "b", "d", None, None, &[]).unwrap();
         storage::create_step(
-            &conn, &plain.id, "x", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plain.id,
+            "x",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let psteps = storage::list_steps(&conn, &plain.id).unwrap();
-        let pj = serde_json::to_string(&build_exported_plan(&plain, &psteps, Vec::new(), &[]))
-            .unwrap();
+        let pj =
+            serde_json::to_string(&build_exported_plan(&plain, &psteps, Vec::new(), &[])).unwrap();
         assert!(!pj.contains("review_enabled"), "{pj}");
         assert!(!pj.contains("squash_on_complete"), "{pj}");
         assert!(!pj.contains("max_review_corrections"), "{pj}");

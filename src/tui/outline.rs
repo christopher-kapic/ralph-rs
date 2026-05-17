@@ -90,8 +90,7 @@ pub fn project_outline(
         .collect();
     // id -> Step, so dependency short_ids can be ordered by the SAME
     // scheduler comparator (no divergent sort for the inline deps list).
-    let step_by_id: HashMap<&str, &Step> =
-        steps.iter().map(|s| (s.id.as_str(), s)).collect();
+    let step_by_id: HashMap<&str, &Step> = steps.iter().map(|s| (s.id.as_str(), s)).collect();
 
     let mut ordered: Vec<&Step> = steps.iter().collect();
     ordered.sort_by(|a, b| step_schedule_cmp(a, b, &depths));
@@ -173,11 +172,7 @@ mod tests {
     }
 
     /// Edge helper: `step short_id` depends on each of `deps` short_ids.
-    fn edge(
-        deps_of: &mut HashMap<String, Vec<String>>,
-        step_short: &str,
-        deps: &[&str],
-    ) {
+    fn edge(deps_of: &mut HashMap<String, Vec<String>>, step_short: &str, deps: &[&str]) {
         deps_of.insert(
             format!("uuid-{step_short}"),
             deps.iter().map(|d| format!("uuid-{d}")).collect(),
@@ -207,7 +202,10 @@ mod tests {
             ids(&out),
             vec!["aaaa1111", "bbbb2222", "cccc3333", "dddd4444"]
         );
-        assert_eq!(out.iter().map(|e| e.depth).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            out.iter().map(|e| e.depth).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
         assert!(out.iter().all(|e| !e.is_join()));
         assert!(out.iter().all(|e| e.join_deps.is_empty()));
         assert!(out.iter().all(|e| e.corrects_short_id.is_none()));
@@ -235,7 +233,10 @@ mod tests {
             ids(&out),
             vec!["aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd"]
         );
-        assert_eq!(out.iter().map(|e| e.depth).collect::<Vec<_>>(), vec![0, 1, 1, 2]);
+        assert_eq!(
+            out.iter().map(|e| e.depth).collect::<Vec<_>>(),
+            vec![0, 1, 1, 2]
+        );
 
         let d = out.iter().find(|e| e.step.short_id == "dddddddd").unwrap();
         assert!(d.is_join());
@@ -268,8 +269,14 @@ mod tests {
 
         let out = project_outline(&steps, &deps_of);
 
-        assert_eq!(ids(&out), vec!["r1______", "r2______", "x_______", "y_______"]);
-        assert_eq!(out.iter().map(|e| e.depth).collect::<Vec<_>>(), vec![0, 0, 1, 1]);
+        assert_eq!(
+            ids(&out),
+            vec!["r1______", "r2______", "x_______", "y_______"]
+        );
+        assert_eq!(
+            out.iter().map(|e| e.depth).collect::<Vec<_>>(),
+            vec![0, 0, 1, 1]
+        );
         assert!(out.iter().all(|e| !e.is_join()));
     }
 
@@ -320,8 +327,7 @@ mod tests {
         let depths = compute_step_depths(&steps, &deps_of);
         let mut expected: Vec<&Step> = steps.iter().collect();
         expected.sort_by(|a, b| step_schedule_cmp(a, b, &depths));
-        let expected_ids: Vec<&str> =
-            expected.iter().map(|s| s.short_id.as_str()).collect();
+        let expected_ids: Vec<&str> = expected.iter().map(|s| s.short_id.as_str()).collect();
 
         assert_eq!(ids(&out), expected_ids);
         // c (a1) sorts before b (a2) at the same depth; d is last (depth 2).

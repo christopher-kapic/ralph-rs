@@ -812,7 +812,17 @@ mod tests {
         let plan =
             storage::create_plan(&conn, "pp", project, "br", "desc", None, None, &[]).unwrap();
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "S", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "S",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -824,7 +834,9 @@ mod tests {
         let cfg_off = Config::default(); // review.enabled = None
 
         // All inherit + config None ⇒ false.
-        let p = storage::get_plan_by_slug(&conn, "pp", project).unwrap().unwrap();
+        let p = storage::get_plan_by_slug(&conn, "pp", project)
+            .unwrap()
+            .unwrap();
         let s = storage::get_step(&conn, &step.id).unwrap();
         assert!(!effective_review_enabled(&s, &p, &cfg_off));
 
@@ -833,7 +845,9 @@ mod tests {
 
         // plan OFF beats config ON.
         cmd_plan_review(&conn, "pp", project, false, &quiet_out()).unwrap();
-        let p = storage::get_plan_by_slug(&conn, "pp", project).unwrap().unwrap();
+        let p = storage::get_plan_by_slug(&conn, "pp", project)
+            .unwrap()
+            .unwrap();
         let s = storage::get_step(&conn, &step.id).unwrap();
         assert!(!effective_review_enabled(&s, &p, &cfg_on));
 

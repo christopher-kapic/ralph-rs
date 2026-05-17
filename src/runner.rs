@@ -2203,8 +2203,9 @@ async fn drain_finished_reviews(
     // If asked to block, wait for the first one; otherwise reap only what is
     // already done. After the (optional) blocking wait, greedily drain every
     // other already-finished task in this same call.
-    let mut joined: Vec<std::result::Result<Result<crate::review::ReviewTaskResult>, tokio::task::JoinError>> =
-        Vec::new();
+    let mut joined: Vec<
+        std::result::Result<Result<crate::review::ReviewTaskResult>, tokio::task::JoinError>,
+    > = Vec::new();
     if block {
         match reviews.join_next().await {
             Some(j) => joined.push(j),
@@ -5501,7 +5502,17 @@ mod tests {
         // the first is under review.
         for title in ["Alpha", "Beta"] {
             storage::create_step(
-                &conn, &plan.id, title, "d", None, None, &[], Some(0), None, None, None,
+                &conn,
+                &plan.id,
+                title,
+                "d",
+                None,
+                None,
+                &[],
+                Some(0),
+                None,
+                None,
+                None,
             )
             .unwrap();
         }
@@ -5511,12 +5522,14 @@ mod tests {
             .unwrap();
 
         let mut config = Config::default();
-        config
-            .harnesses
-            .insert("impl".to_string(), sh_stub_harness(&impl_sh.to_string_lossy()));
-        config
-            .harnesses
-            .insert("reviewer".to_string(), sh_stub_harness(&rev_sh.to_string_lossy()));
+        config.harnesses.insert(
+            "impl".to_string(),
+            sh_stub_harness(&impl_sh.to_string_lossy()),
+        );
+        config.harnesses.insert(
+            "reviewer".to_string(),
+            sh_stub_harness(&rev_sh.to_string_lossy()),
+        );
         config.review.enabled = Some(true);
         config.review.harness = "reviewer".to_string();
 
@@ -5537,10 +5550,8 @@ mod tests {
         assert_eq!(result.final_status, PlanStatus::Complete);
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert!(
-            steps
-                .iter()
-                .all(|s| s.status == StepStatus::Complete
-                    && s.review_status == Some(crate::plan::ReviewStatus::Passed)),
+            steps.iter().all(|s| s.status == StepStatus::Complete
+                && s.review_status == Some(crate::plan::ReviewStatus::Passed)),
             "every step Complete + review Passed (no review left pending — §3.3)"
         );
 

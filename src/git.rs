@@ -1244,13 +1244,7 @@ pub fn order_shas_newest_first(
 pub fn add_detached_worktree(workdir: &Path, path: &Path, sha: &str) -> Result<()> {
     git(
         workdir,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            &path.to_string_lossy(),
-            sha,
-        ],
+        &["worktree", "add", "--detach", &path.to_string_lossy(), sha],
     )
     .with_context(|| {
         format!(
@@ -1294,8 +1288,8 @@ pub fn remove_worktree(workdir: &Path, path: &Path) {
 /// main one), for tests asserting no orphan review worktree leaked.
 #[cfg(test)]
 pub fn list_worktree_paths(workdir: &Path) -> Result<Vec<String>> {
-    let out = git(workdir, &["worktree", "list", "--porcelain"])
-        .context("could not list worktrees")?;
+    let out =
+        git(workdir, &["worktree", "list", "--porcelain"]).context("could not list worktrees")?;
     Ok(out
         .lines()
         .filter_map(|l| l.strip_prefix("worktree "))

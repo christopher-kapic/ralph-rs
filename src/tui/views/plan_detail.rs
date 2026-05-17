@@ -19,9 +19,9 @@ use crate::run_lock::LiveRun;
 use crate::tui::events::{StreamMode, TAIL_BUFFER_LINES, TAIL_VISIBLE_LINES};
 use crate::tui::help::HelpState;
 use crate::tui::read_only::ReadOnly;
-use crate::tui::views::outline_view::OutlineState;
 use crate::tui::selection::Selection;
 use crate::tui::toast::ToastQueue;
+use crate::tui::views::outline_view::OutlineState;
 use crate::tui::widgets::palette_bar::PaletteBarState;
 
 // ---------------------------------------------------------------------------
@@ -222,8 +222,7 @@ impl PlanDetailApp {
     pub fn new(plan: Plan, steps: Vec<Step>, config: &Config) -> Self {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
-        let outline =
-            OutlineState::new(steps.clone(), Default::default(), Default::default());
+        let outline = OutlineState::new(steps.clone(), Default::default(), Default::default());
         Self {
             plan,
             steps,
@@ -812,8 +811,7 @@ impl PlanDetailApp {
         deps_of: std::collections::HashMap<String, Vec<String>>,
         blocked_ids: std::collections::HashSet<String>,
     ) {
-        self.outline
-            .sync(self.steps.clone(), deps_of, blocked_ids);
+        self.outline.sync(self.steps.clone(), deps_of, blocked_ids);
         self.realign_selection_to_outline();
     }
 
@@ -2704,7 +2702,10 @@ mod tests {
         // they point at visible_rows()[2] = uc — NOT self.steps[2] (= "ua").
         assert_eq!(app.outline.cursor(), 2);
         assert_eq!(app.outline.selected_step_id().as_deref(), Some("uc"));
-        assert_eq!(app.selected_index, 3, "self.steps position of uc (scrambled order)");
+        assert_eq!(
+            app.selected_index, 3,
+            "self.steps position of uc (scrambled order)"
+        );
         assert_eq!(app.steps[app.selected_index].id, "uc");
         assert!(
             app.take_pending_open_step().is_none(),
@@ -2775,7 +2776,11 @@ mod tests {
         assert_eq!(app.steps[app.selected_index].id, "uc");
 
         app.handle_mouse(mouse_event(5, 4, MouseEventKind::ScrollUp));
-        assert_eq!(app.outline.cursor(), 1, "ScrollUp moves the outline cursor back");
+        assert_eq!(
+            app.outline.cursor(),
+            1,
+            "ScrollUp moves the outline cursor back"
+        );
         assert_eq!(app.outline.selected_step_id().as_deref(), Some("ub"));
         assert_eq!(app.steps[app.selected_index].id, "ub");
     }

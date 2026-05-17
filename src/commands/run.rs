@@ -2532,8 +2532,8 @@ where
         // (§3.3). Edges and the blocked-step set come from the same poll so
         // the drawn outline can never diverge from the scheduler's view.
         {
-            let deps_of = storage::list_step_dependency_edges(conn, &app.plan.id)
-                .unwrap_or_default();
+            let deps_of =
+                storage::list_step_dependency_edges(conn, &app.plan.id).unwrap_or_default();
             let blocked_ids: std::collections::HashSet<String> =
                 storage::list_open_interruptions_for_plan(conn, &app.plan.id)
                     .map(|v| v.into_iter().map(|i| i.step_id).collect())
@@ -3731,11 +3731,9 @@ pub(crate) fn plan_detail_apply_palette_action(
                         app.realign_selection_to_outline();
                     }
                 }
-                None => app.toasts.push(
-                    "No such step to focus.",
-                    ToastKind::Error,
-                    Instant::now(),
-                ),
+                None => app
+                    .toasts
+                    .push("No such step to focus.", ToastKind::Error, Instant::now()),
             }
         }
         // Terminal-bound: hand back to the caller. `OpenInbox` pushes the
@@ -4535,11 +4533,7 @@ where
                 // Reflect it in-memory and auto-advance to the next open
                 // interruption (run-through — §12.3); a fresh DB poll on
                 // the next loop tick reconciles any drift.
-                app.resolve_and_advance(
-                    &interruption_id,
-                    &resolution,
-                    comment.as_deref(),
-                );
+                app.resolve_and_advance(&interruption_id, &resolution, comment.as_deref());
             }
         }
     }
@@ -6059,7 +6053,12 @@ fn collect_skip_wip_commits(conn: &Connection, plan: &crate::plan::Plan) -> Vec<
 fn collect_iteration_commits_by_step(
     conn: &Connection,
     plan: &crate::plan::Plan,
-) -> Vec<(String, String, Option<String>, Vec<(i32, String, Option<String>)>)> {
+) -> Vec<(
+    String,
+    String,
+    Option<String>,
+    Vec<(i32, String, Option<String>)>,
+)> {
     let workdir = Path::new(&plan.project);
     if !crate::git::branch_exists(workdir, &plan.branch_name).unwrap_or(false) {
         return Vec::new();

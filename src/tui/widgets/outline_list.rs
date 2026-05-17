@@ -47,12 +47,8 @@ pub fn review_badge(rs: ReviewStatus) -> Option<(&'static str, Color)> {
         ReviewStatus::InFlight => {
             Some(("review?", theme::step_status_color(StepStatus::InProgress)))
         }
-        ReviewStatus::Passed => {
-            Some(("review✔", theme::step_status_color(StepStatus::Complete)))
-        }
-        ReviewStatus::Failed => {
-            Some(("review✘", theme::step_status_color(StepStatus::Failed)))
-        }
+        ReviewStatus::Passed => Some(("review✔", theme::step_status_color(StepStatus::Complete))),
+        ReviewStatus::Failed => Some(("review✘", theme::step_status_color(StepStatus::Failed))),
         ReviewStatus::Skipped => Some(("review⊘", theme::CHROME_DIM)),
     }
 }
@@ -81,8 +77,7 @@ pub fn render(
             let indent = "  ".repeat(row.depth);
             let glyph = status_glyph(row.effective_status);
             let label = format!("{indent}{glyph} {} {}", row.short_id, row.title);
-            let mut row_style = Style::default()
-                .fg(theme::step_status_color(row.effective_status));
+            let mut row_style = Style::default().fg(theme::step_status_color(row.effective_status));
             if matches!(row.effective_status, StepStatus::InProgress) {
                 row_style = row_style.add_modifier(Modifier::BOLD);
             }
@@ -258,8 +253,7 @@ mod tests {
     fn blocked_overlay_uses_orange_via_theme_helper() {
         let mut steps = vec![step("aaaa", "a0")];
         steps[0].status = StepStatus::InProgress;
-        let blocked: HashSet<String> =
-            ["uuid-aaaa".to_string()].into_iter().collect();
+        let blocked: HashSet<String> = ["uuid-aaaa".to_string()].into_iter().collect();
         let st = OutlineState::new(steps, HashMap::new(), blocked);
         let rows = st.visible_rows();
         assert_eq!(rows[0].effective_status, StepStatus::Blocked);
@@ -276,10 +270,12 @@ mod tests {
             .unwrap();
         let buf = terminal.backend().buffer().clone();
         let orange = theme::step_status_color(StepStatus::Blocked);
-        let found = (0..buf.area().height).any(|y| {
-            (0..buf.area().width).any(|x| buf[(x, y)].style().fg == Some(orange))
-        });
-        assert!(found, "blocked row must use the §12.5 orange via theme helper");
+        let found = (0..buf.area().height)
+            .any(|y| (0..buf.area().width).any(|x| buf[(x, y)].style().fg == Some(orange)));
+        assert!(
+            found,
+            "blocked row must use the §12.5 orange via theme helper"
+        );
     }
 
     #[test]

@@ -7072,9 +7072,10 @@ mod tests {
         config
             .harnesses
             .insert("poly".to_string(), harness_config_for_script(&harness_path));
-        config
-            .harnesses
-            .insert("reviewer".to_string(), harness_config_for_script(&reviewer_path));
+        config.harnesses.insert(
+            "reviewer".to_string(),
+            harness_config_for_script(&reviewer_path),
+        );
         // Global review is ENABLED + a real review harness is configured,
         // so the only thing keeping the reviewer from spawning is the
         // step-scope OFF override resolving via effective_review_enabled.

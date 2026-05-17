@@ -189,7 +189,11 @@ fn draw_step_list(frame: &mut Frame, app: &mut PlanDetailApp, area: Rect) {
         Some(app.outline.cursor().min(rows.len() - 1))
     };
     let title = if app.outline_focused() {
-        format!("{}  focus: {}", app.plan.slug, app.outline.focus_breadcrumb().join(" › "))
+        format!(
+            "{}  focus: {}",
+            app.plan.slug,
+            app.outline.focus_breadcrumb().join(" › ")
+        )
     } else {
         app.plan.slug.clone()
     };
@@ -489,7 +493,9 @@ fn draw_open_questions_banner(frame: &mut Frame, app: &PlanDetailApp, area: Rect
         .border_style(Style::default().fg(interrupted));
     let para = Paragraph::new(Span::styled(
         text,
-        Style::default().fg(interrupted).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(interrupted)
+            .add_modifier(Modifier::BOLD),
     ))
     .block(block);
     frame.render_widget(para, area);

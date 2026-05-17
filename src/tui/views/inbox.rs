@@ -107,10 +107,7 @@ impl InboxState {
             .map(|i| i.interruption.id.clone());
         self.items = items;
         if let Some(id) = cursor_id
-            && let Some(idx) = self
-                .items
-                .iter()
-                .position(|i| i.interruption.id == id)
+            && let Some(idx) = self.items.iter().position(|i| i.interruption.id == id)
         {
             self.cursor = idx;
         } else if self.items.is_empty() {
@@ -426,11 +423,7 @@ mod tests {
 
     #[test]
     fn answering_n_advances_through_all_then_ends() {
-        let mut st = InboxState::new(vec![
-            item("1", true),
-            item("2", true),
-            item("3", true),
-        ]);
+        let mut st = InboxState::new(vec![item("1", true), item("2", true), item("3", true)]);
         assert!(st.start_run_through());
         assert_eq!(*st.mode(), InboxMode::RunThrough);
 
@@ -464,7 +457,9 @@ mod tests {
         assert!(st.modal().is_none());
         assert_eq!(st.open_count(), 1, "#2 still open after Esc");
         assert!(
-            st.items().iter().any(|i| i.interruption.id == "2" && i.is_open())
+            st.items()
+                .iter()
+                .any(|i| i.interruption.id == "2" && i.is_open())
         );
     }
 
@@ -488,10 +483,7 @@ mod tests {
     fn run_through_skips_resolved_items_and_starts_at_first_open() {
         // Cursor parked on a resolved row; start_run_through jumps to the
         // first OPEN item rather than trying to answer a resolved one.
-        let mut st = InboxState::new(vec![
-            item("done", false),
-            item("open1", true),
-        ]);
+        let mut st = InboxState::new(vec![item("done", false), item("open1", true)]);
         assert_eq!(st.cursor(), 0); // on "done" (resolved)
         assert!(st.start_run_through());
         assert_eq!(st.modal().unwrap().interruption_id, "open1");

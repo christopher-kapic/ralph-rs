@@ -162,7 +162,9 @@ fn render_bottom(
                 // single §12.5 mapping so chrome can't drift from the
                 // plan-list dot / step glyph (docs/dag-redesign.md §12.5).
                 Style::default()
-                    .fg(theme::plan_status_color(crate::plan::PlanStatus::InProgress))
+                    .fg(theme::plan_status_color(
+                        crate::plan::PlanStatus::InProgress,
+                    ))
                     .add_modifier(Modifier::BOLD),
             ))
             .alignment(Alignment::Right),

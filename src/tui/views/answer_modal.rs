@@ -274,9 +274,10 @@ impl InterruptionModal {
     /// `None` when nothing has been chosen/typed yet (e.g. freeform empty).
     pub fn chosen_resolution(&self) -> Option<String> {
         match self.focus {
-            InterruptionFocus::Options if !self.options.is_empty() => {
-                self.options.get(self.selected_option).map(|o| o.text.clone())
-            }
+            InterruptionFocus::Options if !self.options.is_empty() => self
+                .options
+                .get(self.selected_option)
+                .map(|o| o.text.clone()),
             _ => {
                 let t = self.freeform.trim();
                 if t.is_empty() {
@@ -316,8 +317,7 @@ impl InterruptionModal {
             KeyCode::Char('j') | KeyCode::Down
                 if self.focus == InterruptionFocus::Options && !self.options.is_empty() =>
             {
-                self.selected_option =
-                    (self.selected_option + 1) % self.options.len();
+                self.selected_option = (self.selected_option + 1) % self.options.len();
                 InterruptionModalAction::Pending
             }
             KeyCode::Char('k') | KeyCode::Up
@@ -344,12 +344,8 @@ impl InterruptionModal {
                 };
                 InterruptionModalAction::Pending
             }
-            KeyCode::Char('f') | KeyCode::Char('F') => {
-                InterruptionModalAction::EditFreeform
-            }
-            KeyCode::Char('m') | KeyCode::Char('M') => {
-                InterruptionModalAction::EditComment
-            }
+            KeyCode::Char('f') | KeyCode::Char('F') => InterruptionModalAction::EditFreeform,
+            KeyCode::Char('m') | KeyCode::Char('M') => InterruptionModalAction::EditComment,
             KeyCode::Enter => match self.chosen_resolution() {
                 Some(resolution) => InterruptionModalAction::Resolve {
                     interruption_id: self.interruption_id.clone(),
@@ -563,9 +559,7 @@ mod tests {
 
     // -- InterruptionModal (§12.4) ---------------------------------------
 
-    use crate::plan::{
-        Interruption, InterruptionKind, InterruptionOption, InterruptionState,
-    };
+    use crate::plan::{Interruption, InterruptionKind, InterruptionOption, InterruptionState};
     use chrono::Utc;
 
     fn question(opts: &[(&str, i32)]) -> Interruption {
@@ -616,7 +610,10 @@ mod tests {
             ("second", 2),
         ]));
         assert_eq!(
-            m.options.iter().map(|o| o.text.as_str()).collect::<Vec<_>>(),
+            m.options
+                .iter()
+                .map(|o| o.text.as_str())
+                .collect::<Vec<_>>(),
             vec!["best", "second", "third"]
         );
         assert_eq!(m.selected_option, 0);
@@ -626,10 +623,7 @@ mod tests {
 
     #[test]
     fn enter_resolves_with_chosen_option_and_comment() {
-        let mut m = InterruptionModal::from_interruption(&question(&[
-            ("opt-a", 1),
-            ("opt-b", 2),
-        ]));
+        let mut m = InterruptionModal::from_interruption(&question(&[("opt-a", 1), ("opt-b", 2)]));
         // Move to opt-b, set a comment via the editor handoff stub.
         assert_eq!(
             m.handle_key(key(KeyCode::Char('j'))),

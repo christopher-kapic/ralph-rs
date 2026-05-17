@@ -312,9 +312,7 @@ pub fn parse(input: &str) -> Result<PaletteCommand, ParseError> {
 
         // /focus [<short_id>] — re-root the outline (§12.2)
         ["focus"] => Ok(PaletteCommand::Focus(None)),
-        ["focus", short_id] => {
-            Ok(PaletteCommand::Focus(Some((*short_id).to_string())))
-        }
+        ["focus", short_id] => Ok(PaletteCommand::Focus(Some((*short_id).to_string()))),
 
         _ => Err(ParseError::Unknown(body.to_string())),
     }

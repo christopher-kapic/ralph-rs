@@ -1568,7 +1568,10 @@ mod tests {
         // `--review inherit` ⇒ NULL (clear the override).
         edit_review(Some(None)).unwrap();
         let s = storage::get_step(&conn, &step0.id).unwrap();
-        assert_eq!(s.review_enabled, None, "after `inherit` the override clears");
+        assert_eq!(
+            s.review_enabled, None,
+            "after `inherit` the override clears"
+        );
 
         // Flag absent (outer None) ⇒ "nothing to edit" guard fires.
         let err = edit_review(None).expect_err("no fields to edit must error");

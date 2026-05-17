@@ -310,13 +310,7 @@ pub fn for_inbox() -> HelpModel {
                     ("<esc>", "Exit run-through back to the list"),
                 ],
             ),
-            Group::new(
-                "Other",
-                vec![
-                    ("?", "Toggle this help"),
-                    ("Ctrl-C", "Back"),
-                ],
-            ),
+            Group::new("Other", vec![("?", "Toggle this help"), ("Ctrl-C", "Back")]),
         ],
     )
 }
@@ -806,8 +800,7 @@ mod tests {
             "missing Z (pop focus) binding: {all:?}"
         );
         assert!(
-            all.iter()
-                .any(|(_, a)| a.to_lowercase().contains("inbox")),
+            all.iter().any(|(_, a)| a.to_lowercase().contains("inbox")),
             "missing inbox entry: {all:?}"
         );
     }

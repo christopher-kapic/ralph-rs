@@ -111,7 +111,6 @@ fn handle_normal_mode(app: &mut PlanDetailApp, key: KeyEvent) -> InputAction {
     }
 
     match key.code {
-
         // Multi-select
         KeyCode::Char(' ') => {
             app.toggle_selection();

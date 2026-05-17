@@ -1556,7 +1556,11 @@ mod tests {
         let cfg = config_with_review_harness("ghost", false);
         let r = check_review_harness(&cfg);
         assert_eq!(r.severity, CheckSeverity::Warning);
-        assert!(r.message.contains("not defined in config.json"), "{}", r.message);
+        assert!(
+            r.message.contains("not defined in config.json"),
+            "{}",
+            r.message
+        );
     }
 
     #[test]
@@ -1602,10 +1606,7 @@ mod tests {
         let mut cfg = config_with_review_harness("rev", true);
         cfg.review.harness = String::new();
         // Helper alone would warn …
-        assert_eq!(
-            check_review_harness(&cfg).severity,
-            CheckSeverity::Warning
-        );
+        assert_eq!(check_review_harness(&cfg).severity, CheckSeverity::Warning);
         // … but the gate (any_review_enabled) on a fresh isolated DB is
         // false, so no row is emitted. Prove the gate predicate.
         let conn = crate::db::open_memory().unwrap();
