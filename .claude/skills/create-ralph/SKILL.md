@@ -41,17 +41,47 @@ Run these checks first. If any fail, fix them before authoring the plan:
 
 6. **Create the plan** with the commands in *Authoring* below.
 
+## Express step independence (the DAG payoff)
+
+Ralph executes a plan as a **dependency DAG**, not a flat list. When one
+branch blocks on a human (a question or a blocker the agent can't clear),
+**independent branches keep running** and the human batch-answers on their
+own schedule. **The payoff scales with the DAG's width — a purely linear
+plan gets *zero* benefit** (its single branch blocking = the whole plan
+blocked, exactly like before).
+
+So, when the work genuinely allows it, **make independence explicit**:
+
+- Split work into branches that *don't* depend on each other and declare
+  only the edges that are real. Use `--depends-on <short_id|num>` on
+  `ralph step add` (or `ralph step dependency add` afterward) to wire only
+  the true ordering constraints. A step with no `--depends-on` is a root
+  and can run as soon as the scheduler reaches it.
+- Don't manufacture a dependency just because two steps touch the same
+  area — only add an edge when step B genuinely needs step A's output.
+- **But don't over-fragment into deep independent branches that all
+  re-converge at one late join step.** History is linear (one git branch
+  per plan), so a deep side branch's commits stack on top of whatever else
+  committed meanwhile; a late join then has to absorb all of that at once.
+  Prefer **shallow, wide independence** (several short parallel branches)
+  over **deep, narrow independence** (long chains that join late) — it
+  limits how much in-flight work is entangled when something blocks.
+- A linear plan is still perfectly valid (and behaves exactly as before —
+  deterministic, no regressions). Independence is *soft pressure*, not a
+  mandate: only express it when the task actually decomposes that way.
+
 ## Recommended plan shape
 
 Default to: **build → verify → review → fix-as-needed**, repeated per phase.
 
-- **Build steps** (default `change_policy=required`): the agent writes code. Ralph fails the step if no diff is produced.
-- **Verify step** (a deterministic test like `cargo test`): catches "code compiled but the page is broken in the browser" failures that reviewers can't replace. Don't skip this even if you also have a review step.
-- **Review steps** (use a different harness if available — e.g. `codex` when the implementer is `claude`): another model audits the diff. Set:
-  - `--change-policy optional` — reviewers normally don't write code; without this the step fails for producing no diff.
-  - `--max-retries 1` — review steps shouldn't retry-loop on disagreement.
-  - `--harness codex-orchestrator` if the review step is supposed to **append fix steps via `ralph step add`** — that writes to ralph's DB outside the workspace, which the default sandbox blocks.
-- **Fix steps**: appended by the reviewer to the end of the plan (no `--after`) when issues are found. Reordering is one `ralph step move` away if the user wants it.
+- **Build steps** (default `change_policy=required`): the agent writes code. Ralph fails the step if no diff is produced. Where build steps are independent, wire only the real `--depends-on` edges so they can interleave.
+- **Verify step** (a deterministic test like `cargo test`): catches "code compiled but the page is broken in the browser" failures that reviewers can't replace. Don't skip this even if review is on.
+- **Review — prefer the built-in pipeline.** Ralph now has a **built-in nondeterministic review pipeline**: a separate harness reviews each step's commit read-only, and a failed review automatically inserts a corrective step and re-parents dependents. You usually do **not** need to author explicit review steps anymore. Turn it on instead:
+  - `ralph config review set --harness <h> --model <m> --enabled true` — set the global reviewer (use a *different* model from the implementer when possible, e.g. `codex` reviewing `claude`).
+  - `ralph plan review on <slug>` — review every step in the plan; or
+  - `ralph step edit <sel> --review on` — review only specific (risky / subtle-criteria) steps; `--review off` exempts one; `--review inherit` defers to plan/global. Precedence is step > plan > global > off.
+  - Tune the recursion bound with `ralph plan create ... --max-review-corrections <n>` (default 3): if a corrective step keeps failing its own review past this many rounds, ralph raises a blocker for a human instead of looping forever.
+- **Explicit review/fix steps are now the exception**, for cases the built-in pipeline doesn't cover (e.g. a whole-plan audit at the end, or a review that must run a command rather than read a diff). If you do author one, set `--change-policy optional` (reviewers produce no diff) and `--max-retries 1` (don't retry-loop on disagreement). Manual reviewer-appended fix steps still go at the end (no `--after`); `ralph step move` reorders.
 
 ## Authoring (this is where the gotchas hide)
 
@@ -98,16 +128,26 @@ Each step gets a **fresh context** — there is no conversation in step N+1. Pro
 - **Keep one concern per step**: don't combine "add the model" and "add the API endpoint".
 - **Order dependencies correctly**: types before uses, modules before imports.
 
-## Codex review prompts (when codex is the reviewer)
+## Review verdicts (built-in pipeline and manual review steps)
 
-- Tell codex to read `AGENTS.md` / `CLAUDE.md` and per-phase patterns explicitly — it doesn't load them by default.
-- Make codex emit a **structured verdict** so downstream steps can parse it: a single line of either `REVIEW PASS — <one-line summary>` or `REVIEW FAIL — N issue(s)`, followed by a numbered list when failing.
-- If you want codex to append fix steps, **describe the action in prose**, not as a copy-paste shell snippet — that re-introduces the embedded-quoting trap. Tell it: "for each issue, run `ralph step add` with `--harness claude`, `--change-policy required`, and a description containing the restated issue, the affected files, the exact fix, the patterns to consult, and the acceptance signal."
-- The codex review step itself needs `--harness codex-orchestrator` if it will call `ralph step add`.
+The **built-in review pipeline** handles the verdict/correction loop for
+you: the reviewer harness is told to emit a structured verdict, ralph
+parses pass/fail, records the verdict as a git note, and on a failure
+auto-inserts a corrective step and re-parents dependents — you don't write
+the "append a fix step" logic yourself. Just pick a capable reviewer
+harness/model via `ralph config review set` and enable review at the plan
+or step level.
+
+If you still author an **explicit manual review step** for a case the
+built-in pipeline doesn't cover:
+
+- Tell the reviewer to read `AGENTS.md` / `CLAUDE.md` and per-phase patterns explicitly — most harnesses don't load them by default.
+- Have it emit a **structured verdict** so a following step (or a human) can parse it: a single line of either `REVIEW PASS — <one-line summary>` or `REVIEW FAIL — N issue(s)`, followed by a numbered list when failing. (This is the same verdict shape the built-in reviewer is instructed to produce, so the convention is consistent.)
+- If that manual step must itself append fix steps via `ralph step add`, **describe the action in prose**, not as a copy-paste shell snippet — that re-introduces the embedded-quoting trap.
 
 ## Branching
 
-Use `--branch feat/<slug>` so reviewers can run `git diff main..HEAD` from any step to see the cumulative work-to-date. (Ralph auto-commits each successful step on the plan branch — that's how rollback and per-step diff isolation work, so don't try to disable it.)
+Use `--branch feat/<slug>` so reviewers can run `git diff main..HEAD` from any step to see the cumulative work-to-date. (Ralph commits **per iteration** on the single plan branch — subject `ralph <short_id>.<n> - <title>` plus `Ralph-*` trailers — and history stays linear, one branch per plan; that's how rollback, per-step diff isolation, and the built-in reviewer's fixed-SHA review all work, so don't try to disable it. By default every iteration commit is kept; `ralph plan create ... --squash-on-complete` collapses a step's iteration commits into one when it completes.)
 
 ## Plan size
 
@@ -122,19 +162,27 @@ Don't compress a big task into a handful of mega-steps — you lose the per-step
 
 ## Anti-patterns
 
-- ❌ Referencing "the previous step" by name in a prompt — refer to files or commits.
+- ❌ Referencing "the previous step" by name in a prompt — refer to files or commits (a DAG has no positional "previous").
 - ❌ Long inline `--description "..."` with mixed quoting — silent truncation. Use `--import-json` or a quoted heredoc → tempfile.
-- ❌ Skipping `--change-policy optional` on review/audit steps — they'll be marked failed for producing no diff.
-- ❌ Using `codex` (default sandbox) for a review step that appends fix steps — writes to the ralph DB silently fail. Use `codex-orchestrator`.
-- ❌ Skipping the verify step because "the review step will catch it" — reviewers don't run the code.
-- ❌ Trying to make the harness commit instead of letting ralph commit — ralph commits each successful step by design; harness-side commits will conflict and produce a clean diff at step end (which `change_policy=required` will correctly fail).
+- ❌ Inventing dependency edges that aren't real ordering constraints — it serializes work the scheduler could have run independently and kills the DAG payoff.
+- ❌ Deep independent branches that all re-converge at one late join — maximizes in-flight entanglement when something blocks. Prefer shallow + wide.
+- ❌ Authoring explicit review steps when the built-in review pipeline already covers it — enable `ralph plan/step review` instead of hand-rolling reviewer + fix-step plumbing.
+- ❌ Skipping `--change-policy optional` on a manual review/audit step — it'll be marked failed for producing no diff.
+- ❌ Skipping the verify (deterministic test) step because "review will catch it" — reviewers read a diff, they don't run the code.
+- ❌ Trying to make the harness commit instead of letting ralph commit — ralph commits each iteration by design; harness-side commits conflict and produce a clean diff at step end (which `change_policy=required` will correctly fail).
 
 ## Reference: useful CLI flags
 
-- `ralph step add --import-json <FILE|->` — bulk insert steps from JSON array.
+- `ralph step add --import-json <FILE|->` — bulk insert steps from JSON array (no dependency field; conflicts with `--depends-on`).
+- `ralph step add ... --depends-on <short_id|num>` (repeatable) — declare DAG edges at creation. A step with no `--depends-on` is a root. Self-edges and cycles are rejected.
+- `ralph step dependency add|remove|list <num|short_id> [--depends-on <short_id|num>...]` — edit a step's dependency edges after creation.
+- Every `<num>` step selector also accepts the step's stable 8-char `short_id` (shown by `ralph step list` / `ralph plan show`), which survives reordering and inserted corrective steps.
 - `ralph step add ... --change-policy {required|optional|forbidden}` — `required` (default) fails on empty diff; `optional` allows it (use for review); `forbidden` fails on any diff (use for read-only audit).
 - `ralph step add ... --max-retries <n>` — per-step retry override.
 - `ralph step add ... --harness <name>` — per-step harness override.
+- `ralph config review set [--harness <h>] [--model <m>] [--enabled <bool>]` — the global built-in-review harness/model/default (only the fields you pass are written).
+- `ralph plan review <on|off> <slug>` — per-plan review toggle. `ralph step edit <sel> --review <on|off|inherit>` — per-step override. Precedence: step > plan > global > off (off by default).
+- `ralph plan create ... --max-review-corrections <n>` — cap the review→correction recursion (default 3); over the cap, ralph raises a blocker for a human instead of looping.
 - `ralph plan create ... --retry-strategy {keep|rollback}` / `ralph step add|edit ... --retry-strategy {keep|rollback}` — how a failed attempt's tree is handled before the retry. `keep` (the default) carries the dirty tree forward; `rollback` reverts to a clean tree and feeds the prior diff into the next prompt. Use `rollback` for steps where a half-done attempt would poison the retry (e.g. partial migrations). `ralph step edit --clear-retry-strategy` drops a step-level override back to plan/global inheritance.
 - `ralph plan create ... --squash-on-complete` — by default every per-iteration step commit is kept (full audit trail). With this flag, a step's iteration commits are squashed into one commit when the step completes (the `Ralph-*` trailers are preserved). Opt in only when a clean one-commit-per-step history matters more than the per-iteration trail.
 - `ralph skip [<slug>] [--step <n>] --changes {stash|commit|discard}` — skip a step; `--changes` (default `stash`) decides what happens to a killed harness's uncommitted work. `commit` writes a `[ralph wip]` commit with a `Ralph-Skipped-Step` trailer that `ralph step reset` can later revert.

@@ -1,16 +1,20 @@
-<p align="center"><img src="header.png" alt="ralph — Deterministic execution planner for coding agent harnesses" width="100%" /></p>
+<p align="center"><img src="header.png" alt="ralph — deterministic dependencies & validation, dynamic scheduling, optional nondeterministic review for coding agent harnesses" width="100%" /></p>
 
 # ralph-rs
 
-A deterministic orchestrator for coding agent harnesses. Takes step-based plans and executes them through AI coding agents (Claude, Codex, OpenCode, Copilot, Goose, Pi) with retry loops, test validation, and git integration.
+An orchestrator for coding agent harnesses built on **deterministic dependencies & validation, dynamic scheduling, and optional nondeterministic review**. Takes plans whose steps form a dependency DAG and executes them through AI coding agents (Claude, Codex, OpenCode, Copilot, Goose, Pi) with retry loops, test validation, git integration, and an optional built-in step-by-step review pipeline.
+
+ralph's reproducibility promise is **per-step**, not whole-run: given the same inputs a step behaves the same way, and the scheduler's choice among runnable steps is a deterministic `(topological depth, sort_key, short_id)` tie-break — so a linear plan (and any plan, given identical human answers) executes in the same order it always did. What is *new* is **dynamic scheduling** (when a branch blocks on a human, the order the remaining branches run in depends on when the human answers) and **first-class nondeterministic review** (a separate harness can audit each step). The wall-clock interleave of concurrently-running reviews is explicitly **not** part of the reproducibility guarantee.
 
 ## What it does
 
-- **Plan management**: Create, edit, and execute step-based plans for AI coding agents
+- **Dependency-DAG plans**: Steps declare dependencies; independent branches run while another is blocked on a human
 - **Multi-harness support**: Works with Claude Code, Codex, OpenCode, Copilot, Goose, Pi, and more
-- **Deterministic execution**: Subprocess orchestration with test validation, git commits, and rollback on failure
+- **Deterministic dependencies & validation**: Test-gated steps, git commits, and rollback on failure; per-step behavior and the `(topological depth, sort_key, short_id)` scheduling tie-break are deterministic
+- **Dynamic scheduling**: A single scheduler picks the next runnable step; when a branch blocks on a human, unrelated branches keep moving and the human batch-answers on their own schedule
+- **Optional nondeterministic review**: A built-in step-by-step review pipeline can audit each step with a second harness (off by default; per-step/plan/global toggle)
 - **Retry with context**: Failed attempts inject diffs and test output into retry prompts
-- **Plan portability**: Export/import plans as JSON for harness comparison and reuse
+- **Plan portability**: Export/import plans (including the DAG edges) as JSON for harness comparison and reuse
 
 ## Install
 
