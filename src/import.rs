@@ -120,18 +120,22 @@ pub struct ImportedStep {
     #[serde(default)]
     pub retry_strategy: Option<crate::plan::RetryStrategy>,
     /// Plan-unique portable edge handle (docs/dag-redesign.md §13.2/§13.3).
-    /// Absent in pre-DAG bundles and in chain-suppressed exports of linear
-    /// plans (`#[serde(default)]` → `None`); present and preserved verbatim
-    /// for genuinely-branched DAG-aware bundles (never re-minted — that
-    /// would orphan the bundle's `depends_on` references).
+    /// Absent only in *true legacy* pre-DAG bundles (`#[serde(default)]` →
+    /// `None`); present and **preserved verbatim** for every DAG-aware
+    /// bundle — including a linear plan (whose steps now carry real chain
+    /// edges) and a no-edge multi-root DAG. Never re-minted when present
+    /// (that would break `short_id` stability and orphan `depends_on`
+    /// references).
     #[serde(default)]
     pub short_id: Option<String>,
     /// `short_id`s of the steps this step directly depends on
-    /// (docs/dag-redesign.md §13.2/§13.3). `#[serde(default)]` so a legacy
-    /// bundle or a chain-suppressed linear-plan export (field absent)
-    /// deserializes to an empty list and takes the linear-chain backfill
-    /// path; a non-empty list anywhere marks the bundle DAG-aware and is
-    /// validated before any DB write.
+    /// (docs/dag-redesign.md §13.2/§13.3). `#[serde(default)]` → empty when
+    /// the step is a root (a linear plan's first step, or any root of a
+    /// multi-root DAG) or in a true legacy bundle. Bundle classification is
+    /// by `short_id` presence, **not** by whether `depends_on` is non-empty:
+    /// a bundle that carries `short_id`s is DAG-aware and its edges (which
+    /// may legitimately be empty for a no-edge multi-root DAG) are taken
+    /// literally and validated before any DB write.
     #[serde(default)]
     pub depends_on: Vec<String>,
 }
@@ -140,17 +144,56 @@ pub struct ImportedStep {
 // DAG validation (docs/dag-redesign.md §13.3)
 // ---------------------------------------------------------------------------
 
-/// True when the bundle carries explicit step edges — i.e. any step has a
-/// non-empty `depends_on`. A legacy pre-DAG bundle *and* a chain-suppressed
-/// export of a linear plan (where `resolve_step_depends_on` deliberately
-/// drops the chain edges) both have no `depends_on` anywhere and so are
-/// **not** DAG-aware: they re-import via the linear-chain backfill, exactly
-/// as the V25 migration backfills existing linear plans
-/// (docs/dag-redesign.md §13.2/§13.3 — the round-trip guarantee for a
-/// linear plan is reproduced by re-synthesizing, not preserving, the
-/// chain). Only a genuinely-branched bundle is DAG-aware.
-fn is_dag_aware(steps: &[ImportedStep]) -> bool {
-    steps.iter().any(|s| !s.depends_on.is_empty())
+/// How the importer should build the step graph for a bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BundleShape {
+    /// **True legacy** pre-DAG bundle: *no* step carries a `short_id` and no
+    /// step carries `depends_on`. Mint a fresh plan-unique `short_id` per
+    /// step and synthesize a linear chain (step *k* depends on *k−1* by array
+    /// order) — byte-identical to the V25 migration backfill, so import and
+    /// migration produce the same DAG for the same linear input
+    /// (docs/dag-redesign.md §13.3).
+    Legacy,
+    /// **DAG-aware** bundle: it carries `short_id`s (every modern export does,
+    /// §13.2). Validate the §13.3 rules, preserve the bundle's `short_id`s
+    /// verbatim, and wire *exactly* the explicit `depends_on` edges — which
+    /// may legitimately be empty everywhere (a no-edge multi-root DAG stays
+    /// no-edge; **no** chain is synthesized). A linear plan's bundle now
+    /// carries its real chain edges, so this path reproduces it exactly.
+    DagAware,
+}
+
+/// Classify a bundle by **`short_id` presence**, not by whether any
+/// `depends_on` is non-empty (docs/dag-redesign.md §13.2/§13.3).
+///
+/// The old "DAG-aware ⇔ some non-empty `depends_on`" rule misclassified a
+/// bundle that carried a `short_id` on every step but no serialized
+/// `depends_on` (a multi-root no-edge DAG, or — under the now-removed
+/// chain-suppression — a linear export) as legacy: its `short_id`s were
+/// re-minted and its independent roots were fused into a synthetic linear
+/// chain. The correct discriminator:
+///
+/// - **No `short_id` on any step** (and, defensively, no `depends_on`
+///   anywhere — a true pre-DAG bundle never carries either) ⇒ [`Legacy`].
+/// - **Otherwise** the bundle carries `short_id`s ⇒ [`DagAware`]: preserve
+///   them and take its edge set literally (empty edges ⇒ a genuine no-edge
+///   multi-root DAG, preserved as such).
+///
+/// A *partial* `short_id` set (some steps have one, some don't) is a
+/// corrupt DAG-aware bundle, not legacy: it routes to [`DagAware`] where
+/// rule 0 of [`validate_dag_aware_steps`] rejects it with a precise message
+/// rather than silently re-minting and chain-fusing.
+///
+/// [`Legacy`]: BundleShape::Legacy
+/// [`DagAware`]: BundleShape::DagAware
+fn classify_bundle(steps: &[ImportedStep]) -> BundleShape {
+    let any_short_id = steps.iter().any(|s| s.short_id.is_some());
+    let any_depends_on = steps.iter().any(|s| !s.depends_on.is_empty());
+    if !any_short_id && !any_depends_on {
+        BundleShape::Legacy
+    } else {
+        BundleShape::DagAware
+    }
 }
 
 /// In-memory analogue of [`storage::would_create_step_cycle`] (§6) applied
@@ -353,10 +396,12 @@ fn import_plan_inner(
 ) -> Result<String> {
     // Decide the step-graph shape *before any DB write* so a malformed
     // DAG-aware bundle aborts without leaving a partial plan
-    // (docs/dag-redesign.md §13.3). A legacy bundle / chain-suppressed
-    // linear export takes the linear-chain backfill path; a branched
-    // bundle is validated here.
-    let dag_aware = is_dag_aware(&data.steps);
+    // (docs/dag-redesign.md §13.3). A true legacy bundle takes the
+    // linear-chain backfill path; any bundle carrying `short_id`s is
+    // DAG-aware and validated here (its edges, possibly empty for a
+    // no-edge multi-root DAG, are taken literally).
+    let shape = classify_bundle(&data.steps);
+    let dag_aware = shape == BundleShape::DagAware;
     if dag_aware {
         validate_dag_aware_steps(&data.steps)?;
     }
@@ -1812,12 +1857,127 @@ mod tests {
         assert_eq!(roots, vec![a.short_id.as_str()]);
     }
 
-    /// Round-trip for a *linear* plan: export suppresses the chain edges
-    /// (byte-identical to pre-DAG output); re-import re-synthesizes the
-    /// identical chain DAG via the legacy backfill (§13.3), with fresh
-    /// minted short_ids — structure, not handle identity, is guaranteed.
+    /// §13.3 defect fix: a multi-root **no-edge** plan must round-trip with
+    /// **no `step_dependencies`** and its `short_id`s **preserved** — it must
+    /// NOT be misclassified as legacy (which would re-mint short_ids and fuse
+    /// the independent roots into a synthetic linear chain).
     #[test]
-    fn test_roundtrip_linear_plan_resynthesizes_chain() {
+    fn test_roundtrip_multi_root_no_edge_plan_stays_no_edge() {
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn, "multiroot", "/tmp/src", "b", "d", None, None, &[],
+        )
+        .unwrap();
+        let mk = |t: &str| {
+            storage::create_step(
+                &conn, &plan.id, t, "d", None, None, &[], None, None, None, None,
+            )
+            .unwrap()
+            .0
+        };
+        // Three independent roots, zero edges.
+        let r0 = mk("R0");
+        let r1 = mk("R1");
+        let r2 = mk("R2");
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("multiroot.json");
+        export::export_plan(&conn, "multiroot", "/tmp/src", Some(&file_path)).unwrap();
+        let imported_data = read_plan_file(&file_path).unwrap();
+
+        // Bundle: short_id on every step, depends_on absent everywhere.
+        assert!(
+            imported_data.steps.iter().all(|s| s.short_id.is_some()),
+            "every step carries a short_id"
+        );
+        assert!(
+            imported_data.steps.iter().all(|s| s.depends_on.is_empty()),
+            "a no-edge DAG carries no depends_on"
+        );
+        // It is DAG-aware (carries short_ids) — NOT legacy.
+        assert_eq!(classify_bundle(&imported_data.steps), BundleShape::DagAware);
+
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: false,
+        };
+        let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
+        let steps = storage::list_steps(&conn, &imported_id).unwrap();
+        let titles: Vec<&str> = steps.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, vec!["R0", "R1", "R2"]);
+
+        // short_ids preserved verbatim — NOT re-minted.
+        assert_eq!(steps[0].short_id, r0.short_id);
+        assert_eq!(steps[1].short_id, r1.short_id);
+        assert_eq!(steps[2].short_id, r2.short_id);
+
+        // Zero step_dependencies: every step is still an independent root.
+        assert!(
+            edge_set(&conn, &imported_id).is_empty(),
+            "no synthetic linear chain may be created for a no-edge DAG"
+        );
+        for s in &steps {
+            assert!(
+                storage::list_step_dependencies(&conn, &s.id)
+                    .unwrap()
+                    .is_empty(),
+                "step {} must remain a root",
+                s.title
+            );
+        }
+    }
+
+    /// Unit-level guard on the classification defect: a bundle that carries
+    /// `short_id` on every step but no `depends_on` (a no-edge multi-root
+    /// DAG, or a chain-suppressed-style linear export) is **DAG-aware**, not
+    /// legacy; only a bundle with no `short_id` and no `depends_on` anywhere
+    /// is legacy.
+    #[test]
+    fn test_classify_bundle_short_id_presence_not_depends_on() {
+        // No short_id, no depends_on → true legacy.
+        let legacy = serde_json::from_str::<ImportedPlan>(
+            r#"{"ralph_rs_version":"0.1.0","exported_at":"x",
+                "plan":{"slug":"s","branch_name":"b","description":"d"},
+                "steps":[{"title":"A","description":"d"},
+                         {"title":"B","description":"d"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(classify_bundle(&legacy.steps), BundleShape::Legacy);
+
+        // short_id on every step, NO depends_on anywhere → DAG-aware
+        // (this is the case the old `any non-empty depends_on` rule got
+        // wrong by treating it as legacy).
+        let no_edge = serde_json::from_str::<ImportedPlan>(
+            r#"{"ralph_rs_version":"0.1.0","exported_at":"x",
+                "plan":{"slug":"s","branch_name":"b","description":"d"},
+                "steps":[{"title":"A","description":"d","short_id":"aaaaaaaa"},
+                         {"title":"B","description":"d","short_id":"bbbbbbbb"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(classify_bundle(&no_edge.steps), BundleShape::DagAware);
+
+        // Explicit edges → DAG-aware (unchanged behavior).
+        let branched = serde_json::from_str::<ImportedPlan>(
+            r#"{"ralph_rs_version":"0.1.0","exported_at":"x",
+                "plan":{"slug":"s","branch_name":"b","description":"d"},
+                "steps":[{"title":"A","description":"d","short_id":"aaaaaaaa"},
+                         {"title":"B","description":"d","short_id":"bbbbbbbb",
+                          "depends_on":["aaaaaaaa"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(classify_bundle(&branched.steps), BundleShape::DagAware);
+    }
+
+    /// Round-trip for a *linear* plan (§13.3, defect fix): the export now
+    /// emits the real chain edges (no suppression), so re-import takes the
+    /// DAG-aware path — the exact chain is reproduced **and** every
+    /// `short_id` is preserved verbatim (no re-minting). This is the
+    /// `short_id`-stability guarantee the prior chain-suppression broke.
+    #[test]
+    fn test_roundtrip_linear_plan_preserves_short_ids_and_exact_chain() {
         let conn = setup();
         let plan = storage::create_plan(
             &conn, "linear", "/tmp/src", "b", "d", None, None, &[],
@@ -1839,12 +1999,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("linear.json");
         export::export_plan(&conn, "linear", "/tmp/src", Some(&file_path)).unwrap();
-        // The chain is suppressed: no per-step depends_on in the bundle.
+        // The chain is now emitted: the root omits depends_on, the rest
+        // carry their single predecessor edge.
         let imported_data = read_plan_file(&file_path).unwrap();
         assert!(
-            imported_data.steps.iter().all(|s| s.depends_on.is_empty()),
-            "linear export must suppress chain edges"
+            imported_data.steps[0].depends_on.is_empty(),
+            "S0 is the root"
         );
+        assert_eq!(
+            imported_data.steps[1].depends_on,
+            vec![s0.short_id.clone()]
+        );
+        assert_eq!(
+            imported_data.steps[2].depends_on,
+            vec![s1.short_id.clone()]
+        );
+        // It is classified DAG-aware (carries short_ids), not legacy.
+        assert_eq!(classify_bundle(&imported_data.steps), BundleShape::DagAware);
 
         let options = ImportOptions {
             slug: None,
@@ -1857,10 +2028,11 @@ mod tests {
         let steps = storage::list_steps(&conn, &imported_id).unwrap();
         let titles: Vec<&str> = steps.iter().map(|s| s.title.as_str()).collect();
         assert_eq!(titles, vec!["S0", "S1", "S2"]);
-        // Chain re-synthesized structurally (short_ids are freshly minted).
-        for s in &steps {
-            assert!(storage::is_short_id_shaped(&s.short_id));
-        }
+        // short_ids preserved verbatim — NOT re-minted.
+        assert_eq!(steps[0].short_id, s0.short_id);
+        assert_eq!(steps[1].short_id, s1.short_id);
+        assert_eq!(steps[2].short_id, s2.short_id);
+        // Exact chain reproduced: S0 root, S1→S0, S2→S1.
         assert!(storage::list_step_dependencies(&conn, &steps[0].id)
             .unwrap()
             .is_empty());

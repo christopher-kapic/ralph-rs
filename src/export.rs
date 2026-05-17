@@ -82,12 +82,14 @@ pub struct ExportedStep {
     pub short_id: String,
     /// `short_id`s of the steps this step directly depends on
     /// (docs/dag-redesign.md §13.2). `#[serde(skip_serializing_if =
-    /// "Vec::is_empty")]` so a degenerate linear plan — whose chain edges are
-    /// *suppressed* by [`build_exported_plan`] (see [`resolve_step_depends_on`])
-    /// — still exports byte-identical to pre-DAG output for the common case;
-    /// only genuinely-branched plans carry edge data. A suppressed-edge bundle
-    /// re-imports via the legacy linear-chain backfill to the identical DAG
-    /// (the §13.3 round-trip guarantee).
+    /// "Vec::is_empty")]` so a *root* step (genuinely no dependencies — a
+    /// linear plan's first step, or any root of a multi-root DAG) omits the
+    /// field. Edges are **not** suppressed: a linear plan exports its real
+    /// chain edges (each step depends on its predecessor) so the round-trip
+    /// reproduces the exact chain with stable `short_id`s, while a genuine
+    /// no-edge multi-root DAG exports with the field absent everywhere and
+    /// round-trips with no edges (§13.3). Only a *true legacy* bundle (no
+    /// `short_id` on any step) re-imports via the linear-chain backfill.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
 }
@@ -97,16 +99,20 @@ pub struct ExportedStep {
 // ---------------------------------------------------------------------------
 
 /// Resolve each step's direct dependencies to a sorted list of *step*
-/// `short_id`s, suppressing the edge data entirely when the plan is a
-/// degenerate linear chain (docs/dag-redesign.md §13.2 / §13.3).
+/// `short_id`s (docs/dag-redesign.md §13.2 / §13.3).
 ///
-/// The canonical chain is exactly the V25 backfill / legacy-import shape
-/// (step *k* depends on step *k−1* by `sort_key` order, step 0 a root). When
-/// the whole edge set is precisely that chain, every step's `depends_on` is
-/// suppressed (returned empty) so the bundle exports byte-identical to
-/// pre-DAG output for the common case, and re-imports via the legacy
-/// linear-chain backfill to the identical DAG. Only genuinely-branched plans
-/// carry edge data.
+/// **No chain suppression.** Earlier revisions dropped the edge data when the
+/// plan was a degenerate linear chain so the bundle stayed "byte-identical to
+/// pre-DAG output". That rationale is void: `short_id` is now *always*
+/// emitted on every step (a field pre-DAG bundles never had), so a bundle is
+/// never byte-identical to pre-DAG output anyway. Worse, suppression made a
+/// chain-suppressed linear export and a genuine *multi-root no-edge* DAG
+/// produce byte-identical bundles, so the importer could not honour both the
+/// linear round-trip guarantee (§13.3) and "preserve a no-edge multi-root DAG
+/// as no-edge" (§13.3) at once. Emitting the real edges makes export lossless:
+/// a linear plan round-trips to its exact chain with stable `short_id`s, a
+/// no-edge multi-root DAG round-trips with no edges, and only a *true* legacy
+/// bundle (no `short_id` anywhere) takes the import linear-chain backfill.
 ///
 /// `steps` must be in canonical `sort_key` order (as [`storage::list_steps`]
 /// returns). The returned vec is parallel to `steps`; `short_id`s within each
@@ -134,22 +140,7 @@ fn resolve_step_depends_on(conn: &Connection, steps: &[Step]) -> Result<Vec<Vec<
         resolved.push(shorts);
     }
 
-    // Degenerate linear chain ⇔ step 0 is a root and every later step
-    // depends on exactly its immediate `sort_key` predecessor. Vacuously
-    // true for an empty plan.
-    let is_linear_chain = (0..steps.len()).all(|i| {
-        if i == 0 {
-            resolved[0].is_empty()
-        } else {
-            resolved[i].len() == 1 && resolved[i][0] == steps[i - 1].short_id
-        }
-    });
-
-    if is_linear_chain {
-        Ok(vec![Vec::new(); steps.len()])
-    } else {
-        Ok(resolved)
-    }
+    Ok(resolved)
 }
 
 /// Build an ExportedPlan from a Plan and its steps.
@@ -675,10 +666,13 @@ mod tests {
     }
 
     #[test]
-    fn test_export_short_id_always_emitted_and_chain_suppressed() {
-        // docs/dag-redesign.md §13.2: `short_id` is ALWAYS emitted; a
-        // degenerate linear chain suppresses `depends_on` so the bundle
-        // stays byte-identical (w.r.t. edge data) to pre-DAG output.
+    fn test_export_linear_plan_emits_short_ids_and_real_chain_edges() {
+        // docs/dag-redesign.md §13.2/§13.3: `short_id` is ALWAYS emitted and
+        // stable, and chain edges are **no longer suppressed** — a linear
+        // plan exports its real chain so the round-trip reproduces the exact
+        // chain with stable short_ids (and is unambiguous against a genuine
+        // no-edge multi-root DAG, which exports with the field absent
+        // everywhere).
         let conn = setup();
         let plan = storage::create_plan(
             &conn, "chain", "/tmp/proj", "branch", "desc", None, None, &[],
@@ -693,24 +687,36 @@ mod tests {
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         let resolved = resolve_step_depends_on(&conn, &steps).unwrap();
-        // Chain is detected → every step's edge data is suppressed.
-        assert!(resolved.iter().all(|d| d.is_empty()));
+        // Real edges are emitted: A is a root; B→A; C→B.
+        assert!(resolved[0].is_empty(), "A is a root");
+        assert_eq!(resolved[1], vec![a.short_id.clone()]);
+        assert_eq!(resolved[2], vec![b.short_id.clone()]);
 
         let exported = build_exported_plan(&plan, &steps, Vec::new(), &resolved);
         // short_id is carried through verbatim, never re-minted.
         assert_eq!(exported.steps[0].short_id, a.short_id);
         assert_eq!(exported.steps[1].short_id, b.short_id);
         assert_eq!(exported.steps[2].short_id, c.short_id);
-        assert!(exported.steps.iter().all(|s| s.depends_on.is_empty()));
+        assert!(exported.steps[0].depends_on.is_empty());
+        assert_eq!(exported.steps[1].depends_on, vec![a.short_id.clone()]);
+        assert_eq!(exported.steps[2].depends_on, vec![b.short_id.clone()]);
 
         let json = serde_json::to_string(&exported).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // short_id present on every step; only the root omits depends_on.
         for i in 0..3 {
-            // short_id present on every step.
             assert!(parsed["steps"][i]["short_id"].is_string());
-            // depends_on suppressed (skip_serializing_if) for a linear plan.
-            assert!(parsed["steps"][i].get("depends_on").is_none());
         }
+        assert!(
+            parsed["steps"][0].get("depends_on").is_none(),
+            "root step omits depends_on (skip_serializing_if on empty)"
+        );
+        assert_eq!(parsed["steps"][1]["depends_on"][0], a.short_id);
+        assert_eq!(parsed["steps"][2]["depends_on"][0], b.short_id);
+        assert!(
+            !json.contains(&a.id),
+            "internal UUID must never be exported"
+        );
     }
 
     #[test]
