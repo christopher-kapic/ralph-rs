@@ -239,6 +239,151 @@ impl std::str::FromStr for RetryStrategy {
 }
 
 // ---------------------------------------------------------------------------
+// Interruption domain model (questions + blockers, unified)
+// ---------------------------------------------------------------------------
+
+/// What kind of branch-pausing interruption this is
+/// (docs/dag-redesign.md §3.4).
+///
+/// Questions and blockers are *one* entity — a branch-pausing interrupt that
+/// needs a human and may carry text forward into the next prompt. A
+/// [`InterruptionKind::Question`] carries proposed [`InterruptionOption`]s
+/// with a priority (1 = the agent's best guess); a
+/// [`InterruptionKind::Blocker`] has no options (the agent explains what it
+/// cannot do and the human resolves it).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum InterruptionKind {
+    #[default]
+    Question,
+    Blocker,
+}
+
+impl InterruptionKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Question => "question",
+            Self::Blocker => "blocker",
+        }
+    }
+}
+
+impl std::fmt::Display for InterruptionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for InterruptionKind {
+    type Err = ParseStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "question" => Ok(Self::Question),
+            "blocker" => Ok(Self::Blocker),
+            other => Err(ParseStatusError(other.to_string())),
+        }
+    }
+}
+
+/// Lifecycle state of an [`Interruption`] (docs/dag-redesign.md §3.4).
+///
+/// A fresh interruption is [`InterruptionState::Open`]: its step's branch is
+/// `Blocked`, **no retry budget is consumed**, and the scheduler moves on to
+/// another runnable step. Once a human resolves it the state becomes
+/// [`InterruptionState::Resolved`] and the resolution/comment are injected
+/// (bounded) into the step's next prompt (§8).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum InterruptionState {
+    #[default]
+    Open,
+    Resolved,
+}
+
+impl InterruptionState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+        }
+    }
+}
+
+impl std::fmt::Display for InterruptionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for InterruptionState {
+    type Err = ParseStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "open" => Ok(Self::Open),
+            "resolved" => Ok(Self::Resolved),
+            other => Err(ParseStatusError(other.to_string())),
+        }
+    }
+}
+
+/// One proposed answer to a [`InterruptionKind::Question`] interruption.
+///
+/// `priority` ranks the agent's proposals (1 = the agent's best guess).
+/// Blockers and freeform-only questions carry an empty option list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)] // DB/CLI/TUI consumers land in later DAG-redesign steps.
+pub struct InterruptionOption {
+    pub text: String,
+    pub priority: i32,
+}
+
+/// A unified branch-pausing interruption — a question or a blocker
+/// (docs/dag-redesign.md §3.4).
+///
+/// One entity, one state machine: a [`InterruptionKind::Question`] carries
+/// proposed [`options`](Interruption::options) with priority (1 = agent
+/// best); a [`InterruptionKind::Blocker`] has no options. Resolving an
+/// interruption records `resolution`/`comment` and flips `state` to
+/// [`InterruptionState::Resolved`]; while it is
+/// [`InterruptionState::Open`] the step's branch is `Blocked` and the
+/// scheduler works elsewhere (no retry budget consumed). The
+/// resolution/comment are later injected, bounded, into the step's next
+/// prompt (§8).
+///
+/// Model + tests only at this step — no DB/CLI wiring yet (those land in
+/// later DAG-redesign steps).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)] // DB/CLI/TUI consumers land in later DAG-redesign steps.
+pub struct Interruption {
+    pub id: String,
+    pub step_id: String,
+    pub attempt: i32,
+    pub kind: InterruptionKind,
+    /// The question text, or the blocker explanation.
+    pub body: String,
+    /// Questions only (priority 1 = agent's best). Empty for blockers and
+    /// freeform-only questions.
+    #[serde(default)]
+    pub options: Vec<InterruptionOption>,
+    /// The chosen option text or freeform answer; `None` while `Open`.
+    #[serde(default)]
+    pub resolution: Option<String>,
+    /// Extra human note, always injectable alongside the resolution.
+    #[serde(default)]
+    pub comment: Option<String>,
+    pub state: InterruptionState,
+    pub asked_at: DateTime<Utc>,
+    /// Set when `state` becomes [`InterruptionState::Resolved`]; `None`
+    /// while `Open`.
+    #[serde(default)]
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+// ---------------------------------------------------------------------------
 // Phase enum
 // ---------------------------------------------------------------------------
 
@@ -1496,6 +1641,136 @@ mod tests {
     fn test_invalid_retry_strategy() {
         let result: Result<RetryStrategy, _> = "discard".parse();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_interruption_kind_roundtrip() {
+        for k in [InterruptionKind::Question, InterruptionKind::Blocker] {
+            let parsed: InterruptionKind = k.as_str().parse().unwrap();
+            assert_eq!(k, parsed);
+        }
+    }
+
+    #[test]
+    fn test_interruption_kind_default_is_question() {
+        assert_eq!(InterruptionKind::default(), InterruptionKind::Question);
+    }
+
+    #[test]
+    fn test_interruption_kind_display() {
+        assert_eq!(InterruptionKind::Question.to_string(), "question");
+        assert_eq!(InterruptionKind::Blocker.to_string(), "blocker");
+    }
+
+    #[test]
+    fn test_interruption_kind_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&InterruptionKind::Question).unwrap(),
+            r#""question""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&InterruptionKind::Blocker).unwrap(),
+            r#""blocker""#,
+        );
+    }
+
+    #[test]
+    fn test_invalid_interruption_kind() {
+        let result: Result<InterruptionKind, _> = "answer".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_interruption_state_roundtrip() {
+        for s in [InterruptionState::Open, InterruptionState::Resolved] {
+            let parsed: InterruptionState = s.as_str().parse().unwrap();
+            assert_eq!(s, parsed);
+        }
+    }
+
+    #[test]
+    fn test_interruption_state_default_is_open() {
+        assert_eq!(InterruptionState::default(), InterruptionState::Open);
+    }
+
+    #[test]
+    fn test_interruption_state_display() {
+        assert_eq!(InterruptionState::Open.to_string(), "open");
+        assert_eq!(InterruptionState::Resolved.to_string(), "resolved");
+    }
+
+    #[test]
+    fn test_interruption_state_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&InterruptionState::Open).unwrap(),
+            r#""open""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&InterruptionState::Resolved).unwrap(),
+            r#""resolved""#,
+        );
+    }
+
+    #[test]
+    fn test_invalid_interruption_state() {
+        let result: Result<InterruptionState, _> = "closed".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_interruption_serde_round_trip_snake_case() {
+        let interruption = Interruption {
+            id: "i1".into(),
+            step_id: "s1".into(),
+            attempt: 2,
+            kind: InterruptionKind::Question,
+            body: "Which database driver?".into(),
+            options: vec![
+                InterruptionOption {
+                    text: "rusqlite (bundled)".into(),
+                    priority: 1,
+                },
+                InterruptionOption {
+                    text: "sqlx".into(),
+                    priority: 2,
+                },
+            ],
+            resolution: Some("rusqlite (bundled)".into()),
+            comment: Some("matches the zero-system-deps goal".into()),
+            state: InterruptionState::Resolved,
+            asked_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            resolved_at: Some("2026-01-02T00:00:00Z".parse().unwrap()),
+        };
+
+        let json = serde_json::to_string(&interruption).unwrap();
+        // kind/state must serialize as snake_case tokens.
+        assert!(json.contains(r#""kind":"question""#));
+        assert!(json.contains(r#""state":"resolved""#));
+
+        let back: Interruption = serde_json::from_str(&json).unwrap();
+        assert_eq!(interruption, back);
+    }
+
+    #[test]
+    fn test_interruption_blocker_serde_defaults_empty_options() {
+        // A blocker omits options/resolution/comment/resolved_at; the
+        // serde(default) attributes must backfill them.
+        let json = r#"{
+            "id": "i2",
+            "step_id": "s2",
+            "attempt": 1,
+            "kind": "blocker",
+            "body": "needs sudo to install package",
+            "state": "open",
+            "asked_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let blocker: Interruption = serde_json::from_str(json).unwrap();
+        assert_eq!(blocker.kind, InterruptionKind::Blocker);
+        assert_eq!(blocker.state, InterruptionState::Open);
+        assert!(blocker.options.is_empty());
+        assert_eq!(blocker.resolution, None);
+        assert_eq!(blocker.comment, None);
+        assert_eq!(blocker.resolved_at, None);
     }
 
     #[test]
