@@ -22,6 +22,7 @@ pub fn plan_create(
     harness: Option<&str>,
     agent: Option<&str>,
     retry_strategy: Option<RetryStrategy>,
+    squash_on_complete: bool,
     tests: &[String],
     depends_on: &[String],
     out: &OutputContext,
@@ -56,6 +57,14 @@ pub fn plan_create(
     // present.
     if let Some(rs) = retry_strategy {
         storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
+    }
+
+    // Persist the `--squash-on-complete` toggle only when the user opted in.
+    // Default OFF (the column default NULL → `false`) is identical to the
+    // step 32/33 keep-every-iteration-commit behavior, so we skip the write
+    // entirely in that case (mirrors the `retry_strategy` handling above).
+    if squash_on_complete {
+        storage::set_plan_squash_on_complete(conn, &plan.id, true)?;
     }
 
     // Attach each resolved dependency. Self-references and cycles are

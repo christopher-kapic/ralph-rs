@@ -5676,9 +5676,30 @@ pub fn cmd_log(
         // These don't have an execution_logs row, so surface them from git.
         let wip_skips = collect_skip_wip_commits(conn, &plan);
 
-        if entries.is_empty() && skipped_with_reason.is_empty() && wip_skips.is_empty() {
+        // Per-iteration step commits (docs/dag-redesign.md §5), grouped by
+        // step short_id, mapped via the `Ralph-Step`/`Ralph-Iteration`
+        // trailers — the same trailer-discovery discipline as skip-WIP.
+        let iteration_groups = collect_iteration_commits_by_step(conn, &plan);
+
+        if entries.is_empty()
+            && skipped_with_reason.is_empty()
+            && wip_skips.is_empty()
+            && iteration_groups.is_empty()
+        {
             eprintln!("No execution logs for plan '{}'.", plan.slug);
             return Ok(());
+        }
+
+        if !iteration_groups.is_empty() {
+            eprintln!("Iteration commits for plan '{}':", plan.slug);
+            eprintln!();
+            for (short_id, title, commits) in &iteration_groups {
+                println!("  {short_id} — {title} ({} iteration commits)", commits.len());
+                for (iteration, short_sha) in commits {
+                    println!("    .{iteration} {short_sha}");
+                }
+            }
+            println!();
         }
 
         if !wip_skips.is_empty() {
@@ -5771,6 +5792,65 @@ fn collect_skip_wip_commits(conn: &Connection, plan: &crate::plan::Plan) -> Vec<
             let short = c.sha[..c.sha.len().min(8)].to_string();
             (num, short)
         })
+        .collect()
+}
+
+/// Scan the plan branch for per-iteration step commits (docs/dag-redesign.md
+/// §5) and group them by step `short_id`, resolving the human-readable step
+/// title from the DB where possible.
+///
+/// Returns `(short_id, step_title, [(iteration, short_sha)])` ordered by the
+/// step's authored position; iterations within a group are ascending. The
+/// commits↔steps mapping is the `Ralph-Step`/`Ralph-Iteration` trailers
+/// (parsed by git's own trailer parser) — the same discipline as
+/// `collect_skip_wip_commits`. Best-effort: any git failure (not a repo,
+/// branch absent) yields an empty list so `ralph log` never hard-errors.
+#[allow(clippy::type_complexity)]
+fn collect_iteration_commits_by_step(
+    conn: &Connection,
+    plan: &crate::plan::Plan,
+) -> Vec<(String, String, Vec<(i32, String)>)> {
+    let workdir = Path::new(&plan.project);
+    if !crate::git::branch_exists(workdir, &plan.branch_name).unwrap_or(false) {
+        return Vec::new();
+    }
+    let commits = match crate::git::list_iteration_commits(workdir, &plan.branch_name) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    if commits.is_empty() {
+        return Vec::new();
+    }
+    let steps = storage::list_steps(conn, &plan.id).unwrap_or_default();
+
+    // Group by short_id; ascending iteration within a group.
+    use std::collections::BTreeMap;
+    let mut grouped: BTreeMap<String, Vec<(i32, String)>> = BTreeMap::new();
+    for c in commits {
+        let short = c.sha[..c.sha.len().min(8)].to_string();
+        grouped
+            .entry(c.step_short_id)
+            .or_default()
+            .push((c.iteration, short));
+    }
+
+    // Sort groups by the step's authored sort position; unknown short_ids
+    // (since-removed steps) sort last but still surface.
+    let mut out: Vec<(usize, String, String, Vec<(i32, String)>)> = grouped
+        .into_iter()
+        .map(|(short_id, mut commits)| {
+            commits.sort_by_key(|(it, _)| *it);
+            let (pos, title) = steps
+                .iter()
+                .position(|s| s.short_id == short_id)
+                .map(|i| (i, steps[i].title.clone()))
+                .unwrap_or((usize::MAX, "(unknown step)".to_string()));
+            (pos, short_id, title, commits)
+        })
+        .collect();
+    out.sort_by_key(|(pos, _, _, _)| *pos);
+    out.into_iter()
+        .map(|(_, short_id, title, commits)| (short_id, title, commits))
         .collect()
 }
 
@@ -7085,6 +7165,92 @@ mod status_live_view_tests {
         assert!(line.contains("~ step 1 skipped (WIP committed: "));
     }
 
+    // ----- STEP 34: ralph log groups per-iteration commits by step -----
+
+    #[test]
+    fn test_collect_iteration_commits_groups_by_step_short_id() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        }
+        fs::write(dir.join("README.md"), "# hi").unwrap();
+        crate::git::commit_changes(&dir, "init").unwrap();
+        let branch = crate::git::get_current_branch(&dir).unwrap();
+        let project = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let conn = db::open_memory().unwrap();
+        let plan =
+            storage::create_plan(&conn, "itp", &project, &branch, "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "Step one", "", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        let (s2, _) = storage::create_step(
+            &conn, &plan.id, "Step two", "", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        // An ordinary commit (no trailer) — must NOT appear.
+        fs::write(dir.join("ord.txt"), "x").unwrap();
+        crate::git::commit_changes(&dir, "ordinary work").unwrap();
+
+        // Step 1: two iteration commits. Step 2: one.
+        for it in [1, 2] {
+            fs::write(dir.join("s1.txt"), format!("{it}")).unwrap();
+            crate::git::commit_changes(
+                &dir,
+                &crate::git::build_iteration_commit_message(&s1.short_id, it, "Step one", "itp"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("s2.txt"), "1").unwrap();
+        crate::git::commit_changes(
+            &dir,
+            &crate::git::build_iteration_commit_message(&s2.short_id, 1, "Step two", "itp"),
+        )
+        .unwrap();
+
+        let groups = collect_iteration_commits_by_step(&conn, &plan);
+        assert_eq!(groups.len(), 2, "two steps own iteration commits");
+        // Group order follows the authored step order (s1 then s2).
+        assert_eq!(groups[0].0, s1.short_id);
+        assert_eq!(groups[0].1, "Step one");
+        assert_eq!(
+            groups[0].2.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1, 2],
+            "iterations ascending within a step group"
+        );
+        assert_eq!(groups[1].0, s2.short_id);
+        assert_eq!(groups[1].2.len(), 1);
+    }
+
+    #[test]
+    fn test_collect_iteration_commits_empty_when_no_repo() {
+        let conn = db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "norepo2",
+            "/tmp/definitely-not-a-git-repo-xyz",
+            "br",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(collect_iteration_commits_by_step(&conn, &plan).is_empty());
+    }
+
     #[test]
     fn test_collect_skip_wip_commits_empty_when_no_repo() {
         let conn = db::open_memory().unwrap();
@@ -7324,6 +7490,7 @@ mod plan_detail_init_tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         }
     }
 
@@ -8188,6 +8355,7 @@ mod step_detail_dispatcher_tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -9170,6 +9338,7 @@ mod sub_view_routing_tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         };
         let steps = vec![Step {
             id: "step-1".to_string(),
@@ -9600,6 +9769,7 @@ mod mouse_routing_tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         };
         PlanDetailApp::new(plan, Vec::new(), &Config::default())
     }
@@ -9626,6 +9796,7 @@ mod mouse_routing_tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         };
         let step = Step {
             id: "step-1".to_string(),

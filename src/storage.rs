@@ -1155,6 +1155,25 @@ pub fn set_plan_retry_strategy(
     Ok(())
 }
 
+/// Set (or clear) a plan's `--squash-on-complete` toggle and bump
+/// `updated_at`. Stored as a nullable INTEGER (V28): `false` writes 0
+/// rather than NULL so the value round-trips explicitly; `Plan::from_row`
+/// coerces both NULL and 0 to `false`.
+pub fn set_plan_squash_on_complete(
+    conn: &Connection,
+    plan_id: &str,
+    squash: bool,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET squash_on_complete = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![if squash { 1 } else { 0 }, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
 /// Update a plan's description and bump `updated_at`. The plan description
 /// IS the Plan layer of the four-layer prompt model, so this is the write
 /// path behind the step-detail "Plan prompt" pane editor.

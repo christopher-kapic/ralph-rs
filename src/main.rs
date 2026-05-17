@@ -108,6 +108,7 @@ fn main() -> Result<()> {
                 harness,
                 agent,
                 retry_strategy,
+                squash_on_complete,
                 tests,
                 depends_on,
             } => {
@@ -124,6 +125,7 @@ fn main() -> Result<()> {
                     h,
                     agent.as_deref(),
                     retry_strategy,
+                    squash_on_complete,
                     &tests,
                     &depends_on,
                     &out,

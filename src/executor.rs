@@ -1037,6 +1037,16 @@ pub async fn execute_step(
     let mut prev_files_modified: Vec<String> = Vec::new();
     let mut prev_failure_reason: Option<String> = None;
 
+    // The HEAD SHA that immediately precedes this step's FIRST per-iteration
+    // commit. Captured lazily the first time we make an iteration commit and
+    // used only by `--squash-on-complete` (docs/dag-redesign.md §14.1) to
+    // `git reset --soft` back here before the single squashed commit. `None`
+    // until the step has made at least one iteration commit; never reset
+    // across attempts (the step's whole iteration-commit run squashes as a
+    // unit). The `Keep` path leaves earlier iteration commits in place so a
+    // later attempt's success can still see the full base.
+    let mut step_base_sha: Option<String> = None;
+
     let mut attempt = step.attempts;
 
     while attempt < max_attempts {
@@ -1537,6 +1547,57 @@ pub async fn execute_step(
                     continue;
                 }
 
+                // ---------------------------------------------------------
+                // PER-ITERATION COMMIT (docs/dag-redesign.md §3.2 / §5).
+                //
+                // The commit now happens PER ITERATION, *before* the
+                // deterministic test — a change from the pre-DAG "commit only
+                // on full success." It runs whenever the harness finished
+                // successfully and left uncommitted changes; the test then
+                // validates the committed tree, so:
+                //   (a) the subject can carry `<short_id>.<n>`, and
+                //   (b) a reviewer has a stable SHA to review (Phase 3).
+                //
+                // `agent_committed_clean` (worktree clean + HEAD advanced)
+                // is still a contract violation — the agent committed its
+                // own work. We do NOT make a ralph iteration commit there;
+                // the existing classification/edge-case handling below is
+                // preserved verbatim.
+                //
+                // Tooling (`ralph log` / `step reset`) parses ONLY the
+                // `Ralph-*` trailers, never the subject (reuses the
+                // `Ralph-Skipped-Step` + `[ralph wip]` precedent).
+                let mut iteration_commit_sha: Option<String> = None;
+                if has_changes && !agent_committed_clean {
+                    write_phase(
+                        conn,
+                        plan,
+                        &step.id,
+                        step_num,
+                        attempt,
+                        max_attempts,
+                        Some(exec_log.id),
+                        Phase::Commit,
+                        None,
+                        ChildUpdate::Clear,
+                        exec_opts.json_output,
+                    )?;
+                    // Record the pre-first-iteration HEAD exactly once so
+                    // `--squash-on-complete` can `reset --soft` back to it.
+                    if step_base_sha.is_none() {
+                        step_base_sha = git::get_commit_hash(workdir).ok();
+                    }
+                    let commit_msg = git::build_iteration_commit_message(
+                        &step.short_id,
+                        attempt,
+                        &step.title,
+                        &plan.slug,
+                    );
+                    git::stage_except(workdir, &pre_existing_untracked)?;
+                    git::commit_staged(workdir, &commit_msg)?;
+                    iteration_commit_sha = Some(git::get_commit_hash(workdir)?);
+                }
+
                 // Decide whether to run the test phase.
                 //
                 // With `change_policy = Required`, tests only run when the
@@ -1735,7 +1796,16 @@ pub async fn execute_step(
                     // (Fix 3). A no-op unless a stale `Skipped` is latched;
                     // never disturbs the `Aborted` reason.
                     crate::signal::clear_pending_skip_state();
-                    if has_changes {
+                    // The in-flight work is now a per-iteration commit (made
+                    // before the test phase), not a dirty tree. Ctrl+C tears
+                    // the whole run down; to preserve the pre-DAG observable
+                    // semantics (an aborted attempt's work does not persist
+                    // as usable history for the next `ralph resume`), revert
+                    // the iteration commit we made this attempt. `git revert`
+                    // (never `reset --hard`) keeps linear history intact even
+                    // if something committed on top — mirrors the
+                    // skip/step-reset revert discipline.
+                    if let Some(sha) = &iteration_commit_sha {
                         write_phase(
                             conn,
                             plan,
@@ -1749,7 +1819,7 @@ pub async fn execute_step(
                             ChildUpdate::Clear,
                             exec_opts.json_output,
                         )?;
-                        git::rollback_except(workdir, &pre_existing_untracked)?;
+                        let _ = git::revert_commit(workdir, sha);
                     }
                     let fail_output = FailureOutput {
                         diff: diff.as_deref(),
@@ -1844,27 +1914,54 @@ pub async fn execute_step(
                 }
 
                 if test_passed && has_changes {
-                    // Stage changes, excluding pre-existing untracked files.
-                    let commit_msg = format!(
-                        "ralph: {} [step:{}, plan:{}, attempt:{}]",
-                        step.title, step.id, plan.slug, attempt,
-                    );
-                    write_phase(
-                        conn,
-                        plan,
-                        &step.id,
-                        step_num,
-                        attempt,
-                        max_attempts,
-                        Some(exec_log.id),
-                        Phase::Commit,
-                        None,
-                        ChildUpdate::Clear,
-                        exec_opts.json_output,
-                    )?;
-                    git::stage_except(workdir, &pre_existing_untracked)?;
-                    git::commit_staged(workdir, &commit_msg)?;
-                    let commit_hash = git::get_commit_hash(workdir)?;
+                    // The per-iteration commit ALREADY happened before the
+                    // test phase (docs/dag-redesign.md §3.2). The success
+                    // path therefore does NOT re-commit — it just resolves
+                    // the final commit hash and, when the plan opted into
+                    // `--squash-on-complete`, collapses this step's
+                    // iteration commits into one.
+                    let mut commit_hash = iteration_commit_sha
+                        .clone()
+                        .unwrap_or(git::get_commit_hash(workdir)?);
+
+                    // --squash-on-complete (docs/dag-redesign.md §14.1,
+                    // DECIDED): when the step reaches Complete, collapse its
+                    // per-iteration commits into ONE, preserving the
+                    // `Ralph-*` trailers (the iteration is collapsed to this
+                    // final `n`). Default OFF keeps every iteration commit
+                    // (full audit trail) — byte-identical to step 32/33.
+                    //
+                    // Only squash when there's actually a multi-commit run
+                    // to collapse (≥2 commits since the step's base). A
+                    // single iteration is already one commit, so the
+                    // soft-reset+recommit would be pointless SHA churn — skip
+                    // it, keeping the common single-attempt case byte-
+                    // identical to the default-OFF / pre-squash output.
+                    if plan.squash_on_complete
+                        && let Some(base) = &step_base_sha
+                        && git::count_commits_since(workdir, base)? > 1
+                    {
+                        write_phase(
+                            conn,
+                            plan,
+                            &step.id,
+                            step_num,
+                            attempt,
+                            max_attempts,
+                            Some(exec_log.id),
+                            Phase::Commit,
+                            None,
+                            ChildUpdate::Clear,
+                            exec_opts.json_output,
+                        )?;
+                        let squash_msg = git::build_iteration_commit_message(
+                            &step.short_id,
+                            attempt,
+                            &step.title,
+                            &plan.slug,
+                        );
+                        commit_hash = git::squash_since(workdir, base, &squash_msg)?;
+                    }
 
                     // When no deterministic tests are configured, we skip the
                     // test phase entirely — record NotConfigured so an observer
@@ -1990,50 +2087,44 @@ pub async fn execute_step(
                     .await;
                 }
 
-                // Retry path. Reverting the tree is now strategy-gated
-                // (Step 22):
+                // Retry path. The failed attempt's work is now a
+                // per-iteration commit (made before the test phase —
+                // docs/dag-redesign.md §3.2). `RetryStrategy` is
+                // reinterpreted accordingly (§5); the OBSERVABLE retry
+                // semantics for a linear plan are unchanged aside from the
+                // commit now being per-iteration:
                 //
-                //  - `Rollback` (opt-in): revert the failed attempt's diff
-                //    before retrying — exactly today's behavior. The
-                //    rolled-back diff/files are fed into the next prompt via
-                //    `RetryContext` so the agent can learn from work it no
-                //    longer sees on disk.
+                //  - `Rollback` (opt-in): `git revert` the failed
+                //    iteration's commit before the retry. Reverting (never
+                //    `reset --hard`) keeps linear history intact even if
+                //    something committed on top — the §5 discipline, and the
+                //    same `revert_commit` machinery `step reset` uses. The
+                //    rolled-back diff/files are still fed into the next
+                //    prompt via `RetryContext` (`prev_diff = diff` below) so
+                //    the agent learns from work it no longer sees on disk —
+                //    exactly today's behavior.
                 //
-                //  - `Keep` (default): do NOT revert. The dirty tree carries
-                //    forward so the next attempt builds directly on the prior
-                //    work (which it reads via `git diff`, not the prompt).
+                //  - `Keep` (default): do NOT revert. Iteration n's commit
+                //    stays in history; iteration n+1 commits on top of it.
+                //    The agent sees the prior work on disk (it's the
+                //    committed state); the retry context omits the diff —
+                //    exactly today's `Keep` behavior.
                 //
-                // EDGE CASE — `agent_committed_clean` under `Keep`
-                // (review will scrutinize this): if the agent committed its
-                // own work, the worktree is clean but HEAD advanced. Under
-                // `Keep` we must NOT discard that work, but we also must NOT
-                // leave the agent's commit sitting in HEAD, because:
-                //   1. It would be an orphan, off-contract commit (ralph owns
-                //      step commits; provenance metadata would be missing).
-                //   2. When a later attempt succeeds, the success path
-                //      (`stage_except` + `commit_staged`) would add a SECOND
-                //      commit on top of the agent's — a double-commit for one
-                //      step.
-                //   3. If instead the later attempt produced no *new* changes
-                //      (the agent had already committed everything), the
-                //      success path's `has_changes` gate would be false and
-                //      we'd loop on `agent_committed_clean` forever, never
-                //      succeeding.
-                // Fix: `git reset --mixed` back to the pre-attempt HEAD
-                // (`head_before_harness`). That un-commits the agent's commit
-                // but leaves every changed file on disk as uncommitted work —
-                // precisely `Keep`'s contract. The next attempt sees the
-                // carried-forward changes via `git diff`; whichever attempt
-                // ultimately passes runs the normal single `stage_except` +
-                // `commit_staged`, yielding exactly ONE coherent `ralph:`
-                // step commit with no orphan and no "nothing to commit"
-                // failure. The final-success commit logic is therefore
-                // unchanged — it always operates on an un-committed dirty
-                // tree, regardless of whether a prior Keep attempt's agent
-                // had committed.
+                // EDGE CASE — `agent_committed_clean` under `Keep`: the agent
+                // committed its OWN work, so `has_changes == false` and NO
+                // ralph iteration commit was made this attempt. We must not
+                // leave the agent's orphan commit sitting in HEAD, or a
+                // later attempt's per-iteration commit gate (`has_changes`)
+                // would be false and the step would loop forever on
+                // `agent_committed_clean`. `git reset --mixed` back to the
+                // pre-attempt HEAD un-commits it but keeps every changed file
+                // on disk as uncommitted work — so the next attempt's
+                // per-iteration commit picks it up. (Unchanged from the
+                // pre-DAG fix; it only ever fires when ralph itself made no
+                // iteration commit.)
                 let rolled_back = match retry_strategy {
-                    RetryStrategy::Rollback => {
-                        if has_changes {
+                    RetryStrategy::Rollback => match &iteration_commit_sha {
+                        Some(sha) => {
                             write_phase(
                                 conn,
                                 plan,
@@ -2047,10 +2138,11 @@ pub async fn execute_step(
                                 ChildUpdate::Clear,
                                 exec_opts.json_output,
                             )?;
-                            git::rollback_except(workdir, &pre_existing_untracked)?;
+                            git::revert_commit(workdir, sha)?;
+                            true
                         }
-                        has_changes
-                    }
+                        None => false,
+                    },
                     RetryStrategy::Keep => {
                         if agent_committed_clean && let Some(before) = &head_before_harness {
                             write_phase(
@@ -6066,25 +6158,57 @@ mod tests {
              2-line test passes on attempt 2",
         );
         assert_eq!(result.attempts_used, 2);
-        // Exactly one new commit (the step commit) — the carried-forward
-        // line + the new line collapse into a single coherent commit.
+        // PER-ITERATION COMMITS (docs/dag-redesign.md §3.2/§5): under `Keep`
+        // each iteration commits BEFORE its test. Attempt 1 commits `.1`
+        // (1 line, test fails), attempt 2 commits `.2` ON TOP of `.1`
+        // (2 lines, test passes). Two ralph commits — the audit trail keeps
+        // every iteration (this was `base + 1` pre-DAG, when ralph committed
+        // only on final success).
         assert_eq!(
             commit_count(&dir),
-            base_commits + 1,
-            "exactly one step commit; no double-commit"
+            base_commits + 2,
+            "Keep keeps every iteration commit (one per attempt)"
         );
         let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
         assert_eq!(
             final_lines.lines().count(),
             2,
-            "both attempts' appends are present (no rollback under Keep)"
+            "both attempts' appends are present (Keep never reverts)"
         );
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
-        // Attempt 1 failed and did NOT roll back under Keep.
+        // Attempt 1 failed and did NOT roll back under Keep — its iteration
+        // commit stays in history and attempt 2 builds on it.
         let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
         assert!(
             !a1.rolled_back,
-            "Keep must not roll back the failed attempt"
+            "Keep must not roll back the failed iteration"
+        );
+        // The final (successful) commit subject is the per-iteration format.
+        let head_msg = {
+            let out = std::process::Command::new("git")
+                .args(["log", "-1", "--pretty=%s"])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert!(
+            head_msg.starts_with(&format!("ralph {}.2 - ", step.short_id)),
+            "final commit subject must be the per-iteration format; got: {head_msg}"
+        );
+        // And the trailers are present + correct on the final commit.
+        let head_sha = crate::git::get_commit_hash(&dir).unwrap();
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &head_sha, crate::git::ITERATION_STEP_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some(step.short_id.as_str())
+        );
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &head_sha, crate::git::ITERATION_NUM_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some("2")
         );
     }
 
@@ -6197,22 +6321,48 @@ mod tests {
         assert_eq!(
             result.outcome,
             StepOutcome::Failed,
-            "Rollback reverts attempt 1, so attempt 2 can only reach one \
-             line and the 2-line test never passes",
+            "Rollback reverts attempt 1's iteration commit, so attempt 2 \
+             starts from 0 lines, can only reach one line, and the 2-line \
+             test never passes",
         );
         assert_eq!(result.attempts_used, 2);
-        // acc.txt is back to its committed (empty) state — rolled back.
+        // PER-ITERATION + Rollback (docs/dag-redesign.md §5): attempt 1
+        // commits `.1` (1 line) BEFORE its test; the test fails, so `.1` is
+        // `git revert`ed (a revert commit — linear history preserved, NOT
+        // `reset --hard`), which takes acc.txt back to 0 lines. Attempt 2
+        // commits `.2` (1 line); its test also fails and the budget is
+        // exhausted, so `.2` stays in history (a terminal failure keeps the
+        // last iteration commit — §5 audit trail). The final WORKING TREE
+        // therefore reflects attempt 2's committed line.
         let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
         assert_eq!(
             final_lines.lines().count(),
-            0,
-            "Rollback must revert the failed attempt's tree"
+            1,
+            "attempt 1's iteration commit was reverted; attempt 2's terminal \
+             iteration commit stays (1 line)"
         );
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
         let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
-        assert!(a1.rolled_back, "Rollback must roll back the failed attempt");
+        assert!(
+            a1.rolled_back,
+            "Rollback must revert the failed iteration's commit"
+        );
+        // The .1 iteration commit exists AND a revert of it exists, so its
+        // change is no longer reachable on the tree even though history is
+        // linear and intact.
+        let it_commits =
+            crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
+        assert!(
+            it_commits.iter().any(|c| c.iteration == 1),
+            "the .1 iteration commit is still in history (reverted, not erased)"
+        );
+        assert!(
+            it_commits.iter().any(|c| c.iteration == 2),
+            "the terminal .2 iteration commit is kept (§5 audit trail)"
+        );
         // Attempt 2's prompt must carry the rolled-back diff (so the agent
-        // can learn from work it no longer sees on disk).
+        // can learn from work it no longer sees on disk) — unchanged
+        // mechanism, just now after a per-iteration commit + revert.
         let a2 = logs.iter().find(|l| l.attempt == 2).unwrap();
         let a2_prompt = a2.prompt_text.as_deref().unwrap_or("");
         assert!(
@@ -6383,10 +6533,43 @@ mod tests {
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
+        // PER-ITERATION COMMIT format (docs/dag-redesign.md §3.2/§5): the
+        // final commit is ralph's iteration `.2` commit (attempt 1 was
+        // agent_committed_clean → NO ralph commit, only attempt 2 made one),
+        // not the agent's orphan 'agent commit'. Subject is the new
+        // `ralph <short_id>.<n> - <title>` format (pre-DAG was
+        // `ralph: <title> [step:..., attempt:...]`).
         assert!(
-            msg.starts_with("ralph: Acc"),
-            "the final commit must be ralph's step commit, not the agent's \
-             orphan 'agent commit'; got: {msg}"
+            msg.starts_with(&format!("ralph {}.2 - Acc", step.short_id)),
+            "the final commit must be ralph's per-iteration step commit, not \
+             the agent's orphan 'agent commit'; got: {msg}"
+        );
+        // Trailers are present + correct (tooling parses these, not the
+        // subject).
+        let head_sha = crate::git::get_commit_hash(&dir).unwrap();
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &head_sha, crate::git::ITERATION_PLAN_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some("slug")
+        );
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &head_sha, crate::git::ITERATION_STEP_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some(step.short_id.as_str())
+        );
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &head_sha, crate::git::ITERATION_NUM_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &head_sha, crate::git::ITERATION_REVIEW_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some("pending")
         );
         // Attempt 1 failed as agent_committed_clean → classified NoChanges,
         // and Keep did NOT roll back (the mixed-reset is not a rollback of
@@ -6399,6 +6582,400 @@ mod tests {
             final_lines.lines().count(),
             2,
             "both attempts' lines are present in the final tree"
+        );
+    }
+
+    /// Build an executable harness script at `harness_dir` that appends one
+    /// line to `acc.txt` in `workdir` per invocation. Written OUTSIDE the
+    /// workdir so the script isn't counted as a step change.
+    #[cfg(test)]
+    fn write_append_line_harness(
+        harness_dir: &std::path::Path,
+        workdir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let p = harness_dir.join("append.sh");
+        fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\necho line >> {0}/acc.txt\nexit 0\n",
+                workdir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&p, perms).unwrap();
+        p
+    }
+
+    /// STEP 32: the commit happens PER ITERATION, *before* the deterministic
+    /// test (docs/dag-redesign.md §3.2). The test command asserts the
+    /// committed tree (`git show HEAD:acc.txt`) — so it can only pass if the
+    /// commit landed first. The commit subject is the
+    /// `ralph <short_id>.<n> - <title>` format and carries all four
+    /// `Ralph-*` trailers (tooling parses trailers, never the subject).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_per_iteration_commit_subject_trailers_before_test() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        let base_commits = commit_count(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_append_line_harness(harness_tmp.path(), &dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        // The test inspects the COMMITTED blob, not the worktree: it passes
+        // only if the per-iteration commit happened *before* this runs.
+        let test_cmd = format!(
+            "test \"$(git -C {0} show HEAD:acc.txt | wc -l)\" -eq 1",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Add the thing", "desc", None, None, &[], Some(0), None, None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Success,
+            "test reads the committed blob — only passes if commit-before-test"
+        );
+        assert_eq!(result.attempts_used, 1);
+        // Exactly ONE iteration commit was created (before the test).
+        assert_eq!(commit_count(&dir), base_commits + 1);
+        let head = result.commit_hash.clone().unwrap();
+        let subject = {
+            let out = std::process::Command::new("git")
+                .args(["log", "-1", "--pretty=%s", &head])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(
+            subject,
+            format!("ralph {}.1 - Add the thing", step.short_id),
+            "subject format: ralph <short_id>.<n> - <sanitized title>"
+        );
+        // All four trailers present + correct.
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &head, crate::git::ITERATION_PLAN_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some("slug")
+        );
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &head, crate::git::ITERATION_STEP_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some(step.short_id.as_str())
+        );
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &head, crate::git::ITERATION_NUM_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &head, crate::git::ITERATION_REVIEW_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some("pending")
+        );
+    }
+
+    /// STEP 32: a multi-iteration run creates exactly ONE commit per
+    /// iteration (not "commit only on success"). With `Keep` + a test that
+    /// needs 2 lines, iteration 1 commits 1 line (test fails), iteration 2
+    /// commits the 2nd line on top (test passes) → 2 ralph commits, the
+    /// deterministic-test failure of iteration 1 feeds the next prompt's
+    /// retry context.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_per_iteration_commit_one_commit_per_iteration() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        let base_commits = commit_count(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_append_line_harness(harness_tmp.path(), &dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        assert_eq!(result.attempts_used, 2);
+        assert_eq!(
+            commit_count(&dir),
+            base_commits + 2,
+            "exactly one commit per iteration (2 iterations → 2 commits)"
+        );
+        // Each iteration has its own trailer-tagged commit.
+        let its = crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
+        let mut iters: Vec<i32> = its.iter().map(|c| c.iteration).collect();
+        iters.sort();
+        assert_eq!(iters, vec![1, 2]);
+        // Iteration 1's deterministic-test failure fed attempt 2's prompt.
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        let a2 = logs.iter().find(|l| l.attempt == 2).unwrap();
+        let a2_prompt = a2.prompt_text.as_deref().unwrap_or("");
+        assert!(
+            a2_prompt.contains("# Retry Context"),
+            "iteration 1's test failure must feed iteration 2's retry context"
+        );
+    }
+
+    /// STEP 35 (default OFF): without `--squash-on-complete`, every
+    /// per-iteration commit is kept (full audit trail) — identical to the
+    /// step 32/33 output. A 2-iteration Keep run leaves 2 ralph commits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_squash_on_complete_default_off_keeps_iteration_commits() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        let base_commits = commit_count(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_append_line_harness(harness_tmp.path(), &dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        // squash_on_complete is the column default (NULL → false).
+        assert!(!plan.squash_on_complete);
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        assert_eq!(
+            commit_count(&dir),
+            base_commits + 2,
+            "default OFF keeps every iteration commit"
+        );
+        let its = crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
+        assert_eq!(its.len(), 2, "both iteration commits remain");
+    }
+
+    /// STEP 35 (`--squash-on-complete`): when the step reaches Complete its
+    /// per-iteration commits collapse into exactly ONE commit, with the
+    /// `Ralph-*` trailers preserved (Ralph-Iteration → the final n).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_squash_on_complete_collapses_to_one_commit() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        let base_commits = commit_count(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_append_line_harness(harness_tmp.path(), &dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        storage::set_plan_squash_on_complete(&conn, &plan.id, true).unwrap();
+        let plan = storage::get_plan_by_id(&conn, &plan.id).unwrap();
+        assert!(plan.squash_on_complete);
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        assert_eq!(result.attempts_used, 2);
+        // 2 iterations → exactly 1 squashed commit for the completed step.
+        assert_eq!(
+            commit_count(&dir),
+            base_commits + 1,
+            "--squash-on-complete collapses the step's iteration commits into one"
+        );
+        let its = crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
+        assert_eq!(its.len(), 1, "exactly one commit for the completed step");
+        // Trailers preserved; Ralph-Iteration collapsed to the final n.
+        let sha = result.commit_hash.clone().unwrap();
+        assert_eq!(its[0].sha, sha);
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &sha, crate::git::ITERATION_STEP_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some(step.short_id.as_str())
+        );
+        assert_eq!(
+            crate::git::parse_trailer(&dir, &sha, crate::git::ITERATION_NUM_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some("2"),
+            "Ralph-Iteration collapsed to the final iteration number"
+        );
+        // The final tree is correct (both lines present).
+        assert_eq!(
+            fs::read_to_string(dir.join("acc.txt")).unwrap().lines().count(),
+            2
         );
     }
 

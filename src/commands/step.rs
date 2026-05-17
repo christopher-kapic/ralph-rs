@@ -604,10 +604,13 @@ pub fn step_reset(
 
     let (step, display_num) = resolve_step(conn, &plan.id, step_sel, step_id)?;
 
-    // Before flipping the step back to pending, undo any `[ralph wip]`
-    // skip commit(s) we parked on the plan branch for this step. We revert
-    // (never `reset --hard`) so branch history is preserved even when later
-    // steps committed on top of the WIP.
+    // Before flipping the step back to pending, undo any commit(s) this step
+    // owns on the plan branch:
+    //  - `[ralph wip]` skip commits (the `Ralph-Skipped-Step` trailer), and
+    //  - per-iteration step commits (the `Ralph-Step`/`Ralph-Iteration`
+    //    trailers — docs/dag-redesign.md §5).
+    // We revert (never `reset --hard`) so branch history is preserved even
+    // when later steps committed on top.
     let workdir = std::path::Path::new(project);
     // Only scan when the plan branch actually exists in this repo. A clean
     // `Ok(false)` (the project dir isn't a git repo, or the branch was never
@@ -629,10 +632,50 @@ pub fn step_reset(
         }
     };
     let wip_shas = if branch_present {
-        crate::git::skip_wip_commits_for_step(workdir, &plan.branch_name, &step.id).with_context(
+        // Skip-WIP commits are keyed by step UUID (`Ralph-Skipped-Step`);
+        // per-iteration commits are keyed by `short_id`
+        // (`Ralph-Step`/`Ralph-Iteration`). Collect both and dedup. Order:
+        // newest-first overall so each `git revert` applies cleanly on top
+        // of the previous (the iteration scan is already newest-first; we
+        // interleave by walking the iteration list, then any skip-WIP shas
+        // not already covered).
+        let skip_shas = crate::git::skip_wip_commits_for_step(
+            workdir,
+            &plan.branch_name,
+            &step.id,
+        )
+        .with_context(|| {
+            format!(
+                "could not scan branch '{}' for skip-WIP commits",
+                plan.branch_name
+            )
+        })?;
+        let iter_shas: Vec<String> = crate::git::iteration_commits_for_step(
+            workdir,
+            &plan.branch_name,
+            &step.short_id,
+        )
+        .with_context(|| {
+            format!(
+                "could not scan branch '{}' for per-iteration step commits",
+                plan.branch_name
+            )
+        })?
+        .into_iter()
+        .map(|c| c.sha)
+        .collect();
+        // Both scans yield newest-first independently, but a step can own a
+        // mix of skip-WIP and per-iteration commits interleaved with other
+        // steps' commits. Re-order the combined set by actual branch
+        // position so each `git revert` applies cleanly on top of the
+        // previous (dedup is implicit — `order_shas_newest_first` keeps each
+        // SHA once, in branch order).
+        let mut combined: Vec<String> = iter_shas;
+        combined.extend(skip_shas);
+        crate::git::order_shas_newest_first(workdir, &plan.branch_name, &combined).with_context(
             || {
                 format!(
-                    "could not scan branch '{}' for skip-WIP commits",
+                    "could not order step commits for revert on branch '{}'",
                     plan.branch_name
                 )
             },
@@ -651,14 +694,14 @@ pub fn step_reset(
         let current = crate::git::get_current_branch(workdir).with_context(|| {
             format!(
                 "could not determine the current branch before reverting \
-                 skip-WIP commits for step #{display_num}"
+                 step commits for step #{display_num}"
             )
         })?;
         if current != plan.branch_name {
             bail!(
-                "Step #{display_num} has {} parked skip-WIP commit(s) on \
-                 branch '{}', but the working tree is on '{}'. Reverting here \
-                 would misplace the revert commits. Check out '{}' first \
+                "Step #{display_num} has {} ralph commit(s) on branch '{}', \
+                 but the working tree is on '{}'. Reverting here would \
+                 misplace the revert commits. Check out '{}' first \
                  (e.g. `git checkout {}`), then re-run `ralph step reset`.",
                 wip_shas.len(),
                 plan.branch_name,
@@ -674,7 +717,7 @@ pub fn step_reset(
                 .map(|s| s[..s.len().min(8)].to_string())
                 .collect();
             let prompt = format!(
-                "Resetting step #{display_num} will revert {} skip-WIP commit{plural} ({}) on branch '{}'. This adds revert commit(s). Continue?",
+                "Resetting step #{display_num} will revert {} ralph commit{plural} ({}) on branch '{}' (per-iteration + skip-WIP). This adds revert commit(s). Continue?",
                 wip_shas.len(),
                 shorts.join(", "),
                 plan.branch_name
@@ -1066,6 +1109,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             &[],
             &[],
             &test_out(),
@@ -1746,6 +1790,87 @@ mod tests {
             .unwrap();
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Pending);
+    }
+
+    /// STEP 34: `ralph step reset` reverts exactly the target step's
+    /// per-iteration commits (mapped via the `Ralph-Step`/`Ralph-Iteration`
+    /// trailers) and nothing else — a sibling step's iteration commit and an
+    /// ordinary commit are left untouched.
+    #[test]
+    fn test_step_reset_reverts_only_target_iteration_commits() {
+        use std::fs;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@t.com"],
+            vec!["config", "user.name", "t"],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        }
+        fs::write(dir.join("README.md"), "# hi").unwrap();
+        crate::git::commit_changes(&dir, "init").unwrap();
+        let branch = crate::git::get_current_branch(&dir).unwrap();
+        let project = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+
+        let conn = db::open_memory().unwrap();
+        let plan =
+            storage::create_plan(&conn, "p", &project, &branch, "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "Step one", "", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        let (s2, _) = storage::create_step(
+            &conn, &plan.id, "Step two", "", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        // Step 1: two iteration commits.
+        for it in [1, 2] {
+            fs::write(dir.join("s1.txt"), format!("{it}")).unwrap();
+            crate::git::commit_changes(
+                &dir,
+                &crate::git::build_iteration_commit_message(&s1.short_id, it, "Step one", "p"),
+            )
+            .unwrap();
+        }
+        // Step 2: one iteration commit ON TOP of step 1's (interleaved).
+        fs::write(dir.join("s2.txt"), "keep-me").unwrap();
+        crate::git::commit_changes(
+            &dir,
+            &crate::git::build_iteration_commit_message(&s2.short_id, 1, "Step two", "p"),
+        )
+        .unwrap();
+        // An ordinary (non-ralph) commit too.
+        fs::write(dir.join("ord.txt"), "ordinary").unwrap();
+        crate::git::commit_changes(&dir, "unrelated work").unwrap();
+
+        storage::update_step_status(&conn, &s1.id, StepStatus::Failed).unwrap();
+
+        // Reset step 1 by its short_id selector.
+        step_reset(&conn, "p", &project, Some(&s1.short_id), None, true, &test_out()).unwrap();
+
+        // Step 1's file is gone (both its iterations reverted), but step 2's
+        // file and the ordinary file are intact — isolation holds even
+        // though step 2's commit sits ON TOP of step 1's in linear history.
+        assert!(!dir.join("s1.txt").exists(), "step 1 iterations reverted");
+        assert_eq!(
+            fs::read_to_string(dir.join("s2.txt")).unwrap(),
+            "keep-me",
+            "sibling step 2's commit untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("ord.txt")).unwrap(),
+            "ordinary",
+            "unrelated ordinary commit untouched"
+        );
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let s1_now = steps.iter().find(|s| s.id == s1.id).unwrap();
+        assert_eq!(s1_now.status, StepStatus::Pending);
     }
 
     #[test]

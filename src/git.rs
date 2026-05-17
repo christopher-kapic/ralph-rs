@@ -837,6 +837,249 @@ pub fn revert_commit(workdir: &Path, sha: &str) -> Result<RevertOutcome> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-iteration step commits + Ralph-* trailers (docs/dag-redesign.md §3.2/§5)
+// ---------------------------------------------------------------------------
+
+/// Trailer key carrying the plan slug on a per-iteration step commit.
+pub const ITERATION_PLAN_TRAILER: &str = "Ralph-Plan";
+/// Trailer key carrying the step `short_id` on a per-iteration step commit.
+pub const ITERATION_STEP_TRAILER: &str = "Ralph-Step";
+/// Trailer key carrying the 1-based iteration number on a per-iteration
+/// step commit.
+pub const ITERATION_NUM_TRAILER: &str = "Ralph-Iteration";
+/// Trailer key carrying the review verdict on a per-iteration step commit
+/// (`pending` initially; later annotated by the review pipeline).
+pub const ITERATION_REVIEW_TRAILER: &str = "Ralph-Review";
+
+/// Collapse a step title into a single sanitized commit-subject fragment.
+///
+/// The git subject line must be a single line: newlines/tabs/control chars
+/// are replaced with spaces and runs of whitespace collapsed. The result is
+/// length-capped so a pathological multi-paragraph title can't produce a
+/// thousand-column subject. Tooling never parses the subject (it parses the
+/// trailers), so this is purely cosmetic — but it must stay deterministic.
+pub fn sanitize_commit_subject(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut prev_space = false;
+    for ch in title.chars() {
+        if ch.is_control() || ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    let trimmed = out.trim();
+    // Cap at 72 chars (a conventional git subject soft limit) on a char
+    // boundary so multibyte titles don't panic.
+    const MAX: usize = 72;
+    if trimmed.chars().count() > MAX {
+        trimmed.chars().take(MAX).collect::<String>()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build the full commit message for one per-iteration step commit.
+///
+/// Subject: `ralph <short_id>.<n> - <sanitized one-line title>`.
+/// Trailers (a blank line then `Key: value`, git's standard trailer block —
+/// the same shape [`park_changes`] uses for `Ralph-Skipped-Step`):
+/// ```text
+/// Ralph-Plan: <slug>
+/// Ralph-Step: <short_id>
+/// Ralph-Iteration: <n>
+/// Ralph-Review: pending
+/// ```
+/// Tooling (`ralph log` / `step reset`) parses *only* the trailers via git's
+/// own trailer parser, never the subject.
+pub fn build_iteration_commit_message(
+    short_id: &str,
+    iteration: i32,
+    title: &str,
+    plan_slug: &str,
+) -> String {
+    let subject = format!(
+        "ralph {}.{} - {}",
+        short_id,
+        iteration,
+        sanitize_commit_subject(title)
+    );
+    format!(
+        "{subject}\n\n\
+         {ITERATION_PLAN_TRAILER}: {plan_slug}\n\
+         {ITERATION_STEP_TRAILER}: {short_id}\n\
+         {ITERATION_NUM_TRAILER}: {iteration}\n\
+         {ITERATION_REVIEW_TRAILER}: pending\n"
+    )
+}
+
+/// A per-iteration step commit discovered on a branch: its SHA plus the
+/// `Ralph-Step` short id and `Ralph-Iteration` number pulled from trailers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IterationCommit {
+    pub sha: String,
+    pub plan_slug: Option<String>,
+    pub step_short_id: String,
+    pub iteration: i32,
+}
+
+/// Extract a single named trailer's value from a commit, using git's own
+/// trailer parser (`git interpret-trailers --parse`) so a body sentence or a
+/// quoted diff that merely *mentions* the key can never false-match. Returns
+/// `None` when the commit carries no such trailer.
+///
+/// Generalizes [`parse_skipped_step_trailer`] (which is kept as-is for the
+/// skip-WIP path) to any trailer key.
+pub fn parse_trailer(workdir: &Path, sha: &str, key: &str) -> Result<Option<String>> {
+    let raw = git(workdir, &["log", "-1", "--format=%B", sha])
+        .with_context(|| format!("could not read commit message for {sha}"))?;
+
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .args(["interpret-trailers", "--parse"])
+        .current_dir(workdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn git interpret-trailers")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(raw.as_bytes())
+            .context("failed to write commit message to git interpret-trailers")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("git interpret-trailers --parse failed to run")?;
+    if !output.status.success() {
+        bail!(
+            "git interpret-trailers --parse failed (exit {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let parsed = String::from_utf8_lossy(&output.stdout);
+    for line in parsed.lines() {
+        if let Some((k, value)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case(key)
+        {
+            let v = value.trim();
+            if !v.is_empty() {
+                return Ok(Some(v.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Walk every commit reachable from `branch` and return the per-iteration
+/// step commits (those carrying a `Ralph-Step` trailer), **newest first**
+/// (`git log` order). Commits without the trailer (or with an unparseable
+/// `Ralph-Iteration`) are skipped.
+///
+/// `branch` is resolved with `git rev-list`, so it works whether or not it
+/// is currently checked out — mirrors [`list_skip_wip_commits`].
+pub fn list_iteration_commits(workdir: &Path, branch: &str) -> Result<Vec<IterationCommit>> {
+    let shas = git(workdir, &["rev-list", branch])
+        .with_context(|| format!("could not list commits on branch '{branch}'"))?;
+    let mut out = Vec::new();
+    for sha in shas.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let Some(step_short_id) = parse_trailer(workdir, sha, ITERATION_STEP_TRAILER)? else {
+            continue;
+        };
+        let iteration = match parse_trailer(workdir, sha, ITERATION_NUM_TRAILER)? {
+            Some(s) => match s.parse::<i32>() {
+                Ok(n) => n,
+                // A Ralph-Step commit with a non-numeric Ralph-Iteration is
+                // malformed — skip rather than guess.
+                Err(_) => continue,
+            },
+            None => continue,
+        };
+        let plan_slug = parse_trailer(workdir, sha, ITERATION_PLAN_TRAILER)?;
+        out.push(IterationCommit {
+            sha: sha.to_string(),
+            plan_slug,
+            step_short_id,
+            iteration,
+        });
+    }
+    Ok(out)
+}
+
+/// Per-iteration commits on `branch` whose `Ralph-Step` trailer equals
+/// `short_id`, newest-first. Convenience filter over
+/// [`list_iteration_commits`].
+pub fn iteration_commits_for_step(
+    workdir: &Path,
+    branch: &str,
+    short_id: &str,
+) -> Result<Vec<IterationCommit>> {
+    Ok(list_iteration_commits(workdir, branch)?
+        .into_iter()
+        .filter(|c| c.step_short_id == short_id)
+        .collect())
+}
+
+/// Squash every commit reachable from HEAD back to (but excluding) `base_sha`
+/// into a single new commit with `message`, preserving the working tree.
+///
+/// Used by `--squash-on-complete` (docs/dag-redesign.md §14.1): when a step
+/// reaches `Complete`, its N per-iteration commits collapse into one. We
+/// `git reset --soft <base_sha>` (moves the branch ref back, keeps the index
+/// and working tree exactly as the last iteration left them) then commit the
+/// staged tree once. `base_sha` MUST be an ancestor of HEAD and is the SHA
+/// that immediately preceded the step's first iteration commit.
+pub fn squash_since(workdir: &Path, base_sha: &str, message: &str) -> Result<String> {
+    git(workdir, &["reset", "--soft", base_sha])
+        .with_context(|| format!("git reset --soft {base_sha} failed"))?;
+    git(workdir, &["commit", "-m", message]).context("git commit (squash) failed")?;
+    get_commit_hash(workdir)
+}
+
+/// Number of commits in the range `base_sha..HEAD` (commits reachable from
+/// HEAD but not from `base_sha`). Used by `--squash-on-complete` to skip the
+/// soft-reset+recommit churn when a step made only a single iteration commit
+/// (nothing to collapse). `base_sha` must be an ancestor of HEAD.
+pub fn count_commits_since(workdir: &Path, base_sha: &str) -> Result<usize> {
+    let out = git(
+        workdir,
+        &["rev-list", "--count", &format!("{base_sha}..HEAD")],
+    )
+    .with_context(|| format!("could not count commits since {base_sha}"))?;
+    Ok(out.trim().parse().unwrap_or(0))
+}
+
+/// Order an arbitrary set of `targets` SHAs by their position on `branch`,
+/// **newest-first** (`git rev-list` order). SHAs not reachable from `branch`
+/// are dropped. Used by `ralph step reset` so a mixed set of skip-WIP +
+/// per-iteration commits is reverted in a clean newest-first sequence
+/// regardless of how the two trailer scans interleaved them.
+pub fn order_shas_newest_first(
+    workdir: &Path,
+    branch: &str,
+    targets: &[String],
+) -> Result<Vec<String>> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let want: std::collections::HashSet<&str> = targets.iter().map(String::as_str).collect();
+    let shas = git(workdir, &["rev-list", branch])
+        .with_context(|| format!("could not list commits on branch '{branch}'"))?;
+    Ok(shas
+        .lines()
+        .map(str::trim)
+        .filter(|s| want.contains(s))
+        .map(str::to_string)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1604,5 +1847,138 @@ mod tests {
         // Both layers undone; f.txt no longer exists (back to init state).
         assert!(!dir.join("f.txt").exists());
         assert!(!has_uncommitted_changes(&dir).unwrap());
+    }
+
+    // ----- Per-iteration commit message + Ralph-* trailers (STEP 32/34) -----
+
+    #[test]
+    fn test_sanitize_commit_subject_collapses_and_caps() {
+        assert_eq!(sanitize_commit_subject("Add  OAuth\tlogin"), "Add OAuth login");
+        assert_eq!(
+            sanitize_commit_subject("line one\nline two\n\nline three"),
+            "line one line two line three"
+        );
+        assert_eq!(sanitize_commit_subject("  trim me  "), "trim me");
+        let long = "x".repeat(200);
+        assert_eq!(sanitize_commit_subject(&long).chars().count(), 72);
+        // Multibyte titles cap on a char boundary (no panic).
+        let multi = "é".repeat(100);
+        assert_eq!(sanitize_commit_subject(&multi).chars().count(), 72);
+    }
+
+    #[test]
+    fn test_build_iteration_commit_message_subject_and_trailers() {
+        let msg = build_iteration_commit_message("a1b2c3d4", 3, "Add  the\nthing", "my-plan");
+        let mut lines = msg.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "ralph a1b2c3d4.3 - Add the thing",
+            "subject is `ralph <short_id>.<n> - <sanitized title>`"
+        );
+        assert!(msg.contains("\nRalph-Plan: my-plan\n"));
+        assert!(msg.contains("\nRalph-Step: a1b2c3d4\n"));
+        assert!(msg.contains("\nRalph-Iteration: 3\n"));
+        assert!(msg.contains("\nRalph-Review: pending\n"));
+    }
+
+    #[test]
+    fn test_iteration_commit_trailers_parsed_by_git_not_subject() {
+        let (_tmp, dir) = init_repo();
+        let branch = get_current_branch(&dir).unwrap();
+
+        // Commit two iterations for one step + one for another.
+        fs::write(dir.join("a.txt"), "1").unwrap();
+        commit_changes(&dir, &build_iteration_commit_message("STEPAAAA", 1, "A", "p")).unwrap();
+        let a1 = get_commit_hash(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "2").unwrap();
+        commit_changes(&dir, &build_iteration_commit_message("STEPAAAA", 2, "A", "p")).unwrap();
+        let a2 = get_commit_hash(&dir).unwrap();
+        fs::write(dir.join("b.txt"), "1").unwrap();
+        commit_changes(&dir, &build_iteration_commit_message("STEPBBBB", 1, "B", "p")).unwrap();
+        let b1 = get_commit_hash(&dir).unwrap();
+
+        // Trailer parsing is by git's own parser (not subject scraping):
+        // a prose mention must not false-match.
+        fs::write(dir.join("c.txt"), "1").unwrap();
+        commit_changes(&dir, "talks about Ralph-Step: NOTATRAILER inline\n").unwrap();
+        let prose = get_commit_hash(&dir).unwrap();
+        assert_eq!(
+            parse_trailer(&dir, &prose, ITERATION_STEP_TRAILER).unwrap(),
+            None
+        );
+
+        // All iteration commits discovered, newest-first, grouped by step.
+        let all = list_iteration_commits(&dir, &branch).unwrap();
+        let shas: Vec<&str> = all.iter().map(|c| c.sha.as_str()).collect();
+        assert_eq!(shas, vec![b1.as_str(), a2.as_str(), a1.as_str()]);
+
+        let a = iteration_commits_for_step(&dir, &branch, "STEPAAAA").unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].iteration, 2);
+        assert_eq!(a[1].iteration, 1);
+        assert_eq!(a[0].plan_slug.as_deref(), Some("p"));
+
+        // step reset isolation: ordering a step's SHAs newest-first and
+        // reverting them touches ONLY that step's commits.
+        let targets: Vec<String> = a.iter().map(|c| c.sha.clone()).collect();
+        let ordered = order_shas_newest_first(&dir, &branch, &targets).unwrap();
+        assert_eq!(ordered, vec![a2.clone(), a1.clone()]);
+        for sha in &ordered {
+            assert!(matches!(
+                revert_commit(&dir, sha).unwrap(),
+                RevertOutcome::Reverted { .. }
+            ));
+        }
+        // Step A's file is gone (both iterations reverted); step B's stays.
+        assert!(!dir.join("a.txt").exists(), "A reverted");
+        assert_eq!(fs::read_to_string(dir.join("b.txt")).unwrap(), "1", "B intact");
+    }
+
+    #[test]
+    fn test_squash_since_collapses_to_one_commit_preserving_tree() {
+        let (_tmp, dir) = init_repo();
+        let base = get_commit_hash(&dir).unwrap();
+
+        fs::write(dir.join("acc.txt"), "1\n").unwrap();
+        commit_changes(&dir, &build_iteration_commit_message("SQ123456", 1, "Acc", "p")).unwrap();
+        fs::write(dir.join("acc.txt"), "1\n2\n").unwrap();
+        commit_changes(&dir, &build_iteration_commit_message("SQ123456", 2, "Acc", "p")).unwrap();
+        fs::write(dir.join("acc.txt"), "1\n2\n3\n").unwrap();
+        commit_changes(&dir, &build_iteration_commit_message("SQ123456", 3, "Acc", "p")).unwrap();
+
+        let count_before = git(&dir, &["rev-list", "--count", "HEAD"])
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+
+        let squash_msg = build_iteration_commit_message("SQ123456", 3, "Acc", "p");
+        let sha = squash_since(&dir, &base, &squash_msg).unwrap();
+
+        let count_after = git(&dir, &["rev-list", "--count", "HEAD"])
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(
+            count_after,
+            count_before - 2,
+            "3 iteration commits collapse into 1"
+        );
+        // The squashed commit keeps the final tree state and the trailers.
+        assert_eq!(fs::read_to_string(dir.join("acc.txt")).unwrap(), "1\n2\n3\n");
+        assert_eq!(
+            parse_trailer(&dir, &sha, ITERATION_STEP_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some("SQ123456")
+        );
+        assert_eq!(
+            parse_trailer(&dir, &sha, ITERATION_NUM_TRAILER)
+                .unwrap()
+                .as_deref(),
+            Some("3"),
+            "Ralph-Iteration collapsed to the final n"
+        );
     }
 }

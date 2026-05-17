@@ -2105,6 +2105,7 @@ mod tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         }
     }
 
@@ -3409,6 +3410,7 @@ mod tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -3450,6 +3452,7 @@ mod tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -4040,6 +4043,7 @@ mod tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -4104,6 +4108,7 @@ mod tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");

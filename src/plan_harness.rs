@@ -275,6 +275,11 @@ atomic and independently verifiable.
   half-done attempt would poison the retry (e.g. partial migrations).
   `ralph step edit --clear-retry-strategy` drops a step-level override back
   to plan/global inheritance.
+- `ralph plan create ... --squash-on-complete` — by default every
+  per-iteration step commit is kept (full audit trail). With this flag, a
+  step's iteration commits are squashed into one commit when the step
+  completes (the `Ralph-*` trailers are preserved). Opt in only when a clean
+  one-commit-per-step history matters more than the per-iteration trail.
 - `ralph skip [<slug>] [--step <n>] --changes {stash|commit|discard}` — skip
   a step; `--changes` (default `stash`) decides what happens to a killed
   harness's uncommitted work. `commit` writes a `[ralph wip]` commit with a

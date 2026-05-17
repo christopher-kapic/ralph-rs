@@ -814,7 +814,7 @@ impl std::str::FromStr for TestStatus {
 /// columns). Every `Plan`-returning query MUST use this list so
 /// [`Plan::from_row`]'s indices line up — a raw `SELECT *` would
 /// otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, retry_strategy, review_enabled";
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, retry_strategy, review_enabled, squash_on_complete";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -895,6 +895,15 @@ pub struct Plan {
     /// yet consumed by the runner in this batch.
     #[serde(default)]
     pub review_enabled: Option<bool>,
+    /// Per-plan `--squash-on-complete` toggle (V28, docs/dag-redesign.md
+    /// §14.1). `false` (the default; on-disk NULL or 0) keeps every
+    /// per-iteration step commit (full audit trail — identical to the
+    /// step 32/33 output). `true` collapses a step's iteration commits into
+    /// a single commit when the step reaches `Complete`, preserving the
+    /// `Ralph-*` trailers on the squashed commit. Stored as a nullable
+    /// INTEGER; NULL is coerced to `false`.
+    #[serde(default)]
+    pub squash_on_complete: bool,
 }
 
 impl Plan {
@@ -905,7 +914,7 @@ impl Plan {
     /// deterministic_tests, created_at, updated_at, plan_harness,
     /// questions_enabled, pause_requested, last_run_branch,
     /// last_run_started_at, skip_requested_step_id, skip_changes,
-    /// retry_strategy, review_enabled
+    /// retry_strategy, review_enabled, squash_on_complete
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -956,6 +965,19 @@ impl Plan {
         // integer-to-bool handling above.
         let review_enabled: Option<bool> = row.get::<_, Option<i64>>(19)?.map(|v| v != 0);
 
+        // `squash_on_complete` is a nullable INTEGER column (V28) at index
+        // 20. NULL (pre-V28 / never-set) coerces to `false` — the default-OFF
+        // behavior. SQLite has no native bool, so read as `Option<i64>` and
+        // treat any non-zero as true (same pattern as `review_enabled` /
+        // `questions_enabled`). `.ok()`-tolerant for SELECTs/raw test inserts
+        // that predate the column.
+        let squash_on_complete: bool = row
+            .get::<_, Option<i64>>(20)
+            .ok()
+            .flatten()
+            .map(|v| v != 0)
+            .unwrap_or(false);
+
         Ok(Plan {
             id: row.get(0)?,
             slug: row.get(1)?,
@@ -977,6 +999,7 @@ impl Plan {
             skip_changes: row.get(17)?,
             retry_strategy,
             review_enabled,
+            squash_on_complete,
         })
     }
 }
@@ -2276,6 +2299,7 @@ mod tests {
                 skip_changes: None,
                 retry_strategy: rs,
                 review_enabled: None,
+                squash_on_complete: false,
             }
         }
         fn make_step(rs: Option<RetryStrategy>) -> Step {

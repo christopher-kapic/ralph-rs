@@ -37,6 +37,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v25,
     migrate_v26,
     migrate_v27,
+    migrate_v28,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -1063,6 +1064,26 @@ fn migrate_v27(conn: &Connection) -> Result<()> {
         ALTER TABLE steps ADD COLUMN corrects_step_id TEXT;
         ",
     )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V28: per-plan --squash-on-complete
+// ---------------------------------------------------------------------------
+
+fn migrate_v28(conn: &Connection) -> Result<()> {
+    // docs/dag-redesign.md §14.1 (DECIDED): every per-iteration step commit
+    // is KEPT by default (full audit trail). An *optional* per-plan
+    // `squash_on_complete` collapses a step's iteration commits into one
+    // commit when the step reaches `Complete`.
+    //
+    // Nullable INTEGER with NO non-null default, exactly like the V24/V27
+    // tri-state columns: NULL means "not set" → the executor treats it as
+    // `false` (default OFF = identical to step 32/33 behavior). A non-null
+    // value is a 0/1 boolean (SQLite has no native bool). Additive `ALTER`,
+    // so old DBs migrate forward untouched and old export JSON keeps
+    // round-tripping via `#[serde(default)]`.
+    conn.execute_batch("ALTER TABLE plans ADD COLUMN squash_on_complete INTEGER;")?;
     Ok(())
 }
 
@@ -3235,6 +3256,97 @@ mod tests {
         assert_eq!(step_re, Some(0));
         assert_eq!(step_rstat.as_deref(), Some("in_flight"));
 
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v28_adds_squash_on_complete_to_plans() {
+        // Mirror of `test_migration_v24`: seed a pre-V28 DB, run V28, verify
+        // the existing row defaults `squash_on_complete` to NULL (→ false /
+        // "off" — the correct default), a fresh explicit value round-trips,
+        // the schema carries the column, user_version lands at
+        // CURRENT_VERSION, and re-open is a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v27.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v27 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(27) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V28 applies. The pre-V28 row must default the column
+        // NULL (inherit → `false`).
+        let conn = open_at(&path).unwrap();
+        let plan_sq: Option<i64> = conn
+            .query_row(
+                "SELECT squash_on_complete FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            plan_sq.is_none(),
+            "pre-V28 rows must default squash_on_complete to NULL (got {plan_sq:?})"
+        );
+
+        // The schema actually carries the column.
+        let cols: Vec<String> = conn
+            .prepare("SELECT * FROM plans LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(
+            cols.iter().any(|c| c == "squash_on_complete"),
+            "plans must have a squash_on_complete column post-V28 (cols: {cols:?})"
+        );
+
+        // A fresh insert with an explicit value round-trips, and
+        // `Plan::from_row` coerces it to the typed `bool`.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, squash_on_complete) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", 1_i64],
+        )
+        .unwrap();
+        let plan_sq2: Option<i64> = conn
+            .query_row(
+                "SELECT squash_on_complete FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(plan_sq2, Some(1));
+        let p1 = crate::storage::get_plan_by_id(&conn, "p1").unwrap();
+        let p2 = crate::storage::get_plan_by_id(&conn, "p2").unwrap();
+        assert!(!p1.squash_on_complete, "NULL coerces to false");
+        assert!(p2.squash_on_complete, "1 coerces to true");
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();

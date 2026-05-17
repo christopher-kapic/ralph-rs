@@ -468,6 +468,13 @@ pub enum PlanCommand {
         #[arg(long, value_name = "STRATEGY")]
         retry_strategy: Option<RetryStrategy>,
 
+        /// Squash a step's per-iteration commits into a single commit when
+        /// the step reaches `Complete` (the `Ralph-*` trailers are preserved
+        /// on the squashed commit). Omit to keep every iteration commit
+        /// (the default — a full audit trail). docs/dag-redesign.md §14.1.
+        #[arg(long)]
+        squash_on_complete: bool,
+
         /// Deterministic test command(s) to validate each step.
         #[arg(long = "test")]
         tests: Vec<String>,

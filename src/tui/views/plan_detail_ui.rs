@@ -560,6 +560,7 @@ mod tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
@@ -664,6 +665,7 @@ mod tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -798,6 +800,7 @@ mod tests {
             skip_changes: None,
             retry_strategy: None,
             review_enabled: None,
+            squash_on_complete: false,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
