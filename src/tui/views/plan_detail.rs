@@ -508,7 +508,8 @@ impl PlanDetailApp {
             StepStatus::Pending
             | StepStatus::InProgress
             | StepStatus::Failed
-            | StepStatus::Aborted => Some(step.id.clone()),
+            | StepStatus::Aborted
+            | StepStatus::Blocked => Some(step.id.clone()),
             StepStatus::Complete | StepStatus::Skipped => None,
         }
     }
@@ -976,6 +977,8 @@ impl PlanDetailApp {
             StepStatus::Failed => "✘",
             StepStatus::Skipped => "⊘",
             StepStatus::Aborted => "⊘",
+            // §3.3 derived overlay (open interruption — question or blocker).
+            StepStatus::Blocked => "?",
         }
     }
 }

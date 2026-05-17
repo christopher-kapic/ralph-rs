@@ -30,7 +30,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::plan::{AnsweredQuestion, ExecutionLog, Plan, RetryStrategy, Step, TerminationReason};
+use crate::plan::{ExecutionLog, Interruption, Plan, RetryStrategy, Step, TerminationReason};
 use crate::prompt::{self, Prompts, RetryContext};
 use crate::tui::help::{self, HelpState};
 use crate::tui::theme;
@@ -268,7 +268,7 @@ impl RenderedPromptApp {
         agent_name: Option<&str>,
         harness_supports_agent_file: bool,
         prompts: &Prompts,
-        answered_questions: &[AnsweredQuestion],
+        resolved_interruptions: &[Interruption],
         max_attempts: i32,
         logs: &[ExecutionLog],
     ) -> Vec<AttemptPrompt> {
@@ -284,7 +284,7 @@ impl RenderedPromptApp {
                 None,
                 harness_supports_agent_file,
                 prompts,
-                answered_questions,
+                resolved_interruptions,
             );
             out.push(AttemptPrompt {
                 attempt: 1,
@@ -307,7 +307,7 @@ impl RenderedPromptApp {
                 retry.as_ref(),
                 harness_supports_agent_file,
                 prompts,
-                answered_questions,
+                resolved_interruptions,
             );
             out.push(AttemptPrompt {
                 attempt: log.attempt,

@@ -34,6 +34,8 @@ pub fn status_glyph(status: StepStatus) -> &'static str {
         StepStatus::Failed => "✘",
         StepStatus::Skipped => "⊘",
         StepStatus::Aborted => "⊘",
+        // §3.3 derived overlay (open interruption — question or blocker).
+        StepStatus::Blocked => "?",
     }
 }
 
@@ -48,6 +50,9 @@ fn status_fg(status: StepStatus) -> Color {
         StepStatus::Skipped => theme::CHROME_DIM,
         StepStatus::Aborted => theme::STATUS_FAILED,
         StepStatus::Pending => theme::STATUS_PENDING,
+        // §3.3 overlay; reuse the existing derived-question token (the
+        // §12.5 `STATUS_BLOCKED` rename lands with the Phase 4 TUI work).
+        StepStatus::Blocked => theme::STATUS_QUESTION,
     }
 }
 

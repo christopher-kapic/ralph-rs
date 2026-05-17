@@ -1,6 +1,6 @@
 // Prompt generation
 
-use crate::plan::{AnsweredQuestion, Plan, Step, StepStatus};
+use crate::plan::{Interruption, Plan, Step, StepStatus};
 
 /// Default "how to introspect this plan" block prepended to every step's
 /// prompt. Injected verbatim — there is no per-plan override.
@@ -166,7 +166,9 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 ///    place the plan description is emitted.
 /// 4. Agent pointer (instructs the harness to fetch the agent profile itself)
 /// 5. Retry context (if this is a retry attempt)
-/// 6. Previously answered questions (only if `answered_questions` is non-empty)
+/// 6. Resolved interruptions — bounded (only if `resolved_interruptions` is
+///    non-empty; the slice is the last *N*, newest-first, from the bounded
+///    storage query)
 /// 7. Step details (title and description of current step) + acceptance
 ///    criteria
 /// 8. Plan step map — a compact titles-only list of ALL steps in the plan
@@ -182,11 +184,18 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 /// `all_steps` is the full ordered list of steps in the plan (as returned by
 /// `storage::list_steps`). `step` must be one of them — matched by `id`.
 ///
-/// `answered_questions` is the chronological list of Q&A pairs for this step
-/// (from [`crate::storage::list_answered_questions_for_step`]). When non-empty
-/// the prompt injects a "Previously answered questions" section between Plan
-/// context and Step details so the harness sees the user's clarifications
-/// verbatim before re-attacking the step.
+/// `resolved_interruptions` is the **bounded** (last *N*, newest-first) list
+/// of resolved interruptions for this step, from
+/// [`crate::storage::list_resolved_interruptions_for_step`]. When non-empty
+/// the prompt injects a "Resolved interruptions" section between Plan context
+/// and Step details so the harness sees the human's clarifications/unblocks
+/// verbatim before re-attacking the step. This section is the §8/§4 cutover:
+/// it replaces the old unbounded "Previously answered questions" section and
+/// is bounded in **both** entry count (the caller's `LIMIT`) **and**
+/// per-field length (every body/resolution/comment is `truncate_text`'d),
+/// closing the one pre-existing unbounded-context leak (docs/dag-redesign.md
+/// §4). Callers must pass the result of the bounded query — there is no
+/// unbounded slice anywhere in prompt assembly.
 #[allow(clippy::too_many_arguments)]
 pub fn build_step_prompt(
     plan: &Plan,
@@ -196,7 +205,7 @@ pub fn build_step_prompt(
     retry_context: Option<&RetryContext>,
     harness_supports_agent_file: bool,
     prompts: &Prompts,
-    answered_questions: &[AnsweredQuestion],
+    resolved_interruptions: &[Interruption],
 ) -> String {
     let mut sections: Vec<String> = Vec::new();
 
@@ -224,12 +233,14 @@ pub fn build_step_prompt(
         sections.push(format_retry_context(retry));
     }
 
-    // Previously answered questions — injected between plan context and
-    // step details so the harness sees the user's clarifications before
-    // re-reading the step description (TUI-plan.md §17 "Retry context after
-    // answering"). Empty slice contributes nothing.
-    if !answered_questions.is_empty() {
-        sections.push(format_answered_questions(answered_questions));
+    // Resolved interruptions — injected between plan context and step
+    // details so the harness sees the human's clarifications/unblocks before
+    // re-reading the step description (docs/dag-redesign.md §8 item 1). The
+    // slice is already bounded by the caller's `LIMIT`; each field is
+    // additionally `truncate_text`'d inside the formatter, so this section is
+    // doubly bounded (count + per-field). Empty slice contributes nothing.
+    if !resolved_interruptions.is_empty() {
+        sections.push(format_resolved_interruptions(resolved_interruptions));
     }
 
     // Step details (with 1-based position in the plan)
@@ -359,21 +370,62 @@ fn format_plan_context(plan: &Plan, plan_layer: Option<&str>) -> String {
     )
 }
 
-/// Render the "Previously answered questions" section. Each Q&A pair becomes
-/// two markdown blockquote lines (`> Q: ...` / `> A: ...`) separated by a
-/// blank line, in chronological order. Verbatim shape from TUI-plan.md §17.
-fn format_answered_questions(answered: &[AnsweredQuestion]) -> String {
-    let mut lines = vec![
-        "## Previously answered questions".to_string(),
-        String::new(),
-    ];
-    let last = answered.len().saturating_sub(1);
-    for (i, qa) in answered.iter().enumerate() {
-        lines.push(format!("> Q: {}", qa.question));
-        lines.push(format!("> A: {}", qa.answer));
+/// Max lines kept per interruption field (body / resolution / comment) when
+/// rendering the "Resolved interruptions" section. The *count* of entries is
+/// bounded upstream by [`crate::storage::list_resolved_interruptions_for_step`]
+/// (its `LIMIT`); this is the **per-field** half of the §4 fix — the same
+/// `truncate_text` helper used for the 200-line diff truncation, applied here
+/// so a single pathologically long answer/blocker explanation cannot blow the
+/// prompt up.
+const RESOLVED_INTERRUPTION_FIELD_MAX_LINES: usize = 20;
+
+/// Render the bounded "Resolved interruptions" section (docs/dag-redesign.md
+/// §8 item 1). Each resolved interruption becomes a markdown blockquote
+/// carrying its **kind**, **body**, the chosen **resolution**, and any human
+/// **comment** — every free-text field run through [`truncate_text`] so the
+/// section is bounded in per-field length (the entry *count* is already
+/// bounded by the caller's `LIMIT`). The input is newest-first (as the
+/// bounded query returns it); we render in that order so the freshest
+/// clarification leads.
+///
+/// This replaces the pre-Phase-2 unbounded `format_answered_questions` —
+/// there is no longer any unbounded vector anywhere in prompt assembly.
+fn format_resolved_interruptions(resolved: &[Interruption]) -> String {
+    let mut lines = vec!["## Resolved interruptions".to_string(), String::new()];
+    let last = resolved.len().saturating_sub(1);
+    for (i, intr) in resolved.iter().enumerate() {
+        let body = truncate_text(&intr.body, RESOLVED_INTERRUPTION_FIELD_MAX_LINES);
+        lines.push(format!("> **{kind}**", kind = intr.kind.as_str()));
+        // Each multi-line field is re-quoted line-by-line so the blockquote
+        // stays well-formed even after truncation inserts its elision line.
+        for bl in body.lines() {
+            lines.push(format!("> {bl}"));
+        }
+        if let Some(resolution) = &intr.resolution {
+            let r = truncate_text(resolution, RESOLVED_INTERRUPTION_FIELD_MAX_LINES);
+            lines.push(">".to_string());
+            for (j, rl) in r.lines().enumerate() {
+                lines.push(if j == 0 {
+                    format!("> Resolution: {rl}")
+                } else {
+                    format!("> {rl}")
+                });
+            }
+        }
+        if let Some(comment) = &intr.comment {
+            let c = truncate_text(comment, RESOLVED_INTERRUPTION_FIELD_MAX_LINES);
+            lines.push(">".to_string());
+            for (j, cl) in c.lines().enumerate() {
+                lines.push(if j == 0 {
+                    format!("> Comment: {cl}")
+                } else {
+                    format!("> {cl}")
+                });
+            }
+        }
         if i != last {
-            // Blank line between pairs to keep each blockquote distinct in
-            // markdown rendering. The trailing pair has no separator.
+            // Blank line between entries to keep each blockquote distinct in
+            // markdown rendering. The trailing entry has no separator.
             lines.push(String::new());
         }
     }
@@ -424,6 +476,11 @@ fn status_label(status: StepStatus) -> &'static str {
         StepStatus::InProgress => "IN_PROGRESS",
         StepStatus::Failed => "FAILED",
         StepStatus::Aborted => "ABORTED",
+        // `Blocked` is a derived overlay never stored on `steps.status`, so
+        // the plan-step-map (built from stored statuses) won't normally see
+        // it; label it explicitly for exhaustiveness if a derived value is
+        // ever passed in.
+        StepStatus::Blocked => "BLOCKED",
     }
 }
 
@@ -490,8 +547,30 @@ fn truncate_text(text: &str, max_lines: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{ChangePolicy, Plan, PlanStatus};
+    use crate::plan::{ChangePolicy, InterruptionKind, InterruptionState, Plan, PlanStatus};
     use chrono::Utc;
+
+    /// Build a resolved [`Interruption`] for prompt-rendering tests.
+    fn resolved_intr(
+        kind: InterruptionKind,
+        body: &str,
+        resolution: Option<&str>,
+        comment: Option<&str>,
+    ) -> Interruption {
+        Interruption {
+            id: "i-test".to_string(),
+            step_id: "s1".to_string(),
+            attempt: 1,
+            kind,
+            body: body.to_string(),
+            options: vec![],
+            resolution: resolution.map(str::to_string),
+            comment: comment.map(str::to_string),
+            state: InterruptionState::Resolved,
+            asked_at: Utc::now(),
+            resolved_at: Some(Utc::now()),
+        }
+    }
 
     fn make_plan() -> Plan {
         Plan {
@@ -1078,10 +1157,12 @@ mod tests {
             files_modified: vec![],
             previous_failure_reason: Some("tests failed".to_string()),
         };
-        let answered = vec![AnsweredQuestion {
-            question: "Which DB?".to_string(),
-            answer: "SQLite".to_string(),
-        }];
+        let resolved = vec![resolved_intr(
+            InterruptionKind::Question,
+            "Which DB?",
+            Some("SQLite"),
+            None,
+        )];
 
         let prompts = Prompts {
             global: Some(DEFAULT_CONTEXT_PREPEND.to_string()),
@@ -1097,18 +1178,18 @@ mod tests {
             Some(&retry),
             false,
             &prompts,
-            &answered,
+            &resolved,
         );
 
         // Verify ordering:
-        // global -> project -> plan -> agent -> retry -> answered_questions
+        // global -> project -> plan -> agent -> retry -> resolved-interruptions
         // -> step -> criteria -> step map -> tests -> focus -> ask-instruction
         let global_pos = prompt.find("# Ralph context").unwrap();
         let project_pos = prompt.find("PROJECT-LAYER").unwrap();
         let plan_pos = prompt.find("# Plan:").unwrap();
         let agent_pos = prompt.find("# Agent Profile").unwrap();
         let retry_pos = prompt.find("# Retry Context").unwrap();
-        let answered_pos = prompt.find("## Previously answered questions").unwrap();
+        let answered_pos = prompt.find("## Resolved interruptions").unwrap();
         let step_pos = prompt.find("## Your step").unwrap();
         let criteria_pos = prompt.find("Acceptance criteria").unwrap();
         let map_pos = prompt.find("## Plan step map").unwrap();
@@ -1263,19 +1344,24 @@ mod tests {
     }
 
     #[test]
-    fn test_previously_answered_questions_section_renders_qa_pairs() {
+    fn test_resolved_interruptions_section_renders_kind_body_resolution_comment() {
         let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
-        let answered = vec![
-            AnsweredQuestion {
-                question: "Should this use Postgres or SQLite?".to_string(),
-                answer: "SQLite (already a dep)".to_string(),
-            },
-            AnsweredQuestion {
-                question: "Pick a logging crate.".to_string(),
-                answer: "tracing".to_string(),
-            },
+        // Newest-first (as the bounded query returns it).
+        let resolved = vec![
+            resolved_intr(
+                InterruptionKind::Blocker,
+                "Needs sudo to install libfoo",
+                Some("Installed by operator"),
+                Some("ran apt-get install libfoo-dev"),
+            ),
+            resolved_intr(
+                InterruptionKind::Question,
+                "Should this use Postgres or SQLite?",
+                Some("SQLite (already a dep)"),
+                None,
+            ),
         ];
 
         let prompt = build_step_prompt(
@@ -1286,32 +1372,37 @@ mod tests {
             None,
             true,
             &Prompts::default(),
-            &answered,
+            &resolved,
         );
 
-        // Section heading is present.
-        assert!(prompt.contains("## Previously answered questions"));
-        // Each Q&A pair renders as a `> Q:` / `> A:` blockquote pair.
-        assert!(prompt.contains("> Q: Should this use Postgres or SQLite?"));
-        assert!(prompt.contains("> A: SQLite (already a dep)"));
-        assert!(prompt.contains("> Q: Pick a logging crate."));
-        assert!(prompt.contains("> A: tracing"));
+        // Section heading present; old heading gone.
+        assert!(prompt.contains("## Resolved interruptions"));
+        assert!(!prompt.contains("## Previously answered questions"));
 
-        // The section sits between Plan context and Step details.
+        // Kind, body, resolution, and comment all render.
+        assert!(prompt.contains("> **blocker**"));
+        assert!(prompt.contains("> Needs sudo to install libfoo"));
+        assert!(prompt.contains("> Resolution: Installed by operator"));
+        assert!(prompt.contains("> Comment: ran apt-get install libfoo-dev"));
+        assert!(prompt.contains("> **question**"));
+        assert!(prompt.contains("> Should this use Postgres or SQLite?"));
+        assert!(prompt.contains("> Resolution: SQLite (already a dep)"));
+
+        // Section sits between Plan context and Step details.
         let plan_pos = prompt.find("# Plan:").unwrap();
-        let answered_pos = prompt.find("## Previously answered questions").unwrap();
+        let sec_pos = prompt.find("## Resolved interruptions").unwrap();
         let step_pos = prompt.find("## Your step").unwrap();
-        assert!(plan_pos < answered_pos);
-        assert!(answered_pos < step_pos);
+        assert!(plan_pos < sec_pos);
+        assert!(sec_pos < step_pos);
 
-        // Pairs render in the order supplied (chronological).
-        let q1_pos = prompt.find("Postgres or SQLite").unwrap();
-        let q2_pos = prompt.find("Pick a logging crate").unwrap();
-        assert!(q1_pos < q2_pos);
+        // Rendered in the order supplied (newest-first).
+        let blocker_pos = prompt.find("> **blocker**").unwrap();
+        let question_pos = prompt.find("> **question**").unwrap();
+        assert!(blocker_pos < question_pos);
     }
 
     #[test]
-    fn test_previously_answered_questions_absent_when_empty() {
+    fn test_resolved_interruptions_absent_when_empty() {
         let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
@@ -1327,31 +1418,33 @@ mod tests {
             &[],
         );
 
-        assert!(!prompt.contains("## Previously answered questions"));
-        // No stray blockquote markers from this section either.
-        assert!(!prompt.contains("> Q:"));
-        assert!(!prompt.contains("> A:"));
+        assert!(!prompt.contains("## Resolved interruptions"));
+        // No stray section blockquote markers.
+        assert!(!prompt.contains("> Resolution:"));
+        assert!(!prompt.contains("> Comment:"));
     }
 
     #[test]
-    fn test_question_features_independent() {
-        // The "Previously answered questions" section is gated on the
-        // `answered_questions` slice, NOT on `questions_enabled`. If a plan
-        // had questions enabled, got answers, and then the user toggled the
-        // flag off, we still want the harness to see the answers it received
-        // on the prior attempt — otherwise the user's input is silently
-        // dropped from the next retry. Conversely, enabling questions on a
-        // fresh plan must not synthesize an empty section.
+    fn test_resolved_interruptions_independent_of_questions_enabled() {
+        // The "Resolved interruptions" section is gated on the
+        // `resolved_interruptions` slice, NOT on `questions_enabled`. If a
+        // plan had questions enabled, an interruption was resolved, and the
+        // user then toggled the flag off, the harness must still see the
+        // resolution — otherwise the human's input is silently dropped from
+        // the next retry. Conversely, enabling questions on a fresh plan
+        // must not synthesize an empty section.
         let mut plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
-        let answered = vec![AnsweredQuestion {
-            question: "Q?".to_string(),
-            answer: "A.".to_string(),
-        }];
+        let resolved = vec![resolved_intr(
+            InterruptionKind::Question,
+            "Q?",
+            Some("A."),
+            None,
+        )];
 
-        // Case 1: questions disabled, but answers exist (toggled-off-after-
-        // answering). Section IS rendered; ask-instruction is NOT.
+        // Case 1: questions disabled, but a resolution exists. Section IS
+        // rendered; ask-instruction is NOT.
         plan.questions_enabled = false;
         let prompt = build_step_prompt(
             &plan,
@@ -1361,13 +1454,13 @@ mod tests {
             None,
             true,
             &Prompts::default(),
-            &answered,
+            &resolved,
         );
-        assert!(prompt.contains("## Previously answered questions"));
+        assert!(prompt.contains("## Resolved interruptions"));
         assert!(!prompt.contains("## Asking the user a question"));
 
-        // Case 2: questions enabled, but no answers yet. Ask-instruction IS
-        // rendered; previously-answered section is NOT.
+        // Case 2: questions enabled, but nothing resolved yet. Ask-
+        // instruction IS rendered; resolved section is NOT.
         plan.questions_enabled = true;
         let prompt = build_step_prompt(
             &plan,
@@ -1379,7 +1472,82 @@ mod tests {
             &Prompts::default(),
             &[],
         );
-        assert!(!prompt.contains("## Previously answered questions"));
+        assert!(!prompt.contains("## Resolved interruptions"));
         assert!(prompt.contains("## Asking the user a question"));
+    }
+
+    /// §4 fix proof: even when many resolved interruptions with very long
+    /// fields are passed, the rendered section is bounded in BOTH
+    /// dimensions — entry count (caller's slice, which in production is the
+    /// bounded query) AND per-field length (`truncate_text` inside the
+    /// formatter). This test feeds the formatter a deliberately oversized
+    /// input and asserts the output is small.
+    #[test]
+    fn test_resolved_interruptions_section_is_bounded_in_count_and_per_field() {
+        let plan = make_plan();
+        let step = make_step();
+        let all_steps = vec![step.clone()];
+
+        // Production passes at most DEFAULT_RESOLVED_INTERRUPTION_LIMIT (5)
+        // entries; emulate that bound here and make every field pathological
+        // (5000 lines each).
+        const N: usize = crate::storage::DEFAULT_RESOLVED_INTERRUPTION_LIMIT;
+        let huge = (0..5000)
+            .map(|i| format!("line-{i}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let resolved: Vec<Interruption> = (0..N)
+            .map(|_| {
+                resolved_intr(
+                    InterruptionKind::Question,
+                    &huge,
+                    Some(&huge),
+                    Some(&huge),
+                )
+            })
+            .collect();
+
+        let prompt = build_step_prompt(
+            &plan,
+            &step,
+            &all_steps,
+            None,
+            None,
+            true,
+            &Prompts::default(),
+            &resolved,
+        );
+
+        // Isolate the rendered section (from its heading to the next `## `
+        // heading) so we measure only this section's contribution.
+        let start = prompt.find("## Resolved interruptions").unwrap();
+        let rest = &prompt[start + "## Resolved interruptions".len()..];
+        let end = rest.find("\n## ").map(|p| start + p).unwrap_or(prompt.len());
+        let section = &prompt[start..end];
+
+        // (1) Per-field truncation fired — the elision marker is present and
+        // the raw 5000-line field did NOT survive intact.
+        assert!(
+            section.contains("lines omitted"),
+            "each oversized field must be truncate_text'd"
+        );
+        assert!(
+            !section.contains("line-4999-"),
+            "the tail of a 5000-line field must be dropped"
+        );
+
+        // (2) Hard upper bound on the whole section's line count:
+        // N entries × (1 kind line + 3 separators + 3 fields ×
+        // (FIELD_MAX_LINES + 1 elision + 1 label)) + heading/blank/sep slack.
+        // Use a generous but FINITE ceiling that does NOT scale with the
+        // 5000-line input.
+        let section_lines = section.lines().count();
+        let ceiling = N * (3 * (RESOLVED_INTERRUPTION_FIELD_MAX_LINES + 4) + 8) + 8;
+        assert!(
+            section_lines <= ceiling,
+            "section must be bounded: {section_lines} lines > ceiling {ceiling}"
+        );
+        // Sanity: the ceiling is far below the unbounded size (≈ N×3×5000).
+        assert!(ceiling < N * 3 * 5000 / 10);
     }
 }

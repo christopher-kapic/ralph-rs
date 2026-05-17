@@ -11,12 +11,19 @@ use std::fmt;
 
 /// Status of a plan throughout its lifecycle.
 ///
-/// Note: [`PlanStatus::Question`] is a *derived* status — it is never written
-/// to `plans.status`. A plan is reported as `Question` whenever any unanswered
-/// `step_questions` row exists for one of its steps; the underlying lifecycle
+/// Note: [`PlanStatus::Interrupted`] is a *derived* status — it is never
+/// written to `plans.status`. A plan is reported as `Interrupted` whenever any
+/// **open interruption** (a question *or* a blocker — docs/dag-redesign.md
+/// §3.4/§6) exists for one of its steps; the underlying lifecycle
 /// (in_progress/ready/etc.) stays in the column and un-shadows automatically
-/// when the user answers. The variant exists in the enum so consumers
-/// (TUI/JSON output) can render the derived state uniformly with the rest.
+/// when the human resolves the last open interruption. The variant exists in
+/// the enum so consumers (TUI/JSON output) can render the derived state
+/// uniformly with the rest.
+///
+/// This is the post-Phase-2 rename of the old `Question` variant. For one
+/// release the legacy `"question"` string is still **accepted on parse** (a
+/// back-compat alias) but it always **serializes** / `as_str`es as
+/// `"interrupted"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
@@ -28,7 +35,7 @@ pub enum PlanStatus {
     Failed,
     Aborted,
     Archived,
-    Question,
+    Interrupted,
 }
 
 impl PlanStatus {
@@ -42,7 +49,7 @@ impl PlanStatus {
             Self::Failed => "failed",
             Self::Aborted => "aborted",
             Self::Archived => "archived",
-            Self::Question => "question",
+            Self::Interrupted => "interrupted",
         }
     }
 }
@@ -77,7 +84,12 @@ impl std::str::FromStr for PlanStatus {
             "failed" => Ok(Self::Failed),
             "aborted" => Ok(Self::Aborted),
             "archived" => Ok(Self::Archived),
-            "question" => Ok(Self::Question),
+            "interrupted" => Ok(Self::Interrupted),
+            // One-release back-compat alias: the pre-Phase-2 derived status
+            // was spelled "question". It is never written to the DB (derived
+            // only), but accept it on parse so a value materialized by an
+            // older binary still round-trips.
+            "question" => Ok(Self::Interrupted),
             other => Err(ParseStatusError(other.to_string())),
         }
     }
@@ -88,6 +100,17 @@ impl std::str::FromStr for PlanStatus {
 // ---------------------------------------------------------------------------
 
 /// Status of an individual step.
+///
+/// Note: [`StepStatus::Blocked`] is an *orthogonal derived overlay*, not a
+/// stored lifecycle state (docs/dag-redesign.md §3.3). It is **never written
+/// to `steps.status`** — exactly like [`PlanStatus::Interrupted`]. A step
+/// *presents* as `Blocked` whenever it has an open interruption (question or
+/// blocker); its underlying stored status (`pending`/`in_progress`/…) is
+/// preserved underneath and un-shadows automatically the moment the
+/// interruption is resolved. The variant only exists in the enum so the
+/// derivation helper [`effective_step_status`] can hand callers a single
+/// status to render. `as_str`/`FromStr`/serde still support it (round-trip
+/// safe), but storage code must never persist it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepStatus {
@@ -97,6 +120,7 @@ pub enum StepStatus {
     Failed,
     Skipped,
     Aborted,
+    Blocked,
 }
 
 impl StepStatus {
@@ -108,7 +132,40 @@ impl StepStatus {
             Self::Failed => "failed",
             Self::Skipped => "skipped",
             Self::Aborted => "aborted",
+            Self::Blocked => "blocked",
         }
+    }
+}
+
+/// Derive a step's *effective* (presentation) status.
+///
+/// `Blocked` is an overlay (docs/dag-redesign.md §3.3): when the step has an
+/// open interruption it *presents* as [`StepStatus::Blocked`] while its
+/// stored lifecycle is preserved underneath. The instant the interruption is
+/// resolved (`has_open_interruption == false`) the underlying status
+/// un-shadows — this helper simply returns it, so the overlay is fully
+/// reversible and never needs a DB write.
+///
+/// Terminal stored states are *not* overlaid: a `Complete`/`Failed`/`Skipped`
+/// /`Aborted` step is done with respect to its branch and a lingering
+/// (typically already-resolved-but-stale-flagged) interruption must not make
+/// a finished step look re-blocked. Only the active lifecycle states
+/// (`Pending`/`InProgress`) take the overlay. This mirrors how
+/// `plan_effective_status` upgrades a still-running plan but leaves a
+/// completed one alone.
+#[allow(dead_code)] // scheduler + Phase 4 TUI status-rendering consumers land in later steps.
+pub fn effective_step_status(stored: StepStatus, has_open_interruption: bool) -> StepStatus {
+    if !has_open_interruption {
+        return stored;
+    }
+    match stored {
+        StepStatus::Pending | StepStatus::InProgress => StepStatus::Blocked,
+        // Terminal states are not re-shadowed.
+        StepStatus::Complete
+        | StepStatus::Failed
+        | StepStatus::Skipped
+        | StepStatus::Aborted
+        | StepStatus::Blocked => stored,
     }
 }
 
@@ -129,6 +186,7 @@ impl std::str::FromStr for StepStatus {
             "failed" => Ok(Self::Failed),
             "skipped" => Ok(Self::Skipped),
             "aborted" => Ok(Self::Aborted),
+            "blocked" => Ok(Self::Blocked),
             other => Err(ParseStatusError(other.to_string())),
         }
     }
@@ -335,7 +393,6 @@ impl std::str::FromStr for InterruptionState {
 /// `priority` ranks the agent's proposals (1 = the agent's best guess).
 /// Blockers and freeform-only questions carry an empty option list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)] // DB/CLI/TUI consumers land in later DAG-redesign steps.
 pub struct InterruptionOption {
     pub text: String,
     pub priority: i32,
@@ -354,10 +411,10 @@ pub struct InterruptionOption {
 /// resolution/comment are later injected, bounded, into the step's next
 /// prompt (§8).
 ///
-/// Model + tests only at this step — no DB/CLI wiring yet (those land in
-/// later DAG-redesign steps).
+/// Native storage/model wiring lands with the Phase 2 interruption CRUD
+/// (`storage::insert_interruption` and friends); the `interruption` CLI and
+/// TUI inbox land in later DAG-redesign steps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[allow(dead_code)] // DB/CLI/TUI consumers land in later DAG-redesign steps.
 pub struct Interruption {
     pub id: String,
     pub step_id: String,
@@ -381,6 +438,68 @@ pub struct Interruption {
     /// while `Open`.
     #[serde(default)]
     pub resolved_at: Option<DateTime<Utc>>,
+}
+
+impl Interruption {
+    /// Read an [`Interruption`] from a SQLite row.
+    ///
+    /// Expected column order (the native `interruptions` table, V26):
+    /// id, step_id, attempt, kind, body, options, resolution, comment,
+    /// state, asked_at, resolved_at
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        use std::str::FromStr;
+
+        let kind_str: String = row.get(3)?;
+        let kind = InterruptionKind::from_str(&kind_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+        let options_json: String = row.get(5)?;
+        let options: Vec<InterruptionOption> =
+            serde_json::from_str(&options_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
+        let state_str: String = row.get(8)?;
+        let state = InterruptionState::from_str(&state_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+        let asked_str: String = row.get(9)?;
+        let asked_at = parse_datetime(&asked_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
+        })?;
+
+        let resolved_str: Option<String> = row.get(10)?;
+        let resolved_at = match resolved_str {
+            Some(s) => Some(parse_datetime(&s).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?),
+            None => None,
+        };
+
+        Ok(Interruption {
+            id: row.get(0)?,
+            step_id: row.get(1)?,
+            attempt: row.get(2)?,
+            kind,
+            body: row.get(4)?,
+            options,
+            resolution: row.get(6)?,
+            comment: row.get(7)?,
+            state,
+            asked_at,
+            resolved_at,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -940,20 +1059,10 @@ impl Step {
     }
 }
 
-// ---------------------------------------------------------------------------
-// AnsweredQuestion struct
-// ---------------------------------------------------------------------------
-
-/// A question that the harness asked via `ralph question ask` and the user
-/// has since answered. Returned by
-/// [`crate::storage::list_answered_questions_for_step`] in chronological order
-/// and rendered into the prompt's "Previously answered questions" section on
-/// the next attempt of the step (TUI-plan.md §17).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnsweredQuestion {
-    pub question: String,
-    pub answer: String,
-}
+// The pre-Phase-2 `AnsweredQuestion` struct was removed in the §8/§4 cutover.
+// Prompt assembly now consumes the bounded, interruption-native
+// `Interruption` model (see `Interruption` above and
+// `storage::list_resolved_interruptions_for_step`).
 
 // ---------------------------------------------------------------------------
 // ExecutionLog struct
@@ -1080,7 +1189,7 @@ mod tests {
             PlanStatus::Failed,
             PlanStatus::Aborted,
             PlanStatus::Archived,
-            PlanStatus::Question,
+            PlanStatus::Interrupted,
         ];
         for status in &statuses {
             let s = status.as_str();
@@ -1090,18 +1199,28 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_status_question_serde_and_display() {
-        // The derived `Question` status must serialize as snake_case
+    fn test_plan_status_interrupted_serde_and_display() {
+        // The derived `Interrupted` status must serialize as snake_case
         // (matches every other variant) so the TUI/JSON output renders it
         // uniformly without a special case.
-        assert_eq!(PlanStatus::Question.as_str(), "question");
-        assert_eq!(PlanStatus::Question.to_string(), "question");
+        assert_eq!(PlanStatus::Interrupted.as_str(), "interrupted");
+        assert_eq!(PlanStatus::Interrupted.to_string(), "interrupted");
         assert_eq!(
-            serde_json::to_string(&PlanStatus::Question).unwrap(),
-            r#""question""#,
+            serde_json::to_string(&PlanStatus::Interrupted).unwrap(),
+            r#""interrupted""#,
         );
-        let parsed: PlanStatus = "question".parse().unwrap();
-        assert_eq!(parsed, PlanStatus::Question);
+        let parsed: PlanStatus = "interrupted".parse().unwrap();
+        assert_eq!(parsed, PlanStatus::Interrupted);
+
+        // One-release back-compat: the legacy "question" spelling still
+        // parses (to the renamed variant) but never serializes back out.
+        let legacy: PlanStatus = "question".parse().unwrap();
+        assert_eq!(legacy, PlanStatus::Interrupted);
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            r#""interrupted""#,
+            "legacy alias must serialize forward as `interrupted`",
+        );
     }
 
     #[test]
@@ -1113,12 +1232,119 @@ mod tests {
             StepStatus::Failed,
             StepStatus::Skipped,
             StepStatus::Aborted,
+            StepStatus::Blocked,
         ];
         for status in &statuses {
             let s = status.as_str();
             let parsed: StepStatus = s.parse().unwrap();
             assert_eq!(*status, parsed);
+            // serde must agree with the FromStr/as_str pair.
+            assert_eq!(
+                serde_json::to_string(status).unwrap(),
+                format!(r#""{s}""#),
+                "{status:?} must serialize as its snake_case as_str()"
+            );
         }
+    }
+
+    #[test]
+    fn test_effective_step_status_blocked_is_derived_and_reversible() {
+        // No open interruption: identity for every stored state.
+        for stored in [
+            StepStatus::Pending,
+            StepStatus::InProgress,
+            StepStatus::Complete,
+            StepStatus::Failed,
+            StepStatus::Skipped,
+            StepStatus::Aborted,
+        ] {
+            assert_eq!(
+                effective_step_status(stored, false),
+                stored,
+                "no open interruption ⇒ stored status passes through unchanged"
+            );
+        }
+
+        // Open interruption shadows only the *active* lifecycle states.
+        assert_eq!(
+            effective_step_status(StepStatus::Pending, true),
+            StepStatus::Blocked
+        );
+        assert_eq!(
+            effective_step_status(StepStatus::InProgress, true),
+            StepStatus::Blocked
+        );
+
+        // Terminal states are NOT re-shadowed by a (stale) open flag.
+        for terminal in [
+            StepStatus::Complete,
+            StepStatus::Failed,
+            StepStatus::Skipped,
+            StepStatus::Aborted,
+        ] {
+            assert_eq!(
+                effective_step_status(terminal, true),
+                terminal,
+                "terminal {terminal:?} must not present as Blocked"
+            );
+        }
+
+        // Reversible: the same stored status un-shadows the instant the
+        // interruption resolves (overlay carries no state of its own).
+        let stored = StepStatus::InProgress;
+        assert_eq!(effective_step_status(stored, true), StepStatus::Blocked);
+        assert_eq!(
+            effective_step_status(stored, false),
+            StepStatus::InProgress,
+            "resolving the interruption restores the underlying status"
+        );
+    }
+
+    #[test]
+    fn test_blocked_overlay_is_never_persisted_by_storage() {
+        // The overlay is presentation-only: prove no storage write path can
+        // land `blocked` in `steps.status`. We round-trip a step through the
+        // DB and assert the column never holds 'blocked' even after deriving
+        // a Blocked presentation from an open interruption.
+        let conn = db::open_memory().unwrap();
+        let plan =
+            crate::storage::create_plan(&conn, "ov", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = crate::storage::create_step(
+            &conn, &plan.id, "S", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        // Raise an open interruption, then derive the presentation status.
+        crate::storage::insert_interruption(
+            &conn,
+            &step.id,
+            1,
+            InterruptionKind::Blocker,
+            "blocked on access",
+            &[],
+        )
+        .unwrap();
+        let reloaded = crate::storage::get_step(&conn, &step.id).unwrap();
+        let has_open = !crate::storage::list_open_interruptions_for_plan(&conn, &plan.id)
+            .unwrap()
+            .is_empty();
+        assert_eq!(
+            effective_step_status(reloaded.status, has_open),
+            StepStatus::Blocked,
+            "derived presentation is Blocked while the interruption is open"
+        );
+
+        // The *stored* column is still the underlying lifecycle, never
+        // 'blocked'.
+        let raw: String = conn
+            .query_row(
+                "SELECT status FROM steps WHERE id = ?1",
+                rusqlite::params![step.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(raw, "blocked", "Blocked must never be written to the DB");
+        assert_eq!(reloaded.status, StepStatus::Pending);
     }
 
     #[test]

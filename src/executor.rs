@@ -59,8 +59,9 @@ pub enum StepOutcome {
     /// The harness called `ralph question ask` during the attempt, leaving one
     /// or more unanswered `step_questions` rows. Tests + commit are skipped,
     /// any diff is rolled back, and the plan's effective status becomes
-    /// [`crate::plan::PlanStatus::Question`] until the user answers (TUI-plan
-    /// §17). The runner stops the loop cleanly so the run lock is released.
+    /// [`crate::plan::PlanStatus::Interrupted`] until the user answers
+    /// (docs/dag-redesign.md §3.4/§6). The runner stops the loop cleanly so
+    /// the run lock is released.
     PausedForQuestion,
 }
 
@@ -1091,12 +1092,18 @@ pub async fn execute_step(
             plan: Some(plan.description.clone()),
         };
 
-        // Fetch any answered questions for this step so the next-attempt
-        // prompt re-injects the user's clarifications between Plan context
-        // and Step details (TUI-plan.md §17 "Retry context after answering").
-        // First attempts on un-paused steps return an empty slice — the call
-        // is one indexed lookup, no need to gate it on attempt > 1.
-        let answered_questions = storage::list_answered_questions_for_step(conn, &step.id)?;
+        // Fetch the BOUNDED resolved-interruption set for this step so the
+        // next-attempt prompt re-injects the human's clarifications/unblocks
+        // between Plan context and Step details (docs/dag-redesign.md §8
+        // item 1). The query `LIMIT`s to the most-recent N resolved
+        // interruptions — this is the §4 fix: the prompt feed is bounded in
+        // count here and in per-field length inside the formatter. First
+        // attempts on never-interrupted steps return an empty slice.
+        let resolved_interruptions = storage::list_resolved_interruptions_for_step(
+            conn,
+            &step.id,
+            storage::DEFAULT_RESOLVED_INTERRUPTION_LIMIT,
+        )?;
 
         // Build prompt.
         let prompt_text = prompt::build_step_prompt(
@@ -1107,7 +1114,7 @@ pub async fn execute_step(
             retry_context.as_ref(),
             harness_config.supports_agent_file,
             &prompts,
-            &answered_questions,
+            &resolved_interruptions,
         );
 
         // Create execution log entry.
@@ -7394,10 +7401,13 @@ mod tests {
         let head_after = crate::git::get_commit_hash(&dir).unwrap();
         assert_eq!(head_before, head_after, "pause must not advance HEAD");
 
-        // The plan's effective status is now Question (derived) even though
-        // the underlying plans.status column may still be in_progress.
+        // The plan's effective status is now Interrupted (derived) even
+        // though the underlying plans.status column may still be in_progress.
+        // (The harness wrote a `step_questions` row, which the V26
+        // back-compat view materializes as an open `interruptions` row that
+        // the native derivation now reads.)
         let effective = storage::plan_effective_status(&conn, &plan.id).unwrap();
-        assert_eq!(effective, crate::plan::PlanStatus::Question);
+        assert_eq!(effective, crate::plan::PlanStatus::Interrupted);
     }
 
     /// Pause path with a harness that produced a diff. The diff must be
@@ -7563,9 +7573,9 @@ mod tests {
         assert!(logs[0].committed);
 
         // And the plan's effective status reflects the actual stored value
-        // — no Question shadow when there are no unanswered rows.
+        // — no Interrupted shadow when there are no open interruptions.
         let effective = storage::plan_effective_status(&conn, &plan.id).unwrap();
-        assert_ne!(effective, crate::plan::PlanStatus::Question);
+        assert_ne!(effective, crate::plan::PlanStatus::Interrupted);
     }
 
     /// A question row tagged to a *different* attempt (e.g. left over from a

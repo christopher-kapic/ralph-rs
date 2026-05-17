@@ -627,12 +627,13 @@ async fn run_plan_inner(
                         step_num, total_now, current_step.title
                     );
                 }
-                // Don't write `Question` to plans.status — it's a *derived*
-                // status (TUI-plan.md §17). Leave the underlying lifecycle
-                // (`in_progress`) alone so it un-shadows automatically once
-                // the user answers. The PlanRunResult reports the derived
-                // state for the caller's benefit.
-                result.final_status = PlanStatus::Question;
+                // Don't write `Interrupted` to plans.status — it's a *derived*
+                // status (docs/dag-redesign.md §3.4/§6). Leave the underlying
+                // lifecycle (`in_progress`) alone so it un-shadows
+                // automatically once the human resolves the last open
+                // interruption. The PlanRunResult reports the derived state
+                // for the caller's benefit.
+                result.final_status = PlanStatus::Interrupted;
                 result.step_results.push(step_result);
                 return Ok(result);
             }
@@ -1240,8 +1241,14 @@ pub fn skip_step(
     let actual_num = idx + 1;
 
     // Only allow skipping pending, failed, or in_progress steps.
+    // `Blocked` is a derived overlay never stored on `steps.status` (its
+    // underlying state is Pending/InProgress, both skippable), but match it
+    // explicitly for exhaustiveness.
     match step.status {
-        StepStatus::Pending | StepStatus::Failed | StepStatus::InProgress => {}
+        StepStatus::Pending
+        | StepStatus::Failed
+        | StepStatus::InProgress
+        | StepStatus::Blocked => {}
         StepStatus::Complete => bail!("Step {} '{}' is already complete", actual_num, step.title),
         StepStatus::Skipped => bail!("Step {} '{}' is already skipped", actual_num, step.title),
         StepStatus::Aborted => {
@@ -1346,13 +1353,13 @@ fn validate_plan_status(plan: &Plan) -> Result<()> {
             plan.slug,
             plan.slug
         ),
-        // `Question` is a derived status — `plans.status` is never written
-        // to "question" in the DB, so this arm is defensive. If a caller
-        // ever materializes a Plan with Question (e.g. a future helper that
-        // shadows status when unanswered questions exist), refuse to run:
-        // the user must answer first.
-        PlanStatus::Question => bail!(
-            "Plan '{}' is paused for an unanswered question. Answer it first.",
+        // `Interrupted` is a derived status — `plans.status` is never written
+        // to "interrupted" in the DB, so this arm is defensive. If a caller
+        // ever materializes a Plan with Interrupted (e.g. a future helper
+        // that shadows status when open interruptions exist), refuse to run:
+        // the human must resolve the interruption first.
+        PlanStatus::Interrupted => bail!(
+            "Plan '{}' is paused for an open interruption. Resolve it first.",
             plan.slug
         ),
     }
@@ -1979,6 +1986,9 @@ fn dry_run_report(plan: &Plan, all_steps: &[Step], steps_to_run: &[Step]) -> Res
             StepStatus::Failed => "WOULD RETRY",
             StepStatus::InProgress => "WOULD RESUME",
             StepStatus::Aborted => "WOULD RETRY",
+            // Derived overlay; never stored, so a dry run (which reads stored
+            // statuses) won't normally see it.
+            StepStatus::Blocked => "BLOCKED (open interruption)",
         };
         println!(
             "  [{}/{}] Step {}: {} [{}]",

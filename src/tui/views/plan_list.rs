@@ -576,16 +576,18 @@ fn collapse_spaces(s: &str) -> String {
 
 /// Status-dot color for a plan tile.
 ///
-/// Colors come from TUI-plan.md §5 status legend. `PlanStatus::Question` is a
-/// derived state (§17): callers stamp it onto `tile.plan.status` whenever an
-/// unanswered question row exists for the plan.
+/// Colors come from TUI-plan.md §5 status legend. `PlanStatus::Interrupted`
+/// is a derived state (docs/dag-redesign.md §3.4/§6): callers stamp it onto
+/// `tile.plan.status` whenever an open interruption (question *or* blocker)
+/// exists for the plan. (The §12.5 colour-token rename to `STATUS_BLOCKED`
+/// lands with the Phase 4 TUI work; the variant rename here is colour-stable.)
 fn status_dot_color(status: PlanStatus) -> ratatui::style::Color {
     match status {
         PlanStatus::Complete => theme::STATUS_COMPLETE,
         PlanStatus::InProgress => theme::STATUS_IN_PROGRESS,
         PlanStatus::Planning | PlanStatus::Ready => theme::STATUS_PENDING,
         PlanStatus::Failed | PlanStatus::Aborted | PlanStatus::Archived => theme::STATUS_FAILED,
-        PlanStatus::Question => theme::STATUS_QUESTION,
+        PlanStatus::Interrupted => theme::STATUS_QUESTION,
     }
 }
 
@@ -1830,7 +1832,7 @@ mod tests {
         assert_eq!(status_dot_color(PlanStatus::Failed), theme::STATUS_FAILED);
         assert_eq!(status_dot_color(PlanStatus::Aborted), theme::STATUS_FAILED);
         assert_eq!(
-            status_dot_color(PlanStatus::Question),
+            status_dot_color(PlanStatus::Interrupted),
             theme::STATUS_QUESTION
         );
     }

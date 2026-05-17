@@ -251,12 +251,17 @@ pub fn status_icon(status: StepStatus, color: bool) -> &'static str {
         (StepStatus::Failed, true) => "\x1b[31m✘\x1b[0m",
         (StepStatus::Skipped, true) => "\x1b[90m⊘\x1b[0m",
         (StepStatus::Aborted, true) => "\x1b[31m⊘\x1b[0m",
+        // Blocked is the §3.3 derived overlay (open interruption). Closest
+        // ANSI to the §12.5 orange is yellow; a distinct `?` glyph reads as
+        // "needs a human" alongside the plan-level derived status.
+        (StepStatus::Blocked, true) => "\x1b[33m?\x1b[0m",
         (StepStatus::Pending, false) => "○",
         (StepStatus::InProgress, false) => "▶",
         (StepStatus::Complete, false) => "✔",
         (StepStatus::Failed, false) => "✘",
         (StepStatus::Skipped, false) => "⊘",
         (StepStatus::Aborted, false) => "⊘",
+        (StepStatus::Blocked, false) => "?",
     }
 }
 
@@ -274,6 +279,7 @@ pub fn colored_status(status: StepStatus, color: bool) -> String {
         StepStatus::Failed => "\x1b[31m",
         StepStatus::Skipped => "\x1b[90m",
         StepStatus::Aborted => "\x1b[31m",
+        StepStatus::Blocked => "\x1b[33m",
     };
     format!("{code}{}\x1b[0m", status.as_str())
 }
@@ -290,7 +296,7 @@ pub fn plan_status_icon(status: PlanStatus, color: bool) -> &'static str {
         (PlanStatus::Failed, true) => "\x1b[31m✘\x1b[0m",
         (PlanStatus::Aborted, true) => "\x1b[31m⊘\x1b[0m",
         (PlanStatus::Archived, true) => "\x1b[90m▪\x1b[0m",
-        (PlanStatus::Question, true) => "\x1b[33m?\x1b[0m",
+        (PlanStatus::Interrupted, true) => "\x1b[33m?\x1b[0m",
         (PlanStatus::Planning, false) => "◯",
         (PlanStatus::Ready, false) => "◉",
         (PlanStatus::InProgress, false) => "▶",
@@ -298,7 +304,7 @@ pub fn plan_status_icon(status: PlanStatus, color: bool) -> &'static str {
         (PlanStatus::Failed, false) => "✘",
         (PlanStatus::Aborted, false) => "⊘",
         (PlanStatus::Archived, false) => "▪",
-        (PlanStatus::Question, false) => "?",
+        (PlanStatus::Interrupted, false) => "?",
     }
 }
 
@@ -361,7 +367,7 @@ pub fn colored_plan_status(status: PlanStatus, color: bool) -> String {
         PlanStatus::Failed => "\x1b[31m",
         PlanStatus::Aborted => "\x1b[31m",
         PlanStatus::Archived => "\x1b[90m",
-        PlanStatus::Question => "\x1b[33m",
+        PlanStatus::Interrupted => "\x1b[33m",
     };
     format!("{code}{}\x1b[0m", status.as_str())
 }

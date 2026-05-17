@@ -4432,7 +4432,11 @@ where
         plan: Some(plan.description.clone()),
     };
 
-    let answered_questions = storage::list_answered_questions_for_step(conn, &step.id)?;
+    let resolved_interruptions = storage::list_resolved_interruptions_for_step(
+        conn,
+        &step.id,
+        storage::DEFAULT_RESOLVED_INTERRUPTION_LIMIT,
+    )?;
 
     // max_attempts resolution mirrors execute_step in src/executor.rs.
     let max_attempts = step
@@ -4449,7 +4453,7 @@ where
         agent_name,
         supports_agent_file,
         &prompts,
-        &answered_questions,
+        &resolved_interruptions,
         max_attempts,
         &logs,
     );
