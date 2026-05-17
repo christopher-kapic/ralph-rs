@@ -16,6 +16,7 @@ mod plan;
 mod plan_harness;
 mod preflight;
 mod prompt;
+mod review;
 mod run_lock;
 mod runner;
 mod signal;
@@ -109,6 +110,7 @@ fn main() -> Result<()> {
                 agent,
                 retry_strategy,
                 squash_on_complete,
+                max_review_corrections,
                 tests,
                 depends_on,
             } => {
@@ -126,6 +128,7 @@ fn main() -> Result<()> {
                     agent.as_deref(),
                     retry_strategy,
                     squash_on_complete,
+                    max_review_corrections,
                     &tests,
                     &depends_on,
                     &out,

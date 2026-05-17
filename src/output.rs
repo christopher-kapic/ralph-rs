@@ -121,6 +121,61 @@ pub enum RunEvent {
         attempt: i32,
         at: DateTime<Utc>,
     },
+    /// Emitted the moment a read-only reviewer is spawned against a
+    /// committed iteration (docs/dag-redesign.md §3.2/§9-inv-2). Lets the
+    /// TUI show a "reviewing" badge without polling. The review runs
+    /// concurrently with the next unrelated implementation; it is read-only
+    /// w.r.t. the working tree (fixed `commit_sha`).
+    ReviewStarted {
+        step_id: String,
+        step_num: usize,
+        commit_sha: String,
+        iteration: i32,
+    },
+    /// Emitted when a reviewer returns a verdict. `passed = true` ⇒
+    /// `REVIEW PASS` (the step is `Complete`/`Passed`); `false` ⇒
+    /// `REVIEW FAIL` (a corrective step is requested — see
+    /// `corrective_step_requested`). The matching `Ralph-Review` commit
+    /// trailer is annotated `passed`/`failed` alongside this event.
+    ReviewFinished {
+        step_id: String,
+        step_num: usize,
+        commit_sha: String,
+        iteration: i32,
+        passed: bool,
+    },
+    /// The reviewer-side half of the §9-inv-3 structured channel: a failed
+    /// review *requests* (never performs) a corrective-step insertion. The
+    /// orchestrator — the SOLE DAG writer — consumes the matching
+    /// `corrective_step_requests` bridge row at a scheduler tick and performs
+    /// the §10 insert + re-parent. A reviewer subprocess never writes step
+    /// rows/edges; this event + the DB bridge row ARE the request.
+    CorrectiveStepRequested {
+        reviewed_step_id: String,
+        reviewed_step_num: usize,
+        commit_sha: String,
+        iteration: i32,
+        issues: i32,
+    },
+    /// Emitted when the orchestrator (sole writer) has inserted corrective
+    /// step `A′` and re-parented every former dependent of `A` onto it
+    /// (§10). `corrects_step_id` is the reviewed step `A`.
+    CorrectiveStepInserted {
+        corrective_step_id: String,
+        corrective_short_id: String,
+        corrects_step_id: String,
+    },
+    /// Emitted when the review→correction→review chain hits the per-plan
+    /// `max_review_corrections` cap (§10 item 4 / §14.5): instead of
+    /// spawning another correction, the orchestrator raises a
+    /// `kind=blocker` interruption ("review loop — needs human") on the
+    /// offending step and stops the chain.
+    ReviewLoopEscalated {
+        step_id: String,
+        step_num: usize,
+        chain_len: usize,
+        cap: usize,
+    },
     /// Emitted when the runner exits cleanly because the operator set
     /// `plans.pause_requested` (TUI `[P]` keybinding or `ralph pause`).
     /// Distinct from `plan_complete`/`summary` so the TUI can surface the

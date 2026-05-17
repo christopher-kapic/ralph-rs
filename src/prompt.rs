@@ -292,6 +292,151 @@ pub fn build_step_prompt(
 }
 
 // ---------------------------------------------------------------------------
+// Reviewer prompt (docs/dag-redesign.md §8, §9-inv-2, Decision 5)
+// ---------------------------------------------------------------------------
+
+/// The structured-verdict contract the reviewer harness MUST emit.
+///
+/// The reviewer is a *separate* nondeterministic harness invocation
+/// (docs/dag-redesign.md §3.2/§9). Its only machine-consumed output is a
+/// single verdict line, which `crate::review::parse_review_verdict` parses:
+///
+/// - `REVIEW PASS` — no real defect found in *this step's* implementation.
+///   The step is `Complete` with `review_status = Passed`.
+/// - `REVIEW FAIL — N issue(s)` — a real defect was found; the orchestrator
+///   (sole DAG writer — §9-inv-3) inserts a corrective step and re-parents
+///   dependents (§10). The em-dash and `N` are advisory; the parser keys off
+///   the leading `REVIEW FAIL` token so a hyphen/spacing wobble can't flip a
+///   FAIL into a silently-ignored line.
+///
+/// This text is embedded verbatim in the reviewer prompt so the contract is
+/// stated *to the harness* exactly as the parser enforces it — the two must
+/// never drift. Case, the two literal tokens, and the read-only mandate are
+/// load-bearing.
+pub const REVIEW_VERDICT_CONTRACT: &str = "\
+## Your verdict (REQUIRED — exact format)
+
+End your reply with EXACTLY ONE of these two lines, on its own line, as the
+final line of your output:
+
+    REVIEW PASS
+    REVIEW FAIL — N issue(s)
+
+(`N` is the count of real defects you found; the wording after `REVIEW FAIL`
+is free text.) Emit nothing after the verdict line.";
+
+/// Build the **read-only reviewer prompt** for one committed iteration.
+///
+/// This is deliberately a SEPARATE builder from [`build_step_prompt`] with
+/// **no shared assembly** (docs/dag-redesign.md §8): the four-layer
+/// Global/Project/Plan/Step stack, retry context, resolved-interruptions,
+/// step map, deterministic-tests, and question-ask sections are all
+/// irrelevant to a reviewer and would dilute the verdict. The reviewer sees
+/// only:
+///
+/// 1. Plan + step context — **titles and acceptance criteria ONLY** (no plan
+///    description body, no other steps' descriptions). The acceptance
+///    criteria ARE the review rubric.
+/// 2. The **single** commit diff for the reviewed iteration, supplied by the
+///    caller as the verbatim output of `git show <sha>` (one commit, never a
+///    cumulative `a..b` range and never a dependency's diff — Decision 5 /
+///    §4: the reviewer prompt is O(1) in plan size).
+/// 3. The §8 instruction (read-only; request a corrective step only on a
+///    real defect in *this step's* implementation) + the verdict contract
+///    ([`REVIEW_VERDICT_CONTRACT`]).
+///
+/// `commit_diff` MUST be exactly one commit's `git show` patch. The caller
+/// (`crate::review`) is the single place that produces it via
+/// `git::show_commit_diff`; passing a range diff here would violate the §9
+/// hard invariant — the dedicated unit test asserts the assembled prompt
+/// contains exactly one diff and zero dependency/cumulative diffs.
+pub fn build_review_prompt(
+    plan: &Plan,
+    step: &Step,
+    short_commit: &str,
+    iteration: i32,
+    commit_diff: &str,
+) -> String {
+    let mut sections: Vec<String> = Vec::new();
+
+    // (1) Plan + step context — titles + acceptance criteria ONLY. We
+    // intentionally do NOT emit `plan.description` (the Plan prompt layer)
+    // or any other step's body: the review rubric is this step's acceptance
+    // criteria, and pulling in surrounding context would both dilute the
+    // verdict and risk re-introducing cross-step accumulation (§4).
+    sections.push(format!(
+        "# Review task\n\n\
+         You are reviewing one committed iteration of a single step in the \
+         `{slug}` plan. This is a **read-only code review** — see the rules \
+         below.\n\n\
+         **Plan:** {slug}\n\
+         **Step:** {title}",
+        slug = plan.slug,
+        title = step.title,
+    ));
+
+    if step.acceptance_criteria.is_empty() {
+        sections.push(
+            "## Acceptance criteria\n\n\
+             _This step declared no explicit acceptance criteria. Judge the \
+             commit against the step title and whether the change is a \
+             coherent, defect-free implementation of it._"
+                .to_string(),
+        );
+    } else {
+        let mut lines = vec![
+            "## Acceptance criteria".to_string(),
+            String::new(),
+            "Review the commit against THESE criteria and nothing else:".to_string(),
+            String::new(),
+        ];
+        for c in &step.acceptance_criteria {
+            lines.push(format!("- {c}"));
+        }
+        sections.push(lines.join("\n"));
+    }
+
+    // (2) The SINGLE commit diff (O(1) — Decision 5). Fenced as ```diff so
+    // the harness reads it as one patch; this is the verbatim
+    // `git show <sha>` output for exactly the reviewed iteration's commit.
+    sections.push(format!(
+        "## Commit under review: `{short_commit}` ({sid}.{n})\n\n\
+         This is the **entire** change introduced by this one commit — the \
+         only thing you are reviewing. Do not request, fetch, or reason about \
+         any other commit's diff.\n\n\
+         ```diff\n{diff}\n```",
+        short_commit = short_commit,
+        sid = step.short_id,
+        n = iteration,
+        diff = commit_diff,
+    ));
+
+    // (3) The §8 read-only instruction + verdict contract.
+    sections.push(format!(
+        "## Review rules (READ-ONLY)\n\n\
+         Review commit `{sid}.{n}` against this step's acceptance criteria.\n\n\
+         - You are **read-only**. Do NOT modify, create, or delete any files. \
+           Do NOT run commands that change the working tree or git state. The \
+           commit is fixed history; your job is solely to judge it.\n\
+         - Only if you find a **real defect in THIS step's implementation** \
+           (a criterion genuinely unmet, a bug introduced by this commit, a \
+           regression) should you fail the review. Style nits, hypothetical \
+           future concerns, or pre-existing issues NOT introduced by this \
+           commit are NOT grounds to fail.\n\
+         - If you fail it, a **corrective step** will be inserted immediately \
+           after this step, and everything that depended on this step will be \
+           re-pointed at the correction. You do not create that step — you \
+           only deliver the verdict; the orchestrator performs the change.\n\n\
+         {contract}",
+        sid = step.short_id,
+        n = iteration,
+        contract = REVIEW_VERDICT_CONTRACT,
+    ));
+
+    sections.join("\n\n")
+}
+
+// ---------------------------------------------------------------------------
 // Section formatters
 // ---------------------------------------------------------------------------
 
@@ -599,6 +744,7 @@ mod tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         }
     }
 
@@ -1484,6 +1630,99 @@ mod tests {
         assert!(prompt.contains("## Asking the user a question"));
     }
 
+    // ---- Reviewer prompt (STEP 36; §8 / §9-inv-2 / Decision 5) ----
+
+    #[test]
+    fn test_build_review_prompt_basic_structure() {
+        let plan = make_plan();
+        let mut step = make_step();
+        step.short_id = "abcd1234".to_string();
+        step.acceptance_criteria = vec![
+            "spawn_harness() works".to_string(),
+            "Tests pass".to_string(),
+        ];
+
+        let diff = "diff --git a/src/x.rs b/src/x.rs\n\
+                    @@ -1 +1 @@\n-old\n+new";
+        let prompt = build_review_prompt(&plan, &step, "deadbee", 2, diff);
+
+        // Plan + step titles, NOT the plan description body.
+        assert!(prompt.contains("**Plan:** test-plan"));
+        assert!(prompt.contains("Implement harness spawning"));
+        assert!(
+            !prompt.contains("Build a new feature for the project"),
+            "reviewer prompt must NOT carry the plan description (§8: titles \
+             + acceptance criteria only)"
+        );
+
+        // Acceptance criteria ARE the rubric.
+        assert!(prompt.contains("## Acceptance criteria"));
+        assert!(prompt.contains("- spawn_harness() works"));
+        assert!(prompt.contains("- Tests pass"));
+
+        // The single commit diff, framed with the <short_id>.<n> handle.
+        assert!(prompt.contains("abcd1234.2"));
+        assert!(prompt.contains("deadbee"));
+        assert!(prompt.contains("+new"));
+
+        // §8 read-only instruction + verdict contract.
+        assert!(prompt.contains("READ-ONLY"));
+        assert!(prompt.contains("Do NOT modify"));
+        assert!(prompt.contains("corrective step"));
+        assert!(prompt.contains("REVIEW PASS"));
+        assert!(prompt.contains("REVIEW FAIL"));
+
+        // NONE of build_step_prompt's sections leak in (separate assembly).
+        assert!(!prompt.contains("## Plan step map"));
+        assert!(!prompt.contains("Post-harness validation"));
+        assert!(!prompt.contains("## Asking the user a question"));
+        assert!(!prompt.contains("# Retry Context"));
+    }
+
+    /// HARD-INVARIANT PROOF (Decision 5 / §4 / §9): the reviewer prompt
+    /// carries **exactly one** commit's diff and **zero** cumulative or
+    /// dependency diffs. We feed a single-commit `git show`-shaped patch and
+    /// assert there is exactly one diff fence and exactly one `diff --git`
+    /// header — i.e. the prompt did not (and structurally cannot) splice in a
+    /// prior step's / dependency's / range diff.
+    #[test]
+    fn test_review_prompt_is_o1_single_commit_diff_only() {
+        let plan = make_plan();
+        let mut step = make_step();
+        step.short_id = "ff00ff00".to_string();
+
+        // One commit's `git show --patch` output: a single `diff --git`
+        // header. (A cumulative/range diff would contain several.)
+        let one_commit_diff = "diff --git a/src/a.rs b/src/a.rs\n\
+             index 111..222 100644\n\
+             --- a/src/a.rs\n\
+             +++ b/src/a.rs\n\
+             @@ -1,2 +1,2 @@\n\
+             -let x = 1;\n\
+             +let x = 2;";
+
+        let prompt = build_review_prompt(&plan, &step, "abc1234", 1, one_commit_diff);
+
+        // Exactly one fenced ```diff block.
+        assert_eq!(
+            prompt.matches("```diff").count(),
+            1,
+            "reviewer prompt must contain exactly ONE diff block (O(1) — \
+             Decision 5). Prompt:\n{prompt}"
+        );
+        // Exactly one `diff --git` header — proves no cumulative/dependency
+        // diff was concatenated in (those carry one header per file/commit).
+        assert_eq!(
+            prompt.matches("diff --git").count(),
+            1,
+            "reviewer prompt must carry exactly one commit's diff, never a \
+             cumulative or dependency diff (§9 hard invariant). Prompt:\n{prompt}"
+        );
+        // And the diff content is precisely what the caller supplied,
+        // verbatim — the builder neither expands nor accumulates it.
+        assert!(prompt.contains(one_commit_diff));
+    }
+
     /// §4 fix proof: even when many resolved interruptions with very long
     /// fields are passed, the rendered section is bounded in BOTH
     /// dimensions — entry count (caller's slice, which in production is the
@@ -1505,14 +1744,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let resolved: Vec<Interruption> = (0..N)
-            .map(|_| {
-                resolved_intr(
-                    InterruptionKind::Question,
-                    &huge,
-                    Some(&huge),
-                    Some(&huge),
-                )
-            })
+            .map(|_| resolved_intr(InterruptionKind::Question, &huge, Some(&huge), Some(&huge)))
             .collect();
 
         let prompt = build_step_prompt(
@@ -1530,7 +1762,10 @@ mod tests {
         // heading) so we measure only this section's contribution.
         let start = prompt.find("## Resolved interruptions").unwrap();
         let rest = &prompt[start + "## Resolved interruptions".len()..];
-        let end = rest.find("\n## ").map(|p| start + p).unwrap_or(prompt.len());
+        let end = rest
+            .find("\n## ")
+            .map(|p| start + p)
+            .unwrap_or(prompt.len());
         let section = &prompt[start..end];
 
         // (1) Per-field truncation fired — the elision marker is present and

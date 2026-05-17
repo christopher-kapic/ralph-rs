@@ -972,6 +972,7 @@ mod tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         };
         let results = run_preflight_checks(&plan, &[], &config, tmp.path()).unwrap();
         let auth = results

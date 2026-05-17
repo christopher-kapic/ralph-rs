@@ -2411,8 +2411,7 @@ mod tests {
         assert_eq!(cfg.review.harness, "codex");
         assert_eq!(cfg.review.model, "gpt-5-codex");
 
-        let round: Config =
-            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        let round: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(round.review, cfg.review);
     }
 
@@ -2458,6 +2457,7 @@ mod tests {
             retry_strategy: None,
             review_enabled,
             squash_on_complete: false,
+            max_review_corrections: None,
         }
     }
 
@@ -2506,10 +2506,7 @@ mod tests {
         for step in [None, Some(true), Some(false)] {
             for plan in [None, Some(true), Some(false)] {
                 for global in [None, Some(true), Some(false)] {
-                    let expected = step
-                        .or(plan)
-                        .or(global)
-                        .unwrap_or(false);
+                    let expected = step.or(plan).or(global).unwrap_or(false);
                     let got = effective_review_enabled(
                         &review_step(step),
                         &review_plan(plan),

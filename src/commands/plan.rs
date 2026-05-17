@@ -23,6 +23,7 @@ pub fn plan_create(
     agent: Option<&str>,
     retry_strategy: Option<RetryStrategy>,
     squash_on_complete: bool,
+    max_review_corrections: Option<i32>,
     tests: &[String],
     depends_on: &[String],
     out: &OutputContext,
@@ -65,6 +66,14 @@ pub fn plan_create(
     // entirely in that case (mirrors the `retry_strategy` handling above).
     if squash_on_complete {
         storage::set_plan_squash_on_complete(conn, &plan.id, true)?;
+    }
+
+    // Persist the per-plan review recursion cap only when explicitly given.
+    // `None` is the column default (NULL → built-in
+    // `review::DEFAULT_MAX_REVIEW_CORRECTIONS`), so skipping the write keeps
+    // the common case identical (mirrors `retry_strategy` / `squash` above).
+    if let Some(cap) = max_review_corrections {
+        storage::set_plan_max_review_corrections(conn, &plan.id, Some(cap))?;
     }
 
     // Attach each resolved dependency. Self-references and cycles are

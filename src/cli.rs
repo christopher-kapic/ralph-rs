@@ -475,6 +475,16 @@ pub enum PlanCommand {
         #[arg(long)]
         squash_on_complete: bool,
 
+        /// Cap the review→correction→review recursion depth for this plan
+        /// (docs/dag-redesign.md §10 item 4 / §14.5). When a corrective
+        /// step's own review keeps failing past this many corrections, ralph
+        /// raises a `kind=blocker` interruption ("review loop — needs
+        /// human") instead of spawning corrective steps indefinitely. Omit
+        /// to use the built-in default (3). Sibling of `--retry-strategy`:
+        /// the per-plan way to configure the review recursion bound.
+        #[arg(long, value_name = "N")]
+        max_review_corrections: Option<i32>,
+
         /// Deterministic test command(s) to validate each step.
         #[arg(long = "test")]
         tests: Vec<String>,
@@ -1580,10 +1590,8 @@ mod tests {
 
     #[test]
     fn test_parse_step_add_without_depends_on_is_empty() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "step", "add", "Solo step"]).unwrap();
-        if let Command::Step(StepCommand::Add { depends_on, .. }) = cli.command.unwrap()
-        {
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "add", "Solo step"]).unwrap();
+        if let Command::Step(StepCommand::Add { depends_on, .. }) = cli.command.unwrap() {
             assert!(depends_on.is_empty());
         } else {
             panic!("Expected Step Add");
@@ -1854,12 +1862,9 @@ mod tests {
 
     #[test]
     fn test_parse_step_dependency_list() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "step", "dependency", "list", "2"]).unwrap();
-        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::List {
-            step,
-            plan,
-        })) = cli.command.unwrap()
+        let cli = Cli::try_parse_from(["ralph-rs", "step", "dependency", "list", "2"]).unwrap();
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::List { step, plan })) =
+            cli.command.unwrap()
         {
             assert_eq!(step, "2");
             assert_eq!(plan, None);
@@ -2650,8 +2655,7 @@ mod tests {
 
     #[test]
     fn test_parse_block_positional_and_stdin() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "block", "needs sudo to install deps"]).unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "block", "needs sudo to install deps"]).unwrap();
         if let Command::Block { text } = cli.command.unwrap() {
             assert_eq!(text.as_deref(), Some("needs sudo to install deps"));
         } else {
@@ -2674,8 +2678,7 @@ mod tests {
             Command::Interruption(InterruptionCommand::List { plan: None })
         ));
 
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "interruption", "show", "abc-123"]).unwrap();
+        let cli = Cli::try_parse_from(["ralph-rs", "interruption", "show", "abc-123"]).unwrap();
         if let Command::Interruption(InterruptionCommand::Show { id }) = cli.command.unwrap() {
             assert_eq!(id, "abc-123");
         } else {

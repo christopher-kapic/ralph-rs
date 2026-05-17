@@ -75,6 +75,20 @@ pub struct StepResult {
     pub step_id: String,
     pub attempts_used: i32,
     pub commit_hash: Option<String>,
+    /// Set on a `Success` outcome when nondeterministic review is
+    /// effective-enabled for this step (docs/dag-redesign.md §3.2-§3.3 /
+    /// §9-inv-2). Carries `(commit_sha, iteration)` of the committed
+    /// iteration the read-only reviewer must run against. When `Some`, the
+    /// executor deliberately leaves the step `InProgress` (NOT `Complete`)
+    /// with `review_status = Pending`: the step reaches `Complete` only
+    /// after its review *returns* (§3.3), and its direct dependents stay
+    /// non-runnable until then (`deps_satisfied` requires `Complete`). The
+    /// runner spawns the concurrent review and finalizes the step.
+    ///
+    /// `None` for every step when review is not effective-enabled — i.e.
+    /// the linear-plan / no-review-config path is byte-identical to before
+    /// (the executor writes `Complete` exactly as today).
+    pub needs_review: Option<(String, i32)>,
 }
 
 /// Per-call options threaded from the runner into [`execute_step`] to drive
@@ -449,6 +463,7 @@ async fn finalize_failure(
         step_id: ctx.step.id.clone(),
         attempts_used: attempt,
         commit_hash: None,
+        needs_review: None,
     })
 }
 
@@ -702,6 +717,7 @@ async fn finalize_skipped(
         step_id: ctx.step.id.clone(),
         attempts_used: attempt,
         commit_hash,
+        needs_review: None,
     })
 }
 
@@ -873,6 +889,7 @@ async fn finalize_paused_for_question(
         step_id: ctx.step.id.clone(),
         attempts_used: attempt,
         commit_hash: None,
+        needs_review: None,
     })
 }
 
@@ -975,6 +992,7 @@ pub async fn execute_step(
                         step_id: step.id.clone(),
                         attempts_used: attempt,
                         commit_hash: None,
+                        needs_review: None,
                     });
                 }
             }
@@ -1221,6 +1239,7 @@ pub async fn execute_step(
                     step_id: step.id.clone(),
                     attempts_used: attempt,
                     commit_hash: None,
+                    needs_review: None,
                 });
             }
             prev_test_output = Some(format!("pre-step hook failed: {e}"));
@@ -1910,6 +1929,14 @@ pub async fn execute_step(
                         step_id: step.id.clone(),
                         attempts_used: attempt,
                         commit_hash: None,
+                        // Optional-policy no-diff success: nothing was
+                        // committed, so there is no SHA for a read-only
+                        // reviewer to run `git show` against. Review needs a
+                        // committed iteration (§3.2 commits *then* reviews);
+                        // a zero-diff success is not reviewable, so it
+                        // completes straight from passing tests exactly as
+                        // before (linear-plan parity).
+                        needs_review: None,
                     });
                 }
 
@@ -1992,8 +2019,38 @@ pub async fn execute_step(
                         Some(success_test_status),
                     )?;
 
-                    // Mark step as complete.
-                    storage::update_step_status(conn, &step.id, StepStatus::Complete)?;
+                    // Review gate (docs/dag-redesign.md §3.2-§3.3 / §9-inv-2).
+                    // A step reaches `Complete` only after its review
+                    // *returns* (any verdict). When review is
+                    // effective-enabled for this step we therefore DO NOT
+                    // mark it `Complete` here: we leave it `InProgress` with
+                    // `review_status = Pending` and hand the committed SHA
+                    // back to the runner via `needs_review`. The runner
+                    // spawns the read-only reviewer concurrently with the
+                    // next *unrelated* implementation; this step's direct
+                    // dependents stay non-runnable (deps_satisfied requires
+                    // `Complete`) until the review returns and the
+                    // orchestrator finalizes the step.
+                    //
+                    // When review is NOT effective-enabled (the default — no
+                    // review config), this is byte-identical to before: the
+                    // executor writes `Complete` and `needs_review` is
+                    // `None`, so a linear/no-review plan behaves exactly as
+                    // today.
+                    let review_on = crate::config::effective_review_enabled(step, plan, config);
+                    let needs_review = if review_on {
+                        storage::update_step_status(conn, &step.id, StepStatus::InProgress)?;
+                        storage::update_step_review_status(
+                            conn,
+                            &step.id,
+                            crate::plan::ReviewStatus::Pending,
+                        )?;
+                        Some((commit_hash.clone(), attempt))
+                    } else {
+                        // Mark step as complete (unchanged path).
+                        storage::update_step_status(conn, &step.id, StepStatus::Complete)?;
+                        None
+                    };
 
                     write_phase(
                         conn,
@@ -2016,6 +2073,7 @@ pub async fn execute_step(
                         step_id: step.id.clone(),
                         attempts_used: attempt,
                         commit_hash: Some(commit_hash),
+                        needs_review,
                     });
                 }
 
@@ -2848,6 +2906,7 @@ fn finalize_precancel(
         step_id: step_id.to_string(),
         attempts_used: attempt,
         commit_hash: None,
+        needs_review: None,
     })
 }
 
@@ -6648,7 +6707,16 @@ mod tests {
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Add the thing", "desc", None, None, &[], Some(0), None, None,
+            &conn,
+            &plan.id,
+            "Add the thing",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -6761,7 +6829,17 @@ mod tests {
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -6845,7 +6923,17 @@ mod tests {
         assert!(!plan.squash_on_complete);
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -6919,7 +7007,17 @@ mod tests {
         assert!(plan.squash_on_complete);
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Acc", "desc", None, None, &[], Some(1), None, None, None,
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -6974,7 +7072,10 @@ mod tests {
         );
         // The final tree is correct (both lines present).
         assert_eq!(
-            fs::read_to_string(dir.join("acc.txt")).unwrap().lines().count(),
+            fs::read_to_string(dir.join("acc.txt"))
+                .unwrap()
+                .lines()
+                .count(),
             2
         );
     }

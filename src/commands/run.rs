@@ -5694,7 +5694,10 @@ pub fn cmd_log(
             eprintln!("Iteration commits for plan '{}':", plan.slug);
             eprintln!();
             for (short_id, title, commits) in &iteration_groups {
-                println!("  {short_id} — {title} ({} iteration commits)", commits.len());
+                println!(
+                    "  {short_id} — {title} ({} iteration commits)",
+                    commits.len()
+                );
                 for (iteration, short_sha) in commits {
                     println!("    .{iteration} {short_sha}");
                 }
@@ -7192,11 +7195,31 @@ mod status_live_view_tests {
         let plan =
             storage::create_plan(&conn, "itp", &project, &branch, "d", None, None, &[]).unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "Step one", "", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Step one",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let (s2, _) = storage::create_step(
-            &conn, &plan.id, "Step two", "", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Step two",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -7491,6 +7514,7 @@ mod plan_detail_init_tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         }
     }
 
@@ -8356,6 +8380,7 @@ mod step_detail_dispatcher_tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         };
         let steps = vec![Step {
             id: "s0".to_string(),
@@ -9339,6 +9364,7 @@ mod sub_view_routing_tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         };
         let steps = vec![Step {
             id: "step-1".to_string(),
@@ -9770,6 +9796,7 @@ mod mouse_routing_tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         };
         PlanDetailApp::new(plan, Vec::new(), &Config::default())
     }
@@ -9797,6 +9824,7 @@ mod mouse_routing_tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         };
         let step = Step {
             id: "step-1".to_string(),

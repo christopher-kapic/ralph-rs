@@ -19,10 +19,7 @@ use crate::storage::{self, OpenQuestion};
 /// the numbered-list UX); anything else is treated as an id. An id that does
 /// not match any *open* interruption falls through to the caller's
 /// resolve/show, which produces a precise native error.
-fn resolve_selector<'a>(
-    opens: &'a [OpenQuestion],
-    selector: &str,
-) -> Option<&'a OpenQuestion> {
+fn resolve_selector<'a>(opens: &'a [OpenQuestion], selector: &str) -> Option<&'a OpenQuestion> {
     if let Ok(idx) = selector.parse::<usize>() {
         if idx >= 1 && idx <= opens.len() {
             return Some(&opens[idx - 1]);
@@ -246,7 +243,17 @@ mod tests {
         let plan = storage::create_plan(conn, slug, project, "br", "desc", None, None, &[])
             .expect("create_plan");
         let (step, _) = storage::create_step(
-            conn, &plan.id, "title", "desc", None, None, &[], None, None, None, None,
+            conn,
+            &plan.id,
+            "title",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .expect("create_step");
         (plan.id, step.id)
@@ -265,8 +272,14 @@ mod tests {
             InterruptionKind::Question,
             "DB engine?",
             &[
-                InterruptionOption { text: "Postgres".into(), priority: 1 },
-                InterruptionOption { text: "SQLite".into(), priority: 2 },
+                InterruptionOption {
+                    text: "Postgres".into(),
+                    priority: 1,
+                },
+                InterruptionOption {
+                    text: "SQLite".into(),
+                    priority: 2,
+                },
             ],
         )
         .unwrap();
@@ -291,7 +304,13 @@ mod tests {
 
         // Resolve the question via --option 2 (SQLite by priority).
         cmd_interruption_resolve(
-            &conn, project, &qid, Some(2), None, Some("go with file db"), &quiet_out(),
+            &conn,
+            project,
+            &qid,
+            Some(2),
+            None,
+            Some("go with file db"),
+            &quiet_out(),
         )
         .unwrap();
         let resolved = storage::list_interruptions_for_step(&conn, &step_id).unwrap();
@@ -302,7 +321,13 @@ mod tests {
 
         // Resolve the blocker via --answer.
         cmd_interruption_resolve(
-            &conn, project, &bid, None, Some("granted"), None, &quiet_out(),
+            &conn,
+            project,
+            &bid,
+            None,
+            Some("granted"),
+            None,
+            &quiet_out(),
         )
         .unwrap();
         let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
@@ -320,14 +345,15 @@ mod tests {
             1,
             InterruptionKind::Question,
             "?",
-            &[InterruptionOption { text: "only".into(), priority: 1 }],
+            &[InterruptionOption {
+                text: "only".into(),
+                priority: 1,
+            }],
         )
         .unwrap();
 
-        let err = cmd_interruption_resolve(
-            &conn, project, &qid, Some(5), None, None, &quiet_out(),
-        )
-        .unwrap_err();
+        let err = cmd_interruption_resolve(&conn, project, &qid, Some(5), None, None, &quiet_out())
+            .unwrap_err();
         assert!(err.to_string().contains("out of range"));
 
         // Still open.
@@ -340,10 +366,9 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let project = "/proj-unk";
         seed_plan_and_step(&conn, "p", project);
-        let err = cmd_interruption_resolve(
-            &conn, project, "nope", None, Some("x"), None, &quiet_out(),
-        )
-        .unwrap_err();
+        let err =
+            cmd_interruption_resolve(&conn, project, "nope", None, Some("x"), None, &quiet_out())
+                .unwrap_err();
         assert!(err.to_string().contains("No open interruption matched"));
     }
 }

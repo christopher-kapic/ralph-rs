@@ -295,6 +295,47 @@ pub fn get_commit_hash(workdir: &Path) -> Result<String> {
     Ok(out.trim().to_string())
 }
 
+/// Abbreviate a commit SHA to git's short form (`git rev-parse --short`).
+///
+/// Used by the read-only reviewer prompt (docs/dag-redesign.md §8) so the
+/// `<short_id>.<n>` framing in the instruction reads against a human-sized
+/// commit handle rather than a 40-char hash. Falls back to the first 12
+/// chars of `sha` if `git` can't resolve it (e.g. a synthetic SHA in a unit
+/// test) — purely cosmetic, never load-bearing.
+pub fn short_sha(workdir: &Path, sha: &str) -> String {
+    match git(workdir, &["rev-parse", "--short", sha]) {
+        Ok(out) => out.trim().to_string(),
+        Err(_) => sha.chars().take(12).collect(),
+    }
+}
+
+/// Return the unified diff **introduced by a single commit** —
+/// `git show <sha>` restricted to the patch with no pager/color.
+///
+/// This is the O(1) reviewer-diff primitive (docs/dag-redesign.md §4/§8,
+/// Decision 5): the reviewer is shown *exactly one* commit's change, never a
+/// cumulative range diff (`a..b`) and never a dependency's diff — so a
+/// step's review cost does not grow with the depth or width of the branch
+/// above it. The format is fixed to `--format=` (empty) + `--patch` so the
+/// output is *only* the diff hunks (no commit-header noise that could be
+/// mistaken for a second diff), keeping the §8/Decision-5 guarantee
+/// machine-checkable.
+pub fn show_commit_diff(workdir: &Path, sha: &str) -> Result<String> {
+    git(
+        workdir,
+        &[
+            "-c",
+            "core.pager=cat",
+            "show",
+            "--no-color",
+            "--format=",
+            "--patch",
+            sha,
+        ],
+    )
+    .with_context(|| format!("could not `git show` commit {sha}"))
+}
+
 /// Create a new branch rooted at the given SHA and switch to it.
 ///
 /// Equivalent to `git checkout -b <branch_name> <sha>`. Fails if the branch
@@ -969,6 +1010,83 @@ pub fn parse_trailer(workdir: &Path, sha: &str, key: &str) -> Result<Option<Stri
             && k.trim().eq_ignore_ascii_case(key)
         {
             let v = value.trim();
+            if !v.is_empty() {
+                return Ok(Some(v.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Dedicated git-notes ref the review pipeline annotates verdicts under.
+/// Notes attach to a *fixed* commit SHA without rewriting history (so it is
+/// safe to annotate a non-HEAD historical iteration commit) and without ever
+/// touching the working tree (so it does not violate the §9-inv-2 "reviews
+/// are strictly read-only w.r.t. the working tree" hard invariant — a note
+/// write changes `refs/notes/...`, not the index/worktree/branch).
+pub const REVIEW_NOTES_REF: &str = "refs/notes/ralph-review";
+
+/// Annotate the reviewed commit's `Ralph-Review` verdict (§5/§9).
+///
+/// The per-iteration commit bakes in `Ralph-Review: pending` at commit time
+/// (it is immutable history). The verdict (`passed` | `failed` | `skipped` |
+/// `disabled`) is recorded *after the fact* against the fixed SHA via a git
+/// note on [`REVIEW_NOTES_REF`], NOT by amending/rewriting the commit:
+///
+/// - Amending a historical commit would rewrite linear history and shift
+///   every later iteration commit's SHA — fatal under concurrent reviews
+///   (§9-inv-2: a review runs against a *fixed* SHA while the next
+///   implementation is already committing on top).
+/// - A note write is read-only w.r.t. the working tree / index / branch ref,
+///   so it preserves the read-only-review hard invariant.
+///
+/// The note body is a single `Ralph-Review: <verdict>` line — the same
+/// trailer key ([`ITERATION_REVIEW_TRAILER`]) the commit carries — so
+/// tooling reads the final verdict by preferring the note over the baked-in
+/// `pending`. `--force` so a re-review (corrective-chain) overwrites a prior
+/// note rather than erroring.
+pub fn annotate_review_verdict(workdir: &Path, sha: &str, verdict: &str) -> Result<()> {
+    let body = format!("{ITERATION_REVIEW_TRAILER}: {verdict}");
+    git(
+        workdir,
+        &[
+            "notes",
+            "--ref",
+            REVIEW_NOTES_REF,
+            "add",
+            "--force",
+            "-m",
+            &body,
+            sha,
+        ],
+    )
+    .with_context(|| format!("could not annotate review verdict on commit {sha}"))?;
+    Ok(())
+}
+
+/// Read back the annotated `Ralph-Review` verdict for `sha` (the note on
+/// [`REVIEW_NOTES_REF`]), or `None` when no verdict has been recorded yet
+/// (the commit still carries only its baked-in `pending` trailer). Used by
+/// tests and `ralph log` to surface the *final* verdict rather than the
+/// commit-time placeholder.
+#[allow(dead_code)] // surfaced by `ralph log` in a later Phase-3 step; used by tests now
+pub fn read_review_verdict(workdir: &Path, sha: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["notes", "--ref", REVIEW_NOTES_REF, "show", sha])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to read review note for {sha}"))?;
+    if !output.status.success() {
+        // `git notes show` exits non-zero when there is no note — that is the
+        // "not yet reviewed / no verdict" case, not an error.
+        return Ok(None);
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    for line in raw.lines() {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case(ITERATION_REVIEW_TRAILER)
+        {
+            let v = v.trim();
             if !v.is_empty() {
                 return Ok(Some(v.to_string()));
             }
@@ -1853,7 +1971,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_commit_subject_collapses_and_caps() {
-        assert_eq!(sanitize_commit_subject("Add  OAuth\tlogin"), "Add OAuth login");
+        assert_eq!(
+            sanitize_commit_subject("Add  OAuth\tlogin"),
+            "Add OAuth login"
+        );
         assert_eq!(
             sanitize_commit_subject("line one\nline two\n\nline three"),
             "line one line two line three"
@@ -1888,13 +2009,25 @@ mod tests {
 
         // Commit two iterations for one step + one for another.
         fs::write(dir.join("a.txt"), "1").unwrap();
-        commit_changes(&dir, &build_iteration_commit_message("STEPAAAA", 1, "A", "p")).unwrap();
+        commit_changes(
+            &dir,
+            &build_iteration_commit_message("STEPAAAA", 1, "A", "p"),
+        )
+        .unwrap();
         let a1 = get_commit_hash(&dir).unwrap();
         fs::write(dir.join("a.txt"), "2").unwrap();
-        commit_changes(&dir, &build_iteration_commit_message("STEPAAAA", 2, "A", "p")).unwrap();
+        commit_changes(
+            &dir,
+            &build_iteration_commit_message("STEPAAAA", 2, "A", "p"),
+        )
+        .unwrap();
         let a2 = get_commit_hash(&dir).unwrap();
         fs::write(dir.join("b.txt"), "1").unwrap();
-        commit_changes(&dir, &build_iteration_commit_message("STEPBBBB", 1, "B", "p")).unwrap();
+        commit_changes(
+            &dir,
+            &build_iteration_commit_message("STEPBBBB", 1, "B", "p"),
+        )
+        .unwrap();
         let b1 = get_commit_hash(&dir).unwrap();
 
         // Trailer parsing is by git's own parser (not subject scraping):
@@ -1931,7 +2064,11 @@ mod tests {
         }
         // Step A's file is gone (both iterations reverted); step B's stays.
         assert!(!dir.join("a.txt").exists(), "A reverted");
-        assert_eq!(fs::read_to_string(dir.join("b.txt")).unwrap(), "1", "B intact");
+        assert_eq!(
+            fs::read_to_string(dir.join("b.txt")).unwrap(),
+            "1",
+            "B intact"
+        );
     }
 
     #[test]
@@ -1940,11 +2077,23 @@ mod tests {
         let base = get_commit_hash(&dir).unwrap();
 
         fs::write(dir.join("acc.txt"), "1\n").unwrap();
-        commit_changes(&dir, &build_iteration_commit_message("SQ123456", 1, "Acc", "p")).unwrap();
+        commit_changes(
+            &dir,
+            &build_iteration_commit_message("SQ123456", 1, "Acc", "p"),
+        )
+        .unwrap();
         fs::write(dir.join("acc.txt"), "1\n2\n").unwrap();
-        commit_changes(&dir, &build_iteration_commit_message("SQ123456", 2, "Acc", "p")).unwrap();
+        commit_changes(
+            &dir,
+            &build_iteration_commit_message("SQ123456", 2, "Acc", "p"),
+        )
+        .unwrap();
         fs::write(dir.join("acc.txt"), "1\n2\n3\n").unwrap();
-        commit_changes(&dir, &build_iteration_commit_message("SQ123456", 3, "Acc", "p")).unwrap();
+        commit_changes(
+            &dir,
+            &build_iteration_commit_message("SQ123456", 3, "Acc", "p"),
+        )
+        .unwrap();
 
         let count_before = git(&dir, &["rev-list", "--count", "HEAD"])
             .unwrap()
@@ -1966,7 +2115,10 @@ mod tests {
             "3 iteration commits collapse into 1"
         );
         // The squashed commit keeps the final tree state and the trailers.
-        assert_eq!(fs::read_to_string(dir.join("acc.txt")).unwrap(), "1\n2\n3\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("acc.txt")).unwrap(),
+            "1\n2\n3\n"
+        );
         assert_eq!(
             parse_trailer(&dir, &sha, ITERATION_STEP_TRAILER)
                 .unwrap()

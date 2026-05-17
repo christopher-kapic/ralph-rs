@@ -913,6 +913,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &["cargo build".to_string()],
             &[],
             &test_out(),
@@ -944,6 +945,7 @@ mod tests {
             None,
             Some(crate::plan::RetryStrategy::Rollback),
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -973,6 +975,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1000,6 +1003,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1026,6 +1030,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1051,6 +1056,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1118,6 +1124,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1206,6 +1213,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1255,6 +1263,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1323,6 +1332,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1367,7 +1377,16 @@ mod tests {
         )
         .unwrap();
 
-        step_remove(&conn, "my-plan", &project, Some("2"), None, true, &test_out()).unwrap();
+        step_remove(
+            &conn,
+            "my-plan",
+            &project,
+            Some("2"),
+            None,
+            true,
+            &test_out(),
+        )
+        .unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "my-plan", &project)
             .unwrap()
@@ -1391,6 +1410,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1462,6 +1482,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1493,7 +1514,16 @@ mod tests {
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         storage::update_step_status(&conn, &steps[0].id, StepStatus::Failed).unwrap();
 
-        step_reset(&conn, "my-plan", &project, Some("1"), None, true, &test_out()).unwrap();
+        step_reset(
+            &conn,
+            "my-plan",
+            &project,
+            Some("1"),
+            None,
+            true,
+            &test_out(),
+        )
+        .unwrap();
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].status, StepStatus::Pending);
@@ -1514,6 +1544,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1603,6 +1634,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1694,6 +1726,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1709,6 +1742,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1724,6 +1758,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &["plan-a".to_string(), "plan-b".to_string()],
             &test_out(),
@@ -1759,6 +1794,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &["nonexistent".to_string()],
             &test_out(),
@@ -1784,6 +1820,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1799,6 +1836,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1835,6 +1873,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1865,6 +1904,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1880,6 +1920,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1920,6 +1961,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1935,6 +1977,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &["plan-a".to_string()],
             &test_out(),
@@ -1977,6 +2020,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1992,6 +2036,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &["plan-a".to_string()],
             &test_out(),
@@ -2007,6 +2052,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &["plan-a".to_string()],
             &test_out(),
@@ -2037,15 +2083,7 @@ mod tests {
 
         // Add via a numeric selector (step 3) depending on a short_id
         // selector (step 1) — both forms must resolve through resolve_step.
-        step_dependency_add(
-            &conn,
-            "sel",
-            &project,
-            "3",
-            &[sids[0].clone()],
-            &test_out(),
-        )
-        .unwrap();
+        step_dependency_add(&conn, "sel", &project, "3", &[sids[0].clone()], &test_out()).unwrap();
 
         let s3 = resolve_step(&conn, &_plan_id, Some(sids[2].as_str()), None)
             .unwrap()
@@ -2090,15 +2128,8 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        step_dependency_remove(
-            &conn,
-            "sel",
-            &project,
-            "3",
-            &["1".to_string()],
-            &test_out(),
-        )
-        .unwrap();
+        step_dependency_remove(&conn, "sel", &project, "3", &["1".to_string()], &test_out())
+            .unwrap();
     }
 
     #[test]
@@ -2115,6 +2146,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -2140,7 +2172,15 @@ mod tests {
         )
         .unwrap();
 
-        let result = step_remove(&conn, "my-plan", &project, Some("5"), None, true, &test_out());
+        let result = step_remove(
+            &conn,
+            "my-plan",
+            &project,
+            Some("5"),
+            None,
+            true,
+            &test_out(),
+        );
         assert!(result.is_err());
     }
 
@@ -2358,8 +2398,7 @@ mod tests {
     /// Build a plan with `n` appended steps titled `Step {i}` (0-based).
     /// Returns `(plan_id, short_ids_in_order)`.
     fn plan_with_steps(conn: &Connection, project: &str, n: usize) -> (String, Vec<String>) {
-        let plan =
-            storage::create_plan(conn, "sel", project, "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(conn, "sel", project, "b", "d", None, None, &[]).unwrap();
         let mut sids = Vec::with_capacity(n);
         for i in 0..n {
             let (s, _) = storage::create_step(
@@ -2459,10 +2498,20 @@ mod tests {
         let a_step = resolve_step(&conn, &_plan_a, Some(a_sids[0].as_str()), None)
             .unwrap()
             .0;
-        let plan_b = storage::create_plan(&conn, "other", &project, "b", "d", None, None, &[])
-            .unwrap();
+        let plan_b =
+            storage::create_plan(&conn, "other", &project, "b", "d", None, None, &[]).unwrap();
         storage::create_step(
-            &conn, &plan_b.id, "B0", "", None, None, &[], None, None, None, None,
+            &conn,
+            &plan_b.id,
+            "B0",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 

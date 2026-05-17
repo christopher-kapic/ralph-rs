@@ -639,31 +639,24 @@ pub fn step_reset(
         // of the previous (the iteration scan is already newest-first; we
         // interleave by walking the iteration list, then any skip-WIP shas
         // not already covered).
-        let skip_shas = crate::git::skip_wip_commits_for_step(
-            workdir,
-            &plan.branch_name,
-            &step.id,
-        )
-        .with_context(|| {
-            format!(
-                "could not scan branch '{}' for skip-WIP commits",
-                plan.branch_name
-            )
-        })?;
-        let iter_shas: Vec<String> = crate::git::iteration_commits_for_step(
-            workdir,
-            &plan.branch_name,
-            &step.short_id,
-        )
-        .with_context(|| {
-            format!(
-                "could not scan branch '{}' for per-iteration step commits",
-                plan.branch_name
-            )
-        })?
-        .into_iter()
-        .map(|c| c.sha)
-        .collect();
+        let skip_shas = crate::git::skip_wip_commits_for_step(workdir, &plan.branch_name, &step.id)
+            .with_context(|| {
+                format!(
+                    "could not scan branch '{}' for skip-WIP commits",
+                    plan.branch_name
+                )
+            })?;
+        let iter_shas: Vec<String> =
+            crate::git::iteration_commits_for_step(workdir, &plan.branch_name, &step.short_id)
+                .with_context(|| {
+                    format!(
+                        "could not scan branch '{}' for per-iteration step commits",
+                        plan.branch_name
+                    )
+                })?
+                .into_iter()
+                .map(|c| c.sha)
+                .collect();
         // Both scans yield newest-first independently, but a step can own a
         // mix of skip-WIP and per-iteration commits interleaved with other
         // steps' commits. Re-order the combined set by actual branch
@@ -1110,6 +1103,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             &[],
             &[],
             &test_out(),
@@ -1821,11 +1815,31 @@ mod tests {
         let plan =
             storage::create_plan(&conn, "p", &project, &branch, "d", None, None, &[]).unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "Step one", "", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Step one",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let (s2, _) = storage::create_step(
-            &conn, &plan.id, "Step two", "", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Step two",
+            "",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -1852,7 +1866,16 @@ mod tests {
         storage::update_step_status(&conn, &s1.id, StepStatus::Failed).unwrap();
 
         // Reset step 1 by its short_id selector.
-        step_reset(&conn, "p", &project, Some(&s1.short_id), None, true, &test_out()).unwrap();
+        step_reset(
+            &conn,
+            "p",
+            &project,
+            Some(&s1.short_id),
+            None,
+            true,
+            &test_out(),
+        )
+        .unwrap();
 
         // Step 1's file is gone (both its iterations reverted), but step 2's
         // file and the ordinary file are intact — isolation holds even
@@ -2089,12 +2112,7 @@ mod tests {
         let (a, b) = (&steps[0], &steps[1]);
 
         // c depends on step #1 (by number) and step b (by short id).
-        add_plain(
-            &conn,
-            &project,
-            "c",
-            &["1".to_string(), b.short_id.clone()],
-        );
+        add_plain(&conn, &project, "c", &["1".to_string(), b.short_id.clone()]);
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         let c = steps.iter().find(|s| s.title == "c").unwrap();

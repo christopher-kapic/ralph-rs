@@ -6,12 +6,12 @@ use rusqlite::{Connection, params, params_from_iter};
 use uuid::Uuid;
 
 use crate::frac_index;
+#[cfg(test)]
+use crate::plan::InterruptionState;
 use crate::plan::{
     ChangePolicy, ExecutionLog, Interruption, InterruptionKind, InterruptionOption, PLAN_COLUMNS,
     Phase, Plan, PlanStatus, RetryStrategy, Step, StepStatus,
 };
-#[cfg(test)]
-use crate::plan::InterruptionState;
 use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 
 /// Canonical column list for `SELECT` queries against the `steps` table.
@@ -751,11 +751,7 @@ fn list_open_interruptions_enriched_impl(
         let suggestions: Vec<String> = ordered.into_iter().map(|o| o.text).collect();
         let kind_str: String = row.get(9)?;
         let kind = InterruptionKind::from_str(&kind_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                9,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
         })?;
         let step_num: i64 = row.get(4)?;
         Ok(OpenQuestion {
@@ -938,8 +934,8 @@ pub fn insert_interruption(
     options: &[InterruptionOption],
 ) -> Result<String> {
     let id = Uuid::new_v4().to_string();
-    let options_json = serde_json::to_string(options)
-        .context("serializing interruption options for insert")?;
+    let options_json =
+        serde_json::to_string(options).context("serializing interruption options for insert")?;
     conn.execute(
         "INSERT INTO interruptions \
             (id, step_id, attempt, kind, body, options, state, asked_at) \
@@ -1020,10 +1016,7 @@ pub fn list_open_interruptions_for_plan(
 /// first. Used by the step-detail TUI surface. NOT used for prompt assembly —
 /// the prompt path uses the bounded [`list_resolved_interruptions_for_step`].
 #[allow(dead_code)] // step-detail TUI surface lands in a later step.
-pub fn list_interruptions_for_step(
-    conn: &Connection,
-    step_id: &str,
-) -> Result<Vec<Interruption>> {
+pub fn list_interruptions_for_step(conn: &Connection, step_id: &str) -> Result<Vec<Interruption>> {
     let sql = format!(
         "SELECT {INTERRUPTION_COLUMNS} FROM interruptions \
          WHERE step_id = ?1 \
@@ -1159,14 +1152,32 @@ pub fn set_plan_retry_strategy(
 /// `updated_at`. Stored as a nullable INTEGER (V28): `false` writes 0
 /// rather than NULL so the value round-trips explicitly; `Plan::from_row`
 /// coerces both NULL and 0 to `false`.
-pub fn set_plan_squash_on_complete(
-    conn: &Connection,
-    plan_id: &str,
-    squash: bool,
-) -> Result<()> {
+pub fn set_plan_squash_on_complete(conn: &Connection, plan_id: &str, squash: bool) -> Result<()> {
     let affected = conn.execute(
         "UPDATE plans SET squash_on_complete = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
         params![if squash { 1 } else { 0 }, plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// Set (or clear) a plan's `max_review_corrections` cap (V30,
+/// docs/dag-redesign.md §10 item 4 / §14.5) and bump `updated_at`. `None`
+/// writes NULL → the runner uses the built-in default
+/// ([`crate::review::DEFAULT_MAX_REVIEW_CORRECTIONS`]); `Some(n)` pins the
+/// per-plan cap. Sibling setter to [`set_plan_squash_on_complete`] /
+/// [`set_plan_retry_strategy`] — the per-plan way to configure the review
+/// recursion bound, consistent with how `retry_strategy` is plan-configured.
+pub fn set_plan_max_review_corrections(
+    conn: &Connection,
+    plan_id: &str,
+    cap: Option<i32>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET max_review_corrections = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![cap, plan_id],
     )?;
     if affected == 0 {
         anyhow::bail!("Plan not found: {plan_id}");
@@ -2434,18 +2445,14 @@ pub fn add_step_dependency(
     }
 
     if would_create_step_cycle(conn, step_id, depends_on_step_id)? {
-        anyhow::bail!(
-            "Adding dependency {step_id} -> {depends_on_step_id} would create a cycle"
-        );
+        anyhow::bail!("Adding dependency {step_id} -> {depends_on_step_id} would create a cycle");
     }
 
     conn.execute(
         "INSERT INTO step_dependencies (step_id, depends_on_step_id) VALUES (?1, ?2)",
         params![step_id, depends_on_step_id],
     )
-    .with_context(|| {
-        format!("Failed to add dependency {step_id} -> {depends_on_step_id}")
-    })?;
+    .with_context(|| format!("Failed to add dependency {step_id} -> {depends_on_step_id}"))?;
 
     Ok(())
 }
@@ -2461,9 +2468,7 @@ pub fn remove_step_dependency(
         "DELETE FROM step_dependencies WHERE step_id = ?1 AND depends_on_step_id = ?2",
         params![step_id, depends_on_step_id],
     )
-    .with_context(|| {
-        format!("Failed to remove dependency {step_id} -> {depends_on_step_id}")
-    })?;
+    .with_context(|| format!("Failed to remove dependency {step_id} -> {depends_on_step_id}"))?;
     Ok(())
 }
 
@@ -2503,11 +2508,7 @@ pub fn list_step_dependents(conn: &Connection, step_id: &str) -> Result<Vec<Stri
 /// would close a cycle. A self-edge (`step_id == new_dep_id`) is also reported
 /// as a cycle. Reused by import validation (docs/dag-redesign.md §13.3).
 #[allow(dead_code)] // CLI/scheduler callers land in later DAG-redesign steps.
-pub fn would_create_step_cycle(
-    conn: &Connection,
-    step_id: &str,
-    new_dep_id: &str,
-) -> Result<bool> {
+pub fn would_create_step_cycle(conn: &Connection, step_id: &str, new_dep_id: &str) -> Result<bool> {
     if step_id == new_dep_id {
         return Ok(true);
     }
@@ -2565,6 +2566,182 @@ pub fn list_step_dependency_edges(
         edges.entry(step_id).or_default().push(dep_id);
     }
     Ok(edges)
+}
+
+// ---------------------------------------------------------------------------
+// Review pipeline: review_status, corrective steps, corrective-step request
+// bridge (docs/dag-redesign.md §3.3, §9-inv-3, §10)
+// ---------------------------------------------------------------------------
+
+/// Set a step's `review_status` (V27 `steps.review_status` TEXT column) and
+/// bump `updated_at`. NULL on disk means [`crate::plan::ReviewStatus::Pending`];
+/// this writes the explicit serialized variant so the
+/// Pending→InFlight→Passed/Failed transitions the review pipeline drives are
+/// durable and observable cross-process (mirrors [`update_step_status`]).
+pub fn update_step_review_status(
+    conn: &Connection,
+    step_id: &str,
+    status: crate::plan::ReviewStatus,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE steps SET review_status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![status.as_str(), step_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
+/// Point a (reviewer-inserted) step at the step it corrects (§10): sets
+/// `steps.corrects_step_id`. Only the orchestrator calls this, as the SOLE
+/// DAG writer (§9-inv-3). `None` clears it (an ordinary, non-corrective
+/// step). Does not bump `updated_at` — `corrects_step_id` is immutable
+/// provenance set once at corrective-step creation, like `short_id`.
+pub fn set_step_corrects_step_id(
+    conn: &Connection,
+    step_id: &str,
+    corrects: Option<&str>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE steps SET corrects_step_id = ?1 WHERE id = ?2",
+        params![corrects, step_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
+/// One open corrective-step request — the durable face of the §9-inv-3
+/// "structured channel" by which a reviewer *requests* (never performs) a
+/// DAG mutation. Rows live in `corrective_step_requests` (V29).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectiveStepRequest {
+    pub id: String,
+    pub reviewed_step_id: String,
+    pub reviewed_iteration: i32,
+    pub commit_sha: String,
+    pub issues: i32,
+    pub verdict_body: Option<String>,
+}
+
+/// Insert an OPEN corrective-step request (V29 bridge — docs/dag-redesign.md
+/// §9 invariant 3). This is the *only* DAG-related write a failed review
+/// performs: it records a *request*, keyed to the reviewed step + iteration +
+/// commit, that the orchestrator drains at a scheduler tick and acts on as
+/// the sole writer. Structural sibling of [`request_skip`] / V23 skip-bridge
+/// and [`insert_interruption`] / V26 interruption-bridge. Returns the
+/// generated request id.
+pub fn insert_corrective_step_request(
+    conn: &Connection,
+    reviewed_step_id: &str,
+    reviewed_iteration: i32,
+    commit_sha: &str,
+    issues: i32,
+    verdict_body: Option<&str>,
+) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO corrective_step_requests \
+            (id, reviewed_step_id, reviewed_iteration, commit_sha, issues, verdict_body, state, requested_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+        params![
+            id,
+            reviewed_step_id,
+            reviewed_iteration,
+            commit_sha,
+            issues,
+            verdict_body
+        ],
+    )?;
+    Ok(id)
+}
+
+/// List every OPEN corrective-step request whose reviewed step belongs to
+/// `plan_id`, oldest-first (`requested_at ASC, id ASC` — stable). The
+/// orchestrator drains these at a scheduler tick. Ordering is deterministic
+/// so the scheduler tie-break stays reproducible (§3.5 item 4 / §11).
+pub fn list_open_corrective_step_requests_for_plan(
+    conn: &Connection,
+    plan_id: &str,
+) -> Result<Vec<CorrectiveStepRequest>> {
+    let mut stmt = conn.prepare(
+        "SELECT r.id, r.reviewed_step_id, r.reviewed_iteration, r.commit_sha, r.issues, r.verdict_body \
+         FROM corrective_step_requests r \
+         JOIN steps s ON s.id = r.reviewed_step_id \
+         WHERE r.state = 'open' AND s.plan_id = ?1 \
+         ORDER BY r.requested_at ASC, r.id ASC",
+    )?;
+    let rows = stmt.query_map(params![plan_id], |row| {
+        Ok(CorrectiveStepRequest {
+            id: row.get(0)?,
+            reviewed_step_id: row.get(1)?,
+            reviewed_iteration: row.get(2)?,
+            commit_sha: row.get(3)?,
+            issues: row.get(4)?,
+            verdict_body: row.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Atomically mark a corrective-step request `consumed` **only when it is
+/// still `open`**, in one predicate-guarded transaction (the same
+/// read-and-clear discipline as [`take_skip_request_for_step`]). Returns
+/// `Ok(true)` when this call transitioned an open row (the caller owns the
+/// consumption and must perform the §10 mutation), `Ok(false)` when it was
+/// already consumed or gone — so the §9-inv-3 single-writer guarantee holds
+/// even if the drain is ever entered twice.
+pub fn consume_corrective_step_request(conn: &Connection, request_id: &str) -> Result<bool> {
+    let affected = conn.execute(
+        "UPDATE corrective_step_requests SET state = 'consumed' \
+         WHERE id = ?1 AND state = 'open'",
+        params![request_id],
+    )?;
+    Ok(affected > 0)
+}
+
+/// Length of the corrective chain ending at `step_id`, i.e. how many
+/// `corrects_step_id` hops it takes to walk back to a non-corrective step.
+///
+/// An ordinary step returns 0. A first corrective step A′ (`corrects A`,
+/// A ordinary) returns 1; A″ correcting A′ returns 2; and so on. The
+/// recursion-cap check (§10 item 4 / §14.5) compares the chain length the
+/// *next* correction would have against the per-plan
+/// `max_review_corrections`. A `visited` guard bounds the walk even if a
+/// `corrects_step_id` pointer is ever cyclic (it cannot be under normal
+/// operation — corrective steps only ever point *backward* at an
+/// already-existing step).
+pub fn corrective_chain_len(conn: &Connection, step_id: &str) -> Result<usize> {
+    let mut len = 0usize;
+    let mut current = step_id.to_string();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            break;
+        }
+        let corrects: Option<String> = conn
+            .query_row(
+                "SELECT corrects_step_id FROM steps WHERE id = ?1",
+                params![current],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        match corrects {
+            Some(parent) => {
+                len += 1;
+                current = parent;
+            }
+            None => break,
+        }
+    }
+    Ok(len)
 }
 
 // ---------------------------------------------------------------------------
@@ -2958,11 +3135,31 @@ mod tests {
         let plan = create_plan(&conn, "sid", "/proj", "b", "d", None, None, &[]).unwrap();
 
         let (s1, _) = create_step(
-            &conn, &plan.id, "Step one", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Step one",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let (s2, _) = create_step(
-            &conn, &plan.id, "Step two", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Step two",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -3849,18 +4046,18 @@ mod tests {
         // Different combinations of (attempt, open/resolved state) so we can
         // verify the scoping. Only attempt=2 still-open should count. Native
         // `interruptions` rows — no `step_questions`.
-        let q1 = insert_interruption(
+        let q1 =
+            insert_interruption(&conn, &step.id, 1, InterruptionKind::Question, "a1", &[]).unwrap();
+        resolve_interruption(&conn, &q1, "done", None).unwrap();
+        insert_interruption(
             &conn,
             &step.id,
             1,
             InterruptionKind::Question,
-            "a1",
+            "old open",
             &[],
         )
         .unwrap();
-        resolve_interruption(&conn, &q1, "done", None).unwrap();
-        insert_interruption(&conn, &step.id, 1, InterruptionKind::Question, "old open", &[])
-            .unwrap();
         insert_interruption(
             &conn,
             &step.id,
@@ -3923,15 +4120,8 @@ mod tests {
 
         // An open *question* (native `interruptions` row) derives
         // Interrupted.
-        let q1 = insert_interruption(
-            &conn,
-            &step.id,
-            1,
-            InterruptionKind::Question,
-            "open?",
-            &[],
-        )
-        .unwrap();
+        let q1 = insert_interruption(&conn, &step.id, 1, InterruptionKind::Question, "open?", &[])
+            .unwrap();
 
         assert_eq!(
             plan_effective_status(&conn, &plan.id).unwrap(),
@@ -3985,15 +4175,8 @@ mod tests {
         update_plan_status(&conn, &plan.id, PlanStatus::Complete).unwrap();
 
         // Resolved interruptions must not trigger the Interrupted shadow.
-        let q1 = insert_interruption(
-            &conn,
-            &step.id,
-            1,
-            InterruptionKind::Question,
-            "old?",
-            &[],
-        )
-        .unwrap();
+        let q1 = insert_interruption(&conn, &step.id, 1, InterruptionKind::Question, "old?", &[])
+            .unwrap();
         resolve_interruption(&conn, &q1, "yes", None).unwrap();
 
         assert_eq!(
@@ -4001,7 +4184,6 @@ mod tests {
             PlanStatus::Complete,
         );
     }
-
 
     #[test]
     fn test_set_plan_questions_enabled_missing_plan_errs() {
@@ -6331,7 +6513,17 @@ mod tests {
     fn step_for_interruptions(conn: &Connection) -> String {
         let plan = create_plan(conn, "intr", "/proj", "b", "d", None, None, &[]).unwrap();
         let (step, _) = create_step(
-            conn, &plan.id, "Step A", "d", None, None, &[], None, None, None, None,
+            conn,
+            &plan.id,
+            "Step A",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         step.id
@@ -6397,8 +6589,11 @@ mod tests {
             list_open_interruptions_for_plan(
                 &conn,
                 &conn
-                    .query_row("SELECT plan_id FROM steps WHERE id = ?1", params![step_id], |r| r
-                        .get::<_, String>(0))
+                    .query_row(
+                        "SELECT plan_id FROM steps WHERE id = ?1",
+                        params![step_id],
+                        |r| r.get::<_, String>(0)
+                    )
                     .unwrap()
             )
             .unwrap()
@@ -6450,10 +6645,7 @@ mod tests {
 
         // Double-resolve is a precise error (row exists but not open).
         let err = resolve_interruption(&conn, &id, "again", None).unwrap_err();
-        assert!(
-            err.to_string().contains("already resolved"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("already resolved"), "got: {err}");
 
         // Unknown id is a distinct precise error.
         let err = resolve_interruption(&conn, "no-such-id", "x", None).unwrap_err();
@@ -6539,11 +6731,31 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "scope", "/proj", "b", "d", None, None, &[]).unwrap();
         let (s1, _) = create_step(
-            &conn, &plan.id, "S1", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "S1",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let (s2, _) = create_step(
-            &conn, &plan.id, "S2", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "S2",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 

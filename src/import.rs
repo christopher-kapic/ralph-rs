@@ -439,8 +439,7 @@ fn import_plan_inner(
     // for existing linear plans (docs/dag-redesign.md §13.3). `created_ids`
     // is parallel to `data.steps`.
     let mut created_ids: Vec<String> = Vec::with_capacity(data.steps.len());
-    let mut short_to_id: std::collections::HashMap<&str, String> =
-        std::collections::HashMap::new();
+    let mut short_to_id: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     for step_data in &data.steps {
         let tags_arg: Option<&[String]> = if step_data.tags.is_empty() {
             None
@@ -1071,7 +1070,8 @@ mod tests {
 
         // Build the export payload for B manually, resolving A's slug.
         let b_steps = storage::list_steps(&conn, &plan_b.id).unwrap();
-        let exported_b = export::build_exported_plan(&plan_b, &b_steps, vec!["dep-a".to_string()], &[]);
+        let exported_b =
+            export::build_exported_plan(&plan_b, &b_steps, vec!["dep-a".to_string()], &[]);
         assert_eq!(exported_b.plan.depends_on, vec!["dep-a".to_string()]);
         let json_b = serde_json::to_string_pretty(&exported_b).unwrap();
 
@@ -1689,10 +1689,7 @@ mod tests {
     /// The plan's step edge set as a sorted set of `(step_short_id,
     /// dep_short_id)` pairs — a stable, UUID-independent fingerprint of
     /// the DAG used by the round-trip assertions.
-    fn edge_set(
-        conn: &Connection,
-        plan_id: &str,
-    ) -> std::collections::BTreeSet<(String, String)> {
+    fn edge_set(conn: &Connection, plan_id: &str) -> std::collections::BTreeSet<(String, String)> {
         let steps = storage::list_steps(conn, plan_id).unwrap();
         let by_id: std::collections::HashMap<String, String> = steps
             .iter()
@@ -1744,9 +1741,11 @@ mod tests {
             );
         }
         // Linear chain: S1->S0, S2->S1; S0 the sole root.
-        assert!(storage::list_step_dependencies(&conn, &steps[0].id)
-            .unwrap()
-            .is_empty());
+        assert!(
+            storage::list_step_dependencies(&conn, &steps[0].id)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             storage::list_step_dependencies(&conn, &steps[1].id).unwrap(),
             vec![steps[0].id.clone()]
@@ -1800,13 +1799,21 @@ mod tests {
     #[test]
     fn test_roundtrip_branched_plan_reproduces_dag() {
         let conn = setup();
-        let plan = storage::create_plan(
-            &conn, "diamond", "/tmp/src", "b", "d", None, None, &[],
-        )
-        .unwrap();
+        let plan =
+            storage::create_plan(&conn, "diamond", "/tmp/src", "b", "d", None, None, &[]).unwrap();
         let mk = |t: &str| {
             storage::create_step(
-                &conn, &plan.id, t, "d", None, None, &[], None, None, None, None,
+                &conn,
+                &plan.id,
+                t,
+                "d",
+                None,
+                None,
+                &[],
+                None,
+                None,
+                None,
+                None,
             )
             .unwrap()
             .0
@@ -1851,7 +1858,11 @@ mod tests {
         assert_eq!(edge_set(&conn, &imported_id), orig_edges);
         let roots: Vec<&str> = imported_steps
             .iter()
-            .filter(|s| storage::list_step_dependencies(&conn, &s.id).unwrap().is_empty())
+            .filter(|s| {
+                storage::list_step_dependencies(&conn, &s.id)
+                    .unwrap()
+                    .is_empty()
+            })
             .map(|s| s.short_id.as_str())
             .collect();
         assert_eq!(roots, vec![a.short_id.as_str()]);
@@ -1864,13 +1875,21 @@ mod tests {
     #[test]
     fn test_roundtrip_multi_root_no_edge_plan_stays_no_edge() {
         let conn = setup();
-        let plan = storage::create_plan(
-            &conn, "multiroot", "/tmp/src", "b", "d", None, None, &[],
-        )
-        .unwrap();
+        let plan = storage::create_plan(&conn, "multiroot", "/tmp/src", "b", "d", None, None, &[])
+            .unwrap();
         let mk = |t: &str| {
             storage::create_step(
-                &conn, &plan.id, t, "d", None, None, &[], None, None, None, None,
+                &conn,
+                &plan.id,
+                t,
+                "d",
+                None,
+                None,
+                &[],
+                None,
+                None,
+                None,
+                None,
             )
             .unwrap()
             .0
@@ -1979,13 +1998,21 @@ mod tests {
     #[test]
     fn test_roundtrip_linear_plan_preserves_short_ids_and_exact_chain() {
         let conn = setup();
-        let plan = storage::create_plan(
-            &conn, "linear", "/tmp/src", "b", "d", None, None, &[],
-        )
-        .unwrap();
+        let plan =
+            storage::create_plan(&conn, "linear", "/tmp/src", "b", "d", None, None, &[]).unwrap();
         let mk = |t: &str| {
             storage::create_step(
-                &conn, &plan.id, t, "d", None, None, &[], None, None, None, None,
+                &conn,
+                &plan.id,
+                t,
+                "d",
+                None,
+                None,
+                &[],
+                None,
+                None,
+                None,
+                None,
             )
             .unwrap()
             .0
@@ -2006,14 +2033,8 @@ mod tests {
             imported_data.steps[0].depends_on.is_empty(),
             "S0 is the root"
         );
-        assert_eq!(
-            imported_data.steps[1].depends_on,
-            vec![s0.short_id.clone()]
-        );
-        assert_eq!(
-            imported_data.steps[2].depends_on,
-            vec![s1.short_id.clone()]
-        );
+        assert_eq!(imported_data.steps[1].depends_on, vec![s0.short_id.clone()]);
+        assert_eq!(imported_data.steps[2].depends_on, vec![s1.short_id.clone()]);
         // It is classified DAG-aware (carries short_ids), not legacy.
         assert_eq!(classify_bundle(&imported_data.steps), BundleShape::DagAware);
 
@@ -2033,9 +2054,11 @@ mod tests {
         assert_eq!(steps[1].short_id, s1.short_id);
         assert_eq!(steps[2].short_id, s2.short_id);
         // Exact chain reproduced: S0 root, S1→S0, S2→S1.
-        assert!(storage::list_step_dependencies(&conn, &steps[0].id)
-            .unwrap()
-            .is_empty());
+        assert!(
+            storage::list_step_dependencies(&conn, &steps[0].id)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             storage::list_step_dependencies(&conn, &steps[1].id).unwrap(),
             vec![steps[0].id.clone()]
@@ -2080,11 +2103,19 @@ mod tests {
         );
         let err = import_plan_from_data(&conn, &data, &opts()).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("zzzzzzzz"), "message must name the bad id: {msg}");
-        assert!(msg.contains("dangling"), "message must cite the rule: {msg}");
-        assert!(storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
-            .unwrap()
-            .is_none());
+        assert!(
+            msg.contains("zzzzzzzz"),
+            "message must name the bad id: {msg}"
+        );
+        assert!(
+            msg.contains("dangling"),
+            "message must cite the rule: {msg}"
+        );
+        assert!(
+            storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Rule 2: duplicate `short_id`s within the bundle abort the import.
@@ -2100,9 +2131,11 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("duplicate short_id"), "got: {msg}");
         assert!(msg.contains("samesame"), "got: {msg}");
-        assert!(storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
-            .unwrap()
-            .is_none());
+        assert!(
+            storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Rule 0: a DAG-aware bundle with a step missing its `short_id`
@@ -2115,13 +2148,12 @@ mod tests {
                {"title": "B", "short_id": "bbbbbbbb", "depends_on": ["aaaaaaaa"]}"#,
         );
         let err = import_plan_from_data(&conn, &data, &opts()).unwrap_err();
+        assert!(err.to_string().contains("no short_id"), "got: {err}");
         assert!(
-            err.to_string().contains("no short_id"),
-            "got: {err}"
+            storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+                .unwrap()
+                .is_none()
         );
-        assert!(storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
-            .unwrap()
-            .is_none());
     }
 
     /// Rule 3: a dependency cycle aborts the import.
@@ -2134,9 +2166,11 @@ mod tests {
         );
         let err = import_plan_from_data(&conn, &data, &opts()).unwrap_err();
         assert!(err.to_string().contains("cycle"), "got: {err}");
-        assert!(storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
-            .unwrap()
-            .is_none());
+        assert!(
+            storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Rule 3: a self-edge is reported as a cycle (mirrors
@@ -2152,9 +2186,11 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("itself"), "got: {msg}");
         assert!(msg.contains("aaaaaaaa"), "got: {msg}");
-        assert!(storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
-            .unwrap()
-            .is_none());
+        assert!(
+            storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Rule 4 (`≥1 root`) is a defensive backstop: once rules 1–3 hold it

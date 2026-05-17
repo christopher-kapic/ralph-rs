@@ -177,11 +177,7 @@ pub fn record_question_ask(
 /// run / when the feature is off, exactly like a question — preserving the
 /// pre-DAG guard), then inserts a fresh **open native `interruptions` row**
 /// (`kind=blocker`, no options). docs/dag-redesign.md §3.4/§7.
-pub fn record_block(
-    conn: &Connection,
-    project: &str,
-    body: &str,
-) -> Result<QuestionAskOutcome> {
+pub fn record_block(conn: &Connection, project: &str, body: &str) -> Result<QuestionAskOutcome> {
     let bound = match resolve_bound_step(conn, project)? {
         Ok(b) => b,
         Err(outcome) => return Ok(outcome),
@@ -389,7 +385,6 @@ pub fn cmd_question_show(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,7 +398,17 @@ mod tests {
         let plan = storage::create_plan(conn, slug, project, "br", "desc", None, None, &[])
             .expect("create_plan");
         let (step, _) = storage::create_step(
-            conn, &plan.id, "title", "desc", None, None, &[], None, None, None, None,
+            conn,
+            &plan.id,
+            "title",
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .expect("create_step");
         (plan.id, step.id)
@@ -524,9 +529,8 @@ mod tests {
         seed_run_lock(&conn, project, &plan_id, "p-enabled", &step_id, 2);
 
         let suggestions = vec!["Option A".to_string(), "Option B".to_string()];
-        let outcome =
-            record_question_ask(&conn, project, "What should I do?", &suggestions, &[])
-                .expect("ok");
+        let outcome = record_question_ask(&conn, project, "What should I do?", &suggestions, &[])
+            .expect("ok");
         let (qid, recorded_step_id, attempt) = match outcome {
             QuestionAskOutcome::Recorded {
                 question_id,
@@ -677,13 +681,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// Insert an open question interruption with explicit options.
-    fn ins_q(
-        conn: &Connection,
-        step_id: &str,
-        attempt: i32,
-        body: &str,
-        opts: &[&str],
-    ) -> String {
+    fn ins_q(conn: &Connection, step_id: &str, attempt: i32, body: &str, opts: &[&str]) -> String {
         let options: Vec<InterruptionOption> = opts
             .iter()
             .enumerate()
@@ -748,7 +746,11 @@ mod tests {
         .unwrap();
 
         let qs = storage::list_open_questions(&conn, project, None).unwrap();
-        assert_eq!(qs.len(), 1, "resolved + blockers excluded from question list");
+        assert_eq!(
+            qs.len(),
+            1,
+            "resolved + blockers excluded from question list"
+        );
         assert_eq!(qs[0].id, open);
     }
 
@@ -791,11 +793,31 @@ mod tests {
         let plan = storage::create_plan(&conn, "p-multi", project, "br", "d", None, None, &[])
             .expect("create_plan");
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "first", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "first",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         let (s2, _) = storage::create_step(
-            &conn, &plan.id, "second", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "second",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -866,7 +888,13 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let project = "/proj-show";
         let (_p, step_id) = seed_plan_and_step(&conn, "p-show", project);
-        ins_q(&conn, &step_id, 2, "What's the right approach?", &["A", "B"]);
+        ins_q(
+            &conn,
+            &step_id,
+            2,
+            "What's the right approach?",
+            &["A", "B"],
+        );
 
         cmd_question_show(&conn, project, 1, &quiet_out()).unwrap();
         let still_open = storage::list_open_questions(&conn, project, None).unwrap();

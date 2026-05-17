@@ -659,7 +659,17 @@ mod tests {
     /// Helper: create a titled step with all-default optional fields.
     fn mk_step(conn: &Connection, plan_id: &str, title: &str) -> Step {
         let (s, _) = storage::create_step(
-            conn, plan_id, title, "desc", None, None, &[], None, None, None, None,
+            conn,
+            plan_id,
+            title,
+            "desc",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         s
@@ -675,7 +685,14 @@ mod tests {
         // everywhere).
         let conn = setup();
         let plan = storage::create_plan(
-            &conn, "chain", "/tmp/proj", "branch", "desc", None, None, &[],
+            &conn,
+            "chain",
+            "/tmp/proj",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
         )
         .unwrap();
         let a = mk_step(&conn, &plan.id, "A");
@@ -725,7 +742,14 @@ mod tests {
         // data: B→A and C→A (fan-out), so chain suppression does NOT apply.
         let conn = setup();
         let plan = storage::create_plan(
-            &conn, "branched", "/tmp/proj", "branch", "desc", None, None, &[],
+            &conn,
+            "branched",
+            "/tmp/proj",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
         )
         .unwrap();
         let a = mk_step(&conn, &plan.id, "A");
@@ -749,7 +773,10 @@ mod tests {
         assert!(parsed["steps"][0].get("depends_on").is_none());
         assert_eq!(parsed["steps"][1]["depends_on"][0], a.short_id);
         assert_eq!(parsed["steps"][2]["depends_on"][0], a.short_id);
-        assert!(!json.contains(&a.id), "internal UUID must never be exported");
+        assert!(
+            !json.contains(&a.id),
+            "internal UUID must never be exported"
+        );
     }
 
     #[test]
@@ -758,7 +785,14 @@ mod tests {
         // (docs/dag-redesign.md §13.2: short_ids are not re-minted on export).
         let conn = setup();
         let plan = storage::create_plan(
-            &conn, "stable", "/tmp/proj", "branch", "desc", None, None, &[],
+            &conn,
+            "stable",
+            "/tmp/proj",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
         )
         .unwrap();
         let a = mk_step(&conn, &plan.id, "A");

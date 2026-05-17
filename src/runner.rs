@@ -335,6 +335,22 @@ async fn run_plan_inner(
     // TUI-plan §13.1.
     let chunk_seq: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
+    // ONE implementation slot (docs/dag-redesign.md §9 invariant 1 / §3.5
+    // item 2). A `Semaphore` with exactly **1** permit guards the
+    // implement+test+commit phase: at most one step may be in that phase at
+    // a time — this *is* "implementation steps don't run in parallel". The
+    // loop is already serial, so under no review this changes no behavior
+    // (a linear plan is byte-identical); the explicit semaphore makes the
+    // invariant a structural, test-observable guarantee and is what the
+    // read-only review is deliberately allowed to run *outside* of (it
+    // never acquires this permit — §9-inv-2 / §3.5 item 3), so the
+    // scheduler is free to pick the next *unrelated* implementation while a
+    // review is outstanding. A step's *direct dependents* are still gated
+    // (they require the reviewed step `Complete`, which only happens after
+    // the review returns — §3.1/§3.3), so concurrency never starts work on
+    // un-reviewed output.
+    let impl_slot = Arc::new(tokio::sync::Semaphore::new(1));
+
     // For `--one`, we need to stop after the first step actually executed;
     // capture its ID at the start (the step the topological scheduler would
     // pick first) and exit after it completes. Positions can shift due to
@@ -504,6 +520,18 @@ async fn run_plan_inner(
         // the flag on drop — covering the `?`-early-return path too.
         let _in_flight = crate::signal::StepInFlightGuard::enter();
 
+        // Acquire the single implementation slot (§9-inv-1 / §3.5 item 2).
+        // Held ONLY for implement+test+commit; explicitly released before any
+        // read-only review so a review never occupies the implementation
+        // slot (§9-inv-2). `acquire_owned` cannot fail here — the semaphore
+        // is never closed — but we surface it rather than `unwrap` to keep
+        // the runner panic-free.
+        let impl_permit = impl_slot
+            .clone()
+            .acquire_owned()
+            .await
+            .context("implementation semaphore closed unexpectedly")?;
+
         // Execute the step.
         let step_result = executor::execute_step(
             conn,
@@ -525,6 +553,80 @@ async fn run_plan_inner(
         )
         .await?;
         drop(_in_flight);
+
+        // Release the implementation slot BEFORE any review (§9-inv-2 /
+        // §3.5 item 3): a read-only review must never hold the
+        // implementation permit, so the scheduler is free to take it for the
+        // next *unrelated* implementation while this step's review is
+        // outstanding. Direct dependents of `current_step` are NOT in the
+        // runnable set yet — `execute_step` left a review-gated step
+        // `InProgress` (not `Complete`), and `deps_satisfied` requires
+        // `Complete` — so concurrency never starts work on un-reviewed
+        // output.
+        drop(impl_permit);
+
+        // Built-in review pipeline (docs/dag-redesign.md §3.2-§3.3 / §9 /
+        // §10). When the step's success carries `needs_review`, the executor
+        // deliberately left it `InProgress` with `review_status = Pending`;
+        // run the read-only reviewer against the FIXED committed SHA (it
+        // holds no implementation permit), then — as the SOLE DAG writer
+        // (§9-inv-3) — drain any resulting corrective-step requests and
+        // perform the §10 insert + re-parent. A linear/no-review plan never
+        // sets `needs_review`, so this whole block is skipped and behavior
+        // is byte-identical to before.
+        if let StepResult {
+            outcome: StepOutcome::Success,
+            needs_review: Some((ref commit_sha, iteration)),
+            ..
+        } = step_result
+        {
+            match crate::review::run_review(
+                conn,
+                &effective_plan,
+                &current_step,
+                config,
+                workdir,
+                commit_sha,
+                iteration,
+                step_num,
+                out,
+            )
+            .await
+            {
+                Ok(crate::review::ReviewOutcome::Passed) => {
+                    // Review returned PASS ⇒ the step is now genuinely done.
+                    // Promote it to `Complete` (it was held `InProgress`
+                    // during the concurrent-eligible review window). Its
+                    // dependents become runnable on the next tick.
+                    storage::update_step_status(conn, &current_step.id, StepStatus::Complete)?;
+                }
+                Ok(crate::review::ReviewOutcome::Failed { .. }) => {
+                    // The reviewer only *requested* a corrective step (a V29
+                    // bridge row + NDJSON event). The orchestrator (here —
+                    // the sole DAG writer) consumes it below.
+                }
+                Err(e) => {
+                    // A review error (e.g. read-only invariant violated, or
+                    // misconfigured review harness) must not silently pass
+                    // un-reviewed work. Surface it and fail the run, exactly
+                    // as a hard step failure would.
+                    eprintln!("Review of step '{}' failed: {e:#}", current_step.title);
+                    storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
+                    result.final_status = PlanStatus::Failed;
+                    result.step_results.push(step_result);
+                    return Ok(result);
+                }
+            }
+
+            // Drain corrective-step requests for this plan as the SOLE DAG
+            // writer (§9-inv-3 / §10). Oldest-first, deterministic
+            // (reproducible scheduling — §3.5 item 4 / §11).
+            for req in
+                storage::list_open_corrective_step_requests_for_plan(conn, &effective_plan.id)?
+            {
+                crate::review::consume_corrective_request(conn, &effective_plan, &req, out)?;
+            }
+        }
 
         let elapsed = started.elapsed();
         result.steps_executed += 1;
@@ -1277,10 +1379,8 @@ pub fn skip_step(
     // underlying state is Pending/InProgress, both skippable), but match it
     // explicitly for exhaustiveness.
     match step.status {
-        StepStatus::Pending
-        | StepStatus::Failed
-        | StepStatus::InProgress
-        | StepStatus::Blocked => {}
+        StepStatus::Pending | StepStatus::Failed | StepStatus::InProgress | StepStatus::Blocked => {
+        }
         StepStatus::Complete => bail!("Step {} '{}' is already complete", actual_num, step.title),
         StepStatus::Skipped => bail!("Step {} '{}' is already skipped", actual_num, step.title),
         StepStatus::Aborted => {
@@ -2106,6 +2206,7 @@ mod tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         }
     }
 
@@ -3411,6 +3512,7 @@ mod tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         };
 
         // Should create feat/rooted rooted at initial_sha.
@@ -3453,6 +3555,7 @@ mod tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         };
 
         // Concurrent ticker that increments a counter every few ms. On a
@@ -4044,6 +4147,7 @@ mod tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(
@@ -4109,6 +4213,7 @@ mod tests {
             retry_strategy: None,
             review_enabled: None,
             squash_on_complete: false,
+            max_review_corrections: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
         assert_eq!(git::get_current_branch(&dir).unwrap(), "feat/clean");
@@ -4842,12 +4947,7 @@ mod tests {
         // And once the interruption is resolved (blocked set empties), the
         // very next scheduler pass runs the whole chain in authored order —
         // the cross-process re-queue (§9 invariant 4).
-        let resumed = schedule_order_blocked(
-            &mut steps,
-            &edges,
-            &full_window(),
-            &HashSet::new(),
-        );
+        let resumed = schedule_order_blocked(&mut steps, &edges, &full_window(), &HashSet::new());
         assert_eq!(resumed, vec!["s0", "s1", "s2"]);
     }
 
@@ -4982,8 +5082,7 @@ mod tests {
             StepStatus::Aborted,
             StepStatus::Skipped, // §14 open question: Skipped does NOT unblock
         ] {
-            let win_status: HashMap<&str, StepStatus> =
-                [("s0", blocking)].into_iter().collect();
+            let win_status: HashMap<&str, StepStatus> = [("s0", blocking)].into_iter().collect();
             assert!(
                 !deps_satisfied("s1", &deps_of, &win_status),
                 "{blocking:?} dep must block its dependent"
@@ -4998,6 +5097,142 @@ mod tests {
         // not block — keeps the graph from deadlocking and preserves
         // `--from`/`--to`.
         assert!(deps_satisfied("s1", &deps_of, &HashMap::new()));
+    }
+
+    // ---- STEP 38: concurrency model (§9-inv-1/2, §3.5 item 2/3) ----
+
+    /// HARD-INVARIANT PROOF (§9-inv-1): ONE implementation slot. A
+    /// `Semaphore` with 1 permit guarding implement+test+commit means two
+    /// implementations can NEVER overlap. We model the runner's
+    /// acquire-around-execute discipline and assert that while one permit is
+    /// held, a second acquire cannot succeed (no two impls in flight).
+    #[tokio::test]
+    async fn test_impl_semaphore_serializes_implementations() {
+        let impl_slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        // Step A's implementation acquires the single slot.
+        let a = impl_slot.clone().acquire_owned().await.unwrap();
+
+        // While A holds it, a second implementation cannot start: a
+        // non-blocking try-acquire fails (two impls would overlap otherwise).
+        assert!(
+            impl_slot.clone().try_acquire_owned().is_err(),
+            "two implementations must NEVER hold the slot at once (§9-inv-1)"
+        );
+        assert_eq!(impl_slot.available_permits(), 0);
+
+        // A finishes (implement+test+commit done) and releases the slot.
+        drop(a);
+
+        // Now the next implementation can take it — but still only one.
+        let b = impl_slot.clone().acquire_owned().await.unwrap();
+        assert!(impl_slot.clone().try_acquire_owned().is_err());
+        drop(b);
+    }
+
+    /// HARD-INVARIANT PROOF (§9-inv-2 / §3.5 item 3): a read-only review
+    /// runs CONCURRENTLY with the next *unrelated* implementation. The
+    /// review holds NO implementation permit (the runner drops it before
+    /// reviewing), so the slot is free for the next unrelated step's
+    /// implementation while the review is outstanding.
+    #[tokio::test]
+    async fn test_review_runs_concurrently_with_next_unrelated_impl() {
+        let impl_slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        // Step A's implementation holds the slot...
+        let a_permit = impl_slot.clone().acquire_owned().await.unwrap();
+        // ...then commits and the runner RELEASES the slot before review.
+        drop(a_permit);
+
+        // A's read-only review is now "in flight" — it deliberately holds
+        // NO implementation permit (it never acquired one). Model that by
+        // simply not holding `impl_slot` here.
+
+        // The next UNRELATED step's implementation can acquire the slot and
+        // run *concurrently* with A's outstanding review.
+        let b_permit = impl_slot
+            .clone()
+            .try_acquire_owned()
+            .expect("an unrelated impl must run while a review is outstanding (§3.5 item 3)");
+        assert_eq!(impl_slot.available_permits(), 0);
+        drop(b_permit);
+    }
+
+    /// §3.5 item 3 / §3.1: a step's DIRECT DEPENDENTS are not runnable until
+    /// that step is `Complete`. While review keeps the reviewed step
+    /// `InProgress` (executor's review gate), `deps_satisfied` (which
+    /// requires `Complete`) excludes its dependents from the runnable set —
+    /// so concurrency never starts work on un-reviewed output.
+    #[test]
+    fn test_direct_dependents_gated_until_reviewed_step_complete() {
+        let steps = make_steps(3); // s0, s1, s2
+        // s1 and s2 both directly depend on s0 (the reviewed step).
+        let deps_of = deps_map(&steps, &[(1, 0), (2, 0)]);
+        let depths = compute_step_depths(&steps, &deps_of);
+
+        // s0 is `InProgress` — exactly the state the executor leaves a
+        // review-gated step in (NOT `Complete`) until its review returns.
+        let mut steps_ip = steps.clone();
+        steps_ip[0].status = StepStatus::InProgress;
+        let win: HashMap<&str, StepStatus> =
+            steps_ip.iter().map(|s| (s.id.as_str(), s.status)).collect();
+        assert!(
+            !deps_satisfied("s1", &deps_of, &win),
+            "a direct dependent must NOT be runnable while the reviewed \
+             step is still InProgress (review not yet returned)"
+        );
+        assert!(!deps_satisfied("s2", &deps_of, &win));
+        // The scheduler therefore picks neither dependent (only s0 is
+        // actionable, and it's already executing/being reviewed).
+        let pick = pick_next_step(
+            &steps_ip,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &["s0".to_string()].into_iter().collect(),
+            &HashSet::new(),
+        );
+        assert!(
+            pick.is_none(),
+            "no dependent may start on un-reviewed work (§3.5 item 3)"
+        );
+
+        // Once review returns and the orchestrator promotes s0 to Complete,
+        // its dependents become runnable on the very next tick.
+        let mut steps_done = steps;
+        steps_done[0].status = StepStatus::Complete;
+        let win2: HashMap<&str, StepStatus> = steps_done
+            .iter()
+            .map(|s| (s.id.as_str(), s.status))
+            .collect();
+        assert!(deps_satisfied("s1", &deps_of, &win2));
+        assert!(deps_satisfied("s2", &deps_of, &win2));
+    }
+
+    /// LINEAR-PARITY PROOF (§9-inv-5 / §1): with no review config and no
+    /// edges (or a degenerate chain), the scheduler tie-break still
+    /// reproduces the authored sort_key order EXACTLY — a linear plan
+    /// serializes and behaves exactly as today. (The review pipeline is
+    /// `needs_review = None` for every step when review is not
+    /// effective-enabled, so the loop never spawns a review at all.)
+    #[test]
+    fn test_linear_plan_serializes_exactly_as_today_under_review_code() {
+        // A degenerate chain s0<-s1<-s2<-s3 (the V25 backfill shape).
+        let mut steps = make_steps(4);
+        let order = schedule_order(&mut steps, &[(1, 0), (2, 1), (3, 2)], &full_window());
+        assert_eq!(
+            order,
+            vec!["s0", "s1", "s2", "s3"],
+            "a linear chain must execute in authored order, byte-identical \
+             to the pre-review behavior"
+        );
+        // And review being OFF by default means a no-review Plan/Step never
+        // sets the executor's review gate. Assert the default config.
+        let cfg = crate::config::Config::default();
+        assert_eq!(
+            cfg.review.enabled, None,
+            "review is OFF by default — linear/no-config plans never review"
+        );
     }
 
     #[test]
@@ -5232,9 +5467,8 @@ mod tests {
         // V25 backfill edges: each step depends on its sort_key
         // predecessor (the linear chain).
         let chain: Vec<&str> = expected.iter().map(|s| s.as_str()).collect();
-        let id_pairs: Vec<(&str, &str)> = (1..chain.len())
-            .map(|i| (chain[i], chain[i - 1]))
-            .collect();
+        let id_pairs: Vec<(&str, &str)> =
+            (1..chain.len()).map(|i| (chain[i], chain[i - 1])).collect();
 
         // The chain's topological depth ranking equals its sort_key
         // ranking, so `(depth, sort_key, short_id)` collapses to

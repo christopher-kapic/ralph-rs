@@ -814,7 +814,7 @@ impl std::str::FromStr for TestStatus {
 /// columns). Every `Plan`-returning query MUST use this list so
 /// [`Plan::from_row`]'s indices line up — a raw `SELECT *` would
 /// otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, retry_strategy, review_enabled, squash_on_complete";
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, retry_strategy, review_enabled, squash_on_complete, max_review_corrections";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -904,6 +904,18 @@ pub struct Plan {
     /// INTEGER; NULL is coerced to `false`.
     #[serde(default)]
     pub squash_on_complete: bool,
+    /// Per-plan cap on the review→correction→review recursion depth (V30,
+    /// docs/dag-redesign.md §10 item 4 / §14.5). `None` means "no plan-level
+    /// override" — the runner uses the built-in default
+    /// ([`crate::review::DEFAULT_MAX_REVIEW_CORRECTIONS`]). When a corrective
+    /// step's own review fails and the chain length would exceed this cap,
+    /// the orchestrator raises a `kind=blocker` interruption
+    /// ("review loop — needs human") instead of spawning another correction.
+    /// Stored as a nullable INTEGER; sibling concept to `max_retries` (set
+    /// per-plan, alongside the plan's review posture). `#[serde(default)]`
+    /// so pre-V30 exported plan JSON still deserializes.
+    #[serde(default)]
+    pub max_review_corrections: Option<i32>,
 }
 
 impl Plan {
@@ -978,6 +990,16 @@ impl Plan {
             .map(|v| v != 0)
             .unwrap_or(false);
 
+        // `max_review_corrections` is a nullable INTEGER column (V30) at
+        // index 21. NULL (pre-V30 / never-set) stays `None` — the runner
+        // then uses the built-in default. `.ok()`-tolerant for raw test
+        // inserts / SELECTs that predate the column.
+        let max_review_corrections: Option<i32> = row
+            .get::<_, Option<i64>>(21)
+            .ok()
+            .flatten()
+            .map(|v| v as i32);
+
         Ok(Plan {
             id: row.get(0)?,
             slug: row.get(1)?,
@@ -1000,6 +1022,7 @@ impl Plan {
             retry_strategy,
             review_enabled,
             squash_on_complete,
+            max_review_corrections,
         })
     }
 }
@@ -1171,11 +1194,8 @@ impl Step {
         // - `review_status` (20): nullable TEXT; a non-null value must parse
         //   to a known `ReviewStatus` variant (NULL = pending).
         // - `corrects_step_id` (21): nullable TEXT step-id pointer.
-        let review_enabled: Option<bool> = row
-            .get::<_, Option<i64>>(19)
-            .ok()
-            .flatten()
-            .map(|v| v != 0);
+        let review_enabled: Option<bool> =
+            row.get::<_, Option<i64>>(19).ok().flatten().map(|v| v != 0);
         let review_status_str: Option<String> = row.get::<_, Option<String>>(20).ok().flatten();
         let review_status = match review_status_str {
             Some(s) => Some(s.parse::<ReviewStatus>().map_err(|e| {
@@ -1480,7 +1500,17 @@ mod tests {
         let plan =
             crate::storage::create_plan(&conn, "ov", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) = crate::storage::create_step(
-            &conn, &plan.id, "S", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "S",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -2300,6 +2330,7 @@ mod tests {
                 retry_strategy: rs,
                 review_enabled: None,
                 squash_on_complete: false,
+                max_review_corrections: None,
             }
         }
         fn make_step(rs: Option<RetryStrategy>) -> Step {

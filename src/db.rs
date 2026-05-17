@@ -38,6 +38,8 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v26,
     migrate_v27,
     migrate_v28,
+    migrate_v29,
+    migrate_v30,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -1084,6 +1086,86 @@ fn migrate_v28(conn: &Connection) -> Result<()> {
     // so old DBs migrate forward untouched and old export JSON keeps
     // round-tripping via `#[serde(default)]`.
     conn.execute_batch("ALTER TABLE plans ADD COLUMN squash_on_complete INTEGER;")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V29: corrective-step request bridge (single DAG writer — §9-inv-3)
+// ---------------------------------------------------------------------------
+
+fn migrate_v29(conn: &Connection) -> Result<()> {
+    // docs/dag-redesign.md §9 invariant 3 ("Single DAG writer"): only the
+    // orchestrator mutates the DAG. A reviewer subprocess that finds a defect
+    // does NOT write step rows/edges itself — it *requests* a corrective
+    // step through a structured channel. The channel has two faces, both
+    // landing here / in `output.rs`:
+    //
+    //   - an NDJSON `RunEvent::CorrectiveStepRequested` (live, for the TUI);
+    //   - a durable DB bridge row, so a reviewer running in a *different*
+    //     process than the orchestrator (or a request that outlives the
+    //     emitting process) is still consumed at the next scheduler tick.
+    //
+    // This is a direct structural sibling of the V23 skip-bridge
+    // (`plans.skip_requested_step_id` / `skip_changes`, polled + cleared by
+    // the runner) and the V26 interruption bridge (an open row IS the
+    // bridge). A dedicated table — not a `plans` column — because, unlike a
+    // skip (one pending request per plan), multiple steps' reviews can fail
+    // and queue corrective requests concurrently; a table lets each request
+    // carry its own `reviewed_step_id` + `reviewed_iteration` + verdict
+    // body and be consumed independently. The orchestrator drains rows
+    // (oldest first) at a scheduler tick, performs the §10 insert+re-parent
+    // as the SOLE writer, then deletes the row. `state` is kept for forward
+    // flexibility but the consume path is a hard delete (the durable audit
+    // trail is the corrective step + its `corrects_step_id` pointer, exactly
+    // as the skip-bridge's audit trail is the `[ralph wip]` commit).
+    //
+    // All references are `ON DELETE CASCADE` on the owning step, mirroring
+    // `step_dependencies` / `interruptions`, so deleting a step never leaves
+    // a dangling request.
+    conn.execute_batch(
+        "
+        CREATE TABLE corrective_step_requests (
+            id                 TEXT PRIMARY KEY,
+            reviewed_step_id   TEXT NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+            reviewed_iteration INTEGER NOT NULL,
+            commit_sha         TEXT NOT NULL,
+            issues             INTEGER NOT NULL DEFAULT 1,
+            verdict_body       TEXT,
+            state              TEXT NOT NULL DEFAULT 'open',  -- 'open' | 'consumed'
+            requested_at       TEXT NOT NULL
+        );
+        CREATE INDEX idx_corrective_requests_step
+            ON corrective_step_requests(reviewed_step_id);
+        CREATE INDEX idx_corrective_requests_open
+            ON corrective_step_requests(state) WHERE state = 'open';
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V30: per-plan max_review_corrections (recursion cap — §10/§14.5)
+// ---------------------------------------------------------------------------
+
+fn migrate_v30(conn: &Connection) -> Result<()> {
+    // docs/dag-redesign.md §10 item 4 / §14.5: a reviewer-inserted
+    // corrective step A′ is ITSELF reviewed (recursion). Bound the
+    // review→correction→review chain with a per-plan
+    // `max_review_corrections` depth — a sibling concept to `max_retries`
+    // (which is global config `max_retries_per_step` with per-step
+    // overrides; the correction cap is per-plan because a deep
+    // self-correcting chain is a property of the plan's review posture, set
+    // alongside the plan's review toggle). Exceeding it raises a
+    // `kind=blocker` interruption ("review loop — needs human") instead of
+    // spawning indefinitely.
+    //
+    // Nullable INTEGER with NO non-null default, exactly like the V24/V27/
+    // V28 tri-state/optional columns: NULL means "not set" → the runner uses
+    // the built-in default (`DEFAULT_MAX_REVIEW_CORRECTIONS` in
+    // `crate::review`). Additive `ALTER`, so old DBs migrate forward
+    // untouched and old export JSON keeps round-tripping via
+    // `#[serde(default)]`.
+    conn.execute_batch("ALTER TABLE plans ADD COLUMN max_review_corrections INTEGER;")?;
     Ok(())
 }
 
@@ -2782,9 +2864,7 @@ mod tests {
 
         // (b) The synthesized linear chain edges exist: s2->s1, s3->s2.
         let edges: Vec<(String, String)> = conn
-            .prepare(
-                "SELECT step_id, depends_on_step_id FROM step_dependencies ORDER BY step_id",
-            )
+            .prepare("SELECT step_id, depends_on_step_id FROM step_dependencies ORDER BY step_id")
             .unwrap()
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap()
@@ -3068,14 +3148,12 @@ mod tests {
         assert_eq!(sq_exists, 0, "fresh DB must not carry the legacy table");
 
         // FK cascade: deleting the step removes its interruptions.
-        conn.execute("DELETE FROM steps WHERE id = 's1'", []).unwrap();
+        conn.execute("DELETE FROM steps WHERE id = 's1'", [])
+            .unwrap();
         let remaining: i64 = conn
             .query_row("SELECT COUNT(*) FROM interruptions", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(
-            remaining, 0,
-            "step deletion must cascade to interruptions"
-        );
+        assert_eq!(remaining, 0, "step deletion must cascade to interruptions");
     }
 
     #[test]
@@ -3121,12 +3199,8 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        let (step_re, step_rstat, step_corrects): (
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-        ) = conn
-            .query_row(
+        let (step_re, step_rstat, step_corrects): (Option<i64>, Option<String>, Option<String>) =
+            conn.query_row(
                 "SELECT review_enabled, review_status, corrects_step_id FROM steps WHERE id = ?1",
                 ["s1"],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -3189,12 +3263,8 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        let (step_re2, step_rstat2, step_corrects2): (
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-        ) = conn
-            .query_row(
+        let (step_re2, step_rstat2, step_corrects2): (Option<i64>, Option<String>, Option<String>) =
+            conn.query_row(
                 "SELECT review_enabled, review_status, corrects_step_id FROM steps WHERE id = ?1",
                 ["s2"],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
@@ -3339,6 +3409,193 @@ mod tests {
         let p2 = crate::storage::get_plan_by_id(&conn, "p2").unwrap();
         assert!(!p1.squash_on_complete, "NULL coerces to false");
         assert!(p2.squash_on_complete, "1 coerces to true");
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v29_adds_corrective_step_request_bridge() {
+        // Mirror of `test_migration_v24`: seed a pre-V29 DB (a plan + a
+        // step), run V29, verify the bridge table exists, accepts a request
+        // row keyed to the step, cascades on step delete, user_version lands
+        // at CURRENT_VERSION, and re-open is a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v28.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v28 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(28) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V29 (and V30) apply.
+        let conn = open_at(&path).unwrap();
+
+        // The bridge table exists.
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            tables.iter().any(|t| t == "corrective_step_requests"),
+            "V29 must create corrective_step_requests (tables: {tables:?})"
+        );
+
+        // A request row keyed to the step inserts and round-trips.
+        conn.execute(
+            "INSERT INTO corrective_step_requests \
+                (id, reviewed_step_id, reviewed_iteration, commit_sha, issues, verdict_body, requested_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            rusqlite::params!["r1", "s1", 2_i64, "deadbeef", 3_i64, "missing edge case"],
+        )
+        .unwrap();
+        let (sid, iter, st): (String, i64, String) = conn
+            .query_row(
+                "SELECT reviewed_step_id, reviewed_iteration, state \
+                 FROM corrective_step_requests WHERE id = ?1",
+                ["r1"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sid, "s1");
+        assert_eq!(iter, 2);
+        assert_eq!(st, "open", "state must default to 'open'");
+
+        // ON DELETE CASCADE: deleting the step removes its request rows.
+        conn.execute("DELETE FROM steps WHERE id = ?1", ["s1"])
+            .unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM corrective_step_requests WHERE reviewed_step_id = ?1",
+                ["s1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "deleting the reviewed step must cascade-delete its requests"
+        );
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v30_adds_max_review_corrections_to_plans() {
+        // Mirror of `test_migration_v24`/`v28`: seed a pre-V30 DB, run V30,
+        // verify the existing row defaults `max_review_corrections` to NULL
+        // (→ built-in default), a fresh explicit value round-trips, the
+        // schema carries the column, user_version lands at CURRENT_VERSION,
+        // and re-open is a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v29.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v29 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(29) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V30 applies. The pre-V30 row must default NULL.
+        let conn = open_at(&path).unwrap();
+        let plan_mrc: Option<i64> = conn
+            .query_row(
+                "SELECT max_review_corrections FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            plan_mrc.is_none(),
+            "pre-V30 rows must default max_review_corrections to NULL (got {plan_mrc:?})"
+        );
+
+        // The schema actually carries the column.
+        let cols: Vec<String> = conn
+            .prepare("SELECT * FROM plans LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(
+            cols.iter().any(|c| c == "max_review_corrections"),
+            "plans must have a max_review_corrections column post-V30 (cols: {cols:?})"
+        );
+
+        // A fresh insert with an explicit value round-trips, and
+        // `Plan::from_row` coerces it to the typed `Option<i64>`.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, max_review_corrections) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", 4_i64],
+        )
+        .unwrap();
+        let plan_mrc2: Option<i64> = conn
+            .query_row(
+                "SELECT max_review_corrections FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(plan_mrc2, Some(4));
+        let p1 = crate::storage::get_plan_by_id(&conn, "p1").unwrap();
+        let p2 = crate::storage::get_plan_by_id(&conn, "p2").unwrap();
+        assert_eq!(p1.max_review_corrections, None, "NULL stays None");
+        assert_eq!(p2.max_review_corrections, Some(4));
 
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
