@@ -321,6 +321,7 @@ mod tests {
             skip_requested_step_id: None,
             skip_changes: None,
             retry_strategy: None,
+            review_enabled: None,
         };
         let steps: Vec<Step> = (0..n)
             .map(|i| Step {
@@ -347,6 +348,9 @@ mod tests {
                 change_policy: crate::plan::ChangePolicy::Required,
                 tags: vec![],
                 retry_strategy: None,
+                review_enabled: None,
+                review_status: None,
+                corrects_step_id: None,
             })
             .collect();
         PlanDetailApp::new(plan, steps, &Config::default())

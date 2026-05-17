@@ -1021,6 +1021,7 @@ mod tests {
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
+            review: crate::config::ReviewConfig::default(),
             harnesses,
         }
     }

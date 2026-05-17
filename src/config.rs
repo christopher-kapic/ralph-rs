@@ -243,6 +243,43 @@ fn default_harness_chunk_max_bytes() -> usize {
 }
 
 /// Top-level ralph-rs configuration.
+/// Global nondeterministic-review configuration (docs/dag-redesign.md §6).
+///
+/// Lives under the top-level `"review"` key of
+/// `~/.config/ralph-rs/config.json`, e.g.
+/// `"review": { "enabled": true, "harness": "codex", "model": "gpt-5-codex" }`.
+///
+/// Every field has a serde default and the whole block is
+/// `#[serde(default)]` on [`Config`], so a config file that predates the
+/// review feature (no `"review"` key at all) keeps loading unchanged and
+/// resolves to "review off, no review harness/model".
+///
+/// - `enabled` is the **global default** in the precedence chain
+///   step.review_enabled ?? plan.review_enabled ?? config.review.enabled
+///   ?? false (resolved by [`effective_review_enabled`], mirroring
+///   `RetryStrategy` step > plan > default precedence). It is `Option<bool>`
+///   so "unset in config" (`None`) is distinguishable from an explicit
+///   `false`; both fall through to `false` today but the distinction keeps
+///   the precedence chain uniform with the per-plan / per-step columns.
+/// - `harness` / `model` name the harness + model the reviewer subprocess
+///   uses. They are *global config*, never plan/export data (a bundle stays
+///   portable across machines whose review harness differs — §13.2). Empty
+///   string = unconfigured; `ralph doctor` warns later when review is on
+///   but no review harness is set (wired in a later Phase 3 step).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ReviewConfig {
+    /// Global default for whether a step is reviewed. `None` = unset in
+    /// config; resolves to `false` at the bottom of the precedence chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Harness name the reviewer subprocess uses. Empty = unconfigured.
+    #[serde(default)]
+    pub harness: String,
+    /// Model the reviewer subprocess uses. Empty = harness default.
+    #[serde(default)]
+    pub model: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     /// The default harness to use when none is specified.
@@ -296,6 +333,12 @@ pub struct Config {
     /// TUI-plan §13.1.
     #[serde(default = "default_harness_chunk_max_bytes")]
     pub harness_chunk_max_bytes: usize,
+    /// Global nondeterministic-review configuration (§6). `#[serde(default)]`
+    /// so a config file with no `"review"` key still loads, resolving to
+    /// [`ReviewConfig::default`] (review off, no review harness/model). The
+    /// effective per-step toggle is resolved by [`effective_review_enabled`].
+    #[serde(default)]
+    pub review: ReviewConfig,
     /// Available harness definitions keyed by name.
     pub harnesses: HashMap<String, HarnessConfig>,
 }
@@ -783,9 +826,42 @@ impl Default for Config {
             min_free_disk_mb: default_min_free_disk_mb(),
             display_timezone: default_display_timezone(),
             harness_chunk_max_bytes: default_harness_chunk_max_bytes(),
+            // Review is off by default and carries no review harness/model
+            // until the user configures one; the per-step effective value
+            // resolves via `effective_review_enabled` (step > plan > this
+            // global > false).
+            review: ReviewConfig::default(),
             harnesses,
         }
     }
+}
+
+/// Resolve whether this step is nondeterministically reviewed.
+///
+/// Precedence is **step > plan > global > false**, the §6 spec table and a
+/// direct analogue of [`crate::plan::Step::effective_retry_strategy`]
+/// (step > plan > built-in default): a step-level override wins over a
+/// plan-level default, which wins over the global `config.review.enabled`,
+/// which finally falls through to `false` when nothing is set anywhere.
+/// `None` at any level means "defer to the next level down".
+///
+/// ```text
+/// step.review_enabled ?? plan.review_enabled ?? config.review.enabled ?? false
+/// ```
+///
+/// Wired but not yet *consumed* by the runner in this batch — the review
+/// pipeline that calls this lands in a later Phase 3 step. Disabled at any
+/// level ⇒ the step is `Complete` straight from passing tests (§6).
+#[allow(dead_code)] // consumed by the review pipeline in a later step
+pub fn effective_review_enabled(
+    step: &crate::plan::Step,
+    plan: &crate::plan::Plan,
+    config: &Config,
+) -> bool {
+    step.review_enabled
+        .or(plan.review_enabled)
+        .or(config.review.enabled)
+        .unwrap_or(false)
 }
 
 /// True when this harness invokes `codex exec` — the non-interactive code
@@ -2297,5 +2373,211 @@ mod tests {
                 format!("{LEGACY_DEFAULT_GLOBAL_PROMPT_PREFIX}\n\nAlways run the linter.").as_str()
             )
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Review config + effective_review_enabled (docs/dag-redesign.md §6)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_review_config_absent_in_json_defaults_off() {
+        // A config file written before the review feature has no `"review"`
+        // key at all. `#[serde(default)]` must backfill `ReviewConfig`'s
+        // default so existing configs keep loading unchanged: review off,
+        // no review harness/model.
+        let json = r#"{
+            "default_harness": "claude",
+            "max_retries_per_step": 3,
+            "harnesses": {}
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.review, ReviewConfig::default());
+        assert_eq!(cfg.review.enabled, None);
+        assert_eq!(cfg.review.harness, "");
+        assert_eq!(cfg.review.model, "");
+    }
+
+    #[test]
+    fn test_review_config_round_trips() {
+        // The §6 example block loads and serializes back faithfully.
+        let json = r#"{
+            "default_harness": "claude",
+            "max_retries_per_step": 3,
+            "review": { "enabled": true, "harness": "codex", "model": "gpt-5-codex" },
+            "harnesses": {}
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.review.enabled, Some(true));
+        assert_eq!(cfg.review.harness, "codex");
+        assert_eq!(cfg.review.model, "gpt-5-codex");
+
+        let round: Config =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(round.review, cfg.review);
+    }
+
+    #[test]
+    fn test_review_config_partial_block_uses_field_defaults() {
+        // A `"review"` block that only sets `enabled` leaves harness/model
+        // at their empty-string defaults (every field is `#[serde(default)]`).
+        let json = r#"{
+            "default_harness": "claude",
+            "max_retries_per_step": 3,
+            "review": { "enabled": false },
+            "harnesses": {}
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.review.enabled, Some(false));
+        assert_eq!(cfg.review.harness, "");
+        assert_eq!(cfg.review.model, "");
+    }
+
+    /// Minimal `Plan` carrying only the `review_enabled` override under test;
+    /// all other fields are inert defaults.
+    fn review_plan(review_enabled: Option<bool>) -> crate::plan::Plan {
+        let now = chrono::Utc::now();
+        crate::plan::Plan {
+            id: "p1".into(),
+            slug: "p".into(),
+            project: "/proj".into(),
+            branch_name: "b".into(),
+            description: "d".into(),
+            status: crate::plan::PlanStatus::Planning,
+            harness: None,
+            agent: None,
+            deterministic_tests: vec![],
+            plan_harness: None,
+            created_at: now,
+            updated_at: now,
+            questions_enabled: false,
+            pause_requested: false,
+            last_run_branch: None,
+            last_run_started_at: None,
+            skip_requested_step_id: None,
+            skip_changes: None,
+            retry_strategy: None,
+            review_enabled,
+        }
+    }
+
+    /// Minimal `Step` carrying only the `review_enabled` override under test.
+    fn review_step(review_enabled: Option<bool>) -> crate::plan::Step {
+        let now = chrono::Utc::now();
+        crate::plan::Step {
+            id: "s1".into(),
+            short_id: String::new(),
+            plan_id: "p1".into(),
+            sort_key: "a0".into(),
+            title: "t".into(),
+            description: "d".into(),
+            agent: None,
+            harness: None,
+            acceptance_criteria: vec![],
+            status: crate::plan::StepStatus::Pending,
+            attempts: 0,
+            max_retries: None,
+            created_at: now,
+            updated_at: now,
+            model: None,
+            skipped_reason: None,
+            change_policy: crate::plan::ChangePolicy::Required,
+            tags: vec![],
+            retry_strategy: None,
+            review_enabled,
+            review_status: None,
+            corrects_step_id: None,
+        }
+    }
+
+    fn cfg_with_review(enabled: Option<bool>) -> Config {
+        let mut c = Config::default();
+        c.review.enabled = enabled;
+        c
+    }
+
+    #[test]
+    fn test_effective_review_enabled_precedence() {
+        // Precedence is step > plan > config.review.enabled > false,
+        // mirroring `Step::effective_retry_strategy` (step > plan >
+        // default). Exercise EVERY combination of the three tri-state
+        // levels (3^3 = 27) against the §6 chain
+        // step ?? plan ?? global ?? false.
+        for step in [None, Some(true), Some(false)] {
+            for plan in [None, Some(true), Some(false)] {
+                for global in [None, Some(true), Some(false)] {
+                    let expected = step
+                        .or(plan)
+                        .or(global)
+                        .unwrap_or(false);
+                    let got = effective_review_enabled(
+                        &review_step(step),
+                        &review_plan(plan),
+                        &cfg_with_review(global),
+                    );
+                    assert_eq!(
+                        got, expected,
+                        "step={step:?} plan={plan:?} global={global:?} \
+                         must resolve to {expected} (step ?? plan ?? global ?? false)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_effective_review_enabled_all_null_is_false() {
+        // The spec's explicit bottom-of-chain case: nothing set anywhere
+        // ⇒ review off.
+        assert!(!effective_review_enabled(
+            &review_step(None),
+            &review_plan(None),
+            &cfg_with_review(None),
+        ));
+    }
+
+    #[test]
+    fn test_effective_review_enabled_step_overrides_plan_and_global() {
+        // A step `false` wins even when plan and global are both `true`.
+        assert!(!effective_review_enabled(
+            &review_step(Some(false)),
+            &review_plan(Some(true)),
+            &cfg_with_review(Some(true)),
+        ));
+        // A step `true` wins even when plan and global are both `false`.
+        assert!(effective_review_enabled(
+            &review_step(Some(true)),
+            &review_plan(Some(false)),
+            &cfg_with_review(Some(false)),
+        ));
+    }
+
+    #[test]
+    fn test_effective_review_enabled_plan_overrides_global() {
+        // Step unset → plan decides over global.
+        assert!(effective_review_enabled(
+            &review_step(None),
+            &review_plan(Some(true)),
+            &cfg_with_review(Some(false)),
+        ));
+        assert!(!effective_review_enabled(
+            &review_step(None),
+            &review_plan(Some(false)),
+            &cfg_with_review(Some(true)),
+        ));
+    }
+
+    #[test]
+    fn test_effective_review_enabled_falls_through_to_global() {
+        // Step + plan unset → global default decides.
+        assert!(effective_review_enabled(
+            &review_step(None),
+            &review_plan(None),
+            &cfg_with_review(Some(true)),
+        ));
+        assert!(!effective_review_enabled(
+            &review_step(None),
+            &review_plan(None),
+            &cfg_with_review(Some(false)),
+        ));
     }
 }

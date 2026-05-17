@@ -388,6 +388,78 @@ impl std::str::FromStr for InterruptionState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ReviewStatus enum
+// ---------------------------------------------------------------------------
+
+/// Per-step nondeterministic-review verdict (docs/dag-redesign.md §3.3).
+///
+/// Orthogonal to [`StepStatus`] exactly as [`TestStatus`] is orthogonal to
+/// the termination reason today: a step reaches `Complete` only after its
+/// review has *returned* (any verdict). Stored in the nullable
+/// `steps.review_status` TEXT column (V27); a NULL on disk means
+/// [`ReviewStatus::Pending`] (not yet reviewed), so the variant set mirrors
+/// the §3.3 list verbatim.
+///
+/// - [`ReviewStatus::Pending`] — review has not started (the on-disk NULL).
+/// - [`ReviewStatus::InFlight`] — a read-only reviewer is running against
+///   the step's commit SHA.
+/// - [`ReviewStatus::Passed`] — reviewer found no defect; the step is
+///   `Complete`.
+/// - [`ReviewStatus::Failed`] — reviewer rejected; a corrective step is
+///   inserted and dependents are re-parented (§10). The step itself still
+///   becomes `Complete` (the fix lives in the corrective step).
+/// - [`ReviewStatus::Skipped`] — review was skipped for this run.
+/// - [`ReviewStatus::Disabled`] — review is off at some scope (step / plan
+///   / global, §6); the step is `Complete` straight from passing tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum ReviewStatus {
+    #[default]
+    Pending,
+    InFlight,
+    Passed,
+    Failed,
+    Skipped,
+    Disabled,
+}
+
+impl ReviewStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InFlight => "in_flight",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+impl std::fmt::Display for ReviewStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ReviewStatus {
+    type Err = ParseStatusError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "in_flight" => Ok(Self::InFlight),
+            "passed" => Ok(Self::Passed),
+            "failed" => Ok(Self::Failed),
+            "skipped" => Ok(Self::Skipped),
+            "disabled" => Ok(Self::Disabled),
+            other => Err(ParseStatusError(other.to_string())),
+        }
+    }
+}
+
 /// One proposed answer to a [`InterruptionKind::Question`] interruption.
 ///
 /// `priority` ranks the agent's proposals (1 = the agent's best guess).
@@ -734,14 +806,15 @@ impl std::str::FromStr for TestStatus {
 /// column through `updated_at`, V5 appended `plan_harness`,
 /// V16 appended `questions_enabled`, V18 appended `pause_requested`,
 /// V19 appended `last_run_branch`, V20 appended `last_run_started_at`,
-/// V23 appended `skip_requested_step_id` + `skip_changes`, and V24
-/// appended `retry_strategy` via `ALTER TABLE ... ADD COLUMN`. V10's
+/// V23 appended `skip_requested_step_id` + `skip_changes`, V24
+/// appended `retry_strategy`, and V27 appended `review_enabled` via
+/// `ALTER TABLE ... ADD COLUMN`. V10's
 /// `prompt_prefix`/`prompt_suffix` and V14's `context_prepend` were
 /// dropped again by V21 (preserving the physical order of the remaining
 /// columns). Every `Plan`-returning query MUST use this list so
 /// [`Plan::from_row`]'s indices line up — a raw `SELECT *` would
 /// otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, retry_strategy";
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, retry_strategy, review_enabled";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -813,6 +886,15 @@ pub struct Plan {
     /// [`Step::effective_retry_strategy`].
     #[serde(default)]
     pub retry_strategy: Option<RetryStrategy>,
+    /// Plan-level review on/off override (V27). `None` means "no plan-level
+    /// override" — the effective value falls through to the global
+    /// `config.review.enabled` (then `false`) unless a step overrides it.
+    /// Resolved via [`crate::config::effective_review_enabled`] with the
+    /// precedence step > plan > global > false (mirrors `RetryStrategy`).
+    /// Stored as a nullable INTEGER (tri-state bool) on disk; wired but not
+    /// yet consumed by the runner in this batch.
+    #[serde(default)]
+    pub review_enabled: Option<bool>,
 }
 
 impl Plan {
@@ -823,7 +905,7 @@ impl Plan {
     /// deterministic_tests, created_at, updated_at, plan_harness,
     /// questions_enabled, pause_requested, last_run_branch,
     /// last_run_started_at, skip_requested_step_id, skip_changes,
-    /// retry_strategy
+    /// retry_strategy, review_enabled
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -866,6 +948,14 @@ impl Plan {
             None => None,
         };
 
+        // `review_enabled` is a nullable INTEGER column (V27) at index 19.
+        // NULL means "no plan-level override" — resolution falls through to
+        // the global `config.review.enabled` (then `false`). SQLite has no
+        // native bool, so read as `Option<i64>` and coerce non-null to a
+        // bool (any non-zero = true), mirroring the `questions_enabled`
+        // integer-to-bool handling above.
+        let review_enabled: Option<bool> = row.get::<_, Option<i64>>(19)?.map(|v| v != 0);
+
         Ok(Plan {
             id: row.get(0)?,
             slug: row.get(1)?,
@@ -886,6 +976,7 @@ impl Plan {
             skip_requested_step_id: row.get(16)?,
             skip_changes: row.get(17)?,
             retry_strategy,
+            review_enabled,
         })
     }
 }
@@ -945,6 +1036,26 @@ pub struct Step {
     /// [`Step::effective_retry_strategy`].
     #[serde(default)]
     pub retry_strategy: Option<RetryStrategy>,
+    /// Step-level review on/off override (V27). `None` means "no step-level
+    /// override" — resolution falls through to the plan's value and then
+    /// the global `config.review.enabled` (then `false`). Resolved via
+    /// [`crate::config::effective_review_enabled`] with the precedence
+    /// step then plan then global then false (mirroring `RetryStrategy`).
+    /// Stored as a nullable INTEGER tri-state bool; wired but not yet
+    /// consumed in this batch.
+    #[serde(default)]
+    pub review_enabled: Option<bool>,
+    /// Per-step nondeterministic-review verdict (V27). `None` (the on-disk
+    /// NULL) means [`ReviewStatus::Pending`] — not yet reviewed. Orthogonal
+    /// to [`Step::status`] exactly as `TestStatus` is orthogonal to the
+    /// termination reason. Wired but not yet consumed in this batch.
+    #[serde(default)]
+    pub review_status: Option<ReviewStatus>,
+    /// For a reviewer-inserted corrective step (§10), the `steps.id` of the
+    /// step it corrects. `None` for ordinary, non-corrective steps. Wired
+    /// but not yet consumed in this batch.
+    #[serde(default)]
+    pub corrects_step_id: Option<String>,
 }
 
 impl Step {
@@ -954,7 +1065,8 @@ impl Step {
     /// id, plan_id, sort_key, title, description, agent, harness,
     /// acceptance_criteria, status, attempts, max_retries, created_at,
     /// updated_at, model, skipped_reason, change_policy, tags,
-    /// retry_strategy, short_id
+    /// retry_strategy, short_id, review_enabled, review_status,
+    /// corrects_step_id
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let criteria_json: String = row.get(7)?;
         let acceptance_criteria: Vec<String> =
@@ -1024,6 +1136,36 @@ impl Step {
         // legacy rows keep round-tripping (mirrors the `tags` handling).
         let short_id: String = row.get::<_, String>(18).ok().unwrap_or_default();
 
+        // V27 review columns at indices 19/20/21. SELECTs that predate V27
+        // omit them and raw test inserts may leave them NULL; `.get(..).ok()`
+        // + the `Option` mapping defensively treats either case as the
+        // inherit / pending default so legacy rows keep round-tripping
+        // (mirrors the `short_id` / `tags` handling above).
+        //
+        // - `review_enabled` (19): nullable INTEGER tri-state bool; non-null
+        //   coerces to a bool (any non-zero = true), like `questions_enabled`
+        //   on `Plan`.
+        // - `review_status` (20): nullable TEXT; a non-null value must parse
+        //   to a known `ReviewStatus` variant (NULL = pending).
+        // - `corrects_step_id` (21): nullable TEXT step-id pointer.
+        let review_enabled: Option<bool> = row
+            .get::<_, Option<i64>>(19)
+            .ok()
+            .flatten()
+            .map(|v| v != 0);
+        let review_status_str: Option<String> = row.get::<_, Option<String>>(20).ok().flatten();
+        let review_status = match review_status_str {
+            Some(s) => Some(s.parse::<ReviewStatus>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    20,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?),
+            None => None,
+        };
+        let corrects_step_id: Option<String> = row.get::<_, Option<String>>(21).ok().flatten();
+
         Ok(Step {
             id: row.get(0)?,
             short_id,
@@ -1044,6 +1186,9 @@ impl Step {
             change_policy,
             tags,
             retry_strategy,
+            review_enabled,
+            review_status,
+            corrects_step_id,
         })
     }
 
@@ -1872,6 +2017,110 @@ mod tests {
     }
 
     #[test]
+    fn test_review_status_roundtrip() {
+        let statuses = [
+            ReviewStatus::Pending,
+            ReviewStatus::InFlight,
+            ReviewStatus::Passed,
+            ReviewStatus::Failed,
+            ReviewStatus::Skipped,
+            ReviewStatus::Disabled,
+        ];
+        for s in &statuses {
+            let token = s.as_str();
+            let parsed: ReviewStatus = token.parse().unwrap();
+            assert_eq!(*s, parsed);
+            // serde round-trips through the same snake_case token.
+            let json = serde_json::to_string(s).unwrap();
+            assert_eq!(json, format!("\"{token}\""));
+            let de: ReviewStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(*s, de);
+        }
+    }
+
+    #[test]
+    fn test_review_status_default_is_pending() {
+        assert_eq!(ReviewStatus::default(), ReviewStatus::Pending);
+    }
+
+    #[test]
+    fn test_review_status_display() {
+        assert_eq!(ReviewStatus::Pending.to_string(), "pending");
+        assert_eq!(ReviewStatus::InFlight.to_string(), "in_flight");
+        assert_eq!(ReviewStatus::Passed.to_string(), "passed");
+        assert_eq!(ReviewStatus::Failed.to_string(), "failed");
+        assert_eq!(ReviewStatus::Skipped.to_string(), "skipped");
+        assert_eq!(ReviewStatus::Disabled.to_string(), "disabled");
+    }
+
+    #[test]
+    fn test_review_status_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ReviewStatus::InFlight).unwrap(),
+            r#""in_flight""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&ReviewStatus::Disabled).unwrap(),
+            r#""disabled""#,
+        );
+    }
+
+    #[test]
+    fn test_invalid_review_status() {
+        let result: Result<ReviewStatus, _> = "approved".parse();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_step_serde_defaults_review_fields_when_missing() {
+        // Pre-V27 exported plan JSON lacks the review fields. The
+        // `#[serde(default)]` attributes must backfill them to the
+        // inherit / pending defaults (all `None`) so round-tripping a
+        // legacy bundle doesn't change effective review behavior.
+        let json = r#"{
+            "id": "s1",
+            "plan_id": "p1",
+            "sort_key": "a0",
+            "title": "T",
+            "description": "",
+            "agent": null,
+            "harness": null,
+            "acceptance_criteria": [],
+            "status": "pending",
+            "attempts": 0,
+            "max_retries": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let step: Step = serde_json::from_str(json).unwrap();
+        assert_eq!(step.review_enabled, None);
+        assert_eq!(step.review_status, None);
+        assert_eq!(step.corrects_step_id, None);
+    }
+
+    #[test]
+    fn test_plan_serde_defaults_review_enabled_when_missing() {
+        // Pre-V27 exported plan JSON lacks `review_enabled`; serde(default)
+        // must backfill it to `None` (inherit global).
+        let json = r#"{
+            "id": "p1",
+            "slug": "s",
+            "project": "/p",
+            "branch_name": "b",
+            "description": "d",
+            "status": "planning",
+            "harness": null,
+            "agent": null,
+            "deterministic_tests": [],
+            "plan_harness": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let plan: Plan = serde_json::from_str(json).unwrap();
+        assert_eq!(plan.review_enabled, None);
+    }
+
+    #[test]
     fn test_interruption_kind_roundtrip() {
         for k in [InterruptionKind::Question, InterruptionKind::Blocker] {
             let parsed: InterruptionKind = k.as_str().parse().unwrap();
@@ -2026,6 +2275,7 @@ mod tests {
                 skip_requested_step_id: None,
                 skip_changes: None,
                 retry_strategy: rs,
+                review_enabled: None,
             }
         }
         fn make_step(rs: Option<RetryStrategy>) -> Step {
@@ -2049,6 +2299,9 @@ mod tests {
                 change_policy: ChangePolicy::Required,
                 tags: vec![],
                 retry_strategy: rs,
+                review_enabled: None,
+                review_status: None,
+                corrects_step_id: None,
             }
         }
 

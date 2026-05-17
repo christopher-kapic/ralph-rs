@@ -439,6 +439,7 @@ mod tests {
             skip_requested_step_id: None,
             skip_changes: None,
             retry_strategy: None,
+            review_enabled: None,
         }
     }
 

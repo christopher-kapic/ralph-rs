@@ -597,6 +597,7 @@ mod tests {
             skip_requested_step_id: None,
             skip_changes: None,
             retry_strategy: None,
+            review_enabled: None,
         }
     }
 
@@ -621,6 +622,9 @@ mod tests {
             change_policy: ChangePolicy::Required,
             tags: vec![],
             retry_strategy: None,
+            review_enabled: None,
+            review_status: None,
+            corrects_step_id: None,
         }
     }
 
@@ -648,6 +652,9 @@ mod tests {
             change_policy: ChangePolicy::Required,
             tags: vec![],
             retry_strategy: None,
+            review_enabled: None,
+            review_status: None,
+            corrects_step_id: None,
         }
     }
 

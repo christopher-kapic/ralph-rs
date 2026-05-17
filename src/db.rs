@@ -36,6 +36,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v24,
     migrate_v25,
     migrate_v26,
+    migrate_v27,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -1021,6 +1022,47 @@ fn migrate_v26(conn: &Connection) -> Result<()> {
     // V26 is now exactly: create `interruptions` + faithful data cutover +
     // `DROP TABLE step_questions`.
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V27: review configuration columns on plans and steps
+// ---------------------------------------------------------------------------
+
+fn migrate_v27(conn: &Connection) -> Result<()> {
+    // The DAG redesign (docs/dag-redesign.md §3.3, §6 `### V27`) makes
+    // nondeterministic review a first-class per-step pipeline stage with an
+    // off-switch at three scopes. These additive columns carry that state;
+    // they are *wired but not yet consumed* by this batch (no behavior
+    // change) — the pipeline that reads them lands in later Phase 3 steps.
+    //
+    // - `plans.review_enabled` / `steps.review_enabled`: nullable INTEGER
+    //   tri-state booleans. NULL means "inherit from the parent scope"
+    //   exactly like the V24 `retry_strategy` columns: effective review =
+    //   step.review_enabled ?? plan.review_enabled ?? config.review.enabled
+    //   ?? false (step > plan > global, mirroring `RetryStrategy`
+    //   precedence). NO non-null default so pre-V27 rows inherit rather
+    //   than being pinned.
+    // - `steps.review_status`: nullable TEXT holding a serialized
+    //   `plan::ReviewStatus` (`pending` | `in_flight` | `passed` |
+    //   `failed` | `skipped` | `disabled`). NULL = pending (not yet
+    //   reviewed) — analogous to how V24's `retry_strategy` NULL means
+    //   "use the default".
+    // - `steps.corrects_step_id`: nullable TEXT set on a reviewer-inserted
+    //   corrective step, pointing at the `steps.id` it corrects (§10).
+    //   NULL = an ordinary, non-corrective step.
+    //
+    // All four are additive nullable `ALTER`s with NO default, so old DBs
+    // migrate forward untouched and old export JSON keeps round-tripping
+    // via `#[serde(default)]` — same shape as V24.
+    conn.execute_batch(
+        "
+        ALTER TABLE plans ADD COLUMN review_enabled INTEGER;
+        ALTER TABLE steps ADD COLUMN review_enabled INTEGER;
+        ALTER TABLE steps ADD COLUMN review_status TEXT;
+        ALTER TABLE steps ADD COLUMN corrects_step_id TEXT;
+        ",
+    )?;
     Ok(())
 }
 
@@ -2935,8 +2977,14 @@ mod tests {
             "idx_interruptions_open must be the §6 partial index (got {open_sql:?})"
         );
 
-        // (c) MIGRATIONS length / user_version are current (== 26).
-        assert_eq!(MIGRATIONS.len(), 26, "V26 must be registered");
+        // (c) MIGRATIONS length / user_version are current. V26 is the 26th
+        // migration; assert it is registered (>= 26 so appending later
+        // migrations like V27 doesn't re-break this V26-specific test).
+        assert!(
+            MIGRATIONS.len() >= 26,
+            "V26 must be registered (MIGRATIONS.len() = {})",
+            MIGRATIONS.len()
+        );
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
@@ -3007,6 +3055,190 @@ mod tests {
             remaining, 0,
             "step deletion must cascade to interruptions"
         );
+    }
+
+    #[test]
+    fn test_migration_v27_adds_review_columns_to_plans_and_steps() {
+        // Seed a pre-V27 DB with a plans row + a steps row, run V27, and
+        // verify the existing rows default all four review columns to NULL
+        // (inherit / pending — the correct behavior), and that fresh values
+        // round-trip on both tables. Mirrors `test_migration_v24`.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v26.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v26 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(26) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V27 applies. Pre-V27 rows must default every new column
+        // NULL on both tables (NULL = inherit / pending).
+        let conn = open_at(&path).unwrap();
+        let plan_re: Option<i64> = conn
+            .query_row(
+                "SELECT review_enabled FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (step_re, step_rstat, step_corrects): (
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT review_enabled, review_status, corrects_step_id FROM steps WHERE id = ?1",
+                ["s1"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            plan_re.is_none()
+                && step_re.is_none()
+                && step_rstat.is_none()
+                && step_corrects.is_none(),
+            "pre-V27 rows must default the review columns to NULL \
+             (got plan.review_enabled={plan_re:?}, step.review_enabled={step_re:?}, \
+             step.review_status={step_rstat:?}, step.corrects_step_id={step_corrects:?})"
+        );
+
+        // Confirm the schema actually carries the columns on both tables.
+        let plan_cols: Vec<String> = conn
+            .prepare("SELECT * FROM plans LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(
+            plan_cols.iter().any(|c| c == "review_enabled"),
+            "plans must have a review_enabled column post-V27 (cols: {plan_cols:?})"
+        );
+        let step_cols: Vec<String> = conn
+            .prepare("SELECT * FROM steps LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        for col in ["review_enabled", "review_status", "corrects_step_id"] {
+            assert!(
+                step_cols.iter().any(|c| c == col),
+                "steps must have a {col} column post-V27 (cols: {step_cols:?})"
+            );
+        }
+
+        // Fresh inserts can carry explicit values; they round-trip.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, review_enabled) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p2", "new", "/proj", "b", "d", 1_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps \
+                 (id, plan_id, sort_key, title, description, review_enabled, review_status, corrects_step_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params!["s2", "p2", "a0", "Step", "d", 0_i64, "passed", "s1"],
+        )
+        .unwrap();
+        let plan_re2: Option<i64> = conn
+            .query_row(
+                "SELECT review_enabled FROM plans WHERE id = ?1",
+                ["p2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (step_re2, step_rstat2, step_corrects2): (
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT review_enabled, review_status, corrects_step_id FROM steps WHERE id = ?1",
+                ["s2"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(plan_re2, Some(1));
+        assert_eq!(step_re2, Some(0));
+        assert_eq!(step_rstat2.as_deref(), Some("passed"));
+        assert_eq!(step_corrects2.as_deref(), Some("s1"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v27_runs_clean_on_fresh_db() {
+        // A fresh in-memory DB applies every migration including V27: the
+        // review columns exist on both tables and accept explicit values.
+        let conn = open_memory().expect("open_memory");
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, review_enabled) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d", 1_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps \
+                 (id, plan_id, sort_key, title, description, review_enabled, review_status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d", 0_i64, "in_flight"],
+        )
+        .unwrap();
+
+        let plan_re: Option<i64> = conn
+            .query_row(
+                "SELECT review_enabled FROM plans WHERE id = 'p1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (step_re, step_rstat): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT review_enabled, review_status FROM steps WHERE id = 's1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(plan_re, Some(1));
+        assert_eq!(step_re, Some(0));
+        assert_eq!(step_rstat.as_deref(), Some("in_flight"));
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
     }
 
     #[test]

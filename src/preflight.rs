@@ -946,6 +946,7 @@ mod tests {
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
+            review: crate::config::ReviewConfig::default(),
             harnesses,
         };
         let now = chrono::Utc::now();
@@ -969,6 +970,7 @@ mod tests {
             skip_requested_step_id: None,
             skip_changes: None,
             retry_strategy: None,
+            review_enabled: None,
         };
         let results = run_preflight_checks(&plan, &[], &config, tmp.path()).unwrap();
         let auth = results
@@ -1023,6 +1025,9 @@ mod tests {
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
             retry_strategy: None,
+            review_enabled: None,
+            review_status: None,
+            corrects_step_id: None,
         }
     }
 
@@ -1145,6 +1150,7 @@ mod tests {
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
+            review: crate::config::ReviewConfig::default(),
             harnesses: HashMap::new(),
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -1180,6 +1186,7 @@ mod tests {
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
+            review: crate::config::ReviewConfig::default(),
             harnesses,
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -1239,6 +1246,7 @@ mod tests {
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
+            review: crate::config::ReviewConfig::default(),
             harnesses,
         };
         let tmp = tempfile::tempdir().unwrap();
@@ -1341,6 +1349,7 @@ mod tests {
             min_free_disk_mb: 1024,
             display_timezone: "UTC".to_string(),
             harness_chunk_max_bytes: 4096,
+            review: crate::config::ReviewConfig::default(),
             harnesses: HashMap::new(),
         }
     }
