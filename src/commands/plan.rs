@@ -480,6 +480,37 @@ pub fn cmd_plan_questions(
     Ok(())
 }
 
+/// Set the plan-level `review_enabled` override (docs/dag-redesign.md
+/// §6/§7). `enabled` writes `Some(true)`/`Some(false)` to the nullable
+/// `plans.review_enabled` column — an explicit per-plan on/off that wins
+/// over the global `config.review.enabled` and is itself overridden by a
+/// per-step `--review` (precedence step > plan > config > false, resolved
+/// by [`crate::config::effective_review_enabled`]). Sibling of
+/// [`cmd_plan_questions`].
+pub fn cmd_plan_review(
+    conn: &Connection,
+    plan_slug: &str,
+    project: &str,
+    enabled: bool,
+    out: &OutputContext,
+) -> Result<()> {
+    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
+        .with_context(|| format!("Plan not found: {plan_slug}"))?;
+    storage::set_plan_review_enabled(conn, &plan.id, Some(enabled))?;
+
+    if out.format == OutputFormat::Json {
+        let json = serde_json::json!({
+            "plan": plan_slug,
+            "review_enabled": enabled,
+        });
+        println!("{}", serde_json::to_string(&json)?);
+    } else {
+        let verb = if enabled { "enabled" } else { "disabled" };
+        println!("Review {verb} for plan '{plan_slug}'.");
+    }
+    Ok(())
+}
+
 pub fn cmd_plan_set_hook(
     conn: &Connection,
     plan_slug: &str,
@@ -727,5 +758,97 @@ mod tests {
         let err = cmd_plan_questions(&conn, "nope", "/tmp/q-noplan", true, &quiet_out())
             .expect_err("missing plan must error");
         assert!(err.to_string().contains("Plan not found: nope"));
+    }
+
+    // ----------------------------------------------------------------------
+    // `ralph plan review on|off` tests (STEP 42 / docs/dag-redesign.md §7)
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_cmd_plan_review_toggles_on_then_off_persists() {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/r-toggle";
+        let plan =
+            storage::create_plan(&conn, "rp", project, "br", "desc", None, None, &[]).unwrap();
+        // New plans default to review_enabled = NULL (inherit global).
+        assert_eq!(plan.review_enabled, None, "default is inherit (NULL)");
+
+        cmd_plan_review(&conn, "rp", project, true, &quiet_out()).unwrap();
+        let on = storage::get_plan_by_slug(&conn, "rp", project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            on.review_enabled,
+            Some(true),
+            "after `on`, the plan-scope override is Some(true)"
+        );
+
+        cmd_plan_review(&conn, "rp", project, false, &quiet_out()).unwrap();
+        let off = storage::get_plan_by_slug(&conn, "rp", project)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            off.review_enabled,
+            Some(false),
+            "after `off`, the plan-scope override is Some(false)"
+        );
+    }
+
+    #[test]
+    fn test_cmd_plan_review_unknown_slug_errors() {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let err = cmd_plan_review(&conn, "nope", "/tmp/r-noplan", true, &quiet_out())
+            .expect_err("missing plan must error");
+        assert!(err.to_string().contains("Plan not found: nope"));
+    }
+
+    /// End-to-end precedence resolution through the actual scope setters:
+    /// step ?? plan ?? config ?? false (docs/dag-redesign.md §6).
+    #[test]
+    fn test_review_scope_precedence_end_to_end() {
+        use crate::config::{Config, effective_review_enabled};
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/r-prec";
+        let plan =
+            storage::create_plan(&conn, "pp", project, "br", "desc", None, None, &[]).unwrap();
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "S", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        let cfg_on = {
+            let mut c = Config::default();
+            c.review.enabled = Some(true);
+            c
+        };
+        let cfg_off = Config::default(); // review.enabled = None
+
+        // All inherit + config None ⇒ false.
+        let p = storage::get_plan_by_slug(&conn, "pp", project).unwrap().unwrap();
+        let s = storage::get_step(&conn, &step.id).unwrap();
+        assert!(!effective_review_enabled(&s, &p, &cfg_off));
+
+        // config ON, plan/step inherit ⇒ true (falls through to config).
+        assert!(effective_review_enabled(&s, &p, &cfg_on));
+
+        // plan OFF beats config ON.
+        cmd_plan_review(&conn, "pp", project, false, &quiet_out()).unwrap();
+        let p = storage::get_plan_by_slug(&conn, "pp", project).unwrap().unwrap();
+        let s = storage::get_step(&conn, &step.id).unwrap();
+        assert!(!effective_review_enabled(&s, &p, &cfg_on));
+
+        // step ON beats plan OFF (and config).
+        storage::set_step_review_enabled(&conn, &step.id, Some(true)).unwrap();
+        let s = storage::get_step(&conn, &step.id).unwrap();
+        assert!(effective_review_enabled(&s, &p, &cfg_on));
+        assert!(
+            effective_review_enabled(&s, &p, &cfg_off),
+            "step ON wins even when config is unset"
+        );
+
+        // step cleared back to inherit ⇒ falls to plan OFF.
+        storage::set_step_review_enabled(&conn, &step.id, None).unwrap();
+        let s = storage::get_step(&conn, &step.id).unwrap();
+        assert!(!effective_review_enabled(&s, &p, &cfg_on));
     }
 }

@@ -481,6 +481,11 @@ pub fn step_edit(
     change_policy: Option<ChangePolicy>,
     retry_strategy: Option<RetryStrategy>,
     clear_retry_strategy: bool,
+    // `--review on|off|inherit` resolved to the nullable column value:
+    // outer `None` = flag absent (leave the stored override untouched);
+    // `Some(Some(true|false))` = explicit per-step on/off override;
+    // `Some(None)` = `inherit` (clear the override → defer to plan/global).
+    review: Option<Option<bool>>,
     tags: &[String],
     clear_tags: bool,
     out: &OutputContext,
@@ -502,11 +507,12 @@ pub fn step_edit(
         && change_policy.is_none()
         && retry_strategy.is_none()
         && !clear_retry_strategy
+        && review.is_none()
         && tags.is_empty()
         && !clear_tags
     {
         bail!(
-            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --clear-criteria, --max-retries, --clear-max-retries, --change-policy, --retry-strategy, --clear-retry-strategy, --tag, or --clear-tags"
+            "Nothing to edit: provide at least one of --title, --description, --agent, --harness, --model, --criteria, --clear-criteria, --max-retries, --clear-max-retries, --change-policy, --retry-strategy, --clear-retry-strategy, --review, --tag, or --clear-tags"
         );
     }
 
@@ -578,6 +584,16 @@ pub fn step_edit(
         storage::set_step_retry_strategy(conn, &step.id, None)?;
     } else if let Some(rs) = retry_strategy {
         storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
+    }
+
+    // Per-step review override (docs/dag-redesign.md §6/§7). Like
+    // retry-strategy, this lives on its own dedicated nullable setter.
+    // `--review on|off` writes the explicit override; `--review inherit`
+    // writes NULL so the step defers to the plan/global default
+    // (precedence step > plan > config > false). Absence of the flag
+    // (`None`) leaves the stored value untouched.
+    if let Some(review_override) = review {
+        storage::set_step_review_enabled(conn, &step.id, review_override)?;
     }
 
     eprintln!(
@@ -1485,6 +1501,7 @@ mod tests {
             None,
             None,
             false,
+            None, // review (--review absent)
             &new_tags,
             false,
             &test_out(),
@@ -1493,6 +1510,69 @@ mod tests {
 
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps[0].tags, new_tags);
+    }
+
+    /// STEP 42 / docs/dag-redesign.md §6/§7: `step edit --review
+    /// on|off|inherit` persists the per-step `review_enabled` override
+    /// (on=Some(true), off=Some(false), inherit=NULL). The CLI tri-state is
+    /// mapped to `Option<Option<bool>>` at dispatch (`None` = flag absent);
+    /// this exercises the command layer's three explicit forms.
+    #[test]
+    fn test_step_edit_review_override_persists_each_scope_value() {
+        let (conn, project) = setup_with_plan();
+        add_with_tags(&conn, &project, "s", &[]);
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let step0 = storage::list_steps(&conn, &plan.id).unwrap().remove(0);
+        // Default: NULL (inherit).
+        assert_eq!(step0.review_enabled, None);
+
+        // Helper: invoke step_edit changing ONLY --review.
+        let edit_review = |rv: Option<Option<bool>>| {
+            step_edit(
+                &conn,
+                "bulk-plan",
+                &project,
+                Some("1"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                false,
+                None,
+                false,
+                None,
+                None,
+                false,
+                rv,
+                &[],
+                false,
+                &test_out(),
+            )
+        };
+
+        // `--review on` ⇒ Some(true).
+        edit_review(Some(Some(true))).unwrap();
+        let s = storage::get_step(&conn, &step0.id).unwrap();
+        assert_eq!(s.review_enabled, Some(true), "after `on`");
+
+        // `--review off` ⇒ Some(false).
+        edit_review(Some(Some(false))).unwrap();
+        let s = storage::get_step(&conn, &step0.id).unwrap();
+        assert_eq!(s.review_enabled, Some(false), "after `off`");
+
+        // `--review inherit` ⇒ NULL (clear the override).
+        edit_review(Some(None)).unwrap();
+        let s = storage::get_step(&conn, &step0.id).unwrap();
+        assert_eq!(s.review_enabled, None, "after `inherit` the override clears");
+
+        // Flag absent (outer None) ⇒ "nothing to edit" guard fires.
+        let err = edit_review(None).expect_err("no fields to edit must error");
+        assert!(err.to_string().contains("Nothing to edit"));
     }
 
     #[test]
@@ -1522,6 +1602,7 @@ mod tests {
             None,
             None,
             false,
+            None, // review (--review absent)
             &[],
             true, // clear_tags
             &test_out(),
@@ -1582,6 +1663,7 @@ mod tests {
             None,
             None,
             false,
+            None, // review (--review absent)
             &[],
             false,
             &test_out(),
@@ -1621,6 +1703,7 @@ mod tests {
             None,
             None,
             false,
+            None, // review (--review absent)
             &[],
             false,
             &test_out(),
@@ -2304,6 +2387,7 @@ mod tests {
             None,
             None, // retry_strategy
             true, // clear_retry_strategy
+            None, // review (--review absent)
             &[],
             false,
             &test_out(),
@@ -2371,6 +2455,7 @@ mod tests {
             None,
             Some(crate::plan::RetryStrategy::Rollback),
             false,
+            None, // review (--review absent)
             &[],
             false,
             &test_out(),

@@ -1148,6 +1148,47 @@ pub fn set_plan_retry_strategy(
     Ok(())
 }
 
+/// Set (or clear) a plan's `review_enabled` override (V27,
+/// docs/dag-redesign.md §6/§7) and bump `updated_at`. Stored as a nullable
+/// INTEGER: `Some(true)`/`Some(false)` write 1/0 (an explicit per-plan
+/// on/off that wins over the global `config.review.enabled`), `None` writes
+/// NULL so the plan inherits the global default. `Plan::from_row` coerces
+/// the column back to `Option<bool>`. Sibling setter to
+/// [`set_plan_retry_strategy`] — the per-plan way to scope review on/off,
+/// resolved by [`crate::config::effective_review_enabled`].
+pub fn set_plan_review_enabled(
+    conn: &Connection,
+    plan_id: &str,
+    enabled: Option<bool>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE plans SET review_enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![enabled.map(|b| if b { 1 } else { 0 }), plan_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Plan not found: {plan_id}");
+    }
+    Ok(())
+}
+
+/// True when ANY plan **or** step anywhere in the DB has its
+/// `review_enabled` override set truthy (`= 1`). Drives the `ralph doctor`
+/// non-fatal review-harness warning (STEP 44, docs/dag-redesign.md §13.3):
+/// if review is turned on somewhere but no review harness is configured (or
+/// the configured one is off PATH), doctor surfaces it without failing.
+/// Project-independent because the review harness is *global* config — a
+/// review-enabled plan in any project means a missing review harness is
+/// worth flagging. Cheap: two `EXISTS` probes, no row materialization.
+pub fn any_review_enabled(conn: &Connection) -> Result<bool> {
+    let found: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM plans WHERE review_enabled = 1) \
+         OR EXISTS(SELECT 1 FROM steps WHERE review_enabled = 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(found)
+}
+
 /// Set (or clear) a plan's `--squash-on-complete` toggle and bump
 /// `updated_at`. Stored as a nullable INTEGER (V28): `false` writes 0
 /// rather than NULL so the value round-trips explicitly; `Plan::from_row`
@@ -1784,6 +1825,29 @@ pub fn set_step_retry_strategy(
     let affected = conn.execute(
         "UPDATE steps SET retry_strategy = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
         params![strategy.map(|s| s.as_str()), step_id],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
+/// Set (or clear) a step's `review_enabled` override (V27,
+/// docs/dag-redesign.md §6/§7) and bump `updated_at`. Stored as a nullable
+/// INTEGER: `Some(true)`/`Some(false)` write 1/0 (an explicit per-step
+/// on/off that wins over the plan/global default), `None` writes NULL so
+/// the step inherits the plan (then global) default. Sibling setter to
+/// [`set_step_retry_strategy`] — the per-step way to scope review on/off,
+/// resolved by [`crate::config::effective_review_enabled`] (step > plan >
+/// config > false).
+pub fn set_step_review_enabled(
+    conn: &Connection,
+    step_id: &str,
+    enabled: Option<bool>,
+) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE steps SET review_enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+        params![enabled.map(|b| if b { 1 } else { 0 }), step_id],
     )?;
     if affected == 0 {
         anyhow::bail!("Step not found: {step_id}");
@@ -3542,6 +3606,42 @@ mod tests {
         set_plan_questions_enabled(&conn, &plan.id, true).unwrap();
         let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
         assert!(on.questions_enabled);
+    }
+
+    /// STEP 44 / docs/dag-redesign.md §13.3: `any_review_enabled` drives
+    /// the doctor review-harness warning. It is true iff some plan OR step
+    /// has `review_enabled = 1`; an explicit `Some(false)` or NULL/inherit
+    /// must NOT count (only a truthy override means review is actually on).
+    #[test]
+    fn test_any_review_enabled_detects_plan_or_step_truthy_only() {
+        let conn = setup();
+        // Fresh DB: nothing enables review.
+        assert!(!any_review_enabled(&conn).unwrap());
+
+        let plan = create_plan(&conn, "rv", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) =
+            create_step(&conn, &plan.id, "s", "d", None, None, &[], None, None, None, None)
+                .unwrap();
+        // Defaults (NULL/inherit) ⇒ still false.
+        assert!(!any_review_enabled(&conn).unwrap());
+
+        // Explicit OFF on both ⇒ still false (not a truthy override).
+        set_plan_review_enabled(&conn, &plan.id, Some(false)).unwrap();
+        set_step_review_enabled(&conn, &step.id, Some(false)).unwrap();
+        assert!(!any_review_enabled(&conn).unwrap());
+
+        // Step ON ⇒ true.
+        set_step_review_enabled(&conn, &step.id, Some(true)).unwrap();
+        assert!(any_review_enabled(&conn).unwrap());
+
+        // Step back to inherit, plan ON ⇒ true (plan side of the OR).
+        set_step_review_enabled(&conn, &step.id, None).unwrap();
+        set_plan_review_enabled(&conn, &plan.id, Some(true)).unwrap();
+        assert!(any_review_enabled(&conn).unwrap());
+
+        // Everything back to inherit ⇒ false again.
+        set_plan_review_enabled(&conn, &plan.id, None).unwrap();
+        assert!(!any_review_enabled(&conn).unwrap());
     }
 
     #[test]

@@ -399,6 +399,39 @@ pub enum ConfigCommand {
         /// IANA timezone name.
         tz: String,
     },
+
+    /// Manage the global nondeterministic-review configuration block
+    /// (docs/dag-redesign.md §6/§7).
+    #[command(subcommand)]
+    Review(ConfigReviewCommand),
+}
+
+/// `ralph config review …` — the global `"review"` config block (the
+/// bottom of the precedence chain step > plan > config > false).
+#[derive(Debug, Subcommand)]
+pub enum ConfigReviewCommand {
+    /// Set one or more fields of the global review block. Every argument is
+    /// independently optional — only the fields you pass are written; the
+    /// rest are left untouched (so `--enabled true` alone flips the global
+    /// default without disturbing a previously-configured harness/model).
+    Set {
+        /// Review harness name (the harness the read-only reviewer
+        /// subprocess invokes, e.g. `codex`). Global config, never plan or
+        /// export data — a bundle stays portable across machines whose
+        /// review harness differs (docs/dag-redesign.md §13.2).
+        #[arg(long)]
+        harness: Option<String>,
+
+        /// Model the reviewer subprocess uses (empty = harness default).
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Global default for whether a step is reviewed. The bottom of the
+        /// precedence chain (step.review_enabled ?? plan.review_enabled ??
+        /// config.review.enabled ?? false).
+        #[arg(long)]
+        enabled: Option<bool>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +624,21 @@ pub enum PlanCommand {
     /// Mirrors the `Q` keybinding in the TUI plan list.
     Questions {
         /// `on` to enable, `off` to disable.
+        state: QuestionsState,
+
+        /// Plan slug.
+        slug: String,
+    },
+
+    /// Toggle the built-in nondeterministic review pipeline for a plan
+    /// (docs/dag-redesign.md §3.3/§6/§7).
+    ///
+    /// `ralph plan review on <slug>` sets the plan-level `review_enabled`
+    /// override to true; `off` sets it to false. The per-plan value wins
+    /// over the global `config.review.enabled` and is itself overridden by
+    /// a per-step `--review` (precedence step > plan > config > false).
+    Review {
+        /// `on` to force review on for the plan, `off` to force it off.
         state: QuestionsState,
 
         /// Plan slug.
@@ -856,6 +904,16 @@ pub enum StepCommand {
         /// `--clear-max-retries`; conflicts with `--retry-strategy`.
         #[arg(long, conflicts_with = "retry_strategy")]
         clear_retry_strategy: bool,
+
+        /// Set the per-step nondeterministic-review override
+        /// (docs/dag-redesign.md §6/§7). `on` forces review on for this
+        /// step, `off` forces it off, `inherit` clears the override so the
+        /// step defers to the plan, then the global, default. Precedence is
+        /// step > plan > config > false. Omit to leave the existing
+        /// override unchanged (no `--clear-*` form needed — `inherit` IS
+        /// the clear).
+        #[arg(long, value_name = "STATE")]
+        review: Option<StepReviewState>,
 
         /// Replace the step's tag list with these values (repeatable). Omit
         /// to leave existing tags unchanged; pass at least once to overwrite.
@@ -1195,7 +1253,8 @@ impl From<ChangeHandling> for crate::git::ParkStrategyKind {
     }
 }
 
-/// `on` / `off` value enum for `ralph plan questions`.
+/// `on` / `off` value enum for `ralph plan questions` and
+/// `ralph plan review`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lowercase")]
 pub enum QuestionsState {
@@ -1203,6 +1262,36 @@ pub enum QuestionsState {
     On,
     /// Disable the feature (the default for new plans).
     Off,
+}
+
+/// `on` / `off` / `inherit` tri-state value enum for
+/// `ralph step edit --review` (docs/dag-redesign.md §6/§7).
+///
+/// Maps to the nullable per-step `review_enabled` override:
+/// `on` ⇒ `Some(true)`, `off` ⇒ `Some(false)`, `inherit` ⇒ `None`
+/// (the step defers to the plan, then the global, default — precedence
+/// step > plan > config > false, resolved by
+/// [`crate::config::effective_review_enabled`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lowercase")]
+pub enum StepReviewState {
+    /// Force review on for this step (overrides plan/global).
+    On,
+    /// Force review off for this step (overrides plan/global).
+    Off,
+    /// Clear the step override — defer to the plan, then global, default.
+    Inherit,
+}
+
+impl StepReviewState {
+    /// Resolve the tri-state to the nullable `review_enabled` column value.
+    pub fn to_override(self) -> Option<bool> {
+        match self {
+            StepReviewState::On => Some(true),
+            StepReviewState::Off => Some(false),
+            StepReviewState::Inherit => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

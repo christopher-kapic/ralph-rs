@@ -75,6 +75,65 @@ pub fn config_set_timezone(tz: &str) -> Result<()> {
     Ok(())
 }
 
+/// Set one or more fields of the global `"review"` config block
+/// (docs/dag-redesign.md §6/§7) and write the config back to disk.
+///
+/// Every argument is independently optional — only the fields the caller
+/// passes are mutated; the rest are left exactly as they were on disk. This
+/// is deliberate: `--enabled true` alone must flip the global review
+/// default without clobbering a previously-configured `harness`/`model`,
+/// and `--harness codex` alone must point the reviewer at a harness without
+/// implicitly enabling review. The `enabled` field is the bottom of the
+/// precedence chain resolved by `effective_review_enabled`
+/// (step ?? plan ?? config ?? false). `harness`/`model` are global config,
+/// never plan/export data (a bundle stays portable across machines whose
+/// review harness differs — §13.2).
+pub fn config_review_set(
+    harness: Option<&str>,
+    model: Option<&str>,
+    enabled: Option<bool>,
+) -> Result<()> {
+    if harness.is_none() && model.is_none() && enabled.is_none() {
+        return Err(anyhow!(
+            "Nothing to set: pass at least one of --harness, --model, or --enabled"
+        ));
+    }
+
+    let mut config: Config = config::load_or_create_config()?;
+    if let Some(h) = harness {
+        config.review.harness = h.to_string();
+    }
+    if let Some(m) = model {
+        config.review.model = m.to_string();
+    }
+    if let Some(e) = enabled {
+        config.review.enabled = Some(e);
+    }
+    config
+        .save()
+        .context("Failed to persist updated config to disk")?;
+
+    eprintln!(
+        "Review config updated: enabled={}, harness={}, model={}.",
+        config
+            .review
+            .enabled
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "<unset>".to_string()),
+        if config.review.harness.is_empty() {
+            "<unset>"
+        } else {
+            &config.review.harness
+        },
+        if config.review.model.is_empty() {
+            "<unset>"
+        } else {
+            &config.review.model
+        },
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +205,54 @@ mod tests {
             !config_path.exists(),
             "rejected set must not leave a config file behind"
         );
+    }
+
+    /// STEP 42 / docs/dag-redesign.md §6/§7: `config review set` writes the
+    /// global review block. Every arg is independently optional — only the
+    /// passed fields are written; the rest survive untouched across calls.
+    #[test]
+    fn test_config_review_set_partial_writes_persist_and_are_independent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = set_xdg(tmp.path());
+
+        // First call: harness only. enabled/model stay at defaults.
+        config_review_set(Some("codex"), None, None).expect("set harness ok");
+        let c = config::load_or_create_config().expect("reload");
+        assert_eq!(c.review.harness, "codex");
+        assert_eq!(c.review.model, "");
+        assert_eq!(c.review.enabled, None, "unpassed --enabled stays unset");
+
+        // Second call: enabled only. harness must survive untouched.
+        config_review_set(None, None, Some(true)).expect("set enabled ok");
+        let c = config::load_or_create_config().expect("reload");
+        assert_eq!(c.review.enabled, Some(true));
+        assert_eq!(
+            c.review.harness, "codex",
+            "harness from the prior call must NOT be clobbered"
+        );
+
+        // Third call: model only. enabled + harness survive.
+        config_review_set(None, Some("gpt-5-codex"), None).expect("set model ok");
+        let c = config::load_or_create_config().expect("reload");
+        assert_eq!(c.review.model, "gpt-5-codex");
+        assert_eq!(c.review.harness, "codex");
+        assert_eq!(c.review.enabled, Some(true));
+
+        // Pretty-printed persisted file carries the review block.
+        let config_path = tmp.path().join("ralph-rs").join("config.json");
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(contents.contains("\"review\""));
+        assert!(contents.contains("\"gpt-5-codex\""));
+        assert!(contents.contains('\n'), "must stay human-readable");
+    }
+
+    #[test]
+    fn test_config_review_set_requires_at_least_one_field() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _guard = set_xdg(tmp.path());
+        let err = config_review_set(None, None, None)
+            .expect_err("no fields must error rather than silently no-op");
+        assert!(err.to_string().contains("Nothing to set"), "{err}");
     }
 
     #[test]

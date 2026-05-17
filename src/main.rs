@@ -227,6 +227,10 @@ fn main() -> Result<()> {
                 let enabled = matches!(state, QuestionsState::On);
                 commands::cmd_plan_questions(&conn, &slug, &project, enabled, &out)
             }
+            PlanCommand::Review { state, slug } => {
+                let enabled = matches!(state, QuestionsState::On);
+                commands::cmd_plan_review(&conn, &slug, &project, enabled, &out)
+            }
         },
 
         // -- Step --
@@ -326,6 +330,7 @@ fn main() -> Result<()> {
                 change_policy,
                 retry_strategy,
                 clear_retry_strategy,
+                review,
                 tags,
                 clear_tags,
             } => {
@@ -348,6 +353,7 @@ fn main() -> Result<()> {
                     change_policy,
                     retry_strategy,
                     clear_retry_strategy,
+                    review.map(|r| r.to_override()),
                     &tags,
                     clear_tags,
                     &out,
@@ -595,6 +601,10 @@ fn main() -> Result<()> {
             strict,
         } => {
             let h = cli.harness.as_deref();
+            // `--strict` rejects a review-enabled bundle when this machine
+            // has no review harness configured (docs/dag-redesign.md
+            // §13.3).
+            let review_harness_configured = !config.review.harness.trim().is_empty();
             import::import_plan(
                 &conn,
                 &file,
@@ -603,6 +613,7 @@ fn main() -> Result<()> {
                 branch.as_deref(),
                 h,
                 strict,
+                review_harness_configured,
             )
         }
 
@@ -828,6 +839,15 @@ fn main() -> Result<()> {
             cli::ConfigCommand::SetTimezone { tz } => {
                 commands::config_cmd::config_set_timezone(&tz)
             }
+            cli::ConfigCommand::Review(cli::ConfigReviewCommand::Set {
+                harness,
+                model,
+                enabled,
+            }) => commands::config_cmd::config_review_set(
+                harness.as_deref(),
+                model.as_deref(),
+                enabled,
+            ),
         },
 
         // -- Completions --

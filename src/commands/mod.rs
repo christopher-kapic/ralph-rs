@@ -1454,6 +1454,7 @@ mod tests {
             None,
             None,
             false,
+            None, // review (--review absent)
             &[],
             false,
             &test_out(),

@@ -1754,6 +1754,7 @@ fn apply_palette_import(
         harness: None,
         project,
         strict: false,
+        review_harness_configured: false,
     };
     match crate::import::import_plan_from_data(conn, &imported, &options) {
         Ok(slug) => {

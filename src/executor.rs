@@ -2047,7 +2047,25 @@ pub async fn execute_step(
                         )?;
                         Some((commit_hash.clone(), attempt))
                     } else {
-                        // Mark step as complete (unchanged path).
+                        // Review effective-DISABLED at some scope (step / plan
+                        // / config) — the §3.3/§6 fast path: record
+                        // `review_status = Disabled` and go straight to
+                        // `Complete` from passing tests with **no reviewer
+                        // spawn**. Writing the explicit `Disabled` variant
+                        // (rather than leaving the on-disk NULL, which means
+                        // `Pending`) makes "review was off for this step"
+                        // durable and observable cross-process — and lets
+                        // `ralph doctor` / the TUI distinguish it from a step
+                        // that simply has not been reviewed yet. For a
+                        // linear/no-review plan this is the only review-status
+                        // write that ever happens; `needs_review` stays `None`
+                        // so the runner never enters the reviewer block,
+                        // keeping behavior byte-identical to pre-review ralph.
+                        storage::update_step_review_status(
+                            conn,
+                            &step.id,
+                            crate::plan::ReviewStatus::Disabled,
+                        )?;
                         storage::update_step_status(conn, &step.id, StepStatus::Complete)?;
                         None
                     };
@@ -6968,6 +6986,143 @@ mod tests {
         );
         let its = crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
         assert_eq!(its.len(), 2, "both iteration commits remain");
+    }
+
+    /// STEP 42 / docs/dag-redesign.md §3.3/§6/§7 — the **disabled review
+    /// fast path**: when review is effective-DISABLED at any scope the step
+    /// goes straight to `Complete` from passing tests with
+    /// `review_status = Disabled` and **NO reviewer is ever spawned**.
+    ///
+    /// The no-spawn proof is structural *and* observable here:
+    /// 1. `execute_step` returns `needs_review: None` — and the runner's
+    ///    reviewer block is gated entirely on `needs_review: Some(..)`, so
+    ///    `None` means the runner can never enter `review::run_review`.
+    /// 2. We additionally wire a review harness whose script drops a
+    ///    sentinel file the instant it is invoked, and assert that sentinel
+    ///    never appears: even if some future refactor moved the spawn into
+    ///    the executor, this would catch it.
+    /// Review is disabled here at the *step* scope (`Some(false)`), which —
+    /// per the precedence chain — also proves a step override beats an
+    /// enabled global config.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_review_disabled_fast_path_no_spawn_marks_disabled_complete() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_append_line_harness(harness_tmp.path(), &dir);
+
+        // A "reviewer" that, if EVER spawned, drops a sentinel file. The
+        // test asserts the sentinel never exists.
+        let sentinel = harness_tmp.path().join("REVIEWER_WAS_SPAWNED");
+        let reviewer_path = harness_tmp.path().join("reviewer.sh");
+        fs::write(
+            &reviewer_path,
+            format!(
+                "#!/bin/sh\ntouch {}\necho 'REVIEW PASS'\nexit 0\n",
+                sentinel.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&reviewer_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&reviewer_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 1",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Step-scope OFF override — wins over the enabled global config.
+        storage::set_step_review_enabled(&conn, &step.id, Some(false)).unwrap();
+        let step = storage::get_step(&conn, &step.id).unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        config
+            .harnesses
+            .insert("reviewer".to_string(), harness_config_for_script(&reviewer_path));
+        // Global review is ENABLED + a real review harness is configured,
+        // so the only thing keeping the reviewer from spawning is the
+        // step-scope OFF override resolving via effective_review_enabled.
+        config.review.enabled = Some(true);
+        config.review.harness = "reviewer".to_string();
+
+        // Sanity: effective review really is disabled for this step.
+        assert!(
+            !crate::config::effective_review_enabled(&step, &plan, &config),
+            "step-scope OFF must make effective review disabled"
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        // (1) The fast path returns no review request: the runner can never
+        //     enter the reviewer block.
+        assert!(
+            result.needs_review.is_none(),
+            "disabled review must NOT hand a review request back to the runner"
+        );
+        // (2) The reviewer sentinel must never have been written.
+        assert!(
+            !sentinel.exists(),
+            "the reviewer harness must NEVER be spawned on the disabled fast path"
+        );
+        // (3) The step is Complete straight from passing tests with
+        //     review_status = Disabled (not the on-disk NULL/Pending).
+        let s = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(s.status, StepStatus::Complete);
+        assert_eq!(s.review_status, Some(crate::plan::ReviewStatus::Disabled));
     }
 
     /// STEP 35 (`--squash-on-complete`): when the step reaches Complete its

@@ -88,6 +88,25 @@ pub struct ImportedPlanMeta {
     /// compatibility with plan JSON written before V24.
     #[serde(default)]
     pub retry_strategy: Option<crate::plan::RetryStrategy>,
+    /// Optional plan-level review on/off override (docs/dag-redesign.md
+    /// §13.3). Missing/absent field ⇒ `None` (inherit global) via
+    /// serde(default), so a legacy (pre-V27) bundle imports fine. Mirrors
+    /// `retry_strategy` exactly.
+    #[serde(default)]
+    pub review_enabled: Option<bool>,
+    /// Plan-level `--squash-on-complete` toggle (docs/dag-redesign.md
+    /// §13.3 / §14.1). Plan-template data. Missing/absent field ⇒ `false`
+    /// via serde(default), so a legacy (pre-V28) bundle imports back to the
+    /// default OFF — the boolean-template-field round-trip convention
+    /// (export emits it only when `true`).
+    #[serde(default)]
+    pub squash_on_complete: bool,
+    /// Optional plan-level `max_review_corrections` recursion cap
+    /// (docs/dag-redesign.md §10 / §13.3). Plan-template data, sibling of
+    /// `retry_strategy`. Missing/absent field ⇒ `None` (use the built-in
+    /// default) via serde(default), so a legacy bundle imports fine.
+    #[serde(default)]
+    pub max_review_corrections: Option<i32>,
 }
 
 /// Step from the portable JSON.
@@ -119,6 +138,13 @@ pub struct ImportedStep {
     /// V24.
     #[serde(default)]
     pub retry_strategy: Option<crate::plan::RetryStrategy>,
+    /// Optional step-level review on/off override (docs/dag-redesign.md
+    /// §13.3). Missing/absent field ⇒ `None` (inherit plan/global) via
+    /// serde(default), so a legacy (pre-V27) bundle imports fine. Mirrors
+    /// `retry_strategy` exactly. The runtime `review_status` /
+    /// `corrects_step_id` are never carried in a bundle (runtime state).
+    #[serde(default)]
+    pub review_enabled: Option<bool>,
     /// Plan-unique portable edge handle (docs/dag-redesign.md §13.2/§13.3).
     /// Absent only in *true legacy* pre-DAG bundles (`#[serde(default)]` →
     /// `None`); present and **preserved verbatim** for every DAG-aware
@@ -342,6 +368,29 @@ pub struct ImportOptions<'a> {
     /// When true, major-version mismatch in `ralph_rs_version` is a hard
     /// error; when false, it only warns.
     pub strict: bool,
+    /// Whether the *target machine* has a global review harness configured
+    /// (`config.review.harness` non-empty). Consulted only under `strict`:
+    /// a bundle whose `review_enabled` is set to `true` anywhere
+    /// (plan- or step-level) cannot run reviews on a machine with no
+    /// review harness, so `--strict` rejects it — consistent with
+    /// `--strict` rejecting an unusable bundle rather than importing
+    /// something that cannot execute as authored (docs/dag-redesign.md
+    /// §13.3). Non-strict import keeps the toggle and `ralph doctor` warns
+    /// until a review harness is configured (STEP 44). Ignored when
+    /// `strict` is false.
+    pub review_harness_configured: bool,
+}
+
+/// True when the bundle turns review **on** at any scope (plan- or
+/// step-level `review_enabled == Some(true)`). A bundle that only sets
+/// `Some(false)` (review explicitly off) needs no review harness, so it is
+/// not rejected even under `--strict`.
+fn bundle_requests_review(data: &ImportedPlan) -> bool {
+    data.plan.review_enabled == Some(true)
+        || data
+            .steps
+            .iter()
+            .any(|s| s.review_enabled == Some(true))
 }
 
 /// Read and parse a portable plan JSON file.
@@ -363,6 +412,24 @@ pub fn import_plan_from_data(
     options: &ImportOptions<'_>,
 ) -> Result<String> {
     check_import_version(&data.ralph_rs_version, options.strict)?;
+
+    // `--strict` additionally rejects a bundle that turns review ON but
+    // whose target machine has no review harness configured
+    // (docs/dag-redesign.md §13.3) — consistent with `--strict` refusing a
+    // bundle it cannot run as authored. Non-strict import keeps the toggle;
+    // `ralph doctor` warns until a review harness is configured (STEP 44).
+    if options.strict
+        && bundle_requests_review(data)
+        && !options.review_harness_configured
+    {
+        anyhow::bail!(
+            "strict import rejected: this bundle enables review (plan/step \
+             `review_enabled` is on) but no review harness is configured on \
+             this machine (set `review.harness` via `ralph config review \
+             set --harness <h>`). Re-run without --strict to import anyway \
+             (`ralph doctor` will warn until a review harness is configured)."
+        );
+    }
 
     let slug = options.slug.unwrap_or(&data.plan.slug);
     let branch = options.branch.unwrap_or(&data.plan.branch_name);
@@ -431,6 +498,24 @@ fn import_plan_inner(
         storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
     }
 
+    // Restore the plan-level review on/off override only when carried
+    // (`None` is the column default — round-trip: None stays None).
+    if let Some(re) = data.plan.review_enabled {
+        storage::set_plan_review_enabled(conn, &plan.id, Some(re))?;
+    }
+    // `squash_on_complete` is a boolean-template field: write only the
+    // explicit `true` (false is the column default, so skipping the write
+    // keeps a legacy/default-OFF bundle OFF — round-trip preserved).
+    if data.plan.squash_on_complete {
+        storage::set_plan_squash_on_complete(conn, &plan.id, true)?;
+    }
+    // Plan-level review recursion cap, sibling of retry_strategy: write
+    // only when present so an unset bundle stays unset (uses the built-in
+    // default).
+    if let Some(cap) = data.plan.max_review_corrections {
+        storage::set_plan_max_review_corrections(conn, &plan.id, Some(cap))?;
+    }
+
     // First pass: create every step (in array order — the deterministic
     // scheduler tie-break seed). On the DAG-aware path the bundle's
     // `short_id`s are preserved verbatim (create_step mints a throwaway id
@@ -463,6 +548,11 @@ fn import_plan_inner(
         // so an unset imported step stays unset (round-trip preserved).
         if let Some(rs) = step_data.retry_strategy {
             storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
+        }
+        // Same rule for the step-level review override (round-trip: an
+        // unset imported step stays unset / inherit).
+        if let Some(re) = step_data.review_enabled {
+            storage::set_step_review_enabled(conn, &step.id, Some(re))?;
         }
         if dag_aware {
             // validate_dag_aware_steps guaranteed Some + uniqueness.
@@ -515,6 +605,7 @@ fn import_plan_inner(
 }
 
 /// Import a plan from a JSON file. Full CLI entry point.
+#[allow(clippy::too_many_arguments)]
 pub fn import_plan(
     conn: &Connection,
     file: &Path,
@@ -523,6 +614,7 @@ pub fn import_plan(
     branch: Option<&str>,
     harness: Option<&str>,
     strict: bool,
+    review_harness_configured: bool,
 ) -> Result<()> {
     let data = read_plan_file(file)?;
 
@@ -532,6 +624,7 @@ pub fn import_plan(
         harness,
         project,
         strict,
+        review_harness_configured,
     };
 
     let effective_slug = slug.unwrap_or(&data.plan.slug);
@@ -604,6 +697,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
 
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
@@ -663,6 +757,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -700,6 +795,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -733,6 +829,7 @@ mod tests {
             harness: Some("codex"),
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -765,6 +862,7 @@ mod tests {
             harness: None,
             project: "/home/user/my-project",
             strict: false,
+            review_harness_configured: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -802,6 +900,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
         let id1 = import_plan_from_data(&conn, &data, &options1).unwrap();
 
@@ -811,6 +910,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
         let id2 = import_plan_from_data(&conn, &data, &options2).unwrap();
 
@@ -848,6 +948,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
 
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
@@ -926,6 +1027,7 @@ mod tests {
             harness: None,
             project: "/tmp/imported",
             strict: false,
+            review_harness_configured: false,
         };
 
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
@@ -1001,7 +1103,7 @@ mod tests {
         let file_path = dir.path().join("plan.json");
         std::fs::write(&file_path, json).unwrap();
 
-        import_plan(&conn, &file_path, "/tmp/proj", None, None, None, false).unwrap();
+        import_plan(&conn, &file_path, "/tmp/proj", None, None, None, false, false).unwrap();
 
         let plan = storage::get_plan_by_slug(&conn, "file-import", "/tmp/proj")
             .unwrap()
@@ -1021,6 +1123,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
         );
         assert!(result.is_err());
@@ -1097,6 +1200,7 @@ mod tests {
             harness: None,
             project: "/tmp/dst",
             strict: false,
+            review_harness_configured: false,
         };
         let b2_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
 
@@ -1129,6 +1233,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
 
         // Import should succeed despite the missing dependency.
@@ -1169,6 +1274,7 @@ mod tests {
             harness: None,
             project: "/tmp/rollback",
             strict: false,
+            review_harness_configured: false,
         };
 
         let result = import_plan_from_data(&conn, &data, &options);
@@ -1206,6 +1312,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
 
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
@@ -1291,6 +1398,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
 
         // Non-strict: should succeed (with a warning printed to stderr).
@@ -1327,6 +1435,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: true,
+            review_harness_configured: false,
         };
 
         let result = import_plan_from_data(&conn, &data, &options);
@@ -1361,6 +1470,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
 
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
@@ -1430,6 +1540,7 @@ mod tests {
             harness: None,
             project: "/tmp/dst",
             strict: false,
+            review_harness_configured: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
         let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
@@ -1465,6 +1576,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: true,
+            review_harness_configured: false,
         };
 
         // Even in strict mode, an unparseable version only warns; the
@@ -1500,6 +1612,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
@@ -1530,6 +1643,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
@@ -1615,6 +1729,7 @@ mod tests {
             harness: None,
             project: "/tmp/dst",
             strict: false,
+            review_harness_configured: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
         let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
@@ -1674,12 +1789,277 @@ mod tests {
             harness: None,
             project: "/tmp/dst",
             strict: false,
+            review_harness_configured: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
         let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
         let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
         assert!(imported_plan.retry_strategy.is_none());
         assert!(imported_steps[0].retry_strategy.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // STEP 43 — review toggles + squash_on_complete + max_review_corrections
+    // round-trip (docs/dag-redesign.md §13.2-§13.3)
+    // -----------------------------------------------------------------
+
+    /// All plan-template review fields survive export -> JSON -> import:
+    /// plan/step `review_enabled`, `squash_on_complete`, and
+    /// `max_review_corrections`. Runtime state (`review_status`,
+    /// `corrects_step_id`) is stripped (the structs have no such fields).
+    #[test]
+    fn test_roundtrip_preserves_review_toggles_squash_and_max_corrections() {
+        let conn = setup();
+        let original = storage::create_plan(
+            &conn, "rev-rt", "/tmp/src", "branch", "desc", None, None, &[],
+        )
+        .unwrap();
+        // Plan-level: review ON, squash ON, cap = 5.
+        storage::set_plan_review_enabled(&conn, &original.id, Some(true)).unwrap();
+        storage::set_plan_squash_on_complete(&conn, &original.id, true).unwrap();
+        storage::set_plan_max_review_corrections(&conn, &original.id, Some(5)).unwrap();
+
+        // step 1: explicit step-level review OFF override.
+        let (s1, _) = storage::create_step(
+            &conn, &original.id, "off-step", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        storage::set_step_review_enabled(&conn, &s1.id, Some(false)).unwrap();
+        // step 2: no step-level override (inherit -> None).
+        storage::create_step(
+            &conn, &original.id, "inherit-step", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        let original = storage::get_plan_by_id(&conn, &original.id).unwrap();
+        let steps = storage::list_steps(&conn, &original.id).unwrap();
+        let exported = export::build_exported_plan(&original, &steps, Vec::new(), &[]);
+        let json = serde_json::to_string_pretty(&exported).unwrap();
+
+        // Plan + explicit step toggles are present; runtime state is NOT.
+        assert!(json.contains("\"review_enabled\": true"));
+        assert!(json.contains("\"review_enabled\": false"));
+        assert!(json.contains("\"squash_on_complete\": true"));
+        assert!(json.contains("\"max_review_corrections\": 5"));
+        assert!(
+            !json.contains("review_status"),
+            "runtime review_status must never be exported; got:\n{json}"
+        );
+        assert!(
+            !json.contains("corrects_step_id"),
+            "the provenance pointer must never be exported; got:\n{json}"
+        );
+
+        let imported_data: ImportedPlan = serde_json::from_str(&json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: false,
+            review_harness_configured: false,
+        };
+        let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
+        let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
+        let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
+
+        assert_eq!(imported_plan.review_enabled, Some(true));
+        assert!(imported_plan.squash_on_complete);
+        assert_eq!(imported_plan.max_review_corrections, Some(5));
+        assert_eq!(imported_steps[0].review_enabled, Some(false));
+        assert!(
+            imported_steps[1].review_enabled.is_none(),
+            "an unset step-level review override must round-trip as None"
+        );
+        // Runtime state is reset on import, never carried by the bundle.
+        assert!(imported_steps[0].review_status.is_none());
+        assert!(imported_steps[0].corrects_step_id.is_none());
+    }
+
+    /// A plan with NO review overrides and the default-OFF squash exports
+    /// without any of the new keys (pre-V27/V28 JSON shape preserved) and a
+    /// legacy bundle (none of the fields present) imports back to the
+    /// inherit/OFF defaults via `#[serde(default)]`.
+    #[test]
+    fn test_legacy_bundle_without_review_fields_imports_to_defaults() {
+        let conn = setup();
+        let original = storage::create_plan(
+            &conn, "no-rev", "/tmp/src", "branch", "desc", None, None, &[],
+        )
+        .unwrap();
+        storage::create_step(
+            &conn, &original.id, "s", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        let steps = storage::list_steps(&conn, &original.id).unwrap();
+        let exported = export::build_exported_plan(&original, &steps, Vec::new(), &[]);
+        let json = serde_json::to_string_pretty(&exported).unwrap();
+        assert!(
+            !json.contains("review_enabled"),
+            "an all-unset plan must not emit review_enabled; got:\n{json}"
+        );
+        assert!(
+            !json.contains("squash_on_complete"),
+            "default-OFF squash must be omitted (boolean-template convention); got:\n{json}"
+        );
+        assert!(
+            !json.contains("max_review_corrections"),
+            "an unset cap must not be emitted; got:\n{json}"
+        );
+
+        // Simulate a TRUE legacy bundle: hand-rolled JSON with none of the
+        // new keys. Must import cleanly to the defaults.
+        let legacy = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {
+                "slug": "legacy-rev",
+                "branch_name": "b",
+                "description": "d",
+                "harness": null,
+                "agent": null,
+                "deterministic_tests": []
+            },
+            "steps": [{"title": "s", "description": "d", "agent": null,
+                       "harness": null, "acceptance_criteria": [],
+                       "max_retries": null}]
+        }"#;
+        let data: ImportedPlan = serde_json::from_str(legacy).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: false,
+            review_harness_configured: false,
+        };
+        let id = import_plan_from_data(&conn, &data, &options).unwrap();
+        let p = storage::get_plan_by_id(&conn, &id).unwrap();
+        let st = storage::list_steps(&conn, &id).unwrap();
+        assert_eq!(p.review_enabled, None, "legacy ⇒ inherit");
+        assert!(!p.squash_on_complete, "legacy ⇒ default OFF");
+        assert_eq!(p.max_review_corrections, None, "legacy ⇒ built-in default");
+        assert_eq!(st[0].review_enabled, None, "legacy step ⇒ inherit");
+    }
+
+    /// `--strict` rejects a bundle that turns review ON when the target
+    /// machine has no review harness configured (docs/dag-redesign.md
+    /// §13.3) — consistent with `--strict` refusing an unrunnable bundle.
+    /// Non-strict import of the same bundle keeps the toggle.
+    #[test]
+    fn test_strict_rejects_review_bundle_without_review_harness() {
+        let conn = setup();
+        let original = storage::create_plan(
+            &conn, "strict-rev", "/tmp/src", "branch", "desc", None, None, &[],
+        )
+        .unwrap();
+        storage::set_plan_review_enabled(&conn, &original.id, Some(true)).unwrap();
+        storage::create_step(
+            &conn, &original.id, "s", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        let original = storage::get_plan_by_id(&conn, &original.id).unwrap();
+        let steps = storage::list_steps(&conn, &original.id).unwrap();
+        let json = serde_json::to_string_pretty(
+            &export::build_exported_plan(&original, &steps, Vec::new(), &[]),
+        )
+        .unwrap();
+        let data: ImportedPlan = serde_json::from_str(&json).unwrap();
+
+        // strict + NO review harness ⇒ reject, no partial plan written.
+        let strict_no_harness = ImportOptions {
+            slug: Some("rejected"),
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: true,
+            review_harness_configured: false,
+        };
+        let err = import_plan_from_data(&conn, &data, &strict_no_harness)
+            .expect_err("strict must reject a review bundle with no review harness");
+        assert!(
+            err.to_string().contains("no review harness is configured"),
+            "{err}"
+        );
+        assert!(
+            storage::get_plan_by_slug(&conn, "rejected", "/tmp/dst")
+                .unwrap()
+                .is_none(),
+            "a rejected strict import must write NO partial plan"
+        );
+
+        // strict + review harness configured ⇒ accepted.
+        let strict_with_harness = ImportOptions {
+            slug: Some("accepted-strict"),
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: true,
+            review_harness_configured: true,
+        };
+        let id = import_plan_from_data(&conn, &data, &strict_with_harness)
+            .expect("strict import must succeed when a review harness exists");
+        assert_eq!(
+            storage::get_plan_by_id(&conn, &id).unwrap().review_enabled,
+            Some(true)
+        );
+
+        // Non-strict + NO review harness ⇒ accepted, toggle kept.
+        let lax = ImportOptions {
+            slug: Some("accepted-lax"),
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: false,
+            review_harness_configured: false,
+        };
+        let id2 = import_plan_from_data(&conn, &data, &lax)
+            .expect("non-strict import must keep the review toggle");
+        assert_eq!(
+            storage::get_plan_by_id(&conn, &id2).unwrap().review_enabled,
+            Some(true),
+            "non-strict import keeps the toggle (doctor warns instead — STEP 44)"
+        );
+    }
+
+    /// A bundle that only sets review **off** (`Some(false)`) needs no
+    /// review harness, so `--strict` must NOT reject it even with no
+    /// review harness configured (only `Some(true)` requires a harness).
+    #[test]
+    fn test_strict_allows_review_off_bundle_without_review_harness() {
+        let conn = setup();
+        let original = storage::create_plan(
+            &conn, "off-rev", "/tmp/src", "branch", "desc", None, None, &[],
+        )
+        .unwrap();
+        storage::set_plan_review_enabled(&conn, &original.id, Some(false)).unwrap();
+        storage::create_step(
+            &conn, &original.id, "s", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        let original = storage::get_plan_by_id(&conn, &original.id).unwrap();
+        let steps = storage::list_steps(&conn, &original.id).unwrap();
+        let json = serde_json::to_string_pretty(
+            &export::build_exported_plan(&original, &steps, Vec::new(), &[]),
+        )
+        .unwrap();
+        let data: ImportedPlan = serde_json::from_str(&json).unwrap();
+
+        let options = ImportOptions {
+            slug: Some("off-ok"),
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: true,
+            review_harness_configured: false,
+        };
+        let id = import_plan_from_data(&conn, &data, &options)
+            .expect("a review-OFF bundle needs no review harness even under --strict");
+        assert_eq!(
+            storage::get_plan_by_id(&conn, &id).unwrap().review_enabled,
+            Some(false)
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1728,6 +2108,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
@@ -1778,6 +2159,7 @@ mod tests {
             harness: None,
             project: "/tmp/proj",
             strict: false,
+            review_harness_configured: false,
         };
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
@@ -1842,6 +2224,7 @@ mod tests {
             harness: None,
             project: "/tmp/dst",
             strict: false,
+            review_harness_configured: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
 
@@ -1922,6 +2305,7 @@ mod tests {
             harness: None,
             project: "/tmp/dst",
             strict: false,
+            review_harness_configured: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
         let steps = storage::list_steps(&conn, &imported_id).unwrap();
@@ -2044,6 +2428,7 @@ mod tests {
             harness: None,
             project: "/tmp/dst",
             strict: false,
+            review_harness_configured: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
         let steps = storage::list_steps(&conn, &imported_id).unwrap();
@@ -2089,6 +2474,7 @@ mod tests {
             harness: None,
             project: "/tmp/bad",
             strict: false,
+            review_harness_configured: false,
         }
     }
 
@@ -2213,6 +2599,7 @@ mod tests {
                 change_policy: crate::plan::ChangePolicy::default(),
                 tags: vec![],
                 retry_strategy: None,
+                review_enabled: None,
                 short_id: Some("aaaaaaaa".into()),
                 depends_on: vec!["bbbbbbbb".into()],
             },
@@ -2227,6 +2614,7 @@ mod tests {
                 change_policy: crate::plan::ChangePolicy::default(),
                 tags: vec![],
                 retry_strategy: None,
+                review_enabled: None,
                 short_id: Some("bbbbbbbb".into()),
                 depends_on: vec!["aaaaaaaa".into()],
             },
