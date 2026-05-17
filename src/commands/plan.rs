@@ -31,6 +31,17 @@ pub fn plan_create(
     let desc = description.unwrap_or(slug);
     let branch_name = branch.unwrap_or(slug);
 
+    // Validate inputs BEFORE any DB write so an invalid slug/branch fails
+    // fast with nothing persisted (previously the bad branch was only
+    // discovered later, at `runner::setup_branch`, after a junk plan row
+    // already existed). Slug rules stay deliberately simple — reject only
+    // empty/blank; we do NOT impose git-ref syntax on slugs, only on the
+    // resolved branch name.
+    if slug.trim().is_empty() {
+        bail!("invalid plan slug: slug is empty or whitespace-only");
+    }
+    crate::git::check_ref_format(branch_name)?;
+
     // Resolve dependency slugs to plan IDs BEFORE creating the plan so we
     // fail fast if any are missing. We must look them up in the same
     // project.
@@ -864,5 +875,101 @@ mod tests {
         storage::set_step_review_enabled(&conn, &step.id, None).unwrap();
         let s = storage::get_step(&conn, &step.id).unwrap();
         assert!(!effective_review_enabled(&s, &p, &cfg_on));
+    }
+
+    // ----------------------------------------------------------------------
+    // FINDING 5: branch/slug validated up front, before any DB write.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_plan_create_invalid_branch_errors_and_writes_no_plan() {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/pc-badbranch";
+
+        let err = plan_create(
+            &conn,
+            "myslug",
+            project,
+            None,
+            Some("feat/bad..branch"), // `..` is rejected by git check-ref-format
+            None,
+            None,
+            None,
+            false,
+            None,
+            &[],
+            &[],
+            &quiet_out(),
+        )
+        .expect_err("an invalid branch name must fail fast");
+        assert!(
+            err.to_string().contains("invalid branch name"),
+            "error must cite the branch rule: {err}"
+        );
+
+        // Nothing was persisted: no plan row exists for the slug.
+        assert!(
+            storage::get_plan_by_slug(&conn, "myslug", project)
+                .unwrap()
+                .is_none(),
+            "no plan row may be written when the branch is invalid"
+        );
+    }
+
+    #[test]
+    fn test_plan_create_blank_slug_errors_and_writes_no_plan() {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/pc-blankslug";
+
+        let err = plan_create(
+            &conn,
+            "   ",
+            project,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            &[],
+            &[],
+            &quiet_out(),
+        )
+        .expect_err("a blank slug must fail fast");
+        assert!(
+            err.to_string().contains("invalid plan slug"),
+            "error must cite the slug rule: {err}"
+        );
+        // The (blank) slug branch defaults from slug, so creation aborts
+        // before any write — verify the plan list stayed empty.
+        let plans = storage::list_plans(&conn, project, false).unwrap();
+        assert!(plans.is_empty(), "no plan row may be written: {plans:?}");
+    }
+
+    #[test]
+    fn test_plan_create_valid_branch_succeeds() {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/pc-okbranch";
+        plan_create(
+            &conn,
+            "good-slug",
+            project,
+            Some("a description"),
+            Some("feat/ok"),
+            None,
+            None,
+            None,
+            false,
+            None,
+            &[],
+            &[],
+            &quiet_out(),
+        )
+        .expect("a valid branch must create the plan");
+        let plan = storage::get_plan_by_slug(&conn, "good-slug", project)
+            .unwrap()
+            .expect("plan row must exist");
+        assert_eq!(plan.branch_name, "feat/ok");
     }
 }

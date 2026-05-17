@@ -21,14 +21,22 @@
 //    only `consume_corrective_request` (orchestrator) does.
 
 use std::path::Path;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::output::{OutputContext, OutputFormat, RunEvent};
 use crate::plan::{InterruptionKind, Plan, ReviewStatus, Step};
-use crate::{git, harness, output, prompt, storage};
+use crate::{git, harness, io_util, output, prompt, storage};
+
+/// Bounded-tail cap for the reviewer subprocess's stdout/stderr. Matches the
+/// implementation harness's `HARNESS_OUTPUT_TAIL_BYTES` (executor.rs) — a
+/// reviewer is a coding-agent harness producing comparable transcript volume,
+/// so the same 4 MiB tail rationale applies (keep the verdict-bearing end of
+/// the transcript without letting a runaway reviewer balloon memory).
+const REVIEW_OUTPUT_TAIL_BYTES: usize = 4 * 1024 * 1024;
 
 /// Built-in default for the per-plan review→correction→review recursion cap
 /// (docs/dag-redesign.md §10 item 4 / §14.5). Used when a plan's
@@ -339,7 +347,9 @@ pub async fn run_review_subprocess(
     // accepted §5 entanglement), which keeps the reviewed commit reachable.
     let guard = ReviewTreeGuard::capture(workdir, commit_sha);
 
-    // The harness's cwd is the THROWAWAY worktree, NOT `workdir`.
+    // The harness's cwd is the THROWAWAY worktree, NOT `workdir`. The child
+    // is a process-group leader (spawn_harness_with_delivery sets
+    // process_group(0) on unix), so a timeout can SIGKILL the whole group.
     let (child, _tmp) = harness::spawn_harness_with_delivery(
         harness_config,
         &args,
@@ -348,11 +358,30 @@ pub async fn run_review_subprocess(
         delivery,
     )
     .await?;
-    let output_captured = child
-        .wait_with_output()
-        .await
-        .context("failed to wait for review harness")?;
-    let stdout = String::from_utf8_lossy(&output_captured.stdout).to_string();
+
+    // Bounded concurrent drain + optional timeout. `config.timeout_secs` is
+    // the same `Option<u64>` (seconds) the implementation harness honors:
+    // `None` ⇒ no timer (but STILL bounded-drained — the unbounded-memory
+    // half of the bug is fixed regardless), `Some(n)` ⇒ kill the reviewer's
+    // process group after n seconds and fail the review (a hung reviewer
+    // becomes a step failure / failed review upstream, the desired behavior).
+    let timeout = config.timeout_secs.map(Duration::from_secs);
+    let wait = io_util::wait_capped(child, timeout, REVIEW_OUTPUT_TAIL_BYTES).await;
+    if wait.timed_out {
+        // The process group was already SIGKILL'd and the child reaped
+        // inside `wait_capped`. Tear the worktree down explicitly before
+        // erroring (Drop would also do it on the `?`-return below).
+        drop(review_wt);
+        let secs = config.timeout_secs.unwrap_or(0);
+        return Err(anyhow!(
+            "review harness timed out after {secs}s for step '{}' and was killed \
+             (process group SIGKILL'd); treating the review as failed",
+            step.title
+        ));
+    }
+    // Only stdout feeds `parse_review_verdict`; stderr is captured (bounded)
+    // for diagnostics but intentionally unused here.
+    let stdout = wait.stdout;
 
     // Defense-in-depth: the reviewed commit must remain reachable from the
     // main repo's HEAD (catches a hypothetical history rewrite of the
@@ -1175,6 +1204,51 @@ mod tests {
                 "erroring review left an orphan worktree (Drop did not run): {wts:?}"
             );
         }
+    }
+
+    /// FINDING 1: a review harness that hangs past `config.timeout_secs` has
+    /// its process group SIGKILL'd and `run_review_subprocess` returns an
+    /// `Err` clearly mentioning the timeout — promptly, well under the
+    /// stub's sleep (proving the timer fired rather than us waiting it out).
+    #[tokio::test]
+    async fn test_review_subprocess_times_out_and_errors() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        // Reviewer sleeps far past the 1s timeout and would print PASS — the
+        // timeout must pre-empt it so this never becomes a silent pass.
+        let script = write_stub(dir, "slow_rev.sh", "sleep 60\necho 'REVIEW PASS'");
+        let mut config = config_with_review_harness(&script);
+        config.timeout_secs = Some(1);
+        // `run_review_subprocess` takes no `Connection` (it is the spawnable,
+        // DB-free half) so the seeded conn is intentionally unused here.
+        let (_conn, plan, step, sha) = seed_committed_step(dir);
+
+        let start = std::time::Instant::now();
+        let res = run_review_subprocess(&plan, &step, &config, dir, &sha, 1, 1).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            res.is_err(),
+            "a review harness that exceeds config.timeout_secs must error"
+        );
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            msg.contains("timed out"),
+            "error must mention the timeout, got: {msg}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "timeout should fire promptly (elapsed {elapsed:?}), not wait out \
+             the 60s reviewer sleep"
+        );
+        // No orphan review worktree left behind on the timeout path.
+        let wts = crate::git::list_worktree_paths(dir).unwrap();
+        assert_eq!(
+            wts.len(),
+            1,
+            "timed-out review left an orphan worktree: {wts:?}"
+        );
     }
 
     /// HARD-INVARIANT PROOF (§9-inv-3): a failed review does NOT mutate the

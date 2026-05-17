@@ -19,8 +19,15 @@ use rusqlite::Connection;
 use tokio::process::Command;
 
 use crate::hook_library::{self, Hook, Lifecycle};
+use crate::io_util;
 use crate::plan::{Plan, Step};
 use crate::storage;
+
+/// Bounded-tail cap for a hook subprocess's captured stdout/stderr. Hooks are
+/// short glue scripts (lint/format/notify) — far smaller output than a test
+/// or harness run — so a 256 KiB tail is generous while still closing the
+/// unbounded-`Command::output()` memory hole on a runaway/looping hook.
+const HOOK_OUTPUT_TAIL_BYTES: usize = 256 * 1024;
 
 /// Categorized hook failure. The post-step / post-test entry points use the
 /// variant to choose between a soft warning and a hard failure: only `Db` is
@@ -152,8 +159,15 @@ fn base_env(plan: &Plan, step: &Step, attempt: i32, workdir: &Path) -> Vec<(&'st
 /// literally, never executed. See `test_env_var_values_not_reexpanded_by_shell`.
 ///
 /// `timeout_secs` bounds wall-clock runtime — a hook still executing after
-/// the deadline is killed (via `kill_on_drop`) and the call returns an error.
-/// `0` disables the timeout entirely.
+/// the deadline has its **whole process group** SIGKILL'd (so backgrounded
+/// grandchildren the hook spawned die with it, not just the direct `sh`) and
+/// the call returns [`HookFailure::Timeout`]. `0` disables the timeout
+/// entirely. `kill_on_drop(true)` is kept as defense-in-depth.
+///
+/// stdout/stderr are captured via a bounded concurrent drain
+/// ([`io_util::wait_capped`]) rather than `Command::output()`, so a hook that
+/// floods output cannot balloon ralph's memory and cannot deadlock by
+/// filling the pipe buffer while we wait.
 async fn run_one_hook(
     hook: &Hook,
     workdir: &Path,
@@ -165,41 +179,55 @@ async fn run_one_hook(
     cmd.arg("-c")
         .arg(&hook.command)
         .current_dir(workdir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         // Ensure a hook that blows through its timeout is reaped when the
         // enclosing future is dropped, rather than leaking as a zombie.
+        // Defense-in-depth: the timeout path below already SIGKILLs the
+        // process group and reaps explicitly.
         .kill_on_drop(true);
+
+    // Put the hook into its own process group so the timeout kill fans out
+    // to grandchildren (e.g. a hook that backgrounds `(sleep 99 &)`). Mirrors
+    // `harness::spawn_harness` / `test_runner::run_single_test`.
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
 
     for (k, v) in env.iter().chain(extra_env.iter()) {
         cmd.env(k, v);
     }
     cmd.env("RALPH_HOOK_NAME", &hook.name);
 
-    let run = cmd.output();
-    let output = if timeout_secs == 0 {
-        run.await.map_err(|source| HookFailure::Spawn {
-            hook_name: hook.name.clone(),
-            source,
-        })?
+    let child = cmd.spawn().map_err(|source| HookFailure::Spawn {
+        hook_name: hook.name.clone(),
+        source,
+    })?;
+
+    // `timeout_secs == 0` ⇒ no timeout (plain wait); still bounded-drained.
+    let timeout = if timeout_secs == 0 {
+        None
     } else {
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), run).await {
-            Ok(r) => r.map_err(|source| HookFailure::Spawn {
-                hook_name: hook.name.clone(),
-                source,
-            })?,
-            Err(_) => {
-                return Err(HookFailure::Timeout {
-                    hook_name: hook.name.clone(),
-                    secs: timeout_secs,
-                });
-            }
-        }
+        Some(Duration::from_secs(timeout_secs))
     };
 
-    if !output.status.success() {
+    let result = io_util::wait_capped(child, timeout, HOOK_OUTPUT_TAIL_BYTES).await;
+
+    if result.timed_out {
+        return Err(HookFailure::Timeout {
+            hook_name: hook.name.clone(),
+            secs: timeout_secs,
+        });
+    }
+
+    if !result.success {
         return Err(HookFailure::Exit {
             hook_name: hook.name.clone(),
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            code: result.code,
+            // Bounded stderr tail (last HOOK_OUTPUT_TAIL_BYTES bytes).
+            stderr: result.stderr,
         });
     }
 
@@ -842,6 +870,117 @@ mod tests {
             msg.to_lowercase().contains("database") || msg.to_lowercase().contains("hook bindings"),
             "error should name the DB problem: {msg}"
         );
+    }
+
+    /// A hook that backgrounds a grandchild and then itself hangs must, on
+    /// timeout, have the **whole process group** killed — the grandchild
+    /// must not survive to touch the filesystem after the deadline. We prove
+    /// this by having the hook spawn `(sleep N; touch leaked) &` and a
+    /// blocking `sleep`; after the 1s timeout we wait a few seconds and
+    /// assert `leaked` never appears (a leader-only kill would let the
+    /// detached grandchild's `touch` fire).
+    #[tokio::test]
+    async fn test_hook_timeout_kills_whole_process_group() {
+        let conn = db::open_memory().unwrap();
+        let plan = make_plan("p1", "my-plan");
+        let step = make_step("s1", "p1", "Step one");
+        insert_plan_and_step(&conn, &plan, &step);
+
+        let tmp = TempDir::new().unwrap();
+        let leaked = tmp.path().join("leaked");
+        // Grandchild touches `leaked` after 3s; the hook then blocks far past
+        // its 1s timeout. If only the direct `sh` were killed, the detached
+        // subshell would survive and create `leaked` ~3s later.
+        let cmd = format!(
+            "( sleep 3; touch '{}' ) &\necho started\nsleep 60",
+            leaked.display()
+        );
+        let slow = Hook {
+            name: "leaky".to_string(),
+            description: String::new(),
+            lifecycle: Lifecycle::PreStep,
+            scope: Scope::Global,
+            command: cmd,
+        };
+        let ctx = HookContext {
+            applicable: vec![slow],
+            project_dir: tmp.path().to_path_buf(),
+            hook_timeout_secs: 1,
+        };
+        storage::attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "leaky").unwrap();
+
+        let start = std::time::Instant::now();
+        let err = run_pre_step(&conn, &ctx, &plan, &step, 1, tmp.path())
+            .await
+            .expect_err("timed-out hook must surface as an error");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timeout should fire promptly"
+        );
+        assert!(format!("{err}").contains("timed out"));
+
+        // Give a generous window (well past the grandchild's 3s sleep) for a
+        // surviving grandchild to fire its `touch`. The process-group kill
+        // must have reaped it, so `leaked` must NOT appear.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            !leaked.exists(),
+            "backgrounded grandchild survived the hook timeout — the process \
+             group was not killed (FINDING 2/3 regression)"
+        );
+    }
+
+    /// A hook that floods stderr beyond the bounded-tail cap must still
+    /// complete promptly, and the captured stderr carried in
+    /// `HookFailure::Exit` must be bounded (<= cap + the small truncation
+    /// marker) rather than the unbounded `Command::output()` buffer.
+    #[tokio::test]
+    async fn test_hook_stderr_is_bounded_in_exit_failure() {
+        let conn = db::open_memory().unwrap();
+        let plan = make_plan("p1", "my-plan");
+        let step = make_step("s1", "p1", "Step one");
+        insert_plan_and_step(&conn, &plan, &step);
+
+        let tmp = TempDir::new().unwrap();
+        // ~2 MiB of stderr (>> 256 KiB cap), then a non-zero exit so the
+        // failure is `HookFailure::Exit` carrying the (bounded) stderr.
+        let flood = Hook {
+            name: "flood".to_string(),
+            description: String::new(),
+            lifecycle: Lifecycle::PreStep,
+            scope: Scope::Global,
+            command: "yes ERRLINE | head -c 2000000 1>&2; exit 7".to_string(),
+        };
+        let ctx = ctx_for(vec![flood], tmp.path().to_path_buf());
+        storage::attach_hook_to_step(&conn, &plan.id, &step.id, "pre-step", "flood").unwrap();
+
+        let start = std::time::Instant::now();
+        // Drive run_one_hook directly so we can inspect the typed failure.
+        let env = base_env(&plan, &step, 1, tmp.path());
+        let hook = ctx.find("flood").unwrap();
+        let res = run_one_hook(hook, tmp.path(), &env, &[], ctx.hook_timeout_secs).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "flooding hook must still complete promptly"
+        );
+        match res {
+            Err(HookFailure::Exit { code, stderr, .. }) => {
+                assert_eq!(code, Some(7));
+                // Bounded: at most the cap plus the small truncation marker
+                // (well under the 2 MiB the hook actually wrote).
+                let bound = HOOK_OUTPUT_TAIL_BYTES + 128;
+                assert!(
+                    stderr.len() <= bound,
+                    "stderr not bounded: {} bytes (cap {HOOK_OUTPUT_TAIL_BYTES})",
+                    stderr.len()
+                );
+                assert!(
+                    stderr.contains(crate::io_util::TRUNCATION_MARKER_PREFIX),
+                    "expected the truncation marker on an over-cap stderr"
+                );
+            }
+            other => panic!("expected HookFailure::Exit, got {other:?}"),
+        }
     }
 
     /// `hook_timeout_secs = 0` disables the timeout — a short-lived hook

@@ -18,6 +18,10 @@ pub enum FracIndexError {
     NoKeyBetween { a: String, b: String },
     /// A sort key contained a character outside the base-62 alphabet.
     InvalidChar(char),
+    /// A fractional index key was empty where a non-empty key is required.
+    EmptyKey,
+    /// `key_between` was called without `a < b`.
+    InvalidOrder { a: String, b: String },
 }
 
 impl fmt::Display for FracIndexError {
@@ -31,6 +35,12 @@ impl fmt::Display for FracIndexError {
             }
             FracIndexError::InvalidChar(c) => {
                 write!(f, "invalid fractional index character: {c:?}")
+            }
+            FracIndexError::EmptyKey => {
+                write!(f, "fractional index key must not be empty")
+            }
+            FracIndexError::InvalidOrder { a, b } => {
+                write!(f, "key_between requires a < b, got a={a:?} b={b:?}")
             }
         }
     }
@@ -58,10 +68,14 @@ pub fn initial_key() -> String {
 /// Increments the last character. If it overflows, appends a '0'.
 ///
 /// # Errors
+/// Returns [`FracIndexError::EmptyKey`] if `key` is empty.
 /// Returns [`FracIndexError::InvalidChar`] if the last character of `key` is
 /// outside the base-62 alphabet.
 pub fn key_after(key: &str) -> Result<String, FracIndexError> {
     let bytes = key.as_bytes();
+    if bytes.is_empty() {
+        return Err(FracIndexError::EmptyKey);
+    }
     let last = bytes[bytes.len() - 1];
     let idx = char_index(last)?;
 
@@ -85,11 +99,26 @@ pub fn key_after(key: &str) -> Result<String, FracIndexError> {
 /// # Errors
 /// Returns [`FracIndexError::NoKeyBetween`] when the inputs admit no key
 /// between them under this scheme (e.g. `a = "0"`, `b = "00"`).
-///
-/// # Panics
-/// Panics if `a >= b`. Callers must ensure the ordering precondition.
+/// Returns [`FracIndexError::InvalidOrder`] if `a >= b` (the ordering
+/// precondition is violated; this also covers the `a == b == ""` case).
+/// Returns [`FracIndexError::EmptyKey`] if an empty `b` would otherwise be
+/// indexed (only reachable when the `a < b` guard does not already reject it).
 pub fn key_between(a: &str, b: &str) -> Result<String, FracIndexError> {
-    assert!(a < b, "key_between requires a < b, got a={a:?} b={b:?}");
+    if a >= b {
+        return Err(FracIndexError::InvalidOrder {
+            a: a.to_string(),
+            b: b.to_string(),
+        });
+    }
+    // Past the `a < b` guard, an empty `b` is impossible (only "" sorts <= "",
+    // and "" >= any non-empty b). An empty `a` here is the legitimate
+    // "a is a prefix of b" case, which `suffix_between` handles. The empty `b`
+    // guard below is therefore unreachable defense-in-depth: if a future
+    // refactor weakened the ordering check, an empty `b` would make the
+    // `b[min_len..]` / suffix recursion misbehave, so reject it explicitly.
+    if b.is_empty() {
+        return Err(FracIndexError::EmptyKey);
+    }
 
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
@@ -351,15 +380,88 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "key_between requires a < b")]
-    fn test_key_between_panics_when_a_ge_b() {
-        let _ = key_between("a1", "a0");
+    fn test_key_between_a_gt_b_returns_invalid_order() {
+        let result = key_between("a1", "a0");
+        assert_eq!(
+            result,
+            Err(FracIndexError::InvalidOrder {
+                a: "a1".to_string(),
+                b: "a0".to_string(),
+            })
+        );
     }
 
     #[test]
-    #[should_panic(expected = "key_between requires a < b")]
-    fn test_key_between_panics_when_equal() {
-        let _ = key_between("a0", "a0");
+    fn test_key_between_equal_returns_invalid_order() {
+        let result = key_between("a0", "a0");
+        assert_eq!(
+            result,
+            Err(FracIndexError::InvalidOrder {
+                a: "a0".to_string(),
+                b: "a0".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_key_after_empty_returns_empty_key() {
+        assert_eq!(key_after(""), Err(FracIndexError::EmptyKey));
+    }
+
+    #[test]
+    fn test_key_between_both_empty_returns_invalid_order() {
+        // "" >= "" so the ordering guard rejects this before any indexing.
+        assert_eq!(
+            key_between("", ""),
+            Err(FracIndexError::InvalidOrder {
+                a: String::new(),
+                b: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_key_between_empty_a_prefix_path_still_works() {
+        // Empty `a` with non-empty `b` is the legitimate prefix case and must
+        // NOT regress to an error — it should still synthesize a valid key.
+        let mid = key_between("", "a1").unwrap();
+        assert!(mid.as_str() > "", "mid={mid} should be > \"\"");
+        assert!(mid.as_str() < "a1", "mid={mid} should be < a1");
+    }
+
+    #[test]
+    fn test_key_between_regression_no_panic_on_bad_inputs() {
+        // Previously-panicking inputs now return a clean Err instead of
+        // aborting the process.
+        for (a, b) in [("a1", "a0"), ("a0", "a0"), ("zzz", "a0"), ("", "")] {
+            let result = key_between(a, b);
+            assert!(
+                matches!(result, Err(FracIndexError::InvalidOrder { .. })),
+                "expected InvalidOrder for key_between({a:?}, {b:?}), got {result:?}",
+            );
+        }
+        assert_eq!(key_after(""), Err(FracIndexError::EmptyKey));
+    }
+
+    #[test]
+    fn test_new_error_variants_display() {
+        assert_eq!(
+            FracIndexError::EmptyKey.to_string(),
+            "fractional index key must not be empty",
+        );
+        let order = FracIndexError::InvalidOrder {
+            a: "a1".to_string(),
+            b: "a0".to_string(),
+        };
+        let msg = order.to_string();
+        assert!(
+            msg.contains("requires a < b"),
+            "InvalidOrder message should explain the precondition: {msg}",
+        );
+        assert!(
+            msg.contains("\"a1\"") && msg.contains("\"a0\""),
+            "InvalidOrder message should mention both inputs: {msg}",
+        );
     }
 
     #[test]

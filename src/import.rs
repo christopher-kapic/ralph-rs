@@ -461,6 +461,16 @@ fn import_plan_inner(
     // linear-chain backfill path; any bundle carrying `short_id`s is
     // DAG-aware and validated here (its edges, possibly empty for a
     // no-edge multi-root DAG, are taken literally).
+    // Validate the resolved slug/branch BEFORE any DB write. Import already
+    // runs inside a transaction that ROLLBACKs on Err, but failing here
+    // avoids the wasted write entirely and gives a clear, actionable
+    // message (matching `plan_create`'s fail-fast behavior) instead of the
+    // poor error a bad branch would later raise at `runner::setup_branch`.
+    if slug.trim().is_empty() {
+        anyhow::bail!("invalid plan slug: imported/overridden slug is empty or whitespace-only");
+    }
+    crate::git::check_ref_format(branch)?;
+
     let shape = classify_bundle(&data.steps);
     let dag_aware = shape == BundleShape::DagAware;
     if dag_aware {
@@ -2564,6 +2574,42 @@ mod tests {
             strict: false,
             review_harness_configured: false,
         }
+    }
+
+    /// FINDING 5: an invalid resolved branch (`--branch` override here, but
+    /// equally a bad bundle `branch_name`) aborts the import BEFORE any DB
+    /// write — no partial plan, clear actionable message.
+    #[test]
+    fn test_import_rejects_invalid_branch_before_write() {
+        let conn = setup();
+        let data = dag_bundle(r#"{"title": "A", "short_id": "aaaaaaaa"}"#);
+        let mut o = opts();
+        o.branch = Some("feat/bad..branch"); // rejected by git check-ref-format
+        let err = import_plan_from_data(&conn, &data, &o).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid branch name"),
+            "message must cite the branch rule: {err}"
+        );
+        assert!(
+            storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+                .unwrap()
+                .is_none(),
+            "no plan row may be written when the branch is invalid"
+        );
+    }
+
+    /// FINDING 5: a blank resolved slug aborts the import before any write.
+    #[test]
+    fn test_import_rejects_blank_slug_before_write() {
+        let conn = setup();
+        let data = dag_bundle(r#"{"title": "A", "short_id": "aaaaaaaa"}"#);
+        let mut o = opts();
+        o.slug = Some("   ");
+        let err = import_plan_from_data(&conn, &data, &o).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid plan slug"),
+            "message must cite the slug rule: {err}"
+        );
     }
 
     /// Rule 1: a `depends_on` entry that resolves to no in-bundle

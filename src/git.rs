@@ -34,9 +34,145 @@ fn git(workdir: &Path, args: &[&str]) -> Result<String> {
     Ok(stdout)
 }
 
+/// Run a git command in `workdir` and return its **raw** stdout bytes on
+/// success.
+///
+/// Mirrors [`git`]'s error handling (non-zero exit → `bail!` with the
+/// trimmed stderr) but does **not** lossily UTF-8-decode stdout. Used for
+/// `git status --porcelain=v1 -z`, whose NUL-delimited records can carry
+/// non-UTF8 path bytes that the lossy [`git`] helper would silently corrupt
+/// (and, worse, whose replacement characters could change how a record is
+/// split). Path bytes are converted to `String` only at the parse boundary
+/// (`String::from_utf8_lossy`), matching how the rest of the codebase models
+/// paths as `String` — truly non-UTF8 paths are still best-effort, but they
+/// are no longer silently merged or mis-split.
+fn git_bytes(workdir: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git {}", args.join(" ")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git {} failed (exit {}): {}",
+            args.join(" "),
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    Ok(output.stdout)
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/// Validate that `branch_name` is a syntactically legal git branch name.
+///
+/// This is a **pure, deterministic** reimplementation of the rules in
+/// git-check-ref-format(1), applied to the full ref `refs/heads/<branch>` —
+/// exactly the decision `git check-ref-format refs/heads/<name>` (no
+/// `--allow-onelevel`) would make. It deliberately does **not** spawn a
+/// subprocess: a validation gate that runs before any DB write must not
+/// depend on `git` being on `PATH`, on process-spawn succeeding, or on an
+/// unbounded external command — it has to be fast, total, and byte-identical
+/// on every machine. Git's own check still runs *authoritatively* at
+/// branch-creation time (`create_and_checkout_branch` /
+/// `create_branch_from_sha`), so git remains the final arbiter and any
+/// conceivable divergence on an exotic name is still caught there as
+/// defense-in-depth; this function's job is to reject the clearly-invalid
+/// cases up front with an actionable, machine-independent message.
+///
+/// On any rejection this `bail!`s with a message naming the offending branch.
+pub fn check_ref_format(branch_name: &str) -> Result<()> {
+    if branch_name.trim().is_empty() {
+        bail!(
+            "invalid branch name: name is empty or whitespace-only \
+             (got {branch_name:?})"
+        );
+    }
+
+    // The git-check-ref-format(1) refname rules ACCEPT a leading dash, but a
+    // leading-dash branch is still hazardous: it is later passed as a bare
+    // argument to `git checkout -b <name>` where it would be misparsed as a
+    // flag. Reject it explicitly so the failure is caught up front with a
+    // clear message rather than as a confusing git CLI error later.
+    if branch_name.starts_with('-') {
+        bail!(
+            "invalid branch name '{branch_name}': must not start with '-' \
+             (it would be misinterpreted as a git command-line flag)"
+        );
+    }
+
+    if let Err(rule) = validate_refname(&format!("refs/heads/{branch_name}")) {
+        bail!("invalid branch name '{branch_name}': {rule}");
+    }
+    Ok(())
+}
+
+/// Pure validator for the git-check-ref-format(1) refname rules. `refname` is
+/// the FULL ref (e.g. `refs/heads/<branch>`), so rule 2 ("must contain at
+/// least one `/`") is always satisfied by the `refs/heads/` prefix — matching
+/// `git check-ref-format refs/heads/<name>` without `--allow-onelevel`.
+/// Returns the human-readable rule that was violated, or `Ok(())`.
+///
+/// Encodes every rule from git-check-ref-format(1) verbatim so it cannot
+/// silently drift: whole-name shape (rules 6/7/9 and the `.lock`/`@{`/`..`
+/// sequence rules), the forbidden character set (rules 4/5/10), and the
+/// per-`/`-component rules (rule 1).
+fn validate_refname(refname: &str) -> Result<(), &'static str> {
+    // Whole-name shape rules.
+    if refname == "@" {
+        return Err("a ref cannot be the single character '@'");
+    }
+    if refname.starts_with('/') || refname.ends_with('/') {
+        return Err("a ref cannot begin or end with '/'");
+    }
+    if refname.ends_with('.') {
+        return Err("a ref cannot end with '.'");
+    }
+    if refname.contains("..") {
+        return Err("a ref cannot contain two consecutive dots '..'");
+    }
+    if refname.contains("//") {
+        return Err("a ref cannot contain consecutive slashes '//'");
+    }
+    if refname.contains("@{") {
+        return Err("a ref cannot contain the sequence '@{'");
+    }
+
+    // Forbidden characters anywhere (rules 4/5/10): ASCII control (< 0x20)
+    // and DEL (0x7f), space, ~ ^ : ? * [ and backslash.
+    for ch in refname.chars() {
+        if (ch as u32) < 0x20 || ch == '\u{7f}' {
+            return Err("a ref cannot contain ASCII control characters");
+        }
+        match ch {
+            ' ' => return Err("a ref cannot contain a space"),
+            '~' | '^' | ':' => return Err("a ref cannot contain any of '~', '^', ':'"),
+            '?' | '*' | '[' => return Err("a ref cannot contain any of '?', '*', '['"),
+            '\\' => return Err("a ref cannot contain a backslash"),
+            _ => {}
+        }
+    }
+
+    // Per-slash-component rules (rule 1): no component may begin with '.' or
+    // end with '.lock'. This must check EVERY component, not just the last
+    // (e.g. `foo.lock/bar` is invalid), which the whole-name checks miss.
+    for component in refname.split('/') {
+        if component.starts_with('.') {
+            return Err("no slash-separated ref component may begin with '.'");
+        }
+        if component.ends_with(".lock") {
+            return Err("no slash-separated ref component may end with '.lock'");
+        }
+    }
+
+    Ok(())
+}
 
 /// Create a new branch and switch to it.
 pub fn create_and_checkout_branch(workdir: &Path, branch_name: &str) -> Result<()> {
@@ -92,34 +228,88 @@ pub fn commit_changes(workdir: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
-/// Parse `git status --porcelain` output into a list of file paths.
+/// Parse `git status --porcelain=v1 -z` output into a list of file paths.
 ///
-/// Rename/copy entries (`R` or `C` status in either column) are split on
-/// ` -> ` so both the old and new paths are returned as separate entries.
-fn parse_porcelain_status(out: &str) -> Vec<String> {
+/// **Why `-z`:** the human-readable `--porcelain` (v1, no `-z`) C-quotes any
+/// path containing "unusual" bytes — newlines, double-quotes, backslashes,
+/// non-ASCII — wrapping it in double quotes with backslash escapes, and uses
+/// a literal ` -> ` separator for renames/copies. A path that legitimately
+/// contains those bytes would then be mis-quoted or mis-split by a naive
+/// line/`" -> "` parser. With `-z`, git emits paths **raw** (never quoted)
+/// and delimits every record with a NUL. Each record is `XY <path>` followed
+/// by `\0`. For a rename/copy (`R` or `C` in either status column) the record
+/// is followed by a **second** NUL-terminated record containing the
+/// **original** path: `R  <new>\0<orig>\0`. We consume that following record
+/// and push the old path *then* the new path (preserving this function's
+/// existing returned-order contract: old before new).
+///
+/// `from_utf8_lossy` is applied only at this boundary; see [`git_bytes`].
+///
+/// **This is a total parser: any deviation from the porcelain-v1 `-z`
+/// protocol is a hard error, never a silent best-effort guess.** The returned
+/// list drives the skip/rollback preservation paths (`rollback_except`,
+/// `restage_files`, `get_all_changed_files` callers): a *wrong* list there
+/// means deleting a file the user wanted kept, or failing to restore one — so
+/// a malformed/truncated stream MUST abort the operation rather than act on a
+/// corrupt view. The only deviations git can legitimately produce are none;
+/// every error arm below is an impossible-unless-git-or-the-pipe-broke case,
+/// and in exactly those cases we refuse to proceed.
+fn parse_porcelain_status_z(out: &[u8]) -> Result<Vec<String>> {
     let mut files: Vec<String> = Vec::new();
-    for line in out.lines() {
-        if line.is_empty() {
+    // Split on NUL. A well-formed stream ends with a trailing NUL, so the
+    // final split element is an empty slice; skip empties.
+    let mut records = out.split(|&b| b == 0u8).filter(|r| !r.is_empty());
+
+    while let Some(record) = records.next() {
+        // A record is exactly `XY <path>`: a 2-char status column, a single
+        // space at index 2, then the raw (never-quoted, under `-z`) path.
+        // Anything shorter, or without the space delimiter, is not porcelain
+        // v1 output — refuse rather than mis-slice.
+        if record.len() < 4 || record[2] != b' ' {
+            bail!(
+                "malformed `git status --porcelain=v1 -z` record (expected \
+                 `XY <path>`, got {} byte(s)): refusing to act on an \
+                 unparseable status",
+                record.len()
+            );
+        }
+        let status = &record[..2];
+        let path = &record[3..];
+        let is_rename_or_copy = status.contains(&b'R') || status.contains(&b'C');
+        if is_rename_or_copy {
+            // A rename/copy is TWO records: `XY <new>\0<orig>\0`. The original
+            // path MUST follow; its absence means a truncated stream. Acting
+            // on just the new path here would silently drop the old path from
+            // the preserve/rollback set — exactly the data-loss class this
+            // total parser exists to prevent.
+            let Some(orig) = records.next() else {
+                bail!(
+                    "truncated `git status --porcelain=v1 -z`: rename/copy \
+                     record for {:?} has no following original-path record; \
+                     refusing to act on an incomplete changed-file list",
+                    String::from_utf8_lossy(path)
+                );
+            };
+            // Order contract: old (original) then new, matching the prior
+            // ` -> ` (old -> new) behavior every caller/test depends on.
+            files.push(String::from_utf8_lossy(orig).into_owned());
+            files.push(String::from_utf8_lossy(path).into_owned());
             continue;
         }
-        // `git status --porcelain` lines look like "XY filename" (3-char prefix).
-        let status = line.get(..2).unwrap_or("");
-        let rest = line.get(3..).unwrap_or(line);
-        let is_rename_or_copy = status.contains('R') || status.contains('C');
-        if is_rename_or_copy && let Some((old, new)) = rest.split_once(" -> ") {
-            files.push(old.to_string());
-            files.push(new.to_string());
-            continue;
-        }
-        files.push(rest.to_string());
+        files.push(String::from_utf8_lossy(path).into_owned());
     }
-    files
+    Ok(files)
 }
 
 /// Return a list of all changed files (staged, unstaged, and untracked).
+///
+/// Propagates a hard error if git's porcelain output is malformed/truncated
+/// (see [`parse_porcelain_status_z`]) — callers in the skip/rollback path
+/// must abort rather than preserve/delete files off a corrupt view.
 pub fn get_all_changed_files(workdir: &Path) -> Result<Vec<String>> {
-    let out = git(workdir, &["status", "--porcelain"]).context("could not list changed files")?;
-    Ok(parse_porcelain_status(&out))
+    let out = git_bytes(workdir, &["status", "--porcelain=v1", "-z"])
+        .context("could not list changed files")?;
+    parse_porcelain_status_z(&out).context("could not parse `git status` output")
 }
 
 /// Return a list of paths that currently have **staged** changes (the index
@@ -1454,25 +1644,46 @@ mod tests {
         assert!(files.contains(&"b.txt".to_string()));
     }
 
+    /// Build a NUL-delimited `git status --porcelain=v1 -z` byte stream from
+    /// `(status, path[, orig])` tuples. For an `R`/`C` record git emits the
+    /// `XY <new>` record first, then a SEPARATE NUL-terminated record with
+    /// the ORIGINAL path — this helper reproduces that exact framing.
+    type PorcelainRec<'a> = (&'a str, &'a [u8], Option<&'a [u8]>);
+
+    fn porcelain_z(records: &[PorcelainRec]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        for (status, path, orig) in records {
+            out.extend_from_slice(status.as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(path);
+            out.push(0u8);
+            if let Some(orig) = orig {
+                out.extend_from_slice(orig);
+                out.push(0u8);
+            }
+        }
+        out
+    }
+
     #[test]
     fn test_parse_porcelain_status_rename_and_copy() {
-        // Simulated `git status --porcelain` output covering:
+        // Simulated `git status --porcelain=v1 -z` output covering:
         //   - plain modifications
         //   - adds
         //   - untracked
-        //   - a staged rename (R  old -> new)
-        //   - a staged copy    (C  old -> new)
-        //   - an unstaged rename where worktree column is R ( R old -> new)
-        let lines = [
-            " M modified.txt",
-            "A  added.txt",
-            "?? untracked.txt",
-            "R  old_renamed.txt -> new_renamed.txt",
-            "C  src_copied.txt -> dst_copied.txt",
-            " R wt_old.txt -> wt_new.txt",
-        ];
-        let out = lines.join("\n") + "\n";
-        let files = parse_porcelain_status(&out);
+        //   - a staged rename (R  with a following orig-path record)
+        //   - a staged copy   (C  with a following orig-path record)
+        //   - an unstaged rename where the worktree column is R ( R …)
+        // Returned-order contract: for R/C we push ORIG then NEW.
+        let out = porcelain_z(&[
+            (" M", b"modified.txt", None),
+            ("A ", b"added.txt", None),
+            ("??", b"untracked.txt", None),
+            ("R ", b"new_renamed.txt", Some(b"old_renamed.txt")),
+            ("C ", b"dst_copied.txt", Some(b"src_copied.txt")),
+            (" R", b"wt_new.txt", Some(b"wt_old.txt")),
+        ]);
+        let files = parse_porcelain_status_z(&out).expect("well-formed -z stream parses");
         assert_eq!(
             files,
             vec![
@@ -1487,6 +1698,178 @@ mod tests {
                 "wt_new.txt".to_string(),
             ]
         );
+    }
+
+    /// Paths containing a space, a newline, a double-quote and a non-ASCII
+    /// (non-UTF8) byte. Under the old line/`" -> "` parser these would have
+    /// been C-quoted by git and mis-split / mis-decoded; under `-z` they are
+    /// emitted RAW and must round-trip (the non-UTF8 byte goes through the
+    /// documented best-effort `from_utf8_lossy` boundary).
+    #[test]
+    fn test_parse_porcelain_status_z_unusual_paths() {
+        // 0xFF is never valid UTF-8 → exercises the lossy boundary.
+        let spacey = b"a file.txt".as_slice();
+        let newliney = b"line1\nline2.txt".as_slice();
+        let quoted = b"weird\"name.txt".as_slice();
+        let non_utf8: &[u8] = &[b'b', b'a', b'd', 0xFF, b'.', b't', b'x', b't'];
+
+        let out = porcelain_z(&[
+            (" M", spacey, None),
+            ("A ", newliney, None),
+            ("??", quoted, None),
+            // A rename whose NEW and ORIG paths both carry unusual bytes.
+            ("R ", b"to .txt", Some(non_utf8)),
+        ]);
+        let files = parse_porcelain_status_z(&out).expect("raw -z paths parse");
+
+        assert_eq!(files[0], "a file.txt");
+        assert_eq!(files[1], "line1\nline2.txt");
+        assert_eq!(files[2], "weird\"name.txt");
+        // orig (non-UTF8) pushed before new; lossy-decoded but not split.
+        assert_eq!(files[3], String::from_utf8_lossy(non_utf8));
+        assert!(files[3].contains('\u{FFFD}'), "non-UTF8 byte lossily kept");
+        assert_eq!(files[4], "to .txt");
+        assert_eq!(files.len(), 5);
+    }
+
+    /// Total-parser contract: an empty stream (clean tree) is `Ok([])`, not
+    /// an error.
+    #[test]
+    fn test_parse_porcelain_status_z_empty_is_ok_empty() {
+        assert_eq!(parse_porcelain_status_z(b"").unwrap(), Vec::<String>::new());
+        // A lone trailing NUL (the well-formed "no entries" shape) is also
+        // an empty list, not a malformed record.
+        assert_eq!(
+            parse_porcelain_status_z(b"\0").unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    /// Total-parser contract: a rename/copy record whose required following
+    /// original-path record is missing (truncated pipe) is a HARD ERROR —
+    /// acting on just the new path would silently drop the old path from the
+    /// rollback/preserve set (the data-loss class this parser prevents).
+    #[test]
+    fn test_parse_porcelain_status_z_truncated_rename_is_error() {
+        // `R  new.txt\0` with NO following `\0`-terminated orig record.
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"R ");
+        out.push(b' ');
+        out.extend_from_slice(b"new.txt");
+        out.push(0u8);
+        let err = parse_porcelain_status_z(&out)
+            .expect_err("a rename with no orig record must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("truncated") && msg.contains("rename/copy"),
+            "error must name the truncation: {msg}"
+        );
+    }
+
+    /// Total-parser contract: a record that is not `XY <path>` (too short, or
+    /// missing the space delimiter at index 2) is a HARD ERROR, never
+    /// mis-sliced into a bogus path.
+    #[test]
+    fn test_parse_porcelain_status_z_malformed_record_is_error() {
+        // Missing the space at index 2 ("XYpath" instead of "XY path").
+        let err = parse_porcelain_status_z(b"MMnospace.txt\0")
+            .expect_err("record without the `XY ` delimiter must be rejected");
+        assert!(err.to_string().contains("malformed"), "{err}");
+        // Too short to even contain `XY <1-char path>`.
+        let err2 = parse_porcelain_status_z(b"M\0").expect_err("a 1-byte record must be rejected");
+        assert!(err2.to_string().contains("malformed"), "{err2}");
+    }
+
+    #[test]
+    fn test_check_ref_format_accepts_valid_names() {
+        // A representative spread of legal branch names, including ones that
+        // exercise "allowed" edges of the rules: single-level, slashed,
+        // dots-but-not-double, embedded (non-leading) dash, digits, a
+        // component that merely *contains* "lock", and `@` not as `@{` or a
+        // lone `@`.
+        for ok in [
+            "main",
+            "feat/foo",
+            "release-1.2.3",
+            "feat/JIRA-123_some-thing",
+            "user/feature.work",
+            "v2",
+            "a/b/c/d",
+            "lockfile-update",
+            "has@sign",
+        ] {
+            check_ref_format(ok).unwrap_or_else(|e| panic!("{ok:?} must be valid: {e}"));
+        }
+    }
+
+    /// Every git-check-ref-format(1) rule the native validator encodes must
+    /// reject, plus our two explicit pre-checks (empty, leading dash). Each
+    /// case asserts the user-facing `invalid branch name` framing so callers
+    /// always get an actionable message.
+    #[test]
+    fn test_check_ref_format_rejects_every_rule() {
+        let cases: &[&str] = &[
+            "",                 // empty (pre-check)
+            "   ",              // whitespace-only (pre-check)
+            "-leading-dash",    // leading '-' (pre-check; CLI-flag hazard)
+            "feat/bad..branch", // rule: consecutive dots
+            "..",               // consecutive dots / ends with '.'
+            "bad branch",       // rule: space
+            "feat/..hidden",    // component begins with '.'
+            ".hidden",          // component begins with '.'
+            "ends.",            // ends with '.'
+            "foo.lock",         // component ends with '.lock'
+            "foo.lock/bar",     // NON-last component ends with '.lock'
+            "foo//bar",         // consecutive slashes
+            "trailing/",        // ends with '/'
+            "has~tilde",        // rule: '~'
+            "has^caret",        // rule: '^'
+            "has:colon",        // rule: ':'
+            "has?q",            // rule: '?'
+            "has*star",         // rule: '*'
+            "has[bracket",      // rule: '['
+            "back\\slash",      // rule: backslash
+            "ctrl\u{7f}del",    // rule: DEL control char
+            "ctrl\u{1}soh",     // rule: <0x20 control char
+            "ref@{0}",          // rule: '@{' sequence
+        ];
+        for bad in cases {
+            let e = check_ref_format(bad).expect_err(&format!("{bad:?} must be rejected"));
+            assert!(
+                e.to_string().contains("invalid branch name"),
+                "rejection for {bad:?} must use the actionable framing: {e}"
+            );
+        }
+    }
+
+    /// Slash-shape branches map onto the `refs/heads/<name>` form correctly:
+    /// a leading slash collapses to `refs/heads//x` (consecutive slashes) and
+    /// is rejected deterministically.
+    #[test]
+    fn test_check_ref_format_slash_edges() {
+        check_ref_format("/leading").expect_err("a '/'-leading branch must reject");
+        check_ref_format("a//b").expect_err("consecutive slashes must reject");
+        check_ref_format("trailing/").expect_err("a trailing-'/' branch must reject");
+    }
+
+    /// `validate_refname` is the pure rule core; pin the documented decision
+    /// for the bare-ref forms (no `refs/heads/` prefix) so the encoding can't
+    /// silently drift from git-check-ref-format(1).
+    #[test]
+    fn test_validate_refname_core_rules() {
+        assert!(validate_refname("refs/heads/main").is_ok());
+        assert!(validate_refname("@").is_err()); // rule 9
+        assert!(validate_refname("/x").is_err()); // rule 6 (leading slash)
+        assert!(validate_refname("x/").is_err()); // rule 6 (trailing slash)
+        assert!(validate_refname("a..b").is_err()); // rule 3
+        assert!(validate_refname("a//b").is_err()); // rule 6
+        assert!(validate_refname("a.").is_err()); // rule 7
+        assert!(validate_refname("a@{b").is_err()); // rule 8
+        assert!(validate_refname("a\\b").is_err()); // rule 10
+        assert!(validate_refname(".hidden/x").is_err()); // rule 1 (begins '.')
+        assert!(validate_refname("x/foo.lock").is_err()); // rule 1 ('.lock')
+        assert!(validate_refname("a b").is_err()); // rule 4 (space)
+        assert!(validate_refname("a\u{0}b").is_err()); // rule 4 (control)
     }
 
     #[test]
