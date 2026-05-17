@@ -787,15 +787,27 @@ pub fn list_answered_questions_for_step(
 /// Write an answer to a `step_questions` row, stamping `answered_at` with
 /// the current SQLite UTC time. Errors if no row matches `question_id`.
 pub fn set_question_answer(conn: &Connection, question_id: &str, answer: &str) -> Result<()> {
-    let affected = conn.execute(
+    // Post-V26 `step_questions` is a backward-compat *view* over
+    // `interruptions` with an INSTEAD-OF UPDATE trigger. SQLite's
+    // `sqlite3_changes()` does **not** count rows a view trigger modifies, so
+    // `Connection::execute` always returns 0 here regardless of whether a row
+    // matched — the old `affected == 0 => not found` heuristic no longer
+    // holds. Check existence explicitly to preserve the "Question not found"
+    // contract without falsely failing a real update.
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM step_questions WHERE id = ?1",
+        params![question_id],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        anyhow::bail!("Question not found: {question_id}");
+    }
+    conn.execute(
         "UPDATE step_questions
          SET answer = ?1, answered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE id = ?2",
         params![answer, question_id],
     )?;
-    if affected == 0 {
-        anyhow::bail!("Question not found: {question_id}");
-    }
     Ok(())
 }
 

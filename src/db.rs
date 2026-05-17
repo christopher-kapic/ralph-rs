@@ -1013,6 +1013,83 @@ fn migrate_v26(conn: &Connection) -> Result<()> {
 
     conn.execute_batch("DROP TABLE step_questions;")?;
 
+    // Backward-compatibility shim.
+    //
+    // §6 mandates `DROP TABLE step_questions`, and the canonical store is now
+    // `interruptions` (above). But the Phase-2 cutover of the storage / CLI /
+    // executor consumers that still issue `step_questions` SQL is sequenced
+    // into later dedicated steps (docs/dag-redesign.md §15 Phase 2). To keep
+    // those consumers working byte-identically until that rewrite lands —
+    // without re-introducing the dropped *table* or duplicating the data —
+    // expose a `step_questions` *view* over `interruptions` plus INSTEAD-OF
+    // triggers so legacy `SELECT` / `INSERT` / `UPDATE` keep round-tripping.
+    //
+    // The legacy `suggestions` JSON string-array (`["a","b"]`) maps to the
+    // canonical `options` JSON object-array (`[{text,priority}]`): on read,
+    // `options` is projected back to a priority-ordered string array; on
+    // write, an incoming `suggestions` array is synthesized into ascending
+    // 1-based priorities (index 0 = priority 1 = the agent's best guess) —
+    // exactly the data-cutover rule above, so a row written through the view
+    // is indistinguishable from a row cut over by the migration. Only
+    // `kind='question'` rows surface through the view (the legacy table only
+    // ever held questions); blockers are `interruptions`-native.
+    conn.execute_batch(
+        "
+        CREATE VIEW step_questions AS
+            SELECT
+                id,
+                step_id,
+                attempt,
+                body AS question,
+                (SELECT json_group_array(txt) FROM (
+                    SELECT json_extract(o.value, '$.text') AS txt
+                    FROM json_each(interruptions.options) AS o
+                    ORDER BY json_extract(o.value, '$.priority')
+                 )) AS suggestions,
+                resolution AS answer,
+                asked_at,
+                resolved_at AS answered_at
+            FROM interruptions
+            WHERE kind = 'question';
+
+        CREATE TRIGGER step_questions_insert
+            INSTEAD OF INSERT ON step_questions
+        BEGIN
+            INSERT INTO interruptions
+                (id, step_id, attempt, kind, body, options,
+                 resolution, comment, state, asked_at, resolved_at)
+            VALUES (
+                NEW.id, NEW.step_id, NEW.attempt, 'question', NEW.question,
+                (SELECT COALESCE(json_group_array(
+                            json_object('text', s.value, 'priority', s.key + 1)), '[]')
+                 FROM json_each(COALESCE(NEW.suggestions, '[]')) AS s),
+                NEW.answer,
+                NULL,
+                CASE WHEN NEW.answer IS NULL THEN 'open' ELSE 'resolved' END,
+                NEW.asked_at,
+                NEW.answered_at
+            );
+        END;
+
+        CREATE TRIGGER step_questions_update
+            INSTEAD OF UPDATE ON step_questions
+        BEGIN
+            UPDATE interruptions SET
+                step_id    = NEW.step_id,
+                attempt    = NEW.attempt,
+                body       = NEW.question,
+                options    = (SELECT COALESCE(json_group_array(
+                                  json_object('text', s.value, 'priority', s.key + 1)), '[]')
+                              FROM json_each(COALESCE(NEW.suggestions, '[]')) AS s),
+                resolution = NEW.answer,
+                state      = CASE WHEN NEW.answer IS NULL THEN 'open' ELSE 'resolved' END,
+                asked_at   = NEW.asked_at,
+                resolved_at = NEW.answered_at
+            WHERE id = OLD.id;
+        END;
+        ",
+    )?;
+
     Ok(())
 }
 
@@ -2811,49 +2888,50 @@ mod tests {
 
         // q1: resolved question, empty options, answer -> resolution,
         //     answered_at -> resolved_at, no comment, kind 'question'.
-        let (step_id, attempt, kind, body, options, resolution, comment, state, asked_at, resolved_at): (
-            String,
-            i64,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            Option<String>,
-        ) = conn
+        struct Row {
+            step_id: String,
+            attempt: i64,
+            kind: String,
+            body: String,
+            options: String,
+            resolution: Option<String>,
+            comment: Option<String>,
+            state: String,
+            asked_at: String,
+            resolved_at: Option<String>,
+        }
+        let q1 = conn
             .query_row(
                 "SELECT step_id, attempt, kind, body, options, resolution, comment, state, asked_at, resolved_at \
                  FROM interruptions WHERE id = 'q1'",
                 [],
                 |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                        r.get(8)?,
-                        r.get(9)?,
-                    ))
+                    Ok(Row {
+                        step_id: r.get(0)?,
+                        attempt: r.get(1)?,
+                        kind: r.get(2)?,
+                        body: r.get(3)?,
+                        options: r.get(4)?,
+                        resolution: r.get(5)?,
+                        comment: r.get(6)?,
+                        state: r.get(7)?,
+                        asked_at: r.get(8)?,
+                        resolved_at: r.get(9)?,
+                    })
                 },
             )
             .unwrap();
-        assert_eq!(step_id, "s1");
-        assert_eq!(attempt, 1);
-        assert_eq!(kind, "question");
-        assert_eq!(body, "Q1?");
-        assert_eq!(options, "[]");
-        assert_eq!(resolution.as_deref(), Some("A1."));
-        assert_eq!(comment, None, "step_questions had no comment column");
-        assert_eq!(state, "resolved", "an answered question is resolved");
-        assert_eq!(asked_at, "2026-05-01T10:00:00.000Z");
+        assert_eq!(q1.step_id, "s1");
+        assert_eq!(q1.attempt, 1);
+        assert_eq!(q1.kind, "question");
+        assert_eq!(q1.body, "Q1?");
+        assert_eq!(q1.options, "[]");
+        assert_eq!(q1.resolution.as_deref(), Some("A1."));
+        assert_eq!(q1.comment, None, "step_questions had no comment column");
+        assert_eq!(q1.state, "resolved", "an answered question is resolved");
+        assert_eq!(q1.asked_at, "2026-05-01T10:00:00.000Z");
         assert_eq!(
-            resolved_at.as_deref(),
+            q1.resolved_at.as_deref(),
             Some("2026-05-01T11:00:00.000Z"),
             "answered_at must carry over to resolved_at"
         );
