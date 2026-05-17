@@ -35,6 +35,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v23,
     migrate_v24,
     migrate_v25,
+    migrate_v26,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -864,6 +865,153 @@ fn migrate_v25(conn: &Connection) -> Result<()> {
             prev_step_id = Some(step_id.as_str());
         }
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V26: unified interruptions (supersedes step_questions)
+// ---------------------------------------------------------------------------
+
+fn migrate_v26(conn: &Connection) -> Result<()> {
+    // The DAG redesign (docs/dag-redesign.md §3.4, §6 `### V26`) collapses
+    // the question system into one branch-pausing entity: an
+    // `interruptions` row is either a `question` (carries ranked `options`,
+    // priority 1 = the agent's best guess) or a `blocker` (no options, the
+    // agent explains what it cannot do). One entity, one state machine:
+    // `open` while the branch is `Blocked` and the scheduler works
+    // elsewhere; `resolved` once a human records a `resolution`/`comment`.
+    // This is the same "derived, never stored" plan-status mechanism as
+    // today — `PlanStatus::Question` widens to a derived `Interrupted`.
+    //
+    // Schema is verbatim §6: `options` is a JSON array of `{text,priority}`
+    // (DEFAULT '[]'), `state` DEFAULT 'open', and the open-lookup index is
+    // *partial* (`WHERE state = 'open'`) so "is any branch blocked?" stays
+    // O(open-rows) rather than O(all-rows) — the same trick the dropped
+    // `idx_step_questions_unanswered` used.
+    //
+    // Data cutover: every `step_questions` row becomes a resolved/open
+    // `question` interruption. `id`/`step_id`/`attempt` carry over verbatim
+    // (preserving identity); `question` → `body`; the legacy
+    // `suggestions` string array is synthesized into `options` with
+    // ascending integer priorities (1,2,3,… in stored order — the order the
+    // agent listed them, so the first stays the best guess); `answer` →
+    // `resolution`; `state` is `resolved` iff `answer IS NOT NULL`;
+    // `asked_at` carries over and `answered_at` → `resolved_at`.
+    // `step_questions` had no comment, so `comment` stays NULL. Then the
+    // legacy table is dropped, exactly as §6 mandates.
+    //
+    // Scope note (intentional, per the dag-redesign plan): this migration
+    // is append-only schema + a faithful data copy. The storage/CLI/
+    // executor/TUI consumers that still issue `step_questions` SQL are cut
+    // over to `interruptions` in the dedicated Phase 2 steps that follow
+    // (storage interruption CRUD, the `interruption` CLI, the legacy
+    // `question` aliases, the cross-process bridge, scheduler integration).
+    // Until those land, the full `cargo test` suite is transiently red by
+    // design — this step's acceptance is scoped to `cargo test db::`.
+    conn.execute_batch(
+        "
+        CREATE TABLE interruptions (
+            id          TEXT PRIMARY KEY,
+            step_id     TEXT NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+            attempt     INTEGER NOT NULL,
+            kind        TEXT NOT NULL,                 -- 'question' | 'blocker'
+            body        TEXT NOT NULL,
+            options     TEXT NOT NULL DEFAULT '[]',    -- JSON [{text,priority}]
+            resolution  TEXT,
+            comment     TEXT,
+            state       TEXT NOT NULL DEFAULT 'open',  -- 'open' | 'resolved'
+            asked_at    TEXT NOT NULL,
+            resolved_at TEXT
+        );
+        CREATE INDEX idx_interruptions_step ON interruptions(step_id);
+        CREATE INDEX idx_interruptions_open ON interruptions(state) WHERE state = 'open';
+        ",
+    )?;
+
+    // One legacy `step_questions` row, owned, for the cutover.
+    struct LegacyQuestion {
+        id: String,
+        step_id: String,
+        attempt: i64,
+        question: String,
+        suggestions: String, // JSON string array
+        answer: Option<String>,
+        asked_at: String,
+        answered_at: Option<String>,
+    }
+
+    // Read every legacy question row up front (mirrors the V25 backfill
+    // pattern: collect owned rows, then write) so the read statement is
+    // dropped before the cutover inserts run.
+    let rows: Vec<LegacyQuestion> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, step_id, attempt, question, suggestions, answer, asked_at, answered_at \
+             FROM step_questions",
+        )?;
+        let mapped = stmt.query_map([], |r| {
+            Ok(LegacyQuestion {
+                id: r.get(0)?,
+                step_id: r.get(1)?,
+                attempt: r.get(2)?,
+                question: r.get(3)?,
+                suggestions: r.get(4)?,
+                answer: r.get(5)?,
+                asked_at: r.get(6)?,
+                answered_at: r.get(7)?,
+            })
+        })?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    for LegacyQuestion {
+        id,
+        step_id,
+        attempt,
+        question,
+        suggestions,
+        answer,
+        asked_at,
+        answered_at,
+    } in rows
+    {
+        // `suggestions` is always a JSON string array (`commands::question`
+        // only ever writes `serde_json::to_string(&Vec<String>)`, column is
+        // NOT NULL DEFAULT '[]'). Synthesize `[{text,priority}]` with
+        // ascending 1-based priorities so the agent's stored order is
+        // preserved (index 0 = priority 1 = the agent's best guess).
+        let texts: Vec<String> = serde_json::from_str(&suggestions).with_context(|| {
+            format!("parsing step_questions.suggestions for row {id} during V26 cutover")
+        })?;
+        let options: Vec<serde_json::Value> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| serde_json::json!({ "text": text, "priority": (i as i64) + 1 }))
+            .collect();
+        let options_json = serde_json::to_string(&options)
+            .context("serializing synthesized interruption options during V26 cutover")?;
+
+        let state = if answer.is_some() { "resolved" } else { "open" };
+
+        conn.execute(
+            "INSERT INTO interruptions \
+                 (id, step_id, attempt, kind, body, options, resolution, comment, state, asked_at, resolved_at) \
+             VALUES (?1, ?2, ?3, 'question', ?4, ?5, ?6, NULL, ?7, ?8, ?9)",
+            rusqlite::params![
+                id,
+                step_id,
+                attempt,
+                question,
+                options_json,
+                answer,
+                state,
+                asked_at,
+                answered_at,
+            ],
+        )?;
+    }
+
+    conn.execute_batch("DROP TABLE step_questions;")?;
 
     Ok(())
 }
@@ -1936,10 +2084,14 @@ mod tests {
         )
         .unwrap();
 
-        drop(conn);
-
-        // Re-open — V16 applies. Pre-V16 rows must default to 0 (disabled).
-        let conn = open_at(&path).unwrap();
+        // Apply ONLY migration V16 (the upgrade under test) — NOT the full
+        // chain via open_at(). A later migration (V26) drops step_questions,
+        // so this test must verify V16's table/indexes at V16, not at HEAD.
+        // V16 is MIGRATIONS[15] (1-indexed → index 15).
+        conn.execute_batch("BEGIN;").unwrap();
+        MIGRATIONS[15](&conn).unwrap();
+        conn.pragma_update(None, "user_version", 16u32).unwrap();
+        conn.execute_batch("COMMIT;").unwrap();
 
         let qe: i64 = conn
             .query_row(
@@ -2007,11 +2159,13 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
+        assert_eq!(version, 16, "only V16 was applied in isolation here");
 
-        // Second open is a no-op (re-running V16 would fail on duplicate
-        // column / duplicate table).
-        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        // Applying the rest of the chain on top of a real V16-seeded DB
+        // succeeds and lands at CURRENT_VERSION — this exercises V26's
+        // step_questions → interruptions cutover running over an upgraded DB.
+        drop(conn);
+        let conn = open_at(&path).expect("full chain must apply on top of V16");
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
@@ -2586,6 +2740,264 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v26_cuts_step_questions_over_to_interruptions() {
+        // Seed a pre-V26 DB with a plan + step + three step_questions rows
+        // (answered/no-suggestions, unanswered, answered-with-suggestions),
+        // run V26, and verify the cutover is faithful: every row lands in
+        // `interruptions` as a `question` with the right body, synthesized
+        // ascending-priority options, resolution, and open/resolved state;
+        // the legacy `step_questions` table is gone; the version is current;
+        // and a re-open is a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v25.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v25 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(25) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+
+        // q1: answered, no suggestions.
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at) \
+             VALUES ('q1', 's1', 1, 'Q1?', '[]', 'A1.', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        // q2: unanswered, no suggestions (stays open; resolved_at NULL).
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at) \
+             VALUES ('q2', 's1', 1, 'Q2-pending?', '[]', '2026-05-01T10:30:00.000Z')",
+            [],
+        )
+        .unwrap();
+        // q3: answered, with suggestions (priorities must be 1,2,3 in order).
+        conn.execute(
+            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at) \
+             VALUES ('q3', 's1', 2, 'Q3?', '[\"alpha\",\"beta\",\"gamma\"]', 'beta', '2026-05-01T12:00:00.000Z', '2026-05-01T13:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V26 applies (create interruptions + data cutover + drop).
+        let conn = open_at(&path).unwrap();
+
+        // (a) All three rows are faithfully present in `interruptions`.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM interruptions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "every step_questions row must cut over");
+
+        // q1: resolved question, empty options, answer -> resolution,
+        //     answered_at -> resolved_at, no comment, kind 'question'.
+        let (step_id, attempt, kind, body, options, resolution, comment, state, asked_at, resolved_at): (
+            String,
+            i64,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT step_id, attempt, kind, body, options, resolution, comment, state, asked_at, resolved_at \
+                 FROM interruptions WHERE id = 'q1'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                        r.get(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(step_id, "s1");
+        assert_eq!(attempt, 1);
+        assert_eq!(kind, "question");
+        assert_eq!(body, "Q1?");
+        assert_eq!(options, "[]");
+        assert_eq!(resolution.as_deref(), Some("A1."));
+        assert_eq!(comment, None, "step_questions had no comment column");
+        assert_eq!(state, "resolved", "an answered question is resolved");
+        assert_eq!(asked_at, "2026-05-01T10:00:00.000Z");
+        assert_eq!(
+            resolved_at.as_deref(),
+            Some("2026-05-01T11:00:00.000Z"),
+            "answered_at must carry over to resolved_at"
+        );
+
+        // q2: unanswered -> open, NULL resolution + resolved_at.
+        let (state2, resolution2, resolved_at2): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state, resolution, resolved_at FROM interruptions WHERE id = 'q2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state2, "open", "an unanswered question stays open");
+        assert_eq!(resolution2, None);
+        assert_eq!(resolved_at2, None);
+
+        // q3: suggestions synthesized into ascending-priority options.
+        let (body3, options3, resolution3, state3): (String, String, Option<String>, String) = conn
+            .query_row(
+                "SELECT body, options, resolution, state FROM interruptions WHERE id = 'q3'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(body3, "Q3?");
+        assert_eq!(resolution3.as_deref(), Some("beta"));
+        assert_eq!(state3, "resolved");
+        let parsed: serde_json::Value = serde_json::from_str(&options3).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                {"text": "alpha", "priority": 1},
+                {"text": "beta",  "priority": 2},
+                {"text": "gamma", "priority": 3},
+            ]),
+            "suggestions must synthesize into [{{text,priority}}] with ascending priorities in stored order"
+        );
+
+        // (b) The legacy `step_questions` table no longer exists.
+        let sq_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='step_questions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sq_exists, 0, "V26 must DROP TABLE step_questions");
+
+        // The new indexes exist, and the open-lookup one is *partial*.
+        let idx_sql: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master \
+                 WHERE type='index' AND tbl_name='interruptions' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let names: Vec<&str> = idx_sql.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"idx_interruptions_step"));
+        assert!(names.contains(&"idx_interruptions_open"));
+        let open_sql = idx_sql
+            .iter()
+            .find(|(n, _)| n == "idx_interruptions_open")
+            .and_then(|(_, s)| s.clone())
+            .unwrap();
+        assert!(
+            open_sql.contains("WHERE state = 'open'"),
+            "idx_interruptions_open must be the §6 partial index (got {open_sql:?})"
+        );
+
+        // (c) MIGRATIONS length / user_version are current (== 26).
+        assert_eq!(MIGRATIONS.len(), 26, "V26 must be registered");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // (d) Re-open is a no-op (no re-cutover against the dropped table).
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+        let count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM interruptions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count_after, 3, "re-open must not duplicate cutover rows");
+    }
+
+    #[test]
+    fn test_migration_v26_runs_clean_on_fresh_db() {
+        // A fresh in-memory DB applies every migration including V26 with no
+        // legacy rows to cut over: `interruptions` exists, accepts a
+        // happy-path insert with the schema defaults, and `step_questions`
+        // is absent.
+        let conn = open_memory().expect("open_memory");
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO interruptions (id, step_id, attempt, kind, body, asked_at) \
+             VALUES ('i1', 's1', 1, 'blocker', 'cannot proceed', '2026-05-01T10:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        let (options, state): (String, String) = conn
+            .query_row(
+                "SELECT options, state FROM interruptions WHERE id = 'i1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(options, "[]", "options DEFAULT '[]'");
+        assert_eq!(state, "open", "state DEFAULT 'open'");
+
+        let sq_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='step_questions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sq_exists, 0, "fresh DB must not carry the legacy table");
+
+        // FK cascade: deleting the step removes its interruptions.
+        conn.execute("DELETE FROM steps WHERE id = 's1'", []).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM interruptions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "step deletion must cascade to interruptions"
+        );
     }
 
     #[test]
