@@ -351,6 +351,19 @@ async fn run_plan_inner(
     // un-reviewed output.
     let impl_slot = Arc::new(tokio::sync::Semaphore::new(1));
 
+    // In-flight read-only reviews (docs/dag-redesign.md §3.5 item 3 / §9).
+    // Each entry is a DETACHED `tokio::spawn`ed `run_review_subprocess`
+    // future — `Send`, holds NO `rusqlite::Connection` and NO implementation
+    // permit — so it runs CONCURRENTLY with whatever the scheduler picks
+    // next. The orchestrator (this loop = the SOLE DB writer, §9-inv-3)
+    // drains finished tasks at every scheduler tick via
+    // `drain_finished_reviews`, where ALL DB / git-note side effects happen
+    // serialized. A linear / no-review plan never spawns into this set (the
+    // executor returns `needs_review: None`), so `reviews.is_empty()` is
+    // always true on that path and the loop is byte-identical to before.
+    let mut reviews: tokio::task::JoinSet<Result<crate::review::ReviewTaskResult>> =
+        tokio::task::JoinSet::new();
+
     // For `--one`, we need to stop after the first step actually executed;
     // capture its ID at the start (the step the topological scheduler would
     // pick first) and exit after it completes. Positions can shift due to
@@ -462,7 +475,37 @@ async fn run_plan_inner(
 
         let current_step = match next {
             Some(s) => s,
-            None => break, // no more runnable steps in the window
+            None => {
+                // Nothing is runnable *right now*. If a read-only review is
+                // still in flight, the runnable set is not final: when that
+                // review returns, the orchestrator either promotes the
+                // reviewed step to `Complete` (un-gating its dependents) or
+                // inserts a corrective step `A′` (a fresh runnable step) —
+                // either of which re-populates the runnable set. So instead
+                // of declaring the plan done, BLOCK on the next finished
+                // review, drain it (sole DB writer), then loop and re-tick.
+                // This is what makes the plan not complete with a review
+                // still pending/undrained (§3.3). With no in-flight reviews
+                // (the linear / no-review path always) this is an immediate
+                // `break`, byte-identical to before.
+                if reviews.is_empty() {
+                    break;
+                }
+                if let Some(fs) = drain_finished_reviews(
+                    conn,
+                    &effective_plan,
+                    &mut reviews,
+                    workdir,
+                    out,
+                    true, // block: wait for at least one review to finish
+                )
+                .await?
+                {
+                    result.final_status = fs;
+                    return Ok(result);
+                }
+                continue;
+            }
         };
 
         // `--one`: once we've executed the captured target, stop. We also
@@ -565,67 +608,86 @@ async fn run_plan_inner(
         // output.
         drop(impl_permit);
 
-        // Built-in review pipeline (docs/dag-redesign.md §3.2-§3.3 / §9 /
-        // §10). When the step's success carries `needs_review`, the executor
-        // deliberately left it `InProgress` with `review_status = Pending`;
-        // run the read-only reviewer against the FIXED committed SHA (it
-        // holds no implementation permit), then — as the SOLE DAG writer
-        // (§9-inv-3) — drain any resulting corrective-step requests and
-        // perform the §10 insert + re-parent. A linear/no-review plan never
-        // sets `needs_review`, so this whole block is skipped and behavior
-        // is byte-identical to before.
+        // Built-in review pipeline (docs/dag-redesign.md §3.2-§3.3 / §3.5
+        // item 3 / §9 / §10). When the step's success carries `needs_review`,
+        // the executor deliberately left it `InProgress` with
+        // `review_status = Pending`. We DO NOT review inline — that would
+        // serialize the scheduler behind the reviewer and defeat the entire
+        // §2-Decision-3 / §3.5-item-3 promise that *unrelated branches run
+        // concurrently with a review*. Instead we:
+        //
+        //  1. mark the step `review_status = InFlight` and emit
+        //     `ReviewStarted` HERE (the orchestrator is the SOLE DB writer —
+        //     §9-inv-3 — so this status write must NOT happen in the task);
+        //  2. `tokio::spawn` the read-only `run_review_subprocess` future
+        //     (it is `Send`, holds NO `Connection` and NO impl permit, and
+        //     runs `git show <fixed sha>` only — §9-inv-2) into the
+        //     `reviews` JoinSet;
+        //  3. CONTINUE the scheduler loop. The impl permit is already
+        //     dropped, so the next *unrelated* runnable step implements
+        //     concurrently with this outstanding review. `current_step`'s
+        //     direct dependents stay non-runnable (it is `InProgress`, not
+        //     `Complete`; `deps_satisfied` requires `Complete`), so
+        //     concurrency never starts work on un-reviewed output.
+        //
+        // The orchestrator drains finished reviews at every tick via
+        // `drain_finished_reviews` (below) — the ONLY place
+        // `review_status` Passed/Failed, the git-note verdict, the V29
+        // bridge row, and the §10 insert + re-parent are written, all
+        // serialized on this single loop. A linear / no-review plan never
+        // sets `needs_review`, so nothing is ever spawned and behavior is
+        // byte-identical to before.
         if let StepResult {
             outcome: StepOutcome::Success,
             needs_review: Some((ref commit_sha, iteration)),
             ..
         } = step_result
         {
-            match crate::review::run_review(
+            let commit_sha = commit_sha.clone();
+            // Orchestrator-side DB write (sole writer): Pending -> InFlight.
+            storage::update_step_review_status(
                 conn,
-                &effective_plan,
-                &current_step,
-                config,
-                workdir,
-                commit_sha,
-                iteration,
-                step_num,
-                out,
-            )
-            .await
-            {
-                Ok(crate::review::ReviewOutcome::Passed) => {
-                    // Review returned PASS ⇒ the step is now genuinely done.
-                    // Promote it to `Complete` (it was held `InProgress`
-                    // during the concurrent-eligible review window). Its
-                    // dependents become runnable on the next tick.
-                    storage::update_step_status(conn, &current_step.id, StepStatus::Complete)?;
-                }
-                Ok(crate::review::ReviewOutcome::Failed { .. }) => {
-                    // The reviewer only *requested* a corrective step (a V29
-                    // bridge row + NDJSON event). The orchestrator (here —
-                    // the sole DAG writer) consumes it below.
-                }
-                Err(e) => {
-                    // A review error (e.g. read-only invariant violated, or
-                    // misconfigured review harness) must not silently pass
-                    // un-reviewed work. Surface it and fail the run, exactly
-                    // as a hard step failure would.
-                    eprintln!("Review of step '{}' failed: {e:#}", current_step.title);
-                    storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
-                    result.final_status = PlanStatus::Failed;
-                    result.step_results.push(step_result);
-                    return Ok(result);
-                }
+                &current_step.id,
+                crate::plan::ReviewStatus::InFlight,
+            )?;
+            if out.format == OutputFormat::Json {
+                output::emit_ndjson(&RunEvent::ReviewStarted {
+                    step_id: current_step.id.clone(),
+                    step_num,
+                    commit_sha: commit_sha.clone(),
+                    iteration,
+                })?;
             }
+            // Owned clones so the detached task is `'static` and `Send`.
+            let plan_for_review = effective_plan.clone();
+            let step_for_review = current_step.clone();
+            let config_for_review = config.clone();
+            let workdir_for_review = workdir.to_path_buf();
+            reviews.spawn(async move {
+                crate::review::run_review_subprocess(
+                    &plan_for_review,
+                    &step_for_review,
+                    &config_for_review,
+                    &workdir_for_review,
+                    &commit_sha,
+                    iteration,
+                    step_num,
+                )
+                .await
+            });
+        }
 
-            // Drain corrective-step requests for this plan as the SOLE DAG
-            // writer (§9-inv-3 / §10). Oldest-first, deterministic
-            // (reproducible scheduling — §3.5 item 4 / §11).
-            for req in
-                storage::list_open_corrective_step_requests_for_plan(conn, &effective_plan.id)?
-            {
-                crate::review::consume_corrective_request(conn, &effective_plan, &req, out)?;
-            }
+        // Drain any reviews that finished while this step implemented
+        // (non-blocking). This is the SOLE DAG-writer point for review
+        // verdicts (§9-inv-3): finalize verdict + git-note, promote a passed
+        // step to `Complete`, and consume corrective requests (§10). On a
+        // review error the run fails exactly like a hard step failure.
+        if let Some(fs) =
+            drain_finished_reviews(conn, &effective_plan, &mut reviews, workdir, out, false).await?
+        {
+            result.final_status = fs;
+            result.step_results.push(step_result);
+            return Ok(result);
         }
 
         let elapsed = started.elapsed();
@@ -779,6 +841,28 @@ async fn run_plan_inner(
     //     after every independent branch has run to a stop (the payoff).
     //  3. Otherwise (e.g. `--from/--to` window, a Failed step)
     //     → InProgress, exactly as before.
+    //
+    // The loop only reaches here once the runnable set is empty AND every
+    // in-flight review has been drained (the `None`-branch blocks on
+    // `drain_finished_reviews` and re-ticks while `!reviews.is_empty()`, so
+    // a corrective step a failed review inserts is itself picked up before
+    // the loop can exit). Therefore a plan is never declared `Complete`
+    // with a review pending or undrained (docs/dag-redesign.md §3.3). The
+    // ONE exception is `--one` (it `break`s after its single target): drain
+    // that step's outstanding review here so its status is finalized before
+    // we compute terminal status / return.
+    while !reviews.is_empty() {
+        if let Some(fs) =
+            drain_finished_reviews(conn, &effective_plan, &mut reviews, workdir, out, true).await?
+        {
+            result.final_status = fs;
+            return Ok(result);
+        }
+    }
+    debug_assert!(
+        reviews.is_empty(),
+        "the plan must not be finalized with a review still in flight (§3.3)"
+    );
     let final_steps = storage::list_steps(conn, &effective_plan.id)?;
     let all_done = final_steps
         .iter()
@@ -2046,6 +2130,120 @@ fn pick_next_step<'a>(
                 .then_with(|| a.sort_key.cmp(&b.sort_key))
                 .then_with(|| a.short_id.cmp(&b.short_id))
         })
+}
+
+/// Drain finished concurrent reviews as the SOLE DAG writer
+/// (docs/dag-redesign.md §3.5 item 3 / §9-inv-3 / §10).
+///
+/// Called by the orchestrator (`run_plan`) at every scheduler tick. The
+/// review subprocesses run detached in `reviews` (a `JoinSet`) — `Send`,
+/// holding no `Connection` and no impl permit, so they overlap whatever the
+/// scheduler implements next. This is the *only* place review verdicts hit
+/// the DB / git-notes / the §10 DAG mutation, all serialized on the single
+/// scheduler loop so the §9-inv-3 single-writer guarantee holds even with a
+/// review in flight.
+///
+/// `block`:
+///  - `false` (mid-tick): non-blockingly reap *every already-finished*
+///    review (`try_join_next`), then return. Reviews still running are left
+///    in the set for a later tick — the scheduler keeps implementing
+///    unrelated work meanwhile (the §3.5-item-3 concurrency payoff).
+///  - `true` (runnable set empty / post-loop): the runnable set cannot grow
+///    without a review returning, so `await` the *next* finished review
+///    (`join_next`), drain it (and any other already-finished ones), then
+///    return. This is what lets a passed review un-gate dependents / a
+///    failed review's corrective step re-enter scheduling, and guarantees
+///    the plan is never finalized with a review pending (§3.3).
+///
+/// For each finished review it calls [`crate::review::finalize_review`] (the
+/// sole-writer verdict sink): `Pass` ⇒ promote the reviewed step
+/// `InProgress → Complete` (its dependents become runnable next tick);
+/// `Fail` ⇒ the V29 bridge row is written, then every open corrective
+/// request for the plan is consumed via
+/// [`crate::review::consume_corrective_request`] (§10 insert + re-parent +
+/// recursion cap), oldest-first for deterministic, reproducible scheduling
+/// (§3.5 item 4 / §11). A review **error** (e.g. the §9-inv-2 read-only
+/// invariant fired, or a misconfigured review harness) or a task **panic**
+/// must never silently pass un-reviewed work: the plan is marked `Failed`
+/// and `Some(PlanStatus::Failed)` is returned so the caller stops the run,
+/// exactly as a hard step failure does.
+///
+/// Returns `Ok(None)` on success (drained, or nothing to drain) and
+/// `Ok(Some(final_status))` when the run must terminate.
+async fn drain_finished_reviews(
+    conn: &Connection,
+    plan: &Plan,
+    reviews: &mut tokio::task::JoinSet<Result<crate::review::ReviewTaskResult>>,
+    workdir: &Path,
+    out: &OutputContext,
+    block: bool,
+) -> Result<Option<PlanStatus>> {
+    if reviews.is_empty() {
+        return Ok(None);
+    }
+
+    // If asked to block, wait for the first one; otherwise reap only what is
+    // already done. After the (optional) blocking wait, greedily drain every
+    // other already-finished task in this same call.
+    let mut joined: Vec<std::result::Result<Result<crate::review::ReviewTaskResult>, tokio::task::JoinError>> =
+        Vec::new();
+    if block {
+        match reviews.join_next().await {
+            Some(j) => joined.push(j),
+            None => return Ok(None), // emptied concurrently — nothing to do
+        }
+    }
+    while let Some(j) = reviews.try_join_next() {
+        joined.push(j);
+    }
+
+    for j in joined {
+        let task_result = match j {
+            Ok(r) => r,
+            Err(join_err) => {
+                // A panicked / aborted review task: fail-safe, never pass
+                // un-reviewed work.
+                eprintln!("Review task failed to complete: {join_err}");
+                storage::update_plan_status(conn, &plan.id, PlanStatus::Failed)?;
+                return Ok(Some(PlanStatus::Failed));
+            }
+        };
+        let review = match task_result {
+            Ok(r) => r,
+            Err(e) => {
+                // A review error (read-only invariant violated, or a
+                // misconfigured review harness): surface it and fail the run
+                // exactly as a hard step failure would (§9-inv-2).
+                eprintln!("Review failed: {e:#}");
+                storage::update_plan_status(conn, &plan.id, PlanStatus::Failed)?;
+                return Ok(Some(PlanStatus::Failed));
+            }
+        };
+
+        // SOLE DB writer: finalize the verdict (status + git-note +, on
+        // FAIL, the V29 bridge row).
+        match crate::review::finalize_review(conn, workdir, &review, out)? {
+            crate::review::ReviewOutcome::Passed => {
+                // The reviewed step was held `InProgress` during its
+                // concurrent-eligible review window; PASS ⇒ it is genuinely
+                // done. Promote to `Complete` so its dependents become
+                // runnable on the next tick.
+                storage::update_step_status(conn, &review.step_id, StepStatus::Complete)?;
+            }
+            crate::review::ReviewOutcome::Failed { .. } => {
+                // The reviewer only *requested* a corrective step (V29
+                // bridge row). Consumed just below as the sole writer.
+            }
+        }
+    }
+
+    // Drain corrective-step requests for this plan as the SOLE DAG writer
+    // (§9-inv-3 / §10). Oldest-first, deterministic (reproducible
+    // scheduling — §3.5 item 4 / §11).
+    for req in storage::list_open_corrective_step_requests_for_plan(conn, &plan.id)? {
+        crate::review::consume_corrective_request(conn, plan, &req, out)?;
+    }
+    Ok(None)
 }
 
 /// Sweep any stale InProgress step rows and emit a log line if the sweep
@@ -3477,6 +3675,19 @@ mod tests {
             .unwrap();
 
         (tmp, dir)
+    }
+
+    /// Seed a `run_locks` row so the executor's `write_phase` has a row to
+    /// update (mirrors `run_lock::acquire` in production; the same helper
+    /// the executor tests use). Required by any test that drives a real
+    /// `execute_step` through `run_plan`.
+    #[cfg(test)]
+    fn seed_run_lock_row(conn: &Connection, project: &str) {
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![project, 1i64, "p-test", "slug"],
+        )
+        .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5101,61 +5312,265 @@ mod tests {
 
     // ---- STEP 38: concurrency model (§9-inv-1/2, §3.5 item 2/3) ----
 
-    /// HARD-INVARIANT PROOF (§9-inv-1): ONE implementation slot. A
-    /// `Semaphore` with 1 permit guarding implement+test+commit means two
-    /// implementations can NEVER overlap. We model the runner's
-    /// acquire-around-execute discipline and assert that while one permit is
-    /// held, a second acquire cannot succeed (no two impls in flight).
-    #[tokio::test]
-    async fn test_impl_semaphore_serializes_implementations() {
-        let impl_slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    // -- honest, scheduler-driven concurrency proofs --
+    //
+    // These drive the REAL `run_plan` scheduler on a 2-independent-branch
+    // DAG with stub implementation + a deliberately slow stub review. Each
+    // stub appends a wall-clock-timestamped phase marker to a shared event
+    // log; we parse that log to prove (i) real wall-clock overlap of an
+    // unrelated implementation with an outstanding review and (ii) that two
+    // implementations never overlap (semaphore=1 still holds). They replace
+    // two earlier tests that hand-poked a bare `tokio::sync::Semaphore` and
+    // never drove `run_plan` (so they could not have caught the inline-
+    // review serialization defect this commit fixes).
 
-        // Step A's implementation acquires the single slot.
-        let a = impl_slot.clone().acquire_owned().await.unwrap();
-
-        // While A holds it, a second implementation cannot start: a
-        // non-blocking try-acquire fails (two impls would overlap otherwise).
-        assert!(
-            impl_slot.clone().try_acquire_owned().is_err(),
-            "two implementations must NEVER hold the slot at once (§9-inv-1)"
-        );
-        assert_eq!(impl_slot.available_permits(), 0);
-
-        // A finishes (implement+test+commit done) and releases the slot.
-        drop(a);
-
-        // Now the next implementation can take it — but still only one.
-        let b = impl_slot.clone().acquire_owned().await.unwrap();
-        assert!(impl_slot.clone().try_acquire_owned().is_err());
-        drop(b);
+    /// One parsed phase marker: `(phase, pid, t_ns)`. `phase` is one of
+    /// `IMPL_START`/`IMPL_END`/`REV_START`/`REV_END`; `pid` correlates a
+    /// START with its matching END (multiple reviews can be in flight at
+    /// once — they share no semaphore — so START/END pairs can nest and a
+    /// single-slot stack is wrong; the pid disambiguates).
+    #[cfg(test)]
+    fn parse_event_log(path: &std::path::Path) -> Vec<(String, String, u128)> {
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        let mut ev: Vec<(String, String, u128)> = raw
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split_whitespace();
+                let phase = it.next()?.to_string();
+                let pid = it.next()?.to_string();
+                let ts: u128 = it.next()?.parse().ok()?;
+                Some((phase, pid, ts))
+            })
+            .collect();
+        ev.sort_by_key(|(_, _, t)| *t);
+        ev
     }
 
-    /// HARD-INVARIANT PROOF (§9-inv-2 / §3.5 item 3): a read-only review
-    /// runs CONCURRENTLY with the next *unrelated* implementation. The
-    /// review holds NO implementation permit (the runner drops it before
-    /// reviewing), so the slot is free for the next unrelated step's
-    /// implementation while the review is outstanding.
-    #[tokio::test]
-    async fn test_review_runs_concurrently_with_next_unrelated_impl() {
-        let impl_slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    /// Reconstruct `(start_ns, end_ns)` intervals for `phase_start` /
+    /// `phase_end` markers, correlating by pid so nested/overlapping
+    /// intervals of the same phase are reconstructed correctly.
+    #[cfg(test)]
+    fn intervals(
+        ev: &[(String, String, u128)],
+        phase_start: &str,
+        phase_end: &str,
+    ) -> Vec<(u128, u128)> {
+        use std::collections::HashMap;
+        let mut open: HashMap<String, u128> = HashMap::new();
+        let mut out: Vec<(u128, u128)> = Vec::new();
+        for (phase, pid, t) in ev {
+            if phase == phase_start {
+                open.insert(pid.clone(), *t);
+            } else if phase == phase_end
+                && let Some(s) = open.remove(pid)
+            {
+                out.push((s, *t));
+            }
+        }
+        out
+    }
 
-        // Step A's implementation holds the slot...
-        let a_permit = impl_slot.clone().acquire_owned().await.unwrap();
-        // ...then commits and the runner RELEASES the slot before review.
-        drop(a_permit);
+    /// Build a stub harness `HarnessConfig` that runs `sh <script>` (the
+    /// CLAUDE.md ETXTBSY-safe invocation).
+    #[cfg(test)]
+    fn sh_stub_harness(script: &str) -> crate::config::HarnessConfig {
+        crate::config::HarnessConfig {
+            command: "sh".to_string(),
+            args: vec![script.to_string()],
+            plan_args: vec![],
+            supports_agent_file: false,
+            supports_json_output: false,
+            json_output_args: vec![],
+            agent_file_env: None,
+            agent_file_args: vec![],
+            model_args: vec![],
+            default_model: None,
+            auth_env_vars: vec![],
+            auth_probe_args: vec![],
+            prompt_input: crate::config::PromptInputMode::Stdin,
+            argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+            color: None,
+        }
+    }
 
-        // A's read-only review is now "in flight" — it deliberately holds
-        // NO implementation permit (it never acquired one). Model that by
-        // simply not holding `impl_slot` here.
+    /// HONEST PROOF (§2 Decision 3 / §3.5 item 3 / §9-inv-1/2): driving the
+    /// real `run_plan` scheduler on TWO independent root steps with a slow
+    /// stub review proves that (i) the unrelated branch's IMPLEMENTATION
+    /// actually starts and finishes while the first step's review is still
+    /// in flight (true wall-clock overlap), and (ii) the two
+    /// implementations never overlap (impl semaphore = 1 still holds).
+    ///
+    /// What this proves: under the fixed runner, some implementation
+    /// interval *intersects* some review interval on the wall clock (and
+    /// because a step's own review is spawned only after its own impl ends,
+    /// that intersection is necessarily cross-step — an UNRELATED branch
+    /// implemented while another step's review was in flight) AND no two
+    /// IMPL intervals overlap (impl semaphore=1). Under the pre-fix
+    /// inline-review code the scheduler `await`ed the review before picking
+    /// the next step, so every impl interval was strictly disjoint from
+    /// every review interval and this test would fail — which is exactly
+    /// why it is the honest replacement.
+    ///
+    /// What this does NOT prove: it does not assert a specific scheduler
+    /// pick order beyond "both independent steps run", nor anything about
+    /// review *correctness* (covered by review.rs unit tests); only the
+    /// concurrency *shape*.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_run_plan_overlaps_unrelated_impl_with_in_flight_review() {
+        use std::fs;
+        use tokio::sync::watch;
 
-        // The next UNRELATED step's implementation can acquire the slot and
-        // run *concurrently* with A's outstanding review.
-        let b_permit = impl_slot
-            .clone()
-            .try_acquire_owned()
-            .expect("an unrelated impl must run while a review is outstanding (§3.5 item 3)");
-        assert_eq!(impl_slot.available_permits(), 0);
-        drop(b_permit);
+        let (_tmp, dir) = init_git_repo();
+        let project = dir.to_string_lossy().to_string();
+
+        // Scripts + the shared event log live OUTSIDE the git workdir so
+        // they are never seen as a tracked/untracked "change".
+        let ext = tempfile::TempDir::new().unwrap();
+        let evlog = ext.path().join("events.log");
+        let evlog_s = evlog.to_string_lossy().into_owned();
+
+        // Implementation stub: timestamp IMPL_START, create a UNIQUE file
+        // (so every step produces a real change to commit), timestamp
+        // IMPL_END, exit 0. `date +%s%N` is nanosecond wall-clock.
+        let impl_sh = ext.path().join("impl.sh");
+        fs::write(
+            &impl_sh,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"IMPL_START $$ $(date +%s%N)\" >> {log}\n\
+                 f=\"change_$$_$(date +%s%N).txt\"\n\
+                 echo work > \"$f\"\n\
+                 sleep 0.15\n\
+                 echo \"IMPL_END $$ $(date +%s%N)\" >> {log}\n",
+                log = evlog_s
+            ),
+        )
+        .unwrap();
+
+        // Review stub: timestamp REV_START, sleep LONG (so an unrelated
+        // impl has ample time to start+finish during it), timestamp
+        // REV_END, then PASS.
+        let rev_sh = ext.path().join("rev.sh");
+        fs::write(
+            &rev_sh,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"REV_START $$ $(date +%s%N)\" >> {log}\n\
+                 sleep 0.8\n\
+                 echo \"REV_END $$ $(date +%s%N)\" >> {log}\n\
+                 echo 'REVIEW PASS'\n",
+                log = evlog_s
+            ),
+        )
+        .unwrap();
+
+        let conn = setup();
+        seed_run_lock_row(&conn, &project);
+        let plan = storage::create_plan(
+            &conn,
+            "concurrent",
+            &project,
+            "feat/concurrent",
+            "d",
+            Some("impl"),
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+        // Two INDEPENDENT root steps (no edges between them): both runnable
+        // from the start, so the scheduler is FREE to pick the second while
+        // the first is under review.
+        for title in ["Alpha", "Beta"] {
+            storage::create_step(
+                &conn, &plan.id, title, "d", None, None, &[], Some(0), None, None, None,
+            )
+            .unwrap();
+        }
+
+        let plan = storage::get_plan_by_slug(&conn, "concurrent", &project)
+            .unwrap()
+            .unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("impl".to_string(), sh_stub_harness(&impl_sh.to_string_lossy()));
+        config
+            .harnesses
+            .insert("reviewer".to_string(), sh_stub_harness(&rev_sh.to_string_lossy()));
+        config.review.enabled = Some(true);
+        config.review.harness = "reviewer".to_string();
+
+        let (_tx, rx) = watch::channel(None);
+        let out = OutputContext::from_cli(false, false, false);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let result = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        // Both steps ran and the plan finished cleanly (both reviews PASS,
+        // both promoted to Complete, drained before terminal status).
+        assert_eq!(result.steps_succeeded, 2, "both independent steps ran");
+        assert_eq!(result.final_status, PlanStatus::Complete);
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert!(
+            steps
+                .iter()
+                .all(|s| s.status == StepStatus::Complete
+                    && s.review_status == Some(crate::plan::ReviewStatus::Passed)),
+            "every step Complete + review Passed (no review left pending — §3.3)"
+        );
+
+        let ev = parse_event_log(&evlog);
+        // Reconstruct interval lists (pid-correlated so overlapping reviews
+        // are reconstructed correctly).
+        let impls = intervals(&ev, "IMPL_START", "IMPL_END");
+        let revs = intervals(&ev, "REV_START", "REV_END");
+        assert_eq!(
+            impls.len(),
+            2,
+            "two implementations ran (one per step); events: {ev:?}"
+        );
+        assert_eq!(
+            revs.len(),
+            2,
+            "two reviews ran (one per step); events: {ev:?}"
+        );
+
+        // (i) REAL OVERLAP: some implementation interval intersects some
+        // review interval on the wall clock (`is < re && rs < ie`). Because
+        // a step's own review is spawned only AFTER its implementation has
+        // ended (the executor commits, then the runner spawns the review),
+        // an impl∩review intersection is necessarily *cross-step* — i.e. an
+        // UNRELATED branch implemented while another step's review was in
+        // flight. This is the property the pre-fix inline-review code
+        // structurally CANNOT satisfy: it `await`ed `run_review` before
+        // picking the next step, so every impl interval was strictly
+        // disjoint from every review interval.
+        let overlap = impls
+            .iter()
+            .any(|&(is, ie)| revs.iter().any(|&(rs, re)| is < re && rs < ie));
+        assert!(
+            overlap,
+            "an unrelated implementation MUST overlap an in-flight review \
+             on the wall clock (§2 Decision 3 / §3.5 item 3); events: {ev:?}"
+        );
+
+        // (ii) SEMAPHORE = 1: no two implementation intervals overlap.
+        for (i, &(s1, e1)) in impls.iter().enumerate() {
+            for &(s2, e2) in impls.iter().skip(i + 1) {
+                assert!(
+                    e1 <= s2 || e2 <= s1,
+                    "two implementations overlapped — impl semaphore=1 \
+                     violated (§9-inv-1); events: {ev:?}"
+                );
+            }
+        }
     }
 
     /// §3.5 item 3 / §3.1: a step's DIRECT DEPENDENTS are not runnable until

@@ -1914,8 +1914,21 @@ pub fn reset_step(conn: &Connection, step_id: &str) -> Result<()> {
 /// sees the Aborted row but the caller's return slice reflects the pre-update
 /// state.
 pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
+    // Also reset a stranded `review_status = in_flight` back to `pending`
+    // in the SAME atomic UPDATE. A crash *during a concurrent review*
+    // (docs/dag-redesign.md §3.5 item 3) leaves a step `InProgress` +
+    // `review_status = InFlight`; sweeping only the step status would
+    // produce the impossible `Aborted` + `InFlight` combination (a review
+    // can never be in flight for an aborted step — its detached task died
+    // with the crashed runner). Resetting it to `pending` makes a
+    // subsequent re-run re-review the step from a clean state rather than
+    // believing a phantom reviewer is still running. Other review_status
+    // values (passed/failed/disabled/skipped) are durable verdicts and are
+    // left untouched.
     let sql = format!(
-        "UPDATE steps SET status = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        "UPDATE steps SET status = ?1,
+             review_status = CASE WHEN review_status = ?4 THEN ?5 ELSE review_status END,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE plan_id = ?2 AND status = ?3
          RETURNING {STEP_COLUMNS}",
     );
@@ -1925,6 +1938,8 @@ pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<S
             StepStatus::Aborted.as_str(),
             plan_id,
             StepStatus::InProgress.as_str(),
+            crate::plan::ReviewStatus::InFlight.as_str(),
+            crate::plan::ReviewStatus::Pending.as_str(),
         ],
         Step::from_row,
     )?;
@@ -5894,6 +5909,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.change_policy, ChangePolicy::Optional);
+    }
+
+    /// A crash *during a concurrent review* (docs/dag-redesign.md §3.5
+    /// item 3) leaves a step `InProgress` + `review_status = InFlight`. The
+    /// stale-sweep must reset BOTH so the impossible `Aborted` + `InFlight`
+    /// combination can never persist; other review verdicts are durable and
+    /// must be left untouched.
+    #[test]
+    fn test_sweep_stale_in_progress_resets_in_flight_review_status() {
+        let conn = setup();
+        let plan = create_plan(&conn, "sweep", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        // Step A: crashed mid-review (InProgress + InFlight) — the bug case.
+        let (a, _) = create_step(
+            &conn, &plan.id, "A", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        update_step_status(&conn, &a.id, StepStatus::InProgress).unwrap();
+        update_step_review_status(&conn, &a.id, crate::plan::ReviewStatus::InFlight).unwrap();
+
+        // Step B: crashed mid-implement, review never started (InProgress +
+        // Pending). Sweep flips status; review_status stays Pending.
+        let (b, _) = create_step(
+            &conn, &plan.id, "B", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        update_step_status(&conn, &b.id, StepStatus::InProgress).unwrap();
+
+        // Step C: a *completed, durably-passed* review on a still-Complete
+        // step — NOT swept (status != InProgress) and verdict untouched.
+        let (c, _) = create_step(
+            &conn, &plan.id, "C", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        update_step_status(&conn, &c.id, StepStatus::Complete).unwrap();
+        update_step_review_status(&conn, &c.id, crate::plan::ReviewStatus::Passed).unwrap();
+
+        let swept = sweep_stale_in_progress(&conn, &plan.id).unwrap();
+        assert_eq!(swept.len(), 2, "only A and B were InProgress");
+
+        let a2 = get_step(&conn, &a.id).unwrap();
+        assert_eq!(a2.status, StepStatus::Aborted);
+        assert_eq!(
+            a2.review_status,
+            Some(crate::plan::ReviewStatus::Pending),
+            "InFlight on a swept step MUST reset to Pending — no \
+             Aborted+InFlight (the bug)"
+        );
+
+        let b2 = get_step(&conn, &b.id).unwrap();
+        assert_eq!(b2.status, StepStatus::Aborted);
+        assert_eq!(
+            b2.review_status, None,
+            "a never-set (on-disk NULL ⇒ semantically Pending) review_status \
+             on a swept step is left as NULL — the CASE only rewrites the \
+             literal 'in_flight'"
+        );
+
+        let c2 = get_step(&conn, &c.id).unwrap();
+        assert_eq!(c2.status, StepStatus::Complete, "C was not InProgress");
+        assert_eq!(
+            c2.review_status,
+            Some(crate::plan::ReviewStatus::Passed),
+            "a durable Passed verdict must NOT be clobbered by the sweep"
+        );
+
+        // The RETURNING snapshot reflects the post-update review_status.
+        let swept_a = swept.iter().find(|s| s.id == a.id).unwrap();
+        assert_eq!(
+            swept_a.review_status,
+            Some(crate::plan::ReviewStatus::Pending),
+            "the returned row snapshot must show the reset review_status"
+        );
     }
 
     #[test]

@@ -5694,13 +5694,20 @@ pub fn cmd_log(
         if !iteration_groups.is_empty() {
             eprintln!("Iteration commits for plan '{}':", plan.slug);
             eprintln!();
-            for (short_id, title, commits) in &iteration_groups {
+            for (short_id, title, review_status, commits) in &iteration_groups {
+                let rs = review_status
+                    .as_deref()
+                    .map(|r| format!(", review: {r}"))
+                    .unwrap_or_default();
                 println!(
-                    "  {short_id} — {title} ({} iteration commits)",
+                    "  {short_id} — {title} ({} iteration commits{rs})",
                     commits.len()
                 );
-                for (iteration, short_sha) in commits {
-                    println!("    .{iteration} {short_sha}");
+                for (iteration, short_sha, verdict) in commits {
+                    match verdict.as_deref() {
+                        Some(v) => println!("    .{iteration} {short_sha} [review: {v}]"),
+                        None => println!("    .{iteration} {short_sha}"),
+                    }
                 }
             }
             println!();
@@ -5803,17 +5810,26 @@ fn collect_skip_wip_commits(conn: &Connection, plan: &crate::plan::Plan) -> Vec<
 /// §5) and group them by step `short_id`, resolving the human-readable step
 /// title from the DB where possible.
 ///
-/// Returns `(short_id, step_title, [(iteration, short_sha)])` ordered by the
-/// step's authored position; iterations within a group are ascending. The
-/// commits↔steps mapping is the `Ralph-Step`/`Ralph-Iteration` trailers
-/// (parsed by git's own trailer parser) — the same discipline as
-/// `collect_skip_wip_commits`. Best-effort: any git failure (not a repo,
-/// branch absent) yields an empty list so `ralph log` never hard-errors.
+/// Returns `(short_id, step_title, step_review_status,
+/// [(iteration, short_sha, review_verdict)])` ordered by the step's authored
+/// position; iterations within a group are ascending. The commits↔steps
+/// mapping is the `Ralph-Step`/`Ralph-Iteration` trailers (parsed by git's
+/// own trailer parser) — the same discipline as `collect_skip_wip_commits`.
+///
+/// Each iteration commit's `review_verdict` is the *final* annotated
+/// `Ralph-Review` value read back from the git note
+/// ([`crate::git::read_review_verdict`] on the full SHA — docs/dag-redesign.md
+/// §5/§9), or `None` when no verdict has been recorded (e.g. review disabled,
+/// or not yet reviewed). `step_review_status` is the step's current
+/// `review_status` column rendered for the group header so the operator sees
+/// both the per-commit verdict and the step-level review state. Best-effort:
+/// any git failure (not a repo, branch absent) yields an empty list so
+/// `ralph log` never hard-errors.
 #[allow(clippy::type_complexity)]
 fn collect_iteration_commits_by_step(
     conn: &Connection,
     plan: &crate::plan::Plan,
-) -> Vec<(String, String, Vec<(i32, String)>)> {
+) -> Vec<(String, String, Option<String>, Vec<(i32, String, Option<String>)>)> {
     let workdir = Path::new(&plan.project);
     if !crate::git::branch_exists(workdir, &plan.branch_name).unwrap_or(false) {
         return Vec::new();
@@ -5827,34 +5843,56 @@ fn collect_iteration_commits_by_step(
     }
     let steps = storage::list_steps(conn, &plan.id).unwrap_or_default();
 
-    // Group by short_id; ascending iteration within a group.
+    // Group by short_id; ascending iteration within a group. Carry the
+    // FULL sha so the per-commit review verdict (a git note on the fixed
+    // SHA) can be read back; the abbreviated form is for display only.
     use std::collections::BTreeMap;
-    let mut grouped: BTreeMap<String, Vec<(i32, String)>> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, Vec<(i32, String, Option<String>)>> = BTreeMap::new();
     for c in commits {
         let short = c.sha[..c.sha.len().min(8)].to_string();
+        // Surface the *final* verdict the review pipeline annotated on this
+        // exact iteration commit (note on a fixed SHA — never the baked-in
+        // `pending` placeholder). Best-effort: a read failure ⇒ `None`.
+        let verdict = crate::git::read_review_verdict(workdir, &c.sha)
+            .ok()
+            .flatten();
         grouped
             .entry(c.step_short_id)
             .or_default()
-            .push((c.iteration, short));
+            .push((c.iteration, short, verdict));
     }
 
     // Sort groups by the step's authored sort position; unknown short_ids
     // (since-removed steps) sort last but still surface.
-    let mut out: Vec<(usize, String, String, Vec<(i32, String)>)> = grouped
+    let mut out: Vec<(
+        usize,
+        String,
+        String,
+        Option<String>,
+        Vec<(i32, String, Option<String>)>,
+    )> = grouped
         .into_iter()
         .map(|(short_id, mut commits)| {
-            commits.sort_by_key(|(it, _)| *it);
-            let (pos, title) = steps
+            commits.sort_by_key(|(it, _, _)| *it);
+            let (pos, title, review_status) = steps
                 .iter()
                 .position(|s| s.short_id == short_id)
-                .map(|i| (i, steps[i].title.clone()))
-                .unwrap_or((usize::MAX, "(unknown step)".to_string()));
-            (pos, short_id, title, commits)
+                .map(|i| {
+                    (
+                        i,
+                        steps[i].title.clone(),
+                        steps[i].review_status.map(|r| r.to_string()),
+                    )
+                })
+                .unwrap_or((usize::MAX, "(unknown step)".to_string(), None));
+            (pos, short_id, title, review_status, commits)
         })
         .collect();
-    out.sort_by_key(|(pos, _, _, _)| *pos);
+    out.sort_by_key(|(pos, _, _, _, _)| *pos);
     out.into_iter()
-        .map(|(_, short_id, title, commits)| (short_id, title, commits))
+        .map(|(_, short_id, title, review_status, commits)| {
+            (short_id, title, review_status, commits)
+        })
         .collect()
 }
 
@@ -7243,19 +7281,43 @@ mod status_live_view_tests {
             &crate::git::build_iteration_commit_message(&s2.short_id, 1, "Step two", "itp"),
         )
         .unwrap();
+        let s2_sha = crate::git::get_commit_hash(&dir).unwrap();
+
+        // Annotate a FINAL review verdict on s2's iteration commit (the
+        // history-safe note path) and set s1's step-level review_status, so
+        // the log surface can show both (Phase-3 `ralph log` review verdict).
+        crate::git::annotate_review_verdict(&dir, &s2_sha, "failed").unwrap();
+        storage::update_step_review_status(&conn, &s1.id, crate::plan::ReviewStatus::Passed)
+            .unwrap();
 
         let groups = collect_iteration_commits_by_step(&conn, &plan);
         assert_eq!(groups.len(), 2, "two steps own iteration commits");
         // Group order follows the authored step order (s1 then s2).
+        // Tuple shape: (short_id, title, step_review_status, commits) where
+        // each commit is (iteration, short_sha, review_verdict).
         assert_eq!(groups[0].0, s1.short_id);
         assert_eq!(groups[0].1, "Step one");
         assert_eq!(
-            groups[0].2.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            groups[0].2.as_deref(),
+            Some("passed"),
+            "the step's review_status must surface in the group header"
+        );
+        assert_eq!(
+            groups[0].3.iter().map(|(i, _, _)| *i).collect::<Vec<_>>(),
             vec![1, 2],
             "iterations ascending within a step group"
         );
+        assert!(
+            groups[0].3.iter().all(|(_, _, v)| v.is_none()),
+            "s1's commits were never review-annotated ⇒ no verdict"
+        );
         assert_eq!(groups[1].0, s2.short_id);
-        assert_eq!(groups[1].2.len(), 1);
+        assert_eq!(groups[1].3.len(), 1);
+        assert_eq!(
+            groups[1].3[0].2.as_deref(),
+            Some("failed"),
+            "s2's iteration commit must surface its annotated review verdict"
+        );
     }
 
     #[test]

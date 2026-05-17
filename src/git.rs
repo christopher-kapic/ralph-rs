@@ -309,6 +309,35 @@ pub fn short_sha(workdir: &Path, sha: &str) -> String {
     }
 }
 
+/// True iff `sha` is an ancestor of (or equal to) the current `HEAD`
+/// commit (`git merge-base --is-ancestor <sha> HEAD`).
+///
+/// Used by [`crate::review::ReviewTreeGuard`] to PROVE the §9-inv-2
+/// read-only-review invariant in a way that is **sound under genuine
+/// concurrency**. A review of step A runs while the next *unrelated*
+/// implementation (step B) legitimately commits ON TOP of the branch,
+/// advancing `HEAD` (the accepted §5 linear-history entanglement). That
+/// keeps the reviewed commit an ancestor of `HEAD`, so this stays `true`
+/// — no false positive. A *tampering* reviewer that checks out / resets /
+/// `commit --amend`s / rebases the line containing the reviewed commit
+/// removes it from `HEAD`'s ancestry, so this flips to `false` and the
+/// review is rejected. (Pinning the reviewed commit's own object id is
+/// useless here: git keeps an amended/orphaned commit reachable *by its
+/// SHA* until GC, so `rev-parse <sha>` is a tautology — ancestry-from-HEAD
+/// is the property that actually distinguishes tampering from a concurrent
+/// forward commit.) `Ok(false)` if `sha` does not resolve at all (a
+/// reviewer GC'd / rewrote it away).
+pub fn is_ancestor_of_head(workdir: &Path, sha: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args(["merge-base", "--is-ancestor", sha, "HEAD"])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("could not check ancestry of {sha} vs HEAD"))?;
+    // `--is-ancestor` exits 0 = ancestor, 1 = not, other = error (e.g. a
+    // bad/orphaned rev). Anything other than a clean 0 ⇒ not reachable.
+    Ok(status.status.success())
+}
+
 /// Return the unified diff **introduced by a single commit** —
 /// `git show <sha>` restricted to the patch with no pager/color.
 ///
@@ -1069,7 +1098,6 @@ pub fn annotate_review_verdict(workdir: &Path, sha: &str, verdict: &str) -> Resu
 /// (the commit still carries only its baked-in `pending` trailer). Used by
 /// tests and `ralph log` to surface the *final* verdict rather than the
 /// commit-time placeholder.
-#[allow(dead_code)] // surfaced by `ralph log` in a later Phase-3 step; used by tests now
 pub fn read_review_verdict(workdir: &Path, sha: &str) -> Result<Option<String>> {
     let output = Command::new("git")
         .args(["notes", "--ref", REVIEW_NOTES_REF, "show", sha])
@@ -1195,6 +1223,137 @@ pub fn order_shas_newest_first(
         .filter(|s| want.contains(s))
         .map(str::to_string)
         .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Throwaway review worktree (docs/dag-redesign.md §8 / §9 invariant 2)
+// ---------------------------------------------------------------------------
+
+/// Create a **detached** linked worktree of `workdir` pinned at `sha`, rooted
+/// at `path` (which must not yet exist).
+///
+/// `git worktree add --detach <path> <sha>` checks `sha`'s tree out into a
+/// brand-new, *physically separate* directory whose `HEAD` is detached at
+/// `sha`. The reviewer harness is run with its cwd set to that directory, so
+/// it is structurally incapable of touching the implementation's live working
+/// tree: `echo evil >> src/foo.rs` inside the reviewer lands in the throwaway
+/// directory, never in the shared `workdir` the next implementation commits
+/// from. This is the §9-inv-2 "reviews are strictly read-only w.r.t. the
+/// working tree" hard invariant enforced *structurally* rather than only
+/// detected after the fact.
+pub fn add_detached_worktree(workdir: &Path, path: &Path, sha: &str) -> Result<()> {
+    git(
+        workdir,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &path.to_string_lossy(),
+            sha,
+        ],
+    )
+    .with_context(|| {
+        format!(
+            "could not create detached review worktree at {} pinned at {sha}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Forcibly remove the linked worktree at `path` and prune dangling
+/// administrative entries.
+///
+/// `--force` because the reviewer may have left dirty/untracked junk in the
+/// throwaway tree (that is exactly the tamper class we are containing — it is
+/// *expected* there and must not block cleanup). Tolerant by design: if the
+/// directory is already gone (panic/early-return raced cleanup, or a prior
+/// call already removed it) `git worktree remove` errors, which we swallow,
+/// then always `git worktree prune` so no orphan administrative entry is left
+/// in `.git/worktrees/`. Cleanup must never itself fail a run.
+pub fn remove_worktree(workdir: &Path, path: &Path) {
+    // Best-effort: a failure here (already-removed dir, etc.) must not mask
+    // the review outcome. We still prune unconditionally afterwards.
+    let _ = Command::new("git")
+        .args(["worktree", "remove", "--force", &path.to_string_lossy()])
+        .current_dir(workdir)
+        .output();
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(workdir)
+        .output();
+    // Belt-and-suspenders: if `git worktree remove` could not delete the
+    // directory (e.g. it was already detached from git's metadata), make sure
+    // no throwaway tree is left on disk.
+    if path.exists() {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+/// List the filesystem paths of every registered worktree (including the
+/// main one), for tests asserting no orphan review worktree leaked.
+#[cfg(test)]
+pub fn list_worktree_paths(workdir: &Path) -> Result<Vec<String>> {
+    let out = git(workdir, &["worktree", "list", "--porcelain"])
+        .context("could not list worktrees")?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(|s| s.trim().to_string())
+        .collect())
+}
+
+/// RAII guard for a throwaway review worktree (docs/dag-redesign.md §8/§9-inv-2).
+///
+/// Construction creates the detached worktree at the reviewed SHA; `Drop`
+/// removes it. Because `Drop` runs on **every** exit path of the function that
+/// holds the guard — normal return, `?`-propagated error, the spawn/await
+/// failing, a panic unwinding through the spawned review task, or the task
+/// being aborted/timed out — the throwaway tree is *always* torn down. There
+/// is no code path that creates one and leaks it. The path lives under the
+/// OS temp dir with a unique component so concurrent reviews never collide.
+pub struct ReviewWorktree {
+    /// The main repository the linked worktree is attached to (where
+    /// `git worktree remove/prune` must run).
+    main_repo: std::path::PathBuf,
+    /// The throwaway worktree directory; the reviewer harness's cwd.
+    path: std::path::PathBuf,
+}
+
+impl ReviewWorktree {
+    /// Create a uniquely-named detached worktree of `main_repo` at `sha`.
+    ///
+    /// The directory is `<tmp>/ralph-review-<pid>-<sha12>-<nanos>` so two
+    /// concurrent reviews (allowed by §3.5 item 3) never collide and a stale
+    /// dir from a crashed prior run can never be reused.
+    pub fn create(main_repo: &Path, sha: &str) -> Result<Self> {
+        let unique = format!(
+            "ralph-review-{}-{}-{}",
+            std::process::id(),
+            sha.chars().take(12).collect::<String>(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        let path = std::env::temp_dir().join(unique);
+        add_detached_worktree(main_repo, &path, sha)?;
+        Ok(Self {
+            main_repo: main_repo.to_path_buf(),
+            path,
+        })
+    }
+
+    /// The throwaway worktree directory — the cwd to spawn the reviewer in.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ReviewWorktree {
+    fn drop(&mut self) {
+        remove_worktree(&self.main_repo, &self.path);
+    }
 }
 
 // ---------------------------------------------------------------------------

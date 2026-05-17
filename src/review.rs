@@ -11,9 +11,12 @@
 //
 // Hard invariants enforced here:
 //  - O(1) reviewer prompt: a SINGLE `git show <sha>` diff (Decision 5).
-//  - Reviews are strictly read-only w.r.t. the working tree: the reviewer is
-//    run against a *fixed* committed SHA; `assert_tree_unchanged_by_review`
-//    guards that the reviewer subprocess did not mutate the tree/HEAD.
+//  - Reviews are strictly read-only w.r.t. the working tree (§9-inv-2),
+//    enforced *structurally*: the reviewer harness is spawned in a THROWAWAY
+//    detached `git worktree` pinned at the reviewed SHA, NOT in the shared
+//    implementation workdir. It is physically incapable of touching the live
+//    tree the next implementation commits from. `assert_tree_unchanged_by_review`
+//    is kept as a cheap defense-in-depth ancestry check on the main repo.
 //  - Single DAG writer: nothing in the reviewer path writes step rows/edges;
 //    only `consume_corrective_request` (orchestrator) does.
 
@@ -91,48 +94,90 @@ pub fn effective_max_review_corrections(plan: &Plan) -> usize {
         .unwrap_or(DEFAULT_MAX_REVIEW_CORRECTIONS)
 }
 
-/// Snapshot of git state taken just before a reviewer subprocess runs, used
-/// by [`assert_tree_unchanged_by_review`] to PROVE the review was read-only
-/// w.r.t. the working tree / HEAD (the §9-inv-2 hard invariant). A review
-/// runs against a fixed commit SHA and must never check out, edit, or
-/// commit.
+/// Snapshot taken just before a reviewer subprocess runs, used by
+/// [`assert_tree_unchanged_by_review`] as **defense-in-depth** for the
+/// history dimension of the §9-inv-2 hard invariant. The *primary* guarantee
+/// is now structural: the reviewer runs in a throwaway detached worktree
+/// (`git::ReviewWorktree`) and is physically unable to touch the main
+/// workdir/HEAD. This ancestry snapshot remains as a cheap belt-and-suspenders
+/// check that the reviewed commit is still reachable from the main repo's
+/// HEAD afterwards (catching a hypothetical reviewer that rewrote the
+/// reviewed line). A review runs against a *fixed commit SHA* and must never
+/// check out, edit, amend, reset, or rebase the line of history it is
+/// reviewing.
+///
+/// **Why reachability-from-HEAD, not a live HEAD/worktree snapshot:** under
+/// the spec's concurrency model (§2 Decision 3 / §3.5 item 3) a review of
+/// step A runs *concurrently with the next unrelated implementation*
+/// (step B), which legitimately commits — advancing `HEAD` and transiently
+/// dirtying the shared worktree (the explicitly-accepted §5 linear-history
+/// entanglement, the same `RetryStrategy::Keep` already tolerates). A
+/// live-HEAD / live-worktree snapshot around the reviewer therefore *cannot*
+/// distinguish "the reviewer mutated state" from "a concurrent sibling
+/// implementation legitimately committed" — it false-positives on the
+/// latter, defeating the entire concurrency payoff. (Pinning the reviewed
+/// commit's own object id is also useless: git keeps an amended/orphaned
+/// commit reachable *by its SHA* until GC.) The property that *is* sound
+/// under concurrency: the reviewed commit stays an **ancestor of HEAD**. A
+/// concurrent forward commit keeps it so; a reviewer that checks out /
+/// resets / amends / rebases the reviewed line removes it from HEAD's
+/// ancestry. See [`git::is_ancestor_of_head`].
 #[derive(Debug, Clone)]
 pub struct ReviewTreeGuard {
-    head: Option<String>,
-    diff: String,
+    /// Whether the reviewed commit was an ancestor of HEAD *before* the
+    /// reviewer ran. Captured so a synthetic test SHA that was never an
+    /// ancestor to begin with degrades the assertion to a no-op rather than
+    /// a false failure (real runs always pass a real committed-on-branch
+    /// SHA, so this is `true`).
+    reviewed_reachable_before: bool,
 }
 
 impl ReviewTreeGuard {
-    /// Capture HEAD + the full working-tree diff before the reviewer runs.
-    pub fn capture(workdir: &Path) -> Self {
+    /// Snapshot reachability of the reviewed commit from HEAD before the
+    /// reviewer runs. `commit_sha` is the *fixed* SHA the reviewer is told
+    /// to `git show` (§8/§9-inv-2).
+    pub fn capture(workdir: &Path, commit_sha: &str) -> Self {
         Self {
-            head: git::get_commit_hash(workdir).ok(),
-            diff: git::get_diff(workdir).unwrap_or_default(),
+            reviewed_reachable_before: git::is_ancestor_of_head(workdir, commit_sha)
+                .unwrap_or(false),
         }
     }
 }
 
-/// Hard assertion that the reviewer subprocess did NOT mutate the working
-/// tree or move HEAD (docs/dag-redesign.md §9 invariant 2). Reviews are
-/// "strictly read-only w.r.t. the working tree" — this is the guard that
-/// makes that machine-checkable rather than aspirational. A violation is a
-/// blocker (returns `Err`), never silently tolerated, because a review that
-/// edited the tree would corrupt the concurrently-running implementation.
-pub fn assert_tree_unchanged_by_review(workdir: &Path, before: &ReviewTreeGuard) -> Result<()> {
-    let after_head = git::get_commit_hash(workdir).ok();
-    if after_head != before.head {
-        anyhow::bail!(
-            "read-only review invariant violated: HEAD moved during review \
-             ({:?} -> {:?}). A reviewer must never commit/checkout (§9-inv-2).",
-            before.head,
-            after_head
-        );
+/// Hard assertion that the reviewer subprocess did NOT check out, edit,
+/// amend, reset, or rebase the **history line under review**
+/// (docs/dag-redesign.md §9 invariant 2). Reviews are "strictly read-only" —
+/// this is the guard that makes that machine-checkable rather than
+/// aspirational. A violation is a blocker (returns `Err`), never silently
+/// tolerated, because a review that rewrote the reviewed history would
+/// corrupt the linear history the concurrent implementation is building on.
+///
+/// This deliberately does **not** compare live `HEAD` / worktree: under
+/// genuine concurrency (§2 Decision 3) the next unrelated implementation
+/// commits while this review runs, which legitimately moves `HEAD` and
+/// transiently dirties the shared tree (accepted §5 entanglement). The
+/// sound, concurrency-safe invariant is that the *reviewed commit remains
+/// an ancestor of HEAD* — a concurrent forward commit preserves that; only
+/// a tampering reviewer (checkout/reset/amend/rebase of the reviewed line)
+/// breaks it. See [`ReviewTreeGuard`].
+pub fn assert_tree_unchanged_by_review(
+    workdir: &Path,
+    commit_sha: &str,
+    before: &ReviewTreeGuard,
+) -> Result<()> {
+    if !before.reviewed_reachable_before {
+        // The reviewed commit was not an ancestor of HEAD even before the
+        // reviewer ran (synthetic test SHA / detached edge case): the guard
+        // cannot make a sound claim, so it is a no-op rather than a false
+        // positive. Real runs always review a commit on the plan branch.
+        return Ok(());
     }
-    let after_diff = git::get_diff(workdir).unwrap_or_default();
-    if after_diff != before.diff {
+    if !git::is_ancestor_of_head(workdir, commit_sha)? {
         anyhow::bail!(
-            "read-only review invariant violated: working tree changed during \
-             review. A reviewer must never modify files (§9-inv-2)."
+            "read-only review invariant violated: the reviewed commit {commit_sha} \
+             is no longer an ancestor of HEAD after review. A reviewer must never \
+             check out / reset / amend / rebase the history under review \
+             (§9-inv-2)."
         );
     }
     Ok(())
@@ -152,26 +197,74 @@ pub enum ReviewOutcome {
     Failed { request_id: String, issues: i32 },
 }
 
-/// Spawn the configured review harness/model against a **committed SHA** and
-/// return the verdict (docs/dag-redesign.md §3.2-§3.3, §9-inv-2). STEP 37.
+/// The verdict-only result a *spawned* (detached, concurrent) review task
+/// returns to the orchestrator (docs/dag-redesign.md §3.5 item 3 / §9).
+///
+/// This is the entire payload the read-only review subprocess produces. It
+/// carries **no `Connection`** and performs **no DB mutation** — that is the
+/// whole point: a review runs concurrently with the next unrelated
+/// implementation precisely because the spawned task touches neither the DB
+/// (the orchestrator is the SOLE DAG writer — §9-inv-3) nor the working tree
+/// (it ran `git show <fixed sha>` only — §9-inv-2). The orchestrator drains
+/// this at a scheduler tick via [`finalize_review`] and performs every DB /
+/// git-note side effect there, serialized on the single scheduler loop.
+#[derive(Debug, Clone)]
+pub struct ReviewTaskResult {
+    /// The reviewed step's id (so the orchestrator can re-key DB writes
+    /// without holding a `&Step` across the await).
+    pub step_id: String,
+    /// 1-based step position, for event/log payloads only.
+    pub step_num: usize,
+    /// The FIXED committed SHA the reviewer ran `git show` against.
+    pub commit_sha: String,
+    /// The reviewed iteration number.
+    pub iteration: i32,
+    /// Short SHA (precomputed for human log lines).
+    pub short_sha: String,
+    /// The parsed verdict.
+    pub verdict: ReviewVerdict,
+    /// The reviewer's last non-empty stdout line — bounded provenance for the
+    /// V29 bridge row's `verdict_body` (never the whole transcript).
+    pub verdict_body: Option<String>,
+}
+
+/// Run the configured review harness/model against a **committed SHA** and
+/// return the parsed verdict — *without touching the DB* (STEP 37,
+/// docs/dag-redesign.md §3.5 item 3 / §9-inv-2/3).
+///
+/// This is the **spawnable** half of the review pipeline: it is `Send` (no
+/// `rusqlite::Connection`), so the runner can `tokio::spawn` it and let it
+/// run concurrently with the next unrelated implementation while the
+/// scheduler loop keeps advancing. It:
 ///
 /// - Builds the dedicated read-only reviewer prompt
 ///   ([`prompt::build_review_prompt`]) from the *single* `git show <sha>`
 ///   diff (O(1) — Decision 5).
-/// - Reuses `harness.rs` spawn machinery, but with the **review** harness
+/// - Reuses `harness.rs` spawn machinery with the **review** harness
 ///   (`config.review.harness` / `.model`), not the implementation harness.
-/// - Captures a [`ReviewTreeGuard`] before spawning and asserts the tree is
-///   unchanged after — the read-only hard invariant.
-/// - Transitions `review_status` Pending → InFlight → Passed/Failed and
-///   annotates the commit's `Ralph-Review` trailer (`passed`/`failed`) via
-///   the history-safe note path.
+/// - Spawns the reviewer in a THROWAWAY detached `git worktree` pinned at
+///   the reviewed SHA ([`git::ReviewWorktree`]) — *not* in the shared
+///   implementation `workdir`. This makes the §9-inv-2 read-only invariant
+///   *structural*: a reviewer that does `echo evil >> src/foo.rs` (no commit)
+///   writes into the disposable tree, which is torn down on every exit path
+///   (RAII `Drop`) and is never the directory the next implementation commits
+///   from. The throwaway tree cannot interfere with a concurrent unrelated
+///   implementation in the main workdir — which is the entire premise of
+///   §3.5-item-3 concurrent review.
+/// - Additionally captures a [`ReviewTreeGuard`] on the **main repo** before
+///   spawning and asserts the reviewed commit is still an ancestor of HEAD
+///   after — kept as cheap defense-in-depth for the history dimension (it
+///   catches a reviewer that somehow rewrote the reviewed line). With the
+///   reviewer isolated in its own worktree it cannot affect the main tree or
+///   HEAD anyway; the assertion is a belt-and-suspenders invariant check.
 ///
-/// On `Fail`, this writes the V29 bridge row + emits the
-/// `CorrectiveStepRequested` event (STEP 39) and returns
-/// [`ReviewOutcome::Failed`]; it NEVER mutates step rows/edges itself.
+/// It does NOT write `review_status`, does NOT annotate the git note, and
+/// does NOT write the V29 bridge row — all of that is the orchestrator's
+/// job in [`finalize_review`], serialized on the single scheduler loop so
+/// the §9-inv-3 single-DAG-writer guarantee holds even with a review in
+/// flight.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_review(
-    conn: &Connection,
+pub async fn run_review_subprocess(
     plan: &Plan,
     step: &Step,
     config: &Config,
@@ -179,8 +272,7 @@ pub async fn run_review(
     commit_sha: &str,
     iteration: i32,
     step_num: usize,
-    out: &OutputContext,
-) -> Result<ReviewOutcome> {
+) -> Result<ReviewTaskResult> {
     // Resolve the REVIEW harness (distinct from the implementation harness).
     let review_harness_name = config.review.harness.trim();
     if review_harness_name.is_empty() {
@@ -205,17 +297,7 @@ pub async fn run_review(
         Some(config.review.model.trim())
     };
 
-    storage::update_step_review_status(conn, &step.id, ReviewStatus::InFlight)?;
-
     let short = git::short_sha(workdir, commit_sha);
-    if out.format == OutputFormat::Json {
-        output::emit_ndjson(&RunEvent::ReviewStarted {
-            step_id: step.id.clone(),
-            step_num,
-            commit_sha: commit_sha.to_string(),
-            iteration,
-        })?;
-    }
 
     // O(1) reviewer diff: EXACTLY one commit's `git show` patch. This is the
     // single place the reviewer diff is produced — never a cumulative/range
@@ -234,46 +316,123 @@ pub async fn run_review(
     // practice; kept for parity with the implementation spawn path.
     let env_vars = harness::build_harness_env(harness_config, None);
 
-    // PROVE read-only: snapshot tree+HEAD, run, assert unchanged.
-    let guard = ReviewTreeGuard::capture(workdir);
-    let (child, _tmp) =
-        harness::spawn_harness_with_delivery(harness_config, &args, &env_vars, workdir, delivery)
-            .await?;
+    // STRUCTURAL §9-inv-2 ENFORCEMENT: spawn the reviewer in a THROWAWAY
+    // detached worktree pinned at the reviewed SHA — never the shared
+    // implementation `workdir`. A reviewer that edits files (with or without
+    // committing) can only touch this disposable tree; it physically cannot
+    // reach the live workdir the next implementation commits from. The RAII
+    // guard's `Drop` removes the worktree on EVERY exit path of this function
+    // (normal return, the `?` below, a spawn/await error, a panic unwinding
+    // through this spawned task, or the task being aborted) — there is no
+    // path that creates a worktree and leaks it; `git worktree prune` runs
+    // unconditionally so no orphan administrative entry survives either.
+    let review_wt = git::ReviewWorktree::create(workdir, commit_sha)
+        .context("could not create isolated review worktree (§9-inv-2)")?;
+
+    // Defense-in-depth (history dimension): snapshot that the reviewed commit
+    // is an ancestor of HEAD on the MAIN repo, run, assert it still is. With
+    // the reviewer isolated in its own worktree it cannot move the main
+    // workdir's HEAD anyway, but this is a cheap invariant check that still
+    // catches a reviewer that somehow rewrote the reviewed line. It is sound
+    // under genuine concurrency — a concurrent unrelated implementation may
+    // legitimately commit & move HEAD forward while this review runs (the
+    // accepted §5 entanglement), which keeps the reviewed commit reachable.
+    let guard = ReviewTreeGuard::capture(workdir, commit_sha);
+
+    // The harness's cwd is the THROWAWAY worktree, NOT `workdir`.
+    let (child, _tmp) = harness::spawn_harness_with_delivery(
+        harness_config,
+        &args,
+        &env_vars,
+        review_wt.path(),
+        delivery,
+    )
+    .await?;
     let output_captured = child
         .wait_with_output()
         .await
         .context("failed to wait for review harness")?;
     let stdout = String::from_utf8_lossy(&output_captured.stdout).to_string();
 
-    // HARD INVARIANT: a review never touches the working tree / HEAD.
-    assert_tree_unchanged_by_review(workdir, &guard)?;
+    // Defense-in-depth: the reviewed commit must remain reachable from the
+    // main repo's HEAD (catches a hypothetical history rewrite of the
+    // reviewed line; the worktree isolation already prevents worktree-only
+    // tampering of the live implementation tree structurally).
+    assert_tree_unchanged_by_review(workdir, commit_sha, &guard)?;
+    // Explicit teardown on the success path (Drop would also do this on any
+    // early return / panic above; calling it here makes the lifecycle
+    // unambiguous and frees the disk before the verdict is parsed/returned).
+    drop(review_wt);
 
     let verdict = parse_review_verdict(&stdout);
+    Ok(ReviewTaskResult {
+        step_id: step.id.clone(),
+        step_num,
+        commit_sha: commit_sha.to_string(),
+        iteration,
+        short_sha: short,
+        verdict,
+        verdict_body: last_nonempty_line(&stdout),
+    })
+}
+
+/// Drain a finished review's verdict as the SOLE DB writer (STEP 37/39,
+/// docs/dag-redesign.md §9-inv-3). Called by the orchestrator from the
+/// scheduler loop — NEVER from a spawned task.
+///
+/// Given the [`ReviewTaskResult`] produced (possibly concurrently) by
+/// [`run_review_subprocess`], this performs every DB / git-note side effect,
+/// serialized on the single scheduler loop:
+///
+/// - Transitions `review_status` Passed/Failed.
+/// - Annotates the commit's `Ralph-Review` trailer (`passed`/`failed`) via
+///   the history-safe note path (note on a fixed SHA — never an amend; this
+///   is also serialized here so two concurrent reviews never race on
+///   `refs/notes`).
+/// - On `Fail`, writes the V29 bridge row (the §9-inv-3 structured channel)
+///   and emits the `CorrectiveStepRequested` event (STEP 39). It NEVER
+///   mutates step rows/edges itself — the orchestrator consumes the bridge
+///   row separately via [`consume_corrective_request`].
+pub fn finalize_review(
+    conn: &Connection,
+    workdir: &Path,
+    result: &ReviewTaskResult,
+    out: &OutputContext,
+) -> Result<ReviewOutcome> {
+    let ReviewTaskResult {
+        step_id,
+        step_num,
+        commit_sha,
+        iteration,
+        short_sha,
+        verdict,
+        verdict_body,
+    } = result;
+    let step_num = *step_num;
+    let iteration = *iteration;
 
     match verdict {
         ReviewVerdict::Pass => {
-            storage::update_step_review_status(conn, &step.id, ReviewStatus::Passed)?;
+            storage::update_step_review_status(conn, step_id, ReviewStatus::Passed)?;
             // History-safe verdict annotation (note on a fixed SHA — never an
             // amend, see git::annotate_review_verdict).
             git::annotate_review_verdict(workdir, commit_sha, "passed")?;
             if out.format == OutputFormat::Json {
                 output::emit_ndjson(&RunEvent::ReviewFinished {
-                    step_id: step.id.clone(),
+                    step_id: step_id.clone(),
                     step_num,
-                    commit_sha: commit_sha.to_string(),
+                    commit_sha: commit_sha.clone(),
                     iteration,
                     passed: true,
                 })?;
             } else {
-                eprintln!(
-                    "  review of {short} ({}.{iteration}) ... PASS",
-                    step.short_id
-                );
+                eprintln!("  review of {short_sha} (.{iteration}) ... PASS");
             }
             Ok(ReviewOutcome::Passed)
         }
         ReviewVerdict::Fail { issues } => {
-            storage::update_step_review_status(conn, &step.id, ReviewStatus::Failed)?;
+            let issues = *issues;
+            storage::update_step_review_status(conn, step_id, ReviewStatus::Failed)?;
             git::annotate_review_verdict(workdir, commit_sha, "failed")?;
 
             // STEP 39 — the reviewer side of the §9-inv-3 structured channel:
@@ -283,37 +442,76 @@ pub async fn run_review(
             // consumes it later as the sole writer.
             let request_id = storage::insert_corrective_step_request(
                 conn,
-                &step.id,
+                step_id,
                 iteration,
                 commit_sha,
                 issues,
-                last_nonempty_line(&stdout).as_deref(),
+                verdict_body.as_deref(),
             )?;
 
             if out.format == OutputFormat::Json {
                 output::emit_ndjson(&RunEvent::ReviewFinished {
-                    step_id: step.id.clone(),
+                    step_id: step_id.clone(),
                     step_num,
-                    commit_sha: commit_sha.to_string(),
+                    commit_sha: commit_sha.clone(),
                     iteration,
                     passed: false,
                 })?;
                 output::emit_ndjson(&RunEvent::CorrectiveStepRequested {
-                    reviewed_step_id: step.id.clone(),
+                    reviewed_step_id: step_id.clone(),
                     reviewed_step_num: step_num,
-                    commit_sha: commit_sha.to_string(),
+                    commit_sha: commit_sha.clone(),
                     iteration,
                     issues,
                 })?;
             } else {
                 eprintln!(
-                    "  review of {short} ({}.{iteration}) ... FAIL ({issues} issue(s)) — corrective step requested",
-                    step.short_id
+                    "  review of {short_sha} (.{iteration}) ... FAIL ({issues} issue(s)) — corrective step requested"
                 );
             }
             Ok(ReviewOutcome::Failed { request_id, issues })
         }
     }
+}
+
+/// Synchronous-DB convenience wrapper (STEP 37): mark the step `InFlight`,
+/// emit `ReviewStarted`, run the reviewer subprocess INLINE, then finalize.
+///
+/// This is the *sequential* entry point — it does not give concurrency
+/// (it awaits the subprocess inline). The runner uses the spawnable
+/// [`run_review_subprocess`] + [`finalize_review`] pair instead so a review
+/// overlaps the next unrelated implementation (§3.5 item 3). This wrapper is
+/// kept for the focused unit tests in this module (and any future
+/// single-shot caller), composing the exact same steps as the concurrent
+/// path so the two cannot drift.
+#[allow(clippy::too_many_arguments)]
+// Used by this module's focused integration tests; the runner deliberately
+// uses the spawnable `run_review_subprocess` + `finalize_review` pair to get
+// concurrency, so the composed wrapper is dead in the non-test binary build.
+#[cfg_attr(not(test), allow(dead_code))]
+pub async fn run_review(
+    conn: &Connection,
+    plan: &Plan,
+    step: &Step,
+    config: &Config,
+    workdir: &Path,
+    commit_sha: &str,
+    iteration: i32,
+    step_num: usize,
+    out: &OutputContext,
+) -> Result<ReviewOutcome> {
+    storage::update_step_review_status(conn, &step.id, ReviewStatus::InFlight)?;
+    if out.format == OutputFormat::Json {
+        output::emit_ndjson(&RunEvent::ReviewStarted {
+            step_id: step.id.clone(),
+            step_num,
+            commit_sha: commit_sha.to_string(),
+            iteration,
+        })?;
+    }
+    let result =
+        run_review_subprocess(plan, step, config, workdir, commit_sha, iteration, step_num).await?;
+    finalize_review(conn, workdir, &result, out)
 }
 
 /// The reviewer's last non-empty stdout line, used as the corrective
@@ -803,29 +1001,107 @@ mod tests {
         );
     }
 
-    /// HARD-INVARIANT PROOF (§9-inv-2): a review is strictly read-only
-    /// w.r.t. the working tree. A reviewer that tries to edit the tree /
-    /// move HEAD is detected and the review errors — un-reviewed work is
-    /// never silently passed.
+    /// HARD-INVARIANT PROOF (§9-inv-2) — the **worktree-only tamper class**
+    /// (the regression this fix closes). A malicious reviewer that ONLY edits
+    /// the working tree (writes/overwrites files, NEVER commits) must not be
+    /// able to corrupt the implementation's live workdir. Before the fix the
+    /// ancestry guard returned `Ok` for this case (the reviewed commit stayed
+    /// an ancestor of HEAD) and the injected junk was swept into the next
+    /// per-iteration commit. Now the reviewer is spawned in a THROWAWAY
+    /// detached worktree, so its writes land there and CANNOT appear in the
+    /// shared `workdir`. We prove the live workdir is byte-for-byte untouched.
     #[tokio::test]
-    async fn test_review_is_read_only_wrt_working_tree() {
+    async fn test_review_worktree_only_tamper_cannot_touch_live_workdir() {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         init_repo(dir);
-        // Malicious reviewer: mutates a tracked file before "passing".
+        // Malicious reviewer: edits a tracked file AND drops a brand-new
+        // untracked file — but NEVER commits (the exact class the ancestry
+        // guard alone could not catch). It runs in its own cwd (the throwaway
+        // worktree); these writes must never reach `dir`.
         let script = write_stub(
             dir,
             "evil.sh",
-            "echo 'tampered' >> README.md\necho 'REVIEW PASS'",
+            "echo 'tampered' >> README.md\n\
+             echo 'evil' > injected_by_reviewer.txt\n\
+             echo 'REVIEW PASS'",
         );
         let config = config_with_review_harness(&script);
         let (conn, plan, step, sha) = seed_committed_step(dir);
+
+        // The review itself "passes" (the harness printed PASS) — isolation,
+        // not detection, is what protects the tree here.
+        let outcome = run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out())
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReviewOutcome::Passed);
+
+        // The injected untracked file NEVER appears in the live workdir.
+        assert!(
+            !dir.join("injected_by_reviewer.txt").exists(),
+            "reviewer-written file leaked into the live implementation workdir \
+             (§9-inv-2 worktree isolation violated)"
+        );
+        // The tracked file the reviewer appended to is unchanged in the
+        // live workdir (seed_committed_step never wrote to README.md after
+        // init, so it still holds exactly the init content).
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "init\n",
+            "reviewer edit to a tracked file leaked into the live workdir"
+        );
+        // And the live workdir has NO uncommitted changes at all — so the
+        // next per-iteration commit (which stages tracked+untracked) cannot
+        // sweep in any reviewer-introduced content.
+        assert!(
+            !crate::git::has_uncommitted_changes(dir).unwrap(),
+            "reviewer tampering dirtied the live workdir; the next step's \
+             commit would sweep it in (the corruption §9-inv-2 prevents)"
+        );
+        // No orphan review worktree left behind on a passing review.
+        let wts = crate::git::list_worktree_paths(dir).unwrap();
+        assert_eq!(
+            wts.len(),
+            1,
+            "exactly the main worktree must remain (no orphan review tree): {wts:?}"
+        );
+    }
+
+    /// HARD-INVARIANT PROOF (§9-inv-2) — the **history-rewrite dimension**
+    /// (kept defense-in-depth coverage). A reviewer that reaches back into
+    /// the *main* repo and rewrites the reviewed line (`git -C <workdir>
+    /// commit --amend`) removes the reviewed commit from HEAD's ancestry; the
+    /// `is_ancestor_of_head` guard on the main repo still catches that and
+    /// the review errors — un-reviewed/rewritten work is never silently
+    /// passed. A *concurrent* unrelated implementation committing on top is
+    /// NOT a violation (proven separately by the runner's
+    /// `test_run_plan_overlaps_unrelated_impl_with_in_flight_review`).
+    #[tokio::test]
+    async fn test_review_is_read_only_wrt_reviewed_commit() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        let (conn, plan, step, sha) = seed_committed_step(dir);
+        // Malicious reviewer that explicitly escapes its sandbox and rewrites
+        // history in the MAIN repo (`git -C <dir>`), the worst-case "reviewer
+        // must never rewrite the reviewed line" violation. The defense-in-
+        // depth ancestry guard must reject it.
+        let script = write_stub(
+            dir,
+            "evil.sh",
+            &format!(
+                "git -C '{d}' commit -q --amend --no-edit --allow-empty -m rewritten\n\
+                 echo 'REVIEW PASS'",
+                d = dir.display()
+            ),
+        );
+        let config = config_with_review_harness(&script);
 
         let res = run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out()).await;
 
         assert!(
             res.is_err(),
-            "a reviewer that mutated the working tree MUST be rejected \
+            "a reviewer that rewrote the reviewed commit MUST be rejected \
              (§9-inv-2 read-only review hard invariant)"
         );
         let msg = format!("{:#}", res.unwrap_err());
@@ -833,6 +1109,64 @@ mod tests {
             msg.contains("read-only review invariant violated"),
             "error must name the violated invariant, got: {msg}"
         );
+    }
+
+    /// LIFECYCLE PROOF: the throwaway review worktree is removed (no orphan
+    /// `git worktree list` entry, no leftover dir) after BOTH a passing
+    /// review AND a failing/erroring one — RAII `Drop` + unconditional prune
+    /// on every exit path.
+    #[tokio::test]
+    async fn test_review_worktree_cleaned_up_on_pass_and_failure() {
+        // (a) passing review.
+        {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path();
+            init_repo(dir);
+            let script = write_stub(dir, "rev.sh", "echo 'REVIEW PASS'");
+            let config = config_with_review_harness(&script);
+            let (conn, plan, step, sha) = seed_committed_step(dir);
+            run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out())
+                .await
+                .unwrap();
+            let wts = crate::git::list_worktree_paths(dir).unwrap();
+            assert_eq!(wts.len(), 1, "passing review left an orphan worktree: {wts:?}");
+        }
+        // (b) failing review (FAIL verdict — still a clean teardown).
+        {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path();
+            init_repo(dir);
+            let script = write_stub(dir, "fail.sh", "echo 'REVIEW FAIL — 1 issue(s)'");
+            let config = config_with_review_harness(&script);
+            let (conn, plan, step, sha) = seed_committed_step(dir);
+            run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out())
+                .await
+                .unwrap();
+            let wts = crate::git::list_worktree_paths(dir).unwrap();
+            assert_eq!(wts.len(), 1, "failing review left an orphan worktree: {wts:?}");
+        }
+        // (c) erroring review (the harness binary cannot be spawned — the
+        // worktree is created, then the spawn `?`-errors; Drop must still
+        // remove it).
+        {
+            let tmp = TempDir::new().unwrap();
+            let dir = tmp.path();
+            init_repo(dir);
+            let (conn, plan, step, sha) = seed_committed_step(dir);
+            let mut config = config_with_review_harness("/nonexistent/script.sh");
+            // Force a hard spawn failure: command that does not exist.
+            config.harnesses.get_mut("reviewer").unwrap().command =
+                "/nonexistent/ralph-no-such-binary".to_string();
+            let res =
+                run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out()).await;
+            assert!(res.is_err(), "spawn of a missing harness must error");
+            let wts = crate::git::list_worktree_paths(dir).unwrap();
+            assert_eq!(
+                wts.len(),
+                1,
+                "erroring review left an orphan worktree (Drop did not run): {wts:?}"
+            );
+        }
     }
 
     /// HARD-INVARIANT PROOF (§9-inv-3): a failed review does NOT mutate the
