@@ -7,6 +7,7 @@ mod agents;
 pub mod config_cmd;
 pub mod harness;
 mod hooks;
+pub mod interruption;
 mod plan;
 mod prompt;
 pub mod question;

@@ -29,9 +29,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::cli::{
-    AgentsCommand, Cli, Command, HooksCommand, PlanCommand, PlanDependencyCommand,
-    PlanHarnessCommand, PromptCommand, QuestionCommand, QuestionsState, StepCommand,
-    StepDependencyCommand,
+    AgentsCommand, Cli, Command, HooksCommand, InterruptionCommand, PlanCommand,
+    PlanDependencyCommand, PlanHarnessCommand, PromptCommand, QuestionCommand, QuestionsState,
+    StepCommand, StepDependencyCommand,
 };
 
 use crate::commands::{resolve_plan, resolve_project};
@@ -634,7 +634,11 @@ fn main() -> Result<()> {
 
         // -- Question --
         Command::Question(subcmd) => match subcmd {
-            QuestionCommand::Ask { question, suggest } => {
+            QuestionCommand::Ask {
+                question,
+                suggest,
+                priority,
+            } => {
                 use crate::commands::question::{
                     DISABLED_MESSAGE, NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome,
                     record_question_ask,
@@ -655,7 +659,7 @@ fn main() -> Result<()> {
                     }
                 };
 
-                match record_question_ask(&conn, &project, &q, &suggest)? {
+                match record_question_ask(&conn, &project, &q, &suggest, &priority)? {
                     QuestionAskOutcome::NoActiveRun => {
                         eprintln!("{NO_ACTIVE_RUN_MESSAGE}");
                         std::process::exit(1);
@@ -687,6 +691,64 @@ fn main() -> Result<()> {
             QuestionCommand::Show { num } => {
                 commands::question::cmd_question_show(&conn, &project, num, &out)
             }
+        },
+
+        // -- Block (raise a blocker interruption) --
+        Command::Block { text } => {
+            use crate::commands::question::{
+                DISABLED_MESSAGE, NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome, record_block,
+            };
+            use std::io::Read;
+
+            let body = match text {
+                Some(t) => t,
+                None => {
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .context("Failed to read blocker text from stdin")?;
+                    buf.trim_end().to_string()
+                }
+            };
+
+            match record_block(&conn, &project, &body)? {
+                QuestionAskOutcome::NoActiveRun => {
+                    eprintln!("{NO_ACTIVE_RUN_MESSAGE}");
+                    std::process::exit(1);
+                }
+                QuestionAskOutcome::Disabled => {
+                    eprintln!("{DISABLED_MESSAGE}");
+                    std::process::exit(1);
+                }
+                QuestionAskOutcome::Recorded { .. } => Ok(()),
+            }
+        }
+
+        // -- Interruption (human-side list/show/resolve) --
+        Command::Interruption(subcmd) => match subcmd {
+            InterruptionCommand::List { plan } => commands::interruption::cmd_interruption_list(
+                &conn,
+                &project,
+                plan.as_deref(),
+                &out,
+            ),
+            InterruptionCommand::Show { id } => {
+                commands::interruption::cmd_interruption_show(&conn, &project, &id, &out)
+            }
+            InterruptionCommand::Resolve {
+                id,
+                option,
+                answer,
+                comment,
+            } => commands::interruption::cmd_interruption_resolve(
+                &conn,
+                &project,
+                &id,
+                option,
+                answer.as_deref(),
+                comment.as_deref(),
+                &out,
+            ),
         },
 
         // -- Agents --

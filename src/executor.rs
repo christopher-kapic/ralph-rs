@@ -56,12 +56,14 @@ pub enum StepOutcome {
     Skipped,
     /// The harness process exceeded the timeout.
     Timeout,
-    /// The harness called `ralph question ask` during the attempt, leaving one
-    /// or more unanswered `step_questions` rows. Tests + commit are skipped,
-    /// any diff is rolled back, and the plan's effective status becomes
-    /// [`crate::plan::PlanStatus::Interrupted`] until the user answers
-    /// (docs/dag-redesign.md §3.4/§6). The runner stops the loop cleanly so
-    /// the run lock is released.
+    /// The harness called `ralph question ask` / `ralph block` during the
+    /// attempt, leaving one or more open native `interruptions` rows. Both
+    /// the test phase and the commit are skipped, any diff is rolled back,
+    /// the step's branch is marked `Blocked` (derived), and **no retry
+    /// budget is consumed** (docs/dag-redesign.md §3.4 / §9 invariant 4).
+    /// The scheduler advances to another runnable branch; the plan only
+    /// reports [`crate::plan::PlanStatus::Interrupted`] once the runnable
+    /// set is exhausted, so a linear plan still pauses exactly as before.
     PausedForQuestion,
 }
 
@@ -772,28 +774,38 @@ async fn handle_skipped_attempt(
     Ok(SkipDisposition::Finalized(result))
 }
 
-/// Finalize an attempt that paused because the harness left unanswered
-/// `step_questions` rows behind (TUI-plan.md §17 "Runner integration").
+/// Finalize an attempt that the harness ended by raising an interruption
+/// (an open `interruptions` row — a `ralph question ask` *or* a `ralph
+/// block` — for this (step, attempt)). The cross-process bridge of
+/// docs/dag-redesign.md §7 / §9 invariant 4, mirroring the V23 skip-bridge:
+/// the open row is the bridge; a CLI/TUI in a *different* process resolves
+/// it; the runner observes the resolution at the next scheduler tick and
+/// the step re-runs with the resolution injected (the injection itself is
+/// already done by `prompt.rs`).
 ///
-/// Skips tests + commit, rolls back any diff the harness produced, writes the
-/// `execution_logs` row with `termination_reason = paused_for_question`, and
-/// returns the step's status to [`StepStatus::Pending`] so the user's next
-/// `ralph run` (after answering) picks it up cleanly. Leaving it `InProgress`
-/// would be swept to `Aborted` at the start of the next run and pollute the
-/// audit trail with a synthetic abort. `step.attempts` was already bumped at
-/// the top of the retry loop, mirroring the "single counter" rule from §17.
-#[allow(clippy::too_many_arguments)]
+/// Skips tests + commit, rolls back any diff the harness produced, writes
+/// the `execution_logs` row with `termination_reason = paused_for_question`,
+/// and returns the step's status to [`StepStatus::Pending`] so a re-run
+/// picks it up cleanly (the derived `Blocked` overlay shadows `Pending`
+/// while the interruption is open — `effective_step_status`).
+///
+/// **Zero retry budget (HARD invariant — docs/dag-redesign.md §3.4 / §9
+/// invariant 4).** `step.attempts` was bumped at the top of the retry loop
+/// *before* the harness spawned; we roll it back by one here so the resumed
+/// run re-runs the *same* attempt number, exactly like the skip-dialog
+/// cancel path (`handle_skipped_attempt`'s `set_step_attempts(.. attempt -
+/// 1)`). An interruption is the agent asking for help, not a failed try —
+/// it must never burn a retry.
 async fn finalize_paused_for_question(
     ctx: &ExecCtx<'_>,
     exec_log_id: i64,
-    duration_secs: f64,
     attempt: i32,
-    diff: Option<&str>,
-    stdout: &str,
-    stderr: &str,
-    parsed: &ParsedHarnessOutput,
 ) -> Result<StepResult> {
-    let rolled_back = if git::has_uncommitted_changes(ctx.workdir)? {
+    // Roll back any in-flight diff the harness produced before it raised
+    // the interruption (Decision 5 / §5: a blocked branch parks no WIP — it
+    // re-runs from the committed state once resolved). The exec_log row is
+    // deleted below, so this Rollback phase event carries no log id.
+    if git::has_uncommitted_changes(ctx.workdir)? {
         write_phase(
             ctx.conn,
             ctx.plan,
@@ -808,30 +820,28 @@ async fn finalize_paused_for_question(
             ctx.json_output,
         )?;
         git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)?;
-        true
-    } else {
-        false
-    };
+    }
 
-    storage::update_execution_log(
-        ctx.conn,
-        exec_log_id,
-        Some(duration_secs),
-        diff,
-        &[],
-        rolled_back,
-        false,
-        None,
-        Some(stdout),
-        Some(stderr),
-        parsed.cost_usd,
-        parsed.input_tokens,
-        parsed.output_tokens,
-        parsed.session_id.as_deref(),
-        Some(TerminationReason::PausedForQuestion),
-        Some(TestStatus::NotRun),
-    )?;
-
+    // Zero retry budget (HARD invariant — docs/dag-redesign.md §3.4 / §9
+    // invariant 4). The pre-spawn `set_step_attempts(.. attempt)` is rolled
+    // back AND the `execution_logs` row this attempt created is **deleted**,
+    // exactly like the skip-dialog cancel path (`cancel_skipped_attempt`):
+    //
+    //  - Leaving the row would collide on `UNIQUE(step_id, attempt)` when
+    //    the resolved step re-runs at the *same* attempt number (the §3.2
+    //    pipeline loops back to iteration `n`, it does not advance to
+    //    `n+1`).
+    //  - Leaving the bumped counter would make a later resume think the
+    //    budget was consumed.
+    //
+    // The durable record of the pause is the open `interruptions` row
+    // itself (its `body` / `asked_at`, then `resolution` / `resolved_at`) —
+    // the unified interruption model (§3.4) *is* the audit trail, so a
+    // transient paused exec_log row is redundant. `attempt` is always >= 1
+    // here (the retry loop increments before spawning), so `attempt - 1` is
+    // non-negative.
+    storage::delete_execution_log(ctx.conn, exec_log_id)?;
+    set_step_attempts(ctx.conn, &ctx.step.id, attempt - 1)?;
     storage::update_step_status(ctx.conn, &ctx.step.id, StepStatus::Pending)?;
 
     write_phase(
@@ -841,7 +851,7 @@ async fn finalize_paused_for_question(
         ctx.step_num,
         attempt,
         ctx.max_attempts,
-        Some(exec_log_id),
+        None,
         Phase::PostStepHook,
         None,
         ChildUpdate::Clear,
@@ -1410,28 +1420,21 @@ pub async fn execute_step(
                         _ => false,
                     };
 
-                // Pause if the harness left unanswered `step_questions` rows
-                // behind during this attempt (TUI-plan.md §17). Tested first
-                // — even on non-zero exit — so a harness that asks then
-                // crashes still surfaces as a pause: the user's clarification
-                // is the prerequisite for any retry, regardless of whether
-                // the crash was a side effect of the harness's own
-                // self-terminate-after-asking path.
+                // Pause if the harness raised an open interruption
+                // (`ralph question ask` / `ralph block` — native
+                // `interruptions` rows) during this attempt
+                // (docs/dag-redesign.md §7 harness protocol — the
+                // cross-process bridge, mirroring V23 skip). Tested first —
+                // even on non-zero exit — so a harness that asks then
+                // crashes still surfaces as a pause: the human's
+                // clarification is the prerequisite for any retry,
+                // regardless of whether the crash was a side effect of the
+                // harness's own self-terminate-after-asking path.
                 let unanswered =
                     storage::count_unanswered_questions_for_attempt(conn, &step.id, attempt)?;
                 if unanswered > 0 {
                     let _ = changed_files; // unused on this path
-                    return finalize_paused_for_question(
-                        &ctx,
-                        exec_log.id,
-                        duration_secs,
-                        attempt,
-                        diff.as_deref(),
-                        &output.stdout,
-                        &output.stderr,
-                        &parsed,
-                    )
-                    .await;
+                    return finalize_paused_for_question(&ctx, exec_log.id, attempt).await;
                 }
 
                 // Harness exited non-zero (or was killed by a signal). Do not
@@ -7255,18 +7258,22 @@ mod tests {
     // Question pause integration (TUI-plan §17 step 42)
     // -------------------------------------------------------------------
 
-    /// Insert an unanswered `step_questions` row tagged to a given (step,
+    /// Insert an open *native* interruption tagged to a given (step,
     /// attempt). Simulates what the harness would do via `ralph question
-    /// ask`. Used by the question-pause integration tests to drive the
-    /// "harness left a question behind" branch in `execute_step`.
+    /// ask`. Used by the interruption-pause integration tests to drive the
+    /// "harness raised an interruption" branch in `execute_step`. Native
+    /// `interruptions` table — no `step_questions`.
     #[cfg(test)]
     fn insert_unanswered_question(conn: &Connection, step_id: &str, attempt: i32, question: &str) {
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
-             VALUES (?1, ?2, ?3, ?4, '[]', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-            rusqlite::params![uuid::Uuid::new_v4().to_string(), step_id, attempt, question],
+        storage::insert_interruption(
+            conn,
+            step_id,
+            attempt,
+            crate::plan::InterruptionKind::Question,
+            question,
+            &[],
         )
-        .expect("seed step_questions row");
+        .expect("seed native interruption row");
     }
 
     /// Build a minimal Config registering the given harness path under `name`.
@@ -7297,11 +7304,17 @@ mod tests {
         config
     }
 
-    /// Pause path with a clean-exit, no-diff harness. The harness runs cleanly
-    /// but a `step_questions` row exists for (step, attempt=1). Expected:
-    /// outcome PausedForQuestion, step status reset to Pending,
-    /// step.attempts ticked to 1, exec_log row carries paused_for_question +
-    /// NotRun, no commit was made.
+    /// Pause path with a clean-exit, no-diff harness. The harness runs
+    /// cleanly but an open interruption exists for (step, attempt=1).
+    /// Expected: outcome PausedForQuestion, step status reset to Pending,
+    /// exec_log row carries paused_for_question + NotRun, no commit.
+    ///
+    /// **Zero retry budget (HARD invariant — docs/dag-redesign.md §3.4 / §9
+    /// invariant 4).** The retry loop bumps `step.attempts` to 1 *before*
+    /// the harness spawns; the interruption pause must roll that back so the
+    /// persisted counter is **0** afterward — the resumed run re-runs the
+    /// same attempt #1 once the interruption is resolved, consuming no
+    /// retry. This test is the proof.
     #[tokio::test(flavor = "current_thread")]
     async fn test_paused_for_question_no_diff_skips_tests_and_commit() {
         use tempfile::TempDir;
@@ -7374,28 +7387,29 @@ mod tests {
         assert_eq!(result.attempts_used, 1);
         assert!(result.commit_hash.is_none());
 
-        // Step status returned to Pending so a re-run picks it up cleanly,
-        // and attempts ticked once.
+        // Step status returned to Pending so a re-run picks it up cleanly.
+        // ZERO RETRY BUDGET: the pre-spawn `set_step_attempts(.. 1)` is
+        // rolled back, so the persisted counter is 0 — the resumed run
+        // re-runs attempt #1, not #2. (docs/dag-redesign.md §3.4 / §9
+        // invariant 4, mirroring the skip-dialog cancel path.)
         let updated = storage::get_step(&conn, &step.id).unwrap();
         assert_eq!(updated.status, StepStatus::Pending);
-        assert_eq!(updated.attempts, 1);
-
-        // Exactly one log row, carrying the pause termination reason and
-        // NotRun test status (tests must NOT have run).
-        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].attempt, 1);
         assert_eq!(
-            logs[0].termination_reason,
-            Some(TerminationReason::PausedForQuestion)
+            updated.attempts, 0,
+            "interruption pause must consume NO retry budget (HARD invariant)"
         );
-        assert_eq!(logs[0].test_status, Some(TestStatus::NotRun));
+
+        // NO exec_log row survives the pause. The paused attempt's row is
+        // deleted (zero-budget: the re-run re-uses attempt #1, so leaving
+        // the row would collide on UNIQUE(step_id, attempt)). The durable
+        // record of the pause is the open `interruptions` row, asserted
+        // below via the derived Interrupted status.
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
         assert!(
-            logs[0].test_results.is_empty(),
-            "no tests ran on a paused attempt; test_results must be empty"
+            logs.is_empty(),
+            "interruption pause must delete its exec_log row (zero-budget \
+             re-run re-uses the same attempt number)"
         );
-        assert!(!logs[0].committed, "pause must not commit");
-        assert!(!logs[0].rolled_back, "no diff means nothing to roll back");
 
         // HEAD did not advance — pause skipped the commit.
         let head_after = crate::git::get_commit_hash(&dir).unwrap();
@@ -7403,9 +7417,8 @@ mod tests {
 
         // The plan's effective status is now Interrupted (derived) even
         // though the underlying plans.status column may still be in_progress.
-        // (The harness wrote a `step_questions` row, which the V26
-        // back-compat view materializes as an open `interruptions` row that
-        // the native derivation now reads.)
+        // (The harness wrote an open native `interruptions` row that the
+        // derivation reads.)
         let effective = storage::plan_effective_status(&conn, &plan.id).unwrap();
         assert_eq!(effective, crate::plan::PlanStatus::Interrupted);
     }
@@ -7488,14 +7501,152 @@ mod tests {
             "rolled-back path: harness's file must be gone"
         );
 
+        // The paused attempt's exec_log row is deleted (zero-budget re-run
+        // re-uses the same attempt number). The diff was still rolled back
+        // (asserted above via the clean workdir); the durable record is the
+        // open interruption row.
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
-        assert_eq!(logs.len(), 1);
-        assert_eq!(
-            logs[0].termination_reason,
-            Some(TerminationReason::PausedForQuestion)
+        assert!(
+            logs.is_empty(),
+            "interruption pause must delete its exec_log row"
         );
-        assert!(logs[0].rolled_back, "rolled_back flag must be set");
-        assert!(!logs[0].committed);
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(open.len(), 1, "the open interruption is the durable record");
+    }
+
+    /// STEP 24 — cross-process interruption bridge, end-to-end:
+    ///
+    /// 1. The harness raises an interruption (open native `interruptions`
+    ///    row) and exits. `execute_step` pauses, marks the branch Blocked
+    ///    (derived), and — the HARD invariant — consumes **zero retry
+    ///    budget**: a `max_retries = 1` step is *not* exhausted by the
+    ///    block.
+    /// 2. A *different process* resolves the interruption (modeled here by
+    ///    calling `storage::resolve_interruption` directly — same DB write
+    ///    the `interruption resolve` CLI / TUI inbox performs).
+    /// 3. The runner re-runs the step at the **same attempt #1** (budget was
+    ///    not consumed) and it completes. If the block had burned the single
+    ///    retry, this second run would instead exhaust the budget and fail —
+    ///    so a green second run *is* the zero-budget proof across the bridge.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_interruption_bridge_zero_budget_then_cross_process_resolve_requeues() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let harness_tmp = TempDir::new().unwrap();
+        // First run: a clean no-op harness (the agent asked, then exited).
+        let noop = write_noop_harness(harness_tmp.path());
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("noop"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        // max_retries = 1: the whole budget is a single attempt. If the
+        // interruption pause consumed it, the re-run could not succeed.
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The agent raised an interruption on attempt 1.
+        insert_unanswered_question(&conn, &step.id, 1, "Which DB?");
+
+        let cfg_noop = config_with_harness("noop", &noop);
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+
+        let paused = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &cfg_noop,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(paused.outcome, StepOutcome::PausedForQuestion);
+
+        // ZERO RETRY BUDGET: the pre-spawn bump was rolled back.
+        let after_pause = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(
+            after_pause.attempts, 0,
+            "interruption pause must consume NO retry budget"
+        );
+        assert_eq!(after_pause.status, StepStatus::Pending);
+        // Derived Blocked overlay shadows Pending while the interruption is
+        // open.
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(open.len(), 1, "the open interruption is the bridge row");
+
+        // --- A DIFFERENT PROCESS resolves it (same write the CLI does). ---
+        storage::resolve_interruption(&conn, &open[0].id, "SQLite", None).unwrap();
+        assert!(
+            storage::list_open_interruptions_for_plan(&conn, &plan.id)
+                .unwrap()
+                .is_empty(),
+            "resolution clears the bridge row → step leaves Blocked"
+        );
+
+        // Re-run: the step is re-queued at attempt #1 (budget intact). Use a
+        // harness that produces a change so the step can complete.
+        let committing = write_simple_harness(harness_tmp.path(), &dir, true);
+        let cfg_commit = config_with_harness("noop", &committing);
+        let step_reloaded = storage::get_step(&conn, &step.id).unwrap();
+        let (_tx2, rx2) = watch::channel(None);
+
+        let done = execute_step(
+            &conn,
+            &plan,
+            &step_reloaded,
+            &cfg_commit,
+            &dir,
+            &hook_ctx,
+            rx2,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            done.outcome,
+            StepOutcome::Success,
+            "with budget intact the re-queued step completes on attempt #1"
+        );
+        assert_eq!(
+            done.attempts_used, 1,
+            "the re-run is attempt #1 — the block burned no retry"
+        );
+        let final_step = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(final_step.status, StepStatus::Complete);
     }
 
     /// Happy path regression: a clean run on a question-enabled plan that
@@ -7622,14 +7773,19 @@ mod tests {
         )
         .unwrap();
 
-        // Pre-existing answered question on attempt 1 (the upcoming attempt
-        // number) — answered rows must not pause. Insert it directly so the
-        // helper, which writes unanswered rows, can't be repurposed here.
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
-             VALUES ('prev', ?1, 1, 'old?', '[]', 'yes', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
-            rusqlite::params![&step.id],
-        ).unwrap();
+        // Pre-existing *resolved* interruption on attempt 1 (the upcoming
+        // attempt number) — resolved rows must not pause. Native
+        // `interruptions`: insert then resolve.
+        let prev = storage::insert_interruption(
+            &conn,
+            &step.id,
+            1,
+            crate::plan::InterruptionKind::Question,
+            "old?",
+            &[],
+        )
+        .unwrap();
+        storage::resolve_interruption(&conn, &prev, "yes", None).unwrap();
 
         let config = config_with_harness("happy", &harness_path);
         let hook_ctx = HookContext {

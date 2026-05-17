@@ -901,14 +901,12 @@ fn migrate_v26(conn: &Connection) -> Result<()> {
     // `step_questions` had no comment, so `comment` stays NULL. Then the
     // legacy table is dropped, exactly as §6 mandates.
     //
-    // Scope note (intentional, per the dag-redesign plan): this migration
-    // is append-only schema + a faithful data copy. The storage/CLI/
-    // executor/TUI consumers that still issue `step_questions` SQL are cut
-    // over to `interruptions` in the dedicated Phase 2 steps that follow
-    // (storage interruption CRUD, the `interruption` CLI, the legacy
-    // `question` aliases, the cross-process bridge, scheduler integration).
-    // Until those land, the full `cargo test` suite is transiently red by
-    // design — this step's acceptance is scoped to `cargo test db::`.
+    // This migration is append-only schema + a faithful one-way data copy
+    // (legacy `step_questions` rows → `interruptions`) followed by
+    // `DROP TABLE step_questions`. Every storage / CLI / executor /
+    // scheduler consumer is interruption-native (Phase 2 is complete), so
+    // there is no back-compat view/trigger shim — the legacy table is gone
+    // for good once V26 runs.
     conn.execute_batch(
         "
         CREATE TABLE interruptions (
@@ -1013,82 +1011,15 @@ fn migrate_v26(conn: &Connection) -> Result<()> {
 
     conn.execute_batch("DROP TABLE step_questions;")?;
 
-    // Backward-compatibility shim.
-    //
-    // §6 mandates `DROP TABLE step_questions`, and the canonical store is now
-    // `interruptions` (above). But the Phase-2 cutover of the storage / CLI /
-    // executor consumers that still issue `step_questions` SQL is sequenced
-    // into later dedicated steps (docs/dag-redesign.md §15 Phase 2). To keep
-    // those consumers working byte-identically until that rewrite lands —
-    // without re-introducing the dropped *table* or duplicating the data —
-    // expose a `step_questions` *view* over `interruptions` plus INSTEAD-OF
-    // triggers so legacy `SELECT` / `INSERT` / `UPDATE` keep round-tripping.
-    //
-    // The legacy `suggestions` JSON string-array (`["a","b"]`) maps to the
-    // canonical `options` JSON object-array (`[{text,priority}]`): on read,
-    // `options` is projected back to a priority-ordered string array; on
-    // write, an incoming `suggestions` array is synthesized into ascending
-    // 1-based priorities (index 0 = priority 1 = the agent's best guess) —
-    // exactly the data-cutover rule above, so a row written through the view
-    // is indistinguishable from a row cut over by the migration. Only
-    // `kind='question'` rows surface through the view (the legacy table only
-    // ever held questions); blockers are `interruptions`-native.
-    conn.execute_batch(
-        "
-        CREATE VIEW step_questions AS
-            SELECT
-                id,
-                step_id,
-                attempt,
-                body AS question,
-                (SELECT json_group_array(txt) FROM (
-                    SELECT json_extract(o.value, '$.text') AS txt
-                    FROM json_each(interruptions.options) AS o
-                    ORDER BY json_extract(o.value, '$.priority')
-                 )) AS suggestions,
-                resolution AS answer,
-                asked_at,
-                resolved_at AS answered_at
-            FROM interruptions
-            WHERE kind = 'question';
-
-        CREATE TRIGGER step_questions_insert
-            INSTEAD OF INSERT ON step_questions
-        BEGIN
-            INSERT INTO interruptions
-                (id, step_id, attempt, kind, body, options,
-                 resolution, comment, state, asked_at, resolved_at)
-            VALUES (
-                NEW.id, NEW.step_id, NEW.attempt, 'question', NEW.question,
-                (SELECT COALESCE(json_group_array(
-                            json_object('text', s.value, 'priority', s.key + 1)), '[]')
-                 FROM json_each(COALESCE(NEW.suggestions, '[]')) AS s),
-                NEW.answer,
-                NULL,
-                CASE WHEN NEW.answer IS NULL THEN 'open' ELSE 'resolved' END,
-                NEW.asked_at,
-                NEW.answered_at
-            );
-        END;
-
-        CREATE TRIGGER step_questions_update
-            INSTEAD OF UPDATE ON step_questions
-        BEGIN
-            UPDATE interruptions SET
-                step_id    = NEW.step_id,
-                attempt    = NEW.attempt,
-                body       = NEW.question,
-                options    = (SELECT COALESCE(json_group_array(
-                                  json_object('text', s.value, 'priority', s.key + 1)), '[]')
-                              FROM json_each(COALESCE(NEW.suggestions, '[]')) AS s),
-                resolution = NEW.answer,
-                state      = CASE WHEN NEW.answer IS NULL THEN 'open' ELSE 'resolved' END,
-                asked_at   = NEW.asked_at,
-                resolved_at = NEW.answered_at
-            WHERE id = OLD.id;
-        END;
-        ",
-    )?;
+    // No back-compat shim. §6 mandates `DROP TABLE step_questions` and the
+    // canonical store is now `interruptions`. Every storage / CLI / executor
+    // / scheduler consumer was cut over to the native `interruptions` table
+    // in the Phase 2 steps (native CRUD, the `interruption` CLI + thin
+    // `question` aliases, the cross-process bridge, scheduler integration),
+    // so the transient `step_questions` *view* + INSTEAD-OF triggers that
+    // previously kept not-yet-migrated consumers green have been removed.
+    // V26 is now exactly: create `interruptions` + faithful data cutover +
+    // `DROP TABLE step_questions`.
 
     Ok(())
 }

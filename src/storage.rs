@@ -667,13 +667,16 @@ pub fn clear_skip_request(conn: &Connection, plan_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// One open (unanswered) `step_questions` row enriched with the plan + step
-/// context the CLI list/show commands need to render. Driven by
-/// [`list_open_questions`].
+/// One open interruption enriched with the plan + step context the CLI
+/// list/show commands and the TUI inbox need to render. Driven by
+/// [`list_open_questions`] (questions only) and
+/// [`list_open_interruptions_enriched`] (questions *and* blockers).
 ///
-/// `step_id` and `plan_id` are exposed for upcoming runner + TUI consumers
-/// (TUI-plan.md §17 steps 42–43, which need to scope by plan id and locate
-/// the originating step row).
+/// Native: this is a projection of the `interruptions` table (state='open'),
+/// **not** the dropped `step_questions` view. The struct name / `question`
+/// field name are kept so existing TUI consumers (`plan_detail`, `run.rs`)
+/// compile unchanged through the cutover; `kind` is added so a caller can
+/// tell a blocker from a question.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct OpenQuestion {
@@ -686,38 +689,73 @@ pub struct OpenQuestion {
     pub step_num: usize,
     pub step_title: String,
     pub attempt: i32,
+    /// The interruption body (the question text, or the blocker
+    /// explanation). Named `question` for TUI source-compat.
     pub question: String,
+    /// Proposed-answer texts in priority order (empty for blockers and
+    /// freeform-only questions).
     pub suggestions: Vec<String>,
+    pub kind: InterruptionKind,
     pub asked_at: String,
 }
 
-/// List unanswered questions for plans in `project`, optionally filtered to a
-/// single plan slug. Ordered by `asked_at` ASC then `id` ASC so the index of
-/// any given question is stable as new questions arrive.
-pub fn list_open_questions(
+/// Shared native query behind [`list_open_questions`] /
+/// [`list_open_interruptions_enriched`]: every *open* interruption for
+/// `project` (optionally one plan slug), ordered `asked_at` ASC then `id`
+/// ASC so an index is stable as new ones arrive. `kind_filter` of
+/// `Some(InterruptionKind::Question)` restricts to questions (the legacy
+/// `question list` surface); `None` returns questions *and* blockers (the
+/// `interruption list` surface).
+fn list_open_interruptions_enriched_impl(
     conn: &Connection,
     project: &str,
     plan_slug: Option<&str>,
+    kind_filter: Option<InterruptionKind>,
 ) -> Result<Vec<OpenQuestion>> {
-    // Compute each step's 1-based position via a window function so the result
-    // matches the numbering users see in `ralph step list`.
-    let base = "WITH step_pos AS (
+    use std::str::FromStr;
+
+    // Compute each step's 1-based position via a window function so the
+    // result matches the numbering users see in `ralph step list`.
+    let mut base = String::from(
+        "WITH step_pos AS (
             SELECT id, plan_id,
                    ROW_NUMBER() OVER (PARTITION BY plan_id ORDER BY sort_key) AS step_num
             FROM steps
         )
-        SELECT q.id, q.step_id, s.plan_id, p.slug, sp.step_num,
-               s.title, q.attempt, q.question, q.suggestions, q.asked_at
-        FROM step_questions q
-        JOIN steps s ON s.id = q.step_id
+        SELECT i.id, i.step_id, s.plan_id, p.slug, sp.step_num,
+               s.title, i.attempt, i.body, i.options, i.kind, i.asked_at
+        FROM interruptions i
+        JOIN steps s ON s.id = i.step_id
         JOIN plans p ON p.id = s.plan_id
-        JOIN step_pos sp ON sp.id = q.step_id
-        WHERE q.answer IS NULL AND p.project = ?1";
+        JOIN step_pos sp ON sp.id = i.step_id
+        WHERE i.state = 'open' AND p.project = ?1",
+    );
+    if let Some(k) = kind_filter {
+        base.push_str(&format!(" AND i.kind = '{}'", k.as_str()));
+    }
 
     let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<OpenQuestion> {
-        let suggestions_json: String = row.get(8)?;
-        let suggestions: Vec<String> = serde_json::from_str(&suggestions_json).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        let options_json: String = row.get(8)?;
+        let options: Vec<InterruptionOption> =
+            serde_json::from_str(&options_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+        // Project options → priority-ordered texts so the legacy
+        // `suggestions` shape is preserved for existing consumers.
+        let mut ordered = options;
+        ordered.sort_by_key(|o| o.priority);
+        let suggestions: Vec<String> = ordered.into_iter().map(|o| o.text).collect();
+        let kind_str: String = row.get(9)?;
+        let kind = InterruptionKind::from_str(&kind_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                9,
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
         })?;
         let step_num: i64 = row.get(4)?;
         Ok(OpenQuestion {
@@ -730,20 +768,21 @@ pub fn list_open_questions(
             attempt: row.get(6)?,
             question: row.get(7)?,
             suggestions,
-            asked_at: row.get(9)?,
+            kind,
+            asked_at: row.get(10)?,
         })
     };
 
     let mut out = Vec::new();
     if let Some(slug) = plan_slug {
-        let sql = format!("{base} AND p.slug = ?2 ORDER BY q.asked_at ASC, q.id ASC");
+        let sql = format!("{base} AND p.slug = ?2 ORDER BY i.asked_at ASC, i.id ASC");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![project, slug], map_row)?;
         for row in rows {
             out.push(row?);
         }
     } else {
-        let sql = format!("{base} ORDER BY q.asked_at ASC, q.id ASC");
+        let sql = format!("{base} ORDER BY i.asked_at ASC, i.id ASC");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![project], map_row)?;
         for row in rows {
@@ -753,53 +792,78 @@ pub fn list_open_questions(
     Ok(out)
 }
 
+/// List open *question* interruptions for plans in `project`, optionally
+/// filtered to one plan slug. Native (`interruptions` table, `kind=question`,
+/// `state=open`). Ordered `asked_at` ASC then `id` ASC so an index is stable
+/// as new questions arrive. Drives the deprecated `ralph question list`
+/// alias and the TUI's per-plan open-question surface.
+pub fn list_open_questions(
+    conn: &Connection,
+    project: &str,
+    plan_slug: Option<&str>,
+) -> Result<Vec<OpenQuestion>> {
+    list_open_interruptions_enriched_impl(
+        conn,
+        project,
+        plan_slug,
+        Some(InterruptionKind::Question),
+    )
+}
+
+/// List *every* open interruption (questions **and** blockers) for plans in
+/// `project`, optionally filtered to one plan slug. Drives `ralph
+/// interruption list` (docs/dag-redesign.md §7). Same ordering / stability
+/// guarantee as [`list_open_questions`].
+pub fn list_open_interruptions_enriched(
+    conn: &Connection,
+    project: &str,
+    plan_slug: Option<&str>,
+) -> Result<Vec<OpenQuestion>> {
+    list_open_interruptions_enriched_impl(conn, project, plan_slug, None)
+}
+
 // `list_answered_questions_for_step` (the unbounded "Previously answered
 // questions" prompt feed) was removed in the §8/§4 cutover. Prompt assembly
 // now uses the **bounded** `list_resolved_interruptions_for_step` above,
 // which `LIMIT`s to the most-recent N resolved interruptions and is
 // interruption-native (questions *and* blockers).
 
-/// Write an answer to a `step_questions` row, stamping `answered_at` with
-/// the current SQLite UTC time. Errors if no row matches `question_id`.
+/// Resolve a *question* interruption with a freeform `answer` (no comment).
+///
+/// Thin native wrapper over [`resolve_interruption`] kept so the deprecated
+/// `ralph question answer` alias and the TUI answer modal have a
+/// question-shaped entry point. "Question not found" is preserved as the
+/// not-found message (the alias only ever targets questions) while
+/// [`resolve_interruption`] itself reports "Interruption …".
 pub fn set_question_answer(conn: &Connection, question_id: &str, answer: &str) -> Result<()> {
-    // Post-V26 `step_questions` is a backward-compat *view* over
-    // `interruptions` with an INSTEAD-OF UPDATE trigger. SQLite's
-    // `sqlite3_changes()` does **not** count rows a view trigger modifies, so
-    // `Connection::execute` always returns 0 here regardless of whether a row
-    // matched — the old `affected == 0 => not found` heuristic no longer
-    // holds. Check existence explicitly to preserve the "Question not found"
-    // contract without falsely failing a real update.
     let exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM step_questions WHERE id = ?1",
+        "SELECT COUNT(*) FROM interruptions WHERE id = ?1",
         params![question_id],
         |r| r.get(0),
     )?;
     if exists == 0 {
         anyhow::bail!("Question not found: {question_id}");
     }
-    conn.execute(
-        "UPDATE step_questions
-         SET answer = ?1, answered_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE id = ?2",
-        params![answer, question_id],
-    )?;
-    Ok(())
+    resolve_interruption(conn, question_id, answer, None)
 }
 
-/// Count unanswered `step_questions` rows for a specific (step, attempt) pair.
+/// Count *open* interruptions (questions **or** blockers) for a specific
+/// (step, attempt) pair.
 ///
 /// Driven by [`crate::executor::execute_step`] after the harness exits to
-/// detect whether the harness called `ralph question ask` during this attempt
-/// (TUI-plan.md §17 "Runner integration"). A non-zero count means the runner
-/// must skip tests + commit, roll back any diff, and pause the plan.
+/// detect whether the harness called `ralph question ask` / `ralph block`
+/// during this attempt (docs/dag-redesign.md §7 "harness protocol"). A
+/// non-zero count means the orchestrator skips tests + commit, rolls back
+/// any diff, marks the branch `Blocked`, and — per §3.4/§9 invariant 4 —
+/// consumes **no** retry budget.
 pub fn count_unanswered_questions_for_attempt(
     conn: &Connection,
     step_id: &str,
     attempt: i32,
 ) -> Result<i64> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM step_questions
-         WHERE step_id = ?1 AND attempt = ?2 AND answer IS NULL",
+        "SELECT COUNT(*) FROM interruptions
+         WHERE step_id = ?1 AND attempt = ?2 AND state = 'open'",
         params![step_id, attempt],
         |row| row.get(0),
     )?;
@@ -817,10 +881,9 @@ pub fn count_unanswered_questions_for_attempt(
 ///
 /// This helper is the single source of truth for that derivation: read the
 /// stored status, then upgrade to `Interrupted` if any open interruption
-/// exists. Reads the native `interruptions` table directly (not the
-/// `step_questions` back-compat view), so a blocker — which has no
-/// `step_questions` representation — also interrupts the plan.
-#[allow(dead_code)]
+/// exists. Reads the native `interruptions` table directly, so a blocker
+/// (a question *or* a blocker) interrupts the plan.
+#[allow(dead_code)] // TUI plan-status derivation lands in Phase 4.
 pub fn plan_effective_status(conn: &Connection, plan_id: &str) -> Result<PlanStatus> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM interruptions i
@@ -866,7 +929,6 @@ pub const DEFAULT_RESOLVED_INTERRUPTION_LIMIT: usize = 5;
 /// the orchestrator observes the open row after the harness returns and marks
 /// the branch `Blocked` (no retry budget consumed — docs/dag-redesign.md
 /// §3.4). Returns the generated interruption id.
-#[allow(dead_code)] // `ralph question ask` / `ralph block` CLI land in later steps.
 pub fn insert_interruption(
     conn: &Connection,
     step_id: &str,
@@ -930,7 +992,6 @@ pub fn list_open_interruptions(
 /// List every *open* interruption whose step belongs to `plan_id`. Ordered
 /// `asked_at ASC, id ASC`. Drives the per-plan derived `Interrupted` status
 /// and the plan-scoped inbox.
-#[allow(dead_code)] // scheduler + TUI inbox consumers land in later steps.
 pub fn list_open_interruptions_for_plan(
     conn: &Connection,
     plan_id: &str,
@@ -1013,14 +1074,13 @@ pub fn list_resolved_interruptions_for_step(
 
 /// Resolve an open interruption: record the chosen `resolution` (an option
 /// text or a freeform answer) and an optional `comment`, flip `state` to
-/// `resolved`, and stamp `resolved_at`. Errors if no row matches `id`.
+/// `resolved`, and stamp `resolved_at`. Errors if no row matches `id`
+/// ("Interruption not found") or it is already resolved.
 ///
-/// Mirrors the existence-check pattern in [`set_question_answer`] — the
-/// post-V26 `step_questions` view's INSTEAD-OF triggers mean `execute`'s
-/// changed-row count is unreliable for view writes, but this targets the
-/// native table directly so the row count is accurate; we still check
-/// existence first to give a precise "not found" error.
-#[allow(dead_code)] // `interruption resolve` CLI + TUI inbox land in later steps.
+/// Targets the native `interruptions` table directly, so `execute`'s
+/// changed-row count is accurate; the post-resolve open count dropping to
+/// zero for the step is what un-shadows its `Blocked` overlay and lets the
+/// scheduler re-queue it (docs/dag-redesign.md §3.4/§3.5).
 pub fn resolve_interruption(
     conn: &Connection,
     id: &str,
@@ -3767,41 +3827,51 @@ mod tests {
         )
         .unwrap();
 
-        // Different combinations of (attempt, answer state) so we can verify
-        // the scoping. Only attempt=2 with answer=NULL should count.
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
-             VALUES ('q1', ?1, 1, 'a1', '[]', 'done', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
-            params![&step.id],
-        ).unwrap();
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
-             VALUES ('q2', ?1, 1, 'old open', '[]', '2026-05-01T10:00:00.000Z')",
-            params![&step.id],
+        // Different combinations of (attempt, open/resolved state) so we can
+        // verify the scoping. Only attempt=2 still-open should count. Native
+        // `interruptions` rows — no `step_questions`.
+        let q1 = insert_interruption(
+            &conn,
+            &step.id,
+            1,
+            InterruptionKind::Question,
+            "a1",
+            &[],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
-             VALUES ('q3', ?1, 2, 'current open A', '[]', '2026-05-01T10:00:00.000Z')",
-            params![&step.id],
+        resolve_interruption(&conn, &q1, "done", None).unwrap();
+        insert_interruption(&conn, &step.id, 1, InterruptionKind::Question, "old open", &[])
+            .unwrap();
+        insert_interruption(
+            &conn,
+            &step.id,
+            2,
+            InterruptionKind::Question,
+            "current open A",
+            &[],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
-             VALUES ('q4', ?1, 2, 'current open B', '[]', '2026-05-01T10:00:00.000Z')",
-            params![&step.id],
+        // A blocker on attempt 2 must also count (the bridge pauses on
+        // questions OR blockers — docs/dag-redesign.md §7).
+        insert_interruption(
+            &conn,
+            &step.id,
+            2,
+            InterruptionKind::Blocker,
+            "current open B",
+            &[],
         )
         .unwrap();
 
         assert_eq!(
             count_unanswered_questions_for_attempt(&conn, &step.id, 2).unwrap(),
             2,
-            "two unanswered rows for attempt=2",
+            "two open interruptions for attempt=2",
         );
         assert_eq!(
             count_unanswered_questions_for_attempt(&conn, &step.id, 1).unwrap(),
             1,
-            "one unanswered row for attempt=1 (the answered one is excluded)",
+            "one open interruption for attempt=1 (the resolved one is excluded)",
         );
         assert_eq!(
             count_unanswered_questions_for_attempt(&conn, &step.id, 99).unwrap(),
@@ -3832,12 +3902,15 @@ mod tests {
         // derived status overrides it.
         update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
 
-        // An open *question* (written via the V26 back-compat view) derives
+        // An open *question* (native `interruptions` row) derives
         // Interrupted.
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, asked_at)
-             VALUES ('q1', ?1, 1, 'open?', '[]', '2026-05-01T10:00:00.000Z')",
-            params![&step.id],
+        let q1 = insert_interruption(
+            &conn,
+            &step.id,
+            1,
+            InterruptionKind::Question,
+            "open?",
+            &[],
         )
         .unwrap();
 
@@ -3847,10 +3920,9 @@ mod tests {
             "an open interruption must shadow the underlying lifecycle"
         );
 
-        // Resolve it, then prove a native *blocker* (no step_questions
-        // representation at all) also derives Interrupted — the §3.4/§6
-        // unification: question OR blocker interrupts the plan.
-        resolve_interruption(&conn, "q1", "answered", None).unwrap();
+        // Resolve it, then prove a *blocker* also derives Interrupted — the
+        // §3.4/§6 unification: question OR blocker interrupts the plan.
+        resolve_interruption(&conn, &q1, "answered", None).unwrap();
         assert_eq!(
             plan_effective_status(&conn, &plan.id).unwrap(),
             PlanStatus::InProgress,
@@ -3893,12 +3965,17 @@ mod tests {
         .unwrap();
         update_plan_status(&conn, &plan.id, PlanStatus::Complete).unwrap();
 
-        // Answered rows must not trigger the Question shadow.
-        conn.execute(
-            "INSERT INTO step_questions (id, step_id, attempt, question, suggestions, answer, asked_at, answered_at)
-             VALUES ('q1', ?1, 1, 'old?', '[]', 'yes', '2026-05-01T10:00:00.000Z', '2026-05-01T11:00:00.000Z')",
-            params![&step.id],
-        ).unwrap();
+        // Resolved interruptions must not trigger the Interrupted shadow.
+        let q1 = insert_interruption(
+            &conn,
+            &step.id,
+            1,
+            InterruptionKind::Question,
+            "old?",
+            &[],
+        )
+        .unwrap();
+        resolve_interruption(&conn, &q1, "yes", None).unwrap();
 
         assert_eq!(
             plan_effective_status(&conn, &plan.id).unwrap(),

@@ -348,12 +348,14 @@ async fn run_plan_inner(
     let one_target_id: Option<String> = if options.one {
         let deps_of = storage::list_step_dependency_edges(conn, &effective_plan.id)?;
         let depths = compute_step_depths(&initial_steps, &deps_of);
+        let blocked = blocked_step_ids(conn, &effective_plan.id)?;
         match pick_next_step(
             &initial_steps,
             &deps_of,
             &depths,
             &window,
             &HashSet::new(),
+            &blocked,
         ) {
             Some(s) => Some(s.id.clone()),
             None => bail!("No pending steps to run in plan '{}'", effective_plan.slug),
@@ -425,12 +427,20 @@ async fn run_plan_inner(
         // sort_key" behavior.
         let deps_of = storage::list_step_dependency_edges(conn, &effective_plan.id)?;
         let depths = compute_step_depths(&all_steps, &deps_of);
+        // Recompute the blocked set every tick: a cross-process resolution
+        // (§9 invariant 4) drops a step out of it here, re-queuing the step
+        // on the very next iteration with the resolution injected (the
+        // injection is already done by prompt.rs via the bounded
+        // resolved-interruption section). An empty set ⇒ pre-interruption
+        // behavior, so a linear plan is byte-identical.
+        let blocked = blocked_step_ids(conn, &effective_plan.id)?;
         let next = pick_next_step(
             &all_steps,
             &deps_of,
             &depths,
             &window,
             &executed_step_ids,
+            &blocked,
         )
         .cloned();
 
@@ -623,19 +633,25 @@ async fn run_plan_inner(
                 emit_finished(outcome_str)?;
                 if out.format != OutputFormat::Json {
                     eprintln!(
-                        "[{}/{}] > {} ... PAUSED (open question — answer to resume)",
+                        "[{}/{}] > {} ... BLOCKED (open interruption — resolve to resume)",
                         step_num, total_now, current_step.title
                     );
                 }
-                // Don't write `Interrupted` to plans.status — it's a *derived*
-                // status (docs/dag-redesign.md §3.4/§6). Leave the underlying
-                // lifecycle (`in_progress`) alone so it un-shadows
-                // automatically once the human resolves the last open
-                // interruption. The PlanRunResult reports the derived state
-                // for the caller's benefit.
-                result.final_status = PlanStatus::Interrupted;
+                // DAG scheduler change (docs/dag-redesign.md §1/§3.4/§3.5):
+                // a blocked branch must NOT pause the whole plan. The step
+                // is already in `executed_step_ids` *and* will be in the
+                // recomputed `blocked` set (it left an open interruption),
+                // so the next scheduler tick excludes it and picks another
+                // runnable branch instead of stalling — the §1 payoff. We
+                // do NOT `return` here and do NOT write `Interrupted` to
+                // plans.status (it's a *derived* status). The plan only
+                // reports `Interrupted` once the runnable set is exhausted
+                // (handled after the loop), so a *linear* plan — whose one
+                // blocked step starves all dependents — still pauses
+                // exactly as before (§1: linear plans get zero benefit and
+                // must not regress).
                 result.step_results.push(step_result);
-                return Ok(result);
+                continue;
             }
         }
 
@@ -647,16 +663,32 @@ async fn run_plan_inner(
         }
     }
 
-    // All steps completed successfully.
-    // Check if *all* steps in the plan are done (not just the subset we ran).
+    // The scheduler loop exited because the runnable set is empty. Three
+    // terminal shapes (docs/dag-redesign.md §3.4/§3.5):
+    //
+    //  1. Every step Complete/Skipped         → plan Complete.
+    //  2. Some step has an open interruption   → plan Interrupted (derived;
+    //     never written to plans.status — it un-shadows automatically when
+    //     the human resolves the last open interruption, possibly from a
+    //     different process via the §9-invariant-4 bridge). For a *linear*
+    //     plan this is reached exactly when its one blocked step starves
+    //     all dependents — i.e. it still pauses the whole plan just like
+    //     before (§1: no regression). For a *wide* DAG it is reached only
+    //     after every independent branch has run to a stop (the payoff).
+    //  3. Otherwise (e.g. `--from/--to` window, a Failed step)
+    //     → InProgress, exactly as before.
     let final_steps = storage::list_steps(conn, &effective_plan.id)?;
     let all_done = final_steps
         .iter()
         .all(|s| s.status == StepStatus::Complete || s.status == StepStatus::Skipped);
+    let any_open_interruption =
+        !storage::list_open_interruptions_for_plan(conn, &effective_plan.id)?.is_empty();
 
     if all_done {
         storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Complete)?;
         result.final_status = PlanStatus::Complete;
+    } else if any_open_interruption {
+        result.final_status = PlanStatus::Interrupted;
     } else {
         result.final_status = PlanStatus::InProgress;
     }
@@ -1849,23 +1881,46 @@ fn deps_satisfied(
     })
 }
 
+/// The set of step ids in `plan_id` that currently have at least one open
+/// interruption — i.e. the steps the derived `Blocked` overlay shadows
+/// (docs/dag-redesign.md §3.4). Recomputed every scheduler tick so a
+/// cross-process resolution (a CLI/TUI in another process flipping the row
+/// to `resolved`) drops the step out of the blocked set and back into the
+/// runnable set at the very next tick — the bridge of §9 invariant 4.
+fn blocked_step_ids(conn: &Connection, plan_id: &str) -> Result<HashSet<String>> {
+    Ok(storage::list_open_interruptions_for_plan(conn, plan_id)?
+        .into_iter()
+        .map(|i| i.step_id)
+        .collect())
+}
+
 /// One scheduler tick: pick the next step to execute, or `None` when the
 /// runnable set is empty.
 ///
 /// Runnable ⇔ in the run window, an actionable status (not terminal —
-/// [`is_actionable`]), not already executed this invocation, and every
-/// dependency `Complete` ([`deps_satisfied`]). Among runnable steps the
-/// deterministic tie-break is `(topological depth, sort_key, short_id)`
-/// (§3.5 item 4): depth first so a prerequisite always outranks its
-/// dependents, then the authored sort_key, then short_id as a stable
-/// final discriminator. Concurrency (§3.5 items 2–3) is Phase 3 — this
-/// returns a single step.
+/// [`is_actionable`]), **not `Blocked`** (no open interruption shadows it —
+/// docs/dag-redesign.md §3.4/§3.5: a blocked branch is excluded from the
+/// runnable set so its dependents wait while the scheduler picks another
+/// branch), not already executed this invocation, and every dependency
+/// `Complete` ([`deps_satisfied`]). Among runnable steps the deterministic
+/// tie-break is `(topological depth, sort_key, short_id)` (§3.5 item 4):
+/// depth first so a prerequisite always outranks its dependents, then the
+/// authored sort_key, then short_id as a stable final discriminator.
+/// Concurrency (§3.5 items 2–3) is Phase 3 — this returns a single step.
+///
+/// `blocked_step_ids` is the set of step ids that currently have an open
+/// interruption. It is the *only* place the derived `Blocked` overlay
+/// gates scheduling: the stored status after a pause is `Pending`
+/// (actionable), so without this exclusion the scheduler would re-pick the
+/// blocked step forever. An empty set (no interruptions) reproduces the
+/// pre-interruption behavior exactly, so a linear plan is unaffected.
 fn pick_next_step<'a>(
     all_steps: &'a [Step],
     deps_of: &HashMap<String, Vec<String>>,
     depths: &HashMap<String, usize>,
     window: &RunWindow,
     executed_step_ids: &HashSet<String>,
+    blocked_step_ids: &HashSet<String>,
 ) -> Option<&'a Step> {
     // Status of every step *inside the run window* only — deps outside the
     // window must not gate (preserves `--from`/`--to`; see `deps_satisfied`).
@@ -1880,6 +1935,7 @@ fn pick_next_step<'a>(
         .filter(|s| {
             window.contains_key(&s.sort_key)
                 && is_actionable(s.status)
+                && !blocked_step_ids.contains(&s.id)
                 && !executed_step_ids.contains(&s.id)
                 && deps_satisfied(&s.id, deps_of, &window_status)
         })
@@ -4657,12 +4713,24 @@ mod tests {
         edges: &[(usize, usize)],
         window: &RunWindow,
     ) -> Vec<String> {
+        schedule_order_blocked(steps, edges, window, &HashSet::new())
+    }
+
+    /// `schedule_order` with a fixed set of `Blocked` step ids that are
+    /// never runnable (simulates open interruptions the scheduler must
+    /// route around — docs/dag-redesign.md §3.4/§3.5).
+    fn schedule_order_blocked(
+        steps: &mut [Step],
+        edges: &[(usize, usize)],
+        window: &RunWindow,
+        blocked: &HashSet<String>,
+    ) -> Vec<String> {
         let deps_of = deps_map(steps, edges);
         let mut order: Vec<String> = Vec::new();
         let mut executed: HashSet<String> = HashSet::new();
         loop {
             let depths = compute_step_depths(steps, &deps_of);
-            let pick = pick_next_step(steps, &deps_of, &depths, window, &executed)
+            let pick = pick_next_step(steps, &deps_of, &depths, window, &executed, blocked)
                 .map(|s| s.id.clone());
             let Some(id) = pick else { break };
             order.push(id.clone());
@@ -4692,12 +4760,121 @@ mod tests {
 
         // Only the root is runnable until it completes.
         let executed = HashSet::new();
-        let pick = pick_next_step(&steps, &deps_of, &depths, &full_window(), &executed);
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &executed,
+            &HashSet::new(),
+        );
         assert_eq!(pick.unwrap().id, "s0");
 
         // Full walk reproduces the authored order.
         let order = schedule_order(&mut steps, &edges, &full_window());
         assert_eq!(order, vec!["s0", "s1", "s2", "s3"]);
+    }
+
+    // ---- STEP 25: scheduler interruption integration (§3.4/§3.5) ----
+
+    #[test]
+    fn test_blocked_branch_does_not_starve_an_independent_branch() {
+        // Two independent branches off no shared root:
+        //   branch A: s0 -> s1   branch B: s2 -> s3
+        // s0 is Blocked (open interruption). The §1 payoff: branch B must
+        // still run to completion even though branch A is fully stalled
+        // (s1 waits on the blocked s0 and is therefore never reached).
+        let mut steps = make_steps(4);
+        let edges = [(1, 0), (3, 2)]; // s1<-s0, s3<-s2
+        let mut blocked = HashSet::new();
+        blocked.insert("s0".to_string());
+
+        let order = schedule_order_blocked(&mut steps, &edges, &full_window(), &blocked);
+
+        // Branch B ran fully; branch A produced nothing (s0 blocked, s1
+        // gated on the non-Complete s0).
+        assert_eq!(
+            order,
+            vec!["s2".to_string(), "s3".to_string()],
+            "the blocked branch must not prevent the independent branch"
+        );
+        assert!(!order.contains(&"s0".to_string()), "s0 is Blocked");
+        assert!(
+            !order.contains(&"s1".to_string()),
+            "s1 waits on the blocked s0 (its dependency is not Complete)"
+        );
+    }
+
+    #[test]
+    fn test_linear_plan_with_one_blocked_step_pauses_like_before() {
+        // §1 no-regression: a *linear* plan gets zero benefit. s0<-s1<-s2;
+        // s0 Blocked ⇒ NOTHING is runnable (s1/s2 gated on s0), so the
+        // scheduler stalls exactly as the pre-DAG loop did when the head
+        // step paused for a question.
+        let mut steps = make_steps(3);
+        let edges = [(1, 0), (2, 1)];
+        let mut blocked = HashSet::new();
+        blocked.insert("s0".to_string());
+
+        let order = schedule_order_blocked(&mut steps, &edges, &full_window(), &blocked);
+        assert!(
+            order.is_empty(),
+            "a linear plan whose head step is blocked produces no progress \
+             (same whole-plan pause as before — no regression)"
+        );
+
+        // And once the interruption is resolved (blocked set empties), the
+        // very next scheduler pass runs the whole chain in authored order —
+        // the cross-process re-queue (§9 invariant 4).
+        let resumed = schedule_order_blocked(
+            &mut steps,
+            &edges,
+            &full_window(),
+            &HashSet::new(),
+        );
+        assert_eq!(resumed, vec!["s0", "s1", "s2"]);
+    }
+
+    #[test]
+    fn test_resolved_interruption_requeues_step_at_next_tick() {
+        // A blocked root excludes itself and its dependents this pass;
+        // clearing the block (a cross-process resolve) makes it runnable
+        // again with no other state change — proving the re-queue is purely
+        // a function of the recomputed blocked set.
+        let steps = make_steps(2);
+        let edges = [(1, 0)];
+        let deps_of = deps_map(&steps, &edges);
+        let depths = compute_step_depths(&steps, &deps_of);
+
+        let mut blocked = HashSet::new();
+        blocked.insert("s0".to_string());
+        let pick_blocked = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &blocked,
+        );
+        assert!(
+            pick_blocked.is_none(),
+            "blocked root + gated dependent ⇒ nothing runnable"
+        );
+
+        // Resolution: blocked set no longer contains s0.
+        let pick_after = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            pick_after.unwrap().id,
+            "s0",
+            "resolving the interruption re-queues the step at the next tick"
+        );
     }
 
     #[test]
@@ -4819,7 +4996,14 @@ mod tests {
         let deps_of = deps_map(&steps, &[]);
         let depths = compute_step_depths(&steps, &deps_of);
 
-        let pick = pick_next_step(&steps, &deps_of, &depths, &full_window(), &HashSet::new());
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(pick.unwrap().id, "s1"); // lower short_id wins the tie
     }
 
@@ -4839,7 +5023,14 @@ mod tests {
         let deps_of = deps_map(&steps, &edges);
         let depths = compute_step_depths(&steps, &deps_of);
         // s2's dep (s1) is out of window ⇒ s2 is the first pick.
-        let pick = pick_next_step(&steps, &deps_of, &depths, &window, &HashSet::new());
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &window,
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(pick.unwrap().id, "s2");
 
         let order = schedule_order(&mut steps, &edges, &window);
@@ -4853,15 +5044,36 @@ mod tests {
         let depths = compute_step_depths(&steps, &deps_of);
 
         // Determinism: repeated ticks on identical state pick the same step.
-        let a = pick_next_step(&steps, &deps_of, &depths, &full_window(), &HashSet::new());
-        let b = pick_next_step(&steps, &deps_of, &depths, &full_window(), &HashSet::new());
+        let a = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        let b = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
         assert_eq!(a.unwrap().id, "s0");
         assert_eq!(b.unwrap().id, "s0");
 
         // A step already executed this invocation is not re-picked.
         let mut executed = HashSet::new();
         executed.insert("s0".to_string());
-        let pick = pick_next_step(&steps, &deps_of, &depths, &full_window(), &executed);
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &executed,
+            &HashSet::new(),
+        );
         assert_eq!(pick.unwrap().id, "s1");
 
         // Nothing runnable ⇒ None.
@@ -4872,7 +5084,15 @@ mod tests {
         let deps_of = deps_map(&done, &[]);
         let depths = compute_step_depths(&done, &deps_of);
         assert!(
-            pick_next_step(&done, &deps_of, &depths, &full_window(), &HashSet::new()).is_none()
+            pick_next_step(
+                &done,
+                &deps_of,
+                &depths,
+                &full_window(),
+                &HashSet::new(),
+                &HashSet::new()
+            )
+            .is_none()
         );
     }
 

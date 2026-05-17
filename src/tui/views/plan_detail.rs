@@ -148,7 +148,7 @@ pub struct PlanDetailApp {
     /// dispatcher updates this each poll tick via [`Self::set_read_only`].
     pub read_only: ReadOnly,
 
-    /// Open (unanswered) `step_questions` rows for this plan, ordered oldest
+    /// Open question `interruptions` rows for this plan, ordered oldest
     /// first per [`crate::storage::list_open_questions`]. Drives the §17
     /// banner pane and the `A` keybinding that pushes step-detail focused on
     /// the originating step. Refreshed by the dispatcher each poll tick.

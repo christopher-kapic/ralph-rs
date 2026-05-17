@@ -315,6 +315,30 @@ pub enum Command {
     #[command(subcommand)]
     Question(QuestionCommand),
 
+    /// Raise a blocker the agent cannot clear on its own (needs sudo, needs
+    /// access, needs information).
+    ///
+    /// Invoked by the harness mid-step, exactly like `ralph question ask`:
+    /// binds to the live `ralph run` for this project via the run lock,
+    /// writes an open `interruptions` row (`kind=blocker`, no options), then
+    /// the agent exits cleanly. The orchestrator marks the branch `Blocked`
+    /// (no retry budget consumed) and the scheduler moves on
+    /// (docs/dag-redesign.md §3.4/§7). Rejected outside a run, or when the
+    /// plan/step question feature is off, exactly like `question ask`.
+    Block {
+        /// The blocker explanation (what the agent cannot do and why). If
+        /// omitted, read from stdin.
+        text: Option<String>,
+    },
+
+    /// List, inspect, and resolve open interruptions (questions + blockers).
+    ///
+    /// The human-side counterpart to the harness's `ralph question ask` /
+    /// `ralph block`. The TUI inbox is the primary path; this command group
+    /// is the scriptable equivalent (docs/dag-redesign.md §7).
+    #[command(subcommand)]
+    Interruption(InterruptionCommand),
+
     /// List and manage agent file templates.
     #[command(subcommand)]
     Agents(AgentsCommand),
@@ -1028,21 +1052,38 @@ pub enum QuestionCommand {
         /// answer; suggestions are hints, not a closed set.
         #[arg(long = "suggest", short = 's', value_name = "ANSWER")]
         suggest: Vec<String>,
+
+        /// Priority for the agent's suggested answers (1 = the agent's best
+        /// guess; lower wins). Optional and repeatable: the k-th
+        /// `--priority` binds to the k-th `-s/--suggest` by position. Any
+        /// `--suggest` past the last supplied `--priority` defaults to its
+        /// 1-based append order (docs/dag-redesign.md §7), so omitting
+        /// `--priority` entirely yields 1,2,3,… in listed order — the same
+        /// rule the V26 cutover used.
+        #[arg(long = "priority", value_name = "N")]
+        priority: Vec<i32>,
     },
 
-    /// List open (unanswered) questions for the current project.
+    /// [DEPRECATED — use `ralph interruption list`] List open questions.
     ///
-    /// Output is numbered 1..N — those numbers are the input expected by
-    /// `ralph question answer` and `ralph question show`. Order is by
-    /// `asked_at` ASC then `id`, so a question's index does not change as
-    /// new questions arrive.
+    /// Thin alias retained for one release: identical to
+    /// `ralph interruption list` filtered to `kind=question`
+    /// (docs/dag-redesign.md §7/§13.3). Output is numbered 1..N — those
+    /// numbers feed `ralph question answer` / `ralph question show`. Prefer
+    /// `ralph interruption list`, which also surfaces blockers.
     List {
         /// Filter to questions on a specific plan slug. Without this, all
         /// open questions on plans for the current project are listed.
         plan: Option<String>,
     },
 
-    /// Answer a specific open question by its index in `ralph question list`.
+    /// [DEPRECATED — use `ralph interruption resolve`] Answer an open
+    /// question by its `ralph question list` index.
+    ///
+    /// Thin alias retained for one release: resolves the N-th open
+    /// *question* interruption with freeform text, exactly as
+    /// `ralph interruption resolve <id> --answer <text>`
+    /// (docs/dag-redesign.md §7/§13.3).
     Answer {
         /// 1-based index from `ralph question list`.
         num: usize,
@@ -1056,6 +1097,57 @@ pub enum QuestionCommand {
     Show {
         /// 1-based index from `ralph question list`.
         num: usize,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Interruption subcommands (docs/dag-redesign.md §7)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum InterruptionCommand {
+    /// List every open interruption (questions *and* blockers) for the
+    /// current project.
+    ///
+    /// Numbered 1..N, ordered `asked_at` ASC then `id` so an index is
+    /// stable as new interruptions arrive. The number OR the interruption
+    /// id is accepted by `interruption show` / `interruption resolve`.
+    List {
+        /// Filter to interruptions on a specific plan slug.
+        plan: Option<String>,
+    },
+
+    /// Print one interruption's full body, kind, proposed options (with
+    /// priority), and resolution state.
+    Show {
+        /// Interruption id (a uuid) OR its 1-based index in
+        /// `ralph interruption list`.
+        id: String,
+    },
+
+    /// Resolve an open interruption: record the chosen answer/resolution
+    /// (and optional comment), flip it to `resolved`, and un-shadow the
+    /// step (its `Blocked` overlay clears so the scheduler re-queues it).
+    Resolve {
+        /// Interruption id (a uuid) OR its 1-based index in
+        /// `ralph interruption list`.
+        id: String,
+
+        /// Resolve with the k-th proposed option (1-based, in priority
+        /// order as shown by `interruption show`). Mutually exclusive with
+        /// `--answer`.
+        #[arg(long, value_name = "K", conflicts_with = "answer")]
+        option: Option<usize>,
+
+        /// Resolve with a freeform answer/resolution. Mutually exclusive
+        /// with `--option`.
+        #[arg(long, value_name = "TEXT")]
+        answer: Option<String>,
+
+        /// An extra human note, always injected alongside the resolution
+        /// into the step's next prompt (docs/dag-redesign.md §3.4/§8).
+        #[arg(long, value_name = "TEXT")]
+        comment: Option<String>,
     },
 }
 
@@ -2468,7 +2560,11 @@ mod tests {
             "SQLite",
         ])
         .unwrap();
-        if let Command::Question(QuestionCommand::Ask { question, suggest }) = cli.command.unwrap()
+        if let Command::Question(QuestionCommand::Ask {
+            question,
+            suggest,
+            priority,
+        }) = cli.command.unwrap()
         {
             assert_eq!(
                 question.as_deref(),
@@ -2478,6 +2574,7 @@ mod tests {
                 suggest,
                 vec!["PostgreSQL".to_string(), "SQLite".to_string()]
             );
+            assert!(priority.is_empty(), "no --priority ⇒ append-order default");
         } else {
             panic!("Expected Question Ask");
         }
@@ -2488,13 +2585,137 @@ mod tests {
         // Both the positional and the `-s` flag must be optional so the
         // stdin-only / open-ended cases parse cleanly.
         let cli = Cli::try_parse_from(["ralph-rs", "question", "ask"]).unwrap();
-        if let Command::Question(QuestionCommand::Ask { question, suggest }) = cli.command.unwrap()
+        if let Command::Question(QuestionCommand::Ask {
+            question,
+            suggest,
+            priority,
+        }) = cli.command.unwrap()
         {
             assert!(question.is_none());
             assert!(suggest.is_empty());
+            assert!(priority.is_empty());
         } else {
             panic!("Expected Question Ask");
         }
+    }
+
+    #[test]
+    fn test_parse_question_ask_with_priority() {
+        // Each `--priority` binds to the `-s` at the same position; a
+        // suggestion past the last priority defaults to append order.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "question",
+            "ask",
+            "Which DB?",
+            "-s",
+            "SQLite",
+            "--priority",
+            "1",
+            "-s",
+            "Postgres",
+            "--priority",
+            "2",
+            "-s",
+            "MySQL",
+        ])
+        .unwrap();
+        if let Command::Question(QuestionCommand::Ask {
+            question,
+            suggest,
+            priority,
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(question.as_deref(), Some("Which DB?"));
+            assert_eq!(
+                suggest,
+                vec![
+                    "SQLite".to_string(),
+                    "Postgres".to_string(),
+                    "MySQL".to_string()
+                ]
+            );
+            assert_eq!(priority, vec![1, 2]);
+        } else {
+            panic!("Expected Question Ask");
+        }
+    }
+
+    #[test]
+    fn test_parse_block_positional_and_stdin() {
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "block", "needs sudo to install deps"]).unwrap();
+        if let Command::Block { text } = cli.command.unwrap() {
+            assert_eq!(text.as_deref(), Some("needs sudo to install deps"));
+        } else {
+            panic!("Expected Block");
+        }
+        // Omitted text ⇒ None (dispatcher falls back to stdin).
+        let cli = Cli::try_parse_from(["ralph-rs", "block"]).unwrap();
+        if let Command::Block { text } = cli.command.unwrap() {
+            assert!(text.is_none());
+        } else {
+            panic!("Expected Block");
+        }
+    }
+
+    #[test]
+    fn test_parse_interruption_list_show_resolve() {
+        let cli = Cli::try_parse_from(["ralph-rs", "interruption", "list"]).unwrap();
+        assert!(matches!(
+            cli.command.unwrap(),
+            Command::Interruption(InterruptionCommand::List { plan: None })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["ralph-rs", "interruption", "show", "abc-123"]).unwrap();
+        if let Command::Interruption(InterruptionCommand::Show { id }) = cli.command.unwrap() {
+            assert_eq!(id, "abc-123");
+        } else {
+            panic!("Expected Interruption Show");
+        }
+
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "interruption",
+            "resolve",
+            "2",
+            "--option",
+            "1",
+            "--comment",
+            "go for it",
+        ])
+        .unwrap();
+        if let Command::Interruption(InterruptionCommand::Resolve {
+            id,
+            option,
+            answer,
+            comment,
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(id, "2");
+            assert_eq!(option, Some(1));
+            assert!(answer.is_none());
+            assert_eq!(comment.as_deref(), Some("go for it"));
+        } else {
+            panic!("Expected Interruption Resolve");
+        }
+    }
+
+    #[test]
+    fn test_parse_interruption_resolve_option_answer_conflict() {
+        // clap must reject --option and --answer together (conflicts_with).
+        let res = Cli::try_parse_from([
+            "ralph-rs",
+            "interruption",
+            "resolve",
+            "1",
+            "--option",
+            "1",
+            "--answer",
+            "freeform",
+        ]);
+        assert!(res.is_err(), "--option and --answer are mutually exclusive");
     }
 
     #[test]

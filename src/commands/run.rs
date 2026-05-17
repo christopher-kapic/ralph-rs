@@ -8541,6 +8541,7 @@ mod step_detail_dispatcher_tests {
             attempt: 1,
             question: "Q?".into(),
             suggestions: vec!["yes".into(), "no".into()],
+            kind: crate::plan::InterruptionKind::Question,
             asked_at: "2026-05-05T00:00:00Z".into(),
         }]);
         assert!(!app.open_answer_modal());

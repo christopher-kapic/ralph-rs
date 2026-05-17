@@ -113,7 +113,7 @@ pub enum Pane {
     /// Plan-layer prompt — this IS `plan.description`.
     PlanPrompt,
     StepPrompt,
-    /// Open (unanswered) `step_questions` rows for the focused step
+    /// Open question `interruptions` rows for the focused step
     /// (TUI-plan.md §17). Sits between [`Pane::StepPrompt`] and
     /// [`Pane::Appended`] so the user sees the harness's pending blockers in
     /// the same vertical region that holds the harness's own prompt.
@@ -540,7 +540,7 @@ pub struct StepDetailApp {
     /// updates this each poll tick via [`Self::set_read_only`].
     pub read_only: ReadOnly,
 
-    /// Open (unanswered) `step_questions` rows for the *focused* step,
+    /// Open question `interruptions` rows for the *focused* step,
     /// ordered oldest first. Drives the [`Pane::OpenQuestions`] body.
     /// Refreshed by the dispatcher each poll tick.
     pub open_questions_for_step: Vec<storage::OpenQuestion>,
@@ -2367,6 +2367,7 @@ mod tests {
             attempt: 1,
             question: q.to_string(),
             suggestions: suggestions.iter().map(|s| s.to_string()).collect(),
+            kind: crate::plan::InterruptionKind::Question,
             asked_at: "2026-05-04T00:00:00Z".to_string(),
         }
     }

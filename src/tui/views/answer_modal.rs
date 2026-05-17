@@ -18,9 +18,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// [`AnswerModal::handle_key`] until it returns a non-Pending action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnswerModal {
-    /// The `step_questions.id` row this modal is targeting. The dispatcher
-    /// passes this back to `storage::set_question_answer` once the user
-    /// commits an answer.
+    /// The `interruptions.id` (question) row this modal is targeting. The
+    /// dispatcher passes this back to `storage::set_question_answer`
+    /// (→ `storage::resolve_interruption`) once the user commits an answer.
     pub question_id: String,
     /// Verbatim question text — rendered as the modal's title row.
     pub question: String,

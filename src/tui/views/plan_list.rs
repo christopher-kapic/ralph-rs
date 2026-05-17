@@ -54,7 +54,7 @@ pub struct PlanTile {
     /// True if any `execution_logs` row exists for this plan. Drives the
     /// "Ran" vs. "Created" prefix on the timestamp line.
     pub had_run: bool,
-    /// Number of unanswered `step_questions` rows across this plan's steps.
+    /// Number of open question `interruptions` across this plan's steps.
     /// When non-zero the tile draws the purple `STATUS_QUESTION` dot
     /// (overriding the underlying plan status) and a teaser line per
     /// TUI-plan.md §17.

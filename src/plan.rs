@@ -596,11 +596,13 @@ pub enum TerminationReason {
     /// can tell the difference between "the agent crashed" and "we never
     /// even started it because the FS was about to fill".
     InsufficientDiskSpace,
-    /// Harness exited cleanly but recorded one or more unanswered
-    /// `step_questions` rows during the attempt. The runner skips tests +
-    /// commit, rolls back any diff, and pauses the plan until the user
-    /// answers. Distinct from `HarnessFailed` so paused-for-clarification
-    /// history doesn't pollute real-failure metrics.
+    /// Harness exited cleanly but raised one or more open interruptions
+    /// (`ralph question ask` / `ralph block` — native `interruptions` rows)
+    /// during the attempt. The runner skips tests + commit, rolls back any
+    /// diff, marks the branch `Blocked`, and — per docs/dag-redesign.md
+    /// §3.4 / §9 invariant 4 — consumes no retry budget. Distinct from
+    /// `HarnessFailed` so paused-for-clarification history doesn't pollute
+    /// real-failure metrics.
     PausedForQuestion,
     /// Operator pressed `P` (or ran `ralph pause`) to request a graceful
     /// stop after the current step. The runner observed `pause_requested`
@@ -757,11 +759,11 @@ pub struct Plan {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Per-plan opt-in for the pause-for-question feature. When `false`
-    /// (default), `ralph question ask` invocations from a harness against a
-    /// step in this plan are rejected and no `step_questions` rows are
-    /// written. When `true`, the runner inspects unanswered questions
-    /// after each attempt and may pause the plan. Toggled via
-    /// `ralph plan questions on|off` and the `Q` keybinding in the TUI
+    /// (default), `ralph question ask` / `ralph block` invocations from a
+    /// harness against a step in this plan are rejected and no
+    /// `interruptions` rows are written. When `true`, the runner inspects
+    /// open interruptions after each attempt and blocks the branch. Toggled
+    /// via `ralph plan questions on|off` and the `Q` keybinding in the TUI
     /// plan list.
     #[serde(default)]
     pub questions_enabled: bool,
