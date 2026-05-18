@@ -1710,13 +1710,50 @@ pub fn mark_step_skipped(conn: &Connection, step_id: &str, reason: Option<&str>)
     Ok(())
 }
 
-/// Delete a step (cascades to execution_logs via FK).
+/// Delete a step (cascades to execution_logs and `step_dependencies` via FK).
+///
+/// **Re-parents before deleting** so removing a step from the middle of a
+/// DAG doesn't silently orphan its dependents into new roots. For chain
+/// `A <- B <- C`, deleting `B` must leave `C` depending on `A` (B's
+/// dependencies), preserving the transitive ordering — *not* drop `C`'s only
+/// edge via `ON DELETE CASCADE` and quietly promote `C` to a root that runs
+/// with no gating on `A`'s work. Multi-parent safe: every former dependent
+/// of the deleted step gains an edge to every dependency of the deleted step
+/// (in a tree-shaped plan that is just "inherit the one parent"). Done in a
+/// transaction so the re-parent + delete is atomic.
 pub fn delete_step(conn: &Connection, step_id: &str) -> Result<()> {
-    let affected = conn.execute("DELETE FROM steps WHERE id = ?1", params![step_id])?;
-    if affected == 0 {
-        anyhow::bail!("Step not found: {step_id}");
-    }
-    Ok(())
+    crate::db::with_tx(conn, |conn| {
+        // Preserve the prior "Step not found" contract (was: affected == 0).
+        if get_step_by_id(conn, step_id)?.is_none() {
+            anyhow::bail!("Step not found: {step_id}");
+        }
+        let parents = list_step_dependencies(conn, step_id)?;
+        let dependents = list_step_dependents(conn, step_id)?;
+        for d in &dependents {
+            for p in &parents {
+                if d == p {
+                    continue; // impossible on an acyclic graph; defensive
+                }
+                // Defensive: never close a cycle to delete a step. This
+                // cannot happen for ancestor<-descendant re-parenting on an
+                // acyclic DAG, but skip rather than corrupt the graph.
+                if would_create_step_cycle(conn, d, p)? {
+                    continue;
+                }
+                // `INSERT OR IGNORE`: a dependent may already depend on a
+                // parent directly (diamond); the (step_id, depends_on_step_id)
+                // PK makes a duplicate an error, so ignore it idempotently.
+                conn.execute(
+                    "INSERT OR IGNORE INTO step_dependencies (step_id, depends_on_step_id) \
+                     VALUES (?1, ?2)",
+                    params![d, p],
+                )?;
+            }
+        }
+        // CASCADE drops step_id's own in/out edges with the row.
+        conn.execute("DELETE FROM steps WHERE id = ?1", params![step_id])?;
+        Ok(())
+    })
 }
 
 /// Create a new step inserted at a specific sort_key position.
@@ -2600,7 +2637,6 @@ pub fn add_step_dependency(
 }
 
 /// Remove a specific step-dependency edge. No-op if the row does not exist.
-#[allow(dead_code)] // CLI/scheduler callers land in later DAG-redesign steps.
 pub fn remove_step_dependency(
     conn: &Connection,
     step_id: &str,
@@ -2615,7 +2651,6 @@ pub fn remove_step_dependency(
 }
 
 /// List the step IDs that `step_id` directly depends on.
-#[allow(dead_code)] // CLI/scheduler callers land in later DAG-redesign steps.
 pub fn list_step_dependencies(conn: &Connection, step_id: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT depends_on_step_id FROM step_dependencies WHERE step_id = ?1 ORDER BY depends_on_step_id ASC",
@@ -2629,7 +2664,6 @@ pub fn list_step_dependencies(conn: &Connection, step_id: &str) -> Result<Vec<St
 }
 
 /// List the step IDs that directly depend on `step_id` (reverse edges).
-#[allow(dead_code)] // CLI/scheduler callers land in later DAG-redesign steps.
 pub fn list_step_dependents(conn: &Connection, step_id: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
         "SELECT step_id FROM step_dependencies WHERE depends_on_step_id = ?1 ORDER BY step_id ASC",
@@ -2649,7 +2683,6 @@ pub fn list_step_dependents(conn: &Connection, step_id: &str) -> Result<Vec<Stri
 /// dependencies of `new_dep_id`; if `step_id` appears in that set, the edge
 /// would close a cycle. A self-edge (`step_id == new_dep_id`) is also reported
 /// as a cycle. Reused by import validation (docs/dag-redesign.md §13.3).
-#[allow(dead_code)] // CLI/scheduler callers land in later DAG-redesign steps.
 pub fn would_create_step_cycle(conn: &Connection, step_id: &str, new_dep_id: &str) -> Result<bool> {
     if step_id == new_dep_id {
         return Ok(true);
@@ -2840,9 +2873,14 @@ pub fn list_open_corrective_step_requests_for_plan(
 /// already consumed or gone — so the §9-inv-3 single-writer guarantee holds
 /// even if the drain is ever entered twice.
 pub fn consume_corrective_step_request(conn: &Connection, request_id: &str) -> Result<bool> {
+    // Hard delete (matches the V29 migration's documented intent): the
+    // durable audit trail is the corrective step + its `corrects_step_id`
+    // pointer, not the bridge row. A prior soft `state='consumed'` UPDATE
+    // never deleted anything, so the table grew by one row per failed
+    // review forever. The single-writer guard is unchanged — only the
+    // caller that removes the still-`open` row gets `true`.
     let affected = conn.execute(
-        "UPDATE corrective_step_requests SET state = 'consumed' \
-         WHERE id = ?1 AND state = 'open'",
+        "DELETE FROM corrective_step_requests WHERE id = ?1 AND state = 'open'",
         params![request_id],
     )?;
     Ok(affected > 0)
@@ -5622,6 +5660,56 @@ mod tests {
         // V25's ON DELETE CASCADE drops dependent edges with the step.
         delete_step(&conn, &ids[1]).unwrap();
         assert!(list_step_dependencies(&conn, &ids[0]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_delete_mid_dag_step_reparents_dependents() {
+        // Chain A <- B <- C (ids[1] depends on ids[0]; ids[2] depends on
+        // ids[1]). Deleting the middle step B must re-parent C onto A, not
+        // orphan C into a new root.
+        let conn = setup();
+        let ids = make_steps(&conn, 3); // A=ids[0], B=ids[1], C=ids[2]
+        add_step_dependency(&conn, &ids[1], &ids[0]).unwrap(); // B depends on A
+        add_step_dependency(&conn, &ids[2], &ids[1]).unwrap(); // C depends on B
+
+        delete_step(&conn, &ids[1]).unwrap(); // remove B
+
+        // C must now depend on A (B's parent), preserving the ordering —
+        // NOT be left edgeless (a silent new root).
+        let c_deps = list_step_dependencies(&conn, &ids[2]).unwrap();
+        assert_eq!(
+            c_deps,
+            vec![ids[0].clone()],
+            "C must inherit B's parent A on delete, not become an orphan root"
+        );
+        // B is gone and A has no dangling dependents on the removed B.
+        assert!(get_step_by_id(&conn, &ids[1]).unwrap().is_none());
+        assert_eq!(
+            list_step_dependents(&conn, &ids[0]).unwrap(),
+            vec![ids[2].clone()],
+            "A's sole dependent is now C (re-parented)"
+        );
+    }
+
+    #[test]
+    fn test_delete_mid_dag_step_reparents_without_duplicate_when_diamond() {
+        // Diamond: B->A, C->A, C->B. Deleting B must not error on the
+        // already-present C->A edge (INSERT OR IGNORE) and must leave C
+        // depending only on A.
+        let conn = setup();
+        let ids = make_steps(&conn, 3); // A=ids[0], B=ids[1], C=ids[2]
+        add_step_dependency(&conn, &ids[1], &ids[0]).unwrap(); // B depends on A
+        add_step_dependency(&conn, &ids[2], &ids[0]).unwrap(); // C depends on A
+        add_step_dependency(&conn, &ids[2], &ids[1]).unwrap(); // C depends on B
+
+        delete_step(&conn, &ids[1]).unwrap(); // remove B
+
+        let c_deps = list_step_dependencies(&conn, &ids[2]).unwrap();
+        assert_eq!(
+            c_deps,
+            vec![ids[0].clone()],
+            "C keeps its single A edge; the re-parent is idempotent"
+        );
     }
 
     /// Create a plan with `n` steps; return `(plan_id, step_ids)`.

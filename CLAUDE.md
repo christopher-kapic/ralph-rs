@@ -308,8 +308,32 @@ view bindings don't fire under the overlay.
   validates the imported edge set (no dangling edges, unique short_ids,
   acyclic, ≥1 root) before any write; `--strict` rejects a review-on
   bundle when the target machine has no review harness.
-- **Schema/version:** migrations now run through **V30**; `Cargo.toml`
-  is **0.1.21**.
+- **Explicit step placement (post-redesign follow-up).** `ralph step add`
+  no longer has a positional `--after <N>` (list position, no edge — the
+  ambiguity that silently produced edge-less DAGs). On a **non-empty** plan
+  exactly one placement is required: `--after <S>` (new step depends on S),
+  `--before <S>` (new step takes over S's incoming edges; S then depends
+  only on it; root-S ⇒ new step is the new root), `--depends-on <S>...`
+  (the multi-parent join primitive), or `--root` (explicit independent
+  root). `--after`+`--before` together splices between them. The first step
+  of an empty plan is the implied root. `--import-json` now **carries the
+  DAG** (per-object batch-local `id` + `depends_on`, validated
+  unique/acyclic/no-dangling, whole batch atomic) instead of being
+  edge-free; it also wires `retry_strategy`/`review_enabled` (previously
+  silently dropped). The hand-authored `id` is a **batch-local wiring
+  label only** (never persisted); the persisted `short_id` is minted
+  (auto, the common path) or — if explicitly supplied — validated
+  `is_short_id_shaped` (a readable/numeric `short_id` was the bug: created
+  but unselectable / shadowing a step position). The same
+  `is_short_id_shaped` guard is enforced in `validate_dag_aware_steps` for
+  full `ralph import` bundles (real exports always pass; it's a
+  tamper/hand-edit guard). Engine
+  stays a general DAG (joins via `--depends-on`); `--after`/`--before` are
+  tree-shaped authoring sugar. `ralph step list` now shows each step's
+  `short_id` + `deps:`, and `ralph plan harness generate` emits a non-fatal
+  warning when it produced an edge-less multi-step plan.
+- **Schema/version:** migrations still run through **V30** (this follow-up
+  is logic/CLI only — no new schema); `Cargo.toml` is **0.1.23**.
 
 ## Prompt model
 
@@ -379,7 +403,7 @@ ralph plan harness generate [<description>] [<slug>] [--use-harness <h>]
 
 # Every <num> step selector ALSO accepts an 8-char short_id (DAG handle).
 ralph step list [<slug>]
-ralph step add <title> [<slug>] [-d <desc>] [--after <num>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--max-retries <n>] [--retry-strategy <keep|rollback>] [--depends-on <short_id|num>]... [--import-json <FILE|->]
+ralph step add <title> [<slug>] [-d <desc>] [--after <short_id|num>] [--before <short_id|num>] [--root] [--depends-on <short_id|num>]... [--agent <name>] [--harness <h>] [--criteria <c>]... [--max-retries <n>] [--retry-strategy <keep|rollback>] [--import-json <FILE|->]   # non-empty plan requires exactly one placement: --after | --before | --depends-on | --root (empty plan: implied root)
 ralph step remove <num|short_id>|--step-id <uuid> [<slug>] [--force/-y]
 ralph step edit <num|short_id>|--step-id <uuid> [<slug>] [--title <t>] [--description <d>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--clear-criteria] [--max-retries <n>] [--clear-max-retries] [--retry-strategy <keep|rollback>] [--clear-retry-strategy] [--review <on|off|inherit>]
 ralph step reset <num|short_id>|--step-id <uuid> [<slug>] [--force/-y]

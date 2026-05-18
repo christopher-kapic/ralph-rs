@@ -4506,12 +4506,17 @@ where
             InboxOutcome::Handled => {}
             InboxOutcome::Pop => return Ok(()),
             InboxOutcome::EditFreeform => {
-                if let Ok(Some(text)) = edit_in_editor("") {
+                // Seed the editor with the current freeform so re-opening it
+                // (typo fix, or set freeform → comment → back) amends rather
+                // than wipes the captured text.
+                let seed = app.modal().map(|m| m.freeform.clone()).unwrap_or_default();
+                if let Ok(Some(text)) = edit_in_editor(&seed) {
                     app.set_modal_freeform(text);
                 }
             }
             InboxOutcome::EditComment => {
-                if let Ok(Some(text)) = edit_in_editor("") {
+                let seed = app.modal().map(|m| m.comment.clone()).unwrap_or_default();
+                if let Ok(Some(text)) = edit_in_editor(&seed) {
                     app.set_modal_comment(text);
                 }
             }

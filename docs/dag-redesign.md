@@ -6,6 +6,16 @@ review-via-hooks pattern (`docs/review-hooks.md`)
 **Companion:** `docs/dag-tui-mockups.html` (open in a browser) for the TUI
 visualization options.
 
+> **Shipped deviations:** this remains the authoritative *design draft*.
+> Where the shipped code intentionally differs, `CLAUDE.md` ("DAG redesign
+> — shipped shape") is authoritative. In particular the **step-add
+> placement model** was tightened post-redesign: `ralph step add` no longer
+> has a positional `--after <N>`; on a non-empty plan an explicit placement
+> (`--after`/`--before`/`--depends-on`/`--root`) is **required**, and
+> `--import-json` carries the DAG (`short_id` + `depends_on`). Treat any
+> `ralph step add … --after <num>`-as-position usage in the examples below
+> as superseded by that model.
+
 ---
 
 ## 1. Motivation

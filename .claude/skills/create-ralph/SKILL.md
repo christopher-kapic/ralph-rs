@@ -53,10 +53,20 @@ blocked, exactly like before).
 So, when the work genuinely allows it, **make independence explicit**:
 
 - Split work into branches that *don't* depend on each other and declare
-  only the edges that are real. Use `--depends-on <short_id|num>` on
-  `ralph step add` (or `ralph step dependency add` afterward) to wire only
-  the true ordering constraints. A step with no `--depends-on` is a root
-  and can run as soon as the scheduler reaches it.
+  only the edges that are real. **Every step's place in the DAG is
+  explicit** — on a non-empty plan `ralph step add` *requires* one of:
+  - `--after <S>` — the new step depends on `S` (a new branch off `S`);
+  - `--before <S>` — insert before `S` (the new step takes over `S`'s
+    incoming edges; `S` then depends only on it);
+  - `--depends-on <S>...` — depend on several prior steps (a fan-in/join);
+  - `--root` — a deliberate independent root (no dependencies).
+
+  The first step of an empty plan is the implied root. `--after`/`--before`
+  are **dependency edges, not list position** — there is no positional
+  insert (that ambiguity silently produced edge-less DAGs). In
+  `--import-json`, the DAG is carried per-object via `short_id` +
+  `depends_on` (see below). Wire only true ordering constraints; a `--root`
+  / no-`depends_on` step runs as soon as the scheduler reaches it.
 - Don't manufacture a dependency just because two steps touch the same
   area — only add an edge when step B genuinely needs step A's output.
 - **But don't over-fragment into deep independent branches that all
@@ -81,29 +91,40 @@ Default to: **build → verify → review → fix-as-needed**, repeated per phas
   - `ralph plan review on <slug>` — review every step in the plan; or
   - `ralph step edit <sel> --review on` — review only specific (risky / subtle-criteria) steps; `--review off` exempts one; `--review inherit` defers to plan/global. Precedence is step > plan > global > off.
   - Tune the recursion bound with `ralph plan create ... --max-review-corrections <n>` (default 3): if a corrective step keeps failing its own review past this many rounds, ralph raises a blocker for a human instead of looping forever.
-- **Explicit review/fix steps are now the exception**, for cases the built-in pipeline doesn't cover (e.g. a whole-plan audit at the end, or a review that must run a command rather than read a diff). If you do author one, set `--change-policy optional` (reviewers produce no diff) and `--max-retries 1` (don't retry-loop on disagreement). Manual reviewer-appended fix steps still go at the end (no `--after`); `ralph step move` reorders.
+- **Explicit review/fix steps are now the exception**, for cases the built-in pipeline doesn't cover (e.g. a whole-plan audit at the end, or a review that must run a command rather than read a diff). If you do author one, set `--change-policy optional` (reviewers produce no diff) and `--max-retries 1` (don't retry-loop on disagreement). A whole-plan audit step should `--depends-on` the steps it audits (so it runs after them); an independent check is `--root`. (`--after`/`--before` are dependency edges now, not "append at the end"; `ralph step move` only changes display/tie-break order, not edges.)
 
 ## Authoring (this is where the gotchas hide)
 
 ### Prefer `--import-json` for anything non-trivial
 
-Build a JSON array and pipe it to `ralph step add --import-json -`. JSON sidesteps every shell-quoting failure mode at once. Backticks, dollar signs, parentheses, and double quotes in code references all need escaping in inline `--description` strings, and the failure mode is **silent**: bash command-substitutes backticks at variable-expansion time, your references disappear, and you only notice when the harness produces wrong output.
+Build a JSON array and pipe it to `ralph step add --import-json -`. JSON sidesteps every shell-quoting failure mode at once (backticks, `$`, parens, quotes in code references all need escaping in inline `--description` strings, and the failure mode is **silent**) **and it carries the whole DAG in one document** — the correctness-first, fewest-tokens path. Give each step an `id` (a short readable label *you* choose) and list its parents' `id`s in `depends_on` (a parent may also be an existing plan step by short id or number). A step with no `depends_on` is a root. The batch is validated (unique ids, no dangling/cyclic edges) and inserted atomically — nothing is written if any edge is bad. **Don't** bulk-insert then wire edges in N follow-up commands; put the graph in the JSON.
 
 ```bash
-# Build the steps as JSON. Each entry's `description` is a real string, no shell quoting.
+# The whole DAG in one document. `parser` and `codegen` are independent
+# roots; `integrate` is a fan-in that needs both.
 ralph step add --import-json - <<'JSON'
 [
   {
+    "id": "parser",
     "title": "Add UserService struct",
     "description": "Add `UserService` in `src/services/user.rs` with methods `create`, `get_by_id`, `delete`. Follow the pattern in `src/services/auth.rs`. Acceptance: `cargo test services::user` passes."
   },
   {
-    "title": "Wire UserService into the API",
+    "id": "codegen",
+    "title": "Add the user API handlers",
     "description": "..."
+  },
+  {
+    "id": "integrate",
+    "title": "Wire UserService into the API",
+    "description": "...",
+    "depends_on": ["parser", "codegen"]
   }
 ]
 JSON
 ```
+
+`id` is a **batch-local wiring label** for `depends_on` — it is *not* saved. ralph mints each step's persisted 8-char `short_id` (the handle `ralph step list` shows and `ralph step edit`/`step dependency` take afterwards); don't hand-write `short_id`. Omit `depends_on` (or give `[]`) for a root.
 
 ### When inline is acceptable, use a quoted heredoc + tempfile
 
@@ -113,7 +134,8 @@ For one-off cases where JSON is overkill, write the description to a tempfile vi
 
 ```bash
 ralph plan create <slug> --description "..." --test "<cmd>"
-ralph step add "<Step 1 title>" <slug> --description "<short desc>"
+ralph step add "<Step 1 title>" <slug> --description "<short desc>"   # implied root (empty plan)
+ralph step add "<Step 2 title>" <slug> --description "<short desc>" --after 1   # depends on step 1
 ralph plan approve <slug>
 ```
 
@@ -165,6 +187,8 @@ Don't compress a big task into a handful of mega-steps — you lose the per-step
 - ❌ Referencing "the previous step" by name in a prompt — refer to files or commits (a DAG has no positional "previous").
 - ❌ Long inline `--description "..."` with mixed quoting — silent truncation. Use `--import-json` or a quoted heredoc → tempfile.
 - ❌ Inventing dependency edges that aren't real ordering constraints — it serializes work the scheduler could have run independently and kills the DAG payoff.
+- ❌ Expecting `--after <N>` to mean "insert at list position N" — it does not exist any more. `--after`/`--before` are **dependency edges**. Array order in `--import-json` is not a dependency either; only `depends_on` is.
+- ❌ Bulk-inserting with `--import-json` and forgetting `depends_on` — you get an all-roots, edge-less plan that runs but has none of the gating/ordering you intended. Put the graph in the JSON.
 - ❌ Deep independent branches that all re-converge at one late join — maximizes in-flight entanglement when something blocks. Prefer shallow + wide.
 - ❌ Authoring explicit review steps when the built-in review pipeline already covers it — enable `ralph plan/step review` instead of hand-rolling reviewer + fix-step plumbing.
 - ❌ Skipping `--change-policy optional` on a manual review/audit step — it'll be marked failed for producing no diff.
@@ -173,8 +197,8 @@ Don't compress a big task into a handful of mega-steps — you lose the per-step
 
 ## Reference: useful CLI flags
 
-- `ralph step add --import-json <FILE|->` — bulk insert steps from JSON array (no dependency field; conflicts with `--depends-on`).
-- `ralph step add ... --depends-on <short_id|num>` (repeatable) — declare DAG edges at creation. A step with no `--depends-on` is a root. Self-edges and cycles are rejected.
+- `ralph step add --import-json <FILE|->` — bulk insert steps from a JSON array (or one object). Carries the DAG: per-object `short_id` + `depends_on` (parents by short id, or an existing plan step by short id/number). Unique-short-id / acyclic / no-dangling validated; whole batch atomic. The recommended path for anything non-trivial.
+- `ralph step add ... <placement>` — on a non-empty plan exactly one placement is required: `--after <S>` (depend on S), `--before <S>` (insert before S; it takes over S's incoming edges), `--depends-on <S>...` (depend on several — a join), or `--root` (explicit independent root). First step of an empty plan is the implied root. Self-edges and cycles are rejected.
 - `ralph step dependency add|remove|list <num|short_id> [--depends-on <short_id|num>...]` — edit a step's dependency edges after creation.
 - Every `<num>` step selector also accepts the step's stable 8-char `short_id` (shown by `ralph step list` / `ralph plan show`), which survives reordering and inserted corrective steps.
 - `ralph step add ... --change-policy {required|optional|forbidden}` — `required` (default) fails on empty diff; `optional` allows it (use for review); `forbidden` fails on any diff (use for read-only audit).

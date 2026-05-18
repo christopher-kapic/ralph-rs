@@ -513,6 +513,61 @@ impl Default for Config {
         );
 
         harnesses.insert(
+            "grok".to_string(),
+            HarnessConfig {
+                // xAI's "Grok Build" CLI (grok 0.1.x). Same flag vocabulary
+                // as Claude Code: `--permission-mode bypassPermissions` is
+                // required for non-interactive runs (without it grok falls
+                // back to interactive approval and hangs ralph's subprocess).
+                //
+                // grok exposes a documented `--prompt-file <PATH>` "single
+                // -turn prompt from a file" mode — a perfect fit for
+                // `PromptInputMode::TempFile`: ralph writes the step prompt
+                // to a temp file and substitutes its path for `{prompt}`.
+                // This sidesteps the 128 KB argv cap entirely and avoids
+                // depending on whether grok honours `-p -` for stdin.
+                command: "grok".to_string(),
+                args: vec![
+                    "--prompt-file".to_string(),
+                    "{prompt}".to_string(),
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                ],
+                // Plan generation must stay INTERACTIVE (the user watches
+                // and steers). grok's interactive TUI has no flag to seed
+                // an initial message (only the headless `-p`/`--prompt-file`
+                // take a prompt, and those exit). So just open grok's TUI
+                // with the plan-agent definition loaded via `--agent`. There
+                // is no `{prompt}` slot here: `run_plan_harness` detects
+                // that and folds the task into the `--agent` file content,
+                // so opening grok still conveys what to plan.
+                plan_args: vec![
+                    "--agent".to_string(),
+                    "{agent_file}".to_string(),
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                ],
+                supports_agent_file: true,
+                supports_json_output: true,
+                // grok: `--output-format [plain|json|streaming-json]`.
+                json_output_args: vec!["--output-format".to_string(), "json".to_string()],
+                agent_file_env: None,
+                // grok loads an agent definition file via `--agent <PATH>`.
+                agent_file_args: vec!["--agent".to_string(), "{agent_file}".to_string()],
+                // grok accepts `-m/--model <MODEL>` (its own default is
+                // `grok-build`; leave `default_model` unset so grok picks).
+                model_args: vec!["-m".to_string(), "{model}".to_string()],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                // `--prompt-file` takes a path → TempFile mode.
+                prompt_input: PromptInputMode::TempFile,
+                argv_overflow: ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        harnesses.insert(
             "codex".to_string(),
             HarnessConfig {
                 // Codex non-interactive invocation is `codex exec "<prompt>"`:
@@ -945,8 +1000,9 @@ pub fn harness_footguns(name: &str, hc: &HarnessConfig) -> Vec<String> {
 /// Matched on `HarnessConfig::command` (the actual binary name), not on
 /// harness *name*, so a user who creates a custom harness called
 /// `copilot-fast` pointing at `command: "copilot"` still gets the warning.
-pub const MODEL_CAPABLE_COMMANDS: &[&str] =
-    &["claude", "codex", "copilot", "goose", "opencode", "pi"];
+pub const MODEL_CAPABLE_COMMANDS: &[&str] = &[
+    "claude", "codex", "copilot", "goose", "grok", "opencode", "pi",
+];
 
 /// Inspect a harness for known compatibility issues that won't show up in
 /// `harness_footguns` but will silently break runs.
@@ -1327,6 +1383,7 @@ mod tests {
 
         let expected_harnesses = [
             "claude",
+            "grok",
             "codex",
             "codex-orchestrator",
             "pi",
@@ -1340,7 +1397,7 @@ mod tests {
                 "Missing harness: {name}"
             );
         }
-        assert_eq!(config.harnesses.len(), 7);
+        assert_eq!(config.harnesses.len(), 8);
     }
 
     #[test]

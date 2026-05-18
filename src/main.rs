@@ -211,6 +211,14 @@ fn main() -> Result<()> {
                         plan_slug.as_deref(),
                     ))?;
                     if exit_code == 0 {
+                        // Non-fatal DAG sanity check: an authoring harness
+                        // that expressed ordering by array/positional order
+                        // instead of real edges produces an all-roots,
+                        // edge-less plan that "runs" but has none of the
+                        // intended gating. `ralph import` validates; `plan
+                        // harness generate` had no such guard. Warn (never
+                        // fail) and point at how to inspect/fix.
+                        plan_harness::warn_if_edgeless_dag(&conn, &project, plan_slug.as_deref());
                         return Ok(());
                     }
                     // Drop the SQLite connection and tokio runtime explicitly
@@ -244,6 +252,8 @@ fn main() -> Result<()> {
                 plan,
                 description,
                 after,
+                before,
+                root,
                 agent,
                 harness,
                 model,
@@ -283,7 +293,9 @@ fn main() -> Result<()> {
                         &project,
                         title,
                         description.as_deref(),
-                        after,
+                        after.as_deref(),
+                        before.as_deref(),
+                        root,
                         agent.as_deref(),
                         h,
                         model.as_deref(),

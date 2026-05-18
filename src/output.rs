@@ -694,6 +694,12 @@ impl From<&Plan> for PlanSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct StepSummary {
     pub id: String,
+    /// The plan-unique 8-char DAG handle. Always serialized (like
+    /// `change_policy`/`tags`, matching `ExportedStep`) so a JSON consumer
+    /// authoring the DAG — e.g. parsing `step add --import-json --json`
+    /// output to wire `depends_on` — can read back the (possibly pinned)
+    /// id rather than getting no handle at all.
+    pub short_id: String,
     pub plan_id: String,
     pub sort_key: String,
     pub title: String,
@@ -722,6 +728,7 @@ impl From<&Step> for StepSummary {
     fn from(s: &Step) -> Self {
         Self {
             id: s.id.clone(),
+            short_id: s.short_id.clone(),
             plan_id: s.plan_id.clone(),
             sort_key: s.sort_key.clone(),
             title: s.title.clone(),
@@ -1272,6 +1279,7 @@ mod tests {
     fn test_step_summary_json_snake_case() {
         let summary = StepSummary {
             id: "s1".into(),
+            short_id: "abcd1234".into(),
             plan_id: "p1".into(),
             sort_key: "a0".into(),
             title: "Step 1".into(),
@@ -1290,6 +1298,7 @@ mod tests {
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"plan_id\""));
+        assert!(json.contains("\"short_id\":\"abcd1234\""));
         assert!(json.contains("\"sort_key\""));
         assert!(json.contains("\"acceptance_criteria\""));
         assert!(json.contains("\"max_retries\""));

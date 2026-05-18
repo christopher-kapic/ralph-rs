@@ -105,6 +105,31 @@ pub fn open_memory() -> Result<Connection> {
     Ok(conn)
 }
 
+/// Run `f` inside a single DEFERRED transaction over a shared `&Connection`.
+///
+/// Commits when `f` returns `Ok`; on `Err` (or a panic / early `?`) the
+/// `Transaction` is dropped without `commit`, and rusqlite issues the
+/// `ROLLBACK` via its `Drop` impl — so a rollback path can never be
+/// missed or forgotten the way the hand-rolled `BEGIN;`/`COMMIT;`/
+/// `ROLLBACK;` `execute_batch` triples could. `unchecked_transaction`
+/// (not `transaction`) is used deliberately: the storage / command /
+/// review layers thread a shared `&Connection`, so requiring `&mut` only
+/// to open a transaction would force churn through every caller.
+///
+/// Two sites intentionally keep explicit blocks rather than this helper:
+/// the migration runner (single-threaded startup that must also bump
+/// `user_version` in the same transaction) and the run-lock
+/// (`BEGIN IMMEDIATE` — it must grab the write lock up front for the lock
+/// protocol; this helper is DEFERRED).
+pub fn with_tx<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("Failed to begin transaction")?;
+    let out = f(&tx)?;
+    tx.commit().context("Failed to commit transaction")?;
+    Ok(out)
+}
+
 /// Run all pending migrations in order, each inside its own transaction.
 fn run_migrations(conn: &Connection) -> Result<()> {
     let current: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -982,9 +1007,20 @@ fn migrate_v26(conn: &Connection) -> Result<()> {
         // NOT NULL DEFAULT '[]'). Synthesize `[{text,priority}]` with
         // ascending 1-based priorities so the agent's stored order is
         // preserved (index 0 = priority 1 = the agent's best guess).
-        let texts: Vec<String> = serde_json::from_str(&suggestions).with_context(|| {
-            format!("parsing step_questions.suggestions for row {id} during V26 cutover")
-        })?;
+        // Defensive: a single legacy row with non-array JSON must not abort
+        // the whole one-way V26 cutover (which would roll back to V25 and
+        // re-fail on every subsequent invocation — unrecoverable without
+        // manual DB surgery). The column is `NOT NULL DEFAULT '[]'` and the
+        // only writer serializes `Vec<String>`, so this is not reachable
+        // through normal operation; treat any unparseable value as "no
+        // suggestions" with a warning rather than a hard failure.
+        let texts: Vec<String> = serde_json::from_str(&suggestions).unwrap_or_else(|e| {
+            eprintln!(
+                "warning: step_questions.suggestions for row {id} is not a JSON \
+                 string array ({e}); migrating it with no proposed answers"
+            );
+            Vec::new()
+        });
         let options: Vec<serde_json::Value> = texts
             .iter()
             .enumerate()

@@ -119,6 +119,17 @@ pub fn step_list(
         return Ok(());
     }
 
+    // The DAG must be visible from the CLI — otherwise a wrong/edge-less
+    // graph (e.g. an authoring agent that never wired edges) is invisible
+    // through the most natural inspection path. Show each step's stable
+    // `short_id` and its `deps:` (by short id) / `(root)`.
+    let edges = storage::list_step_dependency_edges(conn, &plan.id)?;
+    let id_to_short: std::collections::HashMap<String, String> =
+        storage::list_steps(conn, &plan.id)?
+            .into_iter()
+            .map(|s| (s.id, s.short_id))
+            .collect();
+
     eprintln!(
         "Steps for {} ({} total):",
         output::bold(plan_slug, out.color),
@@ -138,8 +149,9 @@ pub fn step_list(
         };
         let budget_tag = render_budget_tag(step, config);
         println!(
-            "  {:>3}. {} {}{}{}  [{}]{}",
+            "  {:>3}. [{}] {} {}{}{}  [{}]{}",
             i + 1,
+            step.short_id,
             output::status_icon(step.status, out.color),
             tags_prefix,
             output::bold(&step.title, out.color),
@@ -147,6 +159,20 @@ pub fn step_list(
             output::colored_status(step.status, out.color),
             budget_tag,
         );
+        let mut dep_short: Vec<&str> = edges
+            .get(&step.id)
+            .map(|v| {
+                v.iter()
+                    .map(|id| id_to_short.get(id).map(String::as_str).unwrap_or("?"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        dep_short.sort_unstable();
+        if dep_short.is_empty() {
+            println!("       deps: (root)");
+        } else {
+            println!("       deps: {}", dep_short.join(", "));
+        }
         if !step.description.is_empty() {
             println!("       {}", step.description);
         }
@@ -176,6 +202,24 @@ pub(crate) fn render_budget_tag(step: &Step, config: &Config) -> String {
     format!(" (attempts: {}/{})", step.attempts, max_attempts)
 }
 
+/// Add a single step, placing it explicitly in the dependency DAG.
+///
+/// Placement is mandatory on a non-empty plan (the first step of an empty
+/// plan is the implied root). The old positional `--after <N>` (list
+/// position, no edge) is gone — it silently produced edge-less DAGs. The
+/// modes (mutually exclusive at the clap layer except `--after`+`--before`):
+///
+/// - `--root` / implied first step: no dependencies (a DAG root).
+/// - `--depends-on a b …`: the new step depends on each (the multi-parent
+///   join primitive).
+/// - `--after X`: the new step depends on `X` (a new branch off `X`).
+/// - `--before Y`: the new step takes over **all** of `Y`'s incoming edges;
+///   `Y` then depends only on the new step (if `Y` was a root, the new step
+///   becomes the new root). In a tree-shaped plan this is just "inherit
+///   `Y`'s one parent".
+/// - `--after X --before Y`: splice the new step between them — it depends
+///   on `X`, and the `X → Y` edge is rerouted so `Y` depends on the new
+///   step instead.
 #[allow(clippy::too_many_arguments)]
 pub fn step_add(
     conn: &Connection,
@@ -183,7 +227,9 @@ pub fn step_add(
     project: &str,
     title: &str,
     description: Option<&str>,
-    after: Option<usize>,
+    after: Option<&str>,
+    before: Option<&str>,
+    root: bool,
     agent: Option<&str>,
     harness: Option<&str>,
     model: Option<&str>,
@@ -198,16 +244,62 @@ pub fn step_add(
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
-    // Resolve each dependency selector to an existing step BEFORE creating
+    let plan_nonempty = !storage::list_steps(conn, &plan.id)?.is_empty();
+
+    // Resolve every placement selector to an existing step BEFORE creating
     // the new step so a bad selector fails fast without leaving a
-    // half-created step behind — mirroring how `plan_create` resolves
-    // `--depends-on` slugs into `resolved_deps` before `create_plan`. Deps
-    // are plan-internal pre-existing steps, so resolving them ahead of
-    // creation is correct (the new step has no number/short id yet anyway).
+    // half-created step behind.
+    let after_step = match after {
+        Some(sel) => Some(resolve_step(conn, &plan.id, Some(sel), None)?.0),
+        None => None,
+    };
+    let before_step = match before {
+        Some(sel) => Some(resolve_step(conn, &plan.id, Some(sel), None)?.0),
+        None => None,
+    };
     let mut resolved_deps: Vec<(String, String)> = Vec::with_capacity(depends_on.len());
     for dep_sel in depends_on {
         let (dep, _) = resolve_step(conn, &plan.id, Some(dep_sel.as_str()), None)?;
         resolved_deps.push((dep_sel.clone(), dep.id));
+    }
+
+    // Mandatory placement: an edge-less step on a non-empty plan is almost
+    // always an authoring mistake (it silently becomes an extra root that
+    // runs with no gating). Require an explicit choice; `--root` is the
+    // escape hatch for a *deliberate* extra root.
+    let placement_given =
+        after_step.is_some() || before_step.is_some() || root || !resolved_deps.is_empty();
+    if plan_nonempty && !placement_given {
+        bail!(
+            "This plan already has steps, so the new step needs an explicit \
+             place in the dependency DAG. Pass one of:\n  \
+             --after <step>      depend on it (a new branch off it)\n  \
+             --before <step>     insert before it (take over its incoming edges)\n  \
+             --depends-on <s>... depend on several prior steps (a join step)\n  \
+             --root              a deliberate independent root\n\
+             See `ralph step add --help`."
+        );
+    }
+
+    // `--after X --before Y` is documented as rerouting the *specific* X→Y
+    // edge through the new step. If no such edge exists, the splice arm's
+    // `remove_step_dependency(Y, X)` is a silent no-op while the added
+    // `new→X` / `Y→new` edges invent an ordering constraint the author
+    // never expressed — quietly serializing two unrelated branches. Fail
+    // fast (pre-transaction, both steps already resolved) instead.
+    if let (Some(a), Some(y)) = (&after_step, &before_step) {
+        let y_deps = storage::list_step_dependencies(conn, &y.id)?;
+        if !y_deps.contains(&a.id) {
+            bail!(
+                "--after {a} --before {y} can't splice: {y} does not depend \
+                 on {a}, so there is no {a}→{y} edge to reroute. Use \
+                 `--after {a}` (branch off {a}) or `--before {y}` (take over \
+                 {y}'s incoming edges) instead, or pick an X/Y pair that is \
+                 directly connected.",
+                a = a.short_id,
+                y = y.short_id,
+            );
+        }
     }
 
     let desc = description.unwrap_or("");
@@ -218,85 +310,64 @@ pub fn step_add(
         Some(&normalized_tags)
     };
 
-    let (step, pos) = if let Some(after_pos) = after {
-        // Insert after a specific position using fractional indexing
-        let steps = storage::list_steps(conn, &plan.id)?;
-        if after_pos > steps.len() {
-            bail!(
-                "Position {} is out of range (plan has {} steps)",
-                after_pos,
-                steps.len()
-            );
+    // Create the step and wire its edges atomically: a rejected edge (cycle,
+    // etc.) must not leave a half-created step behind. Execution/outline
+    // order is driven by topological depth (the scheduler's
+    // `step_schedule_cmp`), so the step is simply appended in sort order —
+    // its DAG position comes from the edges, not `sort_key`.
+    let (step, pos) = crate::db::with_tx(conn, |conn| {
+        let (step, pos) = storage::create_step(
+            conn,
+            &plan.id,
+            title,
+            desc,
+            agent,
+            harness,
+            criteria,
+            max_retries,
+            model,
+            change_policy,
+            tags_arg,
+        )?;
+        if let Some(rs) = retry_strategy {
+            storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
         }
 
-        let sort_key = if after_pos == 0 {
-            // Insert before the first step
-            if steps.is_empty() {
-                frac_index::initial_key()
-            } else {
-                let first_key = &steps[0].sort_key;
-                if first_key.as_str() > "0" {
-                    frac_index::key_between("0", first_key)?
-                } else {
-                    "00".to_string()
-                }
+        // --depends-on: the general/join form. The new step has no edges
+        // yet so a cycle is impossible; add_step_dependency still guards.
+        for (dep_sel, dep_id) in &resolved_deps {
+            storage::add_step_dependency(conn, &step.id, dep_id)
+                .with_context(|| format!("Failed to add dependency on '{dep_sel}'"))?;
+        }
+
+        match (&after_step, &before_step) {
+            // --after X (only): the new step depends on X.
+            (Some(a), None) => {
+                storage::add_step_dependency(conn, &step.id, &a.id)?;
             }
-        } else if after_pos == steps.len() {
-            // Append at end
-            frac_index::key_after(&steps[steps.len() - 1].sort_key)?
-        } else {
-            // Insert between after_pos-1 and after_pos
-            let before = &steps[after_pos - 1].sort_key;
-            let after_key = &steps[after_pos].sort_key;
-            frac_index::key_between(before, after_key)?
-        };
-
-        storage::create_step_at(
-            conn,
-            &plan.id,
-            &sort_key,
-            title,
-            desc,
-            agent,
-            harness,
-            criteria,
-            max_retries,
-            model,
-            change_policy,
-            tags_arg,
-        )?
-    } else {
-        // Append at the end (default)
-        storage::create_step(
-            conn,
-            &plan.id,
-            title,
-            desc,
-            agent,
-            harness,
-            criteria,
-            max_retries,
-            model,
-            change_policy,
-            tags_arg,
-        )?
-    };
-
-    // Persist a step-level retry-strategy override when the user supplied
-    // one. `None` is the column default (inherit plan/global) so we skip
-    // the write entirely in that case — mirroring how the plan-level
-    // override is set after `create_plan`.
-    if let Some(rs) = retry_strategy {
-        storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
-    }
-
-    // Attach each resolved dependency. The new step has no edges yet, so a
-    // cycle is impossible here; `add_step_dependency` still guards
-    // self-edges and cycles defensively (docs/dag-redesign.md §6/§7).
-    for (dep_sel, dep_id) in &resolved_deps {
-        storage::add_step_dependency(conn, &step.id, dep_id)
-            .with_context(|| format!("Failed to add dependency on '{dep_sel}'"))?;
-    }
+            // --before Y (only): the new step takes over ALL of Y's
+            // incoming edges; Y then depends only on the new step.
+            (None, Some(y)) => {
+                for p in storage::list_step_dependencies(conn, &y.id)? {
+                    storage::remove_step_dependency(conn, &y.id, &p)?;
+                    storage::add_step_dependency(conn, &step.id, &p)?;
+                }
+                storage::add_step_dependency(conn, &y.id, &step.id)?;
+            }
+            // --after X --before Y: splice between them. The new step
+            // depends on X; the specific X→Y edge is rerouted through it
+            // (Y's other parents are untouched). The X→Y edge is validated
+            // to exist above, so this `remove` is never a silent no-op.
+            (Some(a), Some(y)) => {
+                storage::add_step_dependency(conn, &step.id, &a.id)?;
+                storage::remove_step_dependency(conn, &y.id, &a.id)?;
+                storage::add_step_dependency(conn, &y.id, &step.id)?;
+            }
+            // --root / --depends-on / implied first root: nothing more.
+            (None, None) => {}
+        }
+        Ok((step, pos))
+    })?;
 
     eprintln!(
         "{} Added step #{} [{}]: {}",
@@ -305,10 +376,19 @@ pub fn step_add(
         step.short_id,
         output::bold(&step.title, out.color),
     );
-    if !resolved_deps.is_empty() {
+    let placement = if let (Some(a), Some(y)) = (&after_step, &before_step) {
+        format!("spliced between {} and {}", a.short_id, y.short_id)
+    } else if let Some(a) = &after_step {
+        format!("depends on {}", a.short_id)
+    } else if let Some(y) = &before_step {
+        format!("inserted before {}", y.short_id)
+    } else if !resolved_deps.is_empty() {
         let sels: Vec<&str> = resolved_deps.iter().map(|(s, _)| s.as_str()).collect();
-        eprintln!("  Depends on: {}", sels.join(", "));
-    }
+        format!("depends on {}", sels.join(", "))
+    } else {
+        "root (no dependencies)".to_string()
+    };
+    eprintln!("  Placement: {placement}");
     Ok(())
 }
 
@@ -363,26 +443,103 @@ pub fn step_add_bulk(
         bail!("--import-json payload contained no steps");
     }
 
-    // Validate each step up front so we fail before touching the database.
+    // Validate up front so we fail before touching the database. The bulk
+    // form carries the DAG. Each step may declare:
+    //   * `id`       — a *batch-local* readable authoring label, used only
+    //                  to wire `depends_on` within this one payload; it is
+    //                  **never persisted** (so it can be anything readable).
+    //   * `short_id` — the *persisted* 8-char handle that `ralph step
+    //                  edit`/`step list` resolve. Omit it and ralph mints a
+    //                  valid one; if supplied it must be `is_short_id_shaped`
+    //                  (a readable value would be created-but-unselectable;
+    //                  a numeric one would silently shadow a step position).
+    // A `depends_on` entry resolves against another batch step's
+    // `id`/`short_id` or an existing plan step. A step with no `depends_on`
+    // is a root.
+    use std::collections::HashSet;
+    // Every batch-local handle (an `id` or an explicit `short_id`) must be
+    // unique across the whole payload so `depends_on` resolves to exactly
+    // one step. Built in a first pass so the dangling-edge check below sees
+    // forward references too.
+    let mut batch_handles: HashSet<&str> = HashSet::new();
     for (i, s) in steps.iter().enumerate() {
         if s.title.trim().is_empty() {
             bail!("Step #{} is missing a non-empty `title`", i + 1);
         }
+        if let Some(sid) = s.short_id.as_deref() {
+            if !storage::is_short_id_shaped(sid) {
+                bail!(
+                    "Step #{} has an invalid `short_id` '{sid}': a persisted \
+                     short id must be exactly 8 base-62 characters. Omit \
+                     `short_id` to have ralph mint one, and use `id` for a \
+                     readable label to wire `depends_on` within this payload.",
+                    i + 1
+                );
+            }
+            if resolve_step(conn, &plan.id, Some(sid), None).is_ok() {
+                bail!(
+                    "`short_id` '{sid}' (step #{}) already exists in plan \
+                     '{plan_slug}' — choose a fresh id",
+                    i + 1
+                );
+            }
+            if !batch_handles.insert(sid) {
+                bail!(
+                    "Duplicate handle '{sid}' in the payload (step #{}) — \
+                     each step's `id`/`short_id` must be unique",
+                    i + 1
+                );
+            }
+        }
+        if let Some(rid) = s.id.as_deref() {
+            if rid.trim().is_empty() {
+                bail!("Step #{} has an empty `id`", i + 1);
+            }
+            if !batch_handles.insert(rid) {
+                bail!(
+                    "Duplicate handle '{rid}' in the payload (step #{}) — \
+                     each step's `id`/`short_id` must be unique",
+                    i + 1
+                );
+            }
+        }
+    }
+    // A `depends_on` ref must resolve to either another step IN this batch
+    // (by its `id`/`short_id`) or an existing plan step. Catch a dangling
+    // ref early with a precise message (the per-edge insert below also
+    // fails closed, but this is friendlier and pre-DB). Forward references
+    // are fine — `batch_handles` is the complete set after the pass above.
+    for (i, s) in steps.iter().enumerate() {
+        for dep in &s.depends_on {
+            if !batch_handles.contains(dep.as_str())
+                && resolve_step(conn, &plan.id, Some(dep.as_str()), None).is_err()
+            {
+                bail!(
+                    "Step #{} depends on '{dep}', which is neither another \
+                     step's `id`/`short_id` in this payload nor an existing \
+                     step in plan '{plan_slug}'",
+                    i + 1
+                );
+            }
+        }
     }
 
-    // Insert atomically inside a transaction. On any error, roll back.
-    conn.execute_batch("BEGIN;")
-        .context("Failed to begin bulk-import transaction")?;
-
-    let mut inserted: Vec<(crate::plan::Step, usize)> = Vec::with_capacity(steps.len());
-    let insert_result: Result<()> = (|| {
+    // Insert atomically inside a transaction (`with_tx` commits on Ok and
+    // rolls back via RAII on the first `?`/Err — no missed rollback path).
+    let inserted: Vec<(crate::plan::Step, usize)> = crate::db::with_tx(conn, |conn| {
+        let mut inserted: Vec<(crate::plan::Step, usize)> = Vec::with_capacity(steps.len());
+        // Pass 1: create every step (pinning a caller-supplied `short_id`),
+        // recording every batch-local handle (`id` and/or explicit
+        // `short_id`) → new step id for edge wiring.
+        let mut by_batch_handle: std::collections::HashMap<&str, String> =
+            std::collections::HashMap::new();
         for s in &steps {
             let tags_arg: Option<&[String]> = if s.tags.is_empty() {
                 None
             } else {
                 Some(&s.tags)
             };
-            let (step, pos) = storage::create_step(
+            let (mut step, pos) = storage::create_step(
                 conn,
                 &plan.id,
                 &s.title,
@@ -395,18 +552,57 @@ pub fn step_add_bulk(
                 Some(s.change_policy),
                 tags_arg,
             )?;
+            if let Some(sid) = s.short_id.as_deref() {
+                // Pin the (validated, 8-char) persisted handle. The
+                // (plan_id, short_id) unique index rejects a collision (→
+                // rollback, nothing written). Refresh the in-memory copy
+                // too: `create_step` returned a `Step` still carrying its
+                // throwaway minted short_id, and `inserted` feeds the
+                // success / JSON output below — without this the caller is
+                // handed an id that doesn't exist in the DB.
+                storage::set_step_short_id(conn, &step.id, sid)?;
+                step.short_id = sid.to_string();
+                by_batch_handle.insert(sid, step.id.clone());
+            }
+            // The batch-local `id` is an authoring label only: it lets
+            // intra-payload `depends_on` resolve by a readable name but is
+            // never persisted (the persisted, user-facing handle is the
+            // minted-or-explicit `short_id` above).
+            if let Some(rid) = s.id.as_deref() {
+                by_batch_handle.insert(rid, step.id.clone());
+            }
+            // `create_step` has no parameter for the nullable step-level
+            // overrides; the single-step `step add`/`step edit` paths set
+            // these via dedicated setters, so the bulk path must too —
+            // otherwise a `retry_strategy`/`review_enabled` in the JSON is
+            // silently dropped (the create-ralph skill recommends
+            // `--import-json` for exactly the review steps that need these).
+            if let Some(rs) = s.retry_strategy {
+                storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
+            }
+            if let Some(re) = s.review_enabled {
+                storage::set_step_review_enabled(conn, &step.id, Some(re))?;
+            }
             inserted.push((step, pos));
         }
-        Ok(())
-    })();
-
-    if let Err(e) = insert_result {
-        let _ = conn.execute_batch("ROLLBACK;");
-        return Err(e).context("Bulk step insert failed; rolled back (no steps added)");
-    }
-
-    conn.execute_batch("COMMIT;")
-        .context("Failed to commit bulk-import transaction")?;
+        // Pass 2: wire edges in array order (each step's `depends_on` in
+        // listed order) — `add_step_dependency`'s incremental cycle guard
+        // is the per-edge analogue of `import::find_imported_cycle`, so a
+        // cyclic/self/dangling edge fails closed and rolls the batch back.
+        for (s, (created, _)) in steps.iter().zip(inserted.iter()) {
+            for dep in &s.depends_on {
+                let dep_id = match by_batch_handle.get(dep.as_str()) {
+                    Some(id) => id.clone(),
+                    None => resolve_step(conn, &plan.id, Some(dep.as_str()), None)?.0.id,
+                };
+                storage::add_step_dependency(conn, &created.id, &dep_id).with_context(|| {
+                    format!("Failed to add dependency '{}' -> '{dep}'", created.short_id)
+                })?;
+            }
+        }
+        Ok(inserted)
+    })
+    .context("Bulk step insert failed; rolled back (no steps added)")?;
 
     // Emit results.
     if out.format == OutputFormat::Json {
@@ -1274,6 +1470,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1316,6 +1514,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1348,6 +1548,8 @@ mod tests {
             "No override",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -1388,6 +1590,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1427,6 +1631,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1452,6 +1658,8 @@ mod tests {
             "t",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -1627,6 +1835,8 @@ mod tests {
             "with criteria",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -2103,6 +2313,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -2138,6 +2350,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -2171,6 +2385,8 @@ mod tests {
             title,
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -2223,6 +2439,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -2269,6 +2487,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -2288,6 +2508,8 @@ mod tests {
             "inherits",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -2359,6 +2581,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -2428,6 +2652,8 @@ mod tests {
             "s",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,

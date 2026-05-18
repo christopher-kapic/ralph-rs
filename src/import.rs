@@ -151,9 +151,26 @@ pub struct ImportedStep {
     /// bundle — including a linear plan (whose steps now carry real chain
     /// edges) and a no-edge multi-root DAG. Never re-minted when present
     /// (that would break `short_id` stability and orphan `depends_on`
-    /// references).
+    /// references). When supplied it **must be `is_short_id_shaped`** (8
+    /// base-62 chars): it becomes the persisted, user-facing handle that
+    /// `ralph step edit`/`step list` resolve, and a non-shaped value would
+    /// be created-but-unselectable (and a numeric one would silently shadow
+    /// a step position). Hand-authored `--import-json` payloads should
+    /// instead omit this (ralph mints one) and use [`id`](Self::id) for
+    /// readable `depends_on` wiring.
     #[serde(default)]
     pub short_id: Option<String>,
+    /// **Batch-local authoring label.** Unlike [`short_id`](Self::short_id)
+    /// this is *never persisted* and never shown anywhere — it exists only
+    /// so a hand-authored `--import-json` payload can wire `depends_on`
+    /// edges *within the one document* by a readable name (`"parser"`)
+    /// without the author having to invent a valid 8-char `short_id`. The
+    /// persisted handle is still the minted (or explicitly supplied,
+    /// validated) `short_id`. `#[serde(default)]` → `None`; `ralph export`
+    /// never emits it, so full-bundle `ralph import` is unaffected (its
+    /// edges wire by the real `short_id`s).
+    #[serde(default)]
+    pub id: Option<String>,
     /// `short_id`s of the steps this step directly depends on
     /// (docs/dag-redesign.md §13.2/§13.3). `#[serde(default)]` → empty when
     /// the step is a root (a linear plan's first step, or any root of a
@@ -282,7 +299,11 @@ fn find_imported_cycle(steps: &[ImportedStep]) -> Option<(String, String)> {
 ///
 ///  0. every step carries a `short_id` (the portable edge handle — a
 ///     DAG-aware exporter always emits one for every step; a missing one
-///     is a corrupt bundle that cannot be wired deterministically);
+///     is a corrupt bundle that cannot be wired deterministically), and
+///     that `short_id` is `is_short_id_shaped` (8 base-62 chars). Every
+///     real export satisfies this — it's a tamper/hand-edit guard: a
+///     readable short_id would import but be unselectable afterwards, and
+///     a numeric one would silently shadow a step position;
 ///  1. no dangling edge — every `depends_on` entry resolves to a
 ///     `short_id` present in the same bundle;
 ///  2. `short_id`s are unique within the bundle;
@@ -296,7 +317,8 @@ fn find_imported_cycle(steps: &[ImportedStep]) -> Option<(String, String)> {
 fn validate_dag_aware_steps(steps: &[ImportedStep]) -> Result<()> {
     use std::collections::HashSet;
 
-    // Rule 0 + 2: every step has a short_id, and they are unique.
+    // Rule 0 + 2: every step has a (well-shaped) short_id, and they are
+    // unique.
     let mut seen: HashSet<&str> = HashSet::new();
     for (i, step) in steps.iter().enumerate() {
         let sid = step.short_id.as_deref().ok_or_else(|| {
@@ -307,6 +329,16 @@ fn validate_dag_aware_steps(steps: &[ImportedStep]) -> Result<()> {
                 step.title
             )
         })?;
+        if !crate::storage::is_short_id_shaped(sid) {
+            return Err(anyhow!(
+                "DAG-aware import: step #{} ('{}') has an invalid short_id \
+                 '{sid}'; a short_id must be exactly 8 base-62 characters \
+                 (a readable or numeric one would import but be \
+                 unselectable / shadow a step position)",
+                i + 1,
+                step.title
+            ));
+        }
         if !seen.insert(sid) {
             return Err(anyhow!(
                 "DAG-aware import: duplicate short_id '{sid}' in the bundle; \
@@ -429,22 +461,9 @@ pub fn import_plan_from_data(
     let branch = options.branch.unwrap_or(&data.plan.branch_name);
     let harness = options.harness.or(data.plan.harness.as_deref());
 
-    conn.execute_batch("BEGIN;")
-        .context("Failed to begin import transaction")?;
-
-    let result = import_plan_inner(conn, data, slug, branch, harness, options);
-
-    match &result {
-        Ok(_) => {
-            conn.execute_batch("COMMIT;")
-                .context("Failed to commit import transaction")?;
-        }
-        Err(_) => {
-            let _ = conn.execute_batch("ROLLBACK;");
-        }
-    }
-
-    result
+    crate::db::with_tx(conn, |conn| {
+        import_plan_inner(conn, data, slug, branch, harness, options)
+    })
 }
 
 fn import_plan_inner(
@@ -2735,6 +2754,7 @@ mod tests {
                 retry_strategy: None,
                 review_enabled: None,
                 short_id: Some("aaaaaaaa".into()),
+                id: None,
                 depends_on: vec!["bbbbbbbb".into()],
             },
             ImportedStep {
@@ -2750,6 +2770,7 @@ mod tests {
                 retry_strategy: None,
                 review_enabled: None,
                 short_id: Some("bbbbbbbb".into()),
+                id: None,
                 depends_on: vec!["aaaaaaaa".into()],
             },
         ];

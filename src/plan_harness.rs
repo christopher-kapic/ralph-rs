@@ -86,10 +86,18 @@ blocked).
 When the work genuinely allows it, **make independence explicit**:
 
 - Split work into branches that *don't* depend on each other and declare
-  only the edges that are real. Use `--depends-on <short_id|num>` on
-  `ralph step add` (or `ralph step dependency add` afterward) to wire only
-  the true ordering constraints. A step with no `--depends-on` is a root
-  and runs as soon as the scheduler reaches it.
+  only the edges that are real. **Every step's place in the DAG is
+  explicit** — on a non-empty plan `ralph step add` *requires* one of:
+  `--after <S>` (the new step depends on S — a new branch off S),
+  `--before <S>` (insert before S — the new step takes over S's incoming
+  edges; S then depends only on it), `--depends-on <S>...` (depend on
+  several prior steps — a fan-in/join), or `--root` (a deliberate
+  independent root). The first step of an empty plan is the implied root.
+  `--after`/`--before` are **dependency edges, not list position** — there
+  is no positional insert (that ambiguity silently produced edge-less
+  DAGs). In `--import-json` the DAG is carried per-object via `short_id` +
+  `depends_on`. A `--root` / no-`depends_on` step runs as soon as the
+  scheduler reaches it.
 - Don't manufacture a dependency just because two steps touch the same
   area — only add an edge when step B genuinely needs step A's output.
 - **Don't over-fragment into deep independent branches that all re-converge
@@ -136,29 +144,56 @@ Default to: **build → verify → review → fix-as-needed**, repeated per phas
   fix steps via `ralph step add` still needs a sandbox that can write ralph's
   DB outside the workspace — use the `codex-orchestrator` harness for that
   step (default `codex`'s `workspace-write` sandbox blocks the DB write).
-  Manual fix steps go at the end (no `--after`); `ralph step move` reorders.
+  A whole-plan audit step should `--depends-on` the steps it audits; an
+  independent check is `--root`. (`--after`/`--before` are dependency edges
+  now, not "append at the end"; `ralph step move` only changes display
+  order, not edges.)
 
 ## Authoring (this is where the gotchas hide)
 
 ### Prefer `--import-json` for anything non-trivial
 
 Build a JSON array and pipe it to `ralph step add --import-json -`. JSON
-sidesteps every shell-quoting failure mode at once. Backticks, dollar signs,
-parentheses, and double quotes in code references all need escaping in inline
-`--description` strings, and the failure mode is **silent**: bash
-command-substitutes backticks at variable-expansion time, your references
-disappear, and you only notice when the harness produces wrong output.
+sidesteps every shell-quoting failure mode at once (backticks, `$`, parens,
+quotes in code references all need escaping in inline `--description` strings,
+and the failure mode is **silent**) **and it carries the whole DAG in one
+document** — the correctness-first, fewest-tokens path. Give each step an
+`id` (a short readable label you choose) and list its parents' `id`s in
+`depends_on` (a parent may also be an existing plan step by short id or
+number). A step with no `depends_on` is a root. The batch is validated
+(unique ids, no dangling/cyclic edges) and inserted atomically. Do **not**
+bulk-insert then wire edges in N follow-up commands — put the graph in the
+JSON.
 
 ```bash
+# The whole DAG in one document. `parser` and `codegen` are independent
+# roots; `integrate` is a fan-in that needs both.
 ralph step add --import-json - <<'JSON'
 [
   {
+    "id": "parser",
     "title": "Add UserService struct",
     "description": "Add `UserService` in `src/services/user.rs` with methods `create`, `get_by_id`, `delete`. Follow the pattern in `src/services/auth.rs`. Acceptance: `cargo test services::user` passes."
+  },
+  {
+    "id": "codegen",
+    "title": "Add the user API handlers",
+    "description": "..."
+  },
+  {
+    "id": "integrate",
+    "title": "Wire UserService into the API",
+    "description": "...",
+    "depends_on": ["parser", "codegen"]
   }
 ]
 JSON
 ```
+
+`id` is a batch-local wiring label for `depends_on` — it is *not* saved;
+ralph mints each step's persisted 8-char `short_id` (the handle
+`ralph step list` shows and `ralph step edit` takes). Don't hand-write
+`short_id`. Omit `depends_on` (or give `[]`) for a root.
 
 ### When inline is acceptable, use a quoted heredoc + tempfile
 
@@ -172,7 +207,8 @@ with backslash escapes.
 
 ```bash
 ralph plan create <slug> --description "..." --test "<cmd>"
-ralph step add "<Step 1 title>" <slug> --description "<short desc>"
+ralph step add "<Step 1 title>" <slug> --description "<short desc>"   # implied root (empty plan)
+ralph step add "<Step 2 title>" <slug> --description "<short desc>" --after 1   # depends on step 1
 ralph plan approve <slug>
 ```
 
@@ -189,7 +225,7 @@ ralph plan approve <slug>
 Plan slug is a trailing positional argument on every step command and defaults
 to the active plan when omitted.
 
-- `ralph step add "<title>" <slug> [--description "<desc>"] [--after <n>] [--harness <h>] [--change-policy {required|optional|forbidden}] [--max-retries <n>] [--retry-strategy {keep|rollback}] [--depends-on <short_id|num>]... [--import-json <FILE|->]`
+- `ralph step add "<title>" <slug> [--description "<desc>"] <placement> [--harness <h>] [--change-policy {required|optional|forbidden}] [--max-retries <n>] [--retry-strategy {keep|rollback}] [--import-json <FILE|->]` — on a non-empty plan exactly one `<placement>` is required: `--after <S>` (depend on S), `--before <S>` (insert before S), `--depends-on <S>...` (depend on several — a join), or `--root` (explicit independent root). First step of an empty plan is the implied root.
 - `ralph step list <slug>`
 - `ralph step edit <n> <slug> [--title "<title>"] [--description "<desc>"] [--review {on|off|inherit}]`
 - `ralph step remove <n> <slug> --force`
@@ -198,9 +234,10 @@ to the active plan when omitted.
 - `ralph step dependency add|remove|list <n|short_id> [--depends-on <short_id|num>...]` — edit a step's DAG edges after creation.
 - Every `<n>` step selector also accepts the step's stable 8-char
   `short_id` (shown by `ralph step list` / `ralph plan show`); it survives
-  reordering and reviewer-inserted corrective steps. `--depends-on` is the
-  interactive path for DAG edges (the `--import-json` bulk form has no
-  dependency field, so the two flags conflict).
+  reordering and reviewer-inserted corrective steps. The placement flags
+  (`--after`/`--before`/`--depends-on`/`--root`) are the interactive way to
+  declare DAG edges; `--import-json` carries the same DAG per-object via
+  `short_id` + `depends_on` (so they're alternatives, not combined).
 
 ## Hook Attachment
 
@@ -329,14 +366,25 @@ atomic and independently verifiable.
   commits each iteration by design; harness-side commits will conflict and
   produce a clean diff at step end (which `change_policy=required` will
   correctly fail).
+- ❌ Expecting `--after <N>` to mean "insert at list position N" — it does not
+  exist any more. `--after`/`--before` are **dependency edges**. Array order
+  in `--import-json` is not a dependency either; only `depends_on` is.
+- ❌ Bulk-inserting with `--import-json` and forgetting `depends_on` — you get
+  an all-roots, edge-less plan that runs but has none of the gating/ordering
+  you intended. Put the graph in the JSON.
 
 ## Reference: useful CLI flags
 
-- `ralph step add --import-json <FILE|->` — bulk insert steps from JSON array
-  (no dependency field; conflicts with `--depends-on`).
-- `ralph step add ... --depends-on <short_id|num>` (repeatable) — declare DAG
-  edges at creation. No `--depends-on` = a root step. Self-edges and cycles
-  are rejected.
+- `ralph step add --import-json <FILE|->` — bulk insert from a JSON array (or
+  one object). Carries the DAG: per-object `short_id` + `depends_on` (parents
+  by short id, or an existing plan step by short id/number). Unique-short-id
+  / acyclic / no-dangling validated; whole batch atomic. Recommended for
+  anything non-trivial.
+- `ralph step add ... <placement>` — on a non-empty plan exactly one is
+  required: `--after <S>` (depend on S), `--before <S>` (insert before S — it
+  takes over S's incoming edges), `--depends-on <S>...` (depend on several —
+  a join), or `--root` (explicit independent root). First step of an empty
+  plan is the implied root. Self-edges and cycles are rejected.
 - `ralph step dependency add|remove|list <n|short_id> [--depends-on <short_id|num>...]`
   — edit a step's dependency edges after creation.
 - `ralph step add ... --change-policy {required|optional|forbidden}` —
@@ -353,8 +401,6 @@ atomic and independently verifiable.
 - `ralph plan create ... --max-review-corrections <n>` — cap the
   review→correction recursion (default 3); over the cap, ralph raises a
   blocker for a human instead of looping.
-- `ralph plan create ... --squash-on-complete` — keep one commit per step
-  (instead of the default full per-iteration audit trail).
 - `ralph plan create ... --retry-strategy {keep|rollback}` /
   `ralph step add|edit ... --retry-strategy {keep|rollback}` — how a failed
   attempt's tree is handled before the retry. `keep` (the default) carries
@@ -591,6 +637,50 @@ pub fn preflight_no_live_run(conn: &Connection, project: &str) -> Result<()> {
     Ok(())
 }
 
+/// Non-fatal post-generation DAG sanity check.
+///
+/// An authoring harness that expressed ordering by array/positional order
+/// (the old `--after <N>` trap) instead of real `--depends-on`/`--after`
+/// edges produces an **all-roots, edge-less** plan: it runs in sort order
+/// so tests pass and it "looks linear", but it has none of the gating /
+/// branch-isolation / review-reparenting the author intended. `ralph
+/// import` validates its bundle; `plan harness generate` had no such guard.
+/// This warns (never fails — generation already succeeded) and points at
+/// how to inspect and fix it. Best-effort: any DB hiccup is swallowed.
+pub fn warn_if_edgeless_dag(conn: &Connection, project: &str, plan_slug: Option<&str>) {
+    // The just-generated plan: the named one, else the most recent.
+    let plan = match plan_slug {
+        Some(s) => storage::get_plan_by_slug(conn, s, project).ok().flatten(),
+        None => storage::list_plans_sorted_by_recency(conn, project)
+            .ok()
+            .and_then(|v| v.into_iter().next()),
+    };
+    let Some(plan) = plan else { return };
+    let Ok(steps) = storage::list_steps(conn, &plan.id) else {
+        return;
+    };
+    if steps.len() < 2 {
+        return; // a 0/1-step plan can't have a meaningful edge
+    }
+    let Ok(edges) = storage::list_step_dependency_edges(conn, &plan.id) else {
+        return;
+    };
+    let total_edges: usize = edges.values().map(|v| v.len()).sum();
+    if total_edges == 0 {
+        eprintln!(
+            "\nwarning: plan '{slug}' has {n} steps but ZERO dependency edges — \
+             every step is an independent root.\n         \
+             If you intended an ordering/DAG, this is an authoring mistake \
+             (array/list order is NOT a dependency).\n         \
+             Inspect:  ralph step list {slug}\n         \
+             Fix:      ralph step dependency add <step> --depends-on <step>… \
+             (or re-author with --after/--depends-on / `depends_on` in --import-json).",
+            slug = plan.slug,
+            n = steps.len(),
+        );
+    }
+}
+
 /// Run the interactive plan-harness: spawn a harness with the plan agent definition
 /// and wait for it to exit.
 ///
@@ -614,15 +704,33 @@ pub async fn run_plan_harness(
     let project_path = std::path::Path::new(project);
     let hooks = hook_library::load_all()?;
     let applicable = hook_library::filter_by_project(hooks, project_path);
-    let agent_content = render_plan_agent(&applicable);
+    let base_agent_content = render_plan_agent(&applicable);
+
+    // Build the initial (task) prompt.
+    let prompt = build_initial_prompt(project, description, plan_slug);
+
+    // Plan generation must stay interactive. If this harness's `plan_args`
+    // has no `{prompt}` slot, its TUI cannot be seeded with the task
+    // (e.g. grok — only its headless `-p`/`--prompt-file` take a prompt,
+    // and those exit). Fold the task into the `--agent` definition file so
+    // just opening the harness still conveys WHAT to plan. This is the
+    // mirror of `build_plan_harness_args`'s agent-into-prompt fold for the
+    // no-agent-file case. (Empty `plan_args` is the legacy fallback handled
+    // in `build_plan_harness_args`; don't fold there.)
+    let plan_args_has_prompt = harness_config
+        .plan_args
+        .iter()
+        .any(|a| a.contains("{prompt}"));
+    let agent_content = if !harness_config.plan_args.is_empty() && !plan_args_has_prompt {
+        format!("{base_agent_content}\n\n---\n\n# Your task\n\n{prompt}")
+    } else {
+        base_agent_content
+    };
 
     // Write the agent definition to a temporary file.
     // This file lives for the duration of the harness process.
     let agent_temp_file = write_agent_temp_file(&agent_content)?;
     let agent_file_path = agent_temp_file.path();
-
-    // Build the initial prompt
-    let prompt = build_initial_prompt(project, description, plan_slug);
 
     // Build per-harness args and env
     let args = build_plan_harness_args(

@@ -1474,6 +1474,52 @@ pub fn remove_worktree(workdir: &Path, path: &Path) {
     }
 }
 
+/// Best-effort sweep of review worktrees stranded by a `SIGKILL`'d run.
+///
+/// `ReviewWorktree`'s RAII `Drop` cleans up on every *normal* exit path, but
+/// a forceful second Ctrl+C (`std::process::exit(130)`) or an OS `SIGKILL`
+/// skips `Drop`, leaving a `<tmp>/ralph-review-*` directory and a
+/// `.git/worktrees/` admin entry behind. Reviews are short-lived (a single
+/// read-only `git show` diff), so any `ralph-review-*` temp dir older than a
+/// few hours is unambiguously orphaned. We prune git's admin entries, then
+/// remove on-disk dirs older than the threshold. The mtime-age guard makes
+/// this safe under a *concurrent* ralph run: an in-flight review's worktree
+/// has a recent mtime and is left alone. Never fails the caller.
+pub fn sweep_stale_review_worktrees(main_repo: &Path) {
+    // 6h: orders of magnitude longer than any real review, far short of
+    // anything that would race a live concurrent review.
+    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+    if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("ralph-review-") {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| mtime.elapsed().ok())
+                .map(|age| age >= STALE_AFTER)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
+    // Prune *after* the removals so that the `.git/worktrees/*` admin
+    // entries for the directories we just deleted are reaped in the same
+    // sweep (not stranded until some later run prunes again). A single
+    // prune at the end also clears any entries whose directory was already
+    // gone for unrelated reasons, so this still covers the original intent.
+    let _ = Command::new("git")
+        .args(["worktree", "prune"])
+        .current_dir(main_repo)
+        .output();
+}
+
 /// List the filesystem paths of every registered worktree (including the
 /// main one), for tests asserting no orphan review worktree leaked.
 #[cfg(test)]

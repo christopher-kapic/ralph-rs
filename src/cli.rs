@@ -699,17 +699,31 @@ pub enum StepCommand {
 
     /// Add a new step to a plan.
     ///
-    /// The single-step form takes a positional title plus per-field flags.
-    /// For bulk insertion use `--import-json <FILE|->` to read an array of
-    /// step objects (or a single object) from a file or stdin; the per-field
-    /// flags are mutually exclusive with `--import-json`. When `--import-json`
-    /// is used, the first positional is interpreted as the plan slug (since
-    /// no title is meaningful for a bulk import).
+    /// Every step's place in the dependency DAG is **explicit**. On a
+    /// non-empty plan you must pass exactly one placement:
     ///
-    /// `--depends-on` is the *interactive* path for declaring a DAG edge as
-    /// the step is created; it is rejected together with `--import-json` (the
-    /// bulk JSON form carries no dependency field — declare those afterward
-    /// with `ralph step dependency add`).
+    ///   --after <S>    the new step depends on S (a new branch off S)
+    ///   --before <S>   the new step takes over S's incoming edges; S then
+    ///                   depends only on the new step (insert *before* S; if
+    ///                   S was a root the new step becomes the new root)
+    ///   --after <X> --before <Y>
+    ///                   splice the new step between X and Y (it depends on
+    ///                   X; the X→Y edge is rerouted so Y depends on it)
+    ///   --depends-on <S>...  the general/join form: depend on each S (use
+    ///                   this for a step that needs *several* prior steps)
+    ///   --root         an explicit independent root (deliberate extra root)
+    ///
+    /// The very first step of an empty plan is the implied root and needs no
+    /// flag. `--after`/`--before` are **dependency** edges, not list
+    /// position — there is no positional-only insert any more (that
+    /// ambiguity silently produced edge-less DAGs).
+    ///
+    /// For bulk insertion use `--import-json <FILE|->` (a JSON array, or one
+    /// object) from a file or stdin; it carries the DAG via a per-object
+    /// readable `id` + `depends_on` (validated like `ralph import`; the
+    /// persisted `short_id` is minted, not hand-written). The single-step
+    /// flags are mutually exclusive with `--import-json`; with
+    /// `--import-json` a single positional is the plan slug.
     #[command(after_help = AUTHORING_TIP_COMMITS)]
     Add {
         /// Step title. Required unless `--import-json` is used. With
@@ -725,9 +739,35 @@ pub enum StepCommand {
         #[arg(long, short, conflicts_with = "import_json")]
         description: Option<String>,
 
-        /// Position to insert at (1-based). Defaults to end.
-        #[arg(long, conflicts_with = "import_json")]
-        after: Option<usize>,
+        /// Placement: the new step DEPENDS ON this step (a new branch off
+        /// it), identified by 1-based number or 8-char short id. This is a
+        /// dependency edge, NOT list position. With `--before`, splices the
+        /// new step between this step and the `--before` step.
+        #[arg(
+            long,
+            value_name = "SHORT_ID|NUM",
+            conflicts_with_all = ["import_json", "root", "depends_on"]
+        )]
+        after: Option<String>,
+
+        /// Placement: insert the new step BEFORE this step — the new step
+        /// takes over all of this step's incoming dependency edges and this
+        /// step then depends only on the new step (if it was a root, the new
+        /// step becomes the new root). Identified by number or short id.
+        #[arg(
+            long,
+            value_name = "SHORT_ID|NUM",
+            conflicts_with_all = ["import_json", "root", "depends_on"]
+        )]
+        before: Option<String>,
+
+        /// Placement: add the new step as an explicit independent root (no
+        /// dependencies — a deliberate additional root of the DAG).
+        #[arg(
+            long,
+            conflicts_with_all = ["import_json", "after", "before", "depends_on"]
+        )]
+        root: bool,
 
         /// Agent/model override for this step.
         #[arg(long, conflicts_with = "import_json")]
@@ -779,24 +819,35 @@ pub enum StepCommand {
         #[arg(long = "tag", value_name = "TAG", conflicts_with = "import_json")]
         tags: Vec<String>,
 
-        /// Make the new step depend on an existing step in the same plan,
-        /// identified by 1-based number or 8-char short id (repeatable).
-        /// Each edge is resolved and attached after the step is created;
-        /// self-edges and cycles are rejected. This is the interactive path
-        /// for declaring DAG edges — the `--import-json` bulk form has no
-        /// dependency field, so it conflicts with this flag.
+        /// Placement (general / join form): make the new step depend on each
+        /// of these existing steps, by 1-based number or 8-char short id
+        /// (repeatable). Use this when a step needs *several* prior steps
+        /// (a fan-in / integration step) — `--after`/`--before` are the
+        /// single-parent tree sugar; this is the multi-parent primitive.
+        /// Self-edges and cycles are rejected. Mutually exclusive with the
+        /// other placement flags.
         #[arg(
             long = "depends-on",
             value_name = "SHORT_ID|NUM",
-            conflicts_with = "import_json"
+            conflicts_with_all = ["import_json", "after", "before", "root"]
         )]
         depends_on: Vec<String>,
 
         /// Bulk-insert steps from a JSON file or stdin (use `-` for stdin).
         /// Accepts a JSON array of step objects, or a single object. Each
         /// object requires `title`; `description`, `acceptance_criteria`,
-        /// `agent`, `harness`, and `max_retries` are optional. Steps are
-        /// appended in array order; the whole batch is atomic.
+        /// `agent`, `harness`, `model`, `max_retries`, `change_policy`,
+        /// `retry_strategy`, `review_enabled`, `tags`, `id`, `short_id`, and
+        /// `depends_on` are optional. The DAG is carried in the payload: give
+        /// each step a readable `id` and list its parents' `id`s in
+        /// `depends_on` (a parent may also be an existing plan step by short
+        /// id or number). `id` is a batch-local wiring label only — it is
+        /// NOT persisted; ralph mints each step's 8-char `short_id` (the
+        /// handle later CLI commands resolve). Only set `short_id` to pin an
+        /// exported handle; if set it must be 8 base-62 chars. The whole
+        /// batch is validated (unique ids, no dangling/cyclic edges) and
+        /// inserted atomically — nothing is written if any edge is bad. A
+        /// step with no `depends_on` is a root.
         #[arg(long, value_name = "FILE|-")]
         import_json: Option<String>,
     },

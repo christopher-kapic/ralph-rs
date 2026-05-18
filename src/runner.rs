@@ -113,6 +113,10 @@ pub async fn run_plan(
     // here is definitively orphaned. Skip in dry-run mode (it mutates state).
     if !options.dry_run {
         sweep_and_log_stale_in_progress(conn, &effective_plan, out)?;
+        // Best-effort: reap review worktrees stranded by a force-quit/SIGKILL
+        // of a prior run (RAII Drop is skipped on exit(130)/SIGKILL). Acts
+        // only on >6h-old dirs, so it is safe under a concurrent run.
+        crate::git::sweep_stale_review_worktrees(workdir);
     }
 
     // 2. Stash dirty tree + (optionally) create branch.
@@ -802,18 +806,32 @@ async fn run_plan_inner(
                     );
                 }
                 // DAG scheduler change (docs/dag-redesign.md §1/§3.4/§3.5):
-                // a blocked branch must NOT pause the whole plan. The step
-                // is already in `executed_step_ids` *and* will be in the
-                // recomputed `blocked` set (it left an open interruption),
-                // so the next scheduler tick excludes it and picks another
-                // runnable branch instead of stalling — the §1 payoff. We
-                // do NOT `return` here and do NOT write `Interrupted` to
-                // plans.status (it's a *derived* status). The plan only
-                // reports `Interrupted` once the runnable set is exhausted
-                // (handled after the loop), so a *linear* plan — whose one
-                // blocked step starves all dependents — still pauses
-                // exactly as before (§1: linear plans get zero benefit and
-                // must not regress).
+                // a blocked branch must NOT pause the whole plan. While the
+                // interruption is open the step is in the recomputed
+                // `blocked` set, so the next scheduler tick excludes it and
+                // picks another runnable branch instead of stalling — the §1
+                // payoff. We do NOT `return` here and do NOT write
+                // `Interrupted` to plans.status (it's a *derived* status).
+                // The plan only reports `Interrupted` once the runnable set
+                // is exhausted (handled after the loop), so a *linear* plan —
+                // whose one blocked step starves all dependents — still
+                // pauses exactly as before (§1: linear plans get zero benefit
+                // and must not regress).
+                //
+                // Crucially, a paused step must NOT stay in
+                // `executed_step_ids`: that set permanently excludes a step
+                // from `pick_next_step` for the rest of this run, so leaving
+                // it there means a *same-run* resolution (a human answers
+                // while the loop keeps ticking on another branch — the exact
+                // §1 scenario, or the §9-invariant-4 cross-process bridge)
+                // would drop the step out of `blocked` but it would still
+                // never be re-picked until a fresh `ralph resume` process.
+                // Drop it back out so the next tick after the interruption is
+                // resolved re-queues it (the resolution is injected by
+                // prompt.rs via the bounded resolved-interruption section);
+                // while the interruption stays open `blocked` keeps it
+                // excluded, so this does not busy-spin.
+                executed_step_ids.remove(&current_step.id);
                 result.step_results.push(step_result);
                 continue;
             }
@@ -2252,6 +2270,12 @@ async fn drain_finished_reviews(
             crate::review::ReviewOutcome::Failed { .. } => {
                 // The reviewer only *requested* a corrective step (V29
                 // bridge row). Consumed just below as the sole writer.
+            }
+            crate::review::ReviewOutcome::Discarded => {
+                // The reviewed step was removed (CASCADE) while its review
+                // was in flight; the verdict is for a step that no longer
+                // exists. Nothing to promote, no corrective to request —
+                // skip it rather than failing the whole run.
             }
         }
     }
@@ -5179,6 +5203,93 @@ mod tests {
         // the cross-process re-queue (§9 invariant 4).
         let resumed = schedule_order_blocked(&mut steps, &edges, &full_window(), &HashSet::new());
         assert_eq!(resumed, vec!["s0", "s1", "s2"]);
+    }
+
+    /// Regression for the same-run re-queue bug: the scheduler loop adds
+    /// every picked step to `executed_step_ids` (runner.rs ~695) so it is
+    /// never re-picked this run. A step that paused for an interruption must
+    /// be dropped back out of that set in the `PausedForQuestion` arm —
+    /// otherwise a *same-run* resolution (a human answers while the loop
+    /// keeps ticking on another branch — the §1 payoff / §9-inv-4 bridge)
+    /// clears `blocked` but the step is still permanently excluded and never
+    /// resumes until a fresh process. This models the loop's exact
+    /// executed/blocked transitions across a pause→resolve.
+    #[test]
+    fn test_paused_step_requeues_within_same_run_after_resolution() {
+        // Two independent branches so the loop keeps ticking while one
+        // branch is paused: A: s0   B: s1->s2. s0 pauses on its first pick
+        // (raises an interruption); branch B keeps the loop alive; then the
+        // interruption is resolved mid-run and s0 must run *this run*.
+        let mut steps = make_steps(3);
+        let edges = [(2, 1)]; // s2 <- s1 ; s0 independent
+        let deps_of = deps_map(&steps, &edges);
+
+        let mut executed: HashSet<String> = HashSet::new();
+        let mut blocked: HashSet<String> = HashSet::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut s0_paused_once = false;
+
+        // Drive the scheduler exactly as run_plan_inner does: pick, then
+        // either "execute" (mark Complete + insert into executed) or, for
+        // s0's first pick, take the PausedForQuestion path (insert into
+        // executed at ~695 THEN the arm's `executed.remove`, leaving an open
+        // interruption in `blocked`).
+        let mut ticks = 0;
+        loop {
+            ticks += 1;
+            assert!(ticks < 50, "scheduler must not busy-spin");
+            let depths = compute_step_depths(&steps, &deps_of);
+            let pick = pick_next_step(
+                &steps,
+                &deps_of,
+                &depths,
+                &full_window(),
+                &executed,
+                &blocked,
+            )
+            .map(|s| s.id.clone());
+            let Some(id) = pick else { break };
+
+            // runner.rs:695 — every picked step enters executed_step_ids.
+            executed.insert(id.clone());
+
+            if id == "s0" && !s0_paused_once {
+                // PausedForQuestion arm: leaves an open interruption AND
+                // (the fix) drops the step back out of executed_step_ids.
+                s0_paused_once = true;
+                blocked.insert("s0".to_string());
+                executed.remove("s0"); // <-- the fix under test
+                // Simulate branch B keeping the loop alive, then a human
+                // resolving s0's interruption out of band.
+                continue;
+            }
+
+            order.push(id.clone());
+            for s in steps.iter_mut() {
+                if s.id == id {
+                    s.status = StepStatus::Complete;
+                }
+            }
+            // Resolve s0's interruption once branch B has made progress,
+            // proving the resolution lands mid-run (loop still alive).
+            if id == "s1" {
+                blocked.remove("s0");
+            }
+        }
+
+        assert!(
+            order.contains(&"s0".to_string()),
+            "a paused step whose interruption is resolved mid-run MUST run \
+             in the same run (got order {order:?})"
+        );
+        // Deterministic interleave: s0 pauses; s1 runs (branch B); on
+        // resolution s0 (depth 0) re-queues ahead of the still-gated depth-1
+        // s2; then s2. The point is s0 runs *this run* — not the exact spot.
+        assert_eq!(
+            order,
+            vec!["s1".to_string(), "s0".to_string(), "s2".to_string()],
+            "branch B runs while s0 is paused; s0 resumes after resolution"
+        );
     }
 
     #[test]

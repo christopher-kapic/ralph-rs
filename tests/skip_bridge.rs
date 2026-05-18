@@ -203,6 +203,10 @@ fn setup() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
             "fast",
             "--harness",
             "quick",
+            // Independent root: a skip drops the blocking step and the run
+            // must still advance to (and complete) this one. Mandatory DAG
+            // placement now requires an explicit flag on a non-empty plan.
+            "--root",
         ]),
         "step add 2",
     );

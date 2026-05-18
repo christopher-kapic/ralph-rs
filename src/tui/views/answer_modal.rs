@@ -236,6 +236,15 @@ pub struct InterruptionModal {
     pub freeform: String,
     /// Optional extra note captured via `$EDITOR`.
     pub comment: String,
+    /// Whether the human has explicitly engaged the option list (navigated
+    /// it with j/k). The agent's #1 is *pre-selected* for convenience, but
+    /// §12.4 forbids an implicit "agent decides": pressing Enter after
+    /// Tab-ing away to an empty freeform must NOT silently accept #1. This
+    /// records that the human actually interacted with the ranked list, so
+    /// the option remains a valid submission even once focus moves off it
+    /// (e.g. to add a Comment) — without turning the mere pre-selection into
+    /// an auto-answer.
+    pub option_touched: bool,
 }
 
 impl InterruptionModal {
@@ -260,6 +269,7 @@ impl InterruptionModal {
             focus,
             freeform: String::new(),
             comment: String::new(),
+            option_touched: false,
         }
     }
 
@@ -269,24 +279,24 @@ impl InterruptionModal {
         self.kind == InterruptionKind::Blocker
     }
 
-    /// The currently-chosen resolution text: the highlighted option when the
-    /// option list is focused and non-empty, otherwise the freeform answer.
-    /// `None` when nothing has been chosen/typed yet (e.g. freeform empty).
+    /// The currently-chosen resolution text. **Independent of `self.focus`**:
+    /// an explicitly-typed freeform answer is the deliberate §12.4 escape
+    /// hatch and wins; otherwise the highlighted option (the agent's #1 is
+    /// pre-selected, §12.4) is the answer even when focus has moved to the
+    /// Comment/Freeform field. Keying this off focus was a data-loss bug —
+    /// picking an option then Tab-ing to the Comment field to add a note
+    /// discarded the option and (freeform being empty) blocked submission, so
+    /// a ranked answer + comment could not be submitted together. `None` only
+    /// when there is genuinely nothing chosen (no options *and* empty
+    /// freeform — e.g. a blocker the human hasn't written a resolution for).
     pub fn chosen_resolution(&self) -> Option<String> {
-        match self.focus {
-            InterruptionFocus::Options if !self.options.is_empty() => self
-                .options
-                .get(self.selected_option)
-                .map(|o| o.text.clone()),
-            _ => {
-                let t = self.freeform.trim();
-                if t.is_empty() {
-                    None
-                } else {
-                    Some(t.to_string())
-                }
-            }
+        let freeform = self.freeform.trim();
+        if !freeform.is_empty() {
+            return Some(freeform.to_string());
         }
+        self.options
+            .get(self.selected_option)
+            .map(|o| o.text.clone())
     }
 
     /// The optional comment, trimmed; `None` when blank.
@@ -318,6 +328,7 @@ impl InterruptionModal {
                 if self.focus == InterruptionFocus::Options && !self.options.is_empty() =>
             {
                 self.selected_option = (self.selected_option + 1) % self.options.len();
+                self.option_touched = true;
                 InterruptionModalAction::Pending
             }
             KeyCode::Char('k') | KeyCode::Up
@@ -328,6 +339,7 @@ impl InterruptionModal {
                 } else {
                     self.selected_option - 1
                 };
+                self.option_touched = true;
                 InterruptionModalAction::Pending
             }
             KeyCode::Tab => {
@@ -346,17 +358,29 @@ impl InterruptionModal {
             }
             KeyCode::Char('f') | KeyCode::Char('F') => InterruptionModalAction::EditFreeform,
             KeyCode::Char('m') | KeyCode::Char('M') => InterruptionModalAction::EditComment,
-            KeyCode::Enter => match self.chosen_resolution() {
-                Some(resolution) => InterruptionModalAction::Resolve {
-                    interruption_id: self.interruption_id.clone(),
-                    resolution,
-                    comment: self.comment_opt(),
-                },
+            KeyCode::Enter => {
                 // §12.4: an explicit human answer is required — no implicit
-                // "agent decides" path. Keep the modal open until one is
-                // provided (pick an option or type a freeform answer).
-                None => InterruptionModalAction::Pending,
-            },
+                // "agent decides" path. The pre-selected #1 alone is NOT a
+                // decision; a submission is explicit only when the human
+                // either typed a freeform answer, engaged the ranked list
+                // (navigated it with j/k), or pressed Enter while focused on
+                // the option list (accepting the highlight directly). This
+                // gate is intentionally separate from `chosen_resolution()`
+                // (which stays focus-independent so the option survives focus
+                // moving to the Comment field, and so the renderer can show
+                // the current highlight).
+                let explicit = !self.freeform.trim().is_empty()
+                    || self.option_touched
+                    || self.focus == InterruptionFocus::Options;
+                match self.chosen_resolution() {
+                    Some(resolution) if explicit => InterruptionModalAction::Resolve {
+                        interruption_id: self.interruption_id.clone(),
+                        resolution,
+                        comment: self.comment_opt(),
+                    },
+                    _ => InterruptionModalAction::Pending,
+                }
+            }
             _ => InterruptionModalAction::Pending,
         }
     }
@@ -637,6 +661,55 @@ mod tests {
                 interruption_id: "i1".to_string(),
                 resolution: "opt-b".to_string(),
                 comment: Some("also check perf".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn selected_option_survives_focus_moving_to_comment_field() {
+        // Regression: the user picks option #2, then Tab-s off the option
+        // list to the Comment field to add a note, then Enter. Previously
+        // `chosen_resolution()` keyed off `focus`, so once focus left
+        // `Options` it fell back to the (empty) freeform → `None` → Enter
+        // rejected (Pending), silently discarding the selected option. The
+        // resolution must be focus-independent.
+        let mut m = InterruptionModal::from_interruption(&question(&[("opt-a", 1), ("opt-b", 2)]));
+        assert_eq!(
+            m.handle_key(key(KeyCode::Char('j'))),
+            InterruptionModalAction::Pending,
+            "navigate to opt-b"
+        );
+        // Tab Options -> Freeform -> Comment (focus now off the option list).
+        m.handle_key(key(KeyCode::Tab));
+        m.handle_key(key(KeyCode::Tab));
+        assert_eq!(m.focus, InterruptionFocus::Comment);
+        m.comment = "also check perf".to_string();
+        assert_eq!(
+            m.handle_key(key(KeyCode::Enter)),
+            InterruptionModalAction::Resolve {
+                interruption_id: "i1".to_string(),
+                resolution: "opt-b".to_string(),
+                comment: Some("also check perf".to_string()),
+            },
+            "selected option + comment must submit even with focus off Options"
+        );
+    }
+
+    #[test]
+    fn enter_on_focused_option_list_accepts_preselected_one() {
+        // The intended fast path: a question opens focused on the ranked
+        // list with #1 pre-selected; pressing Enter right there is an
+        // explicit human accept of #1 (the human IS on the list). This is
+        // distinct from Tab-ing away to freeform and pressing Enter (which
+        // must stay Pending — see no_agent_decide_shortcut_*).
+        let mut m = InterruptionModal::from_interruption(&question(&[("best", 1), ("other", 2)]));
+        assert_eq!(m.focus, InterruptionFocus::Options);
+        assert_eq!(
+            m.handle_key(key(KeyCode::Enter)),
+            InterruptionModalAction::Resolve {
+                interruption_id: "i1".to_string(),
+                resolution: "best".to_string(),
+                comment: None,
             }
         );
     }

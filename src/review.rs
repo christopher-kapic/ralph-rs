@@ -203,6 +203,14 @@ pub enum ReviewOutcome {
     /// bridge and a `CorrectiveStepRequested` NDJSON event emitted. The
     /// orchestrator performs the actual DAG mutation later.
     Failed { request_id: String, issues: i32 },
+    /// The reviewed step no longer exists — it was removed (e.g. `ralph step
+    /// remove`, which CASCADE-deletes the row) while its read-only review was
+    /// in flight. The verdict is for a step that is gone, so it is discarded:
+    /// no status/verdict write, no corrective request. Without this the
+    /// `update_step_review_status`/`update_step_status` calls would
+    /// `bail!("Step not found")` and that error would propagate out of the
+    /// scheduler, failing the entire run over an orphaned verdict.
+    Discarded,
 }
 
 /// The verdict-only result a *spawned* (detached, concurrent) review task
@@ -440,6 +448,20 @@ pub fn finalize_review(
     let step_num = *step_num;
     let iteration = *iteration;
 
+    // The review ran detached and concurrently; the step may have been
+    // removed (`ralph step remove` → CASCADE) while it was in flight. A
+    // verdict for a step that no longer exists is discarded — finalizing it
+    // would `bail!("Step not found")` and fail the whole run over an
+    // orphaned verdict.
+    if storage::get_step_by_id(conn, step_id)?.is_none() {
+        if out.format != OutputFormat::Json {
+            eprintln!(
+                "  review of {short_sha} (.{iteration}) ... step removed mid-review — verdict discarded"
+            );
+        }
+        return Ok(ReviewOutcome::Discarded);
+    }
+
     match verdict {
         ReviewVerdict::Pass => {
             storage::update_step_review_status(conn, step_id, ReviewStatus::Passed)?;
@@ -461,22 +483,41 @@ pub fn finalize_review(
         }
         ReviewVerdict::Fail { issues } => {
             let issues = *issues;
-            storage::update_step_review_status(conn, step_id, ReviewStatus::Failed)?;
-            git::annotate_review_verdict(workdir, commit_sha, "failed")?;
 
+            // M1 fix: the `Failed` verdict and its V29 corrective-request
+            // bridge row must land atomically. Previously these were two
+            // separate statements: a crash between them left the step
+            // `review_status = Failed` with NO bridge row, and
+            // `sweep_stale_in_progress` only rescues `InFlight` (never
+            // `Failed`) — so the step ended terminal `Aborted` with no
+            // corrective request and its dependents gated forever, with no
+            // recovery short of a manual `ralph step reset`. Wrapping both
+            // writes in one transaction guarantees the durable corrective
+            // request always exists whenever `review_status = Failed` was
+            // persisted (the §9-inv-3 promise that the bridge survives a
+            // crash between request and drain).
+            //
             // STEP 39 — the reviewer side of the §9-inv-3 structured channel:
             // *request* a corrective step (DB bridge row + NDJSON event).
             // This is the ONLY DAG-adjacent write the review path performs,
             // and it writes a *request*, not the DAG. The orchestrator
             // consumes it later as the sole writer.
-            let request_id = storage::insert_corrective_step_request(
-                conn,
-                step_id,
-                iteration,
-                commit_sha,
-                issues,
-                verdict_body.as_deref(),
-            )?;
+            let request_id = crate::db::with_tx(conn, |conn| {
+                storage::update_step_review_status(conn, step_id, ReviewStatus::Failed)?;
+                let request_id = storage::insert_corrective_step_request(
+                    conn,
+                    step_id,
+                    iteration,
+                    commit_sha,
+                    issues,
+                    verdict_body.as_deref(),
+                )?;
+                Ok(request_id)
+            })?;
+            // The git note is a non-DB audit annotation; do it only after
+            // the verdict is durably committed so a crashed/rolled-back
+            // verdict leaves no contradictory `failed` note either.
+            git::annotate_review_verdict(workdir, commit_sha, "failed")?;
 
             if out.format == OutputFormat::Json {
                 output::emit_ndjson(&RunEvent::ReviewFinished {
@@ -630,10 +671,20 @@ pub fn consume_corrective_request(
             ),
             &[],
         )?;
-        // The reviewed step still becomes Complete/Failed (its commit is
-        // history); the open blocker keeps its dependents gated until a
-        // human resolves it, exactly like any other interruption.
-        finalize_reviewed_step_failed(conn, &reviewed.id)?;
+        // C1 fix (docs/dag-redesign.md §10 item 4): on escalation the
+        // reviewed step must NOT become `Complete`. A step-level blocker only
+        // shadows the step it is keyed to — never its dependents — so if the
+        // step went `Complete` here, `deps_satisfied` would immediately
+        // unblock every dependent (they'd run on the known-defective output)
+        // and `all_done` would finalize the whole plan as `Complete` with the
+        // "needs human" blocker silently ignored. Gating an escalated loop is
+        // therefore *structural*: leave the step non-terminal. With a
+        // non-terminal status + an open blocker it renders derived-`Blocked`,
+        // `deps_satisfied` keeps every dependent gated, and the plan reports
+        // derived `Interrupted` until a human resolves the loop. Its
+        // `review_status` is already `Failed` (set by `finalize_review`); set
+        // it again defensively in case a resume sweep cleared it.
+        storage::update_step_review_status(conn, &reviewed.id, ReviewStatus::Failed)?;
         if out.format == OutputFormat::Json {
             output::emit_ndjson(&RunEvent::ReviewLoopEscalated {
                 step_id: reviewed.id.clone(),
@@ -1519,6 +1570,23 @@ mod tests {
         assert!(
             blockers[0].body.contains("review loop"),
             "blocker body must name the review loop"
+        );
+
+        // C1 regression guard: an escalated step must NOT be `Complete`.
+        // Marking it Complete would let `deps_satisfied` unblock its
+        // dependents onto the known-defective output and let the plan
+        // finalize Complete with the blocker ignored. It stays non-terminal
+        // (gating is structural) with `review_status = Failed`.
+        let a_prime = storage::get_step(&conn, &a_prime_id).unwrap();
+        assert_ne!(
+            a_prime.status,
+            StepStatus::Complete,
+            "escalated step must stay non-terminal so dependents stay gated"
+        );
+        assert_eq!(
+            a_prime.review_status,
+            Some(ReviewStatus::Failed),
+            "escalated step keeps the Failed review verdict"
         );
     }
 }

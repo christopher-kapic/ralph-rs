@@ -1070,6 +1070,8 @@ mod tests {
             Some("Do something"),
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1088,6 +1090,8 @@ mod tests {
             "Second step",
             Some("Do another thing"),
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -1130,6 +1134,7 @@ mod tests {
             &test_out(),
         )
         .unwrap();
+        // First is the root; Third depends on First (a First -> Third chain).
         step_add(
             &conn,
             "my-plan",
@@ -1137,6 +1142,8 @@ mod tests {
             "First",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -1155,7 +1162,9 @@ mod tests {
             &project,
             "Third",
             None,
+            Some("1"), // depends on First (step #1)
             None,
+            false,
             None,
             None,
             None,
@@ -1168,14 +1177,18 @@ mod tests {
             &test_out(),
         )
         .unwrap();
-        // Insert after position 1
+        // Splice "Second" between First and Third: it takes over Third's
+        // incoming edge so the chain becomes First -> Second -> Third.
+        // (Replaces the old positional "insert after position 1".)
         step_add(
             &conn,
             "my-plan",
             &project,
             "Second",
             None,
-            Some(1),
+            None,
+            Some("2"), // before Third (step #2); Second inherits its incoming edges
+            false,
             None,
             None,
             None,
@@ -1194,9 +1207,22 @@ mod tests {
             .unwrap();
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(steps.len(), 3);
-        assert_eq!(steps[0].title, "First");
-        assert_eq!(steps[1].title, "Second");
-        assert_eq!(steps[2].title, "Third");
+        let first = steps.iter().find(|s| s.title == "First").unwrap();
+        let second = steps.iter().find(|s| s.title == "Second").unwrap();
+        let third = steps.iter().find(|s| s.title == "Third").unwrap();
+
+        // The new model is structural: assert the spliced dependency edges
+        // (First -> Second -> Third), not a flat list position.
+        let second_deps = storage::list_step_dependencies(&conn, &second.id).unwrap();
+        assert_eq!(second_deps, vec![first.id.clone()]);
+        let third_deps = storage::list_step_dependencies(&conn, &third.id).unwrap();
+        assert_eq!(third_deps, vec![second.id.clone()]);
+        // First is the sole root.
+        assert!(
+            storage::list_step_dependencies(&conn, &first.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1227,6 +1253,8 @@ mod tests {
             "Build it",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -1277,6 +1305,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1289,13 +1319,18 @@ mod tests {
         )
         .unwrap();
         let criteria = vec!["Inserted check".to_string()];
+        // Insert "Inserted" so it depends on First (a new branch off step #1)
+        // and carries its own criteria + max_retries. (Replaces the old
+        // positional "insert after position 1".)
         step_add(
             &conn,
             "my-plan",
             &project,
             "Inserted",
             None,
-            Some(1),
+            Some("1"), // depends on First (step #1)
+            None,
+            false,
             None,
             None,
             None,
@@ -1313,9 +1348,16 @@ mod tests {
             .unwrap()
             .unwrap();
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
-        assert_eq!(steps[1].title, "Inserted");
-        assert_eq!(steps[1].acceptance_criteria, criteria);
-        assert_eq!(steps[1].max_retries, Some(2));
+        let first = steps.iter().find(|s| s.title == "First").unwrap();
+        let inserted = steps.iter().find(|s| s.title == "Inserted").unwrap();
+        // The inserted step carries its own criteria/max_retries...
+        assert_eq!(inserted.acceptance_criteria, criteria);
+        assert_eq!(inserted.max_retries, Some(2));
+        // ...and is structurally placed as a dependent of First.
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &inserted.id).unwrap(),
+            vec![first.id.clone()]
+        );
     }
 
     #[test]
@@ -1346,6 +1388,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1364,6 +1408,8 @@ mod tests {
             "Second",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -1423,6 +1469,8 @@ mod tests {
             "Old title",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -1497,6 +1545,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1559,6 +1609,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1578,6 +1630,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1596,6 +1650,8 @@ mod tests {
             "C",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -1649,6 +1705,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1668,6 +1726,8 @@ mod tests {
             None,
             None,
             None,
+            true,
+            None,
             None,
             None,
             &[],
@@ -1686,6 +1746,8 @@ mod tests {
             "C",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
@@ -2160,6 +2222,8 @@ mod tests {
             "Step",
             None,
             None,
+            None,
+            true,
             None,
             None,
             None,
