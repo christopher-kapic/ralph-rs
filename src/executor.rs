@@ -687,6 +687,15 @@ async fn finalize_skipped(
     )?;
 
     storage::update_step_status(ctx.conn, &ctx.step.id, StepStatus::Skipped)?;
+    // A skipped step's pending question/blocker is moot — resolve it so the
+    // step does not stay derived-`Blocked` and the plan can finalize
+    // `Complete` (a skipped step counts as done). Mirrors the resolution
+    // baked into `storage::mark_step_skipped` for the CLI/TUI skip paths.
+    storage::resolve_open_interruptions_for_step(
+        ctx.conn,
+        &ctx.step.id,
+        "step skipped — interruption no longer applicable",
+    )?;
 
     write_phase(
         ctx.conn,
@@ -2918,6 +2927,15 @@ fn finalize_precancel(
     // check still needs to see it to tear the whole run down.
     if reason == CancelReason::Skipped {
         crate::signal::clear_pending_skip_state();
+        // Skipping abandons this step's work; its pending question/blocker is
+        // moot. Resolve it so the step doesn't stay derived-`Blocked` and the
+        // plan can finalize `Complete`. (An `Aborted` step is *not* abandoned
+        // — it resumes later — so its interruption is deliberately left open.)
+        storage::resolve_open_interruptions_for_step(
+            conn,
+            step_id,
+            "step skipped — interruption no longer applicable",
+        )?;
     }
     Ok(StepResult {
         outcome,

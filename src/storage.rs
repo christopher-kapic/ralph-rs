@@ -1166,6 +1166,32 @@ pub fn resolve_interruption(
     Ok(())
 }
 
+/// Resolve **every still-open** interruption for `step_id` with `resolution`
+/// (and no human comment), returning how many rows were closed.
+///
+/// Used when a step is skipped. A skipped step's pending question/blocker is
+/// moot — the work it asked about will never run — so the interruption must
+/// not keep the step derived-`Blocked`, must not keep the plan derived
+/// `Interrupted`, and (the actual bug this fixes) must not let the plan
+/// finalize `Complete` while an interruption is still open: a skipped step
+/// counts toward "all done", so without this a `ralph skip` on a
+/// derived-`Blocked` step left a permanently-open interruption behind a
+/// `Complete` plan. Idempotent — `Ok(0)` when nothing is open.
+pub fn resolve_open_interruptions_for_step(
+    conn: &Connection,
+    step_id: &str,
+    resolution: &str,
+) -> Result<usize> {
+    let affected = conn.execute(
+        "UPDATE interruptions \
+         SET resolution = ?1, state = 'resolved', \
+             resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') \
+         WHERE step_id = ?2 AND state = 'open'",
+        params![resolution, step_id],
+    )?;
+    Ok(affected)
+}
+
 /// Delete a plan (cascades to steps and execution_logs via FK).
 pub fn delete_plan(conn: &Connection, plan_id: &str) -> Result<()> {
     let affected = conn.execute("DELETE FROM plans WHERE id = ?1", params![plan_id])?;
@@ -1697,17 +1723,29 @@ pub fn update_step_status_if(
 
 /// Mark a step as skipped and record the operator-supplied reason (if any).
 ///
-/// Writes `status` and `skipped_reason` in a single UPDATE so a concurrent
-/// reader can't observe the skipped status without its reason.
+/// Writes `status` + `skipped_reason` and resolves the step's open
+/// interruptions atomically (one transaction) so a concurrent reader can't
+/// observe the skipped status without its reason, nor a skipped step still
+/// carrying an open interruption. Resolving the interruptions here is what
+/// keeps a `ralph skip` on a derived-`Blocked` step from leaving an
+/// unresolved interruption behind a `Complete` plan (see
+/// [`resolve_open_interruptions_for_step`]).
 pub fn mark_step_skipped(conn: &Connection, step_id: &str, reason: Option<&str>) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE steps SET status = ?1, skipped_reason = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
-        params![StepStatus::Skipped.as_str(), reason, step_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Step not found: {step_id}");
-    }
-    Ok(())
+    crate::db::with_tx(conn, |conn| {
+        let affected = conn.execute(
+            "UPDATE steps SET status = ?1, skipped_reason = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
+            params![StepStatus::Skipped.as_str(), reason, step_id],
+        )?;
+        if affected == 0 {
+            anyhow::bail!("Step not found: {step_id}");
+        }
+        resolve_open_interruptions_for_step(
+            conn,
+            step_id,
+            "step skipped — interruption no longer applicable",
+        )?;
+        Ok(())
+    })
 }
 
 /// Delete a step (cascades to execution_logs and `step_dependencies` via FK).
@@ -2013,6 +2051,17 @@ pub fn reset_step(conn: &Connection, step_id: &str) -> Result<()> {
 /// snapshot is atomic with the flip: no TOCTOU window where a concurrent reader
 /// sees the Aborted row but the caller's return slice reflects the pre-update
 /// state.
+///
+/// **A step with an open interruption is NOT swept.** Such a step is a
+/// *deliberately parked* step, not a crashed-runner orphan: it raised a
+/// question/blocker (the §1 pause, the §10 review-loop escalation, or the
+/// review-error blocker `drain_finished_reviews` raises) and the scheduler
+/// already excludes it as derived-`Blocked` until a human resolves it.
+/// Aborting it here would discard its committed work and reduce it to a
+/// re-implement on the next run while *also* ignoring the human-needed
+/// interruption. Leaving it `InProgress` is correct: the scheduler keeps it
+/// gated, the plan reads derived `Interrupted`, and resolving the
+/// interruption lets the run pick it back up.
 pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
     // Also reset a stranded `review_status = in_flight` back to `pending`
     // in the SAME atomic UPDATE. A crash *during a concurrent review*
@@ -2030,6 +2079,10 @@ pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<S
              review_status = CASE WHEN review_status = ?4 THEN ?5 ELSE review_status END,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE plan_id = ?2 AND status = ?3
+           AND NOT EXISTS (
+               SELECT 1 FROM interruptions i
+               WHERE i.step_id = steps.id AND i.state = 'open'
+           )
          RETURNING {STEP_COLUMNS}",
     );
     let mut stmt = conn.prepare(&sql)?;

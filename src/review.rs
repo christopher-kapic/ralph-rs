@@ -244,6 +244,29 @@ pub struct ReviewTaskResult {
     pub verdict_body: Option<String>,
 }
 
+/// What a *spawned* (detached) review task hands back to the orchestrator's
+/// sole-writer drain. Unlike [`ReviewTaskResult`] (the success-only payload),
+/// this wrapper carries the reviewed step's identity **unconditionally** —
+/// even when `result` is `Err` (the review subprocess errored, or the
+/// §9-inv-2 read-only invariant fired, before any verdict was produced).
+///
+/// Without this, a review *error* lost the step id, so the drain could only
+/// blanket-mark the plan `Failed`: the implementation-complete step was left
+/// `InProgress` + `review_status = InFlight` and the *next* run's
+/// stale-`InProgress` sweep silently re-implemented it (discarding correct,
+/// committed work). With the id in hand the drain instead resets
+/// `review_status` and raises a targeted blocker so the failure surfaces
+/// cleanly and dependents stay gated.
+pub struct SpawnedReview {
+    /// The reviewed step's id — present even on `Err`.
+    pub step_id: String,
+    /// The reviewed iteration number (for the blocker interruption's attempt).
+    pub iteration: i32,
+    /// The subprocess outcome: `Ok` ⇒ a verdict was produced; `Err` ⇒ the
+    /// reviewer could not run / violated the read-only invariant.
+    pub result: Result<ReviewTaskResult>,
+}
+
 /// Run the configured review harness/model against a **committed SHA** and
 /// return the parsed verdict — *without touching the DB* (STEP 37,
 /// docs/dag-redesign.md §3.5 item 3 / §9-inv-2/3).
@@ -640,110 +663,145 @@ pub fn consume_corrective_request(
     request: &storage::CorrectiveStepRequest,
     out: &OutputContext,
 ) -> Result<CorrectiveConsumeOutcome> {
-    // (1) Single-writer guard: only the tick that flips open→consumed acts.
-    if !storage::consume_corrective_step_request(conn, &request.id)? {
-        return Ok(CorrectiveConsumeOutcome::AlreadyConsumed);
-    }
+    // The guarded bridge-row delete AND every follow-up DAG mutation (the §10
+    // insert + re-parent + status writes, OR the cap-escalation blocker) run
+    // inside ONE transaction. Before this, the delete committed immediately
+    // and any later failure — a cycle-guard error mid re-parent, an I/O
+    // error, an `insert_interruption` failure — lost the durable request with
+    // NO corrective step / blocker ever created: the failed review then
+    // silently vanished and its dependents were gated forever with no
+    // recovery. With the transaction, such a failure rolls back the delete
+    // too (rusqlite ROLLBACK-on-drop), so the still-`open` row survives and
+    // the next drain tick retries it. NDJSON / stderr side effects are
+    // deferred until AFTER the commit so a rolled-back mutation is never
+    // announced.
+    let outcome = crate::db::with_tx(conn, |conn| {
+        // (1) Single-writer guard: only the tick that flips open→consumed acts.
+        if !storage::consume_corrective_step_request(conn, &request.id)? {
+            return Ok(CorrectiveConsumeOutcome::AlreadyConsumed);
+        }
 
-    let reviewed = storage::get_step(conn, &request.reviewed_step_id)?;
-    let step_num = step_position(conn, plan, &reviewed.id)?;
+        let reviewed = storage::get_step(conn, &request.reviewed_step_id)?;
 
-    // (2) Recursion cap (STEP 41 / §10 item 4 / §14.5). The chain length the
-    // *next* correction would have is `len(reviewed) + 1`: if `reviewed` is
-    // itself a corrective step A′ (chain_len 1), inserting A″ would be
-    // chain_len 2, etc. Escalate when that would exceed the cap.
-    let cap = effective_max_review_corrections(plan);
-    let next_chain_len = storage::corrective_chain_len(conn, &reviewed.id)? + 1;
-    if next_chain_len > cap {
-        // Raise exactly ONE blocker interruption and stop spawning.
-        storage::insert_interruption(
-            conn,
-            &reviewed.id,
-            request.reviewed_iteration,
-            InterruptionKind::Blocker,
-            &format!(
-                "review loop — needs human: step '{}' has been corrected {} time(s) \
-                 and still fails review (cap {}). A human must intervene; ralph will \
-                 not spawn further corrective steps for this chain.",
-                reviewed.title,
-                next_chain_len - 1,
-                cap
-            ),
-            &[],
-        )?;
-        // C1 fix (docs/dag-redesign.md §10 item 4): on escalation the
-        // reviewed step must NOT become `Complete`. A step-level blocker only
-        // shadows the step it is keyed to — never its dependents — so if the
-        // step went `Complete` here, `deps_satisfied` would immediately
-        // unblock every dependent (they'd run on the known-defective output)
-        // and `all_done` would finalize the whole plan as `Complete` with the
-        // "needs human" blocker silently ignored. Gating an escalated loop is
-        // therefore *structural*: leave the step non-terminal. With a
-        // non-terminal status + an open blocker it renders derived-`Blocked`,
-        // `deps_satisfied` keeps every dependent gated, and the plan reports
-        // derived `Interrupted` until a human resolves the loop. Its
-        // `review_status` is already `Failed` (set by `finalize_review`); set
-        // it again defensively in case a resume sweep cleared it.
-        storage::update_step_review_status(conn, &reviewed.id, ReviewStatus::Failed)?;
-        if out.format == OutputFormat::Json {
-            output::emit_ndjson(&RunEvent::ReviewLoopEscalated {
-                step_id: reviewed.id.clone(),
-                step_num,
+        // (2) Recursion cap (STEP 41 / §10 item 4 / §14.5). The chain length
+        // the *next* correction would have is `len(reviewed) + 1`: if
+        // `reviewed` is itself a corrective step A′ (chain_len 1), inserting
+        // A″ would be chain_len 2, etc. Escalate when that would exceed the
+        // cap.
+        let cap = effective_max_review_corrections(plan);
+        let next_chain_len = storage::corrective_chain_len(conn, &reviewed.id)? + 1;
+        if next_chain_len > cap {
+            // Raise exactly ONE blocker interruption and stop spawning.
+            storage::insert_interruption(
+                conn,
+                &reviewed.id,
+                request.reviewed_iteration,
+                InterruptionKind::Blocker,
+                &format!(
+                    "review loop — needs human: step '{}' has been corrected {} time(s) \
+                     and still fails review (cap {}). A human must intervene; ralph will \
+                     not spawn further corrective steps for this chain.",
+                    reviewed.title,
+                    next_chain_len - 1,
+                    cap
+                ),
+                &[],
+            )?;
+            // C1 fix (docs/dag-redesign.md §10 item 4): on escalation the
+            // reviewed step must NOT become `Complete`. A step-level blocker
+            // only shadows the step it is keyed to — never its dependents — so
+            // if the step went `Complete` here, `deps_satisfied` would
+            // immediately unblock every dependent (they'd run on the
+            // known-defective output) and `all_done` would finalize the whole
+            // plan as `Complete` with the "needs human" blocker silently
+            // ignored. Gating an escalated loop is therefore *structural*:
+            // leave the step non-terminal. With a non-terminal status + an
+            // open blocker it renders derived-`Blocked`, `deps_satisfied`
+            // keeps every dependent gated, and the plan reports derived
+            // `Interrupted` until a human resolves the loop. Its
+            // `review_status` is already `Failed` (set by `finalize_review`);
+            // set it again defensively in case a resume sweep cleared it.
+            storage::update_step_review_status(conn, &reviewed.id, ReviewStatus::Failed)?;
+            return Ok(CorrectiveConsumeOutcome::Escalated {
                 chain_len: next_chain_len - 1,
                 cap,
-            })?;
-        } else {
-            eprintln!(
-                "  review loop on '{}' exceeded cap {cap} — raised a blocker (needs human)",
-                reviewed.title
-            );
+            });
         }
-        return Ok(CorrectiveConsumeOutcome::Escalated {
-            chain_len: next_chain_len - 1,
-            cap,
-        });
-    }
 
-    // (3) Insert corrective step A′ immediately after A (sort order), then
-    // re-parent every former dependent of A onto A′.
-    let (corrective, _pos) = insert_corrective_step(conn, plan, &reviewed)?;
-    storage::add_step_dependency(conn, &corrective.id, &reviewed.id)?;
-    storage::set_step_corrects_step_id(conn, &corrective.id, Some(&reviewed.id))?;
+        // (3) Insert corrective step A′ immediately after A (sort order), then
+        // re-parent every former dependent of A onto A′.
+        let (corrective, _pos) = insert_corrective_step(conn, plan, &reviewed)?;
+        storage::add_step_dependency(conn, &corrective.id, &reviewed.id)?;
+        storage::set_step_corrects_step_id(conn, &corrective.id, Some(&reviewed.id))?;
 
-    // Re-parent: snapshot A's former direct dependents *before* adding A′'s
-    // own edge (A′ depends_on A is already in place; we must not re-point A′
-    // at itself). Every other former dependent of A now ALSO depends on A′.
-    let former_dependents = storage::list_step_dependents(conn, &reviewed.id)?;
-    for dep in former_dependents {
-        if dep == corrective.id {
-            continue; // the A′ -> A edge we just added
+        // Re-parent: snapshot A's former direct dependents *before* adding A′'s
+        // own edge (A′ depends_on A is already in place; we must not re-point
+        // A′ at itself). Every other former dependent of A now ALSO depends on
+        // A′.
+        let former_dependents = storage::list_step_dependents(conn, &reviewed.id)?;
+        for dep in former_dependents {
+            if dep == corrective.id {
+                continue; // the A′ -> A edge we just added
+            }
+            // Cycle-safe (would_create_step_cycle guards inside).
+            storage::add_step_dependency(conn, &dep, &corrective.id)?;
         }
-        // Cycle-safe (would_create_step_cycle guards inside).
-        storage::add_step_dependency(conn, &dep, &corrective.id)?;
+
+        // (4) A becomes Complete with review_status = Failed (its commit stays
+        // in history; dependents are gated by the structural edge to A′, not
+        // A's status).
+        finalize_reviewed_step_failed(conn, &reviewed.id)?;
+
+        Ok(CorrectiveConsumeOutcome::Inserted {
+            corrective_step_id: corrective.id,
+            corrective_short_id: corrective.short_id,
+        })
+    })?;
+
+    // Post-commit side effects (NDJSON event / human log line), emitted only
+    // after the transaction durably committed so a rolled-back corrective
+    // step / escalation is never announced. These are pure reads + emits and
+    // are safe outside the transaction.
+    match &outcome {
+        CorrectiveConsumeOutcome::AlreadyConsumed => {}
+        CorrectiveConsumeOutcome::Escalated { chain_len, cap } => {
+            let reviewed = storage::get_step(conn, &request.reviewed_step_id)?;
+            let step_num = step_position(conn, plan, &reviewed.id)?;
+            if out.format == OutputFormat::Json {
+                output::emit_ndjson(&RunEvent::ReviewLoopEscalated {
+                    step_id: reviewed.id.clone(),
+                    step_num,
+                    chain_len: *chain_len,
+                    cap: *cap,
+                })?;
+            } else {
+                eprintln!(
+                    "  review loop on '{}' exceeded cap {cap} — raised a blocker (needs human)",
+                    reviewed.title
+                );
+            }
+        }
+        CorrectiveConsumeOutcome::Inserted {
+            corrective_step_id,
+            corrective_short_id,
+        } => {
+            if out.format == OutputFormat::Json {
+                output::emit_ndjson(&RunEvent::CorrectiveStepInserted {
+                    corrective_step_id: corrective_step_id.clone(),
+                    corrective_short_id: corrective_short_id.clone(),
+                    corrects_step_id: request.reviewed_step_id.clone(),
+                })?;
+            } else {
+                let reviewed = storage::get_step(conn, &request.reviewed_step_id)?;
+                eprintln!(
+                    "  inserted corrective step {} (corrects '{}') + re-parented dependents",
+                    corrective_short_id, reviewed.title
+                );
+            }
+        }
     }
 
-    // (4) A becomes Complete with review_status = Failed (its commit stays in
-    // history; dependents are gated by the structural edge to A′, not A's
-    // status).
-    finalize_reviewed_step_failed(conn, &reviewed.id)?;
-
-    if out.format == OutputFormat::Json {
-        output::emit_ndjson(&RunEvent::CorrectiveStepInserted {
-            corrective_step_id: corrective.id.clone(),
-            corrective_short_id: corrective.short_id.clone(),
-            corrects_step_id: reviewed.id.clone(),
-        })?;
-    } else {
-        eprintln!(
-            "  inserted corrective step {} (corrects '{}') + re-parented dependents",
-            corrective.short_id, reviewed.title
-        );
-    }
-
-    Ok(CorrectiveConsumeOutcome::Inserted {
-        corrective_step_id: corrective.id,
-        corrective_short_id: corrective.short_id,
-    })
+    Ok(outcome)
 }
 
 /// Transition the reviewed step to `Complete` with `review_status = Failed`

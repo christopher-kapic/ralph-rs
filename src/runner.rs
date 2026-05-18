@@ -365,7 +365,7 @@ async fn run_plan_inner(
     // serialized. A linear / no-review plan never spawns into this set (the
     // executor returns `needs_review: None`), so `reviews.is_empty()` is
     // always true on that path and the loop is byte-identical to before.
-    let mut reviews: tokio::task::JoinSet<Result<crate::review::ReviewTaskResult>> =
+    let mut reviews: tokio::task::JoinSet<crate::review::SpawnedReview> =
         tokio::task::JoinSet::new();
 
     // For `--one`, we need to stop after the first step actually executed;
@@ -667,8 +667,9 @@ async fn run_plan_inner(
             let step_for_review = current_step.clone();
             let config_for_review = config.clone();
             let workdir_for_review = workdir.to_path_buf();
+            let review_step_id = step_for_review.id.clone();
             reviews.spawn(async move {
-                crate::review::run_review_subprocess(
+                let result = crate::review::run_review_subprocess(
                     &plan_for_review,
                     &step_for_review,
                     &config_for_review,
@@ -677,7 +678,17 @@ async fn run_plan_inner(
                     iteration,
                     step_num,
                 )
-                .await
+                .await;
+                // Carry the step identity back even on `Err` so the
+                // sole-writer drain can surface a review *error* cleanly
+                // (reset review_status + raise a blocker) instead of letting
+                // the next run's stale-InProgress sweep re-implement an
+                // implementation-complete step.
+                crate::review::SpawnedReview {
+                    step_id: review_step_id,
+                    iteration,
+                    result,
+                }
             });
         }
 
@@ -887,6 +898,25 @@ async fn run_plan_inner(
         .all(|s| s.status == StepStatus::Complete || s.status == StepStatus::Skipped);
     let any_open_interruption =
         !storage::list_open_interruptions_for_plan(conn, &effective_plan.id)?.is_empty();
+
+    // Invariant: a plan can only be `all_done` (every step Complete/Skipped)
+    // with NO open interruption. A Complete step can't carry an open
+    // interruption (the scheduler parks a derived-`Blocked` step before it
+    // reaches Complete), and skipping a step now resolves its open
+    // interruptions (`storage::mark_step_skipped` /
+    // `resolve_open_interruptions_for_step`) — closing the prior hole where
+    // `ralph skip` on a derived-`Blocked` step left an unresolved
+    // interruption behind a `Complete` plan. The `all_done` arm is kept
+    // first deliberately: a fully Complete/Skipped plan must reach
+    // `Complete`, and preferring `Interrupted` here would instead strand it
+    // forever on a stale interruption the operator already moved past. The
+    // assert catches any future path that reintroduces the inconsistency.
+    debug_assert!(
+        !(all_done && any_open_interruption),
+        "plan {} finalized all-done with an open interruption — a skip path \
+         failed to resolve it (see resolve_open_interruptions_for_step)",
+        effective_plan.slug
+    );
 
     if all_done {
         storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Complete)?;
@@ -2209,7 +2239,7 @@ fn pick_next_step<'a>(
 async fn drain_finished_reviews(
     conn: &Connection,
     plan: &Plan,
-    reviews: &mut tokio::task::JoinSet<Result<crate::review::ReviewTaskResult>>,
+    reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
     workdir: &Path,
     out: &OutputContext,
     block: bool,
@@ -2222,7 +2252,7 @@ async fn drain_finished_reviews(
     // already done. After the (optional) blocking wait, greedily drain every
     // other already-finished task in this same call.
     let mut joined: Vec<
-        std::result::Result<Result<crate::review::ReviewTaskResult>, tokio::task::JoinError>,
+        std::result::Result<crate::review::SpawnedReview, tokio::task::JoinError>,
     > = Vec::new();
     if block {
         match reviews.join_next().await {
@@ -2235,23 +2265,74 @@ async fn drain_finished_reviews(
     }
 
     for j in joined {
-        let task_result = match j {
-            Ok(r) => r,
+        let crate::review::SpawnedReview {
+            step_id,
+            iteration,
+            result,
+        } = match j {
+            Ok(sr) => sr,
             Err(join_err) => {
-                // A panicked / aborted review task: fail-safe, never pass
-                // un-reviewed work.
+                // A panicked / aborted review task: the task died before it
+                // could hand back even its step id, so a targeted recovery
+                // isn't possible. Fail-safe — never pass un-reviewed work.
                 eprintln!("Review task failed to complete: {join_err}");
                 storage::update_plan_status(conn, &plan.id, PlanStatus::Failed)?;
                 return Ok(Some(PlanStatus::Failed));
             }
         };
-        let review = match task_result {
+        let review = match result {
             Ok(r) => r,
             Err(e) => {
-                // A review error (read-only invariant violated, or a
-                // misconfigured review harness): surface it and fail the run
-                // exactly as a hard step failure would (§9-inv-2).
+                // The review SUBPROCESS errored (the §9-inv-2 read-only
+                // invariant fired, or the review harness is misconfigured) —
+                // the reviewer never produced a verdict. But the
+                // implementation itself SUCCEEDED and is committed; the step
+                // is `InProgress` + `review_status = InFlight`. Surface this
+                // cleanly instead of letting the next run's stale-InProgress
+                // sweep silently RE-IMPLEMENT an implementation-complete step:
+                //
+                //   * reset `review_status` InFlight -> Pending so there is no
+                //     phantom in-flight reviewer for a resume to trip over;
+                //   * raise ONE kind=blocker interruption on the reviewed step
+                //     so the failure is visible (`ralph interruption list` /
+                //     the TUI inbox) and — crucially — the step renders
+                //     derived `Blocked`: that gates every dependent AND keeps
+                //     the stale-InProgress sweep from aborting+re-implementing
+                //     it (the sweep now skips steps with an open interruption).
+                //     Resolving the blocker re-runs the step from a clean
+                //     state (re-implement + re-review) — safe and explicit,
+                //     never silent.
+                //
+                // The plan is still marked `Failed` and the run still stops,
+                // exactly as a hard step failure does (§9-inv-2 — never pass
+                // un-reviewed work). The blocker is what makes the *next* run
+                // recover cleanly rather than discard correct committed work.
                 eprintln!("Review failed: {e:#}");
+                if storage::get_step_by_id(conn, &step_id)?.is_some() {
+                    crate::db::with_tx(conn, |conn| {
+                        storage::update_step_review_status(
+                            conn,
+                            &step_id,
+                            crate::plan::ReviewStatus::Pending,
+                        )?;
+                        storage::insert_interruption(
+                            conn,
+                            &step_id,
+                            iteration,
+                            crate::plan::InterruptionKind::Blocker,
+                            &format!(
+                                "review could not run for this step: {e:#}. The \
+                                 implementation is committed but UNREVIEWED. Fix the \
+                                 review configuration if it is misconfigured, then \
+                                 resolve this blocker — ralph will re-run \
+                                 (re-implement and re-review) this step from a clean \
+                                 state. ralph will not continue on unreviewed work."
+                            ),
+                            &[],
+                        )?;
+                        Ok(())
+                    })?;
+                }
                 storage::update_plan_status(conn, &plan.id, PlanStatus::Failed)?;
                 return Ok(Some(PlanStatus::Failed));
             }
