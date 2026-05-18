@@ -2251,9 +2251,8 @@ async fn drain_finished_reviews(
     // If asked to block, wait for the first one; otherwise reap only what is
     // already done. After the (optional) blocking wait, greedily drain every
     // other already-finished task in this same call.
-    let mut joined: Vec<
-        std::result::Result<crate::review::SpawnedReview, tokio::task::JoinError>,
-    > = Vec::new();
+    let mut joined: Vec<std::result::Result<crate::review::SpawnedReview, tokio::task::JoinError>> =
+        Vec::new();
     if block {
         match reviews.join_next().await {
             Some(j) => joined.push(j),
