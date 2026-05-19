@@ -1931,11 +1931,22 @@ async fn stash_if_dirty(
                         }
                         Ok(ReconcileAction::Discard) => {
                             let wdir_d = workdir.to_path_buf();
-                            let _ = blocking_git(move || {
-                                let _ = git::rollback_except(&wdir_d, &[]);
-                                Ok::<_, anyhow::Error>(())
-                            })
-                            .await;
+                            blocking_git(move || git::rollback_except(&wdir_d, &[]))
+                                .await
+                                .context(
+                                    "Discard choice failed while cleaning the working tree; \
+                                     leaving tree untouched for manual recovery",
+                                )?;
+                            let still_dirty = {
+                                let wd = workdir.to_path_buf();
+                                blocking_git(move || git::has_uncommitted_changes(&wd)).await?
+                            };
+                            if still_dirty {
+                                bail!(
+                                    "Discard choice did not fully clean the working tree; \
+                                     resolve manually and retry"
+                                );
+                            }
                             eprintln!("Discarded residue (clean tree).");
                             did_clean = true;
                         }
@@ -1956,7 +1967,7 @@ async fn stash_if_dirty(
                     bail!(
                         "Working tree has uncommitted changes overlapping ralph-owned \
                          files from {} (on plan branch '{}').\n\
-                         (stdout is not a TTY — no interactive prompt offered.)\n\
+                         (stdin/stderr are not both TTYs — no interactive prompt offered.)\n\
                          Quick fixes:\n\
                          \n  ralph skip --changes commit\n    (parks the residue as a [ralph wip] commit with the step's trailer; \
                          safe for the crashed InProgress case)\n\

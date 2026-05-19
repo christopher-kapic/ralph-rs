@@ -958,7 +958,18 @@ impl LiveRunDisplay {
         let crashed = {
             let mut is_crashed = false;
             if lr.child_pid.is_none() {
-                if let Some(ref ua) = lr.updated_at
+                let stale_phase_without_child = matches!(
+                    lr.phase,
+                    Some(
+                        Phase::PreStepHook
+                            | Phase::Commit
+                            | Phase::Rollback
+                            | Phase::PostStepHook
+                            | Phase::Idle
+                    )
+                );
+                if stale_phase_without_child
+                    && let Some(ref ua) = lr.updated_at
                     && let Ok(dt) = ua.parse::<DateTime<Utc>>()
                     && (Utc::now() - dt).num_minutes() > 5
                 {
@@ -1551,6 +1562,34 @@ mod tests {
         live.phase_started_at = Some("not-a-timestamp".into());
         let disp = LiveRunDisplay::from_live_run(&live, 0, false);
         assert!(disp.phase_elapsed_secs.is_none());
+    }
+
+    #[test]
+    fn test_live_run_display_does_not_mark_childless_tests_stale_as_crashed() {
+        let mut live = sample_live_run();
+        live.child_pid = None;
+        live.phase = Some(Phase::Tests);
+        live.updated_at = Some(
+            (Utc::now() - chrono::Duration::minutes(10))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+
+        let disp = LiveRunDisplay::from_live_run(&live, 0, false);
+        assert_eq!(disp.state, "testing");
+    }
+
+    #[test]
+    fn test_live_run_display_marks_stale_internal_phase_without_child_as_crashed() {
+        let mut live = sample_live_run();
+        live.child_pid = None;
+        live.phase = Some(Phase::Commit);
+        live.updated_at = Some(
+            (Utc::now() - chrono::Duration::minutes(10))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+
+        let disp = LiveRunDisplay::from_live_run(&live, 0, false);
+        assert_eq!(disp.state, "crashed");
     }
 
     #[test]
