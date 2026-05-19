@@ -1222,6 +1222,18 @@ fn migrate_v31(conn: &Connection) -> Result<()> {
     // Existing cross-plan rows are invalid under the DAG model and were never
     // schedulable/exportable correctly, so the migration drops them before
     // installing the triggers.
+    //
+    // `IS NOT` is the null-safe distinct operator, deliberately so. A
+    // `BEFORE INSERT/UPDATE` trigger's `WHEN` clause is evaluated *before*
+    // SQLite's (enabled) foreign-key check, so a missing `step_id` makes the
+    // left subquery NULL: `NULL IS NOT 'p'` is true and we abort here with the
+    // cross-plan message rather than the more precise FK/not-found error. That
+    // message imprecision only reaches raw-SQL callers — `add_step_dependency`
+    // does its own `Step not found` vs. cross-plan classification first — and
+    // it never lets a bad row through (both-missing → `NULL IS NOT NULL` is
+    // false → the FK check still rejects it). Keeping `IS NOT` (vs. `=`/`!=`)
+    // is what makes the both-missing case fall through to the FK instead of
+    // silently passing the trigger.
     conn.execute_batch(
         "
         DELETE FROM step_dependencies

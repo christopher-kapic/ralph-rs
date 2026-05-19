@@ -2679,6 +2679,13 @@ pub fn add_step_dependency(
         anyhow::bail!("Adding dependency {step_id} -> {depends_on_step_id} would create a cycle");
     }
 
+    // Plan-local invariant: an edge must connect two steps in the same plan.
+    // The DB enforces this at the boundary via the V31
+    // `step_dependencies_same_plan_{insert,update}` triggers; this in-process
+    // check is deliberate defense-in-depth that runs first so the common path
+    // gets a precise `Step not found` vs. cross-plan error instead of the
+    // trigger's generic abort. If the invariant ever changes, update both this
+    // block and `migrate_v31` together.
     let step_plan: Option<String> = conn
         .query_row(
             "SELECT plan_id FROM steps WHERE id = ?1",

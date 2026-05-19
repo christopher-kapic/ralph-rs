@@ -54,7 +54,7 @@ src/
   main.rs              — Entry point, clap CLI dispatch, resolve_plan helper
   cli.rs               — Clap command/arg definitions (ValueEnum for Lifecycle, PlanStatus)
   config.rs            — JSON config loading (~/.config/ralph-rs/config.json), harness definitions
-  db.rs                — SQLite connection, migrations (V1–V30)
+  db.rs                — SQLite connection, migrations (V1–V31)
   plan.rs              — Plan/Step/ExecutionLog models, enums (RetryStrategy {Keep, Rollback}; StepStatus incl. derived Blocked overlay; PlanStatus incl. derived Interrupted; ReviewStatus; Interruption domain model)
   frac_index.rs        — Base-62 fractional indexing for O(1) step reordering
   storage.rs           — High-level CRUD (plans, steps, step_dependencies + cycle check, short_id mint, interruptions CRUD, corrective-step request bridge, hooks, locks, project prompt)
@@ -332,8 +332,21 @@ view bindings don't fire under the overlay.
   tree-shaped authoring sugar. `ralph step list` now shows each step's
   `short_id` + `deps:`, and `ralph plan harness generate` emits a non-fatal
   warning when it produced an edge-less multi-step plan.
-- **Schema/version:** migrations still run through **V30** (this follow-up
-  is logic/CLI only — no new schema); `Cargo.toml` is **0.1.23**.
+- **Plan-local step dependencies (post-redesign follow-up, V31).** A
+  `step_dependencies` edge is only meaningful inside one plan — the
+  scheduler, import/export, outline, and corrective re-parenting all
+  operate on a single plan's step set. V25's two independent foreign keys
+  blocked dangling step IDs but not a cross-plan edge. V31 enforces the
+  invariant at the DB boundary: it drops any pre-existing cross-plan rows,
+  then installs `BEFORE INSERT` / `BEFORE UPDATE` triggers
+  (`step_dependencies_same_plan_{insert,update}`) that `RAISE(ABORT, …)`
+  on a plan mismatch. `storage::add_step_dependency` additionally
+  re-checks in-process to surface precise errors (`Step not found` vs.
+  cross-plan) on the common path — deliberate defense-in-depth that must
+  stay in sync with the triggers.
+- **Schema/version:** migrations run through **V31** (the explicit
+  step-placement follow-up was logic/CLI only; the plan-local
+  step-dependency follow-up adds V31); `Cargo.toml` is **0.1.24**.
 
 ## Prompt model
 
