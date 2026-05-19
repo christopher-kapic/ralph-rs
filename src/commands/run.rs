@@ -113,6 +113,7 @@ pub fn dispatch_run(
         harness_override,
         dry_run: args.dry_run,
         verbose: args.verbose,
+        resume_target_short_id: None,
     };
 
     if args.all {
@@ -5627,6 +5628,12 @@ fn build_status_summary(
         .filter(|s| s.status == StepStatus::InProgress)
         .count();
 
+    // Wire the open-interruptions count using the same list_ pattern as
+    // runner/executor and the COUNT in plan_effective_status. This powers the
+    // top-level field (always present) and the "blocked" state preference on
+    // any attached LiveRunDisplay.
+    let open_interruptions = storage::list_open_interruptions_for_plan(conn, &plan.id)?.len();
+
     // Load the live-run snapshot for this project and attach it iff its
     // recorded plan_id matches (or is unset — an unbound lock still covers
     // this project). If the live row records a different plan, it belongs to
@@ -5636,7 +5643,11 @@ fn build_status_summary(
     let live_display: Option<output::LiveRunDisplay> =
         live.and_then(|lr| match lr.plan_id.as_deref() {
             Some(pid) if pid != plan.id => None,
-            _ => Some(output::LiveRunDisplay::from_live_run(&lr)),
+            _ => Some(output::LiveRunDisplay::from_live_run(
+                &lr,
+                open_interruptions,
+                plan.pause_requested,
+            )),
         });
 
     let summary = output::StatusSummary {
@@ -5653,6 +5664,7 @@ fn build_status_summary(
         },
         live: live_display,
         pause_requested: plan.pause_requested,
+        open_interruptions,
     };
     Ok((summary, steps))
 }
@@ -7112,11 +7124,15 @@ mod status_live_view_tests {
         assert_eq!(live.attempt, Some(2));
         assert_eq!(live.max_attempts, Some(4));
         assert_eq!(live.current_command.as_deref(), Some("cargo test"));
+        assert_eq!(live.state, "testing");
+        assert_eq!(summary.open_interruptions, 0);
 
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"live\":{"));
         assert!(json.contains("\"pid\":12345"));
         assert!(json.contains("\"phase\":\"tests\""));
+        assert!(json.contains("\"state\":\"testing\""));
+        assert!(json.contains("\"open_interruptions\":0"));
     }
 
     #[test]
@@ -7253,6 +7269,7 @@ mod status_live_view_tests {
             phase: Some(Phase::Tests),
             phase_started_at: Some(started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
             phase_elapsed_secs: Some(12.0),
+            state: "testing".to_string(),
             current_command: Some("cargo test".into()),
             child_pid: Some(54321),
         };

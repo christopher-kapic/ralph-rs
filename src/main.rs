@@ -699,26 +699,6 @@ fn main() -> Result<()> {
                     QuestionAskOutcome::Recorded { .. } => Ok(()),
                 }
             }
-            QuestionCommand::List { plan } => {
-                commands::question::cmd_question_list(&conn, &project, plan.as_deref(), &out)
-            }
-            QuestionCommand::Answer { num, text } => {
-                use std::io::Read;
-                let answer = match text {
-                    Some(t) => t,
-                    None => {
-                        let mut buf = String::new();
-                        std::io::stdin()
-                            .read_to_string(&mut buf)
-                            .context("Failed to read answer text from stdin")?;
-                        buf.trim_end().to_string()
-                    }
-                };
-                commands::question::cmd_question_answer(&conn, &project, num, &answer, &out)
-            }
-            QuestionCommand::Show { num } => {
-                commands::question::cmd_question_show(&conn, &project, num, &out)
-            }
         },
 
         // -- Block (raise a blocker interruption) --
@@ -760,10 +740,17 @@ fn main() -> Result<()> {
                 plan.as_deref(),
                 &out,
             ),
-            InterruptionCommand::Show { id } => {
-                commands::interruption::cmd_interruption_show(&conn, &project, &id, &out)
+            InterruptionCommand::Show { plan, id } => {
+                commands::interruption::cmd_interruption_show(
+                    &conn,
+                    &project,
+                    plan.as_deref(),
+                    &id,
+                    &out,
+                )
             }
             InterruptionCommand::Resolve {
+                plan,
                 id,
                 option,
                 answer,
@@ -771,6 +758,7 @@ fn main() -> Result<()> {
             } => commands::interruption::cmd_interruption_resolve(
                 &conn,
                 &project,
+                plan.as_deref(),
                 &id,
                 option,
                 answer.as_deref(),

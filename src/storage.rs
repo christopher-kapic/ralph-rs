@@ -703,9 +703,8 @@ pub struct OpenQuestion {
 /// [`list_open_interruptions_enriched`]: every *open* interruption for
 /// `project` (optionally one plan slug), ordered `asked_at` ASC then `id`
 /// ASC so an index is stable as new ones arrive. `kind_filter` of
-/// `Some(InterruptionKind::Question)` restricts to questions (the legacy
-/// `question list` surface); `None` returns questions *and* blockers (the
-/// `interruption list` surface).
+/// `Some(InterruptionKind::Question)` restricts to questions only;
+/// `None` returns questions *and* blockers (the `interruption list` surface).
 fn list_open_interruptions_enriched_impl(
     conn: &Connection,
     project: &str,
@@ -791,8 +790,8 @@ fn list_open_interruptions_enriched_impl(
 /// List open *question* interruptions for plans in `project`, optionally
 /// filtered to one plan slug. Native (`interruptions` table, `kind=question`,
 /// `state=open`). Ordered `asked_at` ASC then `id` ASC so an index is stable
-/// as new questions arrive. Drives the deprecated `ralph question list`
-/// alias and the TUI's per-plan open-question surface.
+/// as new questions arrive. Used by the TUI's per-plan open-question surface
+/// (and `list_open_interruptions_enriched` for the full view).
 pub fn list_open_questions(
     conn: &Connection,
     project: &str,
@@ -826,11 +825,11 @@ pub fn list_open_interruptions_enriched(
 
 /// Resolve a *question* interruption with a freeform `answer` (no comment).
 ///
-/// Thin native wrapper over [`resolve_interruption`] kept so the deprecated
-/// `ralph question answer` alias and the TUI answer modal have a
-/// question-shaped entry point. "Question not found" is preserved as the
-/// not-found message (the alias only ever targets questions) while
-/// [`resolve_interruption`] itself reports "Interruption …".
+/// Thin native wrapper over [`resolve_interruption`] that provides a
+/// question-shaped entry point for the TUI answer modal (and any other
+/// question-only call sites). "Question not found" is preserved as the
+/// not-found message while [`resolve_interruption`] itself reports
+/// "Interruption …".
 pub fn set_question_answer(conn: &Connection, question_id: &str, answer: &str) -> Result<()> {
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM interruptions WHERE id = ?1",

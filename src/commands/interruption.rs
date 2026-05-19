@@ -89,15 +89,19 @@ pub fn cmd_interruption_list(
     Ok(())
 }
 
-/// `ralph interruption show <id|index>` — one interruption's full body,
+/// `ralph interruption show [PLAN] <id|index>` — one interruption's full body,
 /// kind, proposed options, and state.
+///
+/// When PLAN is supplied, the selector is resolved (and any index is
+/// interpreted) against only the open interruptions for that plan.
 pub fn cmd_interruption_show(
     conn: &Connection,
     project: &str,
+    plan_slug: Option<&str>,
     selector: &str,
     out: &OutputContext,
 ) -> Result<()> {
-    let opens = storage::list_open_interruptions_enriched(conn, project, None)?;
+    let opens = storage::list_open_interruptions_enriched(conn, project, plan_slug)?;
     let q = match resolve_selector(&opens, selector) {
         Some(q) => q,
         None => bail!(
@@ -146,7 +150,7 @@ pub fn cmd_interruption_show(
     Ok(())
 }
 
-/// `ralph interruption resolve <id|index> [--option K] [--answer T]
+/// `ralph interruption resolve [PLAN] <id|index> [--option K] [--answer T]
 /// [--comment T]`.
 ///
 /// `--option K` picks the K-th proposed option (1-based, priority order, as
@@ -155,16 +159,21 @@ pub fn cmd_interruption_show(
 /// `--answer` or resolves with an empty resolution + comment. `--comment` is
 /// an always-injectable note. Resolving flips state→resolved and un-shadows
 /// the step (its `Blocked` overlay clears — docs/dag-redesign.md §3.4).
+///
+/// When PLAN is supplied, the selector is resolved (and any index is
+/// interpreted) against only the open interruptions for that plan.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_interruption_resolve(
     conn: &Connection,
     project: &str,
+    plan_slug: Option<&str>,
     selector: &str,
     option: Option<usize>,
     answer: Option<&str>,
     comment: Option<&str>,
     out: &OutputContext,
 ) -> Result<()> {
-    let opens = storage::list_open_interruptions_enriched(conn, project, None)?;
+    let opens = storage::list_open_interruptions_enriched(conn, project, plan_slug)?;
     let q = match resolve_selector(&opens, selector) {
         Some(q) => q.clone(),
         None => bail!(
@@ -298,14 +307,15 @@ mod tests {
         assert_eq!(items.len(), 2);
 
         cmd_interruption_list(&conn, project, None, &quiet_out()).unwrap();
-        cmd_interruption_show(&conn, project, &qid, &quiet_out()).unwrap();
+        cmd_interruption_show(&conn, project, None, &qid, &quiet_out()).unwrap();
         // Index selector resolves too.
-        cmd_interruption_show(&conn, project, "1", &quiet_out()).unwrap();
+        cmd_interruption_show(&conn, project, None, "1", &quiet_out()).unwrap();
 
         // Resolve the question via --option 2 (SQLite by priority).
         cmd_interruption_resolve(
             &conn,
             project,
+            None,
             &qid,
             Some(2),
             None,
@@ -323,6 +333,7 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
+            None,
             &bid,
             None,
             Some("granted"),
@@ -352,8 +363,17 @@ mod tests {
         )
         .unwrap();
 
-        let err = cmd_interruption_resolve(&conn, project, &qid, Some(5), None, None, &quiet_out())
-            .unwrap_err();
+        let err = cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &qid,
+            Some(5),
+            None,
+            None,
+            &quiet_out(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("out of range"));
 
         // Still open.
@@ -366,9 +386,17 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let project = "/proj-unk";
         seed_plan_and_step(&conn, "p", project);
-        let err =
-            cmd_interruption_resolve(&conn, project, "nope", None, Some("x"), None, &quiet_out())
-                .unwrap_err();
+        let err = cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            "nope",
+            None,
+            Some("x"),
+            None,
+            &quiet_out(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("No open interruption matched"));
     }
 }

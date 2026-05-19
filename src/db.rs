@@ -569,7 +569,7 @@ fn migrate_v16(conn: &Connection) -> Result<()> {
     // harness mid-run. `attempt` matches `execution_logs.attempt` so the
     // runner can pull "questions asked during the current attempt" without
     // joining through execution_logs. `answer` stays NULL until the user
-    // answers via `ralph question answer` or the TUI; the partial index on
+    // answers via the TUI (or `interruption resolve`) ; the partial index on
     // `answer WHERE answer IS NULL` keeps the "is this plan paused?" lookup
     // O(rows-with-unanswered-questions) instead of O(all-rows).
     //

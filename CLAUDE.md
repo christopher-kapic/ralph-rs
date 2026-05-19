@@ -80,7 +80,7 @@ src/
     step.rs            — Step CRUD, move, edit (agent/harness/criteria/max-retries/retry-strategy), step-level hooks
     run.rs             — Status, log (incl. WIP-skip + per-iteration commits w/ git-note verdict), skip (`--changes`) commands; TUI dispatchers (`run_inbox_tui`, …)
     prompt.rs          — `ralph prompt set/clear/show` (global/project scope; `.ralph/prompt.md`-aware)
-    question.rs        — `ralph question ask --priority` / `ralph block` (harness raises an interruption); legacy `question list/answer` thin aliases over `interruption`
+    question.rs        — `ralph question ask --priority` / `ralph block` (harness raises an interruption)
     interruption.rs    — `ralph interruption list/show/resolve` (human-side resolve of questions + blockers)
     config_cmd.rs      — `ralph config show/set-timezone`, `ralph config review set` (global review block)
     agents.rs          — Agent file CRUD commands
@@ -425,8 +425,6 @@ ralph block [<text>]
 ralph interruption list [<slug>]
 ralph interruption show <id|index>
 ralph interruption resolve <id|index> [--option <k>] [--answer <text>] [--comment <text>]
-ralph question list [<slug>]                  # legacy thin alias over `interruption` (one release)
-ralph question answer <num> [<text>]          # legacy thin alias
 
 ralph export <slug> [-o <file>]
 ralph import <file> [--slug <name>] [--branch <name>] [--strict]

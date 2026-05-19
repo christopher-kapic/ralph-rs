@@ -873,13 +873,20 @@ pub struct StatusSummary {
     /// plain text) when set, so a normal status report stays compact.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub pause_requested: bool,
+    /// Count of open interruptions (questions or blockers) for steps in this
+    /// plan. Always present (0 when none). Wired via
+    /// `storage::list_open_interruptions_for_plan` (or equivalent COUNT) so
+    /// JSON consumers can detect the derived blocked/interrupted state
+    /// without an extra query. When >0 the plan is effectively blocked for
+    /// progress.
+    pub open_interruptions: usize,
 }
 
 /// Serializable projection of a [`LiveRun`] for the `status` command.
 ///
 /// Timestamps are kept as raw strings so the struct mirrors the on-disk row;
-/// `phase_elapsed_secs` is a computed field populated at construction time
-/// when `phase_started_at` parses as a chrono timestamp.
+/// `phase_elapsed_secs` and `state` are computed fields populated at
+/// construction time (see [`LiveRunDisplay::from_live_run`]).
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveRunDisplay {
     pub pid: i64,
@@ -900,6 +907,15 @@ pub struct LiveRunDisplay {
     pub phase_started_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase_elapsed_secs: Option<f64>,
+    /// Derived coarse-grained state string for the live run (and surfaced
+    /// in `status --json`). Values are drawn from the agent-suggested set
+    /// (harness | committing | testing | pre_test_hook | post_test_hook |
+    /// rollback | paused | blocked | crashed | idle) with closest practical
+    /// mappings for the full Phase space (pre_step_hook / post_step_hook
+    /// are emitted as-is). Computed in `from_live_run` from Phase + signals
+    /// (child_pid, updated_at staleness, elapsed) and plan context
+    /// (open_interruptions count, pause_requested).
+    pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -908,16 +924,71 @@ pub struct LiveRunDisplay {
 
 impl LiveRunDisplay {
     /// Project a [`LiveRun`] into its display form, computing
-    /// `phase_elapsed_secs = now() - phase_started_at`. Parse failures on the
-    /// timestamp leave `phase_elapsed_secs` as `None` rather than erroring —
-    /// the point is to surface best-effort observability, not to refuse
-    /// output when the server clock wrote an unparseable string.
-    pub fn from_live_run(lr: &LiveRun) -> Self {
+    /// `phase_elapsed_secs = now() - phase_started_at` and a derived `state`
+    /// string. Parse failures on timestamps leave computed fields as `None`
+    /// rather than erroring — the point is to surface best-effort
+    /// observability.
+    ///
+    /// `open_interruptions` and `pause_requested` come from the plan context
+    /// at call site (in `build_status_summary`) so that `state` can prefer
+    /// "blocked" (when count > 0) or "paused".
+    pub fn from_live_run(lr: &LiveRun, open_interruptions: usize, pause_requested: bool) -> Self {
         let phase_elapsed_secs = lr.phase_started_at.as_deref().and_then(|s| {
             s.parse::<DateTime<Utc>>()
                 .ok()
                 .map(|started| (Utc::now() - started).num_milliseconds() as f64 / 1000.0)
         });
+
+        // Derive `state` with the following precedence (per full agent-suggested
+        // enum decision):
+        //   crashed (heuristic) > blocked (open_interruptions > 0) > paused (pause_requested)
+        //   > phase-derived value (remapping "commit"->"committing", "tests"->"testing";
+        //     PreStepHook/PostStepHook surface as "pre_step_hook"/"post_step_hook").
+        //
+        // Crashed heuristic (conservative, documented). BOTH arms require
+        // `child_pid` to be None: `updated_at` is only bumped on phase
+        // transitions (no intra-phase heartbeat), so a legitimately
+        // long-running harness call or slow test suite leaves it stale while
+        // a live child is still recorded. A recorded child therefore means
+        // "in progress, not crashed" regardless of staleness.
+        // - child_pid is None AND `updated_at` parses and its age is > 5 minutes, OR
+        // - child_pid is None AND phase is Harness or Commit AND
+        //   phase_elapsed_secs > 300s (catches a runner that died mid-phase
+        //   without a final updated_at bump).
+        let crashed = {
+            let mut is_crashed = false;
+            if lr.child_pid.is_none() {
+                if let Some(ref ua) = lr.updated_at
+                    && let Ok(dt) = ua.parse::<DateTime<Utc>>()
+                    && (Utc::now() - dt).num_minutes() > 5
+                {
+                    is_crashed = true;
+                }
+                if !is_crashed
+                    && matches!(lr.phase, Some(Phase::Harness) | Some(Phase::Commit))
+                    && phase_elapsed_secs.is_some_and(|e| e > 300.0)
+                {
+                    is_crashed = true;
+                }
+            }
+            is_crashed
+        };
+
+        let state = if crashed {
+            "crashed".to_string()
+        } else if open_interruptions > 0 {
+            "blocked".to_string()
+        } else if pause_requested {
+            "paused".to_string()
+        } else {
+            match lr.phase {
+                Some(Phase::Commit) => "committing".to_string(),
+                Some(Phase::Tests) => "testing".to_string(),
+                Some(p) => p.as_str().to_string(),
+                None => "idle".to_string(),
+            }
+        };
+
         LiveRunDisplay {
             pid: lr.pid,
             plan_slug: lr.plan_slug.clone(),
@@ -929,6 +1000,7 @@ impl LiveRunDisplay {
             phase: lr.phase,
             phase_started_at: lr.phase_started_at.clone(),
             phase_elapsed_secs,
+            state,
             current_command: lr.current_command.clone(),
             child_pid: lr.child_pid,
         }
@@ -1457,7 +1529,7 @@ mod tests {
     #[test]
     fn test_live_run_display_json_includes_phase_elapsed_secs() {
         let live = sample_live_run();
-        let disp = LiveRunDisplay::from_live_run(&live);
+        let disp = LiveRunDisplay::from_live_run(&live, 0, false);
         assert!(disp.phase_elapsed_secs.is_some());
         let elapsed = disp.phase_elapsed_secs.unwrap();
         assert!(
@@ -1477,7 +1549,7 @@ mod tests {
     fn test_live_run_display_malformed_phase_started_at_yields_none() {
         let mut live = sample_live_run();
         live.phase_started_at = Some("not-a-timestamp".into());
-        let disp = LiveRunDisplay::from_live_run(&live);
+        let disp = LiveRunDisplay::from_live_run(&live, 0, false);
         assert!(disp.phase_elapsed_secs.is_none());
     }
 
@@ -1497,6 +1569,7 @@ mod tests {
             },
             live: None,
             pause_requested: false,
+            open_interruptions: 0,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(
@@ -1519,8 +1592,9 @@ mod tests {
                 pending: 2,
                 in_progress: 1,
             },
-            live: Some(LiveRunDisplay::from_live_run(&sample_live_run())),
+            live: Some(LiveRunDisplay::from_live_run(&sample_live_run(), 0, false)),
             pause_requested: false,
+            open_interruptions: 0,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"live\":{"));

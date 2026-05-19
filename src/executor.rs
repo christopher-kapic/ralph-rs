@@ -229,6 +229,11 @@ enum FailureReason {
     NoChanges,
     /// Harness exited non-zero (or was killed by a signal) — tests never ran.
     HarnessFailed,
+    /// `git commit` (or staging before it) failed — typically a pre-commit
+    /// hook rejection (lint, format, policy). Recoverable within retry budget;
+    /// surfaces via `TerminationReason::CommitFailed` and feeds hook output
+    /// into `previous_failure_reason` for the next prompt.
+    CommitFailed,
 }
 
 impl FailureReason {
@@ -254,6 +259,7 @@ impl FailureReason {
             Self::NoChanges => "no_changes",
             Self::TestFailed => "failed",
             Self::HarnessFailed => "harness_failed",
+            Self::CommitFailed => "commit_failed",
         }
     }
 }
@@ -1621,8 +1627,125 @@ pub async fn execute_step(
                         &step.title,
                         &plan.slug,
                     );
-                    git::stage_except(workdir, &pre_existing_untracked)?;
-                    git::commit_staged(workdir, &commit_msg)?;
+                    // Wrap stage + commit so a pre-commit hook rejection (or other git
+                    // failure) becomes a recoverable in-step failure instead of a hard
+                    // crash out of execute_step. Mirrors harness-nonzero and test-fail
+                    // terminal/retry patterns; consumes the attempt; feeds stderr via
+                    // previous_failure_reason (and test_results for terminal).
+                    let stage_and_commit = git::stage_except(workdir, &pre_existing_untracked)
+                        .and_then(|_| git::commit_staged(workdir, &commit_msg));
+                    if let Err(e) = stage_and_commit {
+                        let err_text = e.to_string();
+                        let mut failure_desc = format!(
+                            "commit rejected by pre-commit hook: {}. Fix the lint/style issues reported by the hook.",
+                            err_text.trim()
+                        );
+                        // Lightweight latent-debt heuristic (best-effort, no over-engineering):
+                        // scan for path-like tokens; if any has low/no overlap with the
+                        // step's `changed_files` this attempt, append note. Signals that
+                        // hook errors may be from pre-existing code outside this diff.
+                        let mut saw_non_overlapping = false;
+                        for token in err_text.split(|c: char| {
+                            !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
+                        }) {
+                            let clean = token.trim_matches(|c: char| {
+                                !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
+                            });
+                            if (clean.contains('/') || (clean.contains('.') && clean.len() > 2))
+                                && !clean.is_empty()
+                            {
+                                let overlaps = changed_files.iter().any(|f| {
+                                    clean == f.as_str()
+                                        || clean.ends_with(f.as_str())
+                                        || f.ends_with(clean)
+                                });
+                                if !overlaps {
+                                    saw_non_overlapping = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if saw_non_overlapping {
+                            failure_desc
+                                .push_str(" (Note: some errors may be in pre-existing files outside this step's diff — latent debt.)");
+                        }
+
+                        if attempt >= max_attempts {
+                            let test_result_strings = vec![failure_desc.clone()];
+                            let fail_output = FailureOutput {
+                                diff: diff.as_deref(),
+                                test_results: &test_result_strings,
+                                stdout: &output.stdout,
+                                stderr: &output.stderr,
+                                parsed: &parsed,
+                                has_changes,
+                            };
+                            return finalize_failure(
+                                &ctx,
+                                exec_log.id,
+                                duration_secs,
+                                attempt,
+                                FailureReason::CommitFailed,
+                                Some(&fail_output),
+                                TerminationReason::CommitFailed,
+                                TestStatus::NotRun,
+                            )
+                            .await;
+                        }
+
+                        // Retry path — mirrors the strategy-aware rollback in
+                        // the harness-nonzero retry arm. The commit failed so
+                        // no iteration commit exists; Rollback reverts via
+                        // rollback_except (the `agent_committed_clean` reset
+                        // guard there is unreachable here — this block only
+                        // runs under `!agent_committed_clean`).
+                        let rolled_back = match retry_strategy {
+                            RetryStrategy::Rollback => {
+                                if has_changes {
+                                    write_phase(
+                                        conn,
+                                        plan,
+                                        &step.id,
+                                        step_num,
+                                        attempt,
+                                        max_attempts,
+                                        Some(exec_log.id),
+                                        Phase::Rollback,
+                                        None,
+                                        ChildUpdate::Clear,
+                                        exec_opts.json_output,
+                                    )?;
+                                    git::rollback_except(workdir, &pre_existing_untracked)?;
+                                }
+                                has_changes
+                            }
+                            RetryStrategy::Keep => false,
+                        };
+                        let test_result_strings = vec![failure_desc.clone()];
+                        storage::update_execution_log(
+                            conn,
+                            exec_log.id,
+                            Some(duration_secs),
+                            diff.as_deref(),
+                            &test_result_strings,
+                            rolled_back,
+                            false,
+                            None,
+                            Some(&output.stdout),
+                            Some(&output.stderr),
+                            parsed.cost_usd,
+                            parsed.input_tokens,
+                            parsed.output_tokens,
+                            parsed.session_id.as_deref(),
+                            Some(TerminationReason::CommitFailed),
+                            Some(TestStatus::NotRun),
+                        )?;
+                        prev_diff = diff;
+                        prev_test_output = Some(test_result_strings.join("\n"));
+                        prev_files_modified = changed_files;
+                        prev_failure_reason = Some(failure_desc);
+                        continue;
+                    }
                     iteration_commit_sha = Some(git::get_commit_hash(workdir)?);
                 }
 
@@ -3191,6 +3314,7 @@ mod tests {
         assert_eq!(FailureReason::TestFailed.hook_label(), "failed");
         assert_eq!(FailureReason::NoChanges.hook_label(), "no_changes");
         assert_eq!(FailureReason::HarnessFailed.hook_label(), "harness_failed");
+        assert_eq!(FailureReason::CommitFailed.hook_label(), "commit_failed");
 
         assert_eq!(FailureReason::Aborted.to_step_status(), StepStatus::Aborted);
         assert_eq!(
@@ -3205,11 +3329,19 @@ mod tests {
             FailureReason::HarnessFailed.to_step_status(),
             StepStatus::Failed
         );
+        assert_eq!(
+            FailureReason::CommitFailed.to_step_status(),
+            StepStatus::Failed
+        );
 
         assert_eq!(FailureReason::NoChanges.to_outcome(), StepOutcome::Failed);
         assert_eq!(FailureReason::TestFailed.to_outcome(), StepOutcome::Failed);
         assert_eq!(
             FailureReason::HarnessFailed.to_outcome(),
+            StepOutcome::Failed
+        );
+        assert_eq!(
+            FailureReason::CommitFailed.to_outcome(),
             StepOutcome::Failed
         );
     }
@@ -3519,6 +3651,146 @@ mod tests {
             Some(TerminationReason::HookFailed)
         );
         assert_eq!(logs[0].test_status, Some(TestStatus::NotRun));
+    }
+
+    /// Harness produces a change (via write_simple_harness), but the
+    /// per-iteration `git commit` is rejected by a pre-commit hook installed
+    /// via a hermetic `core.hooksPath` temp dir + executable shell script
+    /// that exits 1 (with a message mentioning an unrelated path to exercise
+    /// the latent-debt note). Verifies terminal CommitFailed + NotRun path,
+    /// no crash, hook stderr captured in test_results, using max_retries=0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_commit_failure_terminal_reason() {
+        use crate::config::HarnessConfig;
+        use crate::plan::{TerminationReason, TestStatus};
+        use tempfile::TempDir;
+
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        // Hermetic rejecting hook: point core.hooksPath at our dir containing
+        // an executable pre-commit that always fails. The message references a
+        // path with no overlap to the harness-produced file to exercise the
+        // "latent debt" heuristic.
+        let hooks_tmp = TempDir::new().unwrap();
+        let hooks_dir = hooks_tmp.path().join("reject-hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let pre_commit = hooks_dir.join("pre-commit");
+        fs::write(
+            &pre_commit,
+            "#!/bin/sh\necho 'pre-commit hook rejected: style error in unrelated/oldfile.py'\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&pre_commit).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&pre_commit, perms).unwrap();
+        Command::new("git")
+            .args([
+                "config",
+                "core.hooksPath",
+                hooks_dir.to_string_lossy().as_ref(),
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        // Harness that produces a change so we reach (and fail at) the Commit phase.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_simple_harness(harness_tmp.path(), &dir, true);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("changing"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0), // no retries — commit failure is terminal on first attempt
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Register the harness under the name used in create_plan.
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "changing".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Failed);
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::CommitFailed)
+        );
+        assert_eq!(logs[0].test_status, Some(TestStatus::NotRun));
+        assert!(
+            logs[0]
+                .test_results
+                .iter()
+                .any(|s| s.contains("commit rejected by pre-commit hook")),
+            "test_results must contain the commit-failure diagnostic (hook stderr path exercised): {:?}",
+            logs[0].test_results
+        );
     }
 
     /// A harness that exits successfully but produces no changes should

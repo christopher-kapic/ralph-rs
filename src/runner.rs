@@ -5,6 +5,7 @@
 // managing plan-level status transitions.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -52,6 +53,13 @@ pub struct RunOptions {
     pub auto_stash: bool,
     /// Override the harness for this run.
     pub harness_override: Option<String>,
+    /// Optional short_id of the resume target step (populated by
+    /// `resume_plan` from `find_resume_point` + steps list). When present,
+    /// `stash_if_dirty` uses it with `git::has_crash_residue_overlap_for_step`
+    /// (via `iteration_commits_for_step` on the plan branch) for the
+    /// conservative crash-residue detection before offering the medium
+    /// interactive reconcile UX.
+    pub resume_target_short_id: Option<String>,
     /// Dry-run mode: print what would happen without executing.
     pub dry_run: bool,
     /// Print the full per-attempt prompt to stderr instead of the
@@ -142,7 +150,16 @@ pub async fn run_plan(
                 .await
                 .context("Failed to get current git branch")?
         };
-        let stashed = stash_if_dirty(workdir, &effective_plan.slug, options.auto_stash).await?;
+        let stashed = stash_if_dirty(
+            workdir,
+            &effective_plan.slug,
+            Some(&effective_plan.branch_name),
+            options.resume_target_short_id.as_deref(),
+            Some(conn),
+            Some(&effective_plan.id),
+            options.auto_stash,
+        )
+        .await?;
         // Record source_branch + stash_sha on the run_lock row so resume /
         // diagnostics can see what we'll try to restore. Best-effort — if
         // the row isn't there (tests), swallow the error.
@@ -1101,7 +1118,8 @@ pub async fn run_all_plans(
                 .await
                 .context("Failed to get current git branch")?
         };
-        let stashed = stash_if_dirty(workdir, "all", options.auto_stash).await?;
+        let stashed =
+            stash_if_dirty(workdir, "all", None, None, None, None, options.auto_stash).await?;
         let _ = run_lock::record_source_branch_and_stash(
             conn,
             project,
@@ -1310,6 +1328,7 @@ async fn run_all_plans_inner(
             // call won't re-run `setup_branch`.
             auto_stash: options.auto_stash,
             harness_override: options.harness_override.clone(),
+            resume_target_short_id: options.resume_target_short_id.clone(),
             dry_run: options.dry_run,
             verbose: options.verbose,
         };
@@ -1462,6 +1481,7 @@ pub async fn resume_plan(
     let options = RunOptions {
         from: Some(step_num),
         current_branch: true,
+        resume_target_short_id: Some(step.short_id.clone()),
         ..Default::default()
     };
 
@@ -1475,11 +1495,16 @@ pub async fn resume_plan(
 /// `ralph status -v` and `ralph log`.
 ///
 /// `changes` is the user's `--changes` choice. It only matters when the
-/// target step is *currently running in this process*: in that case the
-/// executor (reached through the cancel/kill ladder) parks the harness's
-/// uncommitted work per this strategy. For any non-running step the
-/// changes in the tree aren't causally tied to the skip, so the strategy
-/// is ignored and a one-line note is emitted.
+/// target step is currently running (live harness path via cancel registry
+/// or DB bridge) *or* when the step is stale `InProgress` (crashed runner,
+/// e.g. after pre-commit hook hard-exit) and `changes == Commit`: in the
+/// latter case we directly call `git::park_changes` with `ParkStrategy::Commit`
+/// using the step's `id` for the `Ralph-Skipped-Step` trailer and subject
+/// "[ralph wip] skipped step N: title (crashed runner residue)", after a
+/// conservative `has_uncommitted_changes` safety guard. Only performed if
+/// changes exist; on error we fall back to a note advising manual commit.
+/// For any other non-running step the strategy is ignored (a one-line note
+/// is emitted unless the Stash default).
 pub fn skip_step(
     conn: &Connection,
     plan: &Plan,
@@ -1565,12 +1590,56 @@ pub fn skip_step(
         // No live run despite an InProgress status: this is a stale status
         // (e.g. a crashed prior run). Fall through to the synchronous
         // DB-flip below so the user's skip still takes effect.
+        //
+        // For the Commit strategy we now honor it here: capture any residue
+        // left by the dead runner (e.g. post-harness changes that never got
+        // committed because of a hook crash) as a WIP commit with trailer.
     }
 
-    // Not running here: the working tree's changes (if any) aren't causally
-    // tied to *this* step, so we deliberately don't touch them. Note that
-    // the --changes choice had no effect unless it was the (no-op) default.
-    if changes != crate::git::ParkStrategyKind::Stash {
+    // For a stale InProgress step + explicit --changes commit we (attempt to)
+    // park the crashed-runner residue (if any) using the step id for the
+    // trailer. We use a conservative has_uncommitted_changes guard (no
+    // pre_existing available for the crashed run) and fall back to a
+    // "commit manually" note on park error (be conservative on attribution
+    // and safety). We treat the Commit choice on stale InProgress as handled
+    // (suppress the generic "no effect" note) even if the tree was clean.
+    let handled_stale_commit =
+        step.status == StepStatus::InProgress && changes == crate::git::ParkStrategyKind::Commit;
+    if handled_stale_commit {
+        let workdir = Path::new(&plan.project);
+        let has_changes = git::has_uncommitted_changes(workdir).unwrap_or(false);
+        if has_changes {
+            let trailer_id = &step.id;
+            let subject = format!(
+                "[ralph wip] skipped step {}: {} (crashed runner residue)",
+                actual_num, step.title
+            );
+            let strategy = crate::git::ParkStrategy::Commit { subject };
+            match git::park_changes(workdir, strategy, &[], trailer_id) {
+                Ok(git::ParkOutcome::Committed { sha }) => {
+                    eprintln!(
+                        "Committed crashed-runner residue for step {} '{}' as {}",
+                        actual_num, step.title, sha
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "note: --changes commit could not capture residue for step {} '{}': {} — commit manually if needed",
+                        actual_num, step.title, e
+                    );
+                }
+            }
+        }
+        // (no generic note for this case)
+    }
+
+    // For genuinely non-running steps (or stale InProgress with non-Commit),
+    // the working tree's changes (if any) aren't causally tied to *this*
+    // skip, so we deliberately don't touch them. The --changes choice has
+    // no effect unless it was the (no-op) default. We skip this note when
+    // we just handled a stale-Commit park above.
+    if !handled_stale_commit && changes != crate::git::ParkStrategyKind::Stash {
         eprintln!(
             "note: --changes has no effect — step {} is not running, so its \
              working-tree changes are left untouched",
@@ -1641,16 +1710,102 @@ pub(crate) struct StashedState {
     pub staged_files: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconcileAction {
+    CommitWip,
+    Stash,
+    Discard,
+    Cancel,
+}
+
+/// Tiny stdio prompt (CLI-friendly, no ratatui) for the four crash-reconcile
+/// choices. Used only on TTY after we have detected likely ralph residue.
+fn prompt_crash_reconcile(dirty_files: &[String], step_hint: &str) -> Result<ReconcileAction> {
+    eprintln!(
+        "\nWorking tree has uncommitted changes, and at least one of them \
+         overlaps files touched by recent Ralph-* commits for step '{}' \
+         (likely residue from a crashed InProgress step for this plan).",
+        step_hint
+    );
+    // Detection is overlap-only: a single overlapping file triggers this, but
+    // the dirty set below may also contain UNRELATED work. Commit/Discard act
+    // on the WHOLE tree, not just the residue — so list every dirty file and
+    // say so explicitly. The user makes an informed choice.
+    eprintln!(
+        "\nAll {} uncommitted file(s) below — NOT all are necessarily ralph \
+         residue:",
+        dirty_files.len()
+    );
+    for f in dirty_files {
+        eprintln!("  {}", f);
+    }
+    eprintln!(
+        "\n⚠  Commit and Discard act on ALL of the above, including any \
+         unrelated work. Use Stash if unsure (it is fully recoverable)."
+    );
+    eprintln!("\nReconcile before continuing the run/resume?");
+    eprintln!(
+        "  [c] Commit as [ralph wip]   — commit ALL listed changes as one [ralph wip] commit"
+    );
+    eprintln!("  [s] Stash                 — ralph auto-stash ALL changes (restored on teardown)");
+    eprintln!(
+        "  [d] Discard               — PERMANENTLY delete ALL listed changes (incl. unrelated)"
+    );
+    eprintln!("  [x] Cancel                — abort without touching the tree");
+    for _ in 0..5 {
+        eprint!("Choice [c/s/d/x]: ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return Ok(ReconcileAction::Cancel);
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "c" | "commit" => return Ok(ReconcileAction::CommitWip),
+            "s" | "stash" => return Ok(ReconcileAction::Stash),
+            "d" | "discard" => return Ok(ReconcileAction::Discard),
+            "x" | "cancel" | "q" | "" => return Ok(ReconcileAction::Cancel),
+            other => eprintln!("Unrecognized choice {:?}. Enter c, s, d or x.", other),
+        }
+    }
+    Ok(ReconcileAction::Cancel)
+}
+
 /// If the working tree is dirty, stash it with a ralph-branded message and
 /// return the stash's commit SHA plus the list of files that were staged at
 /// stash time. Returns `Ok(None)` on a clean tree. Bails with a user-facing
 /// error when the tree is dirty and `auto_stash` is false.
+///
+/// When `plan_branch` and/or `resume_target_short_id` are supplied and the
+/// tree is dirty with `auto_stash=false`, we first attempt the "medium"
+/// crash-reconcile UX: if stdout is a TTY and
+/// `git::has_crash_residue_overlap_for_step` (or latest Ralph commit when no
+/// explicit target) reports that the dirty files overlap files touched by
+/// recent Ralph-* commits for the (crashed) step on the plan branch, we pop
+/// an interactive stdio choice (Commit as [ralph wip], Stash, Discard, Cancel).
+/// On Commit/Discard the tree is cleaned and we proceed (return None); on
+/// Stash we perform the stash ourselves and return it; on Cancel we bail.
+///
+/// If not TTY or detection uncertain, we emit a tailored error mentioning
+/// `ralph skip --changes commit` (or the resume step) plus manual options.
+///
+/// The reconcile "Commit as [ralph wip]" path resolves the candidate
+/// `short_id` to its step UUID via `conn`/`plan_id` and parks the changes
+/// through [`git::park_changes`] so the commit carries the standard
+/// `Ralph-Skipped-Step` trailer — making it discoverable by `ralph log` and
+/// revertable by `ralph step reset`, exactly like a `ralph skip --changes
+/// commit` WIP commit. If the UUID can't be resolved (no `conn`, or the
+/// short_id no longer maps to a step) it falls back to a plain trailerless
+/// commit so the reconcile still clears the tree.
 ///
 /// The stash message is `"ralph: auto-stash for plan '<slug>' at
 /// <ISO-8601>"` so teardown (or manual recovery) can locate it by subject.
 async fn stash_if_dirty(
     workdir: &Path,
     plan_slug: &str,
+    plan_branch: Option<&str>,
+    resume_target_short_id: Option<&str>,
+    conn: Option<&Connection>,
+    plan_id: Option<&str>,
     auto_stash: bool,
 ) -> Result<Option<StashedState>> {
     let workdir_owned = workdir.to_path_buf();
@@ -1662,6 +1817,167 @@ async fn stash_if_dirty(
     if !auto_stash {
         let workdir_owned = workdir.to_path_buf();
         let files = blocking_git(move || git::get_all_changed_files(&workdir_owned)).await?;
+
+        // --- crash-reconcile detection + interactive TTY prompt ---
+        let mut candidate: Option<String> = resume_target_short_id.map(|s| s.to_string());
+        let branch_owned = plan_branch.map(|b| b.to_string());
+        let wdir_clone = workdir.to_path_buf();
+
+        if candidate.is_none()
+            && let Some(ref br) = branch_owned
+        {
+            let br2 = br.clone();
+            let wd2 = wdir_clone.clone();
+            if let Ok(iter_cs) = blocking_git(move || git::list_iteration_commits(&wd2, &br2)).await
+                && let Some(l) = iter_cs.first()
+            {
+                candidate = Some(l.step_short_id.clone());
+            }
+        }
+
+        let mut reconciled_stash: Option<StashedState> = None;
+        let mut did_clean = false;
+
+        if let (Some(br), Some(tgt)) = (&branch_owned, &candidate) {
+            let wdir3 = wdir_clone.clone();
+            let br3 = br.clone();
+            let tgt3 = tgt.clone();
+            let is_residue =
+                blocking_git(move || git::has_crash_residue_overlap_for_step(&wdir3, &br3, &tgt3))
+                    .await
+                    .unwrap_or(false);
+
+            if is_residue {
+                // The prompt reads from stdin and writes to stderr, so gate
+                // on *those* streams — not stdout (which carries NDJSON under
+                // `--json` and is piped when a TUI spawns the runner). Keying
+                // on stdout would let a stdin-closed/non-interactive invocation
+                // enter the prompt, hit EOF, and silently Cancel the run.
+                let is_tty = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+                if is_tty {
+                    match prompt_crash_reconcile(&files, tgt) {
+                        Ok(ReconcileAction::CommitWip) => {
+                            let subject =
+                                format!("[ralph wip] crashed-residue before step {}", tgt);
+                            // Resolve the candidate short_id -> step UUID so the
+                            // WIP commit carries the standard Ralph-Skipped-Step
+                            // trailer (discoverable by `ralph log`, revertable by
+                            // `ralph step reset`). Synchronous DB read, done
+                            // before the blocking git call. Falls back to a
+                            // plain trailerless commit if unresolvable.
+                            let trailer_uuid: Option<String> = match (conn, plan_id) {
+                                (Some(c), Some(pid)) => {
+                                    storage::list_steps(c, pid).ok().and_then(|steps| {
+                                        steps.into_iter().find(|s| s.short_id == *tgt).map(|s| s.id)
+                                    })
+                                }
+                                _ => None,
+                            };
+                            let wdir_c = workdir.to_path_buf();
+                            let commit_res = blocking_git(move || match trailer_uuid {
+                                Some(uuid) => git::park_changes(
+                                    &wdir_c,
+                                    git::ParkStrategy::Commit { subject },
+                                    &[],
+                                    &uuid,
+                                )
+                                .map(|_| ()),
+                                None => git::commit_changes(&wdir_c, &subject),
+                            })
+                            .await;
+                            match commit_res {
+                                Ok(_) => {
+                                    eprintln!("Committed residue as [ralph wip] (clean tree).");
+                                    did_clean = true;
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Warning: [ralph wip] commit failed ({e}); tree may still be dirty."
+                                    );
+                                }
+                            }
+                        }
+                        Ok(ReconcileAction::Stash) => {
+                            // Perform the exact same stash that auto=true path would do.
+                            let staged = blocking_git({
+                                let wd = workdir.to_path_buf();
+                                move || git::list_staged_files(&wd)
+                            })
+                            .await
+                            .unwrap_or_default();
+                            let ts = chrono::Utc::now()
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                            let message = format!(
+                                "ralph: auto-stash for plan '{plan_slug}' at {ts} (reconcile)"
+                            );
+                            let wd_s = workdir.to_path_buf();
+                            let msg_s = message.clone();
+                            match blocking_git(move || {
+                                git::stash_push_with_untracked(&wd_s, &msg_s)
+                            })
+                            .await
+                            {
+                                Ok(Some(stash_ref)) => {
+                                    reconciled_stash = Some(StashedState {
+                                        stash_ref,
+                                        staged_files: staged,
+                                    });
+                                    eprintln!("Stashed (via reconcile choice).");
+                                }
+                                _ => {
+                                    eprintln!("Stash choice could not complete; will error below.");
+                                }
+                            }
+                        }
+                        Ok(ReconcileAction::Discard) => {
+                            let wdir_d = workdir.to_path_buf();
+                            let _ = blocking_git(move || {
+                                let _ = git::rollback_except(&wdir_d, &[]);
+                                Ok::<_, anyhow::Error>(())
+                            })
+                            .await;
+                            eprintln!("Discarded residue (clean tree).");
+                            did_clean = true;
+                        }
+                        Ok(ReconcileAction::Cancel) | Err(_) => {
+                            bail!(
+                                "User cancelled at crash-reconcile prompt. \
+                                 Working tree left dirty; resolve manually and re-invoke."
+                            );
+                        }
+                    }
+                } else {
+                    // Non-TTY or uncertain: improved, actionable error (points at skip --changes now that it works)
+                    let step_desc = if resume_target_short_id.is_some() {
+                        format!("resume target step {}", tgt)
+                    } else {
+                        format!("step {} (most recent Ralph-* on branch)", tgt)
+                    };
+                    bail!(
+                        "Working tree has uncommitted changes overlapping ralph-owned \
+                         files from {} (on plan branch '{}').\n\
+                         (stdout is not a TTY — no interactive prompt offered.)\n\
+                         Quick fixes:\n\
+                         \n  ralph skip --changes commit\n    (parks the residue as a [ralph wip] commit with the step's trailer; \
+                         safe for the crashed InProgress case)\n\
+                         \n  git stash push --include-untracked\n  git add -A && git commit -m '[ralph wip] manual'\n  git checkout -- . && git clean -fd\n\
+                         \nThen retry `ralph resume` (or `ralph run`). Or set `auto_stash: true` in config.",
+                        step_desc,
+                        plan_branch.unwrap_or("(unknown)")
+                    );
+                }
+            }
+        }
+
+        if let Some(st) = reconciled_stash {
+            return Ok(Some(st));
+        }
+        if did_clean {
+            // We cleaned via commit or discard; proceed as if tree was clean.
+            return Ok(None);
+        }
+
+        // Fallthrough: no (or failed) reconcile — original generic refusal.
         let mut msg = format!(
             "Working tree has uncommitted changes; refusing to run with \
              auto_stash disabled and {} file(s) dirty:\n",
@@ -3070,12 +3386,16 @@ mod tests {
         )
         .unwrap();
 
+        // Use Commit here so the test exercises the new stale-InProgress +
+        // Commit fallthrough (has_uncommitted_changes returns false on the
+        // non-repo /p project, so we take the safe no-op arm but still cover
+        // the branch and the "no DB request left" assertions).
         let skipped = skip_step(
             &conn,
             &plan,
             Some(1),
             None,
-            crate::git::ParkStrategyKind::Stash,
+            crate::git::ParkStrategyKind::Commit,
         )
         .unwrap();
         assert_eq!(skipped, 1);
@@ -4292,9 +4612,11 @@ mod tests {
         let (_tmp, dir) = init_git_repo();
         fs::write(dir.join("scratch.txt"), "wip").unwrap();
 
-        let err = stash_if_dirty(&dir, "demo", /*auto_stash=*/ false)
-            .await
-            .expect_err("dirty tree with auto_stash=false must bail");
+        let err = stash_if_dirty(
+            &dir, "demo", None, None, None, None, /*auto_stash=*/ false,
+        )
+        .await
+        .expect_err("dirty tree with auto_stash=false must bail");
         let msg = format!("{err}");
         assert!(
             msg.contains("scratch.txt"),
@@ -4414,7 +4736,7 @@ mod tests {
         let staged_before = git::list_staged_files(&dir).unwrap();
         assert_eq!(staged_before, vec!["staged.txt".to_string()]);
 
-        let stashed = stash_if_dirty(&dir, "demo", true)
+        let stashed = stash_if_dirty(&dir, "demo", Some("demo"), None, None, None, true)
             .await
             .unwrap()
             .expect("expected a stash");
@@ -4448,10 +4770,18 @@ mod tests {
 
         let source_branch = git::get_current_branch(&dir).unwrap();
 
-        let stash = stash_if_dirty(&dir, "demo", /*auto_stash=*/ true)
-            .await
-            .unwrap()
-            .expect("expected a stash SHA");
+        let stash = stash_if_dirty(
+            &dir,
+            "demo",
+            Some("demo"),
+            None,
+            None,
+            None,
+            /*auto_stash=*/ true,
+        )
+        .await
+        .unwrap()
+        .expect("expected a stash SHA");
 
         // Tree is clean; scratch.txt is gone; tracked file is reverted.
         assert!(!git::has_uncommitted_changes(&dir).unwrap());
@@ -4520,10 +4850,21 @@ mod tests {
     async fn test_clean_tree_no_stash_needed() {
         let (_tmp, dir) = init_git_repo();
 
-        let result_off = stash_if_dirty(&dir, "demo", false).await.unwrap();
+        let result_off = stash_if_dirty(&dir, "demo", Some("feat/clean"), None, None, None, false)
+            .await
+            .unwrap();
         assert!(result_off.is_none());
-        let result_on = stash_if_dirty(&dir, "demo", true).await.unwrap();
+        let result_on = stash_if_dirty(&dir, "demo", Some("feat/clean"), None, None, None, true)
+            .await
+            .unwrap();
         assert!(result_on.is_none());
+
+        // Exercise the new conservative detection helper (no trailers => no residue).
+        assert!(
+            !git::has_crash_residue_overlap_for_step(&dir, "feat/clean", "no-such-short")
+                .unwrap_or(false),
+            "detection must be conservative (false) when no matching Ralph commits exist"
+        );
 
         let plan = Plan {
             id: "p1".to_string(),
@@ -4570,7 +4911,7 @@ mod tests {
 
         // Pre-stash: README has version A queued up.
         fs::write(dir.join("README.md"), "# version A\n").unwrap();
-        let stash = stash_if_dirty(&dir, "demo", true)
+        let stash = stash_if_dirty(&dir, "demo", Some("demo"), None, None, None, true)
             .await
             .unwrap()
             .expect("sha");
@@ -4751,7 +5092,7 @@ mod tests {
         let (_tmp, dir) = init_git_repo();
         fs::write(dir.join("scratch.txt"), "wip").unwrap();
 
-        let stash = stash_if_dirty(&dir, "crashy", true)
+        let stash = stash_if_dirty(&dir, "crashy", Some("crashy"), None, None, None, true)
             .await
             .unwrap()
             .expect("sha");

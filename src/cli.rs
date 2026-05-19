@@ -307,11 +307,12 @@ pub enum Command {
         lines: Option<usize>,
     },
 
-    /// Ask the user a question or list/answer outstanding questions on a plan.
+    /// Record a harness-asked question mid-step (`ralph question ask`).
     ///
-    /// `ralph question ask` is invoked by the harness mid-step to pause for
-    /// clarification on a per-plan opt-in question feature. See TUI-plan.md
-    /// §17 for the full design.
+    /// Invoked by the harness mid-step to pause for clarification on a
+    /// per-plan opt-in question feature (binds via the run lock). See
+    /// TUI-plan.md §17 for the full design. Human-side management of open
+    /// questions/blockers uses the `interruption` subcommands.
     #[command(subcommand)]
     Question(QuestionCommand),
 
@@ -1189,41 +1190,6 @@ pub enum QuestionCommand {
         #[arg(long = "priority", value_name = "N")]
         priority: Vec<i32>,
     },
-
-    /// [DEPRECATED — use `ralph interruption list`] List open questions.
-    ///
-    /// Thin alias retained for one release: identical to
-    /// `ralph interruption list` filtered to `kind=question`
-    /// (docs/dag-redesign.md §7/§13.3). Output is numbered 1..N — those
-    /// numbers feed `ralph question answer` / `ralph question show`. Prefer
-    /// `ralph interruption list`, which also surfaces blockers.
-    List {
-        /// Filter to questions on a specific plan slug. Without this, all
-        /// open questions on plans for the current project are listed.
-        plan: Option<String>,
-    },
-
-    /// [DEPRECATED — use `ralph interruption resolve`] Answer an open
-    /// question by its `ralph question list` index.
-    ///
-    /// Thin alias retained for one release: resolves the N-th open
-    /// *question* interruption with freeform text, exactly as
-    /// `ralph interruption resolve <id> --answer <text>`
-    /// (docs/dag-redesign.md §7/§13.3).
-    Answer {
-        /// 1-based index from `ralph question list`.
-        num: usize,
-
-        /// Answer text. If omitted, read from stdin (heredoc-friendly).
-        text: Option<String>,
-    },
-
-    /// Print a question's full text and any harness-supplied suggestions,
-    /// identified by its index in `ralph question list`.
-    Show {
-        /// 1-based index from `ralph question list`.
-        num: usize,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,18 +1211,42 @@ pub enum InterruptionCommand {
 
     /// Print one interruption's full body, kind, proposed options (with
     /// priority), and resolution state.
+    ///
+    /// Accepts an optional leading [PLAN] positional (consistent with
+    /// `interruption list`, `status`, `log`, `run`, etc.). When PLAN is
+    /// supplied the selector <id|index> is resolved only against that
+    /// plan's open interruptions (so "1" is the first open item *on that
+    /// plan*).
+    #[command(allow_missing_positional = true)]
     Show {
+        /// Optional plan slug. When supplied, <id|index> resolution + index
+        /// numbering are scoped to this plan only.
+        plan: Option<String>,
+
         /// Interruption id (a uuid) OR its 1-based index in
-        /// `ralph interruption list`.
+        /// `ralph interruption list` (or the plan-scoped list when PLAN
+        /// is given).
         id: String,
     },
 
     /// Resolve an open interruption: record the chosen answer/resolution
     /// (and optional comment), flip it to `resolved`, and un-shadow the
     /// step (its `Blocked` overlay clears so the scheduler re-queues it).
+    ///
+    /// Accepts an optional leading [PLAN] positional (consistent with
+    /// `interruption list`, `status`, `log`, `run`, etc.). When PLAN is
+    /// supplied the selector <id|index> is resolved only against that
+    /// plan's open interruptions (so "1" is the first open item *on that
+    /// plan*).
+    #[command(allow_missing_positional = true)]
     Resolve {
+        /// Optional plan slug. When supplied, <id|index> resolution + index
+        /// numbering are scoped to this plan only.
+        plan: Option<String>,
+
         /// Interruption id (a uuid) OR its 1-based index in
-        /// `ralph interruption list`.
+        /// `ralph interruption list` (or the plan-scoped list when PLAN
+        /// is given).
         id: String,
 
         /// Resolve with the k-th proposed option (1-based, in priority
@@ -2818,13 +2808,28 @@ mod tests {
             Command::Interruption(InterruptionCommand::List { plan: None })
         ));
 
+        // 1-arg selector (plan omitted)
         let cli = Cli::try_parse_from(["ralph-rs", "interruption", "show", "abc-123"]).unwrap();
-        if let Command::Interruption(InterruptionCommand::Show { id }) = cli.command.unwrap() {
+        if let Command::Interruption(InterruptionCommand::Show { plan, id }) = cli.command.unwrap()
+        {
+            assert_eq!(plan, None);
             assert_eq!(id, "abc-123");
         } else {
             panic!("Expected Interruption Show");
         }
 
+        // 2-arg form: [PLAN] <id>
+        let cli = Cli::try_parse_from(["ralph-rs", "interruption", "show", "my-plan", "def-456"])
+            .unwrap();
+        if let Command::Interruption(InterruptionCommand::Show { plan, id }) = cli.command.unwrap()
+        {
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+            assert_eq!(id, "def-456");
+        } else {
+            panic!("Expected Interruption Show with plan");
+        }
+
+        // 1-arg selector (plan omitted)
         let cli = Cli::try_parse_from([
             "ralph-rs",
             "interruption",
@@ -2837,18 +2842,48 @@ mod tests {
         ])
         .unwrap();
         if let Command::Interruption(InterruptionCommand::Resolve {
+            plan,
             id,
             option,
             answer,
             comment,
         }) = cli.command.unwrap()
         {
+            assert_eq!(plan, None);
             assert_eq!(id, "2");
             assert_eq!(option, Some(1));
             assert!(answer.is_none());
             assert_eq!(comment.as_deref(), Some("go for it"));
         } else {
             panic!("Expected Interruption Resolve");
+        }
+
+        // 2-arg form: [PLAN] <index> + flags
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "interruption",
+            "resolve",
+            "the-plan",
+            "3",
+            "--answer",
+            "custom",
+        ])
+        .unwrap();
+        if let Command::Interruption(InterruptionCommand::Resolve {
+            plan,
+            id,
+            option,
+            answer,
+            comment,
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(plan.as_deref(), Some("the-plan"));
+            assert_eq!(id, "3");
+            assert_eq!(option, None);
+            assert_eq!(answer.as_deref(), Some("custom"));
+            assert!(comment.is_none());
+        } else {
+            panic!("Expected Interruption Resolve with plan");
         }
     }
 
@@ -2866,61 +2901,6 @@ mod tests {
             "freeform",
         ]);
         assert!(res.is_err(), "--option and --answer are mutually exclusive");
-    }
-
-    #[test]
-    fn test_parse_question_list_no_plan() {
-        let cli = Cli::try_parse_from(["ralph-rs", "question", "list"]).unwrap();
-        if let Command::Question(QuestionCommand::List { plan }) = cli.command.unwrap() {
-            assert!(plan.is_none());
-        } else {
-            panic!("Expected Question List");
-        }
-    }
-
-    #[test]
-    fn test_parse_question_list_with_plan() {
-        let cli = Cli::try_parse_from(["ralph-rs", "question", "list", "my-plan"]).unwrap();
-        if let Command::Question(QuestionCommand::List { plan }) = cli.command.unwrap() {
-            assert_eq!(plan.as_deref(), Some("my-plan"));
-        } else {
-            panic!("Expected Question List");
-        }
-    }
-
-    #[test]
-    fn test_parse_question_answer() {
-        let cli =
-            Cli::try_parse_from(["ralph-rs", "question", "answer", "3", "use Postgres"]).unwrap();
-        if let Command::Question(QuestionCommand::Answer { num, text }) = cli.command.unwrap() {
-            assert_eq!(num, 3);
-            assert_eq!(text.as_deref(), Some("use Postgres"));
-        } else {
-            panic!("Expected Question Answer");
-        }
-    }
-
-    #[test]
-    fn test_parse_question_answer_text_optional_for_stdin() {
-        // Omitting the text positional must still parse so the dispatcher can
-        // fall back to stdin (heredoc-friendly invocation).
-        let cli = Cli::try_parse_from(["ralph-rs", "question", "answer", "1"]).unwrap();
-        if let Command::Question(QuestionCommand::Answer { num, text }) = cli.command.unwrap() {
-            assert_eq!(num, 1);
-            assert!(text.is_none());
-        } else {
-            panic!("Expected Question Answer");
-        }
-    }
-
-    #[test]
-    fn test_parse_question_show() {
-        let cli = Cli::try_parse_from(["ralph-rs", "question", "show", "2"]).unwrap();
-        if let Command::Question(QuestionCommand::Show { num }) = cli.command.unwrap() {
-            assert_eq!(num, 2);
-        } else {
-            panic!("Expected Question Show");
-        }
     }
 
     #[test]

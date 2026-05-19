@@ -1362,6 +1362,54 @@ pub fn iteration_commits_for_step(
         .collect())
 }
 
+/// Return the distinct file paths touched by the listed commits (added,
+/// modified, deleted, etc.). Uses `git diff-tree --name-only -r` per SHA.
+/// Empty input or no output yields empty vec. Duplicates removed but order
+/// is first-seen.
+pub fn files_touched_by_commits(workdir: &Path, shas: &[String]) -> Result<Vec<String>> {
+    let mut seen = Vec::new();
+    for sha in shas {
+        let out = git(
+            workdir,
+            &["diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+        )
+        .with_context(|| format!("git diff-tree for commit {sha} failed"))?;
+        for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if !seen.contains(&line.to_string()) {
+                seen.push(line.to_string());
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// Returns true iff there are Ralph-* iteration commits for `short_id` on
+/// `branch` *and* the current uncommitted dirty files overlap at least one
+/// path touched by the most recent (up to 3) of those commits.
+///
+/// This is the conservative "likely ralph-owned crash residue from the
+/// InProgress step" test used by the medium crash-reconcile UX in
+/// `stash_if_dirty`. Errors during detection are treated as "no" (do not
+/// offer interactive recovery).
+pub fn has_crash_residue_overlap_for_step(
+    workdir: &Path,
+    branch: &str,
+    short_id: &str,
+) -> Result<bool> {
+    let commits = iteration_commits_for_step(workdir, branch, short_id)?;
+    if commits.is_empty() {
+        return Ok(false);
+    }
+    let recent_shas: Vec<String> = commits.into_iter().take(3).map(|c| c.sha).collect();
+    let touched = files_touched_by_commits(workdir, &recent_shas)?;
+    if touched.is_empty() {
+        return Ok(false);
+    }
+    let dirty = get_all_changed_files(workdir)?;
+    let overlap = dirty.iter().any(|d| touched.contains(d));
+    Ok(overlap)
+}
+
 /// Squash every commit reachable from HEAD back to (but excluding) `base_sha`
 /// into a single new commit with `message`, preserving the working tree.
 ///
