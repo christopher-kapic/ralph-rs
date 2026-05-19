@@ -40,6 +40,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v28,
     migrate_v29,
     migrate_v30,
+    migrate_v31,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -1202,6 +1203,61 @@ fn migrate_v30(conn: &Connection) -> Result<()> {
     // untouched and old export JSON keeps round-tripping via
     // `#[serde(default)]`.
     conn.execute_batch("ALTER TABLE plans ADD COLUMN max_review_corrections INTEGER;")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V31: enforce plan-local step dependency edges
+// ---------------------------------------------------------------------------
+
+fn migrate_v31(conn: &Connection) -> Result<()> {
+    // A step dependency is only meaningful inside one plan: the scheduler,
+    // import/export, outline, and corrective-step re-parenting all operate on
+    // a single plan's step set. V25's two independent foreign keys prevented
+    // dangling step IDs but did not prevent `step_id` from one plan depending
+    // on `depends_on_step_id` from another. Enforce the invariant at the DB
+    // boundary with triggers so every writer (storage API, tests, ad-hoc SQL,
+    // future tooling) gets the same guarantee.
+    //
+    // Existing cross-plan rows are invalid under the DAG model and were never
+    // schedulable/exportable correctly, so the migration drops them before
+    // installing the triggers.
+    conn.execute_batch(
+        "
+        DELETE FROM step_dependencies
+        WHERE EXISTS (
+            SELECT 1
+            FROM steps child
+            JOIN steps dep ON dep.id = step_dependencies.depends_on_step_id
+            WHERE child.id = step_dependencies.step_id
+              AND child.plan_id != dep.plan_id
+        );
+
+        CREATE TRIGGER step_dependencies_same_plan_insert
+        BEFORE INSERT ON step_dependencies
+        FOR EACH ROW
+        WHEN (
+            SELECT plan_id FROM steps WHERE id = NEW.step_id
+        ) IS NOT (
+            SELECT plan_id FROM steps WHERE id = NEW.depends_on_step_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'step dependencies must stay within one plan');
+        END;
+
+        CREATE TRIGGER step_dependencies_same_plan_update
+        BEFORE UPDATE OF step_id, depends_on_step_id ON step_dependencies
+        FOR EACH ROW
+        WHEN (
+            SELECT plan_id FROM steps WHERE id = NEW.step_id
+        ) IS NOT (
+            SELECT plan_id FROM steps WHERE id = NEW.depends_on_step_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'step dependencies must stay within one plan');
+        END;
+        ",
+    )?;
     Ok(())
 }
 
@@ -3644,6 +3700,97 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v31_enforces_plan_local_step_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v30.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v30 only, then seed one valid intra-plan edge
+        // and one invalid cross-plan edge that V31 must clean up.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(30) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute_batch(
+            "
+            INSERT INTO plans (id, slug, project, branch_name, description)
+            VALUES ('p1', 'p1', '/proj', 'b', 'd'),
+                   ('p2', 'p2', '/proj', 'b', 'd');
+            INSERT INTO steps (id, plan_id, sort_key, title, description, acceptance_criteria, short_id)
+            VALUES ('s1', 'p1', 'a', 's1', 'd', '[]', 'aaaaaaaa'),
+                   ('s2', 'p1', 'b', 's2', 'd', '[]', 'bbbbbbbb'),
+                   ('s3', 'p2', 'a', 's3', 'd', '[]', 'cccccccc');
+            INSERT INTO step_dependencies (step_id, depends_on_step_id)
+            VALUES ('s2', 's1'),
+                   ('s1', 's3');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open_at(&path).unwrap();
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        let valid_edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM step_dependencies \
+                 WHERE step_id = 's2' AND depends_on_step_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(valid_edges, 1, "V31 must preserve same-plan edges");
+
+        let cross_edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM step_dependencies \
+                 WHERE step_id = 's1' AND depends_on_step_id = 's3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cross_edges, 0, "V31 must drop invalid cross-plan edges");
+
+        let err = conn
+            .execute(
+                "INSERT INTO step_dependencies (step_id, depends_on_step_id) VALUES (?1, ?2)",
+                rusqlite::params!["s1", "s3"],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("step dependencies must stay within one plan"),
+            "unexpected trigger error: {err}"
+        );
+
+        conn.execute(
+            "INSERT INTO step_dependencies (step_id, depends_on_step_id) VALUES (?1, ?2)",
+            rusqlite::params!["s1", "s2"],
+        )
+        .unwrap();
+        let err = conn
+            .execute(
+                "UPDATE step_dependencies SET depends_on_step_id = ?1 \
+                 WHERE step_id = ?2 AND depends_on_step_id = ?3",
+                rusqlite::params!["s3", "s1", "s2"],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("step dependencies must stay within one plan"),
+            "unexpected update-trigger error: {err}"
+        );
     }
 
     #[test]

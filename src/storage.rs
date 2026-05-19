@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::types::Value;
-use rusqlite::{Connection, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use uuid::Uuid;
 
 use crate::frac_index;
@@ -2677,6 +2677,29 @@ pub fn add_step_dependency(
 
     if would_create_step_cycle(conn, step_id, depends_on_step_id)? {
         anyhow::bail!("Adding dependency {step_id} -> {depends_on_step_id} would create a cycle");
+    }
+
+    let step_plan: Option<String> = conn
+        .query_row(
+            "SELECT plan_id FROM steps WHERE id = ?1",
+            params![step_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let dep_plan: Option<String> = conn
+        .query_row(
+            "SELECT plan_id FROM steps WHERE id = ?1",
+            params![depends_on_step_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match (step_plan, dep_plan) {
+        (Some(a), Some(b)) if a == b => {}
+        (Some(_), Some(_)) => {
+            anyhow::bail!("Step dependencies must stay within one plan");
+        }
+        (None, _) => anyhow::bail!("Step not found: {step_id}"),
+        (_, None) => anyhow::bail!("Step not found: {depends_on_step_id}"),
     }
 
     conn.execute(
@@ -5657,6 +5680,54 @@ mod tests {
         assert!(
             msg.contains("cannot depend on itself"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_add_step_dependency_rejects_cross_plan_edge() {
+        let conn = setup();
+        let plan_a = create_plan(&conn, "spa", "/proj", "branch", "desc", None, None, &[])
+            .expect("create_plan a");
+        let plan_b = create_plan(&conn, "spb", "/proj", "branch", "desc", None, None, &[])
+            .expect("create_plan b");
+        let (a, _) = create_step(
+            &conn,
+            &plan_a.id,
+            "a",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (b, _) = create_step(
+            &conn,
+            &plan_b.id,
+            "b",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let err = add_step_dependency(&conn, &a.id, &b.id).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("within one plan"),
+            "unexpected cross-plan error: {msg}"
+        );
+        assert!(
+            list_step_dependencies(&conn, &a.id).unwrap().is_empty(),
+            "cross-plan edge must not be persisted"
         );
     }
 
