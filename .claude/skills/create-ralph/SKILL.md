@@ -150,6 +150,20 @@ Each step gets a **fresh context** — there is no conversation in step N+1. Pro
 - **Keep one concern per step**: don't combine "add the model" and "add the API endpoint".
 - **Order dependencies correctly**: types before uses, modules before imports.
 
+## Writing acceptance criteria (push intent into criteria, or expect the gap)
+
+The single most common plan failure: **a ralph satisfies your acceptance criteria, not your intent.** Concrete example: if a "compatibility contract" lists `config.theme.transparent` as a kept symbol, a ralph will make the field assignable and call it done — it will not make the renderer actually honor the setting unless a criterion says so. The same trap applies anywhere a name appears in a spec without its effect: feature flags, CLI options, env vars, HTTP params, library surfaces, exported types, database columns. Spec gaps don't get filled in by good taste; they get filled by whichever interpretation is cheapest.
+
+Push intent into criteria — concretely:
+
+1. **Pair every named symbol with an observable behavior.** "`X` is a supported / kept surface" is half a spec — a ralph will literally make the field assignable / the function callable / the flag accepted and stop. Split it into (a) the symbol exists, and (b) "with `X = <value>` (or after calling `X(...)`), <observable thing> happens." Symbol-existence catches a missing rename; behavior catches a no-op stub.
+2. **For replaced components, separate design direction from API contract.** "Replace library/module X with Y" is a *design* choice. "Existing callers of `X.foo(...)` must continue to work" is an *API* choice (a shim). They are different specs — name both, or explicitly mark one as out of scope. Otherwise the ralph reasonably concludes "drop X entirely" and breaks any caller still relying on X's surface.
+3. **For every kept component, name its load/wiring contract.** "Keep dependency Z" leaves *how* Z is wired unspecified — a ralph optimizing for startup time, bundle size, or cold latency will reasonably pick the laziest option and silently break whatever depended on Z being already-loaded. State the wiring you want: eager init, lazy on `<trigger>`, registered as `<role>` in `<container>`, etc.
+4. **Prefer real-world fixtures over synthetic ones.** A test against a synthetic input catches structural breakage; a test against a real captured input (a maintainer's actual config, a recorded request, a production data snapshot, a known-broken legacy file) catches what users actually do. One criterion of "passes under `tests/fixtures/<real-captured-input>`" beats a dozen "the module loads under a minimal hand-written input."
+5. **Make every criterion mechanically checkable.** "It works" / "default behavior is correct" / "feels fast" are wishes. "`<cmd>` exits 0", "GET `/foo` returns 200 with body matching `<regex>`", "operation completes within 200ms p99", "`grep -n FOO src/` returns 0 hits", "the `users` table has exactly N rows after seeding" are tests. If a criterion can't be a shell command, a grep, an exit code, an HTTP status, a latency budget, or an observable file/state change, rephrase it until it can — or accept that nothing will verify it and the ralph will not invent the test for you.
+
+Apply this at two scopes: the **plan-level test commands** (`--test <cmd>`) gate every step, so they're where load-bearing whole-system behavior lives; **per-step acceptance criteria** in step descriptions are where step-local symbol/behavior pairs live. A plan with only symbol-existence in step criteria and only a build/typecheck command in plan tests is the canonical failure mode — it will compile, the symbols will exist, and the behaviors will be silently absent.
+
 ## Review verdicts (built-in pipeline and manual review steps)
 
 The **built-in review pipeline** handles the verdict/correction loop for
@@ -193,6 +207,8 @@ Don't compress a big task into a handful of mega-steps — you lose the per-step
 - ❌ Authoring explicit review steps when the built-in review pipeline already covers it — enable `ralph plan/step review` instead of hand-rolling reviewer + fix-step plumbing.
 - ❌ Skipping `--change-policy optional` on a manual review/audit step — it'll be marked failed for producing no diff.
 - ❌ Skipping the verify (deterministic test) step because "review will catch it" — reviewers read a diff, they don't run the code.
+- ❌ Listing a symbol as a "compatibility surface" without naming the behavior it implies — a ralph will make the field assignable / the function callable and stop there. Pair every named symbol with an observable behavior, or expect a no-op stub.
+- ❌ Acceptance criteria that aren't mechanically checkable ("it works", "feels fast", "default behavior is correct", "looks right") — these are wishes, not specs. A criterion is a shell command, a `grep`, an exit code, an HTTP status, a latency budget, or an observable file/state change, or the ralph will not verify it.
 - ❌ Trying to make the harness commit instead of letting ralph commit — ralph commits each iteration by design; harness-side commits conflict and produce a clean diff at step end (which `change_policy=required` will correctly fail).
 
 ## Reference: useful CLI flags
