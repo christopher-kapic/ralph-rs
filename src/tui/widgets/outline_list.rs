@@ -22,25 +22,6 @@ use crate::tui::selection::Selection;
 use crate::tui::theme;
 use crate::tui::views::outline_view::OutlineRow;
 
-fn display_depth(rows: &[OutlineRow], cursor_index: Option<usize>, row_index: usize) -> usize {
-    let Some(cursor) = cursor_index.filter(|&i| i < rows.len()) else {
-        return rows.get(row_index).map(|r| r.depth).unwrap_or(0);
-    };
-    let Some(row) = rows.get(row_index) else {
-        return 0;
-    };
-    let cursor_depth = rows[cursor].depth;
-    if row_index < cursor {
-        0
-    } else if row_index == cursor {
-        1
-    } else if row.depth > cursor_depth {
-        1 + (row.depth - cursor_depth)
-    } else {
-        0
-    }
-}
-
 /// Single-glyph indicator for an effective [`StepStatus`] (the derived
 /// `Blocked` overlay already folded in by `effective_step_status`).
 pub fn status_glyph(status: StepStatus) -> &'static str {
@@ -92,11 +73,11 @@ pub fn render(
 ) {
     let items: Vec<ListItem> = rows
         .iter()
-        .enumerate()
-        .map(|(idx, row)| {
-            let indent = "  ".repeat(display_depth(rows, cursor_index, idx));
+        .map(|row| {
             let glyph = status_glyph(row.effective_status);
-            let label = format!("{indent}{glyph} {} {}", row.short_id, row.title);
+            // `tree_prefix` is the pre-built ├──/└──/│ ASCII tree art,
+            // already aligned for indent — no per-render depth math here.
+            let label = format!("{}{glyph} {} {}", row.tree_prefix, row.short_id, row.title);
             let mut row_style = Style::default().fg(theme::step_status_color(row.effective_status));
             if matches!(row.effective_status, StepStatus::InProgress) {
                 row_style = row_style.add_modifier(Modifier::BOLD);
@@ -231,32 +212,73 @@ mod tests {
     }
 
     #[test]
-    fn display_depth_flattens_ancestors_and_rebases_descendants_around_cursor() {
+    fn renders_tree_art_connectors_for_branching_subtree() {
+        // Root A with two children (A.1, A.2). Independent root B with
+        // children B.1 (which has B.1.1, B.1.2) and B.2 — the user's
+        // sketched example. Tree art should:
+        //   - leave roots at column 0 (no connector);
+        //   - use ├── for non-last siblings, └── for the last;
+        //   - draw a │ continuation column under a non-last ancestor
+        //     (B.1's children sit under B's "│   ");
+        //   - blank out the column under a last-child ancestor.
+        // Independent roots therefore share no vertical stem.
         let steps = vec![
             step("aaaa", "a0"),
-            step("bbbb", "a1"),
-            step("cccc", "a2"),
-            step("dddd", "a3"),
-            step("eeee", "a4"),
+            step("a1aa", "a1"),
+            step("a2aa", "a2"),
+            step("bbbb", "b0"),
+            step("b1aa", "b1"),
+            step("b11a", "b2"),
+            step("b12a", "b3"),
+            step("b2aa", "b4"),
         ];
         let mut deps_of = HashMap::new();
-        edge(&mut deps_of, "bbbb", &["aaaa"]);
-        edge(&mut deps_of, "cccc", &["bbbb"]);
-        edge(&mut deps_of, "dddd", &["cccc"]);
-        edge(&mut deps_of, "eeee", &["dddd"]);
+        edge(&mut deps_of, "a1aa", &["aaaa"]);
+        edge(&mut deps_of, "a2aa", &["aaaa"]);
+        edge(&mut deps_of, "b1aa", &["bbbb"]);
+        edge(&mut deps_of, "b11a", &["b1aa"]);
+        edge(&mut deps_of, "b12a", &["b1aa"]);
+        edge(&mut deps_of, "b2aa", &["bbbb"]);
         let st = OutlineState::new(steps, deps_of, HashSet::new());
         let rows = st.visible_rows();
 
+        // Each row's prefix is computed once in visible_rows; assert the
+        // exact shape so a regression in the helper is loud.
+        let prefixes: Vec<&str> = rows.iter().map(|r| r.tree_prefix.as_str()).collect();
         assert_eq!(
-            (0..rows.len())
-                .map(|idx| display_depth(&rows, Some(3), idx))
-                .collect::<Vec<_>>(),
-            vec![0, 0, 0, 1, 2]
+            prefixes,
+            vec![
+                "",            // aaaa (root)
+                "├── ",        // a1aa (first child of A)
+                "└── ",        // a2aa (last child of A)
+                "",            // bbbb (root B)
+                "├── ",        // b1aa (first child of B, not last → │ continues)
+                "│   ├── ",    // b11a (first child of B.1, under B's │)
+                "│   └── ",    // b12a (last child of B.1, B's │ still continues)
+                "└── ",        // b2aa (last child of B)
+            ]
+        );
+
+        // And the assembled string really lands the connectors in front
+        // of the glyph + short_id (canary against renderer drift).
+        let out = render_to_string(&rows, "my-plan");
+        assert!(
+            out.contains("│   ├── ○ b11a"),
+            "b11a should sit under B's continuation column:\n{out}"
+        );
+        assert!(
+            out.contains("└── ○ b2aa"),
+            "b2aa should render with the └── connector:\n{out}"
         );
     }
 
     #[test]
-    fn renders_indent_glyph_and_join_deps() {
+    fn renders_join_deps_with_tree_art() {
+        // Diamond: a → {b, c}; d depends on b AND c. The visual parent of
+        // d is c (the deepest in-set dep with the higher row index), so
+        // tree art draws d under c (└── from c). The other parent (b) is
+        // still surfaced via the inline `deps: …` annotation — tree art
+        // never silently hides the second edge of a join.
         let steps = vec![
             step("aaaa", "a0"),
             step("bbbb", "a1"),
@@ -268,12 +290,18 @@ mod tests {
         edge(&mut deps_of, "cccc", &["aaaa"]);
         edge(&mut deps_of, "dddd", &["bbbb", "cccc"]);
         let st = OutlineState::new(steps, deps_of, HashSet::new());
-        let out = render_to_string(&st.visible_rows(), "my-plan");
-        // Root short id and the join's inline deps list both appear.
+        let rows = st.visible_rows();
+        let out = render_to_string(&rows, "my-plan");
         assert!(out.contains("aaaa"), "root short id missing:\n{out}");
         assert!(
             out.contains("deps: bbbb cccc"),
             "join deps list missing:\n{out}"
+        );
+
+        let d = rows.iter().find(|r| r.short_id == "dddd").unwrap();
+        assert_eq!(
+            d.tree_prefix, "    └── ",
+            "d should connect to its deepest dep (c) with a last-child elbow"
         );
     }
 

@@ -20,6 +20,16 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::plan::{ReviewStatus, Step, StepStatus, effective_step_status};
 use crate::tui::outline::{OutlineEntry, project_outline};
 
+/// One indent column unit, in characters. Standard `tree(1)` width.
+const TREE_COL: &str = "    ";
+/// Vertical continuation column for an ancestor that still has more
+/// siblings below the current row.
+const TREE_PIPE: &str = "│   ";
+/// Connector for a row that is *not* the last visible child of its parent.
+const TREE_TEE: &str = "├── ";
+/// Connector for a row that *is* the last visible child of its parent.
+const TREE_ELBOW: &str = "└── ";
+
 /// One drawable outline row: the projected [`OutlineEntry`] plus the derived
 /// presentation fields the renderer needs. Computed purely from the step set,
 /// dependency edges, and the open-interruption set — never re-queried.
@@ -31,8 +41,17 @@ pub struct OutlineRow {
     pub step_id: String,
     /// Title, rendered after the indent + glyph.
     pub title: String,
-    /// Topological depth (= indent level). Root = 0.
+    /// Topological depth in the full DAG. Retained for callers that still
+    /// need the structural depth (e.g. existing assertions); the renderer
+    /// no longer indents from this field — it uses [`Self::tree_prefix`].
     pub depth: usize,
+    /// Pre-built ASCII tree-art prefix for this row (e.g.
+    /// `"│   ├── "`). Empty string for a root or for a row whose visual
+    /// parent is outside the visible (focus-filtered) set. The renderer
+    /// just prints this verbatim ahead of the status glyph, so the
+    /// connector shape is computed once over the same visible set the
+    /// scheduler walks rather than re-derived per draw.
+    pub tree_prefix: String,
     /// `short_id`s of every dependency for a *join* step (>1 dep), in
     /// scheduler order; empty for roots / single-parent steps. Renders as
     /// `deps: a1b2 c3d4`.
@@ -92,6 +111,167 @@ pub struct OutlineState {
     focus_stack: Vec<String>,
     /// Cursor index into the *currently visible* rows.
     cursor: usize,
+}
+
+/// Reorder visible entries into **DFS-by-subtree** order and assign each
+/// row its ASCII tree-art prefix (`├──`/`└──`/`│   `/`    `).
+///
+/// The scheduler's `(depth, sort_key, short_id)` order is BFS-by-depth —
+/// great for a linear chain but it interleaves *every* subtree at each
+/// depth, which turns proper tree-art connectors into visual noise (a
+/// continuation `│` column under one subtree would be broken by rows of
+/// another). For a tree-shaped UI we need subtrees to be contiguous, so
+/// this layout walks the visual-parent tree in DFS preorder; the runner
+/// still schedules off the raw `(depth, sort_key, short_id)` order it
+/// always has, this only changes what the user *sees*.
+///
+/// `entries` arrives in scheduler order; `deps_of` is the **full-DAG**
+/// adjacency. Deps whose `step_id` is missing from `entries` are filtered
+/// out, so a focus cone re-roots cleanly and a root subtree starts a
+/// fresh connector chain at column 0.
+///
+/// For each non-root row a single *visual parent* is chosen from its
+/// in-set dependencies — the deepest one, with `(sort_key, short_id)` as
+/// the tiebreak so the choice is deterministic and matches the scheduler
+/// tier order. A join step's other parents are still surfaced inline via
+/// the `deps: …` annotation, so the tree-art never silently hides edges.
+fn tree_layout(
+    entries: Vec<OutlineEntry>,
+    deps_of: &HashMap<String, Vec<String>>,
+) -> Vec<(OutlineEntry, String)> {
+    let n = entries.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // step_id -> index into `entries`. A miss means the dep is outside
+    // the visible set (focus filter, or just not in this plan); such a
+    // dep does not connect to a visual parent.
+    let idx_of: HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.step.id.as_str(), i))
+        .collect();
+
+    // Visual parent per row: max (depth, sort_key, short_id) over in-set
+    // deps. None for true roots and for rows whose deps were all hidden
+    // by the focus filter (those render as roots within the cone).
+    let mut visual_parent: Vec<Option<usize>> = vec![None; n];
+    for (i, entry) in entries.iter().enumerate() {
+        if let Some(deps) = deps_of.get(&entry.step.id) {
+            let mut best: Option<usize> = None;
+            for dep in deps {
+                if let Some(&p_idx) = idx_of.get(dep.as_str()) {
+                    let better = match best {
+                        None => true,
+                        Some(b) => {
+                            let p = &entries[p_idx];
+                            let q = &entries[b];
+                            (p.depth, &p.step.sort_key, &p.step.short_id)
+                                > (q.depth, &q.step.sort_key, &q.step.short_id)
+                        }
+                    };
+                    if better {
+                        best = Some(p_idx);
+                    }
+                }
+            }
+            visual_parent[i] = best;
+        }
+    }
+
+    // Build children adjacency and root list. Each child list is sorted
+    // by `(sort_key, short_id)` so DFS visits siblings in the same tier
+    // order the scheduler would — preserves the user's authored order
+    // within each subtree.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, vp) in visual_parent.iter().enumerate() {
+        match vp {
+            Some(p) => children[*p].push(i),
+            None => roots.push(i),
+        }
+    }
+    let sibling_cmp = |a: &usize, b: &usize| -> std::cmp::Ordering {
+        let ea = &entries[*a];
+        let eb = &entries[*b];
+        ea.step
+            .sort_key
+            .cmp(&eb.step.sort_key)
+            .then_with(|| ea.step.short_id.cmp(&eb.step.short_id))
+    };
+    for child_list in children.iter_mut() {
+        child_list.sort_by(&sibling_cmp);
+    }
+    roots.sort_by(&sibling_cmp);
+
+    // Manual DFS — rustc has no TCO and the recursion depth tracks DAG
+    // depth, which the LunaVim-style pipelines push past 15. Each frame
+    // carries the node + whether it is the last visible child of its
+    // parent + the ancestors_last chain (one flag per non-root ancestor)
+    // we use to render `│   ` vs `    ` columns.
+    struct Frame {
+        idx: usize,
+        is_last_child: bool,
+        ancestors_last: Vec<bool>,
+    }
+    // `bucket[i].take()` moves the OutlineEntry out in DFS order; the
+    // Option ensures we never double-take (DFS visits each node exactly
+    // once thanks to the parent-tree being acyclic).
+    let mut bucket: Vec<Option<OutlineEntry>> = entries.into_iter().map(Some).collect();
+    let mut out: Vec<(OutlineEntry, String)> = Vec::with_capacity(n);
+    let mut stack: Vec<Frame> = Vec::with_capacity(n);
+    // Push roots in reverse so the first root is the first pop.
+    let root_count = roots.len();
+    for (k, &r) in roots.iter().enumerate().rev() {
+        stack.push(Frame {
+            idx: r,
+            is_last_child: k + 1 == root_count,
+            ancestors_last: Vec::new(),
+        });
+    }
+    while let Some(Frame {
+        idx,
+        is_last_child,
+        ancestors_last,
+    }) = stack.pop()
+    {
+        // Build this row's prefix from the chain of ancestor columns,
+        // then the row's own connector (suppressed for a true root since
+        // a root has no edge to draw).
+        let mut prefix = String::new();
+        for &last in &ancestors_last {
+            prefix.push_str(if last { TREE_COL } else { TREE_PIPE });
+        }
+        if visual_parent[idx].is_some() {
+            prefix.push_str(if is_last_child { TREE_ELBOW } else { TREE_TEE });
+        }
+        let entry = bucket[idx]
+            .take()
+            .expect("DFS visits each node exactly once");
+        out.push((entry, prefix));
+
+        // A root contributes no continuation column to its descendants
+        // (its children start at column 0); a non-root contributes a
+        // column whose shape is its own `is_last_child` flag.
+        let next_ancestors: Vec<bool> = if visual_parent[idx].is_none() {
+            Vec::new()
+        } else {
+            let mut v = ancestors_last.clone();
+            v.push(is_last_child);
+            v
+        };
+        let kids = &children[idx];
+        let kid_count = kids.len();
+        for (k, &c) in kids.iter().enumerate().rev() {
+            stack.push(Frame {
+                idx: c,
+                is_last_child: k + 1 == kid_count,
+                ancestors_last: next_ancestors.clone(),
+            });
+        }
+    }
+    out
 }
 
 impl OutlineState {
@@ -194,26 +374,37 @@ impl OutlineState {
             .collect()
     }
 
-    /// Project the currently-visible rows: the full topological outline,
-    /// then filtered to the active focus cone (if focused). Order is always
-    /// the shared scheduler order (`project_outline` guarantees outline row
-    /// order == execution order — §12.1).
+    /// Project the currently-visible rows.
+    ///
+    /// Pipeline: project the full DAG via [`project_outline`] (scheduler
+    /// order — preserves the §12.1 "outline ⇔ scheduler" invariant *at
+    /// the projection layer*), filter to the active focus cone (§12.2),
+    /// then run [`tree_layout`] which reorders the surviving entries into
+    /// **DFS-by-subtree** order and attaches each row's ASCII tree-art
+    /// prefix. The DFS reorder is what lets a real tree shape draw with
+    /// continuous `│` columns and no cross-subtree interleaving — the
+    /// scheduler still walks `(depth, sort_key, short_id)` independently
+    /// off of `compute_step_depths`, so this is purely a display order.
     pub fn visible_rows(&self) -> Vec<OutlineRow> {
         let entries: Vec<OutlineEntry> = project_outline(&self.steps, &self.deps_of);
         let cone = self.focus_root().map(|r| self.downstream_cone(r));
-        entries
+        let filtered: Vec<OutlineEntry> = entries
             .into_iter()
             .filter(|e| match &cone {
                 Some(c) => c.contains(&e.step.id),
                 None => true,
             })
-            .map(|e| {
+            .collect();
+        tree_layout(filtered, &self.deps_of)
+            .into_iter()
+            .map(|(e, tree_prefix)| {
                 let has_open = self.blocked_ids.contains(&e.step.id);
                 OutlineRow {
                     short_id: e.step.short_id.clone(),
                     step_id: e.step.id.clone(),
                     title: e.step.title.clone(),
                     depth: e.depth,
+                    tree_prefix,
                     join_deps: e.join_deps.clone(),
                     corrects_short_id: e.corrects_short_id.clone(),
                     effective_status: effective_step_status(e.step.status, has_open),
@@ -451,6 +642,66 @@ mod tests {
             rows.iter().map(|r| r.depth).collect::<Vec<_>>(),
             vec![0, 1, 1, 2]
         );
+    }
+
+    #[test]
+    fn tree_prefix_drawn_within_visible_set_and_independent_roots_share_no_stem() {
+        // Two independent root subtrees ("A" with two leaves, "B" with one
+        // branch and one leaf) — the user's sketched example. Each row
+        // carries the exact ASCII tree-art prefix it should render with.
+        // Independent roots reset to column 0 (no shared `│` column).
+        let steps = vec![
+            step("aaaa", "a0"),
+            step("a1aa", "a1"),
+            step("a2aa", "a2"),
+            step("bbbb", "b0"),
+            step("b1aa", "b1"),
+            step("b11a", "b2"),
+            step("b12a", "b3"),
+            step("b2aa", "b4"),
+        ];
+        let mut deps_of = HashMap::new();
+        edge(&mut deps_of, "a1aa", &["aaaa"]);
+        edge(&mut deps_of, "a2aa", &["aaaa"]);
+        edge(&mut deps_of, "b1aa", &["bbbb"]);
+        edge(&mut deps_of, "b11a", &["b1aa"]);
+        edge(&mut deps_of, "b12a", &["b1aa"]);
+        edge(&mut deps_of, "b2aa", &["bbbb"]);
+        let st = OutlineState::new(steps, deps_of, HashSet::new());
+        let rows = st.visible_rows();
+        let prefixes: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.short_id.as_str(), r.tree_prefix.as_str()))
+            .collect();
+        assert_eq!(
+            prefixes,
+            vec![
+                ("aaaa", ""),
+                ("a1aa", "├── "),
+                ("a2aa", "└── "),
+                ("bbbb", ""),
+                ("b1aa", "├── "),
+                ("b11a", "│   ├── "),
+                ("b12a", "│   └── "),
+                ("b2aa", "└── "),
+            ]
+        );
+    }
+
+    #[test]
+    fn tree_prefix_rebases_under_focus_cone() {
+        // Focus on b: cone is {b, d}. b loses its visible parent (a is
+        // outside the cone) and becomes a column-0 root; d connects under
+        // b as a last-child (its other dep c is also outside the cone).
+        let mut st = diamond();
+        st.navigate_down(); // cursor on bbbb
+        assert!(st.focus_cursor());
+        let rows = st.visible_rows();
+        let prefixes: Vec<(&str, &str)> = rows
+            .iter()
+            .map(|r| (r.short_id.as_str(), r.tree_prefix.as_str()))
+            .collect();
+        assert_eq!(prefixes, vec![("bbbb", ""), ("dddd", "└── ")]);
     }
 
     #[test]
