@@ -23,7 +23,7 @@
 // when the state machine asks.
 
 use chrono::{DateTime, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -220,8 +220,12 @@ pub struct RenderedPromptApp {
     /// clamp `scroll` so the user can't scroll past the end. Zero before the
     /// first frame.
     pub last_body_height: u16,
-    /// Line count of the current attempt's prompt recorded during the most
-    /// recent `render`. Paired with `last_body_height` for scroll clamping.
+    /// Visual (post-wrap) line count of the current attempt's prompt
+    /// recorded during the most recent `render`. Paired with
+    /// `last_body_height` for scroll clamping. Visual rather than logical
+    /// because `Paragraph::scroll` with `Wrap` counts wrapped rows — using
+    /// `.lines().count()` would clamp the bottom short on long prompts in
+    /// narrow viewports.
     pub last_line_count: u16,
     /// Help-overlay state. `?` toggles visibility; while visible the per-view
     /// input handler is skipped (TUI-plan.md §15).
@@ -457,6 +461,21 @@ impl RenderedPromptApp {
             _ => Outcome::Pending,
         }
     }
+
+    /// Mouse handler. The scroll wheel scrolls the prompt body regardless of
+    /// attempt count — keyboard `j`/`k` switches attempts when there are
+    /// multiple, but the wheel is always a body-scroll gesture (matches
+    /// step_detail's `handle_mouse`, where the wheel scrolls the focused
+    /// pane). Other mouse events are no-ops for now.
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        use crossterm::event::MouseEventKind;
+
+        match event.kind {
+            MouseEventKind::ScrollDown => self.scroll_down(),
+            MouseEventKind::ScrollUp => self.scroll_up(),
+            _ => {}
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +504,22 @@ fn relative_time(started: DateTime<Utc>, now: DateTime<Utc>) -> String {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+
+/// Wrapped (visual) line count for `text` at `width` columns, mirroring the
+/// helper of the same name in `step_detail` (kept local so this sub-view
+/// doesn't depend on its parent's internals). Each `\n`-delimited logical
+/// line wraps to `ceil(chars / width)` visual rows; a zero-width viewport
+/// returns 0. Caps at `u16::MAX` because the scroll API is `u16`.
+fn text_visual_line_count(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    let w = width as usize;
+    text.split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(w))
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16
+}
 
 /// Render the rendered-prompt preview over the parent step-detail surface.
 /// Caller is expected to have drawn the background view immediately prior;
@@ -558,7 +593,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut RenderedPromptApp) {
     // Record the metrics scroll clamping depends on, then clamp the offset
     // *before* drawing so a stale (too-large) offset from a longer prior
     // attempt can't blank the pane.
-    let line_count = current.prompt.lines().count().max(1) as u16;
+    //
+    // `Paragraph::scroll` with `Wrap{}` counts *wrapped* lines, so the
+    // clamp must also count wrapped lines — using pre-wrap `.lines().count()`
+    // here causes the scroll to stop short of the bottom on long prompts
+    // whose logical lines wrap. Mirror the helper used in step_detail's
+    // scrollable panes (`text_visual_line_count`).
+    let line_count = text_visual_line_count(&current.prompt, body_area.width).max(1);
     app.last_body_height = body_area.height;
     app.last_line_count = line_count;
     let max_scroll = line_count.saturating_sub(body_area.height.max(1));
@@ -958,6 +999,65 @@ mod tests {
     }
 
     #[test]
+    fn mouse_wheel_scrolls_body_regardless_of_attempt_count() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+
+        fn wheel(kind: MouseEventKind) -> MouseEvent {
+            MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }
+        }
+
+        // Multi-attempt: keyboard j/k switches attempts, but the wheel must
+        // still scroll the body (we want consistent gesture semantics — wheel
+        // = scroll, regardless of how many attempts there are).
+        let now = Utc::now();
+        let attempts = vec![
+            AttemptPrompt {
+                attempt: 1,
+                started_at: Some(now),
+                prompt: (0..50)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            },
+            AttemptPrompt {
+                attempt: 2,
+                started_at: Some(now),
+                prompt: (0..50)
+                    .map(|i| format!("attempt2 {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            },
+        ];
+        let mut app = RenderedPromptApp::new("s".into(), "l".into(), attempts);
+        // Land on the most recent attempt by construction.
+        let initial_attempt = app.current().attempt;
+        app.last_body_height = 10;
+        app.last_line_count = 50;
+
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.scroll, 1, "wheel-down scrolls body by one line");
+        assert_eq!(
+            app.current().attempt,
+            initial_attempt,
+            "wheel never switches attempts (that is keyboard j/k territory)"
+        );
+        app.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.scroll, 0, "wheel-up reverses by one line");
+
+        // Other mouse events (e.g. a left click) are explicit no-ops — we are
+        // not yet wiring click-to-scrub or selection.
+        let click = wheel(MouseEventKind::Down(crossterm::event::MouseButton::Left));
+        app.handle_mouse(click);
+        assert_eq!(app.scroll, 0);
+        assert_eq!(app.current().attempt, initial_attempt);
+    }
+
+    #[test]
     fn help_overlay_swallows_keys() {
         let mut app = RenderedPromptApp::new(
             "s".into(),
@@ -977,6 +1077,24 @@ mod tests {
         // `?` again closes it.
         assert_eq!(app.handle_key(key(KeyCode::Char('?'))), Outcome::Pending);
         assert!(!app.help.is_visible());
+    }
+
+    // -- wrap-aware line count ------------------------------------------
+
+    #[test]
+    fn text_visual_line_count_accounts_for_wrap() {
+        // Short lines (≤ width) count as 1 each.
+        assert_eq!(super::text_visual_line_count("a\nb\nc", 80), 3);
+        // A 25-char line in a 10-col viewport wraps to 3 visual rows.
+        let twenty_five = "a".repeat(25);
+        assert_eq!(super::text_visual_line_count(&twenty_five, 10), 3);
+        // Mixed: a 25-char line (3 rows) + a short line (1 row) = 4.
+        let mixed = format!("{twenty_five}\nshort");
+        assert_eq!(super::text_visual_line_count(&mixed, 10), 4);
+        // Empty logical line still counts as 1 row (matches step_detail).
+        assert_eq!(super::text_visual_line_count("\n\n", 10), 3);
+        // Zero-width viewport returns 0 (caller guards the render path).
+        assert_eq!(super::text_visual_line_count("hello", 0), 0);
     }
 
     // -- relative time ---------------------------------------------------

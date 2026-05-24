@@ -12,7 +12,7 @@
 // raw-mode / event loop, the `storage::resolve_interruption` write, and the
 // `$EDITOR` handoff; this module only decides *what* to do.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 
 use crate::plan::{Interruption, InterruptionState};
 use crate::tui::help::HelpState;
@@ -265,6 +265,25 @@ impl InboxState {
         }
     }
 
+    /// Mouse handler — currently only the scroll wheel does anything: in
+    /// list mode it moves the cursor (mirroring `j`/`k`), matching the
+    /// plan_list / archived_list / plan_detail convention. While the
+    /// run-through modal is up the wheel is intentionally inert so a stray
+    /// scroll while typing in `$EDITOR` doesn't shift a selection underneath
+    /// the modal. All other mouse events are no-ops for now.
+    pub fn handle_mouse(&mut self, event: MouseEvent) {
+        use crossterm::event::MouseEventKind;
+
+        if matches!(self.mode, InboxMode::RunThrough) {
+            return;
+        }
+        match event.kind {
+            MouseEventKind::ScrollDown => self.navigate_down(),
+            MouseEventKind::ScrollUp => self.navigate_up(),
+            _ => {}
+        }
+    }
+
     fn handle_list_key(&mut self, key: KeyEvent) -> InboxOutcome {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -375,6 +394,49 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn mouse_wheel_moves_cursor_in_list_mode() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        fn wheel(kind: MouseEventKind) -> MouseEvent {
+            MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }
+        }
+
+        let items = vec![item("1", true), item("2", true), item("3", true)];
+        let mut st = InboxState::new(items);
+        assert_eq!(st.cursor(), 0);
+
+        st.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(st.cursor(), 1, "wheel-down advances cursor");
+        st.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(st.cursor(), 2);
+        // Wraps (matches navigate_down's wrapping behavior — same as j/k).
+        st.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(st.cursor(), 0);
+        st.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(st.cursor(), 2, "wheel-up wraps to the end");
+
+        // While the run-through modal is up the wheel must NOT move the
+        // underlying cursor (the modal owns input; a stray scroll from the
+        // user's mouse during $EDITOR text entry shouldn't shift selection).
+        assert!(st.start_run_through());
+        let before = st.cursor();
+        st.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(st.cursor(), before, "wheel is inert in run-through mode");
+
+        // Non-scroll mouse events are no-ops everywhere.
+        st.exit_run_through();
+        let before = st.cursor();
+        st.handle_mouse(wheel(MouseEventKind::Down(
+            crossterm::event::MouseButton::Left,
+        )));
+        assert_eq!(st.cursor(), before);
     }
 
     // -- STEP 52: listing / selection / badge -----------------------------

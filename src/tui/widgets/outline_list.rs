@@ -22,6 +22,25 @@ use crate::tui::selection::Selection;
 use crate::tui::theme;
 use crate::tui::views::outline_view::OutlineRow;
 
+fn display_depth(rows: &[OutlineRow], cursor_index: Option<usize>, row_index: usize) -> usize {
+    let Some(cursor) = cursor_index.filter(|&i| i < rows.len()) else {
+        return rows.get(row_index).map(|r| r.depth).unwrap_or(0);
+    };
+    let Some(row) = rows.get(row_index) else {
+        return 0;
+    };
+    let cursor_depth = rows[cursor].depth;
+    if row_index < cursor {
+        0
+    } else if row_index == cursor {
+        1
+    } else if row.depth > cursor_depth {
+        1 + (row.depth - cursor_depth)
+    } else {
+        0
+    }
+}
+
 /// Single-glyph indicator for an effective [`StepStatus`] (the derived
 /// `Blocked` overlay already folded in by `effective_step_status`).
 pub fn status_glyph(status: StepStatus) -> &'static str {
@@ -73,8 +92,9 @@ pub fn render(
 ) {
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|row| {
-            let indent = "  ".repeat(row.depth);
+        .enumerate()
+        .map(|(idx, row)| {
+            let indent = "  ".repeat(display_depth(rows, cursor_index, idx));
             let glyph = status_glyph(row.effective_status);
             let label = format!("{indent}{glyph} {} {}", row.short_id, row.title);
             let mut row_style = Style::default().fg(theme::step_status_color(row.effective_status));
@@ -208,6 +228,31 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn display_depth_flattens_ancestors_and_rebases_descendants_around_cursor() {
+        let steps = vec![
+            step("aaaa", "a0"),
+            step("bbbb", "a1"),
+            step("cccc", "a2"),
+            step("dddd", "a3"),
+            step("eeee", "a4"),
+        ];
+        let mut deps_of = HashMap::new();
+        edge(&mut deps_of, "bbbb", &["aaaa"]);
+        edge(&mut deps_of, "cccc", &["bbbb"]);
+        edge(&mut deps_of, "dddd", &["cccc"]);
+        edge(&mut deps_of, "eeee", &["dddd"]);
+        let st = OutlineState::new(steps, deps_of, HashSet::new());
+        let rows = st.visible_rows();
+
+        assert_eq!(
+            (0..rows.len())
+                .map(|idx| display_depth(&rows, Some(3), idx))
+                .collect::<Vec<_>>(),
+            vec![0, 0, 0, 1, 2]
+        );
     }
 
     #[test]

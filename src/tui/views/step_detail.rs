@@ -594,6 +594,20 @@ pub struct StepDetailApp {
     /// True while a left-mouse drag started on the divider column is
     /// active. Cleared on `MouseEventKind::Up(Left)`.
     pub dragging_sidebar: bool,
+
+    /// Per-pane vertical scroll offsets, indexed by [`Pane::index`]. The
+    /// focused pane reads/writes its own offset via `J`/`K`, paging keys,
+    /// and the mouse wheel so long prompt bodies remain readable.
+    pane_scroll: [u16; 8],
+
+    /// Per-pane body heights from the most recent render, paired with
+    /// [`Self::pane_line_counts`] so scroll offsets clamp to the visible
+    /// content instead of drifting past the end.
+    pane_body_heights: [u16; 8],
+
+    /// Per-pane wrapped line counts from the most recent render. Used only
+    /// for scroll clamping.
+    pane_line_counts: [u16; 8],
 }
 
 impl StepDetailApp {
@@ -651,6 +665,9 @@ impl StepDetailApp {
             last_body_width: 0,
             last_sidebar_w: 0,
             dragging_sidebar: false,
+            pane_scroll: [0; 8],
+            pane_body_heights: [0; 8],
+            pane_line_counts: [0; 8],
         }
     }
 
@@ -679,6 +696,18 @@ impl StepDetailApp {
     /// the drag flag. No-op before the first frame (`last_body_width == 0`).
     pub fn handle_mouse(&mut self, event: MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+
+        match event.kind {
+            MouseEventKind::ScrollDown => {
+                self.scroll_focused_pane_down();
+                return;
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll_focused_pane_up();
+                return;
+            }
+            _ => {}
+        }
 
         if self.last_body_width == 0 {
             return;
@@ -722,6 +751,81 @@ impl StepDetailApp {
     /// the `edit_*_pane` methods or opening the question-answer modal.
     pub fn can_edit_panes(&self) -> bool {
         !self.read_only.is_locked()
+    }
+
+    fn pane_scroll(&self, pane: Pane) -> u16 {
+        self.pane_scroll[pane.index()]
+    }
+
+    fn set_pane_metrics(&mut self, pane: Pane, body_height: u16, line_count: u16) -> u16 {
+        let idx = pane.index();
+        self.pane_body_heights[idx] = body_height;
+        self.pane_line_counts[idx] = line_count.max(1);
+        let max = self.max_pane_scroll(pane);
+        if self.pane_scroll[idx] > max {
+            self.pane_scroll[idx] = max;
+        }
+        self.pane_scroll[idx]
+    }
+
+    fn max_pane_scroll(&self, pane: Pane) -> u16 {
+        let idx = pane.index();
+        self.pane_line_counts[idx].saturating_sub(self.pane_body_heights[idx].max(1))
+    }
+
+    fn pane_is_scrollable(pane: Pane) -> bool {
+        pane != Pane::BottomRow
+    }
+
+    pub fn scroll_focused_pane_down(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        let idx = self.focused_pane.index();
+        let max = self.max_pane_scroll(self.focused_pane);
+        self.pane_scroll[idx] = self.pane_scroll[idx].saturating_add(1).min(max);
+    }
+
+    pub fn scroll_focused_pane_up(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        let idx = self.focused_pane.index();
+        self.pane_scroll[idx] = self.pane_scroll[idx].saturating_sub(1);
+    }
+
+    pub fn page_focused_pane_down(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        let idx = self.focused_pane.index();
+        let page = self.pane_body_heights[idx].max(1);
+        let max = self.max_pane_scroll(self.focused_pane);
+        self.pane_scroll[idx] = self.pane_scroll[idx].saturating_add(page).min(max);
+    }
+
+    pub fn page_focused_pane_up(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        let idx = self.focused_pane.index();
+        let page = self.pane_body_heights[idx].max(1);
+        self.pane_scroll[idx] = self.pane_scroll[idx].saturating_sub(page);
+    }
+
+    pub fn scroll_focused_pane_to_top(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        self.pane_scroll[self.focused_pane.index()] = 0;
+    }
+
+    pub fn scroll_focused_pane_to_bottom(&mut self) {
+        if !Self::pane_is_scrollable(self.focused_pane) {
+            return;
+        }
+        let idx = self.focused_pane.index();
+        self.pane_scroll[idx] = self.max_pane_scroll(self.focused_pane);
     }
 
     // -- Pane focus ------------------------------------------------------
@@ -1440,7 +1544,7 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
 
     let step_segment = app.breadcrumb_step_segment();
     let crumbs: [&str; 3] = ["ralph", app.plan.slug.as_str(), step_segment.as_str()];
-    let normal_hint = "[j/k] pane  [h/←] back  [z] zen  [/:] cmd  [q] back";
+    let normal_hint = "[j/k] pane  [J/K] scroll  [h/←] back  [z] zen  [/:] cmd  [q] back";
     let palette_hint = "[tab] complete  [enter] submit  [esc] cancel";
     let hint = if app.palette_active() {
         palette_hint
@@ -1771,7 +1875,7 @@ fn draw_zen_gutter(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
     }
 }
 
-fn draw_pane_stack(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn draw_pane_stack(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1806,7 +1910,7 @@ fn draw_pane_stack(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
 /// Draw one pane — the bordered block plus its read-only body content. The
 /// body is sourced from whichever column / config field §8 designates as the
 /// pane's source of truth.
-fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
+fn draw_pane(frame: &mut Frame, app: &mut StepDetailApp, pane: Pane, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1831,17 +1935,24 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
     }
 
     match pane {
-        Pane::GlobalPrompt => render_text_pane(frame, inner, app.config_prompt.as_deref()),
+        Pane::GlobalPrompt => {
+            let text = app.config_prompt.clone();
+            render_text_pane(frame, app, pane, inner, text.as_deref())
+        }
         Pane::ProjectPrompt => {
-            render_text_pane(frame, inner, app.project_settings.prompt.as_deref())
+            let text = app.project_settings.prompt.clone();
+            render_text_pane(frame, app, pane, inner, text.as_deref())
         }
         // The Plan layer IS `plan.description`. An empty description renders
         // the `(none)` placeholder via `render_text_pane`.
-        Pane::PlanPrompt => render_text_pane(
-            frame,
-            inner,
-            Some(app.plan.description.as_str()).filter(|s| !s.is_empty()),
-        ),
+        Pane::PlanPrompt => {
+            let text = if app.plan.description.is_empty() {
+                None
+            } else {
+                Some(app.plan.description.clone())
+            };
+            render_text_pane(frame, app, pane, inner, text.as_deref())
+        }
         Pane::StepPrompt => render_step_prompt(frame, app, inner),
         Pane::OpenQuestions => render_open_questions(frame, app, inner),
         Pane::Appended => render_appended(frame, app, inner),
@@ -1850,17 +1961,74 @@ fn draw_pane(frame: &mut Frame, app: &StepDetailApp, pane: Pane, area: Rect) {
     }
 }
 
+fn wrapped_visual_line_count(chars: usize, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    chars.max(1).div_ceil(width as usize).min(u16::MAX as usize) as u16
+}
+
+fn text_visual_line_count(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    text.split('\n')
+        .map(|line| wrapped_visual_line_count(line.chars().count(), width) as usize)
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16
+}
+
+fn line_visual_line_count(line: &Line, width: u16) -> u16 {
+    wrapped_visual_line_count(
+        line.spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum(),
+        width,
+    )
+}
+
+fn lines_visual_line_count(lines: &[Line], width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    lines
+        .iter()
+        .map(|line| line_visual_line_count(line, width) as usize)
+        .sum::<usize>()
+        .max(1)
+        .min(u16::MAX as usize) as u16
+}
+
+fn render_scrolled_paragraph<'a>(
+    frame: &mut Frame,
+    app: &mut StepDetailApp,
+    pane: Pane,
+    area: Rect,
+    paragraph: Paragraph<'a>,
+    line_count: u16,
+) {
+    let scroll = app.set_pane_metrics(pane, area.height, line_count);
+    frame.render_widget(paragraph.scroll((scroll, 0)), area);
+}
+
 /// Render the [`Pane::OpenQuestions`] body. Each unanswered question is
 /// shown as a `❓ <text>` line followed by indented `[N] suggestion`
 /// rows. The currently focused question is bolded so j/k feedback is
 /// visible even when the pane itself isn't focused.
-fn render_open_questions(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn render_open_questions(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     if app.open_questions_for_step.is_empty() {
-        let para = Paragraph::new(Span::styled(
-            "(no open questions for this step)",
-            Style::default().fg(theme::CHROME_DIM),
-        ));
-        frame.render_widget(para, area);
+        render_scrolled_paragraph(
+            frame,
+            app,
+            Pane::OpenQuestions,
+            area,
+            Paragraph::new(Span::styled(
+                "(no open questions for this step)",
+                Style::default().fg(theme::CHROME_DIM),
+            )),
+            1,
+        );
         return;
     }
     let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -1906,33 +2074,52 @@ fn render_open_questions(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
             lines.push(Line::from(""));
         }
     }
+    let line_count = lines_visual_line_count(&lines, area.width);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+    render_scrolled_paragraph(frame, app, Pane::OpenQuestions, area, para, line_count);
 }
 
 /// Render a single text body (plan-context-prepend pane). `None` becomes the
 /// dim `(none)` placeholder; `Some("")` renders as an empty body.
-fn render_text_pane(frame: &mut Frame, area: Rect, text: Option<&str>) {
-    let para = match text {
-        None => Paragraph::new(Span::styled(
-            NONE_PLACEHOLDER,
-            Style::default().fg(theme::CHROME_DIM),
-        )),
-        Some(s) => Paragraph::new(s.to_string()),
-    }
-    .wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+fn render_text_pane(
+    frame: &mut Frame,
+    app: &mut StepDetailApp,
+    pane: Pane,
+    area: Rect,
+    text: Option<&str>,
+) {
+    let (para, line_count) = match text {
+        None => (
+            Paragraph::new(Span::styled(
+                NONE_PLACEHOLDER,
+                Style::default().fg(theme::CHROME_DIM),
+            ))
+            .wrap(Wrap { trim: false }),
+            1,
+        ),
+        Some(s) => (
+            Paragraph::new(s.to_string()).wrap(Wrap { trim: false }),
+            text_visual_line_count(s, area.width),
+        ),
+    };
+    render_scrolled_paragraph(frame, app, pane, area, para, line_count);
 }
 
 /// Render the Step prompt pane: title, description, and the bulleted
 /// acceptance criteria.
-fn render_step_prompt(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn render_step_prompt(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     let Some(step) = app.current_step() else {
-        let para = Paragraph::new(Span::styled(
-            "(no steps)",
-            Style::default().fg(theme::CHROME_DIM),
-        ));
-        frame.render_widget(para, area);
+        render_scrolled_paragraph(
+            frame,
+            app,
+            Pane::StepPrompt,
+            area,
+            Paragraph::new(Span::styled(
+                "(no steps)",
+                Style::default().fg(theme::CHROME_DIM),
+            )),
+            1,
+        );
         return;
     };
     let mut lines: Vec<Line> = Vec::new();
@@ -1999,8 +2186,9 @@ fn render_step_prompt(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
         }
     }
 
+    let line_count = lines_visual_line_count(&lines, area.width);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+    render_scrolled_paragraph(frame, app, Pane::StepPrompt, area, para, line_count);
 }
 
 /// Render the Appended pane body: read-only retry context for the focused
@@ -2009,25 +2197,37 @@ fn render_step_prompt(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
 /// attempt N's prompt. Attempt 1 has no previous attempt, so it renders a
 /// dim placeholder; an empty execution log renders the same shape it had
 /// before any attempts ran.
-fn render_appended(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn render_appended(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     if app.execution_logs.is_empty() {
-        let para = Paragraph::new(Span::styled(
-            "(retry context appears here once an attempt has run)",
-            Style::default().fg(theme::CHROME_DIM),
-        ))
-        .wrap(Wrap { trim: false });
-        frame.render_widget(para, area);
+        render_scrolled_paragraph(
+            frame,
+            app,
+            Pane::Appended,
+            area,
+            Paragraph::new(Span::styled(
+                "(retry context appears here once an attempt has run)",
+                Style::default().fg(theme::CHROME_DIM),
+            ))
+            .wrap(Wrap { trim: false }),
+            1,
+        );
         return;
     }
 
     // First attempt has no preceding log to source retry context from.
     if app.appended_attempt_index == 0 {
-        let para = Paragraph::new(Span::styled(
-            "(first attempt — no appended retry context)",
-            Style::default().fg(theme::CHROME_DIM),
-        ))
-        .wrap(Wrap { trim: false });
-        frame.render_widget(para, area);
+        render_scrolled_paragraph(
+            frame,
+            app,
+            Pane::Appended,
+            area,
+            Paragraph::new(Span::styled(
+                "(first attempt — no appended retry context)",
+                Style::default().fg(theme::CHROME_DIM),
+            ))
+            .wrap(Wrap { trim: false }),
+            1,
+        );
         return;
     }
 
@@ -2060,8 +2260,9 @@ fn render_appended(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
         }
     }
 
+    let line_count = lines_visual_line_count(&lines, area.width);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+    render_scrolled_paragraph(frame, app, Pane::Appended, area, para, line_count);
 }
 
 /// Cap `text` at `max_lines` lines, appending an `... (N lines omitted) ...`
@@ -2080,7 +2281,7 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
 
 /// Render the Tests pane: `plan.deterministic_tests` as a bulleted list, or
 /// a dim placeholder if no tests are configured.
-fn render_tests(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
+fn render_tests(frame: &mut Frame, app: &mut StepDetailApp, area: Rect) {
     let lines: Vec<Line> = if app.plan.deterministic_tests.is_empty() {
         vec![Line::from(Span::styled(
             NONE_PLACEHOLDER,
@@ -2093,8 +2294,9 @@ fn render_tests(frame: &mut Frame, app: &StepDetailApp, area: Rect) {
             .map(|t| Line::from(format!("• {t}")))
             .collect()
     };
+    let line_count = lines_visual_line_count(&lines, area.width);
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, area);
+    render_scrolled_paragraph(frame, app, Pane::Tests, area, para, line_count);
 }
 
 /// Render the bottom row: four cells (Harness / Model / Agent / Change
@@ -2405,6 +2607,38 @@ mod tests {
         let mut app = make_app(3, 0);
         app.focus_down();
         assert_eq!(app.focused_pane, Pane::OpenQuestions);
+    }
+
+    #[test]
+    fn focused_pane_scroll_clamps_to_last_rendered_metrics() {
+        let mut app = make_app(3, 0);
+        app.focused_pane = Pane::StepPrompt;
+        app.set_pane_metrics(Pane::StepPrompt, 3, 7);
+
+        for _ in 0..10 {
+            app.scroll_focused_pane_down();
+        }
+        assert_eq!(app.pane_scroll(Pane::StepPrompt), 4);
+
+        app.page_focused_pane_up();
+        assert_eq!(app.pane_scroll(Pane::StepPrompt), 1);
+        app.scroll_focused_pane_to_top();
+        assert_eq!(app.pane_scroll(Pane::StepPrompt), 0);
+        app.scroll_focused_pane_to_bottom();
+        assert_eq!(app.pane_scroll(Pane::StepPrompt), 4);
+    }
+
+    #[test]
+    fn bottom_row_does_not_scroll() {
+        let mut app = make_app(3, 0);
+        app.focused_pane = Pane::BottomRow;
+        app.set_pane_metrics(Pane::BottomRow, 2, 20);
+
+        app.scroll_focused_pane_down();
+        app.page_focused_pane_down();
+        app.scroll_focused_pane_to_bottom();
+
+        assert_eq!(app.pane_scroll(Pane::BottomRow), 0);
     }
 
     // -- Open-question pane (TUI-plan.md §17) -------------------------------

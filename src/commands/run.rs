@@ -4494,6 +4494,10 @@ where
         }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Mouse(m) => {
+                app.handle_mouse(m);
+                continue;
+            }
             _ => continue,
         };
 
@@ -4688,6 +4692,10 @@ where
         }
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
+            Event::Mouse(m) => {
+                app.handle_mouse(m);
+                continue;
+            }
             _ => continue,
         };
         match app.handle_key(key) {
@@ -4948,6 +4956,20 @@ where
                     _ => '/',
                 };
                 app.open_palette(prefix);
+            }
+            KeyCode::Char('J') => app.scroll_focused_pane_down(),
+            KeyCode::Char('K') => app.scroll_focused_pane_up(),
+            KeyCode::PageDown | KeyCode::Char(' ') if app.focused_pane != Pane::BottomRow => {
+                app.page_focused_pane_down();
+            }
+            KeyCode::PageUp if app.focused_pane != Pane::BottomRow => {
+                app.page_focused_pane_up();
+            }
+            KeyCode::Char('g') | KeyCode::Home if app.focused_pane != Pane::BottomRow => {
+                app.scroll_focused_pane_to_top();
+            }
+            KeyCode::Char('G') | KeyCode::End if app.focused_pane != Pane::BottomRow => {
+                app.scroll_focused_pane_to_bottom();
             }
             // Question-pane navigation (j/k) overrides pane navigation while
             // the pane is focused.
@@ -9992,10 +10014,12 @@ mod mouse_routing_tests {
     use crate::config::Config;
     use crate::plan::{ChangePolicy, Plan, PlanStatus, Step, StepStatus};
     use crate::tui::views::archived_list::ArchivedListApp;
+    use crate::tui::views::inbox::InboxState;
     use crate::tui::views::plan_dependencies::PlanDependenciesApp;
     use crate::tui::views::plan_detail::PlanDetailApp;
     use crate::tui::views::plan_hooks::PlanHooksApp;
     use crate::tui::views::plan_list::PlanListApp;
+    use crate::tui::views::rendered_prompt::{AttemptPrompt, RenderedPromptApp};
     use crate::tui::views::step_detail::StepDetailApp;
     use crate::tui::views::step_hooks::StepHooksApp;
     use crate::tui::views::step_tags::StepTagsApp;
@@ -10032,6 +10056,8 @@ mod mouse_routing_tests {
         PlanHooksApp,
         StepHooksApp,
         StepTagsApp,
+        RenderedPromptApp,
+        InboxState,
     );
 
     /// Mirrors the routing arm every TUI dispatcher carries:
@@ -10212,6 +10238,22 @@ mod mouse_routing_tests {
         )
     }
 
+    fn make_rendered_prompt_app() -> RenderedPromptApp {
+        RenderedPromptApp::new(
+            "alpha".to_string(),
+            "#1 — Step".to_string(),
+            vec![AttemptPrompt {
+                attempt: 1,
+                started_at: None,
+                prompt: "preview body".to_string(),
+            }],
+        )
+    }
+
+    fn make_inbox_app() -> InboxState {
+        InboxState::new(Vec::new())
+    }
+
     // -- Dispatcher routing tests --------------------------------------------
 
     #[test]
@@ -10259,6 +10301,18 @@ mod mouse_routing_tests {
     #[test]
     fn step_tags_dispatcher_routes_mouse_to_handle_mouse() {
         let mut app = make_step_tags_app();
+        assert_routes_mouse_to_app(&mut app);
+    }
+
+    #[test]
+    fn rendered_prompt_dispatcher_routes_mouse_to_handle_mouse() {
+        let mut app = make_rendered_prompt_app();
+        assert_routes_mouse_to_app(&mut app);
+    }
+
+    #[test]
+    fn inbox_dispatcher_routes_mouse_to_handle_mouse() {
+        let mut app = make_inbox_app();
         assert_routes_mouse_to_app(&mut app);
     }
 

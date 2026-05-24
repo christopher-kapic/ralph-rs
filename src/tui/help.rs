@@ -295,6 +295,7 @@ pub fn for_inbox() -> HelpModel {
                 vec![
                     ("j / ↓", "Next interruption"),
                     ("k / ↑", "Previous interruption"),
+                    ("mouse wheel", "Move cursor (list mode only)"),
                     ("enter / a", "Start run-through (answer all in one pass)"),
                     ("q / h / ←", "Back"),
                 ],
@@ -334,6 +335,17 @@ pub fn for_step_detail() -> HelpModel {
                 vec![
                     ("c", "Open focused pane in $EDITOR"),
                     ("a", "Answer focused open question"),
+                ],
+            ),
+            Group::new(
+                "Scroll",
+                vec![
+                    ("J", "Scroll focused pane down one line"),
+                    ("K", "Scroll focused pane up one line"),
+                    ("space / PgDn", "Page focused pane down"),
+                    ("PgUp", "Page focused pane up"),
+                    ("g / Home", "Jump focused pane to top"),
+                    ("G / End", "Jump focused pane to bottom"),
                 ],
             ),
             Group::new(
@@ -508,6 +520,7 @@ pub fn for_rendered_prompt() -> HelpModel {
                 vec![
                     ("J", "Scroll down one line"),
                     ("K", "Scroll up one line"),
+                    ("mouse wheel", "Scroll the body (never switches attempts)"),
                     ("space / PgDn", "Page down"),
                     ("PgUp", "Page up"),
                     ("g / Home", "Jump to top"),
