@@ -75,6 +75,22 @@ redesign must preserve that.
 
 ### 3.2 The per-step pipeline
 
+> **Update (post-redesign).** The "commit per iteration, *before* the
+> deterministic test" rule in this section was **reversed** in the
+> shipped code: a commit now happens **only on the first attempt whose
+> tests pass**, and failed attempts preserve the dirty tree
+> (`previous_test_output` — including pre-commit hook stderr, treated as
+> a test failure — feeds the next prompt). Net effect: **at most one
+> commit per step.** The `Ralph-Iteration: <n>` trailer is preserved as
+> the attempt-number identifier. The §5 `RetryStrategy` reinterpretation
+> ("`Keep` accumulates iteration commits; `Rollback` git-reverts the
+> prior iteration") is therefore moot at runtime — both arms preserve
+> the dirty tree, and `RetryStrategy` is vestigial pending removal. The
+> `RUNNABLE → FAILED` transitions on `TestFailed` / `CommitFailed` shown
+> below were also softened — see §3.4-bis ("Retry-exhaustion
+> auto-blocker"). `CLAUDE.md` ("DAG redesign — shipped shape") is
+> authoritative for the shipped flow.
+
 Each step runs this pipeline. The iteration number `n` starts at 1 and
 increments on every implementation re-attempt.
 
@@ -133,6 +149,12 @@ re-parented edge to the corrective step), not status-based — see §10.
 
 ### 3.4 Interruptions: questions + blockers (unified)
 
+> **Update (post-redesign).** The unified interruption model below still
+> describes the shape of an interrupt. The shipped code adds a *second*
+> way an interruption arises: the executor itself raises a
+> `kind=Blocker` interruption on retry-budget exhaustion (test-fail or
+> commit-hook-fail) instead of going terminal-`Failed` — see §3.4-bis.
+
 Questions and blockers are the same entity — *a branch-pausing interrupt
 that needs a human and may carry text forward into the next prompt*. One
 table, one state machine, one TUI inbox, two CLI verbs.
@@ -161,6 +183,64 @@ Interruption {
 - **Resolution** injects a bounded "Resolved interruptions" section into
   the step's next prompt (§8) — the chosen answer/resolution **and** any
   comment.
+
+### 3.4-bis Retry-exhaustion auto-blocker (post-redesign)
+
+The draft pipeline (§3.2) shows `tests fail & no budget ──► FAILED`. The
+shipped executor instead converts the terminal failure into a *Blocker
+interruption* so a human can choose between retrying from scratch and
+accepting the failure. This makes retry budgets recoverable without
+losing the per-step audit trail.
+
+- **Trigger.** A step exhausts its retry budget on either `TestFailed`
+  (deterministic tests still red on the last attempt) or `CommitFailed`
+  (pre-commit hook still rejecting on the last attempt; the hook stderr
+  is treated as a test failure end-to-end, so it gets retried like a
+  test failure and the same exhaustion path fires). Other failure modes
+  — `HarnessFailed`, `Timeout`, `NoChanges` — remain terminal `Failed`.
+- **Effect.** The executor inserts a `kind=Blocker` interruption with
+  two ranked options (`text` is the literal recognition key the
+  resolution handler matches against):
+  - priority 1 — `"Retry the step from scratch"`
+    (`executor::RETRY_EXHAUSTED_OPTION_RETRY`)
+  - priority 2 — `"Mark step Failed"`
+    (`executor::RETRY_EXHAUSTED_OPTION_FAIL`)
+  Body = `"Step failed after N attempts."` plus the final attempt's test
+  output (and hook stderr when applicable), tail-truncated to a fixed
+  byte cap so a runaway dump can't break the inbox UI. The step is
+  parked at `status=Pending` with `attempts == max_attempts`; the
+  derived `Blocked` overlay shadows it (never persisted, clears on
+  resolution — exactly like §3.3). The dirty tree is rolled back; the
+  scheduler advances to another runnable branch (consumes no further
+  retry budget).
+- **Resolution.** The TUI inbox and `ralph interruption resolve` route
+  through `commands::interruption::apply_retry_exhausted_resolution`,
+  which recognises a blocker with two options whose texts equal the two
+  `pub const` strings above:
+  - `RETRY_EXHAUSTED_OPTION_RETRY` → reset `attempts = 0`, status
+    `Pending`; scheduler re-picks on its next tick.
+  - `RETRY_EXHAUSTED_OPTION_FAIL` → status `Failed` (terminal).
+  - Freeform answers matching neither are treated as **retry-with-hint**
+    — `attempts = 0`, status `Pending`, and the human comment flows into
+    the next prompt via the bounded "Resolved interruptions" section
+    (§8). The inbox UI renders option lists for any blocker with
+    non-empty `options`, not just questions, so the ranked-answer modal
+    works uniformly.
+- **Variant reuse, no new variants.**
+  `TerminationReason::PausedForQuestion` and
+  `StepOutcome::PausedForQuestion` are reused — the executor treats a
+  retry-exhausted step exactly like a harness-raised pause for purposes
+  of "did this attempt commit?" and "did this consume budget?". A
+  downstream NDJSON consumer therefore sees a `step_finished` with
+  `termination_reason="paused_for_question"` in both cases and must poll
+  the `interruptions` table to distinguish them (see
+  `docs/ndjson-events.md`).
+- **Concurrency invariant.** The interruption insert + the
+  `update_step_status(Pending)` happen inside a single
+  `unchecked_transaction` so the scheduler can never observe `Pending
+  without open interruption` mid-write — the §9 "single DAG writer"
+  invariant holds across the auto-blocker path the same way it does for
+  corrective-step insertion.
 
 ### 3.5 Scheduler
 
@@ -217,6 +297,34 @@ A full audit of prompt assembly (`prompt.rs`, `executor.rs`, `runner.rs`,
 ---
 
 ## 5. Git model
+
+> **Update (post-redesign).** This section's "commit per iteration"
+> rule and its corresponding `RetryStrategy::Keep` / `Rollback`
+> reinterpretation were superseded by the **test-then-commit** flow
+> (see §3.2 update callout). With **at most one commit per step**:
+>
+> - The subject + trailers (`Ralph-Plan` / `Ralph-Step` /
+>   `Ralph-Iteration: <n>` / `Ralph-Review: pending`) are unchanged;
+>   `<n>` now identifies *which attempt finally passed* rather than
+>   counting commits.
+> - `RetryStrategy` is **vestigial** — both arms preserve the dirty
+>   tree between failed attempts (there is no per-iteration commit to
+>   keep or revert). The enum, the per-plan/per-step columns, and the
+>   `--retry-strategy` CLI flag are kept for migration compatibility,
+>   slated for removal in a follow-up PR.
+> - The §14.1 "iteration-commit history noise" open question is moot:
+>   nothing to squash. The **`execution_logs` rows** are the per-attempt
+>   audit trail (prompt / harness stdout+stderr / test output / diff
+>   per attempt, including failed ones); the single committed SHA
+>   represents only the passing attempt. `--squash-on-complete` / the
+>   per-plan `squash_on_complete` column are vestigial alongside
+>   `RetryStrategy`.
+> - "Blocked branch parks no WIP specially" still holds for
+>   harness-raised interruptions (the prior commit, if any, sits on the
+>   linear history). The §3.4-bis auto-blocker is the *new* parking
+>   case: the step's dirty tree is rolled back before the blocker is
+>   raised, so the linear history never grows from a retry-exhausted
+>   step until a human chooses to retry it.
 
 - **Linear history, one branch per plan** (unchanged branch-per-plan
   policy).

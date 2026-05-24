@@ -4540,6 +4540,15 @@ where
                     &resolution,
                     comment.as_deref(),
                 )?;
+                // Phase C: if this was the Phase B auto-raised
+                // retry-exhausted blocker, apply the chosen side-effect
+                // (Retry → reset attempts + Pending; Fail → terminal
+                // Failed). No-op for normal interruptions.
+                crate::commands::interruption::apply_retry_exhausted_resolution(
+                    conn,
+                    &interruption_id,
+                    &resolution,
+                )?;
                 // Reflect it in-memory and auto-advance to the next open
                 // interruption (run-through — §12.3); a fresh DB poll on
                 // the next loop tick reconciles any drift.

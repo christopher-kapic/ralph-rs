@@ -1030,6 +1030,20 @@ pub fn list_interruptions_for_step(conn: &Connection, step_id: &str) -> Result<V
     Ok(out)
 }
 
+/// Fetch a single interruption by its uuid. Errors with a precise
+/// "interruption not found" anyhow context if no row matches — distinct from
+/// `resolve_interruption`'s "already resolved" so callers (Phase C's shared
+/// retry-exhausted resolution helper, the CLI `interruption show`) can give
+/// the human a useful message. Selects via [`INTERRUPTION_COLUMNS`] so the
+/// row->[`Interruption`] mapping stays in lockstep with
+/// [`list_interruptions_for_step`] (any column drift breaks both at once
+/// rather than silently desynchronizing).
+pub fn get_interruption(conn: &Connection, id: &str) -> Result<Interruption> {
+    let sql = format!("SELECT {INTERRUPTION_COLUMNS} FROM interruptions WHERE id = ?1");
+    conn.query_row(&sql, params![id], Interruption::from_row)
+        .with_context(|| format!("interruption not found: {id}"))
+}
+
 /// One row for the cross-branch interruptions inbox (docs/dag-redesign.md
 /// §12.3): the full [`Interruption`] plus the owning plan slug and the
 /// step's short id, for display without a second lookup.
@@ -1688,6 +1702,27 @@ pub fn update_step_status(conn: &Connection, step_id: &str, status: StepStatus) 
         params![status.as_str(), step_id],
     )?;
 
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
+/// Set the persisted attempt count for a step to an absolute value (NOT a
+/// delta). `0` resets — the Phase C "retry from scratch" path uses this to
+/// re-queue a step that exhausted its budget. Sibling helper to
+/// [`update_step_status`] so the shared resolution helper in
+/// `commands/interruption.rs` can `set_step_attempts(.. 0) +
+/// update_step_status(Pending)` atomically inside [`crate::db::with_tx`]
+/// without going through the executor's private function (kept private so
+/// the executor stays the only writer on the hot-loop path).
+pub fn set_step_attempts(conn: &Connection, step_id: &str, attempts: i32) -> Result<()> {
+    let affected = conn
+        .execute(
+            "UPDATE steps SET attempts = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![attempts, step_id],
+        )
+        .with_context(|| format!("Failed to update step attempts for {step_id}"))?;
     if affected == 0 {
         anyhow::bail!("Step not found: {step_id}");
     }
@@ -7116,6 +7151,141 @@ mod tests {
                 .is_empty(),
             "open interruptions must not appear in the resolved list"
         );
+    }
+
+    /// Phase B: an auto-raised retry-exhausted blocker carries two ranked
+    /// options. Verify the round-trip persists the ranking — the existing
+    /// `test_insert_interruption_round_trips_options_state` only covers the
+    /// Question kind, leaving the relaxed "blockers may carry options"
+    /// contract uncovered before Phase B.
+    #[test]
+    fn test_insert_interruption_blocker_with_options_round_trips() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let opts = vec![
+            InterruptionOption {
+                text: "Retry the step from scratch".to_string(),
+                priority: 1,
+            },
+            InterruptionOption {
+                text: "Mark step Failed".to_string(),
+                priority: 2,
+            },
+        ];
+        let id = insert_interruption(
+            &conn,
+            &step_id,
+            2,
+            InterruptionKind::Blocker,
+            "Step failed after 3 attempts.\n\nLast attempt test output:\n<snip>",
+            &opts,
+        )
+        .unwrap();
+
+        let all = list_interruptions_for_step(&conn, &step_id).unwrap();
+        assert_eq!(all.len(), 1);
+        let i = &all[0];
+        assert_eq!(i.id, id);
+        assert_eq!(i.attempt, 2);
+        assert_eq!(i.kind, InterruptionKind::Blocker);
+        assert_eq!(i.state, InterruptionState::Open);
+        assert_eq!(
+            i.options, opts,
+            "options must round-trip verbatim on a Blocker"
+        );
+        assert!(i.body.contains("Step failed after"));
+    }
+
+    #[test]
+    fn test_get_interruption_round_trips() {
+        // Phase C: `get_interruption` (the targeted single-row read) must
+        // return the same row shape `list_interruptions_for_step` produces.
+        // Covers: open question with ranked options, missing-id precise
+        // error, and post-resolve state/resolution round-trip.
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let opts = vec![
+            InterruptionOption {
+                text: "Retry the step from scratch".to_string(),
+                priority: 1,
+            },
+            InterruptionOption {
+                text: "Mark step Failed".to_string(),
+                priority: 2,
+            },
+        ];
+        let id = insert_interruption(
+            &conn,
+            &step_id,
+            2,
+            InterruptionKind::Blocker,
+            "exhausted budget",
+            &opts,
+        )
+        .unwrap();
+
+        let got = get_interruption(&conn, &id).unwrap();
+        assert_eq!(got.id, id);
+        assert_eq!(got.step_id, step_id);
+        assert_eq!(got.attempt, 2);
+        assert_eq!(got.kind, InterruptionKind::Blocker);
+        assert_eq!(got.body, "exhausted budget");
+        assert_eq!(got.options, opts);
+        assert_eq!(got.state, InterruptionState::Open);
+        assert!(got.resolved_at.is_none());
+
+        // Resolving flips state + resolution; the targeted read must reflect it.
+        resolve_interruption(&conn, &id, "Retry the step from scratch", Some("hint")).unwrap();
+        let after = get_interruption(&conn, &id).unwrap();
+        assert_eq!(after.state, InterruptionState::Resolved);
+        assert_eq!(
+            after.resolution.as_deref(),
+            Some("Retry the step from scratch")
+        );
+        assert_eq!(after.comment.as_deref(), Some("hint"));
+        assert!(after.resolved_at.is_some());
+
+        // Unknown id is a precise error (caller surfaces it to the human).
+        let err = get_interruption(&conn, "no-such-id").unwrap_err();
+        assert!(
+            err.to_string().contains("interruption not found"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_set_step_attempts_persists_value_and_errors_on_missing() {
+        // Phase C: the public `set_step_attempts` in storage (Phase C's
+        // resolution helper uses it; the executor keeps its private
+        // hot-loop one). Round-trip the value through a SELECT (rather than
+        // touching the executor) and verify the missing-step path errors.
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        set_step_attempts(&conn, &step_id, 3).unwrap();
+        let n: i32 = conn
+            .query_row(
+                "SELECT attempts FROM steps WHERE id = ?1",
+                params![step_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+
+        set_step_attempts(&conn, &step_id, 0).unwrap();
+        let n: i32 = conn
+            .query_row(
+                "SELECT attempts FROM steps WHERE id = ?1",
+                params![step_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+
+        let err = set_step_attempts(&conn, "no-such-step", 1).unwrap_err();
+        assert!(err.to_string().contains("Step not found"), "got: {err}");
     }
 
     #[test]

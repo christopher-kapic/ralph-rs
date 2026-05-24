@@ -6,9 +6,90 @@
 use anyhow::{Result, bail};
 use rusqlite::Connection;
 
+use crate::db;
+use crate::executor::{RETRY_EXHAUSTED_OPTION_FAIL, RETRY_EXHAUSTED_OPTION_RETRY};
 use crate::output::{OutputContext, OutputFormat};
-use crate::plan::InterruptionKind;
+use crate::plan::{InterruptionKind, StepStatus};
 use crate::storage::{self, OpenQuestion};
+
+/// Phase C: react to the human-side resolution of the **Phase B auto-raised
+/// retry-exhausted blocker** (the only interruption that carries the two
+/// ranked options [`RETRY_EXHAUSTED_OPTION_RETRY`] /
+/// [`RETRY_EXHAUSTED_OPTION_FAIL`]; harness-raised blockers have empty
+/// options and never match).
+///
+/// `Ok(true)` — the interruption was the auto-blocker and the side-effect
+/// has been applied (`Retry` → `attempts = 0` + status `Pending` so the
+/// scheduler re-queues; `Fail` → status `Failed`, terminal). `Ok(false)` —
+/// the interruption was a normal question or harness-raised blocker; the
+/// caller's existing `resolve_interruption` flow is the whole story.
+///
+/// Resolution-text matching uses the executor's `pub const` strings (so
+/// drift between writer and reader trips `cargo test --lib`, not production).
+/// A freeform resolution that matches neither option is treated as
+/// **Retry-from-scratch + hint**: `resolve_interruption` already persisted
+/// the freeform string as the resolution and the comment, both of which
+/// flow into the next step prompt via the bounded
+/// `list_resolved_interruptions_for_step` injection (§8). This preserves the
+/// "Enter on the default-selected option" UX while honoring the spec
+/// guidance that the safest interpretation of an ambiguous freeform answer
+/// to a retry-exhausted blocker is "try again with this as a hint."
+///
+/// The reset writes are wrapped in [`db::with_tx`] so a concurrent scheduler
+/// poll cannot observe `attempts = 0` with the step still `InProgress` (or
+/// vice versa) — the half-state would let the scheduler skip re-queueing
+/// the step.
+pub fn apply_retry_exhausted_resolution(
+    conn: &Connection,
+    interruption_id: &str,
+    resolution_text: &str,
+) -> Result<bool> {
+    let interruption = storage::get_interruption(conn, interruption_id)?;
+    if interruption.kind != InterruptionKind::Blocker {
+        return Ok(false);
+    }
+    // Auto-blocker recognition: exactly two options whose texts match the
+    // Phase B constants. A harness-raised blocker has empty options; a
+    // hypothetical future blocker with a different option set won't match
+    // either — both correctly fall through to `Ok(false)`.
+    let is_auto = interruption.options.len() == 2
+        && interruption
+            .options
+            .iter()
+            .any(|o| o.text == RETRY_EXHAUSTED_OPTION_RETRY)
+        && interruption
+            .options
+            .iter()
+            .any(|o| o.text == RETRY_EXHAUSTED_OPTION_FAIL);
+    if !is_auto {
+        return Ok(false);
+    }
+
+    let step_id = interruption.step_id.clone();
+    let want_fail = resolution_text == RETRY_EXHAUSTED_OPTION_FAIL;
+
+    db::with_tx(conn, |tx| {
+        if want_fail {
+            // Explicit give-up: terminal Failed. The interruption is already
+            // resolved by the caller; the freeform comment (if any) is on
+            // the resolved row but never feeds another prompt — the step is
+            // done.
+            storage::update_step_status(tx, &step_id, StepStatus::Failed)?;
+        } else {
+            // "Retry the step from scratch" — the explicit option text —
+            // and the freeform-doesn't-match fallthrough both land here.
+            // The freeform text (and optional comment) were already stamped
+            // on the resolved interruption by the caller; the bounded
+            // resolved-interruptions section of the next prompt will pick
+            // it up automatically.
+            storage::set_step_attempts(tx, &step_id, 0)?;
+            storage::update_step_status(tx, &step_id, StepStatus::Pending)?;
+        }
+        Ok(())
+    })?;
+
+    Ok(true)
+}
 
 /// Resolve an interruption *selector* (a uuid OR a 1-based index in `ralph
 /// interruption list`) against the project's open-interruption list.
@@ -213,6 +294,10 @@ pub fn cmd_interruption_resolve(
     };
 
     storage::resolve_interruption(conn, &q.id, &resolution, comment)?;
+    // Phase C: if this was the Phase B auto-raised retry-exhausted blocker,
+    // reset attempts / mark Failed per the chosen option. No-op for normal
+    // interruptions (returns Ok(false) without writing).
+    apply_retry_exhausted_resolution(conn, &q.id, &resolution)?;
 
     if out.format == OutputFormat::Json {
         let json = serde_json::json!({
@@ -398,5 +483,257 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("No open interruption matched"));
+    }
+
+    // -- Phase C: apply_retry_exhausted_resolution -------------------------
+
+    /// Helper: insert the Phase B auto-raised retry-exhausted blocker
+    /// (two ranked options, [`RETRY_EXHAUSTED_OPTION_RETRY`] /
+    /// [`RETRY_EXHAUSTED_OPTION_FAIL`]). Mirrors the shape produced by
+    /// `executor::raise_retry_exhausted_blocker`.
+    fn seed_auto_blocker(conn: &Connection, step_id: &str) -> String {
+        storage::insert_interruption(
+            conn,
+            step_id,
+            3,
+            InterruptionKind::Blocker,
+            "Step failed after 3 attempts.",
+            &[
+                InterruptionOption {
+                    text: RETRY_EXHAUSTED_OPTION_RETRY.into(),
+                    priority: 1,
+                },
+                InterruptionOption {
+                    text: RETRY_EXHAUSTED_OPTION_FAIL.into(),
+                    priority: 2,
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    fn step_attempts(conn: &Connection, step_id: &str) -> i32 {
+        conn.query_row(
+            "SELECT attempts FROM steps WHERE id = ?1",
+            rusqlite::params![step_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn step_status(conn: &Connection, step_id: &str) -> StepStatus {
+        let s: String = conn
+            .query_row(
+                "SELECT status FROM steps WHERE id = ?1",
+                rusqlite::params![step_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        use std::str::FromStr;
+        StepStatus::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn test_apply_retry_exhausted_resolution_retry_resets_attempts() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-rer-retry";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        // Simulate the executor's pre-resolve state: attempts at max,
+        // status Pending (executor parks the step at Pending per the
+        // Phase B contract).
+        storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_auto_blocker(&conn, &step_id);
+
+        let acted =
+            apply_retry_exhausted_resolution(&conn, &id, RETRY_EXHAUSTED_OPTION_RETRY).unwrap();
+        assert!(acted, "auto-blocker recognized");
+        assert_eq!(step_attempts(&conn, &step_id), 0, "attempts reset to 0");
+        assert_eq!(
+            step_status(&conn, &step_id),
+            StepStatus::Pending,
+            "status stays Pending so the scheduler re-queues"
+        );
+    }
+
+    #[test]
+    fn test_apply_retry_exhausted_resolution_fail_marks_failed() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-rer-fail";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        let id = seed_auto_blocker(&conn, &step_id);
+
+        let acted =
+            apply_retry_exhausted_resolution(&conn, &id, RETRY_EXHAUSTED_OPTION_FAIL).unwrap();
+        assert!(acted);
+        assert_eq!(
+            step_status(&conn, &step_id),
+            StepStatus::Failed,
+            "terminal Failed"
+        );
+        // attempts is NOT reset — the row records the exhausted budget.
+        assert_eq!(step_attempts(&conn, &step_id), 3);
+    }
+
+    #[test]
+    fn test_apply_retry_exhausted_resolution_returns_false_for_normal_question() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-rer-q";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 2).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::InProgress).unwrap();
+
+        // Normal harness-raised question with two options that LOOK
+        // like the auto-blocker texts: still Question kind → must not
+        // match. (Defensive: the kind discriminator is the first gate.)
+        let qid = storage::insert_interruption(
+            &conn,
+            &step_id,
+            1,
+            InterruptionKind::Question,
+            "?",
+            &[
+                InterruptionOption {
+                    text: RETRY_EXHAUSTED_OPTION_RETRY.into(),
+                    priority: 1,
+                },
+                InterruptionOption {
+                    text: RETRY_EXHAUSTED_OPTION_FAIL.into(),
+                    priority: 2,
+                },
+            ],
+        )
+        .unwrap();
+
+        let acted =
+            apply_retry_exhausted_resolution(&conn, &qid, RETRY_EXHAUSTED_OPTION_RETRY).unwrap();
+        assert!(!acted, "Question kind must never match auto-blocker");
+        // No state was touched.
+        assert_eq!(step_attempts(&conn, &step_id), 2);
+        assert_eq!(step_status(&conn, &step_id), StepStatus::InProgress);
+    }
+
+    #[test]
+    fn test_apply_retry_exhausted_resolution_returns_false_for_harness_raised_blocker() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-rer-hb";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 1).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::InProgress).unwrap();
+
+        // Harness-raised blocker (empty options) — the most common
+        // false-positive guard: empty options must not match.
+        let bid = storage::insert_interruption(
+            &conn,
+            &step_id,
+            1,
+            InterruptionKind::Blocker,
+            "needs sudo",
+            &[],
+        )
+        .unwrap();
+
+        let acted = apply_retry_exhausted_resolution(&conn, &bid, "granted").unwrap();
+        assert!(!acted, "empty-options blocker must not match");
+        assert_eq!(step_attempts(&conn, &step_id), 1);
+        assert_eq!(step_status(&conn, &step_id), StepStatus::InProgress);
+    }
+
+    #[test]
+    fn test_apply_retry_exhausted_resolution_freeform_treated_as_retry() {
+        // Spec: a freeform resolution that matches neither option text
+        // is the "Enter on default-selected option + hint" UX — treat as
+        // Retry. The hint flows into the next prompt via the bounded
+        // resolved-interruptions injection (already persisted by the
+        // caller's `resolve_interruption`).
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-rer-ff";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_auto_blocker(&conn, &step_id);
+
+        let acted = apply_retry_exhausted_resolution(
+            &conn,
+            &id,
+            "try with --foo bar to skip the broken path",
+        )
+        .unwrap();
+        assert!(
+            acted,
+            "auto-blocker recognized regardless of resolution text"
+        );
+        assert_eq!(step_attempts(&conn, &step_id), 0);
+        assert_eq!(step_status(&conn, &step_id), StepStatus::Pending);
+    }
+
+    #[test]
+    fn test_apply_retry_exhausted_resolution_missing_id_errors() {
+        let conn = db::open_memory().unwrap();
+        let err = apply_retry_exhausted_resolution(&conn, "no-such-id", "x").unwrap_err();
+        assert!(
+            err.to_string().contains("interruption not found"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cli_resolve_with_auto_blocker_retry_resets_step() {
+        // End-to-end via the CLI handler: a retry-exhausted auto-blocker
+        // resolved with `--option 1` (priority 1 = Retry the step from
+        // scratch) must (a) resolve the interruption and (b) reset
+        // attempts/status. This is the contract for `ralph interruption
+        // resolve <id> --option 1` and `ralph interruption resolve <id>
+        // --answer "Retry the step from scratch"`.
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-cli-retry";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_auto_blocker(&conn, &step_id);
+
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &id,
+            Some(1), // priority 1 = Retry
+            None,
+            None,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        // Interruption resolved.
+        let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert!(after.is_empty(), "interruption resolved");
+        // Side-effect applied.
+        assert_eq!(step_attempts(&conn, &step_id), 0);
+        assert_eq!(step_status(&conn, &step_id), StepStatus::Pending);
+    }
+
+    #[test]
+    fn test_cli_resolve_with_auto_blocker_fail_marks_step_failed() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-cli-fail";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_auto_blocker(&conn, &step_id);
+
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &id,
+            None,
+            Some(RETRY_EXHAUSTED_OPTION_FAIL), // freeform that matches the Fail option text
+            None,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        assert_eq!(step_status(&conn, &step_id), StepStatus::Failed);
     }
 }

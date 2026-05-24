@@ -307,8 +307,13 @@ impl std::str::FromStr for RetryStrategy {
 /// needs a human and may carry text forward into the next prompt. A
 /// [`InterruptionKind::Question`] carries proposed [`InterruptionOption`]s
 /// with a priority (1 = the agent's best guess); a
-/// [`InterruptionKind::Blocker`] has no options (the agent explains what it
-/// cannot do and the human resolves it).
+/// [`InterruptionKind::Blocker`] is either one the harness raised mid-step
+/// OR an **auto-raised retry-exhausted blocker** (Phase B): a harness-raised
+/// blocker carries an empty option list (the agent explains what it cannot
+/// do and the human resolves it freeform); the auto-raised retry-exhausted
+/// variant carries two ranked options ("Retry the step from scratch" /
+/// "Mark step Failed") so a human can keep the audit trail and pick a
+/// recovery without typing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
@@ -460,10 +465,16 @@ impl std::str::FromStr for ReviewStatus {
     }
 }
 
-/// One proposed answer to a [`InterruptionKind::Question`] interruption.
+/// Ranked resolution options carried by an [`Interruption`].
 ///
-/// `priority` ranks the agent's proposals (1 = the agent's best guess).
-/// Blockers and freeform-only questions carry an empty option list.
+/// `priority` ranks the proposals (1 = the agent's best guess, or — for
+/// Phase B's auto-raised retry-exhausted blocker — the recommended default).
+/// Always empty for harness-raised blockers and for freeform-only questions;
+/// populated for Questions and for the **auto-raised retry-exhausted
+/// blocker** (`executor::raise_retry_exhausted_blocker`) which always
+/// inserts the two ranked recovery options
+/// ([`crate::executor::RETRY_EXHAUSTED_OPTION_RETRY`] /
+/// [`crate::executor::RETRY_EXHAUSTED_OPTION_FAIL`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterruptionOption {
     pub text: String,
@@ -475,13 +486,16 @@ pub struct InterruptionOption {
 ///
 /// One entity, one state machine: a [`InterruptionKind::Question`] carries
 /// proposed [`options`](Interruption::options) with priority (1 = agent
-/// best); a [`InterruptionKind::Blocker`] has no options. Resolving an
-/// interruption records `resolution`/`comment` and flips `state` to
+/// best); a harness-raised [`InterruptionKind::Blocker`] has no options,
+/// while the Phase B auto-raised retry-exhausted blocker carries the two
+/// ranked recovery options. Resolving an interruption records
+/// `resolution`/`comment` and flips `state` to
 /// [`InterruptionState::Resolved`]; while it is
 /// [`InterruptionState::Open`] the step's branch is `Blocked` and the
-/// scheduler works elsewhere (no retry budget consumed). The
-/// resolution/comment are later injected, bounded, into the step's next
-/// prompt (§8).
+/// scheduler works elsewhere (no retry budget consumed by the *interruption*
+/// itself — the auto-raised exhausted-budget variant is raised *after* the
+/// budget is already spent). The resolution/comment are later injected,
+/// bounded, into the step's next prompt (§8).
 ///
 /// Native storage/model wiring lands with the Phase 2 interruption CRUD
 /// (`storage::insert_interruption` and friends); the `interruption` CLI and
@@ -494,8 +508,9 @@ pub struct Interruption {
     pub kind: InterruptionKind,
     /// The question text, or the blocker explanation.
     pub body: String,
-    /// Questions only (priority 1 = agent's best). Empty for blockers and
-    /// freeform-only questions.
+    /// Ranked options (priority 1 = best). Populated for Questions and for
+    /// the Phase B auto-raised retry-exhausted blocker; empty for
+    /// harness-raised blockers and freeform-only questions.
     #[serde(default)]
     pub options: Vec<InterruptionOption>,
     /// The chosen option text or freeform answer; `None` while `Open`.

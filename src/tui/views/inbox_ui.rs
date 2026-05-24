@@ -115,19 +115,30 @@ fn render_interruption_modal(frame: &mut Frame, area: Rect, modal: &Interruption
     )));
     lines.push(Line::from(""));
 
-    if modal.is_blocker() {
+    // Phase C: option-list rendering is driven by `options.is_empty()`, not
+    // by `is_blocker()`. The Phase B auto-raised retry-exhausted blocker is
+    // a Blocker that DOES carry two ranked options (Retry / Fail); hiding
+    // them behind an `is_blocker` branch left the human with no visible
+    // way to choose. A harness-raised blocker still has empty options and
+    // falls through to the freeform-only placeholder.
+    if modal.options.is_empty() {
+        let placeholder = if modal.is_blocker() {
+            "Blocker — resolve / resolve-with-comment (no options)."
+        } else {
+            "Freeform-only question (no proposed answers)."
+        };
         lines.push(Line::from(Span::styled(
-            "Blocker — resolve / resolve-with-comment (no options).",
-            Style::default().fg(theme::CHROME_DIM),
-        )));
-    } else if modal.options.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Freeform-only question (no proposed answers).",
+            placeholder,
             Style::default().fg(theme::CHROME_DIM),
         )));
     } else {
+        let header = if modal.is_blocker() {
+            "Proposed resolutions (priority order; #1 = agent's best):"
+        } else {
+            "Proposed answers (priority order; #1 = agent's best):"
+        };
         lines.push(Line::from(Span::styled(
-            "Proposed answers (priority order; #1 = agent's best):",
+            header,
             Style::default().add_modifier(Modifier::BOLD),
         )));
         for (i, opt) in modal.options.iter().enumerate() {

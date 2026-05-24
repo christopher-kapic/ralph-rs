@@ -248,14 +248,14 @@ mod tests {
         assert_eq!(
             prefixes,
             vec![
-                "",            // aaaa (root)
-                "├── ",        // a1aa (first child of A)
-                "└── ",        // a2aa (last child of A)
-                "",            // bbbb (root B)
-                "├── ",        // b1aa (first child of B, not last → │ continues)
-                "│   ├── ",    // b11a (first child of B.1, under B's │)
-                "│   └── ",    // b12a (last child of B.1, B's │ still continues)
-                "└── ",        // b2aa (last child of B)
+                "",         // aaaa (root)
+                "├── ",     // a1aa (first child of A)
+                "└── ",     // a2aa (last child of A)
+                "",         // bbbb (root B)
+                "├── ",     // b1aa (first child of B, not last → │ continues)
+                "│   ├── ", // b11a (first child of B.1, under B's │)
+                "│   └── ", // b12a (last child of B.1, B's │ still continues)
+                "└── ",     // b2aa (last child of B)
             ]
         );
 

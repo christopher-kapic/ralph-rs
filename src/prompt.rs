@@ -77,41 +77,48 @@ and inserting before the current step is a no-op for this execution.
 
 /// Context from a previous failed attempt, used when retrying a step.
 ///
-/// The diff/files fields are **strategy-scoped** (Step 22):
+/// Failed attempts leave the dirty tree on disk for the next attempt; this
+/// context carries only the test output (and commit-hook output, if
+/// applicable) plus the failure reason from the prior attempt.
 ///
-/// - Under [`RetryStrategy::Rollback`](crate::plan::RetryStrategy::Rollback)
-///   the working tree was reverted before the retry, so the agent can no
-///   longer see its prior work on disk. We therefore feed the rolled-back
-///   diff and changed-file list back through this struct so the agent can
-///   still learn from — without inheriting — that work.
-/// - Under [`RetryStrategy::Keep`](crate::plan::RetryStrategy::Keep) (the
-///   default) the dirty tree is carried forward, so the prior work is
-///   already on disk for the agent to inspect via `git diff`. Re-sending the
-///   same diff in the prompt would be redundant and confusing, so the
-///   executor leaves `previous_diff = None` and `files_modified = []`;
-///   [`format_retry_context`] then omits those sections entirely.
+/// Post test-then-commit (Phase A): the per-iteration commit happens only
+/// after tests pass, so a failed attempt has no committed diff to feed back.
+/// The `previous_diff` and `files_modified` fields are retained for
+/// `RetryStrategy::Rollback`-style audit and external callers, but the
+/// executor currently populates them lazily/never — the dirty tree is always
+/// on disk for the agent to inspect via `git diff`. The retry-context render
+/// is therefore typically just the failure reason + previous test output.
 ///
-/// `previous_failure_reason` is populated under **both** strategies — it's a
-/// short human-readable note (derived from the prior attempt's
-/// [`TerminationReason`](crate::plan::TerminationReason)) so the Keep prompt
-/// still conveys *why* the last attempt failed even without the diff section.
+/// When a pre-commit hook rejects the commit (tests passed, commit refused),
+/// the captured hook stderr is concatenated into `previous_test_output`
+/// under a `[Commit hook output]` header so the next attempt's prompt
+/// surfaces both the test output and the hook output in a single section.
+///
+/// `previous_failure_reason` is a short human-readable note (derived from
+/// the prior attempt's
+/// [`TerminationReason`](crate::plan::TerminationReason)) so the prompt
+/// states *why* the last attempt failed even without a diff section.
 #[derive(Debug, Clone)]
 pub struct RetryContext {
     /// Which attempt number this is (1-indexed, so attempt 2 means first retry).
     pub attempt: i32,
     /// Maximum number of attempts allowed.
     pub max_attempts: i32,
-    /// The diff produced by the previous attempt. `None` under `Keep` (the
-    /// diff is already on disk) and when the prior attempt produced no diff.
+    /// The diff produced by the previous attempt. Typically `None` post
+    /// test-then-commit: the dirty tree is on disk for the agent to inspect
+    /// via `git diff`, so re-sending the same diff in the prompt would be
+    /// redundant and confusing.
     pub previous_diff: Option<String>,
-    /// Test output from the previous attempt (if tests were run).
+    /// Test output from the previous attempt (if tests were run). On
+    /// commit-hook rejection, the hook stderr is concatenated here under a
+    /// `[Commit hook output]` header so the prompt surfaces both signals.
     pub previous_test_output: Option<String>,
-    /// Files that were modified in the previous attempt. Empty under `Keep`
-    /// (the changes are already on disk) and when nothing was modified.
+    /// Files that were modified in the previous attempt. Typically empty
+    /// post test-then-commit (the changes are already on disk).
     pub files_modified: Vec<String>,
     /// Short human-readable reason the previous attempt failed (e.g. "tests
     /// failed", "harness exited non-zero", "no changes produced"). Always
-    /// set on a real retry so the Keep prompt — which omits the diff — still
+    /// set on a real retry so the prompt — which omits the diff — still
     /// states what went wrong. `None` only when no reason was available.
     pub previous_failure_reason: Option<String>,
 }

@@ -37,7 +37,7 @@ when:
 - The work spans more than a single coherent session of edits.
 - You want each step independently verified by tests before the next one starts.
 - You want a review pass interleaved with implementation passes.
-- You want per-step retry on failure (and, opt-in via `--retry-strategy rollback`, a clean-tree rollback between attempts).
+- You want per-step retry on failure (a failed attempt's dirty tree is preserved and its test/hook output is fed into the next attempt's prompt; on retry-budget exhaustion ralph raises a blocker so a human can choose retry-from-scratch vs. accept-failed instead of going straight terminal).
 
 A bugfix that's "find the line, change three characters, run tests" is not a
 ralph. A multi-phase refactor with verification gates is.
@@ -369,13 +369,17 @@ pipeline doesn't cover:
 ## Branching
 
 Use `--branch feat/<slug>` so reviewers can run `git diff main..HEAD` from any
-step to see the cumulative work-to-date. Ralph commits **per iteration** on
-the single plan branch (subject `ralph <short_id>.<n> - <title>` plus
-`Ralph-*` trailers) and keeps history linear, one git branch per plan — that
-is how rollback, per-step diff isolation, and the built-in reviewer's
-fixed-SHA review all work, so don't try to disable it. Every iteration commit
-is kept by default; `ralph plan create ... --squash-on-complete` collapses a
-step's iteration commits into one when the step completes.
+step to see the cumulative work-to-date. Ralph commits **once per step**, only
+after that step's deterministic tests pass (subject `ralph <short_id>.<n> -
+<title>` plus `Ralph-*` trailers; `<n>` is the attempt that finally passed).
+History stays linear, one git branch per plan. The per-attempt audit trail
+lives in `execution_logs` (prompt / harness output / test output / diff per
+attempt, including failed ones), not in commits. Failed attempts leave the
+dirty tree on disk so the next attempt can build on top, with the prior
+test/hook output fed into its prompt; ralph rolls back only when the retry
+budget is exhausted (then raises a recoverable blocker). That commit shape is
+how rollback, per-step diff isolation, and the built-in reviewer's fixed-SHA
+review all work, so don't try to disable it.
 
 ## Plan size
 
@@ -432,9 +436,9 @@ atomic and independently verifiable.
   an HTTP status, a latency budget, or an observable file/state change, or
   the ralph will not verify it.
 - ❌ Trying to make the harness commit instead of letting ralph commit — ralph
-  commits each iteration by design; harness-side commits will conflict and
-  produce a clean diff at step end (which `change_policy=required` will
-  correctly fail).
+  commits once per step on test-pass by design; harness-side commits leave a
+  clean working tree at step end (which `change_policy=required` will
+  correctly fail) and break the reviewer's fixed-SHA contract.
 - ❌ Expecting `--after <N>` to mean "insert at list position N" — it does not
   exist any more. `--after`/`--before` are **dependency edges**. Array order
   in `--import-json` is not a dependency either; only `depends_on` is.
@@ -471,18 +475,15 @@ atomic and independently verifiable.
   review→correction recursion (default 3); over the cap, ralph raises a
   blocker for a human instead of looping.
 - `ralph plan create ... --retry-strategy {keep|rollback}` /
-  `ralph step add|edit ... --retry-strategy {keep|rollback}` — how a failed
-  attempt's tree is handled before the retry. `keep` (the default) carries
-  the dirty tree forward; `rollback` reverts to a clean tree and feeds the
-  prior diff into the next prompt. Use `rollback` for steps where a
-  half-done attempt would poison the retry (e.g. partial migrations).
-  `ralph step edit --clear-retry-strategy` drops a step-level override back
-  to plan/global inheritance.
-- `ralph plan create ... --squash-on-complete` — by default every
-  per-iteration step commit is kept (full audit trail). With this flag, a
-  step's iteration commits are squashed into one commit when the step
-  completes (the `Ralph-*` trailers are preserved). Opt in only when a clean
-  one-commit-per-step history matters more than the per-iteration trail.
+  `ralph step add|edit ... --retry-strategy {keep|rollback}` — **vestigial
+  post-redesign**. With at most one commit per step (commit-on-test-pass),
+  both arms preserve the dirty tree between failed attempts; the flag is
+  kept for migration compatibility and is a no-op at runtime. Slated for
+  removal in a follow-up PR — prefer not to set it on new plans.
+- `ralph plan create ... --squash-on-complete` — **vestigial post-redesign**.
+  With one commit per step there is nothing to squash; the flag is a no-op
+  kept for migration compatibility. Slated for removal in a follow-up PR —
+  prefer not to set it on new plans.
 - `ralph skip [<slug>] [--step <n>] --changes {stash|commit|discard}` — skip
   a step; `--changes` (default `stash`) decides what happens to a killed
   harness's uncommitted work. `commit` writes a `[ralph wip]` commit with a

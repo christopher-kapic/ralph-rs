@@ -797,4 +797,61 @@ mod tests {
             InterruptionModalAction::EditComment
         );
     }
+
+    /// Phase C: the Phase B auto-raised retry-exhausted blocker is a
+    /// **Blocker kind with two ranked options** (Retry / Fail). The modal
+    /// must open focused on Options (so Enter immediately accepts #1 =
+    /// "Retry the step from scratch") and the chosen resolution must be the
+    /// priority-1 option text — the exact string the Phase C resolution
+    /// helper matches against to reset attempts. Guards the §12.4 default-
+    /// option UX from regressing for the auto-blocker shape.
+    #[test]
+    fn test_inbox_modal_renders_options_for_auto_blocker() {
+        let auto_blocker = Interruption {
+            id: "ab1".to_string(),
+            step_id: "s1".to_string(),
+            attempt: 3,
+            kind: InterruptionKind::Blocker,
+            body: "Step failed after 3 attempts.".to_string(),
+            options: vec![
+                InterruptionOption {
+                    text: "Retry the step from scratch".to_string(),
+                    priority: 1,
+                },
+                InterruptionOption {
+                    text: "Mark step Failed".to_string(),
+                    priority: 2,
+                },
+            ],
+            resolution: None,
+            comment: None,
+            state: InterruptionState::Open,
+            asked_at: Utc::now(),
+            resolved_at: None,
+        };
+
+        let mut m = InterruptionModal::from_interruption(&auto_blocker);
+        // A blocker that DOES carry options opens focused on Options
+        // (priority 1 pre-selected) — not the empty-options Freeform
+        // fallback path.
+        assert!(m.is_blocker());
+        assert_eq!(m.options.len(), 2);
+        assert_eq!(
+            m.focus,
+            InterruptionFocus::Options,
+            "auto-blocker has options → Options focus, not Freeform"
+        );
+        assert_eq!(m.selected_option, 0, "priority 1 pre-selected");
+        // Pressing Enter on the Options focus immediately resolves with
+        // the priority-1 option text — the contract the resolution helper
+        // string-matches against.
+        assert_eq!(
+            m.handle_key(key(KeyCode::Enter)),
+            InterruptionModalAction::Resolve {
+                interruption_id: "ab1".to_string(),
+                resolution: "Retry the step from scratch".to_string(),
+                comment: None,
+            }
+        );
+    }
 }

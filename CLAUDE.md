@@ -20,7 +20,16 @@ The DAG-redesign design document is `docs/dag-redesign.md`. It is the
 authoritative spec for the dependency-DAG model, the interruption system,
 the built-in review pipeline, the scheduler, and the TUI outline/inbox. The
 "Important deliberate deviations" below record where the shipped code
-intentionally differs from that draft.
+intentionally differs from that draft. Two material deviations from §3.2 /
+§5 / §3.4 that landed post-redesign: (1) **test-then-commit + at-most-one
+commit per step** (replaces the draft's "commit per iteration, before the
+test" — with no per-iteration commits there is no `RetryStrategy::Keep`
+vs. `Rollback` distinction at runtime and nothing for
+`--squash-on-complete` to collapse; both are vestigial); (2) a
+**retry-exhaustion auto-blocker** (a `kind=Blocker` interruption with
+ranked Retry / Mark Failed options instead of the draft's terminal
+`StepStatus::Failed` transition on `TestFailed`/`CommitFailed`). Both are
+detailed under "DAG redesign — shipped shape" below.
 
 The pre-DAG TUI design spec is `TUI-plan.md` at the project root. **Note:**
 that document was written before implementation. Its prompt-layer model
@@ -61,7 +70,7 @@ src/
   harness.rs           — Harness resolution, subprocess spawning, output parsing
   prompt.rs            — Step prompt construction (four-layer `Prompts`, bounded "Resolved interruptions" section, retry context, plan context, hooks); DEFAULT_CONTEXT_PREPEND global-prompt seed
   review.rs            — Built-in nondeterministic review pipeline: separate O(1) read-only reviewer prompt, spawnable detached review subprocess, orchestrator-only `finalize_review`, corrective-step request drain + re-parent, recursion-cap escalation
-  executor.rs          — Single-step execution (spawn harness → per-iteration commit → test; retry honors RetryStrategy; skip parks WIP)
+  executor.rs          — Single-step execution (spawn harness → test → commit-on-pass; failed attempts preserve the dirty tree and feed `previous_test_output` into the retry; pre-commit-hook failure is treated as a test failure for retry purposes; retry-budget exhaustion on test-fail or commit-hook-fail raises an auto-`Blocker` interruption instead of going terminal; skip parks WIP)
   runner.rs            — Plan-level orchestrator: the topological **scheduler** (runnable-set + `(depth, sort_key, short_id)` tie-break), impl semaphore=1, detached-review JoinSet drained at scheduler ticks, sole DB writer, status transitions, --all
   run_lock.rs          — Per-project run lock to prevent concurrent runs
   signal.rs            — Two-stage Ctrl+C handling (graceful then forceful)
@@ -209,7 +218,7 @@ view bindings don't fire under the overlay.
 - **Deterministic-only:** No built-in LLM; plans created manually or via harness delegation
 - **Multi-harness:** Pluggable harness support with different integration patterns (native agent file, env var, prompt injection)
 - **Git-integrated:** All steps are git commits; branches per plan
-- **Retry strategy:** `RetryStrategy {Keep, Rollback}`, precedence step > plan > default `Keep`. `Keep` (the default) carries the dirty tree forward between failed attempts (the prior diff is on disk; the retry context omits it); `Rollback` reverts the tree before each retry and feeds the rolled-back diff into the next prompt
+- **Retry strategy:** `RetryStrategy {Keep, Rollback}` is **vestigial post-redesign** (slated for removal in a follow-up PR). Both arms now preserve the dirty tree between failed attempts — there is at most one commit per step (commit-on-test-pass), so there is nothing to keep/rollback across attempts. The enum + per-plan/per-step columns + CLI flags still exist for migration compatibility but are no-ops on the retry path
 - **SQLite storage** at platform-appropriate data dir (`~/.local/share/ralph-rs/ralph.db` on Linux)
 - **JSON config** at `~/.config/ralph-rs/config.json` (XDG semantics on all platforms)
 - **Signal-aware:** Two-stage Ctrl+C (graceful then forceful) via tokio watch channels
@@ -266,17 +275,51 @@ view bindings don't fire under the overlay.
   corrective step / deps-not-satisfied), per §3.3/§10, not status-based.
   A separate per-step `review_status` (`Pending | InFlight | Passed |
   Failed | Skipped | Disabled`) tracks the verdict.
-- **Per-iteration commits + git-note verdict.** A commit happens **per
-  iteration, before the deterministic test**: subject `ralph
+- **Test-then-commit + at-most-one commit per step (deviates from the
+  design draft's "commit per iteration, before the test").** A commit
+  happens **only on the first attempt whose deterministic tests pass**;
+  failed attempts leave the dirty tree on disk and feed
+  `previous_test_output` (and pre-commit hook stderr, treated as a test
+  failure) into the next prompt — no commit, no rollback. Subject `ralph
   <short_id>.<n> - <title>` + trailers `Ralph-Plan` / `Ralph-Step` /
-  `Ralph-Iteration` / `Ralph-Review: pending`. The review verdict is
-  recorded as a **git note on `refs/notes/ralph-review`**, **not** by
-  amending the commit (`git::annotate_review_verdict`) — history/tree-safe
-  under concurrency. `ralph log` groups iteration commits by short_id and
-  surfaces the note verdict; `ralph step reset` reverts a step's iteration
-  commits via trailers. `RetryStrategy` reinterpreted: `Keep` accumulates
-  iteration commits; `Rollback` git-reverts the prior iteration and feeds
-  the rolled-back diff into the next prompt.
+  `Ralph-Iteration: <n>` (n is the attempt number that finally passed —
+  with at most one commit per step, this identifies which attempt
+  succeeded rather than counting commits) / `Ralph-Review: pending`. The
+  review verdict is still recorded as a **git note on
+  `refs/notes/ralph-review`**, **not** by amending the commit
+  (`git::annotate_review_verdict`) — history/tree-safe under concurrency.
+  `ralph log` and `ralph step reset` continue to work via the trailers
+  (reset reverts the single commit). Tooling that read `Ralph-Iteration`
+  as an attempt identifier is still correct; tooling that expected
+  multiple iteration commits per step needs updating.
+- **Retry-exhaustion auto-blocker (deviates from the design draft's
+  terminal-Failed transition on `TestFailed`/`CommitFailed`).** When a
+  step exhausts its retry budget on test-fail or commit-hook-fail
+  (commit-hook stderr is treated as a test failure), the executor
+  **automatically raises a `kind=Blocker` interruption** instead of going
+  terminal. The blocker carries two ranked options — priority 1 = `"Retry
+  the step from scratch"`, priority 2 = `"Mark step Failed"` — and a body
+  of `"Step failed after N attempts."` plus the last attempt's test
+  output (and hook stderr when applicable). The step's stored status
+  stays `Pending` with `attempts == max_attempts`; the derived `Blocked`
+  overlay shadows it while the blocker is open. The scheduler moves to
+  another runnable branch (consumes no further retry budget). Resolution
+  (TUI inbox or `ralph interruption resolve`):
+  `RETRY_EXHAUSTED_OPTION_RETRY` → reset `attempts = 0`, status
+  `Pending`, scheduler re-picks; `RETRY_EXHAUSTED_OPTION_FAIL` → status
+  `Failed` terminal; a freeform answer matching neither is treated as
+  retry-with-hint (the hint flows into the next prompt via the bounded
+  "Resolved interruptions" section). Other failure modes —
+  `HarnessFailed`, `Timeout`, `NoChanges` — remain terminal `Failed`.
+  Recognition contract lives in
+  `commands::interruption::apply_retry_exhausted_resolution`; the option
+  constants `RETRY_EXHAUSTED_OPTION_RETRY` /
+  `RETRY_EXHAUSTED_OPTION_FAIL` are `pub const` in `src/executor.rs` so
+  the executor (writer), Phase C resolution handler, and TUI all share
+  one source of truth. `TerminationReason::PausedForQuestion` and
+  `StepOutcome::PausedForQuestion` are reused (no new variants); the
+  insert + status-park happen in a single `unchecked_transaction` so the
+  scheduler can't observe `Pending without open interruption` mid-write.
 - **Corrective re-parenting + recursion cap (§10).** A failed review
   *requests* (never performs) a corrective step via an NDJSON event +
   the V29 `corrective_step_requests` bridge row. The orchestrator (sole
@@ -293,12 +336,17 @@ view bindings don't fire under the overlay.
   orchestrator mutates the DAG; reviewers only *request*); (4)
   cross-process interruption bridge via `run_locks` (reviews never take
   the run-lock).
-- **§14.1 resolved:** every per-iteration commit is **kept by default**
-  (full audit trail); opt-in per-plan `--squash-on-complete` (V28)
-  collapses a step's iteration commits into one when it reaches
-  `Complete`. **§14.4:** scheduler reproducibility is timing-independent
-  given identical human inputs; the wall-clock interleave of concurrent
-  reviews is **not** part of the guarantee.
+- **§14.1 resolved (flipped post-test-then-commit):** with at most one
+  commit per step, there are no per-iteration commits to keep or squash
+  — the **`execution_logs` rows are the audit trail** (each row carries
+  the attempt's prompt / harness stdout+stderr / test output / diff for
+  every attempt including failed ones), and the single committed SHA
+  represents only the attempt that passed. `--squash-on-complete` / the
+  per-plan `squash_on_complete` column are **vestigial post-redesign**
+  (nothing to squash); kept for migration compatibility, slated for
+  removal in a follow-up PR. **§14.4:** scheduler reproducibility is
+  timing-independent given identical human inputs; the wall-clock
+  interleave of concurrent reviews is **not** part of the guarantee.
 - **Export/import** carry the DAG: `ExportedStep` gains `short_id`
   (always emitted) and `depends_on: Vec<short_id>`; plan+step
   `review_enabled`, `squash_on_complete`, and `max_review_corrections`

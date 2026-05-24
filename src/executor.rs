@@ -19,7 +19,8 @@ use crate::hooks::{self, HookContext};
 use crate::io_util;
 use crate::output::ChunkStream;
 use crate::plan::{
-    ChangePolicy, Phase, Plan, RetryStrategy, Step, StepStatus, TerminationReason, TestStatus,
+    ChangePolicy, InterruptionKind, InterruptionOption, Phase, Plan, RetryStrategy, Step,
+    StepStatus, TerminationReason, TestStatus,
 };
 use crate::prompt::{self, Prompts, RetryContext};
 use crate::run_lock::process_start_token;
@@ -33,6 +34,59 @@ use crate::test_runner;
 /// generous for realistic harness output — structured JSON tails are small —
 /// while bounding a runaway process.
 const HARNESS_OUTPUT_TAIL_BYTES: usize = 4 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Phase B — auto-blocker on retry exhaustion
+// ---------------------------------------------------------------------------
+
+/// Priority-1 option on the auto-raised retry-exhausted blocker — "the human
+/// wants a fresh shot." Phase C's resolution handler will detect this exact
+/// string to wire the "reset attempts → re-queue" path. Kept as a `pub const`
+/// so executor (writer), `commands/run.rs` (Phase C reader), and the TUI all
+/// reference one source of truth and `cargo test --lib` catches any drift via
+/// the assertions in [`tests`].
+pub const RETRY_EXHAUSTED_OPTION_RETRY: &str = "Retry the step from scratch";
+
+/// Priority-2 option on the auto-raised retry-exhausted blocker — the
+/// "explicit give-up" fallback. Phase C's resolution handler detects this
+/// exact string and flips the step to `StepStatus::Failed`, mirroring the
+/// pre-Phase-B terminal behavior. Constant kept `pub` for the same reason as
+/// [`RETRY_EXHAUSTED_OPTION_RETRY`].
+pub const RETRY_EXHAUSTED_OPTION_FAIL: &str = "Mark step Failed";
+
+/// Soft cap on the body length of the auto-raised retry-exhausted blocker.
+/// The inbox UI renders the body verbatim, so a runaway test-output dump
+/// (megabytes of stack traces, harness JSON, …) hurts navigation. 8 KiB is
+/// generous for a single failing-test summary plus hook stderr while keeping
+/// the inbox usable. Truncation is byte-bounded with a tail elision marker
+/// so the most recent (and usually most relevant) lines survive.
+const RETRY_EXHAUSTED_BODY_MAX_BYTES: usize = 8 * 1024;
+
+/// Truncate `text` to `max_bytes`, keeping the **tail** and prefixing an
+/// elision marker. Chosen over a head-keeping truncation because the *last*
+/// lines of a test/hook output usually carry the actual failure (assertion
+/// text, exit-code line) — head-keeping would lose them. UTF-8-safe via
+/// `char_indices()`: we never slice mid-codepoint.
+fn truncate_tail_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    // Find the largest start offset i such that `text.len() - i <= max_bytes`
+    // AND i lies on a char boundary. Walk from the tail backwards.
+    let target = text.len().saturating_sub(max_bytes);
+    let mut cut = text.len();
+    for (i, _) in text.char_indices() {
+        if i >= target {
+            cut = i;
+            break;
+        }
+    }
+    let elided_bytes = cut;
+    format!(
+        "... ({elided_bytes} bytes elided from head) ...\n{}",
+        &text[cut..]
+    )
+}
 
 // ---------------------------------------------------------------------------
 // StepResult
@@ -908,6 +962,218 @@ async fn finalize_paused_for_question(
     })
 }
 
+/// Phase B — auto-raise a `Blocker` interruption when a step exhausts its
+/// retry budget on a **retryable** failure mode (test fail / commit-hook
+/// reject) instead of marking the step terminally `Failed`. The blocker
+/// carries two ranked recovery options
+/// ([`RETRY_EXHAUSTED_OPTION_RETRY`] priority 1,
+/// [`RETRY_EXHAUSTED_OPTION_FAIL`] priority 2) so a human can pick a
+/// recovery without typing. While the interruption is open the derived
+/// `Blocked` overlay shadows the stored `Pending` status
+/// (`effective_step_status`), the scheduler advances to another runnable
+/// branch (mirroring the existing `PausedForQuestion` path), and the plan
+/// only declares itself `Interrupted` once the runnable set is exhausted.
+///
+/// Crucially distinct from [`finalize_paused_for_question`]:
+///
+///  - The execution-log row is **kept** (not deleted): the retry budget was
+///    fully spent, so this attempt's outcome is part of the audit trail. The
+///    `termination_reason` reuses [`TerminationReason::PausedForQuestion`]
+///    (no new variant is added — it remains the single "step parked
+///    awaiting human" idiom; see Phase B notes in CLAUDE.md).
+///  - `step.attempts` is **left at `max_attempts`** (not rolled back).
+///    Phase C's "Retry the step from scratch" resolver is the one to call
+///    `step reset` and bring the counter back to zero, and an observer
+///    inspecting the DB while the blocker is open can tell the step "hit
+///    its budget" — the same information the pre-Phase-B `Failed` status
+///    used to carry.
+///  - Other terminal modes (`HarnessFailed`, `Timeout`, `NoChanges`,
+///    `Aborted`) keep their existing terminal `Failed` shape — those modes
+///    are not productively retryable from the harness's point of view
+///    (timeouts mean nothing reached tests; harness errors mean we never
+///    got a usable artifact; no-changes is a contract violation, not a
+///    test signal). Only [`FailureReason::TestFailed`] and
+///    [`FailureReason::CommitFailed`] route here.
+///
+/// The storage writes (insert interruption, update step status) run inside a
+/// single `unchecked_transaction` so a scheduler tick in another thread can
+/// never observe the half-state `(status=Pending, no open interruption)` —
+/// which would otherwise let the scheduler immediately re-pick the step and
+/// burn another attempt despite our budget already being spent.
+#[allow(clippy::too_many_arguments)]
+async fn raise_retry_exhausted_blocker(
+    ctx: &ExecCtx<'_>,
+    exec_log_id: i64,
+    duration_secs: f64,
+    attempt: i32,
+    failure_output: &FailureOutput<'_>,
+    failure_reason: FailureReason,
+) -> Result<StepResult> {
+    debug_assert!(
+        matches!(
+            failure_reason,
+            FailureReason::TestFailed | FailureReason::CommitFailed
+        ),
+        "raise_retry_exhausted_blocker must only be called for retryable \
+         failure modes (TestFailed / CommitFailed); other modes keep their \
+         terminal Failed shape",
+    );
+
+    // Roll back any dirty tree — exactly like `finalize_paused_for_question`.
+    // The next run (after the human picks Retry) starts from the committed
+    // base; we don't carry uncommitted WIP across the human-pause boundary
+    // because the audit trail of "what the agent had on disk at the moment
+    // of failure" is already in `execution_logs` (stdout/stderr/diff fields
+    // captured below) and on disk we want a clean tree to mirror §3.4 / §5.
+    if git::has_uncommitted_changes(ctx.workdir)? {
+        write_phase(
+            ctx.conn,
+            ctx.plan,
+            &ctx.step.id,
+            ctx.step_num,
+            attempt,
+            ctx.max_attempts,
+            Some(exec_log_id),
+            Phase::Rollback,
+            None,
+            ChildUpdate::Clear,
+            ctx.json_output,
+        )?;
+        git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)?;
+    }
+
+    // The execution_logs row is *kept* (it carries the full diagnostic
+    // payload — stdout/stderr/diff/cost/test_results — captured during this
+    // attempt). Reason reuses `PausedForQuestion`: the existing variant
+    // already means "step parked awaiting human" and adding a new variant
+    // would force every consumer (hook label switches, output formatters,
+    // TUI status renderers) to widen its match without giving the human
+    // anything new — the option text on the interruption already tells the
+    // human which recovery they're picking. Test status maps to whatever
+    // the failing phase observed.
+    let test_st = match failure_reason {
+        FailureReason::TestFailed => TestStatus::Failed,
+        FailureReason::CommitFailed => TestStatus::NotRun,
+        _ => TestStatus::NotRun,
+    };
+    storage::update_execution_log(
+        ctx.conn,
+        exec_log_id,
+        Some(duration_secs),
+        failure_output.diff,
+        failure_output.test_results,
+        true, // rolled_back
+        false,
+        None,
+        Some(failure_output.stdout),
+        Some(failure_output.stderr),
+        failure_output.parsed.cost_usd,
+        failure_output.parsed.input_tokens,
+        failure_output.parsed.output_tokens,
+        failure_output.parsed.session_id.as_deref(),
+        Some(TerminationReason::PausedForQuestion),
+        Some(test_st),
+    )?;
+
+    // Build the blocker body. The `test_results` slice is the canonical
+    // per-attempt failure summary the user already sees in `ralph log`; it
+    // includes the test output AND, for the commit-fail path, the hook
+    // stderr (Phase A concatenated the hook output into the same
+    // string via the `[Tests passed but commit hook rejected]` /
+    // `[Commit hook output]` headers — see the retry branch around
+    // line 2009 — so we deliberately surface that single combined string
+    // here instead of plumbing a parallel "hook output" channel through).
+    let failure_text = failure_output.test_results.join("\n");
+    let raw_body = match failure_reason {
+        FailureReason::TestFailed => format!(
+            "Step failed after {} attempts.\n\nLast attempt test output:\n{}",
+            ctx.max_attempts, failure_text,
+        ),
+        FailureReason::CommitFailed => format!(
+            "Step failed after {} attempts (last attempt's commit hooks rejected the change).\n\n{}",
+            ctx.max_attempts, failure_text,
+        ),
+        _ => format!(
+            "Step failed after {} attempts.\n\n{}",
+            ctx.max_attempts, failure_text,
+        ),
+    };
+    let body = truncate_tail_bytes(&raw_body, RETRY_EXHAUSTED_BODY_MAX_BYTES);
+
+    // Insert + park atomically. A scheduler tick observing
+    // (status=Pending, no open interruption) would immediately re-pick the
+    // step and burn another retry budget despite us already being out — the
+    // transaction collapses the read window so the tick can only ever see
+    // either the pre-exhaustion or the post-blocker state.
+    let tx = ctx.conn.unchecked_transaction()?;
+    let options = vec![
+        InterruptionOption {
+            text: RETRY_EXHAUSTED_OPTION_RETRY.to_string(),
+            priority: 1,
+        },
+        InterruptionOption {
+            text: RETRY_EXHAUSTED_OPTION_FAIL.to_string(),
+            priority: 2,
+        },
+    ];
+    storage::insert_interruption(
+        &tx,
+        &ctx.step.id,
+        attempt,
+        InterruptionKind::Blocker,
+        &body,
+        &options,
+    )?;
+    storage::update_step_status(&tx, &ctx.step.id, StepStatus::Pending)?;
+    tx.commit()?;
+
+    // Post-step hook: route through the same "paused" label the
+    // `finalize_paused_for_question` path uses so hook authors see exactly
+    // one logical "branch is now blocked, human turn" signal. Hook authors
+    // who want to distinguish the two paths can read `RALPH_STEP_ID` and
+    // query the open interruption — this is the same shape every other
+    // interruption surfaces through.
+    write_phase(
+        ctx.conn,
+        ctx.plan,
+        &ctx.step.id,
+        ctx.step_num,
+        attempt,
+        ctx.max_attempts,
+        None,
+        Phase::PostStepHook,
+        None,
+        ChildUpdate::Clear,
+        ctx.json_output,
+    )?;
+    hooks::run_post_step(
+        ctx.conn,
+        ctx.hook_ctx,
+        ctx.plan,
+        ctx.step,
+        attempt,
+        "paused",
+        ctx.workdir,
+    )
+    .await?;
+
+    Ok(StepResult {
+        // Reuse `PausedForQuestion` — the runner already knows how to handle
+        // this outcome: drops the step from `executed_step_ids`, advances to
+        // another runnable branch, and only declares `Interrupted` when the
+        // runnable set is exhausted. A new variant would force the runner's
+        // match to widen with no behavioral difference (Phase B intent: keep
+        // the scheduler unchanged; the *DB shape* under the outcome is what
+        // carries the auto-blocker semantics, observable via the inserted
+        // `interruptions` row + ranked options).
+        outcome: StepOutcome::PausedForQuestion,
+        step_id: ctx.step.id.clone(),
+        attempts_used: attempt,
+        commit_hash: None,
+        needs_review: None,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Core executor
 // ---------------------------------------------------------------------------
@@ -1064,10 +1330,11 @@ pub async fn execute_step(
     //    so the prompt OMITS the now-redundant diff/files sections.
     let retry_strategy = step.effective_retry_strategy(plan);
 
-    // Previous attempt context for retries.
-    let mut prev_diff: Option<String> = None;
+    // Previous attempt context for retries. Post test-then-commit (Phase A)
+    // the dirty tree is always on disk between attempts, so the retry prompt
+    // omits the diff/files sections — only the failure reason + previous
+    // test output (with any commit-hook output appended) ride this struct.
     let mut prev_test_output: Option<String> = None;
-    let mut prev_files_modified: Vec<String> = Vec::new();
     let mut prev_failure_reason: Option<String> = None;
 
     // The HEAD SHA that immediately precedes this step's FIRST per-iteration
@@ -1108,22 +1375,21 @@ pub async fn execute_step(
 
         // Build retry context if this is not the first attempt.
         //
-        // The diff/files are strategy-scoped (Step 22): under `Rollback` the
-        // prior work was reverted, so we re-send it for the agent to learn
-        // from; under `Keep` it's still on disk, so re-sending it is
-        // redundant and confusing — collapse the context to just
-        // attempt/max + previous test output + previous failure reason.
+        // Post test-then-commit (Phase A): a failed attempt leaves the dirty
+        // tree on disk for the next attempt, so the agent inspects prior work
+        // directly via `git diff`. The prompt's diff/files sections are
+        // therefore redundant — collapse the context to just attempt/max +
+        // previous test output (including any commit-hook output) + previous
+        // failure reason. Both `Keep` and `Rollback` paths now produce the
+        // same shape; the diff-feeding `Rollback` behavior is vestigial
+        // (see the retry-tail block — removal in follow-up PR).
         let retry_context = if attempt > 1 {
-            let (previous_diff, files_modified) = match retry_strategy {
-                RetryStrategy::Rollback => (prev_diff.clone(), prev_files_modified.clone()),
-                RetryStrategy::Keep => (None, Vec::new()),
-            };
             Some(RetryContext {
                 attempt,
                 max_attempts,
-                previous_diff,
+                previous_diff: None,
                 previous_test_output: prev_test_output.clone(),
-                files_modified,
+                files_modified: Vec::new(),
                 previous_failure_reason: prev_failure_reason.clone(),
             })
         } else {
@@ -1574,180 +1840,30 @@ pub async fn execute_step(
                         Some(TerminationReason::HarnessFailed),
                         Some(TestStatus::NotRun),
                     )?;
-                    prev_diff = diff;
+                    let _ = diff; // dropped — Phase A omits diff from retry context
                     prev_test_output = Some(test_results.join("\n"));
-                    prev_files_modified = changed_files;
+                    let _ = changed_files; // dropped — Phase A omits files_modified
                     prev_failure_reason = Some("harness exited non-zero".to_string());
                     continue;
                 }
 
                 // ---------------------------------------------------------
-                // PER-ITERATION COMMIT (docs/dag-redesign.md §3.2 / §5).
+                // TEST-THEN-COMMIT (Phase A).
                 //
-                // The commit now happens PER ITERATION, *before* the
-                // deterministic test — a change from the pre-DAG "commit only
-                // on full success." It runs whenever the harness finished
-                // successfully and left uncommitted changes; the test then
-                // validates the committed tree, so:
-                //   (a) the subject can carry `<short_id>.<n>`, and
-                //   (b) a reviewer has a stable SHA to review (Phase 3).
+                // The per-iteration commit no longer runs here. It moved to
+                // *after* the deterministic test passes (see the
+                // `test_passed && has_changes` branch below). Between failed
+                // attempts the dirty tree is preserved on disk so the next
+                // attempt builds on top.
                 //
                 // `agent_committed_clean` (worktree clean + HEAD advanced)
                 // is still a contract violation — the agent committed its
-                // own work. We do NOT make a ralph iteration commit there;
-                // the existing classification/edge-case handling below is
-                // preserved verbatim.
+                // own work. The existing classification/edge-case handling
+                // below is preserved verbatim.
                 //
                 // Tooling (`ralph log` / `step reset`) parses ONLY the
                 // `Ralph-*` trailers, never the subject (reuses the
                 // `Ralph-Skipped-Step` + `[ralph wip]` precedent).
-                let mut iteration_commit_sha: Option<String> = None;
-                if has_changes && !agent_committed_clean {
-                    write_phase(
-                        conn,
-                        plan,
-                        &step.id,
-                        step_num,
-                        attempt,
-                        max_attempts,
-                        Some(exec_log.id),
-                        Phase::Commit,
-                        None,
-                        ChildUpdate::Clear,
-                        exec_opts.json_output,
-                    )?;
-                    // Record the pre-first-iteration HEAD exactly once so
-                    // `--squash-on-complete` can `reset --soft` back to it.
-                    if step_base_sha.is_none() {
-                        step_base_sha = git::get_commit_hash(workdir).ok();
-                    }
-                    let commit_msg = git::build_iteration_commit_message(
-                        &step.short_id,
-                        attempt,
-                        &step.title,
-                        &plan.slug,
-                    );
-                    // Wrap stage + commit so a pre-commit hook rejection (or other git
-                    // failure) becomes a recoverable in-step failure instead of a hard
-                    // crash out of execute_step. Mirrors harness-nonzero and test-fail
-                    // terminal/retry patterns; consumes the attempt; feeds stderr via
-                    // previous_failure_reason (and test_results for terminal).
-                    let stage_and_commit = git::stage_except(workdir, &pre_existing_untracked)
-                        .and_then(|_| git::commit_staged(workdir, &commit_msg));
-                    if let Err(e) = stage_and_commit {
-                        let err_text = e.to_string();
-                        let mut failure_desc = format!(
-                            "commit rejected by pre-commit hook: {}. Fix the lint/style issues reported by the hook.",
-                            err_text.trim()
-                        );
-                        // Lightweight latent-debt heuristic (best-effort, no over-engineering):
-                        // scan for path-like tokens; if any has low/no overlap with the
-                        // step's `changed_files` this attempt, append note. Signals that
-                        // hook errors may be from pre-existing code outside this diff.
-                        let mut saw_non_overlapping = false;
-                        for token in err_text.split(|c: char| {
-                            !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
-                        }) {
-                            let clean = token.trim_matches(|c: char| {
-                                !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
-                            });
-                            if (clean.contains('/') || (clean.contains('.') && clean.len() > 2))
-                                && !clean.is_empty()
-                            {
-                                let overlaps = changed_files.iter().any(|f| {
-                                    clean == f.as_str()
-                                        || clean.ends_with(f.as_str())
-                                        || f.ends_with(clean)
-                                });
-                                if !overlaps {
-                                    saw_non_overlapping = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if saw_non_overlapping {
-                            failure_desc
-                                .push_str(" (Note: some errors may be in pre-existing files outside this step's diff — latent debt.)");
-                        }
-
-                        if attempt >= max_attempts {
-                            let test_result_strings = vec![failure_desc.clone()];
-                            let fail_output = FailureOutput {
-                                diff: diff.as_deref(),
-                                test_results: &test_result_strings,
-                                stdout: &output.stdout,
-                                stderr: &output.stderr,
-                                parsed: &parsed,
-                                has_changes,
-                            };
-                            return finalize_failure(
-                                &ctx,
-                                exec_log.id,
-                                duration_secs,
-                                attempt,
-                                FailureReason::CommitFailed,
-                                Some(&fail_output),
-                                TerminationReason::CommitFailed,
-                                TestStatus::NotRun,
-                            )
-                            .await;
-                        }
-
-                        // Retry path — mirrors the strategy-aware rollback in
-                        // the harness-nonzero retry arm. The commit failed so
-                        // no iteration commit exists; Rollback reverts via
-                        // rollback_except (the `agent_committed_clean` reset
-                        // guard there is unreachable here — this block only
-                        // runs under `!agent_committed_clean`).
-                        let rolled_back = match retry_strategy {
-                            RetryStrategy::Rollback => {
-                                if has_changes {
-                                    write_phase(
-                                        conn,
-                                        plan,
-                                        &step.id,
-                                        step_num,
-                                        attempt,
-                                        max_attempts,
-                                        Some(exec_log.id),
-                                        Phase::Rollback,
-                                        None,
-                                        ChildUpdate::Clear,
-                                        exec_opts.json_output,
-                                    )?;
-                                    git::rollback_except(workdir, &pre_existing_untracked)?;
-                                }
-                                has_changes
-                            }
-                            RetryStrategy::Keep => false,
-                        };
-                        let test_result_strings = vec![failure_desc.clone()];
-                        storage::update_execution_log(
-                            conn,
-                            exec_log.id,
-                            Some(duration_secs),
-                            diff.as_deref(),
-                            &test_result_strings,
-                            rolled_back,
-                            false,
-                            None,
-                            Some(&output.stdout),
-                            Some(&output.stderr),
-                            parsed.cost_usd,
-                            parsed.input_tokens,
-                            parsed.output_tokens,
-                            parsed.session_id.as_deref(),
-                            Some(TerminationReason::CommitFailed),
-                            Some(TestStatus::NotRun),
-                        )?;
-                        prev_diff = diff;
-                        prev_test_output = Some(test_result_strings.join("\n"));
-                        prev_files_modified = changed_files;
-                        prev_failure_reason = Some(failure_desc);
-                        continue;
-                    }
-                    iteration_commit_sha = Some(git::get_commit_hash(workdir)?);
-                }
 
                 // Decide whether to run the test phase.
                 //
@@ -1947,16 +2063,14 @@ pub async fn execute_step(
                     // (Fix 3). A no-op unless a stale `Skipped` is latched;
                     // never disturbs the `Aborted` reason.
                     crate::signal::clear_pending_skip_state();
-                    // The in-flight work is now a per-iteration commit (made
-                    // before the test phase), not a dirty tree. Ctrl+C tears
-                    // the whole run down; to preserve the pre-DAG observable
-                    // semantics (an aborted attempt's work does not persist
-                    // as usable history for the next `ralph resume`), revert
-                    // the iteration commit we made this attempt. `git revert`
-                    // (never `reset --hard`) keeps linear history intact even
-                    // if something committed on top — mirrors the
-                    // skip/step-reset revert discipline.
-                    if let Some(sha) = &iteration_commit_sha {
+                    // Phase A: test-then-commit. No iteration commit was
+                    // made this attempt (commits only happen after tests
+                    // pass), so the in-flight work is a dirty tree. Drop
+                    // it cleanly while preserving the user's pre-existing
+                    // untracked scratch files. The `Phase::Rollback` write
+                    // is recorded so an external observer sees *why* the
+                    // runner is touching the tree.
+                    if git::has_uncommitted_changes(workdir)? {
                         write_phase(
                             conn,
                             plan,
@@ -1970,7 +2084,7 @@ pub async fn execute_step(
                             ChildUpdate::Clear,
                             exec_opts.json_output,
                         )?;
-                        let _ = git::revert_commit(workdir, sha);
+                        git::rollback_except(workdir, &pre_existing_untracked)?;
                     }
                     let fail_output = FailureOutput {
                         diff: diff.as_deref(),
@@ -2073,29 +2187,173 @@ pub async fn execute_step(
                 }
 
                 if test_passed && has_changes {
-                    // The per-iteration commit ALREADY happened before the
-                    // test phase (docs/dag-redesign.md §3.2). The success
-                    // path therefore does NOT re-commit — it just resolves
-                    // the final commit hash and, when the plan opted into
-                    // `--squash-on-complete`, collapses this step's
-                    // iteration commits into one.
-                    let mut commit_hash = iteration_commit_sha
-                        .clone()
-                        .unwrap_or(git::get_commit_hash(workdir)?);
+                    // POST-TEST COMMIT (Phase A): tests passed and the
+                    // harness left uncommitted changes. Stage and commit now,
+                    // *after* the deterministic test, so there is at most one
+                    // ralph commit per step (zero on terminal failure / no
+                    // changes). A pre-commit hook rejection here is treated
+                    // as a retryable failure — same semantics as a test
+                    // failure, with the hook stderr appended to the test
+                    // output so the next attempt's prompt sees both.
+                    write_phase(
+                        conn,
+                        plan,
+                        &step.id,
+                        step_num,
+                        attempt,
+                        max_attempts,
+                        Some(exec_log.id),
+                        Phase::Commit,
+                        None,
+                        ChildUpdate::Clear,
+                        exec_opts.json_output,
+                    )?;
+                    // Record the pre-first-iteration HEAD exactly once so
+                    // the vestigial squash path (kept as no-op below) can
+                    // still see it if/when it's ever re-enabled. With
+                    // at-most-one-commit-per-step this is also the eventual
+                    // committed SHA's parent.
+                    if step_base_sha.is_none() {
+                        step_base_sha = git::get_commit_hash(workdir).ok();
+                    }
+                    let commit_msg = git::build_iteration_commit_message(
+                        &step.short_id,
+                        attempt,
+                        &step.title,
+                        &plan.slug,
+                    );
+                    let stage_and_commit = git::stage_except(workdir, &pre_existing_untracked)
+                        .and_then(|_| git::commit_staged(workdir, &commit_msg));
+                    if let Err(e) = stage_and_commit {
+                        // Pre-commit hook rejection (or other git failure).
+                        // Treat as a test failure: keep the dirty tree on
+                        // disk, append hook stderr to the test output so the
+                        // next attempt sees both, and either retry or
+                        // finalize as terminal failure on exhaustion. The
+                        // existing CommitFailed-specific terminal/retry
+                        // paths are gone (Phase B will reroute terminal
+                        // exhaustion through a blocker).
+                        let err_text = e.to_string();
+                        let mut failure_desc = format!(
+                            "commit rejected by pre-commit hook: {}. Fix the lint/style issues reported by the hook.",
+                            err_text.trim()
+                        );
+                        // Lightweight latent-debt heuristic (best-effort, no over-engineering):
+                        // scan for path-like tokens; if any has low/no overlap with the
+                        // step's `changed_files` this attempt, append note. Signals that
+                        // hook errors may be from pre-existing code outside this diff.
+                        let mut saw_non_overlapping = false;
+                        for token in err_text.split(|c: char| {
+                            !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
+                        }) {
+                            let clean = token.trim_matches(|c: char| {
+                                !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
+                            });
+                            if (clean.contains('/') || (clean.contains('.') && clean.len() > 2))
+                                && !clean.is_empty()
+                            {
+                                let overlaps = changed_files.iter().any(|f| {
+                                    clean == f.as_str()
+                                        || clean.ends_with(f.as_str())
+                                        || f.ends_with(clean)
+                                });
+                                if !overlaps {
+                                    saw_non_overlapping = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if saw_non_overlapping {
+                            failure_desc
+                                .push_str(" (Note: some errors may be in pre-existing files outside this step's diff — latent debt.)");
+                        }
 
-                    // --squash-on-complete (docs/dag-redesign.md §14.1,
-                    // DECIDED): when the step reaches Complete, collapse its
-                    // per-iteration commits into ONE, preserving the
-                    // `Ralph-*` trailers (the iteration is collapsed to this
-                    // final `n`). Default OFF keeps every iteration commit
-                    // (full audit trail) — byte-identical to step 32/33.
-                    //
-                    // Only squash when there's actually a multi-commit run
-                    // to collapse (≥2 commits since the step's base). A
-                    // single iteration is already one commit, so the
-                    // soft-reset+recommit would be pointless SHA churn — skip
-                    // it, keeping the common single-attempt case byte-
-                    // identical to the default-OFF / pre-squash output.
+                        // Combine test output + hook output so the next
+                        // attempt's prompt surfaces both signals in a single
+                        // section. The agent sees that tests passed but the
+                        // commit hook rejected — and what the hook said.
+                        let combined_output = {
+                            let test_summary = test_result_strings.join("\n");
+                            if test_summary.is_empty() {
+                                format!("[Commit hook output]\n{failure_desc}")
+                            } else {
+                                format!(
+                                    "[Tests passed but commit hook rejected]\n{test_summary}\n\n[Commit hook output]\n{failure_desc}"
+                                )
+                            }
+                        };
+                        let combined_result_strings = vec![failure_desc.clone()];
+
+                        if attempt >= max_attempts {
+                            // The combined output Phase A built (test summary
+                            // + hook stderr inside one string with the
+                            // `[Tests passed but commit hook rejected]` /
+                            // `[Commit hook output]` headers) is what we want
+                            // in the blocker body — surface it via
+                            // `test_results` so `raise_retry_exhausted_blocker`
+                            // can join+truncate it the same way it does for
+                            // the test-fail path. The single-string
+                            // `combined_result_strings` already carries
+                            // `failure_desc` (the hook stderr); the combined
+                            // *block* lives in `combined_output` and is
+                            // routed through here as a one-element slice.
+                            let combined_results_for_blocker = vec![combined_output.clone()];
+                            let fail_output = FailureOutput {
+                                diff: diff.as_deref(),
+                                test_results: &combined_results_for_blocker,
+                                stdout: &output.stdout,
+                                stderr: &output.stderr,
+                                parsed: &parsed,
+                                has_changes,
+                            };
+                            // Phase B routing: commit-hook failure is a
+                            // productively retryable mode (different prompt,
+                            // a different attempt, or a code change can pass
+                            // the hook), so an exhausted commit-fail becomes
+                            // an auto-raised blocker just like an exhausted
+                            // test fail — the human picks Retry / Mark
+                            // Failed.
+                            return raise_retry_exhausted_blocker(
+                                &ctx,
+                                exec_log.id,
+                                duration_secs,
+                                attempt,
+                                &fail_output,
+                                FailureReason::CommitFailed,
+                            )
+                            .await;
+                        }
+
+                        // Retry path: do NOT roll back, do NOT advance HEAD.
+                        // Preserve the dirty tree so the next attempt builds
+                        // on top with the rejected work still visible.
+                        storage::update_execution_log(
+                            conn,
+                            exec_log.id,
+                            Some(duration_secs),
+                            diff.as_deref(),
+                            &combined_result_strings,
+                            false, // not rolled back — dirty tree preserved
+                            false,
+                            None,
+                            Some(&output.stdout),
+                            Some(&output.stderr),
+                            parsed.cost_usd,
+                            parsed.input_tokens,
+                            parsed.output_tokens,
+                            parsed.session_id.as_deref(),
+                            Some(TerminationReason::CommitFailed),
+                            Some(TestStatus::NotRun),
+                        )?;
+                        let _ = diff; // dropped — Phase A omits diff from retry context
+                        prev_test_output = Some(combined_output);
+                        let _ = changed_files; // dropped — Phase A omits files_modified
+                        prev_failure_reason = Some(failure_desc);
+                        continue;
+                    }
+                    let mut commit_hash = git::get_commit_hash(workdir)?;
+
+                    // Vestigial post test-then-commit (at most one commit per step). Removal in follow-up PR.
                     if plan.squash_on_complete
                         && let Some(base) = &step_base_sha
                         && git::count_commits_since(workdir, base)? > 1
@@ -2282,6 +2540,27 @@ pub async fn execute_step(
                     if agent_committed_clean && !exec_opts.json_output {
                         eprintln!("  hint: {NO_CHANGES_AGENT_COMMITTED_HINT}");
                     }
+                    // Phase B routing: a retryable failure (TestFailed) that
+                    // just exhausted its budget becomes an auto-raised
+                    // `Blocker` interruption with ranked recovery options
+                    // instead of a terminal `Failed` step. NoChanges (here:
+                    // policy-Required with no diff, or `agent_committed_clean`)
+                    // is a contract violation, not a productively retryable
+                    // mode — it keeps its terminal `Failed` shape because no
+                    // amount of re-running the same prompt is likely to undo a
+                    // missing-diff failure pattern that already burned the
+                    // full retry budget.
+                    if matches!(reason, FailureReason::TestFailed) {
+                        return raise_retry_exhausted_blocker(
+                            &ctx,
+                            exec_log.id,
+                            duration_secs,
+                            attempt,
+                            &fail_output,
+                            reason,
+                        )
+                        .await;
+                    }
                     return finalize_failure(
                         &ctx,
                         exec_log.id,
@@ -2295,63 +2574,35 @@ pub async fn execute_step(
                     .await;
                 }
 
-                // Retry path. The failed attempt's work is now a
-                // per-iteration commit (made before the test phase —
-                // docs/dag-redesign.md §3.2). `RetryStrategy` is
-                // reinterpreted accordingly (§5); the OBSERVABLE retry
-                // semantics for a linear plan are unchanged aside from the
-                // commit now being per-iteration:
+                // Retry path. Post test-then-commit (Phase A): the failed
+                // attempt left a dirty tree on disk and made NO commit; the
+                // next attempt builds on top of that work directly. The
+                // retry context omits the diff/files (already on disk via
+                // `git diff`), passing only the failure reason + previous
+                // test output to the next prompt.
                 //
-                //  - `Rollback` (opt-in): `git revert` the failed
-                //    iteration's commit before the retry. Reverting (never
-                //    `reset --hard`) keeps linear history intact even if
-                //    something committed on top — the §5 discipline, and the
-                //    same `revert_commit` machinery `step reset` uses. The
-                //    rolled-back diff/files are still fed into the next
-                //    prompt via `RetryContext` (`prev_diff = diff` below) so
-                //    the agent learns from work it no longer sees on disk —
-                //    exactly today's behavior.
+                // `RetryStrategy` is now vestigial — both arms preserve the
+                // dirty tree. Removal in follow-up PR.
                 //
-                //  - `Keep` (default): do NOT revert. Iteration n's commit
-                //    stays in history; iteration n+1 commits on top of it.
-                //    The agent sees the prior work on disk (it's the
-                //    committed state); the retry context omits the diff —
-                //    exactly today's `Keep` behavior.
-                //
-                // EDGE CASE — `agent_committed_clean` under `Keep`: the agent
-                // committed its OWN work, so `has_changes == false` and NO
-                // ralph iteration commit was made this attempt. We must not
-                // leave the agent's orphan commit sitting in HEAD, or a
-                // later attempt's per-iteration commit gate (`has_changes`)
-                // would be false and the step would loop forever on
-                // `agent_committed_clean`. `git reset --mixed` back to the
-                // pre-attempt HEAD un-commits it but keeps every changed file
-                // on disk as uncommitted work — so the next attempt's
-                // per-iteration commit picks it up. (Unchanged from the
-                // pre-DAG fix; it only ever fires when ralph itself made no
-                // iteration commit.)
+                // EDGE CASE — `agent_committed_clean`: the agent committed
+                // its OWN work, so `has_changes == false` and HEAD advanced
+                // without ralph making a commit. Mixed-reset back to the
+                // pre-attempt HEAD un-commits it but keeps every changed
+                // file on disk as uncommitted work — so the next attempt's
+                // post-test commit picks it up sitting on the right base.
                 let rolled_back = match retry_strategy {
-                    RetryStrategy::Rollback => match &iteration_commit_sha {
-                        Some(sha) => {
-                            write_phase(
-                                conn,
-                                plan,
-                                &step.id,
-                                step_num,
-                                attempt,
-                                max_attempts,
-                                Some(exec_log.id),
-                                Phase::Rollback,
-                                None,
-                                ChildUpdate::Clear,
-                                exec_opts.json_output,
-                            )?;
-                            git::revert_commit(workdir, sha)?;
-                            true
-                        }
-                        None => false,
-                    },
+                    RetryStrategy::Rollback => {
+                        // RetryStrategy is vestigial post test-then-commit; both arms preserve the dirty tree. Removal in follow-up PR.
+                        false
+                    }
                     RetryStrategy::Keep => {
+                        // EDGE CASE — `agent_committed_clean`: the agent
+                        // committed its OWN work, so HEAD advanced this
+                        // attempt with no diff left for ralph. Mixed-reset
+                        // back to the pre-attempt HEAD so the agent's
+                        // changes survive as uncommitted work — the next
+                        // attempt's post-test commit then sits on the right
+                        // base. (Must remain: same fix as pre-Phase-A.)
                         if agent_committed_clean && let Some(before) = &head_before_harness {
                             write_phase(
                                 conn,
@@ -2404,11 +2655,11 @@ pub async fn execute_step(
                     Some(retry_term),
                     Some(retry_test_status),
                 )?;
-                prev_diff = diff;
+                let _ = diff; // dropped — Phase A omits diff from retry context
                 prev_test_output = Some(test_output_summary);
-                prev_files_modified = changed_files;
+                let _ = changed_files; // dropped — Phase A omits files_modified
                 // Human-readable reason mirrors the termination classification
-                // so the Keep prompt (which omits the diff) still states what
+                // so the prompt (which omits the diff) still states what
                 // went wrong.
                 prev_failure_reason = Some(
                     match retry_term {
@@ -3774,13 +4025,22 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result.outcome, StepOutcome::Failed);
+        // Phase B: terminal commit-hook rejection now routes through the
+        // auto-raised blocker (commit-hook failures are productively
+        // retryable — different prompt/code can pass the hook). The log
+        // row's `termination_reason` is `PausedForQuestion` (reused; see
+        // `raise_retry_exhausted_blocker`) and `test_status` stays `NotRun`
+        // because we never reached the test phase. The commit-failure
+        // diagnostic still lives in `test_results` (Phase B carries it
+        // through the blocker body and the log row alike).
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
 
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(
             logs[0].termination_reason,
-            Some(TerminationReason::CommitFailed)
+            Some(TerminationReason::PausedForQuestion),
+            "Phase B: exhausted-budget commit-fail parks the step",
         );
         assert_eq!(logs[0].test_status, Some(TestStatus::NotRun));
         assert!(
@@ -3791,6 +4051,10 @@ mod tests {
             "test_results must contain the commit-failure diagnostic (hook stderr path exercised): {:?}",
             logs[0].test_results
         );
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, InterruptionKind::Blocker);
+        assert_eq!(open[0].options.len(), 2);
     }
 
     /// A harness that exits successfully but produces no changes should
@@ -6525,16 +6789,15 @@ mod tests {
              2-line test passes on attempt 2",
         );
         assert_eq!(result.attempts_used, 2);
-        // PER-ITERATION COMMITS (docs/dag-redesign.md §3.2/§5): under `Keep`
-        // each iteration commits BEFORE its test. Attempt 1 commits `.1`
-        // (1 line, test fails), attempt 2 commits `.2` ON TOP of `.1`
-        // (2 lines, test passes). Two ralph commits — the audit trail keeps
-        // every iteration (this was `base + 1` pre-DAG, when ralph committed
-        // only on final success).
+        // Phase A (test-then-commit): no commit happens on attempt 1 (test
+        // fails), the dirty tree carries forward, attempt 2 appends the
+        // second line, test passes, and a SINGLE commit lands. The audit
+        // trail collapses to one commit per step (zero on terminal
+        // failure).
         assert_eq!(
             commit_count(&dir),
-            base_commits + 2,
-            "Keep keeps every iteration commit (one per attempt)"
+            base_commits + 1,
+            "Phase A: exactly one commit total (only after final passing attempt)"
         );
         let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
         assert_eq!(
@@ -6579,13 +6842,16 @@ mod tests {
         );
     }
 
-    /// `Rollback` preserves today's behavior: the failed attempt's tree is
-    /// reverted before the retry, and the rolled-back diff is fed into the
-    /// next attempt's prompt. Same harness/test as the Keep test; because
-    /// attempt 1 is rolled back, attempt 2 starts clean, can only reach ONE
-    /// line, the 2-line test never passes, and the step fails terminally.
+    /// Phase A: `RetryStrategy` is vestigial — both Keep and Rollback now
+    /// preserve the dirty tree between failed attempts (the per-iteration
+    /// commit moved to after tests pass, so there is no commit to revert
+    /// on a failed attempt). Same harness/test as the Keep test; attempt
+    /// 1's append survives into attempt 2 regardless of strategy, attempt
+    /// 2 appends the second line, the 2-line test passes, and ONE commit
+    /// lands. Removal of the dead RetryStrategy::Rollback branch is in a
+    /// follow-up PR.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_rollback_strategy_clears_tree_and_feeds_diff() {
+    async fn test_rollback_strategy_now_vestigial_preserves_dirty_tree() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
@@ -6687,49 +6953,35 @@ mod tests {
 
         assert_eq!(
             result.outcome,
-            StepOutcome::Failed,
-            "Rollback reverts attempt 1's iteration commit, so attempt 2 \
-             starts from 0 lines, can only reach one line, and the 2-line \
-             test never passes",
+            StepOutcome::Success,
+            "Phase A: Rollback is vestigial. The dirty tree carries forward \
+             so attempt 2 can see attempt 1's append and the 2-line test \
+             passes — same observable behavior as Keep.",
         );
         assert_eq!(result.attempts_used, 2);
-        // PER-ITERATION + Rollback (docs/dag-redesign.md §5): attempt 1
-        // commits `.1` (1 line) BEFORE its test; the test fails, so `.1` is
-        // `git revert`ed (a revert commit — linear history preserved, NOT
-        // `reset --hard`), which takes acc.txt back to 0 lines. Attempt 2
-        // commits `.2` (1 line); its test also fails and the budget is
-        // exhausted, so `.2` stays in history (a terminal failure keeps the
-        // last iteration commit — §5 audit trail). The final WORKING TREE
-        // therefore reflects attempt 2's committed line.
+        // Phase A: at most one commit per step (only after final passing
+        // attempt). Even under Rollback, the dirty tree carries forward;
+        // no per-iteration commit was ever made for the failed attempt.
         let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
         assert_eq!(
             final_lines.lines().count(),
-            1,
-            "attempt 1's iteration commit was reverted; attempt 2's terminal \
-             iteration commit stays (1 line)"
+            2,
+            "both attempts' appends are present (vestigial Rollback no longer reverts)"
         );
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
         let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
         assert!(
-            a1.rolled_back,
-            "Rollback must revert the failed iteration's commit"
+            !a1.rolled_back,
+            "vestigial Rollback no longer rolls back — the dirty tree is preserved"
         );
-        // The .1 iteration commit exists AND a revert of it exists, so its
-        // change is no longer reachable on the tree even though history is
-        // linear and intact.
+        // Exactly one ralph commit landed — iteration 2.
         let it_commits =
             crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
-        assert!(
-            it_commits.iter().any(|c| c.iteration == 1),
-            "the .1 iteration commit is still in history (reverted, not erased)"
-        );
-        assert!(
-            it_commits.iter().any(|c| c.iteration == 2),
-            "the terminal .2 iteration commit is kept (§5 audit trail)"
-        );
-        // Attempt 2's prompt must carry the rolled-back diff (so the agent
-        // can learn from work it no longer sees on disk) — unchanged
-        // mechanism, just now after a per-iteration commit + revert.
+        assert_eq!(it_commits.len(), 1, "Phase A: exactly one commit per step");
+        assert_eq!(it_commits[0].iteration, 2);
+        // Attempt 2's prompt must include the retry context (failure
+        // reason + previous test output). The diff section is omitted now
+        // — the dirty tree is on disk for the agent to inspect.
         let a2 = logs.iter().find(|l| l.attempt == 2).unwrap();
         let a2_prompt = a2.prompt_text.as_deref().unwrap_or("");
         assert!(
@@ -6737,9 +6989,8 @@ mod tests {
             "attempt 2 prompt must include the retry context"
         );
         assert!(
-            a2_prompt.contains("## Previous Diff"),
-            "Rollback must feed the rolled-back diff into the next prompt; \
-             got prompt:\n{a2_prompt}"
+            !a2_prompt.contains("## Previous Diff"),
+            "Phase A: diff section is omitted (dirty tree is on disk); got prompt:\n{a2_prompt}"
         );
     }
 
@@ -6977,14 +7228,14 @@ mod tests {
         p
     }
 
-    /// STEP 32: the commit happens PER ITERATION, *before* the deterministic
-    /// test (docs/dag-redesign.md §3.2). The test command asserts the
-    /// committed tree (`git show HEAD:acc.txt`) — so it can only pass if the
-    /// commit landed first. The commit subject is the
-    /// `ralph <short_id>.<n> - <title>` format and carries all four
-    /// `Ralph-*` trailers (tooling parses trailers, never the subject).
+    /// Phase A: the commit happens AFTER the deterministic test passes.
+    /// The test command asserts the worktree (not HEAD) — so the harness's
+    /// uncommitted changes drive the test, and the commit only runs on
+    /// success. The commit subject is the `ralph <short_id>.<n> - <title>`
+    /// format and carries all four `Ralph-*` trailers (tooling parses
+    /// trailers, never the subject).
     #[tokio::test(flavor = "current_thread")]
-    async fn test_per_iteration_commit_subject_trailers_before_test() {
+    async fn test_per_iteration_commit_subject_trailers_after_test() {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -6996,10 +7247,10 @@ mod tests {
         let harness_path = write_append_line_harness(harness_tmp.path(), &dir);
 
         let conn = crate::db::open_memory().unwrap();
-        // The test inspects the COMMITTED blob, not the worktree: it passes
-        // only if the per-iteration commit happened *before* this runs.
+        // Test inspects the WORKTREE (uncommitted harness changes), not
+        // HEAD — under Phase A the commit happens after the test passes.
         let test_cmd = format!(
-            "test \"$(git -C {0} show HEAD:acc.txt | wc -l)\" -eq 1",
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 1",
             dir.to_string_lossy()
         );
         let plan = storage::create_plan(
@@ -7055,10 +7306,10 @@ mod tests {
         assert_eq!(
             result.outcome,
             StepOutcome::Success,
-            "test reads the committed blob — only passes if commit-before-test"
+            "test reads the worktree (Phase A: commit after test passes)"
         );
         assert_eq!(result.attempts_used, 1);
-        // Exactly ONE iteration commit was created (before the test).
+        // Exactly ONE commit was created (after the test passed).
         assert_eq!(commit_count(&dir), base_commits + 1);
         let head = result.commit_hash.clone().unwrap();
         let subject = {
@@ -7101,14 +7352,14 @@ mod tests {
         );
     }
 
-    /// STEP 32: a multi-iteration run creates exactly ONE commit per
-    /// iteration (not "commit only on success"). With `Keep` + a test that
-    /// needs 2 lines, iteration 1 commits 1 line (test fails), iteration 2
-    /// commits the 2nd line on top (test passes) → 2 ralph commits, the
-    /// deterministic-test failure of iteration 1 feeds the next prompt's
-    /// retry context.
+    /// Phase A: a multi-iteration run produces exactly ONE commit total
+    /// (only after the final attempt passes tests). Iteration 1 leaves a
+    /// dirty tree (1 line appended, test fails, no commit). Iteration 2
+    /// appends a second line to that dirty tree (test passes, commit).
+    /// The deterministic-test failure of iteration 1 feeds the next
+    /// prompt's retry context.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_per_iteration_commit_one_commit_per_iteration() {
+    async fn test_failing_then_passing_attempts_produce_single_commit() {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -7178,14 +7429,13 @@ mod tests {
         assert_eq!(result.attempts_used, 2);
         assert_eq!(
             commit_count(&dir),
-            base_commits + 2,
-            "exactly one commit per iteration (2 iterations → 2 commits)"
+            base_commits + 1,
+            "Phase A: exactly one commit total (only after final passing attempt)"
         );
-        // Each iteration has its own trailer-tagged commit.
+        // The single commit is tagged for the final (passing) iteration.
         let its = crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
-        let mut iters: Vec<i32> = its.iter().map(|c| c.iteration).collect();
-        iters.sort();
-        assert_eq!(iters, vec![1, 2]);
+        let iters: Vec<i32> = its.iter().map(|c| c.iteration).collect();
+        assert_eq!(iters, vec![2], "the only commit is iteration 2");
         // Iteration 1's deterministic-test failure fed attempt 2's prompt.
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
         let a2 = logs.iter().find(|l| l.attempt == 2).unwrap();
@@ -7269,13 +7519,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.outcome, StepOutcome::Success);
+        // Phase A: at most one commit per step regardless of
+        // squash_on_complete — there is no multi-iteration run to collapse.
+        // The squash code path is now vestigial.
         assert_eq!(
             commit_count(&dir),
-            base_commits + 2,
-            "default OFF keeps every iteration commit"
+            base_commits + 1,
+            "Phase A: exactly one commit per step (squash_on_complete now vestigial)"
         );
         let its = crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
-        assert_eq!(its.len(), 2, "both iteration commits remain");
+        assert_eq!(its.len(), 1, "exactly one commit (the final passing one)");
     }
 
     /// STEP 42 / docs/dag-redesign.md §3.3/§6/§7 — the **disabled review
@@ -7747,16 +8000,30 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.outcome, StepOutcome::Failed);
+        // Phase B: an Optional-policy step whose tests fail with the retry
+        // budget exhausted now routes through the auto-raised blocker (a
+        // failing-test signal is productively retryable). The outcome is
+        // `PausedForQuestion`; the log row's `termination_reason` is
+        // `PausedForQuestion` (reused — see `raise_retry_exhausted_blocker`)
+        // and `test_status` still reflects what the test phase observed
+        // (`Failed`) so the audit trail preserves the underlying signal.
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
 
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(
             logs[0].termination_reason,
-            Some(TerminationReason::TestFailed),
-            "Optional + no changes + failing tests should classify as TestFailed"
+            Some(TerminationReason::PausedForQuestion),
+            "Phase B: exhausted-budget test failure parks the step (paused_for_question)",
         );
-        assert_eq!(logs[0].test_status, Some(TestStatus::Failed));
+        assert_eq!(
+            logs[0].test_status,
+            Some(TestStatus::Failed),
+            "test_status preserves the underlying signal",
+        );
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, InterruptionKind::Blocker);
     }
 
     /// Optional policy + harness produces a diff + passing tests → Success
@@ -8936,6 +9203,961 @@ mod tests {
             result.outcome,
             StepOutcome::Success,
             "answered rows must not pause — got {result:?}",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase A: test-then-commit invariants
+    // ---------------------------------------------------------------------
+
+    /// Phase A: a single failing attempt leaves the harness's uncommitted
+    /// changes on disk for the next attempt and does NOT advance HEAD.
+    /// Drives a step through ONE failing-test attempt (max_retries=0) and
+    /// asserts the dirty tree is preserved and HEAD is unchanged from the
+    /// step's base.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_failed_attempt_leaves_dirty_tree_for_next_attempt() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        // Seed a tracked file so the harness's append produces a clean diff.
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base_head = crate::git::get_commit_hash(&dir).unwrap();
+        let base_commits = commit_count(&dir);
+
+        // Harness appends one line. Test demands TWO lines, so attempt 1
+        // fails the test.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("append.sh");
+        fs::write(
+            &harness_path,
+            format!(
+                "#!/bin/sh\necho line >> {}/acc.txt\nexit 0\n",
+                dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0), // no retries — single failing attempt
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Phase B: a retryable terminal failure (test fail with budget
+        // exhausted) now routes to the auto-raised blocker instead of
+        // `Failed`. The runner outcome is `PausedForQuestion` (reused, see
+        // `raise_retry_exhausted_blocker`); the stored step status is
+        // `Pending` shadowed by the derived `Blocked` overlay; an open
+        // `Blocker` interruption with the two ranked recovery options is
+        // visible.
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
+        let reloaded = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(reloaded.status, StepStatus::Pending);
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(open.len(), 1, "exactly one open interruption");
+        assert_eq!(open[0].kind, InterruptionKind::Blocker);
+        assert_eq!(open[0].options.len(), 2);
+        // HEAD must still not have advanced — same Phase A invariant.
+        assert_eq!(
+            commit_count(&dir),
+            base_commits,
+            "Phase A: failed attempt makes no commit"
+        );
+        assert_eq!(
+            crate::git::get_commit_hash(&dir).unwrap(),
+            base_head,
+            "Phase A: HEAD is unchanged from the step's base after a failing attempt"
+        );
+    }
+
+    /// Phase A: a multi-attempt run with one failing attempt followed by a
+    /// passing attempt produces exactly ONE commit (only after success).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_passing_attempt_after_failing_attempt_makes_single_commit() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        // Seed a tracked file so the harness's append produces a diff.
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base_commits = commit_count(&dir);
+
+        // Harness appends one line per invocation; test needs two lines.
+        // Attempt 1 fails (1 line); attempt 2 passes (2 lines after the
+        // dirty tree carried forward).
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("append.sh");
+        fs::write(
+            &harness_path,
+            format!(
+                "#!/bin/sh\necho line >> {}/acc.txt\nexit 0\n",
+                dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1), // max_retries=1 → up to 2 attempts
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        assert_eq!(result.attempts_used, 2);
+        assert_eq!(
+            commit_count(&dir),
+            base_commits + 1,
+            "Phase A: exactly one commit between step start and step end (only after success)"
+        );
+        // The single commit is the iteration-2 (passing) commit.
+        let its = crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
+        assert_eq!(its.len(), 1);
+        assert_eq!(its[0].iteration, 2);
+    }
+
+    /// Phase A: a commit-hook rejection is retryable. With max_retries=1
+    /// and a hook that always rejects, attempt 1 hits the hook, the next
+    /// attempt's prompt context contains the hook stderr (concatenated
+    /// into the previous_test_output), no commit is made, and after the
+    /// budget exhausts the existing terminal-failure path fires
+    /// (Phase B will reroute this to a blocker).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_commit_hook_rejection_is_retryable() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        let base_commits = commit_count(&dir);
+
+        // Hermetic pre-commit hook that always rejects with a unique marker.
+        let hooks_tmp = TempDir::new().unwrap();
+        let hooks_dir = hooks_tmp.path().join("reject-hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let pre_commit = hooks_dir.join("pre-commit");
+        fs::write(
+            &pre_commit,
+            "#!/bin/sh\necho 'RALPH_PHASE_A_HOOK_MARKER: rejected'\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&pre_commit).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&pre_commit, perms).unwrap();
+        Command::new("git")
+            .args([
+                "config",
+                "core.hooksPath",
+                hooks_dir.to_string_lossy().as_ref(),
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        // Harness produces a change every invocation so we reach the commit
+        // phase on every attempt.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_simple_harness(harness_tmp.path(), &dir, true);
+
+        let conn = crate::db::open_memory().unwrap();
+        // No deterministic tests — has_changes drives `test_passed` via the
+        // "changes produced, no tests configured → treat as passing" path,
+        // so we reach the post-test commit phase reliably.
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("changing"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1), // max_retries=1 → up to 2 attempts
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "changing".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Phase B: exhausted commit-hook rejection now routes to the
+        // auto-raised blocker instead of terminal Failed.
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
+        assert_eq!(result.attempts_used, 2);
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].kind, InterruptionKind::Blocker);
+        assert_eq!(open[0].options.len(), 2);
+        // Zero commits — every attempt's commit was hook-rejected.
+        assert_eq!(
+            commit_count(&dir),
+            base_commits,
+            "Phase A: hook rejection means no commit was made"
+        );
+        // Attempt 2's prompt must carry the hook stderr (via the
+        // previous_test_output → "## Previous Test Output" section).
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        let a2 = logs.iter().find(|l| l.attempt == 2).unwrap();
+        let a2_prompt = a2.prompt_text.as_deref().unwrap_or("");
+        assert!(
+            a2_prompt.contains("# Retry Context"),
+            "attempt 2 must have a retry context block"
+        );
+        assert!(
+            a2_prompt.contains("commit rejected by pre-commit hook"),
+            "attempt 2 prompt must include the hook-rejection diagnostic; got:\n{a2_prompt}"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase B: auto-blocker on retry exhaustion
+    // ---------------------------------------------------------------------
+
+    /// `truncate_tail_bytes` keeps the tail (which carries the actual
+    /// failure on most outputs), prefixes the elision marker, and never
+    /// slices mid-codepoint.
+    #[test]
+    fn test_truncate_tail_bytes_below_cap_is_identity() {
+        let s = "abc\ndef\n";
+        assert_eq!(truncate_tail_bytes(s, 1024), s);
+    }
+
+    #[test]
+    fn test_truncate_tail_bytes_above_cap_keeps_tail_and_marks_elision() {
+        // 200 lines of "line N" — pick the last ~256 bytes only.
+        let text: String = (0..200).map(|i| format!("line {i}\n")).collect();
+        let out = truncate_tail_bytes(&text, 256);
+        assert!(out.starts_with("..."), "elision marker must be at head");
+        assert!(out.contains("bytes elided from head"));
+        assert!(
+            out.ends_with("line 199\n"),
+            "the final line of the input must survive the truncation: {out}",
+        );
+        // The output is approximately the cap plus the marker length.
+        assert!(
+            out.len() <= 256 + 128,
+            "elision overhead bounded: len={}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn test_truncate_tail_bytes_utf8_boundary_safe() {
+        // 4-byte codepoints; cutting at an arbitrary byte would panic.
+        let s: String = "🌟".repeat(50);
+        // Cap below the string length forces a truncation.
+        let out = truncate_tail_bytes(&s, 32);
+        // Must not panic and must remain valid UTF-8 (the format! itself
+        // would have panicked on an invalid slice).
+        assert!(out.contains("🌟"));
+    }
+
+    /// Phase B core: a step driven through a test-failing exhausted budget
+    /// now raises a Blocker with two ranked options instead of marking the
+    /// step `Failed`. The stored step status is `Pending` (shadowed by the
+    /// derived `Blocked` overlay via `effective_step_status`), `attempts`
+    /// stays at `max_attempts` so an observer can see the budget was spent,
+    /// and the working tree is clean with HEAD unchanged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_test_fail_exhaustion_raises_blocker() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        // Seed a tracked file so the harness's append produces a diff with
+        // a sensible base.
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base_head = crate::git::get_commit_hash(&dir).unwrap();
+        let base_commits = commit_count(&dir);
+
+        // Harness appends one line; test demands two lines → always fails.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("append.sh");
+        fs::write(
+            &harness_path,
+            format!(
+                "#!/bin/sh\necho line >> {}/acc.txt\nexit 0\n",
+                dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        // Test condition that no number of harness invocations can satisfy
+        // (the harness adds one line at a time; the test demands 99). This
+        // makes every attempt deterministically fail — the dirty-tree
+        // carry-forward (Phase A) doesn't accidentally pass attempt 2 the
+        // way it does in `test_failing_then_passing_attempts_produce_single_commit`.
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 99",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        // max_retries = 1 so we have a small budget (2 attempts) — every
+        // attempt fails the same test, so we exhaust the budget and trigger
+        // the Phase B path.
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let max_attempts = 1 + step.max_retries.unwrap_or(0);
+        assert_eq!(max_attempts, 2);
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Outcome reuses PausedForQuestion (see raise_retry_exhausted_blocker).
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
+        assert_eq!(
+            result.attempts_used, max_attempts,
+            "attempts_used reflects the exhausted budget",
+        );
+
+        // Exactly one open Blocker interruption with the two ranked options.
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(open.len(), 1, "exactly one open interruption");
+        let blocker = &open[0];
+        assert_eq!(blocker.kind, InterruptionKind::Blocker);
+        assert_eq!(blocker.state, crate::plan::InterruptionState::Open);
+        assert_eq!(blocker.options.len(), 2);
+        assert_eq!(blocker.options[0].text, RETRY_EXHAUSTED_OPTION_RETRY);
+        assert_eq!(blocker.options[0].priority, 1);
+        assert_eq!(blocker.options[1].text, RETRY_EXHAUSTED_OPTION_FAIL);
+        assert_eq!(blocker.options[1].priority, 2);
+        assert!(
+            blocker.body.contains("Step failed after"),
+            "body must summarize the exhausted budget; got:\n{}",
+            blocker.body,
+        );
+        // The body mentions the budget count concretely.
+        assert!(
+            blocker.body.contains(&format!("{max_attempts} attempts")),
+            "body must mention the concrete attempt count {max_attempts}; got:\n{}",
+            blocker.body,
+        );
+
+        // Step is parked as Pending (the derived overlay shadows it with
+        // Blocked at presentation time).
+        let reloaded = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(reloaded.status, StepStatus::Pending);
+        assert_eq!(
+            reloaded.attempts, max_attempts,
+            "attempts left at max so observers see the budget was spent",
+        );
+
+        // Working tree clean, HEAD unchanged.
+        assert!(
+            !git::has_uncommitted_changes(&dir).unwrap(),
+            "auto-blocker rolls back the dirty tree before parking",
+        );
+        assert_eq!(
+            commit_count(&dir),
+            base_commits,
+            "no commit made on any failing attempt",
+        );
+        assert_eq!(
+            crate::git::get_commit_hash(&dir).unwrap(),
+            base_head,
+            "HEAD unchanged when the step is parked",
+        );
+    }
+
+    /// Commit-hook rejection on the last attempt also routes to the Phase B
+    /// auto-blocker (productively retryable: a different prompt / different
+    /// code may pass the hook). Body must mention hooks, body & log must
+    /// carry the hook stderr diagnostic.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_commit_hook_failure_exhaustion_raises_blocker() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        // Hermetic rejecting hook (same pattern as test_commit_failure_terminal_reason).
+        let hooks_tmp = TempDir::new().unwrap();
+        let hooks_dir = hooks_tmp.path().join("reject-hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let pre_commit = hooks_dir.join("pre-commit");
+        fs::write(
+            &pre_commit,
+            "#!/bin/sh\necho 'pre-commit hook rejected: stylebot says no'\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&pre_commit).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&pre_commit, perms).unwrap();
+        Command::new("git")
+            .args([
+                "config",
+                "core.hooksPath",
+                hooks_dir.to_string_lossy().as_ref(),
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        // Harness that always produces a change so the commit phase always
+        // runs (and always rejects).
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_simple_harness(harness_tmp.path(), &dir, true);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("changing"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        // max_retries = 0 — single attempt is the entire budget; first
+        // commit-hook rejection exhausts it.
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "changing".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
+
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(open.len(), 1);
+        let blocker = &open[0];
+        assert_eq!(blocker.kind, InterruptionKind::Blocker);
+        assert_eq!(blocker.options.len(), 2);
+        assert_eq!(blocker.options[0].text, RETRY_EXHAUSTED_OPTION_RETRY);
+        assert_eq!(blocker.options[1].text, RETRY_EXHAUSTED_OPTION_FAIL);
+        // Body must mention hooks (CommitFailed branch).
+        assert!(
+            blocker.body.contains("commit hooks rejected"),
+            "blocker body must mention the commit-hooks rejection; got:\n{}",
+            blocker.body,
+        );
+        // Body must carry the commit-rejection diagnostic ralph builds
+        // (Phase A's combined "[Commit hook output]" block — hook stderr
+        // capture depends on git's behavior with `core.hooksPath`, so we
+        // assert on the ralph-built header that's reliably present).
+        assert!(
+            blocker.body.contains("[Commit hook output]")
+                && blocker.body.contains("commit rejected by pre-commit hook"),
+            "blocker body must include the combined commit-hook diagnostic; got:\n{}",
+            blocker.body,
+        );
+
+        // Step status is Pending (derived overlay would surface Blocked).
+        let reloaded = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(reloaded.status, StepStatus::Pending);
+
+        // Working tree clean, no commit landed.
+        assert!(!git::has_uncommitted_changes(&dir).unwrap());
+    }
+
+    /// Phase B is opinionated about WHICH failure modes route to the
+    /// blocker: harness-exit failures stay terminally `Failed`. Drive a
+    /// step whose harness exits non-zero with max_retries=0 and assert the
+    /// step is `Failed` with no interruption.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_harness_failure_exhaustion_still_terminal() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        // Harness that always exits non-zero.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("crash.sh");
+        fs::write(&harness_path, "#!/bin/sh\nexit 5\n").unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("crashy"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "crashy".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // HarnessFailed stays terminal Failed — Phase B did NOT over-route.
+        assert_eq!(result.outcome, StepOutcome::Failed);
+        let reloaded = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(reloaded.status, StepStatus::Failed);
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert!(
+            open.is_empty(),
+            "no interruption is raised on HarnessFailed exhaustion: {open:?}",
+        );
+    }
+
+    /// NoChanges (Required policy + agent makes no diff) keeps its
+    /// terminal `Failed` shape — Phase B specifically excludes this
+    /// (contract violation, not productively retryable).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_no_changes_exhaustion_still_terminal() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        // Noop harness — exits 0 producing no changes. With Required
+        // policy this is a NoChanges classification.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = write_noop_harness(harness_tmp.path());
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None, // change_policy defaults to Required
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // NoChanges stays terminally Failed — Phase B did NOT over-route.
+        assert_eq!(result.outcome, StepOutcome::Failed);
+        let reloaded = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(reloaded.status, StepStatus::Failed);
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert!(
+            open.is_empty(),
+            "no interruption is raised on NoChanges exhaustion: {open:?}",
         );
     }
 }

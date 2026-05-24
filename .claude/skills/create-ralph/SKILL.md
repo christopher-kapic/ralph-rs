@@ -14,7 +14,7 @@ Plan **per feature, not per task**. If the work fits in one focused session, don
 - The work spans more than a single coherent session of edits.
 - You want each step independently verified by tests before the next one starts.
 - You want a review pass interleaved with implementation passes.
-- You want per-step retry on failure (and, opt-in via `--retry-strategy rollback`, a clean-tree rollback between attempts).
+- You want per-step retry on failure (a failed attempt's dirty tree is preserved and its test/hook output is fed into the next attempt's prompt; on retry-budget exhaustion ralph raises a blocker so a human can choose retry-from-scratch vs. accept-failed instead of going straight terminal).
 
 A bugfix that's "find the line, change three characters, run tests" is not a ralph. A multi-phase refactor with verification gates is.
 
@@ -183,7 +183,7 @@ built-in pipeline doesn't cover:
 
 ## Branching
 
-Use `--branch feat/<slug>` so reviewers can run `git diff main..HEAD` from any step to see the cumulative work-to-date. (Ralph commits **per iteration** on the single plan branch — subject `ralph <short_id>.<n> - <title>` plus `Ralph-*` trailers — and history stays linear, one branch per plan; that's how rollback, per-step diff isolation, and the built-in reviewer's fixed-SHA review all work, so don't try to disable it. By default every iteration commit is kept; `ralph plan create ... --squash-on-complete` collapses a step's iteration commits into one when it completes.)
+Use `--branch feat/<slug>` so reviewers can run `git diff main..HEAD` from any step to see the cumulative work-to-date. Ralph commits **once per step**, only after that step's deterministic tests pass — subject `ralph <short_id>.<n> - <title>` plus `Ralph-*` trailers, where `<n>` is the attempt number that finally passed. History stays linear, one branch per plan; the per-attempt audit trail lives in `execution_logs` (prompt / harness output / test output / diff per attempt, including failed ones). Failed attempts leave the dirty tree on disk so the next attempt can build on top, with the prior test/hook output fed into its prompt; ralph rolls back only when the retry budget is exhausted (then raises a recoverable blocker — see below). That commit shape is how rollback, per-step diff isolation, and the built-in reviewer's fixed-SHA review all work, so don't try to disable it.
 
 ## Plan size
 
@@ -209,7 +209,7 @@ Don't compress a big task into a handful of mega-steps — you lose the per-step
 - ❌ Skipping the verify (deterministic test) step because "review will catch it" — reviewers read a diff, they don't run the code.
 - ❌ Listing a symbol as a "compatibility surface" without naming the behavior it implies — a ralph will make the field assignable / the function callable and stop there. Pair every named symbol with an observable behavior, or expect a no-op stub.
 - ❌ Acceptance criteria that aren't mechanically checkable ("it works", "feels fast", "default behavior is correct", "looks right") — these are wishes, not specs. A criterion is a shell command, a `grep`, an exit code, an HTTP status, a latency budget, or an observable file/state change, or the ralph will not verify it.
-- ❌ Trying to make the harness commit instead of letting ralph commit — ralph commits each iteration by design; harness-side commits conflict and produce a clean diff at step end (which `change_policy=required` will correctly fail).
+- ❌ Trying to make the harness commit instead of letting ralph commit — ralph commits once per step on test-pass by design; harness-side commits leave the post-commit working tree clean (which `change_policy=required` will correctly fail) and break the reviewer's fixed-SHA contract.
 
 ## Reference: useful CLI flags
 
@@ -223,8 +223,8 @@ Don't compress a big task into a handful of mega-steps — you lose the per-step
 - `ralph config review set [--harness <h>] [--model <m>] [--enabled <bool>]` — the global built-in-review harness/model/default (only the fields you pass are written).
 - `ralph plan review <on|off> <slug>` — per-plan review toggle. `ralph step edit <sel> --review <on|off|inherit>` — per-step override. Precedence: step > plan > global > off (off by default).
 - `ralph plan create ... --max-review-corrections <n>` — cap the review→correction recursion (default 3); over the cap, ralph raises a blocker for a human instead of looping.
-- `ralph plan create ... --retry-strategy {keep|rollback}` / `ralph step add|edit ... --retry-strategy {keep|rollback}` — how a failed attempt's tree is handled before the retry. `keep` (the default) carries the dirty tree forward; `rollback` reverts to a clean tree and feeds the prior diff into the next prompt. Use `rollback` for steps where a half-done attempt would poison the retry (e.g. partial migrations). `ralph step edit --clear-retry-strategy` drops a step-level override back to plan/global inheritance.
-- `ralph plan create ... --squash-on-complete` — by default every per-iteration step commit is kept (full audit trail). With this flag, a step's iteration commits are squashed into one commit when the step completes (the `Ralph-*` trailers are preserved). Opt in only when a clean one-commit-per-step history matters more than the per-iteration trail.
+- `ralph plan create ... --retry-strategy {keep|rollback}` / `ralph step add|edit ... --retry-strategy {keep|rollback}` — **vestigial post-redesign**. With at most one commit per step (commit-on-test-pass), both arms preserve the dirty tree between failed attempts; the flag is kept for migration compatibility and is a no-op at runtime. Slated for removal in a follow-up PR — prefer not to set it on new plans.
+- `ralph plan create ... --squash-on-complete` — **vestigial post-redesign**. With one commit per step there is nothing to squash; the flag is a no-op kept for migration compatibility. Slated for removal in a follow-up PR — prefer not to set it on new plans.
 - `ralph skip [<slug>] [--step <n>] --changes {stash|commit|discard}` — skip a step; `--changes` (default `stash`) decides what happens to a killed harness's uncommitted work. `commit` writes a `[ralph wip]` commit with a `Ralph-Skipped-Step` trailer that `ralph step reset` can later revert.
 - `ralph harness list` / `ralph harness show <name>` — verify configured harnesses, sandbox modes, and known foot-guns.
 - `ralph plan harness set <harness> [<slug>]` — pick the plan-generation harness.

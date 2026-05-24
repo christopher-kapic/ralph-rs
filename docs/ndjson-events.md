@@ -133,7 +133,7 @@ Payload:
 | `step_title`    | `string`  | Step title at finish.                                  |
 | `step_num`      | `integer` | 1-based position at finish.                            |
 | `step_total`    | `integer` | Total step count at finish.                            |
-| `outcome`       | `string`  | One of `success`, `failed`, `skipped`, `aborted`.      |
+| `outcome`       | `string`  | One of `success`, `failed`, `skipped`, `aborted`, `timeout`, `paused_for_question`. See note below on `paused_for_question`. |
 | `attempts`      | `integer` | Number of harness invocations this step consumed.      |
 | `duration_secs` | `number`  | Wall-clock seconds from `step_started` to finish.      |
 
@@ -154,6 +154,31 @@ Consumer expectations: a `step_finished` is guaranteed to follow each
 `step_started`, including when the runner is killed mid-flight (the
 runner emits `outcome: aborted`). Stuck-state recovery is via
 `stale_steps_swept` on the next run.
+
+> **`outcome: paused_for_question` is now a two-way street.** It was
+> originally the "harness raised an interruption mid-attempt"
+> termination — `ralph question ask` / `ralph block` wrote an `open`
+> row, the harness exited cleanly, the executor parked the branch
+> `Blocked` with no retry-budget consumed. The shipped post-redesign
+> executor *also* emits this outcome when a step **exhausts its retry
+> budget** on `TestFailed` or `CommitFailed` (the retry-exhaustion
+> auto-blocker — `docs/dag-redesign.md` §3.4-bis): the executor inserts
+> a `kind=Blocker` interruption with two ranked options ("Retry the
+> step from scratch" / "Mark step Failed") and parks the step at
+> `status=Pending` with `attempts == max_attempts`, the dirty tree
+> rolled back. `StepOutcome::PausedForQuestion` is reused — no new
+> outcome variant — so a downstream consumer cannot distinguish the two
+> cases from the event stream alone. To tell them apart, poll
+> `interruptions` for the step and inspect the most recent open row:
+> `kind=blocker` with two options whose `text` matches
+> `executor::RETRY_EXHAUSTED_OPTION_RETRY` /
+> `RETRY_EXHAUSTED_OPTION_FAIL` is the auto-blocker; anything else
+> (typically `kind=question` or a freeform `kind=blocker` body) is a
+> harness-raised pause. The same NDJSON-quiet rule that applies to
+> harness-raised interruptions applies here: **no
+> `interruption_raised` / `interruption_resolved` event is emitted** in
+> either case. The only interruption announced on the stream remains
+> the review-loop escalation (`review_loop_escalated`).
 
 ### `plan_complete`
 
