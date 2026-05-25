@@ -630,7 +630,11 @@ pub enum CorrectiveConsumeOutcome {
     },
     /// The recursion cap was hit; a `kind=blocker` interruption was raised
     /// instead of spawning another correction (§10 item 4 / §14.5).
-    Escalated { chain_len: usize, cap: usize },
+    Escalated {
+        chain_len: usize,
+        cap: usize,
+        interruption_id: String,
+    },
     /// The request was already consumed by a prior tick (no-op — the
     /// single-writer guard fired).
     AlreadyConsumed,
@@ -692,7 +696,7 @@ pub fn consume_corrective_request(
         let next_chain_len = storage::corrective_chain_len(conn, &reviewed.id)? + 1;
         if next_chain_len > cap {
             // Raise exactly ONE blocker interruption and stop spawning.
-            storage::insert_interruption(
+            let interruption_id = storage::insert_interruption(
                 conn,
                 &reviewed.id,
                 request.reviewed_iteration,
@@ -725,6 +729,7 @@ pub fn consume_corrective_request(
             return Ok(CorrectiveConsumeOutcome::Escalated {
                 chain_len: next_chain_len - 1,
                 cap,
+                interruption_id,
             });
         }
 
@@ -764,7 +769,20 @@ pub fn consume_corrective_request(
     // are safe outside the transaction.
     match &outcome {
         CorrectiveConsumeOutcome::AlreadyConsumed => {}
-        CorrectiveConsumeOutcome::Escalated { chain_len, cap } => {
+        CorrectiveConsumeOutcome::Escalated {
+            chain_len,
+            cap,
+            interruption_id,
+        } => {
+            output::emit_interruption_raised(
+                conn,
+                out.format == OutputFormat::Json,
+                interruption_id,
+                &request.reviewed_step_id,
+                InterruptionKind::Blocker.as_str(),
+                false,
+                request.reviewed_iteration,
+            );
             let reviewed = storage::get_step(conn, &request.reviewed_step_id)?;
             let step_num = step_position(conn, plan, &reviewed.id)?;
             if out.format == OutputFormat::Json {
@@ -1107,6 +1125,14 @@ mod tests {
     fn silent_out() -> OutputContext {
         OutputContext {
             format: OutputFormat::Plain,
+            color: false,
+            quiet: true,
+        }
+    }
+
+    fn json_out() -> OutputContext {
+        OutputContext {
+            format: OutputFormat::Json,
             color: false,
             quiet: true,
         }
@@ -1646,5 +1672,57 @@ mod tests {
             Some(ReviewStatus::Failed),
             "escalated step keeps the Failed review verdict"
         );
+    }
+
+    #[test]
+    fn test_recursion_cap_escalation_json_mode_still_commits_blocker() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "cap-json",
+            &dir.to_string_lossy(),
+            "b",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::set_plan_max_review_corrections(&conn, &plan.id, Some(0)).unwrap();
+        let plan = storage::get_plan_by_id(&conn, &plan.id).unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "A",
+            "d",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        storage::insert_corrective_step_request(&conn, &step.id, 1, "sha1", 1, None).unwrap();
+        let req = storage::list_open_corrective_step_requests_for_plan(&conn, &plan.id).unwrap()[0]
+            .clone();
+        let res = consume_corrective_request(&conn, &plan, &req, &json_out()).unwrap();
+        assert!(matches!(
+            res,
+            CorrectiveConsumeOutcome::Escalated { cap: 0, .. }
+        ));
+
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        let blockers: Vec<_> = open
+            .iter()
+            .filter(|i| i.kind == crate::plan::InterruptionKind::Blocker)
+            .collect();
+        assert_eq!(blockers.len(), 1, "JSON-mode emission must not drop blocker writes");
+        assert_eq!(blockers[0].step_id, step.id);
     }
 }

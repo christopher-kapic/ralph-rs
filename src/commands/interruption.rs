@@ -293,11 +293,24 @@ pub fn cmd_interruption_resolve(
         }
     };
 
+    // Capture the step_id BEFORE resolve so we can emit the NDJSON event
+    // even after the row transitions to resolved.
+    let step_id_for_event = q.step_id.clone();
     storage::resolve_interruption(conn, &q.id, &resolution, comment)?;
     // Phase C: if this was the Phase B auto-raised retry-exhausted blocker,
     // reset attempts / mark Failed per the chosen option. No-op for normal
     // interruptions (returns Ok(false) without writing).
     apply_retry_exhausted_resolution(conn, &q.id, &resolution)?;
+    // Phase E Fix 4: emit `InterruptionResolved` for the CLI resolve path.
+    // Best-effort + JSON-mode-gated, matching the raised-event helper.
+    crate::output::emit_interruption_resolved(
+        conn,
+        out.format == OutputFormat::Json,
+        &q.id,
+        &step_id_for_event,
+        &resolution,
+        comment,
+    );
 
     if out.format == OutputFormat::Json {
         let json = serde_json::json!({
@@ -711,6 +724,93 @@ mod tests {
         // Side-effect applied.
         assert_eq!(step_attempts(&conn, &step_id), 0);
         assert_eq!(step_status(&conn, &step_id), StepStatus::Pending);
+    }
+
+    #[test]
+    fn test_cli_resolve_with_auto_blocker_retry_keeps_audit_trail_and_allows_new_attempt_one_log() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-cli-retry-logs";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+
+        // Simulate the exhausted cycle's persisted audit rows. The reset path
+        // must preserve them while still allowing a fresh logical attempt=1.
+        storage::create_execution_log(&conn, &step_id, 1, Some("attempt 1"), None).unwrap();
+        storage::create_execution_log(&conn, &step_id, 2, Some("attempt 2"), None).unwrap();
+        storage::create_execution_log(&conn, &step_id, 3, Some("attempt 3"), None).unwrap();
+
+        storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_auto_blocker(&conn, &step_id);
+
+        cmd_interruption_resolve(&conn, project, None, &id, Some(1), None, None, &quiet_out())
+            .unwrap();
+
+        // Retry-from-scratch preserved the old audit rows. A fresh logical
+        // attempt=1 log must now insert successfully for the new cycle.
+        storage::create_execution_log(&conn, &step_id, 1, Some("retry cycle attempt 1"), None)
+            .unwrap();
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step_id).unwrap();
+        assert_eq!(logs.len(), 4);
+        assert_eq!(
+            logs.iter().map(|l| l.attempt).collect::<Vec<_>>(),
+            vec![1, 2, 3, 1],
+            "logical attempt numbers may repeat across retry-from-scratch cycles"
+        );
+        assert_eq!(logs[0].prompt_text.as_deref(), Some("attempt 1"));
+        assert_eq!(
+            logs[3].prompt_text.as_deref(),
+            Some("retry cycle attempt 1")
+        );
+        // Phase E Fix 2: the old audit rows stay at cycle 0; the post-reset
+        // log lands in cycle 1 (V33 cycle bump on set_step_attempts(0)).
+        assert_eq!(
+            logs.iter().map(|l| l.cycle_index).collect::<Vec<_>>(),
+            vec![0, 0, 0, 1],
+            "cycle pointer bumps from 0 to 1 after the auto-blocker reset",
+        );
+        assert_eq!(step_attempts(&conn, &step_id), 0);
+        assert_eq!(step_status(&conn, &step_id), StepStatus::Pending);
+    }
+
+    #[test]
+    fn test_cli_resolve_emits_no_panic_in_json_mode() {
+        // Phase E Fix 4: the JSON-gated `InterruptionResolved` emission path
+        // must not break the resolve happy path. We can't observe the NDJSON
+        // line from a unit test, but we can drive the JSON-mode handler end
+        // to end and assert the underlying state transitioned correctly.
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-json-resolve";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        let qid = storage::insert_interruption(
+            &conn,
+            &step_id,
+            1,
+            InterruptionKind::Question,
+            "Pick one?",
+            &[
+                InterruptionOption {
+                    text: "A".into(),
+                    priority: 1,
+                },
+                InterruptionOption {
+                    text: "B".into(),
+                    priority: 2,
+                },
+            ],
+        )
+        .unwrap();
+
+        let json_out = OutputContext {
+            format: OutputFormat::Json,
+            quiet: true,
+            color: false,
+        };
+        cmd_interruption_resolve(&conn, project, None, &qid, Some(2), None, None, &json_out)
+            .unwrap();
+
+        let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert!(after.is_empty(), "resolved row drops out of the open set");
     }
 
     #[test]

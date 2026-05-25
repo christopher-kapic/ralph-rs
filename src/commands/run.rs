@@ -4530,6 +4530,11 @@ where
                 resolution,
                 comment,
             } => {
+                // Capture the step_id BEFORE resolving so the NDJSON event
+                // emission below has it even after the row transitions.
+                let step_id_for_event = storage::get_interruption(conn, &interruption_id)
+                    .ok()
+                    .map(|i| i.step_id);
                 // Phase-2 bounded-injection path (§8): the resolution +
                 // comment land in the step's next prompt; resolving drops
                 // the step's open-interruption count to zero which
@@ -4549,6 +4554,23 @@ where
                     &interruption_id,
                     &resolution,
                 )?;
+                // Phase E Fix 4: emit `InterruptionResolved` for inbox-side
+                // resolutions too. The TUI's own stdout is the alternate
+                // screen — the helper is JSON-gated and a TUI session is
+                // never JSON-mode, so this is effectively dormant here;
+                // wiring it anyway keeps the "emit on every resolve" rule
+                // honest if a future spawned-runner / detached TUI path
+                // ever turns JSON on for this dispatcher.
+                if let Some(sid) = step_id_for_event {
+                    crate::output::emit_interruption_resolved(
+                        conn,
+                        false,
+                        &interruption_id,
+                        &sid,
+                        &resolution,
+                        comment.as_deref(),
+                    );
+                }
                 // Reflect it in-memory and auto-advance to the next open
                 // interruption (run-through — §12.3); a fresh DB poll on
                 // the next loop tick reconciles any drift.
@@ -5469,6 +5491,9 @@ fn persist_answer_and_refresh(
     use crate::tui::toast::ToastKind;
     use std::time::Instant;
 
+    let step_id_for_event = storage::get_interruption(conn, question_id)
+        .ok()
+        .map(|q| q.step_id);
     if let Err(e) = storage::set_question_answer(conn, question_id, answer) {
         app.toasts.push(
             format!("Failed to save answer: {e}"),
@@ -5477,6 +5502,12 @@ fn persist_answer_and_refresh(
         );
         app.close_answer_modal();
         return Ok(());
+    }
+    if let Some(step_id) = step_id_for_event {
+        // Mirrors the inbox resolve path: the TUI itself is never JSON-mode,
+        // but wiring the emit here keeps "every resolve goes through the
+        // helper" true for this answer-modal path too.
+        output::emit_interruption_resolved(conn, false, question_id, &step_id, answer, None);
     }
     refresh_step_detail_questions(conn, project, app)?;
     let prev_current_branch = previous_run_current_branch(conn, project, &app.plan.slug)?;
@@ -5922,7 +5953,20 @@ pub fn cmd_log(
             println!();
         }
 
+        // V33 cycle grouping: surface a `=== Cycle N ===` header before each
+        // group when the step has retried-from-scratch at least once
+        // (cycle_index > 0 ever appears). Single-cycle steps render with
+        // no header so existing output stays untouched for the common case.
+        let multi_cycle = logs.iter().any(|l| l.cycle_index > 0);
+        let mut current_cycle: Option<i32> = None;
         for log in &logs {
+            if multi_cycle && current_cycle != Some(log.cycle_index) {
+                if current_cycle.is_some() {
+                    println!();
+                }
+                println!("  === Cycle {} ===", log.cycle_index);
+                current_cycle = Some(log.cycle_index);
+            }
             print_log_entry(&step.title, log, output_mode, out.color);
         }
     } else {
@@ -10253,6 +10297,7 @@ mod mouse_routing_tests {
             "#1 — Step".to_string(),
             vec![AttemptPrompt {
                 attempt: 1,
+                cycle_index: 0,
                 started_at: None,
                 prompt: "preview body".to_string(),
             }],

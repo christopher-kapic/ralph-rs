@@ -2635,7 +2635,7 @@ async fn drain_finished_reviews(
                 // recover cleanly rather than discard correct committed work.
                 eprintln!("Review failed: {e:#}");
                 if storage::get_step_by_id(conn, &step_id)?.is_some() {
-                    crate::db::with_tx(conn, |conn| {
+                    let interruption_id = crate::db::with_tx(conn, |conn| {
                         storage::update_step_review_status(
                             conn,
                             &step_id,
@@ -2655,9 +2655,17 @@ async fn drain_finished_reviews(
                                  state. ralph will not continue on unreviewed work."
                             ),
                             &[],
-                        )?;
-                        Ok(())
+                        )
                     })?;
+                    output::emit_interruption_raised(
+                        conn,
+                        out.format == OutputFormat::Json,
+                        &interruption_id,
+                        &step_id,
+                        crate::plan::InterruptionKind::Blocker.as_str(),
+                        false,
+                        iteration,
+                    );
                 }
                 storage::update_plan_status(conn, &plan.id, PlanStatus::Failed)?;
                 return Ok(Some(PlanStatus::Failed));

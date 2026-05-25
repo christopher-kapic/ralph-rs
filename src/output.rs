@@ -182,6 +182,37 @@ pub enum RunEvent {
     /// "Paused. Use `ralph resume` to continue." toast and so machine
     /// consumers can distinguish a deliberate pause from completion.
     PausedByUser { plan_slug: String },
+    /// Emitted on every new interruption (question / blocker) write, no
+    /// matter who triggered it: harness-raised (`ralph question ask` /
+    /// `ralph block`), executor-raised auto-blocker on retry exhaustion,
+    /// or TUI/CLI-injected. `auto_raised` discriminates the executor's
+    /// retry-exhausted auto-blocker — Phase E reversed the pre-existing
+    /// "no NDJSON for interruptions" stance precisely because the auto-
+    /// raised one is the case a TUI / log shipper most wants to react to
+    /// without polling. Consumers that don't want auto-raised noise can
+    /// gate on `auto_raised == false`.
+    InterruptionRaised {
+        interruption_id: String,
+        step_id: String,
+        plan_slug: String,
+        kind: String,
+        auto_raised: bool,
+        attempt: i32,
+        raised_at: DateTime<Utc>,
+    },
+    /// Emitted on every interruption resolution, no matter who closed it
+    /// (CLI `ralph interruption resolve`, TUI inbox, or a programmatic
+    /// resolution from the orchestrator's auto-resolve paths). Pairs with
+    /// `interruption_raised` by `interruption_id`.
+    InterruptionResolved {
+        interruption_id: String,
+        step_id: String,
+        plan_slug: String,
+        resolution: String,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        comment: Option<String>,
+        resolved_at: DateTime<Utc>,
+    },
     /// Final event for `ralph run`, replacing the role of `plan_complete` for
     /// human-readable summary consumers. `plan_complete` is **kept** for one
     /// release as a compat shim (still emitted alongside `summary`) so
@@ -215,6 +246,79 @@ pub struct StaleStep {
 pub fn emit_ndjson<T: Serialize>(value: &T) -> Result<()> {
     let mut out = io::stdout().lock();
     emit_ndjson_to(&mut out, value)
+}
+
+/// Best-effort emit of an [`RunEvent::InterruptionRaised`]. Looks the plan
+/// slug up by `step_id` so callers (storage, the executor, the harness
+/// CLI handlers) don't have to plumb it through. Silently swallows errors
+/// — these events are advisory; failing to look up a plan slug (e.g.,
+/// orphaned step row, missing FK) must NOT break the underlying insert.
+///
+/// Gated on caller-passed `json_output` so the function is a no-op outside
+/// NDJSON mode (the existing pattern used by `runner.rs` for all other
+/// `RunEvent` variants — emitting unconditionally would corrupt the
+/// human-readable stdout).
+pub fn emit_interruption_raised(
+    conn: &rusqlite::Connection,
+    json_output: bool,
+    interruption_id: &str,
+    step_id: &str,
+    kind: &str,
+    auto_raised: bool,
+    attempt: i32,
+) {
+    if !json_output {
+        return;
+    }
+    let plan_slug = match plan_slug_for_step(conn, step_id) {
+        Some(s) => s,
+        None => return,
+    };
+    let _ = emit_ndjson(&RunEvent::InterruptionRaised {
+        interruption_id: interruption_id.to_string(),
+        step_id: step_id.to_string(),
+        plan_slug,
+        kind: kind.to_string(),
+        auto_raised,
+        attempt,
+        raised_at: chrono::Utc::now(),
+    });
+}
+
+/// Best-effort emit of an [`RunEvent::InterruptionResolved`]. Same shape /
+/// rationale as [`emit_interruption_raised`].
+pub fn emit_interruption_resolved(
+    conn: &rusqlite::Connection,
+    json_output: bool,
+    interruption_id: &str,
+    step_id: &str,
+    resolution: &str,
+    comment: Option<&str>,
+) {
+    if !json_output {
+        return;
+    }
+    let plan_slug = match plan_slug_for_step(conn, step_id) {
+        Some(s) => s,
+        None => return,
+    };
+    let _ = emit_ndjson(&RunEvent::InterruptionResolved {
+        interruption_id: interruption_id.to_string(),
+        step_id: step_id.to_string(),
+        plan_slug,
+        resolution: resolution.to_string(),
+        comment: comment.map(|s| s.to_string()),
+        resolved_at: chrono::Utc::now(),
+    });
+}
+
+fn plan_slug_for_step(conn: &rusqlite::Connection, step_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT p.slug FROM plans p JOIN steps s ON s.plan_id = p.id WHERE s.id = ?1",
+        rusqlite::params![step_id],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
 }
 
 /// Testable variant of [`emit_ndjson`] that writes to an arbitrary writer.
@@ -1494,6 +1598,7 @@ mod tests {
             session_id: None,
             termination_reason: None,
             test_status: None,
+            cycle_index: 0,
         };
         let s = LogEntrySummary::new(&log, &LogOutputMode::Truncated(50));
         let out_lines = s.stdout.as_deref().map(|s| s.lines().count()).unwrap_or(0);

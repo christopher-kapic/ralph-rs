@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 
+use crate::output::{self, OutputContext, OutputFormat};
 use crate::plan::{InterruptionKind, InterruptionOption};
 use crate::storage;
 
@@ -146,6 +147,7 @@ pub fn record_question_ask(
     question: &str,
     suggestions: &[String],
     priorities: &[i32],
+    out: &OutputContext,
 ) -> Result<QuestionAskOutcome> {
     let bound = match resolve_bound_step(conn, project)? {
         Ok(b) => b,
@@ -163,6 +165,19 @@ pub fn record_question_ask(
     )
     .context("inserting question interruption")?;
 
+    // Phase E Fix 4: harness-raised interruptions emit `InterruptionRaised`
+    // (auto_raised=false) for observers wiring `--json` consumers. No-op
+    // outside JSON mode and best-effort on slug-lookup failures.
+    output::emit_interruption_raised(
+        conn,
+        out.format == OutputFormat::Json,
+        &id,
+        &bound.step_id,
+        InterruptionKind::Question.as_str(),
+        false,
+        bound.attempt,
+    );
+
     Ok(QuestionAskOutcome::Recorded {
         question_id: id,
         step_id: bound.step_id,
@@ -176,7 +191,12 @@ pub fn record_question_ask(
 /// run / when the feature is off, exactly like a question — preserving the
 /// pre-DAG guard), then inserts a fresh **open native `interruptions` row**
 /// (`kind=blocker`, no options). docs/dag-redesign.md §3.4/§7.
-pub fn record_block(conn: &Connection, project: &str, body: &str) -> Result<QuestionAskOutcome> {
+pub fn record_block(
+    conn: &Connection,
+    project: &str,
+    body: &str,
+    out: &OutputContext,
+) -> Result<QuestionAskOutcome> {
     let bound = match resolve_bound_step(conn, project)? {
         Ok(b) => b,
         Err(outcome) => return Ok(outcome),
@@ -191,6 +211,19 @@ pub fn record_block(conn: &Connection, project: &str, body: &str) -> Result<Ques
         &[],
     )
     .context("inserting blocker interruption")?;
+
+    // Phase E Fix 4: same NDJSON wiring as `record_question_ask`. A
+    // harness-raised blocker is never auto-raised — only the executor's
+    // retry-exhausted path sets that flag.
+    output::emit_interruption_raised(
+        conn,
+        out.format == OutputFormat::Json,
+        &id,
+        &bound.step_id,
+        InterruptionKind::Blocker.as_str(),
+        false,
+        bound.attempt,
+    );
 
     Ok(QuestionAskOutcome::Recorded {
         question_id: id,
@@ -251,6 +284,22 @@ mod tests {
         .expect("seed run_locks");
     }
 
+    fn quiet_out() -> OutputContext {
+        OutputContext {
+            format: OutputFormat::Plain,
+            quiet: true,
+            color: false,
+        }
+    }
+
+    fn json_out() -> OutputContext {
+        OutputContext {
+            format: OutputFormat::Json,
+            quiet: true,
+            color: false,
+        }
+    }
+
     fn open_count(conn: &Connection) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM interruptions WHERE state = 'open'",
@@ -270,8 +319,15 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let _ = seed_plan_and_step(&conn, "p", "/proj-no-lock");
 
-        let outcome =
-            record_question_ask(&conn, "/proj-no-lock", "Q?", &["A".into()], &[]).expect("ok");
+        let outcome = record_question_ask(
+            &conn,
+            "/proj-no-lock",
+            "Q?",
+            &["A".into()],
+            &[],
+            &quiet_out(),
+        )
+        .expect("ok");
         assert!(matches!(outcome, QuestionAskOutcome::NoActiveRun));
         assert_eq!(
             open_count(&conn),
@@ -294,6 +350,7 @@ mod tests {
             "Should I do A or B?",
             &["A".into(), "B".into()],
             &[],
+            &quiet_out(),
         )
         .expect("ok");
         assert!(matches!(outcome, QuestionAskOutcome::Disabled));
@@ -309,7 +366,8 @@ mod tests {
         // STEP 21: `ralph block` must hit the SAME guard as `question ask`.
         let conn = db::open_memory().unwrap();
         let _ = seed_plan_and_step(&conn, "p", "/proj-blk-no-lock");
-        let outcome = record_block(&conn, "/proj-blk-no-lock", "needs sudo").expect("ok");
+        let outcome =
+            record_block(&conn, "/proj-blk-no-lock", "needs sudo", &quiet_out()).expect("ok");
         assert!(matches!(outcome, QuestionAskOutcome::NoActiveRun));
         assert_eq!(open_count(&conn), 0);
     }
@@ -321,7 +379,7 @@ mod tests {
         let (plan_id, step_id) = seed_plan_and_step(&conn, "p-blk", project);
         storage::set_plan_questions_enabled(&conn, &plan_id, false).unwrap();
         seed_run_lock(&conn, project, &plan_id, "p-blk", &step_id, 1);
-        let outcome = record_block(&conn, project, "needs access").expect("ok");
+        let outcome = record_block(&conn, project, "needs access", &quiet_out()).expect("ok");
         assert!(matches!(outcome, QuestionAskOutcome::Disabled));
         assert_eq!(open_count(&conn), 0);
     }
@@ -335,8 +393,15 @@ mod tests {
         seed_run_lock(&conn, project, &plan_id, "p-enabled", &step_id, 2);
 
         let suggestions = vec!["Option A".to_string(), "Option B".to_string()];
-        let outcome = record_question_ask(&conn, project, "What should I do?", &suggestions, &[])
-            .expect("ok");
+        let outcome = record_question_ask(
+            &conn,
+            project,
+            "What should I do?",
+            &suggestions,
+            &[],
+            &quiet_out(),
+        )
+        .expect("ok");
         let (qid, recorded_step_id, attempt) = match outcome {
             QuestionAskOutcome::Recorded {
                 question_id,
@@ -376,8 +441,15 @@ mod tests {
 
         let suggestions = vec!["best".into(), "second".into(), "third".into()];
         // Only two priorities supplied for three suggestions.
-        let outcome =
-            record_question_ask(&conn, project, "Which?", &suggestions, &[10, 20]).expect("ok");
+        let outcome = record_question_ask(
+            &conn,
+            project,
+            "Which?",
+            &suggestions,
+            &[10, 20],
+            &quiet_out(),
+        )
+        .expect("ok");
         let qid = match outcome {
             QuestionAskOutcome::Recorded { question_id, .. } => question_id,
             other => panic!("expected Recorded, got {other:?}"),
@@ -400,7 +472,8 @@ mod tests {
         storage::set_plan_questions_enabled(&conn, &plan_id, true).unwrap();
         seed_run_lock(&conn, project, &plan_id, "p-block", &step_id, 3);
 
-        let outcome = record_block(&conn, project, "Cannot apt-get without sudo").expect("ok");
+        let outcome =
+            record_block(&conn, project, "Cannot apt-get without sudo", &quiet_out()).expect("ok");
         let qid = match outcome {
             QuestionAskOutcome::Recorded { question_id, .. } => question_id,
             other => panic!("expected Recorded, got {other:?}"),
@@ -424,10 +497,11 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = record_question_ask(&conn, project, "Q?", &[], &[]).expect("ok");
+        let outcome =
+            record_question_ask(&conn, project, "Q?", &[], &[], &quiet_out()).expect("ok");
         assert!(matches!(outcome, QuestionAskOutcome::NoActiveRun));
         // The block verb shares the gate.
-        let outcome = record_block(&conn, project, "blk").expect("ok");
+        let outcome = record_block(&conn, project, "blk", &quiet_out()).expect("ok");
         assert!(matches!(outcome, QuestionAskOutcome::NoActiveRun));
     }
 
@@ -439,8 +513,15 @@ mod tests {
         storage::set_plan_questions_enabled(&conn, &plan_id, true).unwrap();
         seed_run_lock(&conn, project, &plan_id, "p-empty", &step_id, 1);
 
-        let outcome =
-            record_question_ask(&conn, project, "What should we name X?", &[], &[]).expect("ok");
+        let outcome = record_question_ask(
+            &conn,
+            project,
+            "What should we name X?",
+            &[],
+            &[],
+            &quiet_out(),
+        )
+        .expect("ok");
         let qid = match outcome {
             QuestionAskOutcome::Recorded { question_id, .. } => question_id,
             other => panic!("expected Recorded, got {other:?}"),
@@ -470,11 +551,63 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = record_question_ask(&conn, project, "Q?", &[], &[]).expect("ok");
+        let outcome =
+            record_question_ask(&conn, project, "Q?", &[], &[], &quiet_out()).expect("ok");
         let attempt = match outcome {
             QuestionAskOutcome::Recorded { attempt, .. } => attempt,
             other => panic!("expected Recorded, got {other:?}"),
         };
         assert_eq!(attempt, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase E Fix 4: NDJSON emission paths must not panic / leak DB state
+    // -----------------------------------------------------------------
+    //
+    // The NDJSON `InterruptionRaised` event is best-effort and writes to
+    // process stdout, so we can't observe it from a unit test directly.
+    // We instead pin three contract properties:
+    //   1. JSON-mode `record_question_ask` still records the row (the
+    //      event emission is purely additive — no inserts dropped).
+    //   2. JSON-mode `record_block` still records the row (same).
+    //   3. Both paths set `kind` correctly inside the DB so the event we
+    //      would emit reflects the actual state — the `kind` argument
+    //      threading is what would silently break.
+
+    #[test]
+    fn record_question_ask_in_json_mode_still_inserts_question_row() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-json-q";
+        let (plan_id, step_id) = seed_plan_and_step(&conn, "p-json-q", project);
+        storage::set_plan_questions_enabled(&conn, &plan_id, true).unwrap();
+        seed_run_lock(&conn, project, &plan_id, "p-json-q", &step_id, 1);
+
+        let outcome =
+            record_question_ask(&conn, project, "json-q?", &[], &[], &json_out()).expect("ok");
+        let qid = match outcome {
+            QuestionAskOutcome::Recorded { question_id, .. } => question_id,
+            other => panic!("expected Recorded, got {other:?}"),
+        };
+        let rows = storage::list_interruptions_for_step(&conn, &step_id).unwrap();
+        let q = rows.iter().find(|i| i.id == qid).unwrap();
+        assert_eq!(q.kind, InterruptionKind::Question);
+    }
+
+    #[test]
+    fn record_block_in_json_mode_still_inserts_blocker_row() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-json-b";
+        let (plan_id, step_id) = seed_plan_and_step(&conn, "p-json-b", project);
+        storage::set_plan_questions_enabled(&conn, &plan_id, true).unwrap();
+        seed_run_lock(&conn, project, &plan_id, "p-json-b", &step_id, 2);
+
+        let outcome = record_block(&conn, project, "json-blk", &json_out()).expect("ok");
+        let bid = match outcome {
+            QuestionAskOutcome::Recorded { question_id, .. } => question_id,
+            other => panic!("expected Recorded, got {other:?}"),
+        };
+        let rows = storage::list_interruptions_for_step(&conn, &step_id).unwrap();
+        let b = rows.iter().find(|i| i.id == bid).unwrap();
+        assert_eq!(b.kind, InterruptionKind::Blocker);
     }
 }

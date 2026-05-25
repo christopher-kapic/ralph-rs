@@ -46,21 +46,23 @@ The events fall into two groups:
 | `corrective_step_requested`  | lifecycle | When a failed review requests a corrective step (the reviewer-side half of the structured channel) |
 | `corrective_step_inserted`   | lifecycle | When the orchestrator has inserted `A′` and re-parented `A`'s dependents |
 | `review_loop_escalated`      | lifecycle | When the review→correction chain hits the per-plan cap and a blocker is raised |
+| `interruption_raised`        | lifecycle | When ANY interruption (question / blocker) is inserted — harness, executor auto-blocker, TUI, or CLI |
+| `interruption_resolved`      | lifecycle | When ANY interruption is resolved — CLI, TUI, or programmatic |
 | `harness_chunk`    | streaming | Per newline of harness stdout/stderr during the harness phase |
 | `test_chunk`       | streaming | Per newline of test stdout/stderr during the tests phase   |
 | `phase_changed`    | streaming | On every `run_locks.phase` transition                      |
 
-> **There is no `interruption_raised` / `interruption_resolved` event.**
-> Questions and blockers (the unified *interruptions* model) do **not**
-> emit a dedicated NDJSON variant. A harness raising `ralph question ask`
-> / `ralph block` writes a row to the `interruptions` table and exits; the
-> orchestrator observes it at the next scheduler tick and the step's
-> derived `Blocked` overlay surfaces through the normal DB re-read the TUI
-> already performs (the `run_locks` table is the cross-process bridge).
-> Consumers that need interruption state poll the DB / `ralph interruption
-> list`, not the event stream. The review→loop escalation path is the one
-> case where an interruption (a `kind=blocker`) is *announced* on the
-> stream — via `review_loop_escalated`, documented below.
+> **Interruptions now emit NDJSON events** (Phase E reversal of the pre-existing
+> "no event for interruptions" stance). Every insert produces an
+> `interruption_raised` and every resolve produces an
+> `interruption_resolved`, regardless of who triggered it — a harness
+> calling `ralph question ask` / `ralph block`, the executor's
+> retry-exhausted auto-blocker, the TUI inbox, or the `ralph interruption
+> resolve` CLI. The `auto_raised: bool` flag on `interruption_raised`
+> discriminates the executor's retry-exhausted auto-blocker (true) from
+> every other path (false). Consumers that want to subscribe to *just* the
+> auto-blocker (because the human-visible inbox surfaces the rest) can gate
+> on `auto_raised == true`.
 
 ---
 
@@ -174,11 +176,10 @@ runner emits `outcome: aborted`). Stuck-state recovery is via
 > `executor::RETRY_EXHAUSTED_OPTION_RETRY` /
 > `RETRY_EXHAUSTED_OPTION_FAIL` is the auto-blocker; anything else
 > (typically `kind=question` or a freeform `kind=blocker` body) is a
-> harness-raised pause. The same NDJSON-quiet rule that applies to
-> harness-raised interruptions applies here: **no
-> `interruption_raised` / `interruption_resolved` event is emitted** in
-> either case. The only interruption announced on the stream remains
-> the review-loop escalation (`review_loop_escalated`).
+> harness-raised pause. Both cases ALSO emit `interruption_raised` (see
+> below); the auto-blocker is discriminated by `auto_raised: true`. The
+> NDJSON-quiet rule that previously applied to interruptions has been
+> reversed in Phase E.
 
 ### `plan_complete`
 
@@ -554,6 +555,89 @@ Consumer expectations: the step is now `Complete`/`review_status =
 Failed` with an **open blocker** keeping its dependents gated until a
 human resolves it (`ralph interruption resolve`). No further corrective
 steps will be spawned for this chain.
+
+### `interruption_raised`
+
+Emitted on every new interruption row written, no matter who triggered
+it:
+
+- a harness calling `ralph question ask` / `ralph block` from inside a
+  running step (`auto_raised: false`);
+- the executor's retry-exhausted auto-blocker, when a step exhausts its
+  retry budget on a productively-retryable failure mode (TestFailed /
+  CommitFailed) — see also the `outcome: paused_for_question` note on
+  `step_finished` (`auto_raised: true`);
+- TUI / CLI-injected interruptions (`auto_raised: false`).
+
+Best-effort: emitted post-commit so a transaction that rolled back never
+produces a phantom "raised" event. Failure to resolve the plan slug from
+the step id (e.g., a step row that has since been deleted out from under
+the orchestrator) silently swallows the emit rather than failing the
+underlying write.
+
+Payload:
+
+| Field             | Type               | Notes                                                       |
+|-------------------|--------------------|-------------------------------------------------------------|
+| `interruption_id` | `string`           | UUID of the inserted interruption row.                      |
+| `step_id`         | `string`           | UUID of the step the interruption is attached to.           |
+| `plan_slug`       | `string`           | Plan slug, resolved via the step→plan FK.                   |
+| `kind`            | `string`           | `question` or `blocker`.                                    |
+| `auto_raised`     | `boolean`          | `true` only for the executor's retry-exhausted auto-blocker.|
+| `attempt`         | `integer`          | 1-based attempt number this row was bound to.               |
+| `raised_at`       | `string` (RFC3339) | UTC instant the event was emitted.                          |
+
+```json
+{
+  "event": "interruption_raised",
+  "interruption_id": "c0ffee…",
+  "step_id": "9b8c4…",
+  "plan_slug": "dag-redesign",
+  "kind": "blocker",
+  "auto_raised": true,
+  "attempt": 3,
+  "raised_at": "2026-05-25T10:00:00Z"
+}
+```
+
+Consumer expectations: pair with `interruption_resolved` by
+`interruption_id`. A `false`-armed event still requires DB poll for the
+full body / options payload — the event is a notification, not the
+content.
+
+### `interruption_resolved`
+
+Emitted on every resolve, regardless of resolver (CLI
+`ralph interruption resolve`, TUI inbox, or programmatic). Pairs with the
+earlier `interruption_raised` by `interruption_id`.
+
+Payload:
+
+| Field             | Type               | Notes                                              |
+|-------------------|--------------------|----------------------------------------------------|
+| `interruption_id` | `string`           | UUID matching the prior `interruption_raised`.    |
+| `step_id`         | `string`           | UUID of the step the interruption was attached to. |
+| `plan_slug`       | `string`           | Plan slug.                                         |
+| `resolution`      | `string`           | The resolution text (option text or freeform answer). May be empty for a comment-only resolution. |
+| `comment`         | `string?`          | Optional human-side comment captured at resolve.   |
+| `resolved_at`     | `string` (RFC3339) | UTC instant the event was emitted.                 |
+
+```json
+{
+  "event": "interruption_resolved",
+  "interruption_id": "c0ffee…",
+  "step_id": "9b8c4…",
+  "plan_slug": "dag-redesign",
+  "resolution": "Retry the step from scratch",
+  "comment": "tweaked the failing assertion in test::foo",
+  "resolved_at": "2026-05-25T10:05:00Z"
+}
+```
+
+Consumer expectations: resolving an open interruption un-shadows the
+step's derived `Blocked` overlay at the next scheduler tick — expect the
+step's `step_started` / `prompt_prepared` to follow once the scheduler
+re-picks it.
 
 ---
 

@@ -1297,6 +1297,15 @@ pub struct ExecutionLog {
     pub termination_reason: Option<TerminationReason>,
     #[serde(default)]
     pub test_status: Option<TestStatus>,
+    /// V33 per-step retry-from-scratch cycle pointer. `0` for ordinary
+    /// runs; bumps every time the step's `attempts` is reset from >0 to 0
+    /// (the "Retry the step from scratch" auto-blocker resolver). Lets
+    /// `ralph log` and the rendered-prompt picker group attempts by cycle
+    /// when logical attempt numbers repeat (V32 dropped the
+    /// `UNIQUE(step_id, attempt)` constraint so they can).
+    /// `#[serde(default)]` so pre-V33 exported logs keep round-tripping.
+    #[serde(default)]
+    pub cycle_index: i32,
 }
 
 impl ExecutionLog {
@@ -1306,7 +1315,12 @@ impl ExecutionLog {
     /// id, step_id, attempt, started_at, duration_secs, prompt_text, diff,
     /// test_results, rolled_back, committed, commit_hash,
     /// harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens,
-    /// session_id, termination_reason, test_status
+    /// session_id, termination_reason, test_status, cycle_index
+    ///
+    /// `cycle_index` (column 19) is the V33 per-step retry-from-scratch
+    /// pointer. SELECTs that predate V33 may omit the column; `.get(19).ok()`
+    /// defensively maps a missing or NULL value to 0 (mirrors the
+    /// `short_id` / `tags` handling on [`Step`]).
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let started_str: String = row.get(3)?;
         let started_at = parse_datetime(&started_str).map_err(|e| {
@@ -1345,6 +1359,8 @@ impl ExecutionLog {
             None => None,
         };
 
+        let cycle_index: i32 = row.get::<_, Option<i32>>(19).ok().flatten().unwrap_or(0);
+
         Ok(ExecutionLog {
             id: row.get(0)?,
             step_id: row.get(1)?,
@@ -1365,6 +1381,7 @@ impl ExecutionLog {
             session_id: row.get(16)?,
             termination_reason,
             test_status,
+            cycle_index,
         })
     }
 }

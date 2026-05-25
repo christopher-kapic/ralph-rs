@@ -670,9 +670,127 @@ pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
                 message: format!("could not check review configuration: {e}"),
             }),
         }
+
+        // 8. Vestigial `retry_strategy` — post test-then-commit both arms
+        //    preserve the dirty tree, so any explicit step/plan override is
+        //    a no-op pointing at a follow-up cleanup. Cite the offending
+        //    slugs / short_ids so the user knows where to clear it. NON-FATAL.
+        checks.extend(check_vestigial_retry_strategy(conn));
     }
 
     checks
+}
+
+/// Walk every project's plans and steps; warn (non-fatally) for each one that
+/// carries an explicit non-`None` `retry_strategy`. The strategy is vestigial
+/// post test-then-commit (both arms now preserve the dirty tree across failed
+/// attempts) and will be removed in a follow-up PR — the warning points at the
+/// clearing command so the user can clean it up ahead of removal.
+///
+/// Implementation note: walks ALL plans (no `project` filter) because
+/// `ralph doctor` is project-agnostic; the user runs it once per machine.
+fn check_vestigial_retry_strategy(conn: &rusqlite::Connection) -> Vec<CheckResult> {
+    let mut out = Vec::new();
+
+    // Plans first. The `plans` table carries `retry_strategy TEXT` (V24).
+    let mut stmt = match conn.prepare(
+        "SELECT slug, retry_strategy FROM plans \
+         WHERE retry_strategy IS NOT NULL ORDER BY slug ASC",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            out.push(CheckResult {
+                name: "retry-strategy-vestigial".to_string(),
+                severity: CheckSeverity::Warning,
+                message: format!("could not check plan retry strategies: {e}"),
+            });
+            return out;
+        }
+    };
+    let rows = match stmt.query_map([], |r| {
+        let slug: String = r.get(0)?;
+        let strat: String = r.get(1)?;
+        Ok((slug, strat))
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            out.push(CheckResult {
+                name: "retry-strategy-vestigial".to_string(),
+                severity: CheckSeverity::Warning,
+                message: format!("could not iterate plan retry strategies: {e}"),
+            });
+            return out;
+        }
+    };
+    for r in rows.flatten() {
+        out.push(CheckResult {
+            name: "retry-strategy-vestigial".to_string(),
+            severity: CheckSeverity::Warning,
+            message: format!(
+                "plan '{slug}' has retry_strategy = {strat}; vestigial post \
+                 test-then-commit (both arms preserve the dirty tree). Clear \
+                 with: `ralph plan retry-strategy unset {slug}` or edit the \
+                 plan to drop the override.",
+                slug = r.0,
+                strat = r.1,
+            ),
+        });
+    }
+    drop(stmt);
+
+    // Steps next.
+    let mut stmt = match conn.prepare(
+        "SELECT s.short_id, p.slug, s.retry_strategy FROM steps s \
+         JOIN plans p ON p.id = s.plan_id \
+         WHERE s.retry_strategy IS NOT NULL \
+         ORDER BY p.slug ASC, s.sort_key ASC",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            out.push(CheckResult {
+                name: "retry-strategy-vestigial".to_string(),
+                severity: CheckSeverity::Warning,
+                message: format!("could not check step retry strategies: {e}"),
+            });
+            return out;
+        }
+    };
+    let rows = match stmt.query_map([], |r| {
+        let short: String = r.get::<_, Option<String>>(0)?.unwrap_or_default();
+        let slug: String = r.get(1)?;
+        let strat: String = r.get(2)?;
+        Ok((short, slug, strat))
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            out.push(CheckResult {
+                name: "retry-strategy-vestigial".to_string(),
+                severity: CheckSeverity::Warning,
+                message: format!("could not iterate step retry strategies: {e}"),
+            });
+            return out;
+        }
+    };
+    for r in rows.flatten() {
+        let (short, slug, strat) = r;
+        let handle = if short.is_empty() {
+            "<unset short_id>".to_string()
+        } else {
+            short
+        };
+        out.push(CheckResult {
+            name: "retry-strategy-vestigial".to_string(),
+            severity: CheckSeverity::Warning,
+            message: format!(
+                "plan '{slug}' step '{handle}' has retry_strategy = {strat}; \
+                 vestigial post test-then-commit (both arms preserve the dirty \
+                 tree). Clear with: `ralph step edit {handle} \
+                 --clear-retry-strategy` (within plan '{slug}').",
+            ),
+        });
+    }
+
+    out
 }
 
 /// Verify a usable review harness is configured, given that review is
@@ -1613,6 +1731,117 @@ mod tests {
         assert!(
             !crate::storage::any_review_enabled(&conn).unwrap(),
             "a DB with no review-enabled plan/step must not trigger the check"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Vestigial retry_strategy tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_check_vestigial_retry_strategy_no_overrides_is_empty() {
+        // No plan/step has a non-NULL retry_strategy ⇒ no warnings emitted.
+        let conn = crate::db::open_memory().unwrap();
+        let _plan =
+            crate::storage::create_plan(&conn, "fresh", "/proj", "branch", "desc", None, None, &[])
+                .unwrap();
+        let checks = check_vestigial_retry_strategy(&conn);
+        assert!(
+            checks.is_empty(),
+            "no override anywhere → no warnings; got {checks:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_vestigial_retry_strategy_warns_per_plan_and_step() {
+        let conn = crate::db::open_memory().unwrap();
+        let plan = crate::storage::create_plan(
+            &conn,
+            "vestigial-plan",
+            "/proj-v",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        crate::storage::set_plan_retry_strategy(
+            &conn,
+            &plan.id,
+            Some(crate::plan::RetryStrategy::Rollback),
+        )
+        .unwrap();
+        let (step, _) = crate::storage::create_step(
+            &conn,
+            &plan.id,
+            "Title",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        crate::storage::set_step_retry_strategy(
+            &conn,
+            &step.id,
+            Some(crate::plan::RetryStrategy::Keep),
+        )
+        .unwrap();
+
+        let checks = check_vestigial_retry_strategy(&conn);
+        assert!(
+            checks.len() >= 2,
+            "expected one warning per plan + per step override; got {checks:?}"
+        );
+        // Every one must be a non-fatal Warning under the shared check name.
+        for c in &checks {
+            assert_eq!(c.name, "retry-strategy-vestigial");
+            assert_eq!(c.severity, CheckSeverity::Warning);
+            assert!(
+                c.message.contains("vestigial post test-then-commit"),
+                "warning message must explain the deprecation; got: {}",
+                c.message,
+            );
+        }
+        // Plan-level warning cites the slug.
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.message.contains("plan 'vestigial-plan'")),
+            "plan-level warning must cite the plan slug; got {checks:?}",
+        );
+        // Step-level warning cites the short_id and the plan slug for context.
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.message.contains(&step.short_id)
+                    && c.message.contains("vestigial-plan")),
+            "step-level warning must cite the step short_id and plan slug; got {checks:?}",
+        );
+    }
+
+    #[test]
+    fn test_vestigial_retry_strategy_warning_is_non_fatal() {
+        let conn = crate::db::open_memory().unwrap();
+        let plan =
+            crate::storage::create_plan(&conn, "p", "/proj-nf", "branch", "d", None, None, &[])
+                .unwrap();
+        crate::storage::set_plan_retry_strategy(
+            &conn,
+            &plan.id,
+            Some(crate::plan::RetryStrategy::Keep),
+        )
+        .unwrap();
+        let checks = check_vestigial_retry_strategy(&conn);
+        let results = PreflightResults { checks };
+        assert!(
+            results.is_ok(),
+            "vestigial-retry-strategy warnings must not be treated as failures"
         );
     }
 

@@ -1151,6 +1151,7 @@ mod tests {
             session_id: None,
             termination_reason,
             test_status: None,
+            cycle_index: 0,
         }
     }
 

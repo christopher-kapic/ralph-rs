@@ -47,6 +47,13 @@ use crate::tui::theme;
 pub struct AttemptPrompt {
     /// 1-based attempt number (matches `execution_logs.attempt`).
     pub attempt: i32,
+    /// V33 per-step retry-from-scratch cycle pointer (mirrors
+    /// `execution_logs.cycle_index`). `0` for the common single-cycle path;
+    /// non-zero after one or more "Retry from scratch" resolutions. The
+    /// picker prepends a `[cycle N]` label when this is non-zero so the
+    /// user can disambiguate two logical attempt=1 rows from different
+    /// cycles.
+    pub cycle_index: i32,
     /// When this attempt started, from `execution_logs.started_at`. `None`
     /// for the zero-logs synthetic attempt-1 entry.
     pub started_at: Option<DateTime<Utc>>,
@@ -72,8 +79,12 @@ pub enum Outcome {
 // ---------------------------------------------------------------------------
 
 /// Reconstruct the [`RetryContext`] that the executor would have built for
-/// attempt number `attempt` (1-based), given the chronological list of this
-/// step's execution logs and the resolved attempt budget.
+/// the execution-log entry at `log_index`, given the chronological list of
+/// this step's execution logs and the resolved attempt budget.
+///
+/// The returned [`RetryContext::attempt`] is the row's logical in-budget
+/// attempt number (`execution_logs.attempt`), which may repeat across
+/// separate retry-from-scratch cycles for the same step.
 ///
 /// **Source of truth:** `src/executor.rs` (`execute_step`, ~lines 716-727 and
 /// the `prev_diff` / `prev_test_output` / `prev_files_modified` assignments at
@@ -84,7 +95,8 @@ pub enum Outcome {
 /// - `previous_test_output` = the previous attempt's test results joined with `\n`
 /// - `files_modified` = the files changed during the previous attempt
 ///
-/// Attempt 1 has no retry context (returns `None`).
+/// Logical attempt 1 within any cycle has no retry context (returns
+/// `None`).
 ///
 /// Deviation from the executor that cannot be avoided here: the executor
 /// sources `files_modified` from a *live* `git status` taken during the
@@ -110,18 +122,23 @@ pub enum Outcome {
 /// work is still on disk). `previous_failure_reason` is reconstructed from
 /// the previous attempt's `termination_reason` under both strategies.
 pub fn build_retry_context_for_attempt(
-    attempt: i32,
+    log_index: usize,
     max_attempts: i32,
     logs: &[ExecutionLog],
     strategy: RetryStrategy,
 ) -> Option<RetryContext> {
-    if attempt <= 1 {
+    let current = logs.get(log_index)?;
+    let attempt = current.attempt;
+    if attempt <= 1 || log_index == 0 {
         return None;
     }
-    // The executor derives attempt N's retry context from attempt N-1's
-    // recorded outcome. Logs are ordered by `attempt` ASC, so the previous
-    // attempt is the row whose `attempt == attempt - 1`.
-    let prev = logs.iter().find(|l| l.attempt == attempt - 1)?;
+    // Chronological replay: the executor derives an attempt's retry context
+    // from the immediately previous execution-log row in time, not from a
+    // globally unique attempt number. After a human resolves the
+    // retry-exhausted blocker with "Retry from scratch", a later cycle can
+    // legitimately produce another logical attempt=1 row for the same step
+    // while the older rows remain as audit history.
+    let prev = &logs[log_index - 1];
 
     let previous_test_output = if prev.test_results.is_empty() {
         None
@@ -292,6 +309,7 @@ impl RenderedPromptApp {
             );
             out.push(AttemptPrompt {
                 attempt: 1,
+                cycle_index: 0,
                 started_at: None,
                 prompt,
             });
@@ -301,8 +319,8 @@ impl RenderedPromptApp {
         // Resolve the step's retry strategy once so each per-attempt preview
         // scopes the diff/files exactly as the executor would (Step 22).
         let strategy = step.effective_retry_strategy(plan);
-        for log in logs {
-            let retry = build_retry_context_for_attempt(log.attempt, max_attempts, logs, strategy);
+        for (i, log) in logs.iter().enumerate() {
+            let retry = build_retry_context_for_attempt(i, max_attempts, logs, strategy);
             let prompt = prompt::build_step_prompt(
                 plan,
                 step,
@@ -315,6 +333,7 @@ impl RenderedPromptApp {
             );
             out.push(AttemptPrompt {
                 attempt: log.attempt,
+                cycle_index: log.cycle_index,
                 started_at: Some(log.started_at),
                 prompt,
             });
@@ -575,6 +594,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut RenderedPromptApp) {
     // -- Header ----------------------------------------------------------
     let header_text = {
         let mut s = format!("Attempt {} of {}", current.attempt, total);
+        // V33: prefix `[cycle N]` when the surface contains attempts from a
+        // post-reset cycle, so two logical attempt=1 rows can be told apart
+        // at the picker. Cycle 0 is the common case and stays unlabeled.
+        let multi_cycle = app.attempts.iter().any(|a| a.cycle_index > 0);
+        if multi_cycle {
+            s = format!("[cycle {}] {s}", current.cycle_index);
+        }
         if let Some(started) = current.started_at {
             let rel = relative_time(started, Utc::now());
             s.push_str(&format!(" (started {rel})"));
@@ -722,6 +748,7 @@ mod tests {
             session_id: None,
             termination_reason: None,
             test_status: None,
+            cycle_index: 0,
         }
     }
 
@@ -738,8 +765,8 @@ mod tests {
 
     #[test]
     fn attempt_one_has_no_retry_context() {
-        assert!(build_retry_context_for_attempt(1, 4, &[], RetryStrategy::Keep).is_none());
-        assert!(build_retry_context_for_attempt(1, 4, &[], RetryStrategy::Rollback).is_none());
+        assert!(build_retry_context_for_attempt(0, 4, &[], RetryStrategy::Keep).is_none());
+        assert!(build_retry_context_for_attempt(0, 4, &[], RetryStrategy::Rollback).is_none());
     }
 
     #[test]
@@ -753,7 +780,7 @@ mod tests {
         let l2 = make_log(2, Utc::now());
         let logs = vec![l1, l2];
 
-        let ctx = build_retry_context_for_attempt(2, 4, &logs, RetryStrategy::Rollback)
+        let ctx = build_retry_context_for_attempt(1, 4, &logs, RetryStrategy::Rollback)
             .expect("retry ctx for attempt 2");
         assert_eq!(ctx.attempt, 2);
         assert_eq!(ctx.max_attempts, 4);
@@ -783,7 +810,7 @@ mod tests {
         let l2 = make_log(2, Utc::now());
         let logs = vec![l1, l2];
 
-        let ctx = build_retry_context_for_attempt(2, 4, &logs, RetryStrategy::Keep)
+        let ctx = build_retry_context_for_attempt(1, 4, &logs, RetryStrategy::Keep)
             .expect("retry ctx for attempt 2");
         assert_eq!(ctx.attempt, 2);
         assert!(
@@ -796,6 +823,48 @@ mod tests {
         );
         assert_eq!(ctx.previous_test_output.as_deref(), Some("FAIL test_a"));
         assert_eq!(ctx.previous_failure_reason.as_deref(), Some("tests failed"));
+    }
+
+    #[test]
+    fn retry_context_uses_chronological_previous_log_after_attempt_reset() {
+        let plan = make_plan();
+        let step = make_step();
+        let all = vec![step.clone()];
+        let prompts = prompts_for(&plan);
+
+        let mut l1 = make_log(1, Utc::now() - Duration::seconds(30));
+        l1.test_results = vec!["FAIL old cycle".to_string()];
+        l1.termination_reason = Some(TerminationReason::TestFailed);
+        let l2 = make_log(2, Utc::now() - Duration::seconds(20));
+        let l3 = make_log(1, Utc::now() - Duration::seconds(10));
+        let logs = vec![l1, l2, l3];
+
+        assert!(
+            build_retry_context_for_attempt(2, 4, &logs, RetryStrategy::Keep).is_none(),
+            "logical attempt=1 after a retry-from-scratch reset must not inherit retry context"
+        );
+
+        let attempts = RenderedPromptApp::build_attempts(
+            &plan,
+            &step,
+            &all,
+            None,
+            true,
+            &prompts,
+            &[],
+            4,
+            &logs,
+        );
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts[2].attempt, 1);
+        assert!(
+            !attempts[2].prompt.contains("# Retry Context"),
+            "a post-reset attempt 1 preview must rebuild with no retry section"
+        );
+
+        let expected =
+            prompt::build_step_prompt(&plan, &step, &all, None, None, true, &prompts, &[]);
+        assert_eq!(attempts[2].prompt, expected);
     }
 
     #[test]
@@ -875,7 +944,7 @@ mod tests {
         // `step.effective_retry_strategy(plan)`; make_step/make_plan both
         // leave it None → default `Keep`, so mirror that here.
         let ctx =
-            build_retry_context_for_attempt(2, 4, &logs, step.effective_retry_strategy(&plan))
+            build_retry_context_for_attempt(1, 4, &logs, step.effective_retry_strategy(&plan))
                 .unwrap();
         let exp2 =
             prompt::build_step_prompt(&plan, &step, &all, None, Some(&ctx), true, &prompts, &[]);
@@ -892,16 +961,19 @@ mod tests {
         let attempts = vec![
             AttemptPrompt {
                 attempt: 1,
+                cycle_index: 0,
                 started_at: Some(now - Duration::seconds(300)),
                 prompt: "P1".to_string(),
             },
             AttemptPrompt {
                 attempt: 2,
+                cycle_index: 0,
                 started_at: Some(now - Duration::seconds(120)),
                 prompt: "P2".to_string(),
             },
             AttemptPrompt {
                 attempt: 3,
+                cycle_index: 0,
                 started_at: Some(now - Duration::seconds(10)),
                 prompt: "P3".to_string(),
             },
@@ -936,11 +1008,13 @@ mod tests {
         let attempts = vec![
             AttemptPrompt {
                 attempt: 1,
+                cycle_index: 0,
                 started_at: Some(Utc::now()),
                 prompt: "a\nb\nc\nd\ne".to_string(),
             },
             AttemptPrompt {
                 attempt: 2,
+                cycle_index: 0,
                 started_at: Some(Utc::now()),
                 prompt: "x".to_string(),
             },
@@ -957,6 +1031,7 @@ mod tests {
     fn single_attempt_jk_scrolls_instead_of_navigating() {
         let attempts = vec![AttemptPrompt {
             attempt: 1,
+            cycle_index: 0,
             started_at: None,
             prompt: (0..50)
                 .map(|i| format!("line {i}"))
@@ -983,6 +1058,7 @@ mod tests {
                 "l".into(),
                 vec![AttemptPrompt {
                     attempt: 1,
+                    cycle_index: 0,
                     started_at: None,
                     prompt: "p".into(),
                 }],
@@ -1018,6 +1094,7 @@ mod tests {
         let attempts = vec![
             AttemptPrompt {
                 attempt: 1,
+                cycle_index: 0,
                 started_at: Some(now),
                 prompt: (0..50)
                     .map(|i| format!("line {i}"))
@@ -1026,6 +1103,7 @@ mod tests {
             },
             AttemptPrompt {
                 attempt: 2,
+                cycle_index: 0,
                 started_at: Some(now),
                 prompt: (0..50)
                     .map(|i| format!("attempt2 {i}"))
@@ -1064,6 +1142,7 @@ mod tests {
             "l".into(),
             vec![AttemptPrompt {
                 attempt: 1,
+                cycle_index: 0,
                 started_at: None,
                 prompt: "p".into(),
             }],

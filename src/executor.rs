@@ -88,6 +88,113 @@ fn truncate_tail_bytes(text: &str, max_bytes: usize) -> String {
     )
 }
 
+/// Phase E Fix 5: build the retry-exhausted auto-blocker's body from the
+/// last up-to-3 attempts in the step's CURRENT cycle. Returns the body
+/// already truncated to fit within [`RETRY_EXHAUSTED_BODY_MAX_BYTES`].
+///
+/// Layout (final-first; the attempt the user is about to triage is on top):
+/// ```text
+/// Step failed after N attempts.
+///
+/// ### Attempt N (final)
+/// <test_results joined for the persisted attempt N row>
+/// (and the live `failure_output.test_results` if it carries additional
+///  diagnostic the row's `test_results` didn't capture — typically commit-
+///  hook stderr the executor merged via Phase A's `[Commit hook output]`
+///  header)
+///
+/// ### Attempt N-1
+/// <test_results joined for the persisted attempt N-1 row>
+///
+/// ### Attempt N-2
+/// <test_results joined for the persisted attempt N-2 row>
+/// ```
+///
+/// Each attempt's content is independently truncated to its share of the
+/// budget (`(BUDGET - reserve_for_headers) / num_attempts`), so a single
+/// noisy attempt can't crowd the others out of the body.
+fn build_retry_exhausted_body(
+    conn: &Connection,
+    step_id: &str,
+    max_attempts: i32,
+    failure_reason: FailureReason,
+    failure_output: &FailureOutput<'_>,
+) -> String {
+    const HEADER_RESERVE: usize = 256;
+
+    // Resolve the step's current cycle, then take the last 3 attempts
+    // whose `cycle_index` matches it. The auto-blocker is per-cycle: the
+    // attempts the user must triage are the ones from THIS cycle, not
+    // anything left over from a prior "Retry from scratch".
+    let current_cycle: i32 = conn
+        .query_row(
+            "SELECT current_cycle_index FROM steps WHERE id = ?1",
+            rusqlite::params![step_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let all_logs = storage::list_execution_logs_for_step(conn, step_id).unwrap_or_default();
+    let mut cycle_logs: Vec<_> = all_logs
+        .into_iter()
+        .filter(|l| l.cycle_index == current_cycle)
+        .collect();
+    // `list_execution_logs_for_step` already orders by id ASC. Take the
+    // last 3 chronologically.
+    let n_logs = cycle_logs.len();
+    let take_from = n_logs.saturating_sub(3);
+    let last_logs: Vec<_> = cycle_logs.drain(take_from..).collect();
+    let shown = last_logs.len().max(1);
+    let per_attempt_cap = RETRY_EXHAUSTED_BODY_MAX_BYTES.saturating_sub(HEADER_RESERVE) / shown;
+
+    let preamble = match failure_reason {
+        FailureReason::TestFailed => format!("Step failed after {max_attempts} attempts.\n"),
+        FailureReason::CommitFailed => format!(
+            "Step failed after {max_attempts} attempts (last attempt's commit hooks rejected the change).\n",
+        ),
+        _ => format!("Step failed after {max_attempts} attempts.\n"),
+    };
+    let mut sections: Vec<String> = Vec::new();
+
+    if last_logs.is_empty() {
+        // Fall-back when no logs are persisted yet (defensive: the failing
+        // attempt's row was updated just above, so this branch is unlikely).
+        let body = failure_output.test_results.join("\n");
+        sections.push(format!(
+            "### Attempt {max_attempts} (final)\n{}",
+            truncate_tail_bytes(&body, per_attempt_cap),
+        ));
+    } else {
+        // Render newest first. `last_logs` is oldest→newest; reverse it.
+        for (i, log) in last_logs.iter().enumerate().rev() {
+            let suffix = if i == last_logs.len() - 1 {
+                " (final)"
+            } else {
+                ""
+            };
+            // For the final attempt prefer the live `failure_output.test_results`
+            // if the persisted row's `test_results` is empty — that can happen
+            // when the row's update transaction is still in flight in some
+            // edge cases (the surrounding `update_execution_log` above runs
+            // first, so this is belt-and-braces).
+            let raw = if i == last_logs.len() - 1 && log.test_results.is_empty() {
+                failure_output.test_results.join("\n")
+            } else {
+                log.test_results.join("\n")
+            };
+            let trimmed = truncate_tail_bytes(&raw, per_attempt_cap);
+            sections.push(format!("### Attempt {}{suffix}\n{trimmed}", log.attempt));
+        }
+    }
+
+    let mut body = preamble;
+    body.push('\n');
+    body.push_str(&sections.join("\n\n"));
+    // Final hard cap — even after per-attempt slicing the section count and
+    // per-section overhead could in theory push us over; tail-truncate.
+    truncate_tail_bytes(&body, RETRY_EXHAUSTED_BODY_MAX_BYTES)
+}
+
 // ---------------------------------------------------------------------------
 // StepResult
 // ---------------------------------------------------------------------------
@@ -1075,30 +1182,28 @@ async fn raise_retry_exhausted_blocker(
         Some(test_st),
     )?;
 
-    // Build the blocker body. The `test_results` slice is the canonical
-    // per-attempt failure summary the user already sees in `ralph log`; it
-    // includes the test output AND, for the commit-fail path, the hook
-    // stderr (Phase A concatenated the hook output into the same
-    // string via the `[Tests passed but commit hook rejected]` /
-    // `[Commit hook output]` headers — see the retry branch around
-    // line 2009 — so we deliberately surface that single combined string
-    // here instead of plumbing a parallel "hook output" channel through).
-    let failure_text = failure_output.test_results.join("\n");
-    let raw_body = match failure_reason {
-        FailureReason::TestFailed => format!(
-            "Step failed after {} attempts.\n\nLast attempt test output:\n{}",
-            ctx.max_attempts, failure_text,
-        ),
-        FailureReason::CommitFailed => format!(
-            "Step failed after {} attempts (last attempt's commit hooks rejected the change).\n\n{}",
-            ctx.max_attempts, failure_text,
-        ),
-        _ => format!(
-            "Step failed after {} attempts.\n\n{}",
-            ctx.max_attempts, failure_text,
-        ),
-    };
-    let body = truncate_tail_bytes(&raw_body, RETRY_EXHAUSTED_BODY_MAX_BYTES);
+    // Phase E Fix 5: build the blocker body from the last 3 attempts in the
+    // CURRENT cycle (V33). Each attempt's section is independently bounded
+    // so the total stays under `RETRY_EXHAUSTED_BODY_MAX_BYTES` even when
+    // every attempt's output is huge. The final attempt's output is
+    // labeled "(final)" and rendered first so the most relevant context
+    // (the one the user is about to triage) is on top.
+    //
+    // The current attempt's diagnostic (`failure_output.test_results`) was
+    // captured live in this stack frame and is not yet persisted via
+    // `update_execution_log` (that happens above this call site does fire
+    // it but on the row at `exec_log_id`); we still prefer the *persisted*
+    // rows for the body so the final attempt's `harness_stderr` (the
+    // commit-hook stderr captured by the executor) is included verbatim.
+    // The persisted row for this attempt was updated just above; reading
+    // the chronological tail gives us the canonical view.
+    let body = build_retry_exhausted_body(
+        ctx.conn,
+        &ctx.step.id,
+        ctx.max_attempts,
+        failure_reason,
+        failure_output,
+    );
 
     // Insert + park atomically. A scheduler tick observing
     // (status=Pending, no open interruption) would immediately re-pick the
@@ -1116,7 +1221,7 @@ async fn raise_retry_exhausted_blocker(
             priority: 2,
         },
     ];
-    storage::insert_interruption(
+    let interruption_id = storage::insert_interruption(
         &tx,
         &ctx.step.id,
         attempt,
@@ -1127,12 +1232,28 @@ async fn raise_retry_exhausted_blocker(
     storage::update_step_status(&tx, &ctx.step.id, StepStatus::Pending)?;
     tx.commit()?;
 
-    // Post-step hook: route through the same "paused" label the
-    // `finalize_paused_for_question` path uses so hook authors see exactly
-    // one logical "branch is now blocked, human turn" signal. Hook authors
-    // who want to distinguish the two paths can read `RALPH_STEP_ID` and
-    // query the open interruption — this is the same shape every other
-    // interruption surfaces through.
+    // Phase E Fix 4: emit `InterruptionRaised` with `auto_raised=true` for
+    // the executor's retry-exhausted auto-blocker. Surfaces post-commit so
+    // an NDJSON consumer never sees a "raised" event for a row that lost
+    // a race with another writer (the transaction above either fully
+    // committed or fully rolled back; we only emit on the success leg).
+    crate::output::emit_interruption_raised(
+        ctx.conn,
+        ctx.json_output,
+        &interruption_id,
+        &ctx.step.id,
+        InterruptionKind::Blocker.as_str(),
+        true,
+        attempt,
+    );
+
+    // Post-step hook: use a dedicated `retry_exhausted` label so hooks can
+    // distinguish the executor-raised auto-blocker from the harness-raised
+    // interruption path (`finalize_paused_for_question` still fires
+    // `"paused"`). Both paths park the branch awaiting a human, but only
+    // this one means "burned the full retry budget" — which a hook author
+    // might want to surface differently (e.g. paging on retry-exhaustion
+    // but only counting harness-side pauses).
     write_phase(
         ctx.conn,
         ctx.plan,
@@ -1152,7 +1273,7 @@ async fn raise_retry_exhausted_blocker(
         ctx.plan,
         ctx.step,
         attempt,
-        "paused",
+        "retry_exhausted",
         ctx.workdir,
     )
     .await?;
@@ -1782,46 +1903,32 @@ pub async fn execute_step(
                         .await;
                     }
 
-                    // Retry path. Whether we revert the tree depends on the
-                    // step's retry strategy (Step 22):
-                    //  - `Rollback`: revert partial changes before the retry
-                    //    (today's behavior, now opt-in).
-                    //  - `Keep`: leave the dirty tree so the next attempt
-                    //    builds on it. EDGE CASE: if the crashed harness had
-                    //    already committed (agent_committed_clean), leaving
-                    //    that commit in HEAD would orphan it AND let the
-                    //    eventual success path add a *second* step commit on
-                    //    top. Mixed-reset back to the pre-attempt HEAD so the
-                    //    work survives as uncommitted changes (Keep's
-                    //    contract) with no orphan commit — see the detailed
-                    //    rationale on the test-failed retry branch below.
-                    let rolled_back = match retry_strategy {
-                        RetryStrategy::Rollback => {
-                            if has_changes {
-                                write_phase(
-                                    conn,
-                                    plan,
-                                    &step.id,
-                                    step_num,
-                                    attempt,
-                                    max_attempts,
-                                    Some(exec_log.id),
-                                    Phase::Rollback,
-                                    None,
-                                    ChildUpdate::Clear,
-                                    exec_opts.json_output,
-                                )?;
-                                git::rollback_except(workdir, &pre_existing_untracked)?;
-                            }
-                            has_changes
-                        }
-                        RetryStrategy::Keep => {
-                            if agent_committed_clean && let Some(before) = &head_before_harness {
-                                git::reset_mixed_to(workdir, before)?;
-                            }
-                            false
-                        }
-                    };
+                    // Retry path. `RetryStrategy` is vestigial post
+                    // test-then-commit: even a crashing harness leaves its
+                    // partial work on disk for the next attempt to build on.
+                    //
+                    // The one special case that still needs repair is an
+                    // agent that committed on its own before crashing:
+                    // mixed-reset back to the pre-attempt HEAD so the work
+                    // survives as uncommitted changes instead of becoming an
+                    // orphan commit.
+                    if agent_committed_clean && let Some(before) = &head_before_harness {
+                        write_phase(
+                            conn,
+                            plan,
+                            &step.id,
+                            step_num,
+                            attempt,
+                            max_attempts,
+                            Some(exec_log.id),
+                            Phase::Rollback,
+                            None,
+                            ChildUpdate::Clear,
+                            exec_opts.json_output,
+                        )?;
+                        git::reset_mixed_to(workdir, before)?;
+                    }
+                    let rolled_back = false;
                     storage::update_execution_log(
                         conn,
                         exec_log.id,
@@ -3230,12 +3337,13 @@ fn resolve_agent_file(step: &Step, plan: &Plan) -> Option<PathBuf> {
 }
 
 /// Set the attempt count for a step to an absolute value.
+///
+/// Delegates to [`storage::set_step_attempts`] so the V33 cycle-index bump
+/// (on attempts: > 0 → 0 transitions) is centralized in one place. The
+/// executor-side wrapper is kept only for backwards-compatible call sites
+/// inside the hot loop.
 fn set_step_attempts(conn: &Connection, step_id: &str, attempts: i32) -> Result<()> {
-    conn.execute(
-        "UPDATE steps SET attempts = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        rusqlite::params![attempts, step_id],
-    ).context("Failed to update step attempts")?;
-    Ok(())
+    storage::set_step_attempts(conn, step_id, attempts)
 }
 
 /// Finalize an attempt that was cancelled *before* the harness ran (the
@@ -8107,8 +8215,7 @@ mod tests {
     // ---- non-zero harness exit must not false-green -----------------------
 
     /// Build a harness shell script that exits with the given code. Optionally
-    /// writes a file inside `workdir` first to produce a dirty tree, so the
-    /// rollback path can be exercised even on a crashing harness.
+    /// writes a file inside `workdir` first to produce a dirty tree.
     #[cfg(test)]
     fn write_exit_harness(
         outside_dir: &std::path::Path,
@@ -8213,6 +8320,141 @@ mod tests {
             "tests must not run when the harness crashes",
         );
         assert!(!logs[0].committed, "no commit on a crashed harness");
+    }
+
+    /// Phase A: `RetryStrategy` is vestigial for harness failures too. A
+    /// crashing harness that leaves partial work on disk must let the next
+    /// attempt build on it even when the step still says `rollback`.
+    ///
+    /// Attempt 1 appends one line then exits 1; attempt 2 appends the second
+    /// line and exits 0 only if attempt 1's work survived. If the old rollback
+    /// branch regresses, this never reaches success.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_harness_failure_rollback_strategy_now_vestigial_preserves_dirty_tree() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("append-then-exit.sh");
+        let script = format!(
+            "#!/bin/sh\n\
+             echo line >> {0}/acc.txt\n\
+             if [ \"$(wc -l < {0}/acc.txt)\" -ge 2 ]; then\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n",
+            dir.to_string_lossy()
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (mut step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        step.retry_strategy = Some(RetryStrategy::Rollback);
+        assert_eq!(
+            step.effective_retry_strategy(&plan),
+            RetryStrategy::Rollback
+        );
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Success);
+        assert!(
+            result.commit_hash.is_some(),
+            "the second attempt should succeed by building on the first attempt's dirty tree"
+        );
+
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 2, "one failed attempt, then one success");
+        assert_eq!(
+            logs[0].termination_reason,
+            Some(TerminationReason::HarnessFailed)
+        );
+        assert!(
+            !logs[0].rolled_back,
+            "rollback strategy is now vestigial here"
+        );
+        assert_eq!(logs[1].termination_reason, Some(TerminationReason::Success));
+        assert_eq!(
+            fs::read_to_string(dir.join("acc.txt"))
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+            "the second attempt must see attempt 1's line still on disk"
+        );
     }
 
     /// Optional policy + harness exits non-zero + no changes + no tests →
@@ -9802,6 +10044,20 @@ mod tests {
             "body must mention the concrete attempt count {max_attempts}; got:\n{}",
             blocker.body,
         );
+        // Phase E Fix 5: body carries per-attempt sections. With max_attempts
+        // = 2 there are exactly 2 attempts in the cycle, both with the same
+        // test-failure output → both sections must appear, the final one
+        // marked `(final)`.
+        assert!(
+            blocker.body.contains("### Attempt 2 (final)"),
+            "body must label the final attempt; got:\n{}",
+            blocker.body,
+        );
+        assert!(
+            blocker.body.contains("### Attempt 1"),
+            "body must include the prior attempt's section; got:\n{}",
+            blocker.body,
+        );
 
         // Step is parked as Pending (the derived overlay shadows it with
         // Blocked at presentation time).
@@ -10158,6 +10414,270 @@ mod tests {
         assert!(
             open.is_empty(),
             "no interruption is raised on NoChanges exhaustion: {open:?}",
+        );
+    }
+
+    // -- Phase E follow-ups ------------------------------------------------
+
+    /// Phase E Fix 1: the executor's retry-exhausted auto-blocker must fire
+    /// the post-step hook with the **dedicated** `retry_exhausted` label, NOT
+    /// the reused `paused` label the harness-raised-interruption path uses.
+    /// This is what lets a hook author tell "branch is parked because the
+    /// human asked a question" from "branch is parked because every retry
+    /// burned" without round-tripping through the DB.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_test_fail_exhaustion_fires_retry_exhausted_hook_label() {
+        use crate::config::HarnessConfig;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        // Harness writes one line per attempt; the test demands 99 lines so
+        // every attempt fails ⇒ retry exhaustion ⇒ auto-blocker ⇒
+        // post-step hook with the new label.
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("append.sh");
+        fs::write(
+            &harness_path,
+            format!(
+                "#!/bin/sh\necho line >> {}/acc.txt\nexit 0\n",
+                dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 99",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "poly".to_string(),
+            HarnessConfig {
+                command: harness_path.to_string_lossy().into_owned(),
+                args: vec![],
+                plan_args: vec![],
+                supports_agent_file: false,
+                supports_json_output: false,
+                json_output_args: vec![],
+                agent_file_env: None,
+                agent_file_args: vec![],
+                model_args: vec![],
+                default_model: None,
+                auth_env_vars: vec![],
+                auth_probe_args: vec![],
+                prompt_input: crate::config::PromptInputMode::Stdin,
+                argv_overflow: crate::config::ArgvOverflowBehavior::SpillToTempFile,
+                color: None,
+            },
+        );
+
+        // Capture the hook's RALPH_STEP_STATUS via a hermetic post-step hook
+        // that writes the label to a marker file. Attach via the storage API
+        // exactly as a real run would.
+        let marker = tmp.path().join("hook-status.txt");
+        let hook_dir = tmp.path().join("hooks-bin");
+        fs::create_dir_all(&hook_dir).unwrap();
+        let _ = hook_dir; // kept for clarity; hooks are wired by name + lifecycle
+        let hook_lib = crate::hook_library::Hook {
+            name: "capture-status".to_string(),
+            description: String::new(),
+            lifecycle: crate::hook_library::Lifecycle::PostStep,
+            scope: crate::hook_library::Scope::Global,
+            command: format!("echo $RALPH_STEP_STATUS > {}", marker.display()),
+        };
+        storage::attach_hook_to_step(&conn, &plan.id, &step.id, "post-step", &hook_lib.name)
+            .unwrap();
+        let hook_ctx = crate::hooks::HookContext {
+            applicable: vec![hook_lib],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // Sanity-check the auto-blocker path actually fired.
+        assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
+        // The hook captured the **new** label.
+        let captured = fs::read_to_string(&marker).expect("hook ran and wrote status");
+        assert_eq!(
+            captured.trim(),
+            "retry_exhausted",
+            "retry-exhaustion path must use the dedicated `retry_exhausted` \
+             hook label, not the reused `paused` one",
+        );
+    }
+
+    /// Phase E Fix 5: when each attempt's persisted `test_results` is large,
+    /// the auto-blocker body still fits within the 8 KiB cap. The body is
+    /// built straight from a synthetic DB (no harness needed) so we exercise
+    /// `build_retry_exhausted_body` in isolation under adversarial input.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_auto_blocker_body_truncates_when_attempts_exceed_cap() {
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "big-out",
+            "/proj-big",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // 4 attempts in cycle 0, each with a >4KiB test_results blob.
+        let big = "x".repeat(4096);
+        for attempt in 1..=4_i32 {
+            let log = storage::create_execution_log(
+                &conn,
+                &step.id,
+                attempt,
+                Some(&format!("attempt {attempt} prompt")),
+                None,
+            )
+            .unwrap();
+            storage::update_execution_log(
+                &conn,
+                log.id,
+                Some(0.1),
+                None,
+                &[format!("attempt-{attempt}-FAIL:\n{big}")],
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(crate::plan::TerminationReason::TestFailed),
+                Some(crate::plan::TestStatus::Failed),
+            )
+            .unwrap();
+        }
+
+        let dummy_parsed = ParsedHarnessOutput::default();
+        let live = vec!["attempt-4-FAIL: live".to_string()];
+        let failure_output = FailureOutput {
+            test_results: &live,
+            diff: None,
+            stdout: "",
+            stderr: "",
+            parsed: &dummy_parsed,
+            has_changes: false,
+        };
+        let body = build_retry_exhausted_body(
+            &conn,
+            &step.id,
+            4,
+            FailureReason::TestFailed,
+            &failure_output,
+        );
+
+        assert!(
+            body.len() <= RETRY_EXHAUSTED_BODY_MAX_BYTES,
+            "body must be capped at 8 KiB; got {} bytes",
+            body.len(),
+        );
+        // Only the last 3 attempts are surfaced (oldest dropped).
+        assert!(
+            body.contains("### Attempt 4 (final)"),
+            "must include the final attempt header; got:\n{body}",
+        );
+        assert!(body.contains("### Attempt 3"));
+        assert!(body.contains("### Attempt 2"));
+        assert!(
+            !body.contains("### Attempt 1"),
+            "Attempt 1 must be dropped (only the last 3 are kept); got:\n{body}",
+        );
+        // Final attempt's heading appears BEFORE the older ones (final-first).
+        let final_pos = body.find("### Attempt 4 (final)").unwrap();
+        let older_pos = body.find("### Attempt 3").unwrap();
+        assert!(
+            final_pos < older_pos,
+            "final attempt must be rendered first; got:\n{body}",
         );
     }
 }

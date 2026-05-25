@@ -41,6 +41,8 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v29,
     migrate_v30,
     migrate_v31,
+    migrate_v32,
+    migrate_v33,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -220,8 +222,7 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
             cost_usd REAL,
             input_tokens INTEGER,
             output_tokens INTEGER,
-            session_id TEXT,
-            UNIQUE(step_id, attempt)
+            session_id TEXT
         );
 
         CREATE INDEX idx_logs_step_id ON execution_logs(step_id);
@@ -1268,6 +1269,91 @@ fn migrate_v31(conn: &Connection) -> Result<()> {
         BEGIN
             SELECT RAISE(ABORT, 'step dependencies must stay within one plan');
         END;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V32: allow duplicate logical attempt numbers in execution_logs
+// ---------------------------------------------------------------------------
+
+fn migrate_v32(conn: &Connection) -> Result<()> {
+    // Retry-from-scratch on the retry-exhausted blocker resets
+    // `steps.attempts` to 0 but keeps the historical `execution_logs` rows
+    // as the per-step audit trail. The old `UNIQUE(step_id, attempt)`
+    // constraint made that impossible: the next logical attempt=1 row would
+    // fail to insert. Rebuild the table without the uniqueness constraint,
+    // preserving every row and its id chronology.
+    conn.execute_batch(
+        "
+        CREATE TABLE execution_logs_v32 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            step_id TEXT NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+            attempt INTEGER NOT NULL,
+            started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            duration_secs REAL,
+            prompt_text TEXT,
+            diff TEXT,
+            test_results TEXT NOT NULL DEFAULT '[]',
+            rolled_back INTEGER NOT NULL DEFAULT 0,
+            committed INTEGER NOT NULL DEFAULT 0,
+            commit_hash TEXT,
+            harness_stdout TEXT,
+            harness_stderr TEXT,
+            cost_usd REAL,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            session_id TEXT,
+            termination_reason TEXT,
+            test_status TEXT
+        );
+
+        INSERT INTO execution_logs_v32 (
+            id, step_id, attempt, started_at, duration_secs, prompt_text, diff,
+            test_results, rolled_back, committed, commit_hash, harness_stdout,
+            harness_stderr, cost_usd, input_tokens, output_tokens, session_id,
+            termination_reason, test_status
+        )
+        SELECT
+            id, step_id, attempt, started_at, duration_secs, prompt_text, diff,
+            test_results, rolled_back, committed, commit_hash, harness_stdout,
+            harness_stderr, cost_usd, input_tokens, output_tokens, session_id,
+            termination_reason, test_status
+        FROM execution_logs
+        ORDER BY id;
+
+        DROP TABLE execution_logs;
+        ALTER TABLE execution_logs_v32 RENAME TO execution_logs;
+        CREATE INDEX idx_logs_step_id ON execution_logs(step_id);
+        CREATE INDEX idx_logs_step_attempt ON execution_logs(step_id, attempt);
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V33: per-step cycle_index for grouping retry-from-scratch cycles
+// ---------------------------------------------------------------------------
+
+fn migrate_v33(conn: &Connection) -> Result<()> {
+    // The auto-blocker "Retry the step from scratch" resolver zeroes
+    // `steps.attempts` while keeping the prior cycle's `execution_logs` rows
+    // (V32 removed the UNIQUE constraint blocking that). After a reset the
+    // next attempt is a *new* cycle — same logical attempt numbers (1, 2, …)
+    // running over again. `current_cycle_index` is the step's "current cycle
+    // pointer" (bumped every time `set_step_attempts(0)` follows a non-zero
+    // value) and `execution_logs.cycle_index` is the value the log was
+    // created at, so per-cycle grouping in `ralph log` and the
+    // rendered-prompt picker is a simple GROUP BY without any new joins.
+    //
+    // Both columns default to 0 so backfill is automatic: every existing
+    // execution_log was part of cycle 0, every existing step is currently
+    // at cycle 0.
+    conn.execute_batch(
+        "
+        ALTER TABLE steps ADD COLUMN current_cycle_index INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE execution_logs ADD COLUMN cycle_index INTEGER NOT NULL DEFAULT 0;
         ",
     )?;
     Ok(())
@@ -3803,6 +3889,212 @@ mod tests {
                 .contains("step dependencies must stay within one plan"),
             "unexpected update-trigger error: {err}"
         );
+    }
+
+    #[test]
+    fn test_migration_v32_allows_duplicate_log_attempts_per_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v31.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v31 only so the old UNIQUE(step_id, attempt)
+        // schema is present before V32 rebuilds the table.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(31) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, prompt_text) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["s1", 1_i64, "first cycle"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open_at(&path).unwrap();
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, prompt_text) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["s1", 1_i64, "second cycle"],
+        )
+        .unwrap();
+
+        let prompts: Vec<String> = conn
+            .prepare("SELECT prompt_text FROM execution_logs WHERE step_id = ?1 ORDER BY id ASC")
+            .unwrap()
+            .query_map(["s1"], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            prompts,
+            vec!["first cycle".to_string(), "second cycle".to_string()]
+        );
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v32_runs_clean_on_fresh_db() {
+        let conn = open_memory().expect("open_memory");
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, prompt_text) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["s1", 1_i64, "first cycle"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, prompt_text) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["s1", 1_i64, "second cycle"],
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM execution_logs WHERE step_id = ?1 AND attempt = ?2",
+                rusqlite::params!["s1", 1_i64],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 2,
+            "fresh DB must allow duplicate logical attempts per step"
+        );
+    }
+
+    #[test]
+    fn test_migration_v33_adds_cycle_index_column() {
+        // Stage to V32, seed legacy rows, then apply V33 and assert the
+        // new columns exist with the expected defaults.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v32.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(32) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, prompt_text) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["s1", 1_i64, "pre-v33"],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Open via the migration runner — V33 runs and backfills.
+        let conn = open_at(&path).unwrap();
+
+        let step_cycle: i64 = conn
+            .query_row(
+                "SELECT current_cycle_index FROM steps WHERE id = ?1",
+                ["s1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            step_cycle, 0,
+            "pre-V33 step rows must backfill current_cycle_index = 0"
+        );
+
+        let log_cycle: i64 = conn
+            .query_row(
+                "SELECT cycle_index FROM execution_logs WHERE step_id = ?1",
+                ["s1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            log_cycle, 0,
+            "pre-V33 log rows must backfill cycle_index = 0"
+        );
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v33_runs_clean_on_fresh_db() {
+        let conn = open_memory().expect("open_memory");
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "slug", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+
+        // Both columns must exist with NOT NULL DEFAULT 0 — these inserts
+        // omit them and still succeed.
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, prompt_text) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["s1", 1_i64, "x"],
+        )
+        .unwrap();
+
+        let step_cycle: i64 = conn
+            .query_row(
+                "SELECT current_cycle_index FROM steps WHERE id = ?1",
+                ["s1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(step_cycle, 0);
+
+        let log_cycle: i64 = conn
+            .query_row(
+                "SELECT cycle_index FROM execution_logs WHERE step_id = ?1",
+                ["s1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(log_cycle, 0);
     }
 
     #[test]

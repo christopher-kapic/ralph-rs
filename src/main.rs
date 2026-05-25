@@ -687,7 +687,7 @@ fn main() -> Result<()> {
                     }
                 };
 
-                match record_question_ask(&conn, &project, &q, &suggest, &priority)? {
+                match record_question_ask(&conn, &project, &q, &suggest, &priority, &out)? {
                     QuestionAskOutcome::NoActiveRun => {
                         eprintln!("{NO_ACTIVE_RUN_MESSAGE}");
                         std::process::exit(1);
@@ -719,7 +719,7 @@ fn main() -> Result<()> {
                 }
             };
 
-            match record_block(&conn, &project, &body)? {
+            match record_block(&conn, &project, &body, &out)? {
                 QuestionAskOutcome::NoActiveRun => {
                     eprintln!("{NO_ACTIVE_RUN_MESSAGE}");
                     std::process::exit(1);

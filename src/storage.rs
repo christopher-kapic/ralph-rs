@@ -20,7 +20,7 @@ use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 /// can index by column position. Kept as a single shared constant so adding a
 /// new column (V13+ tags etc.) only requires editing one place instead of the
 /// dozen scattered SELECTs.
-const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy, short_id, review_enabled, review_status, corrects_step_id";
+const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy, short_id, review_enabled, review_status, corrects_step_id, current_cycle_index";
 
 // ---------------------------------------------------------------------------
 // Plan operations
@@ -1717,9 +1717,26 @@ pub fn update_step_status(conn: &Connection, step_id: &str, status: StepStatus) 
 /// without going through the executor's private function (kept private so
 /// the executor stays the only writer on the hot-loop path).
 pub fn set_step_attempts(conn: &Connection, step_id: &str, attempts: i32) -> Result<()> {
+    // V33 cycle bump: when the new value is 0 AND the prior value was > 0,
+    // we've just reset a step that had real attempts — the "Retry from
+    // scratch" auto-blocker resolver is the canonical example. That's a
+    // new logical cycle (the prior `execution_logs` rows stay as audit
+    // history; future per-iteration commits / logs created after this
+    // reset will pick up the bumped pointer via `create_execution_log`).
+    //
+    // The bump is folded into the same `UPDATE` so the read-and-write is
+    // atomic — a concurrent reader can never observe `(attempts = 0,
+    // current_cycle_index = old)` between the two writes.
     let affected = conn
         .execute(
-            "UPDATE steps SET attempts = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            "UPDATE steps \
+             SET attempts = ?1, \
+                 current_cycle_index = CASE \
+                    WHEN ?1 = 0 AND attempts > 0 THEN current_cycle_index + 1 \
+                    ELSE current_cycle_index \
+                 END, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?2",
             params![attempts, step_id],
         )
         .with_context(|| format!("Failed to update step attempts for {step_id}"))?;
@@ -2055,10 +2072,9 @@ pub fn set_step_short_id(conn: &Connection, step_id: &str, short_id: &str) -> Re
 
 /// Reset a step's status to pending and zero out attempts.
 ///
-/// Also deletes the step's `execution_logs` rows — otherwise the zeroed
-/// attempt counter collides with the `UNIQUE(step_id, attempt)` constraint
-/// when the executor tries to create a fresh attempt=1 log on the next run
-/// (e.g. via `ralph resume` on an in-progress step).
+/// Also deletes the step's `execution_logs` rows: `step reset` is a
+/// destructive restart that intentionally drops the old per-attempt history
+/// and prompt context before re-queueing the step from a clean slate.
 pub fn reset_step(conn: &Connection, step_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM execution_logs WHERE step_id = ?1",
@@ -2181,9 +2197,16 @@ pub fn create_execution_log(
     prompt_text: Option<&str>,
     session_id: Option<&str>,
 ) -> Result<ExecutionLog> {
+    // V33: copy the step's `current_cycle_index` onto the new log row so
+    // each log records which retry-from-scratch cycle it belonged to.
+    // A subquery (rather than a Rust-side read+insert) keeps the cycle
+    // pointer and the row creation in a single SQL statement — no TOCTOU
+    // window if a concurrent `set_step_attempts(0)` bumps the cycle
+    // between two statements. Defaults to 0 when the step row is missing
+    // (the next INSERT will fail on the FK anyway, so this is benign).
     conn.execute(
-        "INSERT INTO execution_logs (step_id, attempt, prompt_text, session_id)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO execution_logs (step_id, attempt, prompt_text, session_id, cycle_index)
+         VALUES (?1, ?2, ?3, ?4, COALESCE((SELECT current_cycle_index FROM steps WHERE id = ?1), 0))",
         params![step_id, attempt, prompt_text, session_id],
     )
     .with_context(|| {
@@ -2199,9 +2222,8 @@ pub fn create_execution_log(
 /// Used by the executor's TUI-skip *cancel* path (step 18): the retry loop
 /// creates the `execution_logs` row (with the prompt) *before* spawning the
 /// harness, so a cancelled attempt must delete that row to honor the
-/// guarantee that a cancelled attempt leaves no `UNIQUE(step_id, attempt)`
-/// row behind and consumes no retry budget. Idempotent — deleting a missing
-/// id is a no-op.
+/// guarantee that a cancelled attempt leaves no stray audit row behind and
+/// consumes no retry budget. Idempotent — deleting a missing id is a no-op.
 pub fn delete_execution_log(conn: &Connection, log_id: i64) -> Result<()> {
     conn.execute("DELETE FROM execution_logs WHERE id = ?1", params![log_id])
         .with_context(|| format!("Failed to delete execution log {log_id}"))?;
@@ -2216,8 +2238,8 @@ pub fn delete_execution_log(conn: &Connection, log_id: i64) -> Result<()> {
 #[allow(dead_code)]
 pub fn get_latest_log_for_step(conn: &Connection, step_id: &str) -> Result<Option<ExecutionLog>> {
     let mut stmt = conn.prepare(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status
-         FROM execution_logs WHERE step_id = ?1 ORDER BY attempt DESC LIMIT 1",
+        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status, cycle_index
+         FROM execution_logs WHERE step_id = ?1 ORDER BY id DESC LIMIT 1",
     )?;
 
     let mut rows = stmt.query_map(params![step_id], ExecutionLog::from_row)?;
@@ -2314,11 +2336,11 @@ pub fn update_execution_log(
     Ok(())
 }
 
-/// List execution logs for a step, ordered by attempt.
+/// List execution logs for a step, ordered chronologically by row creation.
 pub fn list_execution_logs_for_step(conn: &Connection, step_id: &str) -> Result<Vec<ExecutionLog>> {
     let mut stmt = conn.prepare(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status
-         FROM execution_logs WHERE step_id = ?1 ORDER BY attempt ASC",
+        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status, cycle_index
+         FROM execution_logs WHERE step_id = ?1 ORDER BY id ASC",
     )?;
 
     let rows = stmt.query_map(params![step_id], ExecutionLog::from_row)?;
@@ -2350,7 +2372,7 @@ pub fn list_execution_logs_for_plan(
                 el.prompt_text, el.diff, el.test_results, el.rolled_back, el.committed,
                 el.commit_hash, el.harness_stdout, el.harness_stderr, el.cost_usd,
                 el.input_tokens, el.output_tokens, el.session_id,
-                el.termination_reason, el.test_status
+                el.termination_reason, el.test_status, el.cycle_index
          FROM execution_logs el
          JOIN steps s ON s.id = el.step_id
          WHERE s.plan_id = ?1
@@ -2383,6 +2405,7 @@ pub fn list_execution_logs_for_plan(
             })?),
             None => None,
         };
+        let cycle_index: i32 = row.get(20)?;
         let log = ExecutionLog {
             id: row.get(1)?,
             step_id: row.get(2)?,
@@ -2427,6 +2450,7 @@ pub fn list_execution_logs_for_plan(
             session_id: row.get(17)?,
             termination_reason,
             test_status,
+            cycle_index,
         };
         Ok((step_title, log))
     })?;
@@ -2441,7 +2465,7 @@ pub fn list_execution_logs_for_plan(
 /// Fetch an execution log by its primary key.
 pub(crate) fn get_execution_log_by_id(conn: &Connection, id: i64) -> Result<ExecutionLog> {
     conn.query_row(
-        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status
+        "SELECT id, step_id, attempt, started_at, duration_secs, prompt_text, diff, test_results, rolled_back, committed, commit_hash, harness_stdout, harness_stderr, cost_usd, input_tokens, output_tokens, session_id, termination_reason, test_status, cycle_index
          FROM execution_logs WHERE id = ?1",
         params![id],
         ExecutionLog::from_row,
@@ -7286,6 +7310,73 @@ mod tests {
 
         let err = set_step_attempts(&conn, "no-such-step", 1).unwrap_err();
         assert!(err.to_string().contains("Step not found"), "got: {err}");
+    }
+
+    #[test]
+    fn test_set_step_attempts_zero_after_nonzero_bumps_cycle_index() {
+        // V33: a 0 → bump transition only fires when the prior value was
+        // >0. Setting 0 from 0 must NOT bump (idempotent re-zero); setting
+        // 0 from 3 MUST bump; setting any non-zero value must NOT bump.
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let read_cycle = |sid: &str| -> i32 {
+            conn.query_row(
+                "SELECT current_cycle_index FROM steps WHERE id = ?1",
+                params![sid],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(read_cycle(&step_id), 0, "fresh step starts at cycle 0");
+
+        // 0 → 0 is a no-op (no prior attempts to "reset away" from).
+        set_step_attempts(&conn, &step_id, 0).unwrap();
+        assert_eq!(read_cycle(&step_id), 0, "0 from 0 must not bump cycle");
+
+        // Bump attempts up, then any further non-zero set must not change
+        // the cycle.
+        set_step_attempts(&conn, &step_id, 3).unwrap();
+        assert_eq!(read_cycle(&step_id), 0, "non-zero set never bumps cycle");
+        set_step_attempts(&conn, &step_id, 5).unwrap();
+        assert_eq!(read_cycle(&step_id), 0);
+
+        // Now the actual reset path: 5 → 0 bumps to cycle 1.
+        set_step_attempts(&conn, &step_id, 0).unwrap();
+        assert_eq!(
+            read_cycle(&step_id),
+            1,
+            "0 after >0 must bump the cycle pointer",
+        );
+
+        // A second cycle: bump again, then reset, expect cycle 2.
+        set_step_attempts(&conn, &step_id, 2).unwrap();
+        set_step_attempts(&conn, &step_id, 0).unwrap();
+        assert_eq!(read_cycle(&step_id), 2);
+    }
+
+    #[test]
+    fn test_create_execution_log_copies_current_cycle_index() {
+        // V33: the new log row carries whatever cycle the step is at.
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let l1 = create_execution_log(&conn, &step_id, 1, None, None).unwrap();
+        assert_eq!(l1.cycle_index, 0, "first log lands in cycle 0");
+
+        // Drive the auto-blocker "retry from scratch" path: bump then reset.
+        set_step_attempts(&conn, &step_id, 2).unwrap();
+        set_step_attempts(&conn, &step_id, 0).unwrap();
+
+        let l2 = create_execution_log(&conn, &step_id, 1, None, None).unwrap();
+        assert_eq!(l2.cycle_index, 1, "post-reset log lands in cycle 1");
+
+        // Older log unchanged.
+        let logs = list_execution_logs_for_step(&conn, &step_id).unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].cycle_index, 0);
+        assert_eq!(logs[1].cycle_index, 1);
     }
 
     #[test]
