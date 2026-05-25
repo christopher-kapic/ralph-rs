@@ -801,7 +801,7 @@ mod tests {
     /// Phase C: the Phase B auto-raised retry-exhausted blocker is a
     /// **Blocker kind with two ranked options** (Retry / Fail). The modal
     /// must open focused on Options (so Enter immediately accepts #1 =
-    /// "Retry the step from scratch") and the chosen resolution must be the
+    /// "Retry step with parked changes") and the chosen resolution must be the
     /// priority-1 option text — the exact string the Phase C resolution
     /// helper matches against to reset attempts. Guards the §12.4 default-
     /// option UX from regressing for the auto-blocker shape.
@@ -815,7 +815,7 @@ mod tests {
             body: "Step failed after 3 attempts.".to_string(),
             options: vec![
                 InterruptionOption {
-                    text: "Retry the step from scratch".to_string(),
+                    text: "Retry step with parked changes".to_string(),
                     priority: 1,
                 },
                 InterruptionOption {
@@ -849,7 +849,7 @@ mod tests {
             m.handle_key(key(KeyCode::Enter)),
             InterruptionModalAction::Resolve {
                 interruption_id: "ab1".to_string(),
-                resolution: "Retry the step from scratch".to_string(),
+                resolution: "Retry step with parked changes".to_string(),
                 comment: None,
             }
         );

@@ -43,6 +43,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v31,
     migrate_v32,
     migrate_v33,
+    migrate_v34,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -1279,7 +1280,7 @@ fn migrate_v31(conn: &Connection) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn migrate_v32(conn: &Connection) -> Result<()> {
-    // Retry-from-scratch on the retry-exhausted blocker resets
+    // Retry-with-parked-changes on the retry-exhausted blocker resets
     // `steps.attempts` to 0 but keeps the historical `execution_logs` rows
     // as the per-step audit trail. The old `UNIQUE(step_id, attempt)`
     // constraint made that impossible: the next logical attempt=1 row would
@@ -1337,7 +1338,7 @@ fn migrate_v32(conn: &Connection) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn migrate_v33(conn: &Connection) -> Result<()> {
-    // The auto-blocker "Retry the step from scratch" resolver zeroes
+    // The auto-blocker "Retry step with parked changes" resolver zeroes
     // `steps.attempts` while keeping the prior cycle's `execution_logs` rows
     // (V32 removed the UNIQUE constraint blocking that). After a reset the
     // next attempt is a *new* cycle — same logical attempt numbers (1, 2, …)
@@ -1354,6 +1355,35 @@ fn migrate_v33(conn: &Connection) -> Result<()> {
         "
         ALTER TABLE steps ADD COLUMN current_cycle_index INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE execution_logs ADD COLUMN cycle_index INTEGER NOT NULL DEFAULT 0;
+        ",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V34: parked step worktrees for interruption/resume
+// ---------------------------------------------------------------------------
+
+fn migrate_v34(conn: &Connection) -> Result<()> {
+    // When a step pauses for a human-side interruption (question/blocker or
+    // retry-exhaustion blocker), we now park its in-progress working tree in a
+    // git stash so the scheduler can move on cleanly (including across plan
+    // branch switches) without losing the agent's partial work. This table is
+    // the durable pointer from `steps.id` -> stash commit SHA plus the list of
+    // files that were staged at stash time, so the runner can re-apply the
+    // stash as unstaged WIP just before that step is re-run.
+    //
+    // Separate table rather than extra `steps` columns so the canonical step
+    // row shape stays stable (`STEP_COLUMNS` / `Step::from_row`), and because
+    // the parked-worktree state is sparse/ephemeral: most steps never use it.
+    conn.execute_batch(
+        "
+        CREATE TABLE step_parked_worktrees (
+            step_id TEXT PRIMARY KEY REFERENCES steps(id) ON DELETE CASCADE,
+            stash_sha TEXT NOT NULL,
+            staged_files TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );
         ",
     )?;
     Ok(())
@@ -1396,6 +1426,7 @@ mod tests {
         assert!(tables.contains(&"steps".to_string()));
         assert!(tables.contains(&"execution_logs".to_string()));
         assert!(tables.contains(&"run_locks".to_string()));
+        assert!(tables.contains(&"step_parked_worktrees".to_string()));
     }
 
     #[test]

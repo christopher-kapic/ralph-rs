@@ -980,7 +980,8 @@ pub fn step_reset(
         }
     }
 
-    storage::reset_step(conn, &step.id)?;
+    let parked = storage::reset_step(conn, &step.id)?;
+    crate::runner::discard_parked_worktree_state(workdir, parked)?;
     eprintln!(
         "{} Reset step #{} '{}' to pending (0 attempts)",
         output::check_icon(out.color),

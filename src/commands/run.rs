@@ -2955,7 +2955,8 @@ pub(crate) fn plan_detail_apply_skip(
     use std::time::Instant;
 
     match storage::mark_step_skipped(conn, step_id, None) {
-        Ok(()) => {
+        Ok(parked) => {
+            runner::discard_parked_worktree_state(Path::new(&app.plan.project), parked)?;
             let plan_id = app.plan.id.clone();
             app.refresh_steps(storage::list_steps(conn, &plan_id)?);
             app.toasts
@@ -3373,7 +3374,8 @@ pub(crate) fn plan_detail_apply_reset(
     use std::time::Instant;
 
     match storage::reset_step(conn, step_id) {
-        Ok(()) => {
+        Ok(parked) => {
+            runner::discard_parked_worktree_state(Path::new(&app.plan.project), parked)?;
             let plan_id = app.plan.id.clone();
             app.refresh_steps(storage::list_steps(conn, &plan_id)?);
             app.toasts
@@ -4551,6 +4553,7 @@ where
                 // Failed). No-op for normal interruptions.
                 crate::commands::interruption::apply_retry_exhausted_resolution(
                     conn,
+                    project,
                     &interruption_id,
                     &resolution,
                 )?;

@@ -3,6 +3,8 @@
 // primary path; this is the scriptable equivalent. All I/O is native against
 // the `interruptions` table (no `step_questions`).
 
+use std::path::Path;
+
 use anyhow::{Result, bail};
 use rusqlite::Connection;
 
@@ -27,7 +29,7 @@ use crate::storage::{self, OpenQuestion};
 /// Resolution-text matching uses the executor's `pub const` strings (so
 /// drift between writer and reader trips `cargo test --lib`, not production).
 /// A freeform resolution that matches neither option is treated as
-/// **Retry-from-scratch + hint**: `resolve_interruption` already persisted
+/// **Retry-with-parked-changes + hint**: `resolve_interruption` already persisted
 /// the freeform string as the resolution and the comment, both of which
 /// flow into the next step prompt via the bounded
 /// `list_resolved_interruptions_for_step` injection (§8). This preserves the
@@ -41,6 +43,7 @@ use crate::storage::{self, OpenQuestion};
 /// the step.
 pub fn apply_retry_exhausted_resolution(
     conn: &Connection,
+    project: &str,
     interruption_id: &str,
     resolution_text: &str,
 ) -> Result<bool> {
@@ -68,26 +71,34 @@ pub fn apply_retry_exhausted_resolution(
     let step_id = interruption.step_id.clone();
     let want_fail = resolution_text == RETRY_EXHAUSTED_OPTION_FAIL;
 
-    db::with_tx(conn, |tx| {
+    let parked_to_discard = db::with_tx(conn, |tx| {
         if want_fail {
             // Explicit give-up: terminal Failed. The interruption is already
             // resolved by the caller; the freeform comment (if any) is on
             // the resolved row but never feeds another prompt — the step is
-            // done.
+            // done. Drop the automatic re-apply pointer and discard the
+            // underlying stash so a later unrelated run cannot resurrect this WIP.
             storage::update_step_status(tx, &step_id, StepStatus::Failed)?;
+            let parked = storage::get_step_parked_worktree(tx, &step_id)?;
+            if parked.is_some() {
+                storage::clear_step_parked_worktree(tx, &step_id)?;
+            }
+            Ok(parked)
         } else {
-            // "Retry the step from scratch" — the explicit option text —
+            // "Retry step with parked changes" — the explicit option text —
             // and the freeform-doesn't-match fallthrough both land here.
             // The freeform text (and optional comment) were already stamped
             // on the resolved interruption by the caller; the bounded
             // resolved-interruptions section of the next prompt will pick
-            // it up automatically.
+            // it up automatically. The next run restores the parked stash as
+            // unstaged changes so the step can continue from its prior WIP.
             storage::set_step_attempts(tx, &step_id, 0)?;
             storage::update_step_status(tx, &step_id, StepStatus::Pending)?;
+            Ok(None)
         }
-        Ok(())
     })?;
 
+    crate::runner::discard_parked_worktree_state(Path::new(project), parked_to_discard)?;
     Ok(true)
 }
 
@@ -300,7 +311,7 @@ pub fn cmd_interruption_resolve(
     // Phase C: if this was the Phase B auto-raised retry-exhausted blocker,
     // reset attempts / mark Failed per the chosen option. No-op for normal
     // interruptions (returns Ok(false) without writing).
-    apply_retry_exhausted_resolution(conn, &q.id, &resolution)?;
+    apply_retry_exhausted_resolution(conn, project, &q.id, &resolution)?;
     // Phase E Fix 4: emit `InterruptionResolved` for the CLI resolve path.
     // Best-effort + JSON-mode-gated, matching the raised-event helper.
     crate::output::emit_interruption_resolved(
@@ -559,7 +570,7 @@ mod tests {
         let id = seed_auto_blocker(&conn, &step_id);
 
         let acted =
-            apply_retry_exhausted_resolution(&conn, &id, RETRY_EXHAUSTED_OPTION_RETRY).unwrap();
+            apply_retry_exhausted_resolution(&conn, project, &id, RETRY_EXHAUSTED_OPTION_RETRY).unwrap();
         assert!(acted, "auto-blocker recognized");
         assert_eq!(step_attempts(&conn, &step_id), 0, "attempts reset to 0");
         assert_eq!(
@@ -578,7 +589,7 @@ mod tests {
         let id = seed_auto_blocker(&conn, &step_id);
 
         let acted =
-            apply_retry_exhausted_resolution(&conn, &id, RETRY_EXHAUSTED_OPTION_FAIL).unwrap();
+            apply_retry_exhausted_resolution(&conn, project, &id, RETRY_EXHAUSTED_OPTION_FAIL).unwrap();
         assert!(acted);
         assert_eq!(
             step_status(&conn, &step_id),
@@ -620,7 +631,7 @@ mod tests {
         .unwrap();
 
         let acted =
-            apply_retry_exhausted_resolution(&conn, &qid, RETRY_EXHAUSTED_OPTION_RETRY).unwrap();
+            apply_retry_exhausted_resolution(&conn, project, &qid, RETRY_EXHAUSTED_OPTION_RETRY).unwrap();
         assert!(!acted, "Question kind must never match auto-blocker");
         // No state was touched.
         assert_eq!(step_attempts(&conn, &step_id), 2);
@@ -647,7 +658,7 @@ mod tests {
         )
         .unwrap();
 
-        let acted = apply_retry_exhausted_resolution(&conn, &bid, "granted").unwrap();
+        let acted = apply_retry_exhausted_resolution(&conn, project, &bid, "granted").unwrap();
         assert!(!acted, "empty-options blocker must not match");
         assert_eq!(step_attempts(&conn, &step_id), 1);
         assert_eq!(step_status(&conn, &step_id), StepStatus::InProgress);
@@ -669,6 +680,7 @@ mod tests {
 
         let acted = apply_retry_exhausted_resolution(
             &conn,
+            project,
             &id,
             "try with --foo bar to skip the broken path",
         )
@@ -684,7 +696,8 @@ mod tests {
     #[test]
     fn test_apply_retry_exhausted_resolution_missing_id_errors() {
         let conn = db::open_memory().unwrap();
-        let err = apply_retry_exhausted_resolution(&conn, "no-such-id", "x").unwrap_err();
+        let project = "/proj-rer-missing";
+        let err = apply_retry_exhausted_resolution(&conn, project, "no-such-id", "x").unwrap_err();
         assert!(
             err.to_string().contains("interruption not found"),
             "got: {err}"
@@ -698,7 +711,7 @@ mod tests {
         // scratch) must (a) resolve the interruption and (b) reset
         // attempts/status. This is the contract for `ralph interruption
         // resolve <id> --option 1` and `ralph interruption resolve <id>
-        // --answer "Retry the step from scratch"`.
+        // --answer "Retry step with parked changes"`.
         let conn = db::open_memory().unwrap();
         let project = "/proj-cli-retry";
         let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
@@ -745,7 +758,7 @@ mod tests {
         cmd_interruption_resolve(&conn, project, None, &id, Some(1), None, None, &quiet_out())
             .unwrap();
 
-        // Retry-from-scratch preserved the old audit rows. A fresh logical
+        // Retry-with-parked-changes preserved the old audit rows. A fresh logical
         // attempt=1 log must now insert successfully for the new cycle.
         storage::create_execution_log(&conn, &step_id, 1, Some("retry cycle attempt 1"), None)
             .unwrap();

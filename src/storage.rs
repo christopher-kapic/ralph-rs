@@ -22,6 +22,16 @@ use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 /// dozen scattered SELECTs.
 const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy, short_id, review_enabled, review_status, corrects_step_id, current_cycle_index";
 
+/// Durably parked working-tree state for a step paused on a human-side
+/// interruption. The stash SHA identifies the parked git stash entry;
+/// `staged_files` records which paths were staged when the worktree was
+/// parked so a failed parking attempt can reconstruct the original state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParkedWorktreeState {
+    pub stash_sha: String,
+    pub staged_files: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Plan operations
 // ---------------------------------------------------------------------------
@@ -1695,6 +1705,64 @@ pub fn get_step_by_id(conn: &Connection, step_id: &str) -> Result<Option<Step>> 
     }
 }
 
+/// Persist the git stash pointer for a step paused on an interruption.
+///
+/// The row is sparse/ephemeral: one parked worktree per step at most. A
+/// duplicate row means the caller is about to overwrite still-unrestored WIP,
+/// which is almost certainly a bug, so we error rather than `REPLACE`.
+pub fn set_step_parked_worktree(
+    conn: &Connection,
+    step_id: &str,
+    stash_sha: &str,
+    staged_files: &[String],
+) -> Result<()> {
+    let staged_json = serde_json::to_string(staged_files)?;
+    conn.execute(
+        "INSERT INTO step_parked_worktrees (step_id, stash_sha, staged_files) VALUES (?1, ?2, ?3)",
+        params![step_id, stash_sha, staged_json],
+    )
+    .with_context(|| format!("Failed to persist parked worktree for step {step_id}"))?;
+    Ok(())
+}
+
+/// Fetch the parked worktree pointer for `step_id`, if one exists.
+pub fn get_step_parked_worktree(
+    conn: &Connection,
+    step_id: &str,
+) -> Result<Option<ParkedWorktreeState>> {
+    conn.query_row(
+        "SELECT stash_sha, staged_files FROM step_parked_worktrees WHERE step_id = ?1",
+        params![step_id],
+        |row| {
+            let stash_sha: String = row.get(0)?;
+            let staged_raw: String = row.get(1)?;
+            let staged_files = serde_json::from_str(&staged_raw).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            Ok(ParkedWorktreeState {
+                stash_sha,
+                staged_files,
+            })
+        },
+    )
+    .optional()
+    .context("Failed to load parked worktree")
+}
+
+/// Clear any parked worktree pointer for `step_id`. Missing rows are a no-op.
+pub fn clear_step_parked_worktree(conn: &Connection, step_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM step_parked_worktrees WHERE step_id = ?1",
+        params![step_id],
+    )
+    .with_context(|| format!("Failed to clear parked worktree for step {step_id}"))?;
+    Ok(())
+}
+
 /// Update a step's status. Does not modify `attempts`; use [`set_step_attempts`] for that.
 pub fn update_step_status(conn: &Connection, step_id: &str, status: StepStatus) -> Result<()> {
     let affected = conn.execute(
@@ -1709,7 +1777,7 @@ pub fn update_step_status(conn: &Connection, step_id: &str, status: StepStatus) 
 }
 
 /// Set the persisted attempt count for a step to an absolute value (NOT a
-/// delta). `0` resets — the Phase C "retry from scratch" path uses this to
+/// delta). `0` resets — the Phase C "retry with parked changes" path uses this to
 /// re-queue a step that exhausted its budget. Sibling helper to
 /// [`update_step_status`] so the shared resolution helper in
 /// `commands/interruption.rs` can `set_step_attempts(.. 0) +
@@ -1781,7 +1849,11 @@ pub fn update_step_status_if(
 /// keeps a `ralph skip` on a derived-`Blocked` step from leaving an
 /// unresolved interruption behind a `Complete` plan (see
 /// [`resolve_open_interruptions_for_step`]).
-pub fn mark_step_skipped(conn: &Connection, step_id: &str, reason: Option<&str>) -> Result<()> {
+pub fn mark_step_skipped(
+    conn: &Connection,
+    step_id: &str,
+    reason: Option<&str>,
+) -> Result<Option<ParkedWorktreeState>> {
     crate::db::with_tx(conn, |conn| {
         let affected = conn.execute(
             "UPDATE steps SET status = ?1, skipped_reason = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?3",
@@ -1795,7 +1867,11 @@ pub fn mark_step_skipped(conn: &Connection, step_id: &str, reason: Option<&str>)
             step_id,
             "step skipped — interruption no longer applicable",
         )?;
-        Ok(())
+        let parked = get_step_parked_worktree(conn, step_id)?;
+        if parked.is_some() {
+            clear_step_parked_worktree(conn, step_id)?;
+        }
+        Ok(parked)
     })
 }
 
@@ -2075,19 +2151,25 @@ pub fn set_step_short_id(conn: &Connection, step_id: &str, short_id: &str) -> Re
 /// Also deletes the step's `execution_logs` rows: `step reset` is a
 /// destructive restart that intentionally drops the old per-attempt history
 /// and prompt context before re-queueing the step from a clean slate.
-pub fn reset_step(conn: &Connection, step_id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM execution_logs WHERE step_id = ?1",
-        params![step_id],
-    )?;
-    let affected = conn.execute(
-        "UPDATE steps SET status = ?1, attempts = 0, skipped_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![StepStatus::Pending.as_str(), step_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Step not found: {step_id}");
-    }
-    Ok(())
+pub fn reset_step(conn: &Connection, step_id: &str) -> Result<Option<ParkedWorktreeState>> {
+    crate::db::with_tx(conn, |conn| {
+        conn.execute(
+            "DELETE FROM execution_logs WHERE step_id = ?1",
+            params![step_id],
+        )?;
+        let parked = get_step_parked_worktree(conn, step_id)?;
+        if parked.is_some() {
+            clear_step_parked_worktree(conn, step_id)?;
+        }
+        let affected = conn.execute(
+            "UPDATE steps SET status = ?1, attempts = 0, skipped_reason = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
+            params![StepStatus::Pending.as_str(), step_id],
+        )?;
+        if affected == 0 {
+            anyhow::bail!("Step not found: {step_id}");
+        }
+        Ok(parked)
+    })
 }
 
 /// Flip every InProgress step for a plan to Aborted and return the affected rows.
@@ -7098,6 +7180,52 @@ mod tests {
         step.id
     }
 
+    #[test]
+    fn test_step_parked_worktree_round_trips_and_clears() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let staged = vec!["a.txt".to_string(), "b.txt".to_string()];
+        set_step_parked_worktree(&conn, &step_id, "deadbeef", &staged).unwrap();
+
+        let parked = get_step_parked_worktree(&conn, &step_id)
+            .unwrap()
+            .expect("parked row should exist");
+        assert_eq!(parked.stash_sha, "deadbeef");
+        assert_eq!(parked.staged_files, staged);
+
+        clear_step_parked_worktree(&conn, &step_id).unwrap();
+        assert!(get_step_parked_worktree(&conn, &step_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_reset_step_clears_parked_worktree() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        set_step_parked_worktree(&conn, &step_id, "deadbeef", &[]).unwrap();
+        let parked = reset_step(&conn, &step_id)
+            .unwrap()
+            .expect("reset should return the parked stash pointer");
+
+        assert_eq!(parked.stash_sha, "deadbeef");
+        assert!(get_step_parked_worktree(&conn, &step_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_mark_step_skipped_clears_parked_worktree() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        set_step_parked_worktree(&conn, &step_id, "deadbeef", &[]).unwrap();
+        let parked = mark_step_skipped(&conn, &step_id, Some("no longer needed"))
+            .unwrap()
+            .expect("skip should return the parked stash pointer");
+
+        assert_eq!(parked.stash_sha, "deadbeef");
+        assert!(get_step_parked_worktree(&conn, &step_id).unwrap().is_none());
+    }
+
     /// Force a specific `resolved_at` (and `asked_at`) on a row so ordering
     /// assertions don't race the `strftime('now')` clock when many rows are
     /// resolved within the same millisecond.
@@ -7189,7 +7317,7 @@ mod tests {
 
         let opts = vec![
             InterruptionOption {
-                text: "Retry the step from scratch".to_string(),
+                text: "Retry step with parked changes".to_string(),
                 priority: 1,
             },
             InterruptionOption {
@@ -7232,7 +7360,7 @@ mod tests {
 
         let opts = vec![
             InterruptionOption {
-                text: "Retry the step from scratch".to_string(),
+                text: "Retry step with parked changes".to_string(),
                 priority: 1,
             },
             InterruptionOption {
@@ -7261,12 +7389,12 @@ mod tests {
         assert!(got.resolved_at.is_none());
 
         // Resolving flips state + resolution; the targeted read must reflect it.
-        resolve_interruption(&conn, &id, "Retry the step from scratch", Some("hint")).unwrap();
+        resolve_interruption(&conn, &id, "Retry step with parked changes", Some("hint")).unwrap();
         let after = get_interruption(&conn, &id).unwrap();
         assert_eq!(after.state, InterruptionState::Resolved);
         assert_eq!(
             after.resolution.as_deref(),
-            Some("Retry the step from scratch")
+            Some("Retry step with parked changes")
         );
         assert_eq!(after.comment.as_deref(), Some("hint"));
         assert!(after.resolved_at.is_some());
@@ -7365,7 +7493,7 @@ mod tests {
         let l1 = create_execution_log(&conn, &step_id, 1, None, None).unwrap();
         assert_eq!(l1.cycle_index, 0, "first log lands in cycle 0");
 
-        // Drive the auto-blocker "retry from scratch" path: bump then reset.
+        // Drive the auto-blocker "retry with parked changes" path: bump then reset.
         set_step_attempts(&conn, &step_id, 2).unwrap();
         set_step_attempts(&conn, &step_id, 0).unwrap();
 

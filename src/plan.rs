@@ -311,7 +311,7 @@ impl std::str::FromStr for RetryStrategy {
 /// OR an **auto-raised retry-exhausted blocker** (Phase B): a harness-raised
 /// blocker carries an empty option list (the agent explains what it cannot
 /// do and the human resolves it freeform); the auto-raised retry-exhausted
-/// variant carries two ranked options ("Retry the step from scratch" /
+/// variant carries two ranked options ("Retry step with parked changes" /
 /// "Mark step Failed") so a human can keep the audit trail and pick a
 /// recovery without typing.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -1299,7 +1299,7 @@ pub struct ExecutionLog {
     pub test_status: Option<TestStatus>,
     /// V33 per-step retry-from-scratch cycle pointer. `0` for ordinary
     /// runs; bumps every time the step's `attempts` is reset from >0 to 0
-    /// (the "Retry the step from scratch" auto-blocker resolver). Lets
+    /// (the "Retry step with parked changes" auto-blocker resolver). Lets
     /// `ralph log` and the rendered-prompt picker group attempts by cycle
     /// when logical attempt numbers repeat (V32 dropped the
     /// `UNIQUE(step_id, attempt)` constraint so they can).

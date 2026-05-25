@@ -557,6 +557,15 @@ async fn run_plan_inner(
             continue;
         }
 
+        let resumed_parked_worktree =
+            restore_parked_step_worktree(conn, &current_step, workdir).await?;
+        if resumed_parked_worktree && out.format != OutputFormat::Json {
+            eprintln!(
+                "> Restored parked worktree for step {} '{}' before re-running.",
+                current_step.short_id, current_step.title
+            );
+        }
+
         // Print progress header / emit step_started event.
         let step_num = step_number_in_plan(&all_steps, &current_step);
         if out.format == OutputFormat::Json {
@@ -620,6 +629,7 @@ async fn run_plan_inner(
                 color: out.color,
                 chunk_seq: Some(chunk_seq.clone()),
                 chunk_max_bytes: config.harness_chunk_max_bytes,
+                resumed_parked_worktree,
             },
         )
         .await?;
@@ -1474,7 +1484,8 @@ pub async fn resume_plan(
         || step.status == StepStatus::InProgress
         || step.status == StepStatus::Aborted
     {
-        storage::reset_step(conn, &step.id)?;
+        let parked = storage::reset_step(conn, &step.id)?;
+        discard_parked_worktree_state(workdir, parked)?;
     }
 
     let step_num = resume_idx + 1; // 1-based
@@ -1658,7 +1669,9 @@ pub fn skip_step(
         );
     }
 
-    storage::mark_step_skipped(conn, &step.id, reason)?;
+    let workdir = Path::new(&plan.project);
+    let parked = storage::mark_step_skipped(conn, &step.id, reason)?;
+    discard_parked_worktree_state(workdir, parked)?;
     match reason {
         Some(r) => eprintln!(
             "Skipped step {} '{}' (reason: {})",
@@ -2100,6 +2113,54 @@ async fn restore_working_tree(workdir: &Path, state: Option<&StashedState>) -> R
     }
 
     Ok(())
+}
+
+pub(crate) fn discard_parked_worktree_state(
+    workdir: &Path,
+    parked: Option<storage::ParkedWorktreeState>,
+) -> Result<bool> {
+    let Some(parked) = parked else {
+        return Ok(false);
+    };
+
+    git::drop_stash(workdir, &StashRef(parked.stash_sha))
+}
+
+async fn restore_parked_step_worktree(
+    conn: &Connection,
+    step: &Step,
+    workdir: &Path,
+) -> Result<bool> {
+    let Some(parked) = storage::get_step_parked_worktree(conn, &step.id)? else {
+        return Ok(false);
+    };
+
+    let workdir_owned = workdir.to_path_buf();
+    let stash_ref = StashRef(parked.stash_sha.clone());
+    let stash_ref_for_pop = stash_ref.clone();
+    let outcome = blocking_git(move || git::stash_pop(&workdir_owned, &stash_ref_for_pop)).await?;
+    match outcome {
+        StashPopOutcome::Clean => {
+            storage::clear_step_parked_worktree(conn, &step.id)?;
+            Ok(true)
+        }
+        StashPopOutcome::Conflicted(stderr) => bail!(
+            "Restoring the parked interruption stash for step '{}' conflicted. \
+             The preserved work is still available at {} — resolve it manually \
+             with `git stash pop {}` before re-running.\n{}",
+            step.title,
+            stash_ref.as_str(),
+            stash_ref.as_str(),
+            stderr,
+        ),
+        StashPopOutcome::NotFound => bail!(
+            "The parked interruption stash for step '{}' was not found on the \
+             stash stack (expected {}). The step cannot be resumed safely until \
+             you recover or intentionally discard that parked work.",
+            step.title,
+            stash_ref.as_str(),
+        ),
+    }
 }
 
 /// Set up the git branch for the plan.
@@ -4880,6 +4941,87 @@ mod tests {
         // the index.
         assert!(dir.join("unstaged.txt").exists());
         assert!(!staged_after.contains(&"unstaged.txt".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_restore_parked_step_worktree_reapplies_stash_and_clears_row() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            "demo",
+            &dir.to_string_lossy(),
+            "demo",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        fs::write(
+            dir.join("README.md"),
+            "# staged change
+",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("scratch.txt"),
+            "park me
+",
+        )
+        .unwrap();
+        git::stage_except(&dir, &["scratch.txt".to_string()]).unwrap();
+        let staged_files = git::list_staged_files(&dir).unwrap();
+        assert_eq!(staged_files, vec!["README.md".to_string()]);
+
+        let stash_ref = git::stash_push_with_untracked(&dir, "ralph: parked-step-test")
+            .unwrap()
+            .expect("expected parked stash");
+        assert!(!git::has_uncommitted_changes(&dir).unwrap());
+
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &staged_files)
+            .unwrap();
+
+        let restored = restore_parked_step_worktree(&conn, &step, &dir)
+            .await
+            .unwrap();
+        assert!(restored, "a parked row must be restored");
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# staged change
+"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("scratch.txt")).unwrap(),
+            "park me
+"
+        );
+        assert!(
+            git::list_staged_files(&dir).unwrap().is_empty(),
+            "restored parked work must come back as unstaged changes"
+        );
+        assert!(
+            storage::get_step_parked_worktree(&conn, &step.id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Default (auto_stash=true) stash-push + stash-pop round trip: the

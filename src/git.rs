@@ -719,6 +719,37 @@ pub fn stash_pop(workdir: &Path, stash_ref: &StashRef) -> Result<StashPopOutcome
     Ok(StashPopOutcome::Clean)
 }
 
+/// Drop the stash identified by `stash_ref` without applying it.
+///
+/// Used when a parked step worktree is being intentionally discarded
+/// (skip/reset/terminal fail). Returns `Ok(true)` if a stash entry was found
+/// and dropped, `Ok(false)` if it was already gone.
+pub fn drop_stash(workdir: &Path, stash_ref: &StashRef) -> Result<bool> {
+    let entries = stash_list_shas_with_refs(workdir)?;
+    let stash_ref_name = match entries.iter().find(|(sha, _)| sha == stash_ref.as_str()) {
+        Some((_, name)) => name.clone(),
+        None => return Ok(false),
+    };
+
+    let drop_out = Command::new("git")
+        .args(["stash", "drop", &stash_ref_name])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git stash drop {stash_ref_name}"))?;
+
+    if !drop_out.status.success() {
+        let stderr = String::from_utf8_lossy(&drop_out.stderr);
+        bail!(
+            "git stash drop {} failed ({}): {}",
+            stash_ref_name,
+            drop_out.status,
+            stderr.trim(),
+        );
+    }
+
+    Ok(true)
+}
+
 /// Find a stash (by its commit SHA) whose subject contains `message`.
 ///
 /// Returns `None` if no stash matches. Used by recovery paths that want to
@@ -2289,6 +2320,22 @@ mod tests {
 
         let outcome = stash_pop(&dir, &stash).unwrap();
         assert_eq!(outcome, StashPopOutcome::NotFound);
+    }
+
+    #[test]
+    fn test_drop_stash_discards_entry_without_applying() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("note.txt"), "park me
+").unwrap();
+        let stash = stash_push_with_untracked(&dir, "ralph: discard me")
+            .unwrap()
+            .expect("sha");
+
+        let dropped = drop_stash(&dir, &stash).unwrap();
+
+        assert!(dropped);
+        assert!(!dir.join("note.txt").exists(), "discard must not apply the stash");
+        assert_eq!(stash_pop(&dir, &stash).unwrap(), StashPopOutcome::NotFound);
     }
 
     #[test]

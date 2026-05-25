@@ -45,7 +45,7 @@ const HARNESS_OUTPUT_TAIL_BYTES: usize = 4 * 1024 * 1024;
 /// so executor (writer), `commands/run.rs` (Phase C reader), and the TUI all
 /// reference one source of truth and `cargo test --lib` catches any drift via
 /// the assertions in [`tests`].
-pub const RETRY_EXHAUSTED_OPTION_RETRY: &str = "Retry the step from scratch";
+pub const RETRY_EXHAUSTED_OPTION_RETRY: &str = "Retry step with parked changes";
 
 /// Priority-2 option on the auto-raised retry-exhausted blocker — the
 /// "explicit give-up" fallback. Phase C's resolution handler detects this
@@ -282,6 +282,10 @@ pub struct ExecuteOptions {
     /// [`Config::harness_chunk_max_bytes`]. Ignored when `chunk_seq` is
     /// `None`.
     pub chunk_max_bytes: usize,
+    /// True when the runner has just restored this step's previously parked
+    /// interruption stash, so any untracked files now visible are step-owned
+    /// WIP rather than pre-existing user files that should be preserved.
+    pub resumed_parked_worktree: bool,
 }
 
 impl Default for ExecuteOptions {
@@ -294,6 +298,7 @@ impl Default for ExecuteOptions {
             color: false,
             chunk_seq: None,
             chunk_max_bytes: 4096,
+            resumed_parked_worktree: false,
         }
     }
 }
@@ -988,31 +993,74 @@ async fn handle_skipped_attempt(
 /// cancel path (`handle_skipped_attempt`'s `set_step_attempts(.. attempt -
 /// 1)`). An interruption is the agent asking for help, not a failed try —
 /// it must never burn a retry.
+fn park_step_worktree_for_interruption(
+    ctx: &ExecCtx<'_>,
+    attempt: i32,
+    reason: &str,
+) -> Result<()> {
+    if !git::has_uncommitted_changes(ctx.workdir)? {
+        return Ok(());
+    }
+
+    let staged_files = git::list_staged_files(ctx.workdir)?;
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let label = format!(
+        "ralph: parked {reason} worktree for plan '{}' step '{}' attempt {} at {ts}",
+        ctx.plan.slug, ctx.step.short_id, attempt
+    );
+    let Some(stash_ref) = git::stash_push_with_untracked(ctx.workdir, &label)? else {
+        return Ok(());
+    };
+
+    if let Err(e) = storage::set_step_parked_worktree(
+        ctx.conn,
+        &ctx.step.id,
+        stash_ref.as_str(),
+        &staged_files,
+    ) {
+        match git::stash_pop(ctx.workdir, &stash_ref)? {
+            git::StashPopOutcome::Clean => {
+                if !staged_files.is_empty() {
+                    git::restage_files(ctx.workdir, &staged_files);
+                }
+            }
+            git::StashPopOutcome::Conflicted(stderr) => {
+                bail!(
+                    "parked interruption worktree at {} but failed to persist its pointer; \
+                     stash re-apply also conflicted, so the preserved work remains on the stash stack.\n{}",
+                    stash_ref.as_str(),
+                    stderr,
+                );
+            }
+            git::StashPopOutcome::NotFound => {
+                bail!(
+                    "parked interruption worktree at {} but failed to persist its pointer, \
+                     and the stash entry disappeared before it could be restored",
+                    stash_ref.as_str(),
+                );
+            }
+        }
+        return Err(e).with_context(|| {
+            format!(
+                "parked interruption worktree at {} but failed to persist its pointer; \
+                 restored the worktree so the WIP stays visible",
+                stash_ref.as_str()
+            )
+        });
+    }
+    Ok(())
+}
+
 async fn finalize_paused_for_question(
     ctx: &ExecCtx<'_>,
     exec_log_id: i64,
     attempt: i32,
 ) -> Result<StepResult> {
-    // Roll back any in-flight diff the harness produced before it raised
-    // the interruption (Decision 5 / §5: a blocked branch parks no WIP — it
-    // re-runs from the committed state once resolved). The exec_log row is
-    // deleted below, so this Rollback phase event carries no log id.
-    if git::has_uncommitted_changes(ctx.workdir)? {
-        write_phase(
-            ctx.conn,
-            ctx.plan,
-            &ctx.step.id,
-            ctx.step_num,
-            attempt,
-            ctx.max_attempts,
-            Some(exec_log_id),
-            Phase::Rollback,
-            None,
-            ChildUpdate::Clear,
-            ctx.json_output,
-        )?;
-        git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)?;
-    }
+    // Park any in-flight diff the harness produced before it raised the
+    // interruption. This leaves the repository clean so the scheduler can
+    // move on, while preserving the exact WIP for re-application when the
+    // step is picked again after the interruption is resolved.
+    park_step_worktree_for_interruption(ctx, attempt, "interruption")?;
 
     // Zero retry budget (HARD invariant — docs/dag-redesign.md §3.4 / §9
     // invariant 4). The pre-spawn `set_step_attempts(.. attempt)` is rolled
@@ -1089,7 +1137,7 @@ async fn finalize_paused_for_question(
 ///    (no new variant is added — it remains the single "step parked
 ///    awaiting human" idiom; see Phase B notes in CLAUDE.md).
 ///  - `step.attempts` is **left at `max_attempts`** (not rolled back).
-///    Phase C's "Retry the step from scratch" resolver is the one to call
+///    Phase C's "Retry step with parked changes" resolver is the one to call
 ///    `step reset` and bring the counter back to zero, and an observer
 ///    inspecting the DB while the blocker is open can tell the step "hit
 ///    its budget" — the same information the pre-Phase-B `Failed` status
@@ -1126,28 +1174,11 @@ async fn raise_retry_exhausted_blocker(
          terminal Failed shape",
     );
 
-    // Roll back any dirty tree — exactly like `finalize_paused_for_question`.
-    // The next run (after the human picks Retry) starts from the committed
-    // base; we don't carry uncommitted WIP across the human-pause boundary
-    // because the audit trail of "what the agent had on disk at the moment
-    // of failure" is already in `execution_logs` (stdout/stderr/diff fields
-    // captured below) and on disk we want a clean tree to mirror §3.4 / §5.
-    if git::has_uncommitted_changes(ctx.workdir)? {
-        write_phase(
-            ctx.conn,
-            ctx.plan,
-            &ctx.step.id,
-            ctx.step_num,
-            attempt,
-            ctx.max_attempts,
-            Some(exec_log_id),
-            Phase::Rollback,
-            None,
-            ChildUpdate::Clear,
-            ctx.json_output,
-        )?;
-        git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)?;
-    }
+    // Park any dirty tree instead of throwing it away. The blocker pauses the
+    // branch awaiting a human decision, so we keep the repository clean for
+    // other work while preserving the in-progress WIP for automatic restore if
+    // the human chooses to continue.
+    park_step_worktree_for_interruption(ctx, attempt, "retry-exhausted")?;
 
     // The execution_logs row is *kept* (it carries the full diagnostic
     // payload — stdout/stderr/diff/cost/test_results — captured during this
@@ -1169,7 +1200,7 @@ async fn raise_retry_exhausted_blocker(
         Some(duration_secs),
         failure_output.diff,
         failure_output.test_results,
-        true, // rolled_back
+        false, // parked in stash, not rolled back
         false,
         None,
         Some(failure_output.stdout),
@@ -1426,7 +1457,11 @@ pub async fn execute_step(
     let step_num = resolve_step_num(conn, plan, step)?;
 
     // Snapshot pre-existing untracked files so we don't accidentally commit them.
-    let pre_existing_untracked = git::get_untracked_files(workdir)?;
+    let pre_existing_untracked = if exec_opts.resumed_parked_worktree {
+        Vec::new()
+    } else {
+        git::get_untracked_files(workdir)?
+    };
 
     // Shared context for failure handling.
     let ctx = ExecCtx {
@@ -9123,21 +9158,21 @@ mod tests {
 
         assert_eq!(result.outcome, StepOutcome::PausedForQuestion);
 
-        // Workdir must be clean after pause: the file the harness created
-        // was rolled back, and no commit was made.
+        // Workdir must be clean after pause so the scheduler can move on,
+        // but the harness's diff is preserved in a parked stash for later
+        // re-application when the interruption is resolved.
         assert!(
             !crate::git::has_uncommitted_changes(&dir).unwrap(),
-            "pause must roll back any harness-produced diff"
+            "pause must leave the worktree clean after parking the diff"
         );
         assert!(
             !dir.join("ralph-test-output.txt").exists(),
-            "rolled-back path: harness's file must be gone"
+            "parked path: harness's file must be absent until the stash is restored"
         );
 
         // The paused attempt's exec_log row is deleted (zero-budget re-run
-        // re-uses the same attempt number). The diff was still rolled back
-        // (asserted above via the clean workdir); the durable record is the
-        // open interruption row.
+        // re-uses the same attempt number). The durable records are the open
+        // interruption row and the parked stash pointer.
         let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
         assert!(
             logs.is_empty(),
@@ -9145,6 +9180,16 @@ mod tests {
         );
         let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
         assert_eq!(open.len(), 1, "the open interruption is the durable record");
+        let parked = storage::get_step_parked_worktree(&conn, &step.id)
+            .unwrap()
+            .expect("pause with a diff must park a stash");
+        let popped =
+            crate::git::stash_pop(&dir, &crate::git::StashRef(parked.stash_sha.clone())).unwrap();
+        assert_eq!(popped, crate::git::StashPopOutcome::Clean);
+        assert!(
+            dir.join("ralph-test-output.txt").exists(),
+            "restoring the parked stash must recover the harness's file"
+        );
     }
 
     /// STEP 24 — cross-process interruption bridge, end-to-end:
@@ -9239,6 +9284,7 @@ mod tests {
         // open.
         let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
         assert_eq!(open.len(), 1, "the open interruption is the bridge row");
+        let parked = storage::get_step_parked_worktree(&conn, &step.id).unwrap();
 
         // --- A DIFFERENT PROCESS resolves it (same write the CLI does). ---
         storage::resolve_interruption(&conn, &open[0].id, "SQLite", None).unwrap();
@@ -9249,8 +9295,20 @@ mod tests {
             "resolution clears the bridge row → step leaves Blocked"
         );
 
-        // Re-run: the step is re-queued at attempt #1 (budget intact). Use a
-        // harness that produces a change so the step can complete.
+        // Re-run: the runner restores the parked stash before re-queueing the
+        // step at attempt #1 (budget intact). Use a harness that produces a
+        // change so the step can complete.
+        let resumed_parked_worktree = if let Some(parked) = parked {
+            let popped =
+                crate::git::stash_pop(&dir, &crate::git::StashRef(parked.stash_sha.clone()))
+                    .unwrap();
+            assert_eq!(popped, crate::git::StashPopOutcome::Clean);
+            storage::clear_step_parked_worktree(&conn, &step.id).unwrap();
+            true
+        } else {
+            false
+        };
+
         let committing = write_simple_harness(harness_tmp.path(), &dir, true);
         let cfg_commit = config_with_harness("noop", &committing);
         let step_reloaded = storage::get_step(&conn, &step.id).unwrap();
@@ -9264,7 +9322,10 @@ mod tests {
             &dir,
             &hook_ctx,
             rx2,
-            ExecuteOptions::default(),
+            ExecuteOptions {
+                resumed_parked_worktree,
+                ..ExecuteOptions::default()
+            },
         )
         .await
         .unwrap();
@@ -10068,10 +10129,17 @@ mod tests {
             "attempts left at max so observers see the budget was spent",
         );
 
-        // Working tree clean, HEAD unchanged.
+        // Working tree clean, HEAD unchanged, and the preserved WIP is parked
+        // in a stash for later re-application if the human chooses Retry.
         assert!(
             !git::has_uncommitted_changes(&dir).unwrap(),
-            "auto-blocker rolls back the dirty tree before parking",
+            "auto-blocker must leave the worktree clean after parking",
+        );
+        assert!(
+            storage::get_step_parked_worktree(&conn, &step.id)
+                .unwrap()
+                .is_some(),
+            "retry exhaustion with a dirty tree must park a stash"
         );
         assert_eq!(
             commit_count(&dir),
