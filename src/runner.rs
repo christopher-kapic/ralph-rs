@@ -449,6 +449,13 @@ async fn run_plan_inner(
             return Ok(result);
         }
 
+        // Drain any stranded corrective-step requests BEFORE the scheduler
+        // picks its next step. This closes the restart window where a crash
+        // after a failed review but before request consumption would otherwise
+        // let the resumed run re-execute the reviewed step instead of first
+        // materializing its already-requested corrective step.
+        consume_open_corrective_requests(conn, &effective_plan, out)?;
+
         // Re-fetch the step list. This is the core of the mid-run-insert fix.
         let all_steps = storage::list_steps(conn, &effective_plan.id)?;
 
@@ -1070,9 +1077,10 @@ fn compute_branch_plan(
 /// If `options.current_branch` is true, the orchestrator stays on the
 /// current branch for every plan and does not set up any branches itself.
 ///
-/// Plans in `Planning`, `Complete`, `Aborted`, or `Archived` state are
-/// skipped (only `Ready`, `InProgress`, and `Failed` are considered
-/// runnable).
+/// Plans in `Planning`, `Complete`, or `Archived` state are skipped (only
+/// `Ready`, `InProgress`, `Failed`, and `Aborted` are considered runnable;
+/// an aborted plan is resumable and must stay in-scope so downstream
+/// dependencies never run as if it were absent).
 pub async fn run_all_plans(
     conn: &Connection,
     project: &str,
@@ -1089,7 +1097,10 @@ pub async fn run_all_plans(
         .filter(|p| {
             matches!(
                 p.status,
-                PlanStatus::Ready | PlanStatus::InProgress | PlanStatus::Failed
+                PlanStatus::Ready
+                    | PlanStatus::InProgress
+                    | PlanStatus::Failed
+                    | PlanStatus::Aborted
             )
         })
         .collect();
@@ -2572,6 +2583,7 @@ async fn drain_finished_reviews(
     block: bool,
 ) -> Result<Option<PlanStatus>> {
     if reviews.is_empty() {
+        consume_open_corrective_requests(conn, plan, out)?;
         return Ok(None);
     }
 
@@ -2675,13 +2687,7 @@ async fn drain_finished_reviews(
         // SOLE DB writer: finalize the verdict (status + git-note +, on
         // FAIL, the V29 bridge row).
         match crate::review::finalize_review(conn, workdir, &review, out)? {
-            crate::review::ReviewOutcome::Passed => {
-                // The reviewed step was held `InProgress` during its
-                // concurrent-eligible review window; PASS ⇒ it is genuinely
-                // done. Promote to `Complete` so its dependents become
-                // runnable on the next tick.
-                storage::update_step_status(conn, &review.step_id, StepStatus::Complete)?;
-            }
+            crate::review::ReviewOutcome::Passed => {}
             crate::review::ReviewOutcome::Failed { .. } => {
                 // The reviewer only *requested* a corrective step (V29
                 // bridge row). Consumed just below as the sole writer.
@@ -2695,13 +2701,23 @@ async fn drain_finished_reviews(
         }
     }
 
-    // Drain corrective-step requests for this plan as the SOLE DAG writer
-    // (§9-inv-3 / §10). Oldest-first, deterministic (reproducible
-    // scheduling — §3.5 item 4 / §11).
+    consume_open_corrective_requests(conn, plan, out)?;
+    Ok(None)
+}
+
+/// Drain corrective-step requests for `plan` as the SOLE DAG writer
+/// (§9-inv-3 / §10). Called both after reviews finish and at the top of each
+/// scheduler tick so a restarted run cannot skip over a stranded request from
+/// a prior failed review.
+fn consume_open_corrective_requests(
+    conn: &Connection,
+    plan: &Plan,
+    out: &OutputContext,
+) -> Result<()> {
     for req in storage::list_open_corrective_step_requests_for_plan(conn, &plan.id)? {
         crate::review::consume_corrective_request(conn, plan, &req, out)?;
     }
-    Ok(None)
+    Ok(())
 }
 
 /// Sweep any stale InProgress step rows and emit a log line if the sweep
@@ -4035,6 +4051,97 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_all_plans_keeps_aborted_upstream_in_scope() {
+        let (_tmp, dir) = init_git_repo();
+        let ext = tempfile::TempDir::new().unwrap();
+        let project = dir.to_string_lossy().to_string();
+        let script = ext.path().join("impl.sh");
+        std::fs::write(&script, "f=change_$$.txt\necho work > \"$f\"\n").unwrap();
+
+        let conn = setup();
+        seed_run_lock_row(&conn, &project);
+
+        let parent = storage::create_plan(
+            &conn,
+            "parent",
+            &project,
+            "feat/parent",
+            "d",
+            Some("impl"),
+            None,
+            &[],
+        )
+        .unwrap();
+        let child = storage::create_plan(
+            &conn,
+            "child",
+            &project,
+            "feat/child",
+            "d",
+            Some("impl"),
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::update_plan_status(&conn, &parent.id, PlanStatus::Aborted).unwrap();
+        storage::update_plan_status(&conn, &child.id, PlanStatus::Ready).unwrap();
+        storage::add_plan_dependency(&conn, &child.id, &parent.id).unwrap();
+
+        storage::create_step(
+            &conn,
+            &parent.id,
+            "Parent step",
+            "d",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::create_step(
+            &conn,
+            &child.id,
+            "Child step",
+            "d",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "impl".to_string(),
+            sh_stub_harness(&script.to_string_lossy()),
+        );
+
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let out = OutputContext::from_cli(false, true, true);
+        let options = RunOptions {
+            all_plans: true,
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let results = run_all_plans(&conn, &project, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2, "aborted upstream plan must stay in-scope");
+        assert_eq!(results[0].plan_slug, "parent");
+        assert_eq!(results[1].plan_slug, "child");
+        assert_eq!(results[0].final_status, PlanStatus::Complete);
+        assert_eq!(results[1].final_status, PlanStatus::Complete);
+    }
+
     // -- transitive_dependents (L9 helper) --
 
     #[test]
@@ -5255,6 +5362,116 @@ mod tests {
 
         let after = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(after[0].status, StepStatus::Aborted);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_run_plan_consumes_stranded_corrective_request_before_rerun() {
+        let (_tmp, dir) = init_git_repo();
+        let ext = tempfile::TempDir::new().unwrap();
+        let project = dir.to_string_lossy().to_string();
+        let script = ext.path().join("impl.sh");
+        std::fs::write(&script, "f=change_$$.txt\necho work > \"$f\"\n").unwrap();
+
+        let conn = setup();
+        seed_run_lock_row(&conn, &project);
+        let plan = storage::create_plan(
+            &conn,
+            "resume-corrective",
+            &project,
+            "feat/resume-corrective",
+            "d",
+            Some("impl"),
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
+
+        let (reviewed, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Original",
+            "d",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &reviewed.id, StepStatus::Aborted).unwrap();
+        storage::update_step_review_status(&conn, &reviewed.id, crate::plan::ReviewStatus::Failed)
+            .unwrap();
+        storage::insert_corrective_step_request(
+            &conn,
+            &reviewed.id,
+            1,
+            "deadbeef",
+            1,
+            Some("missing fix"),
+        )
+        .unwrap();
+
+        let plan = storage::get_plan_by_slug(&conn, "resume-corrective", &project)
+            .unwrap()
+            .unwrap();
+        let mut config = Config::default();
+        config.harnesses.insert(
+            "impl".to_string(),
+            sh_stub_harness(&script.to_string_lossy()),
+        );
+
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let out = OutputContext::from_cli(false, true, true);
+        let options = RunOptions {
+            current_branch: true,
+            ..Default::default()
+        };
+
+        let result = run_plan(&conn, &plan, &config, &dir, &options, rx, &out)
+            .await
+            .unwrap();
+
+        assert_eq!(result.final_status, PlanStatus::Complete);
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        assert_eq!(
+            steps.len(),
+            2,
+            "corrective step must be materialized on restart"
+        );
+        let reviewed_after = storage::get_step(&conn, &reviewed.id).unwrap();
+        assert_eq!(reviewed_after.status, StepStatus::Complete);
+        assert_eq!(
+            reviewed_after.review_status,
+            Some(crate::plan::ReviewStatus::Failed)
+        );
+        assert!(
+            storage::list_execution_logs_for_step(&conn, &reviewed.id)
+                .unwrap()
+                .is_empty(),
+            "the original reviewed step must not be re-executed before its stranded request is drained"
+        );
+
+        let corrective = steps
+            .iter()
+            .find(|s| s.corrects_step_id.as_deref() == Some(reviewed.id.as_str()))
+            .expect("corrective step inserted");
+        assert_eq!(corrective.status, StepStatus::Complete);
+        assert_eq!(
+            storage::list_execution_logs_for_step(&conn, &corrective.id)
+                .unwrap()
+                .len(),
+            1,
+            "the restarted run should execute only the corrective step"
+        );
+        assert!(
+            storage::list_open_corrective_step_requests_for_plan(&conn, &plan.id)
+                .unwrap()
+                .is_empty(),
+            "stranded corrective requests must be drained before scheduling"
+        );
     }
 
     // -- RunWindow / resolve_window tests --

@@ -28,7 +28,7 @@ use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::output::{OutputContext, OutputFormat, RunEvent};
-use crate::plan::{InterruptionKind, Plan, ReviewStatus, Step};
+use crate::plan::{InterruptionKind, Plan, ReviewStatus, Step, StepStatus};
 use crate::{git, harness, io_util, output, prompt, storage};
 
 /// Bounded-tail cap for the reviewer subprocess's stdout/stderr. Matches the
@@ -449,6 +449,10 @@ pub async fn run_review_subprocess(
 ///   the history-safe note path (note on a fixed SHA — never an amend; this
 ///   is also serialized here so two concurrent reviews never race on
 ///   `refs/notes`).
+/// - On `Pass`, atomically promotes the reviewed step to `Complete`
+///   alongside `review_status = Passed`, closing the crash window where a
+///   restart sweep could previously strand `InProgress + Passed` and rerun
+///   already-reviewed work.
 /// - On `Fail`, writes the V29 bridge row (the §9-inv-3 structured channel)
 ///   and emits the `CorrectiveStepRequested` event (STEP 39). It NEVER
 ///   mutates step rows/edges itself — the orchestrator consumes the bridge
@@ -487,7 +491,11 @@ pub fn finalize_review(
 
     match verdict {
         ReviewVerdict::Pass => {
-            storage::update_step_review_status(conn, step_id, ReviewStatus::Passed)?;
+            crate::db::with_tx(conn, |conn| {
+                storage::update_step_review_status(conn, step_id, ReviewStatus::Passed)?;
+                storage::update_step_status(conn, step_id, StepStatus::Complete)?;
+                Ok(())
+            })?;
             // History-safe verdict annotation (note on a fixed SHA — never an
             // amend, see git::annotate_review_verdict).
             git::annotate_review_verdict(workdir, commit_sha, "passed")?;
@@ -1155,6 +1163,7 @@ mod tests {
 
         assert_eq!(outcome, ReviewOutcome::Passed);
         let s = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(s.status, StepStatus::Complete);
         assert_eq!(s.review_status, Some(ReviewStatus::Passed));
         assert_eq!(
             crate::git::read_review_verdict(dir, &sha)
