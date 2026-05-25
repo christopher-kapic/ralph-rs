@@ -1722,7 +1722,11 @@ mod tests {
             .iter()
             .filter(|i| i.kind == crate::plan::InterruptionKind::Blocker)
             .collect();
-        assert_eq!(blockers.len(), 1, "JSON-mode emission must not drop blocker writes");
+        assert_eq!(
+            blockers.len(),
+            1,
+            "JSON-mode emission must not drop blocker writes"
+        );
         assert_eq!(blockers[0].step_id, step.id);
     }
 }
