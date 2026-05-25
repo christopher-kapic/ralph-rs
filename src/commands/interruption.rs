@@ -570,7 +570,8 @@ mod tests {
         let id = seed_auto_blocker(&conn, &step_id);
 
         let acted =
-            apply_retry_exhausted_resolution(&conn, project, &id, RETRY_EXHAUSTED_OPTION_RETRY).unwrap();
+            apply_retry_exhausted_resolution(&conn, project, &id, RETRY_EXHAUSTED_OPTION_RETRY)
+                .unwrap();
         assert!(acted, "auto-blocker recognized");
         assert_eq!(step_attempts(&conn, &step_id), 0, "attempts reset to 0");
         assert_eq!(
@@ -589,7 +590,8 @@ mod tests {
         let id = seed_auto_blocker(&conn, &step_id);
 
         let acted =
-            apply_retry_exhausted_resolution(&conn, project, &id, RETRY_EXHAUSTED_OPTION_FAIL).unwrap();
+            apply_retry_exhausted_resolution(&conn, project, &id, RETRY_EXHAUSTED_OPTION_FAIL)
+                .unwrap();
         assert!(acted);
         assert_eq!(
             step_status(&conn, &step_id),
@@ -631,7 +633,8 @@ mod tests {
         .unwrap();
 
         let acted =
-            apply_retry_exhausted_resolution(&conn, project, &qid, RETRY_EXHAUSTED_OPTION_RETRY).unwrap();
+            apply_retry_exhausted_resolution(&conn, project, &qid, RETRY_EXHAUSTED_OPTION_RETRY)
+                .unwrap();
         assert!(!acted, "Question kind must never match auto-blocker");
         // No state was touched.
         assert_eq!(step_attempts(&conn, &step_id), 2);

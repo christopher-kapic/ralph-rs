@@ -1012,12 +1012,9 @@ fn park_step_worktree_for_interruption(
         return Ok(());
     };
 
-    if let Err(e) = storage::set_step_parked_worktree(
-        ctx.conn,
-        &ctx.step.id,
-        stash_ref.as_str(),
-        &staged_files,
-    ) {
+    if let Err(e) =
+        storage::set_step_parked_worktree(ctx.conn, &ctx.step.id, stash_ref.as_str(), &staged_files)
+    {
         match git::stash_pop(ctx.workdir, &stash_ref)? {
             git::StashPopOutcome::Clean => {
                 if !staged_files.is_empty() {

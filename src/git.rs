@@ -2325,8 +2325,12 @@ mod tests {
     #[test]
     fn test_drop_stash_discards_entry_without_applying() {
         let (_tmp, dir) = init_repo();
-        fs::write(dir.join("note.txt"), "park me
-").unwrap();
+        fs::write(
+            dir.join("note.txt"),
+            "park me
+",
+        )
+        .unwrap();
         let stash = stash_push_with_untracked(&dir, "ralph: discard me")
             .unwrap()
             .expect("sha");
@@ -2334,7 +2338,10 @@ mod tests {
         let dropped = drop_stash(&dir, &stash).unwrap();
 
         assert!(dropped);
-        assert!(!dir.join("note.txt").exists(), "discard must not apply the stash");
+        assert!(
+            !dir.join("note.txt").exists(),
+            "discard must not apply the stash"
+        );
         assert_eq!(stash_pop(&dir, &stash).unwrap(), StashPopOutcome::NotFound);
     }
 
