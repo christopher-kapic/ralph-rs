@@ -1292,10 +1292,19 @@ pub fn set_plan_review_enabled(
 /// Project-independent because the review harness is *global* config — a
 /// review-enabled plan in any project means a missing review harness is worth
 /// flagging. Cheap: two `EXISTS` probes, no row materialization.
+///
+/// Mirrors `import::bundle_requests_review` so doctor and `--strict` import
+/// agree on what counts as review-enabled. The plan-half intentionally checks
+/// only an *explicit* `review_enabled = 1` (no `COALESCE` against the global
+/// default): a plan whose `review_enabled` is NULL gets its review state from
+/// its steps, and the step-half already evaluates the full precedence chain
+/// with step-level OFF overrides respected. Without this, a plan with
+/// `review_enabled = NULL`, all steps explicitly `Some(false)`, and a global
+/// default of ON would warn even though no review will ever run.
 pub fn any_review_enabled(conn: &Connection, global_review_enabled: bool) -> Result<bool> {
     let global = if global_review_enabled { 1 } else { 0 };
     let found: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM plans WHERE COALESCE(review_enabled, ?1) = 1) \
+        "SELECT EXISTS(SELECT 1 FROM plans WHERE review_enabled = 1) \
          OR EXISTS(
              SELECT 1 FROM steps s
              JOIN plans p ON p.id = s.plan_id
@@ -4006,6 +4015,14 @@ mod tests {
         // A per-step OFF override still suppresses review under a global ON
         // default.
         set_plan_review_enabled(&conn, &plan.id, Some(false)).unwrap();
+        set_step_review_enabled(&conn, &step.id, Some(false)).unwrap();
+        assert!(!any_review_enabled(&conn, true).unwrap());
+
+        // Plan inheriting (NULL) with every step explicitly OFF must NOT
+        // count, even under a global ON default — no review will ever run on
+        // such a plan, so doctor should stay quiet. This is the symmetry the
+        // function comment promises with `import::bundle_requests_review`.
+        set_plan_review_enabled(&conn, &plan.id, None).unwrap();
         set_step_review_enabled(&conn, &step.id, Some(false)).unwrap();
         assert!(!any_review_enabled(&conn, true).unwrap());
     }
