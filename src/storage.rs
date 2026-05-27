@@ -1283,19 +1283,25 @@ pub fn set_plan_review_enabled(
     Ok(())
 }
 
-/// True when ANY plan **or** step anywhere in the DB has its
-/// `review_enabled` override set truthy (`= 1`). Drives the `ralph doctor`
-/// non-fatal review-harness warning (STEP 44, docs/dag-redesign.md §13.3):
-/// if review is turned on somewhere but no review harness is configured (or
-/// the configured one is off PATH), doctor surfaces it without failing.
+/// True when review is effective-enabled anywhere in the DB after applying
+/// the full precedence chain
+/// `step.review_enabled ?? plan.review_enabled ?? global_review_enabled`.
+/// Drives the `ralph doctor` non-fatal review-harness warning (STEP 44,
+/// docs/dag-redesign.md §13.3): if review is effectively on somewhere but no
+/// usable review harness is configured, doctor surfaces it without failing.
 /// Project-independent because the review harness is *global* config — a
-/// review-enabled plan in any project means a missing review harness is
-/// worth flagging. Cheap: two `EXISTS` probes, no row materialization.
-pub fn any_review_enabled(conn: &Connection) -> Result<bool> {
+/// review-enabled plan in any project means a missing review harness is worth
+/// flagging. Cheap: two `EXISTS` probes, no row materialization.
+pub fn any_review_enabled(conn: &Connection, global_review_enabled: bool) -> Result<bool> {
+    let global = if global_review_enabled { 1 } else { 0 };
     let found: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM plans WHERE review_enabled = 1) \
-         OR EXISTS(SELECT 1 FROM steps WHERE review_enabled = 1)",
-        [],
+        "SELECT EXISTS(SELECT 1 FROM plans WHERE COALESCE(review_enabled, ?1) = 1) \
+         OR EXISTS(
+             SELECT 1 FROM steps s
+             JOIN plans p ON p.id = s.plan_id
+             WHERE COALESCE(s.review_enabled, p.review_enabled, ?1) = 1
+         )",
+        params![global],
         |row| row.get(0),
     )?;
     Ok(found)
@@ -3955,7 +3961,7 @@ mod tests {
     fn test_any_review_enabled_detects_plan_or_step_truthy_only() {
         let conn = setup();
         // Fresh DB: nothing enables review.
-        assert!(!any_review_enabled(&conn).unwrap());
+        assert!(!any_review_enabled(&conn, false).unwrap());
 
         let plan = create_plan(&conn, "rv", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) = create_step(
@@ -3973,25 +3979,35 @@ mod tests {
         )
         .unwrap();
         // Defaults (NULL/inherit) ⇒ still false.
-        assert!(!any_review_enabled(&conn).unwrap());
+        assert!(!any_review_enabled(&conn, false).unwrap());
 
         // Explicit OFF on both ⇒ still false (not a truthy override).
         set_plan_review_enabled(&conn, &plan.id, Some(false)).unwrap();
         set_step_review_enabled(&conn, &step.id, Some(false)).unwrap();
-        assert!(!any_review_enabled(&conn).unwrap());
+        assert!(!any_review_enabled(&conn, false).unwrap());
 
         // Step ON ⇒ true.
         set_step_review_enabled(&conn, &step.id, Some(true)).unwrap();
-        assert!(any_review_enabled(&conn).unwrap());
+        assert!(any_review_enabled(&conn, false).unwrap());
 
         // Step back to inherit, plan ON ⇒ true (plan side of the OR).
         set_step_review_enabled(&conn, &step.id, None).unwrap();
         set_plan_review_enabled(&conn, &plan.id, Some(true)).unwrap();
-        assert!(any_review_enabled(&conn).unwrap());
+        assert!(any_review_enabled(&conn, false).unwrap());
 
         // Everything back to inherit ⇒ false again.
         set_plan_review_enabled(&conn, &plan.id, None).unwrap();
-        assert!(!any_review_enabled(&conn).unwrap());
+        assert!(!any_review_enabled(&conn, false).unwrap());
+
+        // Global default ON means an inheriting plan counts even without an
+        // explicit DB truthy override.
+        assert!(any_review_enabled(&conn, true).unwrap());
+
+        // A per-step OFF override still suppresses review under a global ON
+        // default.
+        set_plan_review_enabled(&conn, &plan.id, Some(false)).unwrap();
+        set_step_review_enabled(&conn, &step.id, Some(false)).unwrap();
+        assert!(!any_review_enabled(&conn, true).unwrap());
     }
 
     #[test]

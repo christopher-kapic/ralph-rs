@@ -524,6 +524,21 @@ pub(crate) fn is_binary_available(binary: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// True when the configured global review harness exists, is defined in
+/// `config.harnesses`, and its command is on PATH. Shared by `doctor` and
+/// strict import so the two surfaces cannot drift on what counts as
+/// "review-capable on this machine".
+pub(crate) fn review_harness_is_usable(config: &Config) -> bool {
+    let name = config.review.harness.trim();
+    if name.is_empty() {
+        return false;
+    }
+    match config.harnesses.get(name) {
+        Some(hc) => is_binary_available(&hc.command),
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Doctor checks
 // ---------------------------------------------------------------------------
@@ -661,7 +676,7 @@ pub fn run_doctor_checks(config: &Config, workdir: &Path) -> Vec<CheckResult> {
     //    silently when the DB didn't open (that failure is already a
     //    standalone Error check above) or when review is on nowhere.
     if let Some(conn) = &db_conn {
-        match crate::storage::any_review_enabled(conn) {
+        match crate::storage::any_review_enabled(conn, config.review.enabled.unwrap_or(false)) {
             Ok(true) => checks.push(check_review_harness(config)),
             Ok(false) => {}
             Err(e) => checks.push(CheckResult {
@@ -804,7 +819,7 @@ fn check_vestigial_retry_strategy(conn: &rusqlite::Connection) -> Vec<CheckResul
 /// - a harness named but absent from `config.harnesses` ⇒ Warning;
 /// - a harness named + defined but its `command` is off PATH ⇒ Warning;
 /// - otherwise ⇒ Pass.
-fn check_review_harness(config: &Config) -> CheckResult {
+pub(crate) fn check_review_harness(config: &Config) -> CheckResult {
     let name = config.review.harness.trim();
     if name.is_empty() {
         return CheckResult {
@@ -1729,7 +1744,7 @@ mod tests {
         // false, so no row is emitted. Prove the gate predicate.
         let conn = crate::db::open_memory().unwrap();
         assert!(
-            !crate::storage::any_review_enabled(&conn).unwrap(),
+            !crate::storage::any_review_enabled(&conn, false).unwrap(),
             "a DB with no review-enabled plan/step must not trigger the check"
         );
     }

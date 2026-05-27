@@ -613,10 +613,12 @@ fn main() -> Result<()> {
             strict,
         } => {
             let h = cli.harness.as_deref();
-            // `--strict` rejects a review-enabled bundle when this machine
-            // has no review harness configured (docs/dag-redesign.md
-            // §13.3).
-            let review_harness_configured = !config.review.harness.trim().is_empty();
+            // `--strict` rejects a bundle that would enable review on this
+            // machine when no usable review harness is configured
+            // (docs/dag-redesign.md §13.3). Inherited global review defaults
+            // count too.
+            let review_harness_configured = crate::preflight::review_harness_is_usable(&config);
+            let global_review_enabled = config.review.enabled.unwrap_or(false);
             import::import_plan(
                 &conn,
                 &file,
@@ -626,6 +628,7 @@ fn main() -> Result<()> {
                 h,
                 strict,
                 review_harness_configured,
+                global_review_enabled,
             )
         }
 
@@ -662,6 +665,24 @@ fn main() -> Result<()> {
 
         // -- Question --
         Command::Question(subcmd) => match subcmd {
+            QuestionCommand::List { plan } => commands::interruption::cmd_interruption_list(
+                &conn,
+                &project,
+                plan.as_deref(),
+                &out,
+            ),
+            QuestionCommand::Answer { id, text } => {
+                commands::interruption::cmd_interruption_resolve(
+                    &conn,
+                    &project,
+                    None,
+                    &id,
+                    None,
+                    Some(&text),
+                    None,
+                    &out,
+                )
+            }
             QuestionCommand::Ask {
                 question,
                 suggest,
@@ -704,7 +725,8 @@ fn main() -> Result<()> {
         // -- Block (raise a blocker interruption) --
         Command::Block { text } => {
             use crate::commands::question::{
-                DISABLED_MESSAGE, NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome, record_block,
+                BLOCK_DISABLED_MESSAGE, BLOCK_NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome,
+                record_block,
             };
             use std::io::Read;
 
@@ -721,11 +743,11 @@ fn main() -> Result<()> {
 
             match record_block(&conn, &project, &body, &out)? {
                 QuestionAskOutcome::NoActiveRun => {
-                    eprintln!("{NO_ACTIVE_RUN_MESSAGE}");
+                    eprintln!("{BLOCK_NO_ACTIVE_RUN_MESSAGE}");
                     std::process::exit(1);
                 }
                 QuestionAskOutcome::Disabled => {
-                    eprintln!("{DISABLED_MESSAGE}");
+                    eprintln!("{BLOCK_DISABLED_MESSAGE}");
                     std::process::exit(1);
                 }
                 QuestionAskOutcome::Recorded { .. } => Ok(()),

@@ -43,6 +43,9 @@ pub enum QuestionAskOutcome {
 /// Stderr message for [`QuestionAskOutcome::NoActiveRun`].
 pub const NO_ACTIVE_RUN_MESSAGE: &str = "ralph question ask: no active ralph run found for this project. This command only works while a step is being executed by `ralph run`.";
 
+/// Stderr message for [`QuestionAskOutcome::NoActiveRun`] on `ralph block`.
+pub const BLOCK_NO_ACTIVE_RUN_MESSAGE: &str = "ralph block: no active ralph run found for this project. This command only works while a step is being executed by `ralph run`.";
+
 /// Stderr message for [`QuestionAskOutcome::Disabled`]. Tone is encouraging
 /// rather than adversarial — the harness will see this in stderr and we want
 /// it to fall back to "make a reasonable guess and flag it" rather than retry
@@ -57,6 +60,17 @@ flagged is preferable to halting; do not retry this command.
 
 (If the user wants to enable questions, they can press `Q` on this plan
 in the ralph TUI, or run `ralph plan questions on <slug>`.)";
+
+/// Stderr message for [`QuestionAskOutcome::Disabled`] on `ralph block`.
+pub const BLOCK_DISABLED_MESSAGE: &str =
+    "ralph block: question/blocker interruptions are not enabled for this plan.
+
+Do not continue past this blocker silently. Stop, surface the missing
+prerequisite to the user, and explain that ralph's interruption feature
+is disabled for this plan. Do not retry this command.
+
+(If the user wants to enable interruptions, they can press `Q` on this
+plan in the ralph TUI, or run `ralph plan questions on <slug>`.)";
 
 /// The (step_id, attempt) an interruption-raising CLI call binds to, after
 /// the run-lock + `questions_enabled` gate has passed.

@@ -1165,6 +1165,30 @@ pub enum PlanHarnessCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum QuestionCommand {
+    /// Legacy alias for `ralph interruption list`.
+    ///
+    /// Kept for one release as the V26 compatibility bridge documented in
+    /// `docs/dag-redesign.md`. Lists open questions and blockers through the
+    /// unified interruption model.
+    List {
+        /// Filter to interruptions on a specific plan slug.
+        plan: Option<String>,
+    },
+
+    /// Legacy alias for `ralph interruption resolve --answer`.
+    ///
+    /// Kept for one release as the V26 compatibility bridge documented in
+    /// `docs/dag-redesign.md`. Accepts the same 1-based list index legacy
+    /// `question answer` used, but also works with a direct interruption id.
+    Answer {
+        /// Interruption id (a uuid) OR its 1-based index in
+        /// `ralph question list` / `ralph interruption list`.
+        id: String,
+
+        /// Freeform answer/resolution text.
+        text: String,
+    },
+
     /// Record a harness-asked question against the currently-executing step.
     ///
     /// Designed to be invoked by the harness mid-step. Binds to the live
@@ -2780,6 +2804,24 @@ mod tests {
             assert_eq!(priority, vec![1, 2]);
         } else {
             panic!("Expected Question Ask");
+        }
+    }
+
+    #[test]
+    fn test_parse_question_list_and_answer_aliases() {
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "list", "my-plan"]).unwrap();
+        if let Command::Question(QuestionCommand::List { plan }) = cli.command.unwrap() {
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+        } else {
+            panic!("Expected Question List");
+        }
+
+        let cli = Cli::try_parse_from(["ralph-rs", "question", "answer", "2", "Ship it"]).unwrap();
+        if let Command::Question(QuestionCommand::Answer { id, text }) = cli.command.unwrap() {
+            assert_eq!(id, "2");
+            assert_eq!(text, "Ship it");
+        } else {
+            panic!("Expected Question Answer");
         }
     }
 

@@ -1783,6 +1783,8 @@ fn apply_palette_import(
         project,
         strict: false,
         review_harness_configured: false,
+
+        global_review_enabled: false,
     };
     match crate::import::import_plan_from_data(conn, &imported, &options) {
         Ok(slug) => {

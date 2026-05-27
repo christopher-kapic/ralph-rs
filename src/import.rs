@@ -400,26 +400,34 @@ pub struct ImportOptions<'a> {
     /// When true, major-version mismatch in `ralph_rs_version` is a hard
     /// error; when false, it only warns.
     pub strict: bool,
-    /// Whether the *target machine* has a global review harness configured
-    /// (`config.review.harness` non-empty). Consulted only under `strict`:
-    /// a bundle whose `review_enabled` is set to `true` anywhere
-    /// (plan- or step-level) cannot run reviews on a machine with no
-    /// review harness, so `--strict` rejects it — consistent with
-    /// `--strict` rejecting an unusable bundle rather than importing
-    /// something that cannot execute as authored (docs/dag-redesign.md
-    /// §13.3). Non-strict import keeps the toggle and `ralph doctor` warns
-    /// until a review harness is configured (STEP 44). Ignored when
-    /// `strict` is false.
+    /// Whether the target machine is actually capable of running reviews right
+    /// now: a review harness is named, defined in config, and on PATH.
+    /// Consulted only under `strict`: a bundle whose imported steps would
+    /// have effective review enabled cannot run as authored on a machine
+    /// without a usable review harness, so `--strict` rejects it. Non-strict
+    /// import keeps the toggle and `ralph doctor` warns until a usable review
+    /// harness is configured (STEP 44). Ignored when `strict` is false.
     pub review_harness_configured: bool,
+    /// Bottom-of-the-chain global review default from the target machine
+    /// (`config.review.enabled ?? false`). Needed so strict import can reject
+    /// a bundle whose plan/steps all *inherit* review from the machine
+    /// default, even when the bundle itself carries no explicit
+    /// `review_enabled = true`.
+    pub global_review_enabled: bool,
 }
 
-/// True when the bundle turns review **on** at any scope (plan- or
-/// step-level `review_enabled == Some(true)`). A bundle that only sets
-/// `Some(false)` (review explicitly off) needs no review harness, so it is
-/// not rejected even under `--strict`.
-fn bundle_requests_review(data: &ImportedPlan) -> bool {
+/// True when importing this bundle onto the target machine would leave review
+/// effective-enabled for at least one imported step. The imported precedence
+/// chain is `step.review_enabled ?? plan.review_enabled ?? global_default`. An
+/// explicit plan-level `true` also counts even for a zero-step template, since
+/// the bundle itself turned review on at plan scope.
+fn bundle_requests_review(data: &ImportedPlan, global_default: bool) -> bool {
     data.plan.review_enabled == Some(true)
-        || data.steps.iter().any(|s| s.review_enabled == Some(true))
+        || data.steps.iter().any(|s| {
+            s.review_enabled
+                .or(data.plan.review_enabled)
+                .unwrap_or(global_default)
+        })
 }
 
 /// Read and parse a portable plan JSON file.
@@ -447,7 +455,10 @@ pub fn import_plan_from_data(
     // (docs/dag-redesign.md §13.3) — consistent with `--strict` refusing a
     // bundle it cannot run as authored. Non-strict import keeps the toggle;
     // `ralph doctor` warns until a review harness is configured (STEP 44).
-    if options.strict && bundle_requests_review(data) && !options.review_harness_configured {
+    if options.strict
+        && bundle_requests_review(data, options.global_review_enabled)
+        && !options.review_harness_configured
+    {
         anyhow::bail!(
             "strict import rejected: this bundle enables review (plan/step \
              `review_enabled` is on) but no review harness is configured on \
@@ -638,6 +649,7 @@ pub fn import_plan(
     harness: Option<&str>,
     strict: bool,
     review_harness_configured: bool,
+    global_review_enabled: bool,
 ) -> Result<()> {
     let data = read_plan_file(file)?;
 
@@ -648,6 +660,7 @@ pub fn import_plan(
         project,
         strict,
         review_harness_configured,
+        global_review_enabled,
     };
 
     let effective_slug = slug.unwrap_or(&data.plan.slug);
@@ -721,6 +734,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
@@ -781,6 +796,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -819,6 +836,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -853,6 +872,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -886,6 +907,8 @@ mod tests {
             project: "/home/user/my-project",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         import_plan_from_data(&conn, &data, &options).unwrap();
@@ -924,6 +947,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let id1 = import_plan_from_data(&conn, &data, &options1).unwrap();
 
@@ -934,6 +959,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let id2 = import_plan_from_data(&conn, &data, &options2).unwrap();
 
@@ -972,6 +999,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
@@ -1051,6 +1080,8 @@ mod tests {
             project: "/tmp/imported",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
@@ -1135,6 +1166,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         )
         .unwrap();
 
@@ -1156,6 +1188,7 @@ mod tests {
             None,
             None,
             None,
+            false,
             false,
             false,
         );
@@ -1234,6 +1267,8 @@ mod tests {
             project: "/tmp/dst",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let b2_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
 
@@ -1267,6 +1302,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         // Import should succeed despite the missing dependency.
@@ -1308,6 +1345,8 @@ mod tests {
             project: "/tmp/rollback",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         let result = import_plan_from_data(&conn, &data, &options);
@@ -1346,6 +1385,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
@@ -1432,6 +1473,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         // Non-strict: should succeed (with a warning printed to stderr).
@@ -1469,6 +1512,8 @@ mod tests {
             project: "/tmp/proj",
             strict: true,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         let result = import_plan_from_data(&conn, &data, &options);
@@ -1504,6 +1549,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
@@ -1574,6 +1621,8 @@ mod tests {
             project: "/tmp/dst",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
         let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
@@ -1610,6 +1659,8 @@ mod tests {
             project: "/tmp/proj",
             strict: true,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
 
         // Even in strict mode, an unparseable version only warns; the
@@ -1646,6 +1697,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
@@ -1677,6 +1730,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
@@ -1763,6 +1818,8 @@ mod tests {
             project: "/tmp/dst",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
         let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
@@ -1823,6 +1880,8 @@ mod tests {
             project: "/tmp/dst",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
         let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
@@ -1918,6 +1977,8 @@ mod tests {
             project: "/tmp/dst",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
         let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
@@ -2010,6 +2071,8 @@ mod tests {
             project: "/tmp/dst",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let id = import_plan_from_data(&conn, &data, &options).unwrap();
         let p = storage::get_plan_by_id(&conn, &id).unwrap();
@@ -2072,6 +2135,8 @@ mod tests {
             project: "/tmp/dst",
             strict: true,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let err = import_plan_from_data(&conn, &data, &strict_no_harness)
             .expect_err("strict must reject a review bundle with no review harness");
@@ -2094,6 +2159,8 @@ mod tests {
             project: "/tmp/dst",
             strict: true,
             review_harness_configured: true,
+
+            global_review_enabled: false,
         };
         let id = import_plan_from_data(&conn, &data, &strict_with_harness)
             .expect("strict import must succeed when a review harness exists");
@@ -2110,6 +2177,8 @@ mod tests {
             project: "/tmp/dst",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let id2 = import_plan_from_data(&conn, &data, &lax)
             .expect("non-strict import must keep the review toggle");
@@ -2117,6 +2186,70 @@ mod tests {
             storage::get_plan_by_id(&conn, &id2).unwrap().review_enabled,
             Some(true),
             "non-strict import keeps the toggle (doctor warns instead — STEP 44)"
+        );
+    }
+
+    /// A bundle with no explicit review toggle still counts as review-enabled
+    /// under `--strict` when the target machine's global default is ON. This
+    /// closes the inheritance gap where doctor/import used to look only for
+    /// explicit DB or bundle `true` values.
+    #[test]
+    fn test_strict_rejects_inheriting_bundle_when_global_review_default_is_on() {
+        let conn = setup();
+        let original = storage::create_plan(
+            &conn,
+            "inherit-rev",
+            "/tmp/src",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::create_step(
+            &conn,
+            &original.id,
+            "s",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let original = storage::get_plan_by_id(&conn, &original.id).unwrap();
+        let steps = storage::list_steps(&conn, &original.id).unwrap();
+        let json = serde_json::to_string_pretty(&export::build_exported_plan(
+            &original,
+            &steps,
+            Vec::new(),
+            &[],
+        ))
+        .unwrap();
+        let data: ImportedPlan = serde_json::from_str(&json).unwrap();
+
+        let strict_no_harness = ImportOptions {
+            slug: Some("inherit-rejected"),
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: true,
+            review_harness_configured: false,
+            global_review_enabled: true,
+        };
+        let err = import_plan_from_data(&conn, &data, &strict_no_harness).expect_err(
+            "strict must reject an inheriting review bundle when the global default is on",
+        );
+        assert!(err.to_string().contains("enables review"), "{err}");
+        assert!(
+            storage::get_plan_by_slug(&conn, "inherit-rejected", "/tmp/dst")
+                .unwrap()
+                .is_none(),
+            "a rejected strict import must write NO partial plan"
         );
     }
 
@@ -2170,9 +2303,12 @@ mod tests {
             project: "/tmp/dst",
             strict: true,
             review_harness_configured: false,
+
+            global_review_enabled: true,
         };
-        let id = import_plan_from_data(&conn, &data, &options)
-            .expect("a review-OFF bundle needs no review harness even under --strict");
+        let id = import_plan_from_data(&conn, &data, &options).expect(
+            "a review-OFF bundle needs no review harness even when global review defaults on",
+        );
         assert_eq!(
             storage::get_plan_by_id(&conn, &id).unwrap().review_enabled,
             Some(false)
@@ -2226,6 +2362,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
@@ -2277,6 +2415,8 @@ mod tests {
             project: "/tmp/proj",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
@@ -2342,6 +2482,8 @@ mod tests {
             project: "/tmp/dst",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
 
@@ -2423,6 +2565,8 @@ mod tests {
             project: "/tmp/dst",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
         let steps = storage::list_steps(&conn, &imported_id).unwrap();
@@ -2546,6 +2690,8 @@ mod tests {
             project: "/tmp/dst",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         };
         let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
         let steps = storage::list_steps(&conn, &imported_id).unwrap();
@@ -2592,6 +2738,8 @@ mod tests {
             project: "/tmp/bad",
             strict: false,
             review_harness_configured: false,
+
+            global_review_enabled: false,
         }
     }
 
