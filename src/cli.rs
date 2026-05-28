@@ -820,13 +820,16 @@ pub enum StepCommand {
         #[arg(long = "tag", value_name = "TAG", conflicts_with = "import_json")]
         tags: Vec<String>,
 
-        /// Placement (general / join form): make the new step depend on each
-        /// of these existing steps, by 1-based number or 8-char short id
-        /// (repeatable). Use this when a step needs *several* prior steps
-        /// (a fan-in / integration step) — `--after`/`--before` are the
-        /// single-parent tree sugar; this is the multi-parent primitive.
-        /// Self-edges and cycles are rejected. Mutually exclusive with the
-        /// other placement flags.
+        /// Placement (general / join form): make the new step depend on
+        /// each of these existing steps, by 1-based number or 8-char short
+        /// id. **Repeat the flag once per parent** (`--depends-on a
+        /// --depends-on b`); space-separated multi-value (`--depends-on a
+        /// b`) is *not* supported here because it would silently swallow
+        /// the trailing `<plan>` positional. Use this when a step needs
+        /// *several* prior steps (a fan-in / integration step) —
+        /// `--after`/`--before` are the single-parent tree sugar; this is
+        /// the multi-parent primitive. Self-edges and cycles are rejected.
+        /// Mutually exclusive with the other placement flags.
         #[arg(
             long = "depends-on",
             value_name = "SHORT_ID|NUM",
@@ -1721,6 +1724,82 @@ mod tests {
             assert_eq!(title.as_deref(), Some("Wire it up"));
             assert_eq!(plan.as_deref(), Some("my-feature"));
             assert_eq!(depends_on, vec!["1".to_string(), "abc12345".to_string()]);
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_depends_on_does_not_swallow_trailing_plan_slug() {
+        // Regression: an earlier `num_args = 1..` attempt made --depends-on
+        // greedy, so `--depends-on a my-plan` consumed `my-plan` as a
+        // second dependency and the bare `step add` then failed with
+        // "No active plan found". The contract is that the trailing
+        // positional `<plan>` slug is always preserved; --depends-on takes
+        // exactly one value per occurrence.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "My Title",
+            "--depends-on",
+            "a",
+            "my-plan",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Add {
+            title,
+            plan,
+            depends_on,
+            ..
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(title.as_deref(), Some("My Title"));
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+            assert_eq!(depends_on, vec!["a".to_string()]);
+        } else {
+            panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_add_repeated_depends_on_preserves_trailing_plan_slug() {
+        // The supported multi-parent form: repeat --depends-on once per
+        // parent. The trailing `<plan>` positional must still parse as
+        // the plan slug.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "add",
+            "Wire it up",
+            "--depends-on",
+            "1",
+            "--depends-on",
+            "abc12345",
+            "--depends-on",
+            "def67890",
+            "my-feature",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Add {
+            title,
+            plan,
+            depends_on,
+            ..
+        }) = cli.command.unwrap()
+        {
+            assert_eq!(title.as_deref(), Some("Wire it up"));
+            assert_eq!(plan.as_deref(), Some("my-feature"));
+            assert_eq!(
+                depends_on,
+                vec![
+                    "1".to_string(),
+                    "abc12345".to_string(),
+                    "def67890".to_string()
+                ]
+            );
         } else {
             panic!("Expected Step Add");
         }

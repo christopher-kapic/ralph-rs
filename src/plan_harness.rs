@@ -37,7 +37,7 @@ when:
 - The work spans more than a single coherent session of edits.
 - You want each step independently verified by tests before the next one starts.
 - You want a review pass interleaved with implementation passes.
-- You want per-step retry on failure (a failed attempt's dirty tree is preserved and its test/hook output is fed into the next attempt's prompt; on retry-budget exhaustion ralph raises a blocker so a human can choose retry-from-scratch vs. accept-failed instead of going straight terminal).
+- You want per-step retry on failure (a failed attempt's dirty tree is preserved and its test/hook output is fed into the next attempt's prompt; on retry-budget exhaustion ralph raises a blocker so a human can choose retry with the parked changes restored vs. accept-failed instead of going straight terminal).
 
 A bugfix that's "find the line, change three characters, run tests" is not a
 ralph. A multi-phase refactor with verification gates is.
@@ -87,17 +87,25 @@ When the work genuinely allows it, **make independence explicit**:
 
 - Split work into branches that *don't* depend on each other and declare
   only the edges that are real. **Every step's place in the DAG is
-  explicit** — on a non-empty plan `ralph step add` *requires* one of:
-  `--after <S>` (the new step depends on S — a new branch off S),
-  `--before <S>` (insert before S — the new step takes over S's incoming
-  edges; S then depends only on it), `--depends-on <S>...` (depend on
-  several prior steps — a fan-in/join), or `--root` (a deliberate
-  independent root). The first step of an empty plan is the implied root.
-  `--after`/`--before` are **dependency edges, not list position** — there
-  is no positional insert (that ambiguity silently produced edge-less
-  DAGs). In `--import-json` the DAG is carried per-object via `short_id` +
-  `depends_on`. A `--root` / no-`depends_on` step runs as soon as the
-  scheduler reaches it.
+  explicit** — on a non-empty plan `ralph step add` *requires* exactly
+  one of the following (or the `--after` + `--before` splice combination
+  described below): `--after <S>` (the new step depends on S — a new
+  branch off S), `--before <S>` (insert before S — the new step takes
+  over S's incoming edges; S then depends only on it),
+  `--depends-on <S>` (depend on several prior steps — a fan-in/join;
+  **repeat the flag** once per parent: `--depends-on a --depends-on b`.
+  Space-separated multi-value is *not* supported here because it would
+  swallow the trailing `<plan>` positional),
+  or `--root` (a deliberate independent root). `--after` and `--before`
+  together is the **splice** operation: the new step takes over
+  `--before` step's incoming edges and `--before` step then depends on
+  the new step, while the new step depends on `--after` step — useful for
+  inserting a step in the middle of a chain. The first step of an empty
+  plan is the implied root. `--after`/`--before` are **dependency edges,
+  not list position** — there is no positional insert (that ambiguity
+  silently produced edge-less DAGs). In `--import-json` the DAG is
+  carried per-object via `id` + `depends_on`. A `--root` /
+  no-`depends_on` step runs as soon as the scheduler reaches it.
 - Don't manufacture a dependency just because two steps touch the same
   area — only add an edge when step B genuinely needs step A's output.
 - **Don't over-fragment into deep independent branches that all re-converge
@@ -133,6 +141,10 @@ Default to: **build → verify → review → fix-as-needed**, repeated per phas
   - `ralph step edit <sel> --review on` — review only specific (risky /
     subtle-criteria) steps; `--review off` exempts one; `--review inherit`
     defers to plan/global. Precedence is step > plan > global > off.
+    (`--review` is `step edit`-only; `ralph step add` has no `--review`
+    flag inline — set `review_enabled: true` per-object in `--import-json`
+    to opt a new step in at creation time, or `ralph step edit <sel>
+    --review on` immediately after.)
   - `ralph plan create ... --max-review-corrections <n>` (default 3) bounds
     the review→correction recursion; over the cap ralph raises a blocker for
     a human instead of looping forever.
@@ -225,7 +237,7 @@ ralph plan approve <slug>
 Plan slug is a trailing positional argument on every step command and defaults
 to the active plan when omitted.
 
-- `ralph step add "<title>" <slug> [--description "<desc>"] <placement> [--harness <h>] [--change-policy {required|optional|forbidden}] [--max-retries <n>] [--retry-strategy {keep|rollback}] [--import-json <FILE|->]` — on a non-empty plan exactly one `<placement>` is required: `--after <S>` (depend on S), `--before <S>` (insert before S), `--depends-on <S>...` (depend on several — a join), or `--root` (explicit independent root). First step of an empty plan is the implied root.
+- `ralph step add "<title>" <slug> [--description "<desc>"] <placement> [--harness <h>] [--model <name>] [--change-policy {required|optional}] [--max-retries <n>] [--retry-strategy {keep|rollback}] [--import-json <FILE|->]` — on a non-empty plan exactly one `<placement>` is required (or the `--after` + `--before` splice combination): `--after <S>` (depend on S), `--before <S>` (insert before S), `--depends-on <S>` (depend on several — a join; **repeat the flag** once per parent: `--depends-on a --depends-on b`. Space-separated multi-value is not supported, it would swallow the trailing `<slug>` positional), or `--root` (explicit independent root). `--after` + `--before` together splices: the new step takes over `--before`'s incoming edges and `--before` then depends on the new step, while the new step depends on `--after` — useful for inserting a step in the middle of a chain. First step of an empty plan is the implied root.
 - `ralph step list <slug>`
 - `ralph step edit <n> <slug> [--title "<title>"] [--description "<desc>"] [--review {on|off|inherit}]`
 - `ralph step remove <n> <slug> --force`
@@ -375,9 +387,14 @@ after that step's deterministic tests pass (subject `ralph <short_id>.<n> -
 History stays linear, one git branch per plan. The per-attempt audit trail
 lives in `execution_logs` (prompt / harness output / test output / diff per
 attempt, including failed ones), not in commits. Failed attempts leave the
-dirty tree on disk so the next attempt can build on top, with the prior
-test/hook output fed into its prompt; ralph rolls back only when the retry
-budget is exhausted (then raises a recoverable blocker). That commit shape is
+dirty tree on disk so the next attempt can build on top — only the
+test/hook output from the prior attempt is injected into the next attempt's
+prompt; the diff is *not* repeated, so the next attempt must read the
+worktree itself (e.g. `git diff`, `git status`) to see what changed. When
+the retry budget is exhausted the dirty tree from the last failed attempt
+is parked (stashed) and the blocker offers a "Retry step with parked
+changes" option that restores it, or a "Mark step Failed" option. That
+commit shape is
 how rollback, per-step diff isolation, and the built-in reviewer's fixed-SHA
 review all work, so don't try to disable it.
 
@@ -449,22 +466,38 @@ atomic and independently verifiable.
 ## Reference: useful CLI flags
 
 - `ralph step add --import-json <FILE|->` — bulk insert from a JSON array (or
-  one object). Carries the DAG: per-object `short_id` + `depends_on` (parents
-  by short id, or an existing plan step by short id/number). Unique-short-id
-  / acyclic / no-dangling validated; whole batch atomic. Recommended for
+  one object). Carries the DAG: per-object `id` + `depends_on` (parents by
+  the batch-local `id`, or an existing plan step by short id/number;
+  `short_id` may also be supplied to pin an exported handle). Unique-id /
+  acyclic / no-dangling validated; whole batch atomic. Recommended for
   anything non-trivial.
 - `ralph step add ... <placement>` — on a non-empty plan exactly one is
-  required: `--after <S>` (depend on S), `--before <S>` (insert before S — it
-  takes over S's incoming edges), `--depends-on <S>...` (depend on several —
-  a join), or `--root` (explicit independent root). First step of an empty
-  plan is the implied root. Self-edges and cycles are rejected.
+  required (or the `--after` + `--before` splice combination): `--after <S>`
+  (depend on S), `--before <S>` (insert before S — it takes over S's
+  incoming edges), `--depends-on <S>` (depend on several — a join;
+  **repeat the flag** once per parent: `--depends-on a --depends-on b`.
+  Space-separated multi-value would swallow the trailing `<plan>`
+  positional and is therefore not accepted), or
+  `--root` (explicit independent root). `--after` + `--before` together
+  splices: the new step takes over `--before`'s incoming edges and
+  `--before` then depends on the new step, while the new step depends on
+  `--after` — useful for inserting a step in the middle of a chain. First
+  step of an empty plan is the implied root. Self-edges and cycles are
+  rejected.
 - `ralph step dependency add|remove|list <n|short_id> [--depends-on <short_id|num>...]`
   — edit a step's dependency edges after creation.
-- `ralph step add ... --change-policy {required|optional|forbidden}` —
+- `ralph step add ... --change-policy {required|optional}` —
   `required` (default) fails on empty diff; `optional` allows it (use for
-  review); `forbidden` fails on any diff (use for read-only audit).
+  review).
 - `ralph step add ... --max-retries <n>` — per-step retry override.
 - `ralph step add ... --harness <name>` — per-step harness override.
+- `ralph step add ... --model <name>` — per-step model override (forwarded to
+  the harness's `model_args` template, e.g. `--model sonnet-4.6`); silently
+  ignored if the resolved harness has no `model_args` configured.
+- `ralph plan questions on <slug>` — opt in to mid-step harness questions.
+  Without this, the harness's `ralph question ask` / `ralph block` calls fail
+  with a disabled-feature error. Turn it on if any step's prompt expects to
+  raise a question or blocker.
 - `ralph config review set [--harness <h>] [--model <m>] [--enabled <bool>]` —
   the global built-in-review harness/model/default (only the fields you pass
   are written).

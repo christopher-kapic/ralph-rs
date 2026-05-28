@@ -148,6 +148,60 @@ fn build_options(suggestions: &[String], priorities: &[i32]) -> Vec<Interruption
         .collect()
 }
 
+/// Shared body of `record_question_ask` / `record_block` — gates via
+/// [`resolve_bound_step`], writes the open native `interruptions` row, and
+/// emits the Phase E `InterruptionRaised` NDJSON event. Kept private so
+/// the two public wrappers fix the `kind`/`options` shape (and keep
+/// stable, harness-facing names + per-kind doc comments).
+///
+/// The two public wrappers used to be 95% identical clones; collapsing
+/// them here keeps the gate + insert + NDJSON ordering in one place. The
+/// `auto_raised: false` argument is fixed for both — the executor's
+/// retry-exhausted auto-blocker (the only `true` writer) goes through
+/// `executor::raise_retry_exhausted_blocker`, not this path.
+fn record_interruption(
+    conn: &Connection,
+    project: &str,
+    kind: InterruptionKind,
+    body: &str,
+    options: &[InterruptionOption],
+    out: &OutputContext,
+) -> Result<QuestionAskOutcome> {
+    let bound = match resolve_bound_step(conn, project)? {
+        Ok(b) => b,
+        Err(outcome) => return Ok(outcome),
+    };
+
+    let id = storage::insert_interruption(
+        conn,
+        &bound.step_id,
+        bound.attempt,
+        kind,
+        body,
+        options,
+    )
+    .with_context(|| format!("inserting {} interruption", kind.as_str()))?;
+
+    // Phase E Fix 4: harness-raised interruptions emit `InterruptionRaised`
+    // (auto_raised=false) for observers wiring `--json` consumers. No-op
+    // outside JSON mode and best-effort on slug-lookup failures.
+    output::emit_interruption_raised(
+        conn,
+        out.format == OutputFormat::Json,
+        &id,
+        &bound.step_id,
+        kind.as_str(),
+        false,
+        bound.attempt,
+    );
+
+    Ok(QuestionAskOutcome::Recorded {
+        question_id: id,
+        step_id: bound.step_id,
+        attempt: bound.attempt,
+    })
+}
+
 /// Implement `ralph question ask` against an open DB connection.
 ///
 /// Gates via [`resolve_bound_step`] (the pre-DAG binding model + the
@@ -163,40 +217,8 @@ pub fn record_question_ask(
     priorities: &[i32],
     out: &OutputContext,
 ) -> Result<QuestionAskOutcome> {
-    let bound = match resolve_bound_step(conn, project)? {
-        Ok(b) => b,
-        Err(outcome) => return Ok(outcome),
-    };
-
     let options = build_options(suggestions, priorities);
-    let id = storage::insert_interruption(
-        conn,
-        &bound.step_id,
-        bound.attempt,
-        InterruptionKind::Question,
-        question,
-        &options,
-    )
-    .context("inserting question interruption")?;
-
-    // Phase E Fix 4: harness-raised interruptions emit `InterruptionRaised`
-    // (auto_raised=false) for observers wiring `--json` consumers. No-op
-    // outside JSON mode and best-effort on slug-lookup failures.
-    output::emit_interruption_raised(
-        conn,
-        out.format == OutputFormat::Json,
-        &id,
-        &bound.step_id,
-        InterruptionKind::Question.as_str(),
-        false,
-        bound.attempt,
-    );
-
-    Ok(QuestionAskOutcome::Recorded {
-        question_id: id,
-        step_id: bound.step_id,
-        attempt: bound.attempt,
-    })
+    record_interruption(conn, project, InterruptionKind::Question, question, &options, out)
 }
 
 /// Implement `ralph block` against an open DB connection.
@@ -211,39 +233,7 @@ pub fn record_block(
     body: &str,
     out: &OutputContext,
 ) -> Result<QuestionAskOutcome> {
-    let bound = match resolve_bound_step(conn, project)? {
-        Ok(b) => b,
-        Err(outcome) => return Ok(outcome),
-    };
-
-    let id = storage::insert_interruption(
-        conn,
-        &bound.step_id,
-        bound.attempt,
-        InterruptionKind::Blocker,
-        body,
-        &[],
-    )
-    .context("inserting blocker interruption")?;
-
-    // Phase E Fix 4: same NDJSON wiring as `record_question_ask`. A
-    // harness-raised blocker is never auto-raised — only the executor's
-    // retry-exhausted path sets that flag.
-    output::emit_interruption_raised(
-        conn,
-        out.format == OutputFormat::Json,
-        &id,
-        &bound.step_id,
-        InterruptionKind::Blocker.as_str(),
-        false,
-        bound.attempt,
-    );
-
-    Ok(QuestionAskOutcome::Recorded {
-        question_id: id,
-        step_id: bound.step_id,
-        attempt: bound.attempt,
-    })
+    record_interruption(conn, project, InterruptionKind::Blocker, body, &[], out)
 }
 
 #[cfg(test)]

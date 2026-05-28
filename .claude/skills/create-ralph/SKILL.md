@@ -14,7 +14,7 @@ Plan **per feature, not per task**. If the work fits in one focused session, don
 - The work spans more than a single coherent session of edits.
 - You want each step independently verified by tests before the next one starts.
 - You want a review pass interleaved with implementation passes.
-- You want per-step retry on failure (a failed attempt's dirty tree is preserved and its test/hook output is fed into the next attempt's prompt; on retry-budget exhaustion ralph raises a blocker so a human can choose retry-from-scratch vs. accept-failed instead of going straight terminal).
+- You want per-step retry on failure (a failed attempt's dirty tree is preserved and its test/hook output is fed into the next attempt's prompt; on retry-budget exhaustion ralph raises a blocker so a human can choose retry with the parked changes restored vs. accept-failed instead of going straight terminal).
 
 A bugfix that's "find the line, change three characters, run tests" is not a ralph. A multi-phase refactor with verification gates is.
 
@@ -41,6 +41,10 @@ Run these checks first. If any fail, fix them before authoring the plan:
 
 6. **Create the plan** with the commands in *Authoring* below.
 
+7. **Show the final plan** with `ralph plan show` for user review.
+
+8. **Suggest hooks** (see *Hook Attachment*) for steps that warrant automated post-execution review.
+
 ## Express step independence (the DAG payoff)
 
 Ralph executes a plan as a **dependency DAG**, not a flat list. When one
@@ -54,17 +58,23 @@ So, when the work genuinely allows it, **make independence explicit**:
 
 - Split work into branches that *don't* depend on each other and declare
   only the edges that are real. **Every step's place in the DAG is
-  explicit** — on a non-empty plan `ralph step add` *requires* one of:
+  explicit** — on a non-empty plan `ralph step add` *requires* exactly one
+  of the following (or the `--after` + `--before` splice combination
+  described below):
   - `--after <S>` — the new step depends on `S` (a new branch off `S`);
   - `--before <S>` — insert before `S` (the new step takes over `S`'s
     incoming edges; `S` then depends only on it);
-  - `--depends-on <S>...` — depend on several prior steps (a fan-in/join);
+  - `--depends-on <S>` (repeat once per parent: `--depends-on a --depends-on b`) — depend on several prior steps (a fan-in/join). Note: space-separated multi-value (`--depends-on a b`) is *not* supported here because it would swallow the trailing `<plan>` positional;
   - `--root` — a deliberate independent root (no dependencies).
 
-  The first step of an empty plan is the implied root. `--after`/`--before`
-  are **dependency edges, not list position** — there is no positional
-  insert (that ambiguity silently produced edge-less DAGs). In
-  `--import-json`, the DAG is carried per-object via `short_id` +
+  `--after` and `--before` together is the **splice** operation: the new
+  step takes over `--before` step's incoming edges and `--before` step
+  then depends on the new step, while the new step depends on `--after`
+  step — useful for inserting a step in the middle of a chain. The first
+  step of an empty plan is the implied root. `--after`/`--before` are
+  **dependency edges, not list position** — there is no positional insert
+  (that ambiguity silently produced edge-less DAGs). In
+  `--import-json`, the DAG is carried per-object via `id` +
   `depends_on` (see below). Wire only true ordering constraints; a `--root`
   / no-`depends_on` step runs as soon as the scheduler reaches it.
 - Don't manufacture a dependency just because two steps touch the same
@@ -89,9 +99,9 @@ Default to: **build → verify → review → fix-as-needed**, repeated per phas
 - **Review — prefer the built-in pipeline.** Ralph now has a **built-in nondeterministic review pipeline**: a separate harness reviews each step's commit read-only, and a failed review automatically inserts a corrective step and re-parents dependents. You usually do **not** need to author explicit review steps anymore. Turn it on instead:
   - `ralph config review set --harness <h> --model <m> --enabled true` — set the global reviewer (use a *different* model from the implementer when possible, e.g. `codex` reviewing `claude`).
   - `ralph plan review on <slug>` — review every step in the plan; or
-  - `ralph step edit <sel> --review on` — review only specific (risky / subtle-criteria) steps; `--review off` exempts one; `--review inherit` defers to plan/global. Precedence is step > plan > global > off.
+  - `ralph step edit <sel> --review on` — review only specific (risky / subtle-criteria) steps; `--review off` exempts one; `--review inherit` defers to plan/global. Precedence is step > plan > global > off. (`--review` is `step edit`-only; `ralph step add` has no `--review` flag inline — set `review_enabled: true` per-object in `--import-json` to opt a new step in at creation time, or `ralph step edit <sel> --review on` immediately after.)
   - Tune the recursion bound with `ralph plan create ... --max-review-corrections <n>` (default 3): if a corrective step keeps failing its own review past this many rounds, ralph raises a blocker for a human instead of looping forever.
-- **Explicit review/fix steps are now the exception**, for cases the built-in pipeline doesn't cover (e.g. a whole-plan audit at the end, or a review that must run a command rather than read a diff). If you do author one, set `--change-policy optional` (reviewers produce no diff) and `--max-retries 1` (don't retry-loop on disagreement). A whole-plan audit step should `--depends-on` the steps it audits (so it runs after them); an independent check is `--root`. (`--after`/`--before` are dependency edges now, not "append at the end"; `ralph step move` only changes display/tie-break order, not edges.)
+- **Explicit review/fix steps are now the exception**, for cases the built-in pipeline doesn't cover (e.g. a whole-plan audit at the end, or a review that must run a command rather than read a diff). If you do author one, set `--change-policy optional` (reviewers produce no diff) and `--max-retries 1` (don't retry-loop on disagreement). A manual reviewer that itself appends fix steps via `ralph step add` needs a sandbox that can write ralph's DB outside the workspace — use the `codex-orchestrator` harness for that step (default `codex`'s `workspace-write` sandbox blocks the DB write silently). A whole-plan audit step should `--depends-on` the steps it audits (so it runs after them); an independent check is `--root`. (`--after`/`--before` are dependency edges now, not "append at the end"; `ralph step move` only changes display/tie-break order, not edges.)
 
 ## Authoring (this is where the gotchas hide)
 
@@ -139,6 +149,28 @@ ralph step add "<Step 2 title>" <slug> --description "<short desc>" --after 1   
 ralph plan approve <slug>
 ```
 
+## Hook Attachment
+
+Ralph supports lifecycle hooks that run shell commands at specific points
+during step execution (pre-step, post-step, pre-test, post-test). The user has
+a curated **hook library** of named hooks. You attach hooks by name — you do
+NOT invent new shell commands. If a hook the user would benefit from doesn't
+exist in the library, tell the user and ask them to create it with
+`ralph hooks add`.
+
+- `ralph plan set-hook <slug> --lifecycle <l> --hook <name>` — attach a
+  plan-wide hook (fires for every step in the plan). Use this for things like
+  "review every completed step".
+- `ralph step set-hook <n> <slug> --lifecycle <l> --hook <name>` — attach a
+  hook to a specific step. Use this when only certain steps need review,
+  linting, or extra checks.
+- `ralph plan hooks <slug>` — show all hooks attached to a plan.
+
+Hooks are most useful for post-step review: e.g., if a step is particularly
+risky or has subtle acceptance criteria, attach a `post-step` hook that runs
+a review agent against the diff. Proactively suggest hooks when a step would
+benefit from automated post-execution review.
+
 ## Writing good step descriptions
 
 Each step gets a **fresh context** — there is no conversation in step N+1. Prompts must be self-contained.
@@ -183,7 +215,7 @@ built-in pipeline doesn't cover:
 
 ## Branching
 
-Use `--branch feat/<slug>` so reviewers can run `git diff main..HEAD` from any step to see the cumulative work-to-date. Ralph commits **once per step**, only after that step's deterministic tests pass — subject `ralph <short_id>.<n> - <title>` plus `Ralph-*` trailers, where `<n>` is the attempt number that finally passed. History stays linear, one branch per plan; the per-attempt audit trail lives in `execution_logs` (prompt / harness output / test output / diff per attempt, including failed ones). Failed attempts leave the dirty tree on disk so the next attempt can build on top, with the prior test/hook output fed into its prompt; ralph rolls back only when the retry budget is exhausted (then raises a recoverable blocker — see below). That commit shape is how rollback, per-step diff isolation, and the built-in reviewer's fixed-SHA review all work, so don't try to disable it.
+Use `--branch feat/<slug>` so reviewers can run `git diff main..HEAD` from any step to see the cumulative work-to-date. Ralph commits **once per step**, only after that step's deterministic tests pass — subject `ralph <short_id>.<n> - <title>` plus `Ralph-*` trailers, where `<n>` is the attempt number that finally passed. History stays linear, one branch per plan; the per-attempt audit trail lives in `execution_logs` (prompt / harness output / test output / diff per attempt, including failed ones). Failed attempts leave the dirty tree on disk so the next attempt can build on top — only the test/hook output from the prior attempt is injected into the next attempt's prompt; the diff is *not* repeated, so the next attempt must read the worktree itself (e.g. `git diff`, `git status`) to see what changed. When the retry budget is exhausted the dirty tree from the last failed attempt is parked (stashed) and the blocker offers a "Retry step with parked changes" option that restores it, or a "Mark step Failed" option. That commit shape is how rollback, per-step diff isolation, and the built-in reviewer's fixed-SHA review all work, so don't try to disable it.
 
 ## Plan size
 
@@ -196,6 +228,14 @@ Pick granularity based on the work, not a target count. Rough bands:
 
 Don't compress a big task into a handful of mega-steps — you lose the per-step checkpointing, retry, and per-step diff isolation. Don't inflate a small task into trivial steps either. Whatever the size, every step must be atomic and independently verifiable.
 
+## Guidelines
+
+- Each step should be atomic and independently verifiable.
+- Steps should be ordered so that earlier steps don't depend on later ones.
+- Include enough context in each step description that an agent can execute it without seeing other steps.
+- Deterministic tests should validate the overall project health after each step.
+- Prefer smaller, focused steps over large monolithic ones.
+
 ## Anti-patterns
 
 - ❌ Referencing "the previous step" by name in a prompt — refer to files or commits (a DAG has no positional "previous").
@@ -206,6 +246,7 @@ Don't compress a big task into a handful of mega-steps — you lose the per-step
 - ❌ Deep independent branches that all re-converge at one late join — maximizes in-flight entanglement when something blocks. Prefer shallow + wide.
 - ❌ Authoring explicit review steps when the built-in review pipeline already covers it — enable `ralph plan/step review` instead of hand-rolling reviewer + fix-step plumbing.
 - ❌ Skipping `--change-policy optional` on a manual review/audit step — it'll be marked failed for producing no diff.
+- ❌ Using `codex` (default sandbox) for a manual review step that appends fix steps via `ralph step add` — writes to the ralph DB silently fail. Use `codex-orchestrator`.
 - ❌ Skipping the verify (deterministic test) step because "review will catch it" — reviewers read a diff, they don't run the code.
 - ❌ Listing a symbol as a "compatibility surface" without naming the behavior it implies — a ralph will make the field assignable / the function callable and stop there. Pair every named symbol with an observable behavior, or expect a no-op stub.
 - ❌ Acceptance criteria that aren't mechanically checkable ("it works", "feels fast", "default behavior is correct", "looks right") — these are wishes, not specs. A criterion is a shell command, a `grep`, an exit code, an HTTP status, a latency budget, or an observable file/state change, or the ralph will not verify it.
@@ -213,13 +254,15 @@ Don't compress a big task into a handful of mega-steps — you lose the per-step
 
 ## Reference: useful CLI flags
 
-- `ralph step add --import-json <FILE|->` — bulk insert steps from a JSON array (or one object). Carries the DAG: per-object `short_id` + `depends_on` (parents by short id, or an existing plan step by short id/number). Unique-short-id / acyclic / no-dangling validated; whole batch atomic. The recommended path for anything non-trivial.
-- `ralph step add ... <placement>` — on a non-empty plan exactly one placement is required: `--after <S>` (depend on S), `--before <S>` (insert before S; it takes over S's incoming edges), `--depends-on <S>...` (depend on several — a join), or `--root` (explicit independent root). First step of an empty plan is the implied root. Self-edges and cycles are rejected.
+- `ralph step add --import-json <FILE|->` — bulk insert steps from a JSON array (or one object). Carries the DAG: per-object `id` + `depends_on` (parents by the batch-local `id`, or an existing plan step by short id/number; `short_id` may also be supplied to pin an exported handle). Unique-id / acyclic / no-dangling validated; whole batch atomic. The recommended path for anything non-trivial.
+- `ralph step add ... <placement>` — on a non-empty plan exactly one placement is required (or the `--after` + `--before` splice combination): `--after <S>` (depend on S), `--before <S>` (insert before S; it takes over S's incoming edges), `--depends-on <S>` (depend on several — a join; **repeat the flag** once per parent: `--depends-on a --depends-on b`. Space-separated multi-value is not supported, it would swallow the trailing `<plan>` positional), or `--root` (explicit independent root). `--after` + `--before` together splices: the new step takes over `--before`'s incoming edges and `--before` then depends on the new step, while the new step depends on `--after` — useful for inserting a step in the middle of a chain. First step of an empty plan is the implied root. Self-edges and cycles are rejected.
 - `ralph step dependency add|remove|list <num|short_id> [--depends-on <short_id|num>...]` — edit a step's dependency edges after creation.
 - Every `<num>` step selector also accepts the step's stable 8-char `short_id` (shown by `ralph step list` / `ralph plan show`), which survives reordering and inserted corrective steps.
-- `ralph step add ... --change-policy {required|optional|forbidden}` — `required` (default) fails on empty diff; `optional` allows it (use for review); `forbidden` fails on any diff (use for read-only audit).
+- `ralph step add ... --change-policy {required|optional}` — `required` (default) fails on empty diff; `optional` allows it (use for review).
 - `ralph step add ... --max-retries <n>` — per-step retry override.
 - `ralph step add ... --harness <name>` — per-step harness override.
+- `ralph step add ... --model <name>` — per-step model override (forwarded to the harness's `model_args` template, e.g. `--model sonnet-4.6`); silently ignored if the resolved harness has no `model_args` configured.
+- `ralph plan questions on <slug>` — opt in to mid-step harness questions. Without this, the harness's `ralph question ask` / `ralph block` calls fail with a disabled-feature error. Turn it on if any step's prompt expects to raise a question or blocker.
 - `ralph config review set [--harness <h>] [--model <m>] [--enabled <bool>]` — the global built-in-review harness/model/default (only the fields you pass are written).
 - `ralph plan review <on|off> <slug>` — per-plan review toggle. `ralph step edit <sel> --review <on|off|inherit>` — per-step override. Precedence: step > plan > global > off (off by default).
 - `ralph plan create ... --max-review-corrections <n>` — cap the review→correction recursion (default 3); over the cap, ralph raises a blocker for a human instead of looping.

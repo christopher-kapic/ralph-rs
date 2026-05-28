@@ -622,14 +622,63 @@ pub enum StashPopOutcome {
 /// - `Err(_)` when `git stash push` itself failed for any reason other than
 ///   a clean tree (e.g. not a git repo, permission error).
 pub fn stash_push_with_untracked(workdir: &Path, message: &str) -> Result<Option<StashRef>> {
+    stash_push_with_untracked_except(workdir, message, &[])
+}
+
+/// Like [`stash_push_with_untracked`] but excludes the named paths from the
+/// stash via negative pathspecs (`:!<path>`). Used by the interruption-park
+/// path to keep the user's *pre-existing* untracked files in the working
+/// tree — they were never the harness's WIP, so we must not bury them on
+/// the stash stack (a later `git stash clear` or pop-conflict would lose
+/// them outright).
+///
+/// `exclude_paths` is a list of repo-relative paths (the same shape as
+/// [`get_untracked_files`] returns). When empty, this is byte-equivalent to
+/// [`stash_push_with_untracked`]. When non-empty, the spawned command is:
+///
+/// ```text
+/// git stash push --include-untracked -m <message> -- ':!<p1>' ':!<p2>' ...
+/// ```
+///
+/// `git stash push` with a pathspec restricts the stash to matching paths;
+/// combining a wildcard implicit-everything pathspec with negative excludes
+/// (the pattern git documents under `pathspec`) is the lightest-weight way
+/// to say "everything except these". Verified compatible with git >=
+/// 2.23. Returns `Ok(None)` when the resulting filtered tree is clean.
+pub fn stash_push_with_untracked_except(
+    workdir: &Path,
+    message: &str,
+    exclude_paths: &[String],
+) -> Result<Option<StashRef>> {
     // `git stash push` on a clean tree exits 0 with "No local changes to
     // save" on stdout — we have to distinguish that case from a real stash.
     // Rather than string-match stdout (brittle across locales), we ask git
     // for the pre-push stash list, push, and diff.
     let before = stash_list_shas(workdir)?;
 
+    let mut args: Vec<String> = vec![
+        "stash".to_string(),
+        "push".to_string(),
+        "--include-untracked".to_string(),
+        "-m".to_string(),
+        message.to_string(),
+    ];
+    // Only add the `--` pathspec sentinel when we have exclusions. Without
+    // it, plain `git stash push --include-untracked` stays the exact
+    // command that hit production for years (and the test fixture below
+    // proves the no-exclusion path is byte-equivalent).
+    if !exclude_paths.is_empty() {
+        args.push("--".to_string());
+        for path in exclude_paths {
+            // `:!<path>` is git's negative-pathspec literal exclude. Quoting
+            // here is unnecessary because we're passing each path as a
+            // separate argv entry rather than through a shell.
+            args.push(format!(":!{path}"));
+        }
+    }
+
     let output = Command::new("git")
-        .args(["stash", "push", "--include-untracked", "-m", message])
+        .args(&args)
         .current_dir(workdir)
         .output()
         .with_context(|| format!("failed to execute git stash push -m '{message}'"))?;
@@ -644,16 +693,17 @@ pub fn stash_push_with_untracked(workdir: &Path, message: &str) -> Result<Option
     }
 
     // Match by message against the post-push list. If nothing was pushed
-    // (clean tree), the match will find no new stash and we return None.
-    // If something was pushed, the new stash's SHA is one of (after -
-    // before) and its subject matches `message`.
+    // (clean tree, or all changes were in the excluded set), the match
+    // will find no new stash and we return None. If something was pushed,
+    // the new stash's SHA is one of (after - before) and its subject
+    // matches `message`.
     let after = stash_list_shas_with_subjects(workdir)?;
     for (sha, subject) in &after {
         if !before.contains(sha) && subject_matches(subject, message) {
             return Ok(Some(StashRef(sha.clone())));
         }
     }
-    // No new stash -> tree was clean.
+    // No new stash -> tree was clean (post-exclusion).
     Ok(None)
 }
 
@@ -1661,7 +1711,37 @@ impl ReviewWorktree {
 
 impl Drop for ReviewWorktree {
     fn drop(&mut self) {
-        remove_worktree(&self.main_repo, &self.path);
+        // `remove_worktree` shells out to git twice (`worktree remove --force`,
+        // `worktree prune`) via the *sync* `std::process::Command`. Dropping a
+        // spawned review (e.g. via `JoinSet::shutdown` on Ctrl+C, or a
+        // panicking review task) runs this Drop on a tokio worker thread —
+        // blocking that worker on two sync subprocess calls (potentially much
+        // longer under a contended `.git/index.lock` or a slow filesystem) can
+        // starve the runtime when several reviews abort concurrently.
+        //
+        // Drop impls cannot be `async`, so we can't `spawn_blocking().await`.
+        // Instead, hand off cleanup to a context where blocking is allowed and
+        // detach. The dropping thread returns immediately.
+        //
+        // Best-effort: if the process exits before the handoff completes, the
+        // worktree leaks — `sweep_stale_review_worktrees` catches anything
+        // older than 6h. Errors from `remove_worktree` are already swallowed
+        // (`let _ = ...`), preserving the original idempotent semantics.
+        let main_repo = std::mem::take(&mut self.main_repo);
+        let path = std::mem::take(&mut self.path);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                remove_worktree(&main_repo, &path);
+            });
+        } else {
+            // No tokio runtime in scope (e.g. dropped from a pure sync test
+            // or from a non-tokio thread): fall back to an OS thread so the
+            // dropping thread still doesn't block on subprocess calls. The
+            // thread is detached — cleanup is best-effort by design.
+            std::thread::spawn(move || {
+                remove_worktree(&main_repo, &path);
+            });
+        }
     }
 }
 
@@ -2230,6 +2310,119 @@ mod tests {
         // find_stash_by_message should locate our stash by substring match.
         let found = find_stash_by_message(&dir, msg).unwrap().expect("found");
         assert_eq!(found, stash);
+    }
+
+    /// `stash_push_with_untracked_except` must preserve the user's
+    /// pre-existing untracked files in the worktree while still stashing
+    /// the harness's tracked modifications and untracked new files. The
+    /// preserved files must NOT appear in the resulting stash entry (so a
+    /// later admin `git stash clear` cannot delete them, and a pop-on-
+    /// conflict leaves them untouched).
+    #[test]
+    fn test_stash_push_with_untracked_except_keeps_excluded_files_in_workdir() {
+        let (_tmp, dir) = init_repo();
+
+        // The user's pre-existing untracked file — must survive the park.
+        fs::write(dir.join("user-scratch.txt"), "user data").unwrap();
+        // Harness work: modify a tracked file + create a new untracked file.
+        fs::write(dir.join("README.md"), "# modified by harness").unwrap();
+        fs::write(dir.join("harness-new.txt"), "wip from harness").unwrap();
+
+        let exclude = vec!["user-scratch.txt".to_string()];
+        let msg = "ralph: park-test exclude scratch";
+        let stash = stash_push_with_untracked_except(&dir, msg, &exclude)
+            .unwrap()
+            .expect("expected a stash entry for the harness's WIP");
+
+        // The user's pre-existing file is STILL in the worktree, untouched.
+        assert!(
+            dir.join("user-scratch.txt").exists(),
+            "pre-existing untracked file must remain in the workdir post-park"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "user data"
+        );
+
+        // The harness's tracked + untracked changes were stashed (and so
+        // are no longer in the worktree).
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
+        assert!(!dir.join("harness-new.txt").exists());
+
+        // Popping the stash restores the harness's work — and the user's
+        // file is *still* there (it was never in the stash).
+        let outcome = stash_pop(&dir, &stash).unwrap();
+        assert_eq!(outcome, StashPopOutcome::Clean);
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# modified by harness"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("harness-new.txt")).unwrap(),
+            "wip from harness"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "user data",
+            "the user's file must survive a clean pop too"
+        );
+    }
+
+    /// When only the excluded paths are dirty, the resulting stash is
+    /// empty — `stash_push_with_untracked_except` must return `None`
+    /// (mirroring `stash_push_with_untracked`'s clean-tree contract) and
+    /// leave the excluded files untouched on disk.
+    #[test]
+    fn test_stash_push_with_untracked_except_returns_none_when_only_excluded_dirty() {
+        let (_tmp, dir) = init_repo();
+        fs::write(dir.join("only-user.txt"), "only user").unwrap();
+
+        let exclude = vec!["only-user.txt".to_string()];
+        let result =
+            stash_push_with_untracked_except(&dir, "ralph: should-be-empty", &exclude).unwrap();
+        assert!(
+            result.is_none(),
+            "a tree whose only diff is in the excluded set is logically clean; got {result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("only-user.txt")).unwrap(),
+            "only user"
+        );
+    }
+
+    /// Dropping the parked stash (the "Mark Failed" / discard path) must
+    /// not affect the user's pre-existing untracked file — proving that
+    /// `discard_parked_worktree_state` (which delegates to `drop_stash`)
+    /// is safe with the negative-pathspec approach because the excluded
+    /// files were never in the stash in the first place.
+    #[test]
+    fn test_stash_push_with_untracked_except_drop_does_not_touch_excluded() {
+        let (_tmp, dir) = init_repo();
+
+        fs::write(dir.join("user-scratch.txt"), "must survive").unwrap();
+        fs::write(dir.join("harness-new.txt"), "wip").unwrap();
+
+        let exclude = vec!["user-scratch.txt".to_string()];
+        let stash =
+            stash_push_with_untracked_except(&dir, "ralph: drop-test exclude scratch", &exclude)
+                .unwrap()
+                .expect("expected stash");
+
+        // Drop without applying — equivalent to discard_parked_worktree_state.
+        assert!(drop_stash(&dir, &stash).unwrap());
+
+        // User's pre-existing file is still right where they left it.
+        assert!(dir.join("user-scratch.txt").exists());
+        assert_eq!(
+            fs::read_to_string(dir.join("user-scratch.txt")).unwrap(),
+            "must survive"
+        );
+        // The harness's stashed work is gone (it was the entire content of
+        // the dropped stash).
+        assert!(!dir.join("harness-new.txt").exists());
     }
 
     #[test]
@@ -2815,6 +3008,51 @@ mod tests {
                 .as_deref(),
             Some("3"),
             "Ralph-Iteration collapsed to the final n"
+        );
+    }
+
+    /// Source-shape assertion for `ReviewWorktree::Drop`.
+    ///
+    /// `Drop` must not block the dropping thread on the two sync git
+    /// subprocess calls inside `remove_worktree` — under abort, the
+    /// dropping thread is a tokio worker, and several concurrent review
+    /// drops blocking on a contended `.git/index.lock` can starve the
+    /// runtime. The fix hands cleanup off to either
+    /// `tokio::runtime::Handle::spawn_blocking` (when a runtime is
+    /// available) or `std::thread::spawn` (the no-runtime fallback) and
+    /// returns immediately.
+    ///
+    /// A behavioral test is hard: `Drop` is fire-and-forget by design and
+    /// the cleanup is best-effort. So we assert the source shape: the
+    /// Drop body must reference both handoff paths and must NOT call
+    /// `remove_worktree` synchronously in the impl body.
+    #[test]
+    fn test_review_worktree_drop_does_not_block_dropping_thread() {
+        let src = include_str!("git.rs");
+        let sig = "impl Drop for ReviewWorktree {";
+        let start = src.find(sig).expect("ReviewWorktree::Drop impl must exist");
+        let after = &src[start..];
+        // The next top-level item after `impl Drop for ReviewWorktree` is
+        // the closing comment-divider for the file's section. We bound
+        // the slice at the impl's own closing brace, found by the next
+        // `// -----` divider OR the next `#[cfg(test)]`. A simple
+        // upper-bound: stop at the next `// ---` divider.
+        let end_rel = after
+            .find("\n// ---")
+            .expect("expected the next section divider after the Drop impl");
+        let body = &after[..end_rel];
+
+        assert!(
+            body.contains("spawn_blocking"),
+            "ReviewWorktree::Drop must hand cleanup off via tokio's \
+             spawn_blocking when a runtime is available; without this the \
+             dropping tokio worker blocks on two sync git subprocess calls",
+        );
+        assert!(
+            body.contains("std::thread::spawn"),
+            "ReviewWorktree::Drop must fall back to std::thread::spawn when \
+             no tokio runtime is in scope, so the dropping thread still \
+             doesn't block on subprocess calls",
         );
     }
 }

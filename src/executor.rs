@@ -19,9 +19,13 @@ use crate::hooks::{self, HookContext};
 use crate::io_util;
 use crate::output::ChunkStream;
 use crate::plan::{
-    ChangePolicy, InterruptionKind, InterruptionOption, Phase, Plan, RetryStrategy, Step,
-    StepStatus, TerminationReason, TestStatus,
+    ChangePolicy, InterruptionKind, InterruptionOption, Phase, Plan, Step, StepStatus,
+    TerminationReason, TestStatus,
 };
+// `RetryStrategy` is referenced only by tests (the runtime path no longer
+// branches on it post test-then-commit — vestigial, slated for removal).
+#[cfg(test)]
+use crate::plan::RetryStrategy;
 use crate::prompt::{self, Prompts, RetryContext};
 use crate::run_lock::process_start_token;
 use crate::signal::{CancelReason, CancelState};
@@ -151,6 +155,10 @@ fn build_retry_exhausted_body(
         FailureReason::TestFailed => format!("Step failed after {max_attempts} attempts.\n"),
         FailureReason::CommitFailed => format!(
             "Step failed after {max_attempts} attempts (last attempt's commit hooks rejected the change).\n",
+        ),
+        FailureReason::InsufficientDiskSpace => format!(
+            "Step blocked: insufficient disk space (see attempt detail below). Free up disk \
+             space and resolve with `{RETRY_EXHAUSTED_OPTION_RETRY}` to retry from scratch.\n",
         ),
         _ => format!("Step failed after {max_attempts} attempts.\n"),
     };
@@ -400,6 +408,11 @@ enum FailureReason {
     /// surfaces via `TerminationReason::CommitFailed` and feeds hook output
     /// into `previous_failure_reason` for the next prompt.
     CommitFailed,
+    /// Per-step disk-space gate breached: free disk dropped below
+    /// `config.min_free_disk_mb` mid-run. Routed through
+    /// [`raise_retry_exhausted_blocker`] as a recoverable auto-blocker so a
+    /// transient FS hiccup doesn't permanently fail the step.
+    InsufficientDiskSpace,
 }
 
 impl FailureReason {
@@ -426,6 +439,7 @@ impl FailureReason {
             Self::TestFailed => "failed",
             Self::HarnessFailed => "harness_failed",
             Self::CommitFailed => "commit_failed",
+            Self::InsufficientDiskSpace => "insufficient_disk_space",
         }
     }
 }
@@ -1008,7 +1022,21 @@ fn park_step_worktree_for_interruption(
         "ralph: parked {reason} worktree for plan '{}' step '{}' attempt {} at {ts}",
         ctx.plan.slug, ctx.step.short_id, attempt
     );
-    let Some(stash_ref) = git::stash_push_with_untracked(ctx.workdir, &label)? else {
+    // Exclude the user's pre-existing untracked files from the stash
+    // (`ctx.pre_existing_untracked` is the snapshot captured by the runner
+    // before this step's harness ever ran). Stashing those files here would
+    // make them disappear from the workdir for the lifetime of the park,
+    // and — far worse — lose them outright if the parked stash is later
+    // dropped administratively (`git stash clear`, IDE plugin, conflict
+    // on resume). `git stash push --include-untracked -- ':!<path>' …`
+    // says "stash everything *except* these paths", which is exactly the
+    // semantics we want.
+    let Some(stash_ref) = git::stash_push_with_untracked_except(
+        ctx.workdir,
+        &label,
+        ctx.pre_existing_untracked,
+    )?
+    else {
         return Ok(());
     };
 
@@ -1077,9 +1105,22 @@ async fn finalize_paused_for_question(
     // transient paused exec_log row is redundant. `attempt` is always >= 1
     // here (the retry loop increments before spawning), so `attempt - 1` is
     // non-negative.
-    storage::delete_execution_log(ctx.conn, exec_log_id)?;
-    set_step_attempts(ctx.conn, &ctx.step.id, attempt - 1)?;
-    storage::update_step_status(ctx.conn, &ctx.step.id, StepStatus::Pending)?;
+    //
+    // Phase E Fix 4: the three writes (delete the per-attempt log row,
+    // roll back the attempts counter, flip status to Pending) run inside a
+    // single `unchecked_transaction`. The same race the sibling
+    // `raise_retry_exhausted_blocker` documents applies here too: between
+    // any two of these writes, a scheduler tick in another process could
+    // observe the half-state — most damagingly `(status=Pending, attempts
+    // still at the bumped value, no open interruption yet visible)` —
+    // re-pick the step, and either burn another attempt or trip the
+    // executor's budget guard. Collapsing the writes into one transaction
+    // makes every observable state either pre-pause or post-pause.
+    let tx = ctx.conn.unchecked_transaction()?;
+    storage::delete_execution_log(&tx, exec_log_id)?;
+    set_step_attempts(&tx, &ctx.step.id, attempt - 1)?;
+    storage::update_step_status(&tx, &ctx.step.id, StepStatus::Pending)?;
+    tx.commit()?;
 
     write_phase(
         ctx.conn,
@@ -1164,11 +1205,13 @@ async fn raise_retry_exhausted_blocker(
     debug_assert!(
         matches!(
             failure_reason,
-            FailureReason::TestFailed | FailureReason::CommitFailed
+            FailureReason::TestFailed
+                | FailureReason::CommitFailed
+                | FailureReason::InsufficientDiskSpace
         ),
         "raise_retry_exhausted_blocker must only be called for retryable \
-         failure modes (TestFailed / CommitFailed); other modes keep their \
-         terminal Failed shape",
+         failure modes (TestFailed / CommitFailed / InsufficientDiskSpace); \
+         other modes keep their terminal Failed shape",
     );
 
     // Park any dirty tree instead of throwing it away. The blocker pauses the
@@ -1189,6 +1232,7 @@ async fn raise_retry_exhausted_blocker(
     let test_st = match failure_reason {
         FailureReason::TestFailed => TestStatus::Failed,
         FailureReason::CommitFailed => TestStatus::NotRun,
+        FailureReason::InsufficientDiskSpace => TestStatus::NotRun,
         _ => TestStatus::NotRun,
     };
     storage::update_execution_log(
@@ -1370,70 +1414,6 @@ pub async fn execute_step(
         );
     }
 
-    // Per-step disk-space gate.
-    //
-    // A nearly-full filesystem is the only class of failure where we actively
-    // don't want to start work — past that point, SQLite writes start failing
-    // with SQLITE_FULL and ralph's own state (execution_logs, run_locks) can
-    // be corrupted. Check before we even touch the retry loop so a FS that
-    // filled between preflight and now still bails out cleanly.
-    //
-    // `min_free_disk_mb = 0` disables the check (user opt-out).
-    if config.min_free_disk_mb > 0 {
-        match crate::preflight::disk_space(workdir) {
-            Ok(ds) => {
-                let required_bytes = config.min_free_disk_mb.saturating_mul(1_048_576);
-                if ds.available_bytes < required_bytes {
-                    let have_gb = ds.available_gb();
-                    let need_gb = config.min_free_disk_mb as f64 / 1024.0;
-                    eprintln!(
-                        "> Step skipped: only {have_gb:.1} GB free, need >= {need_gb:.1} GB \
-                         (config: min_free_disk_mb)"
-                    );
-                    let attempt = step.attempts + 1;
-                    set_step_attempts(conn, &step.id, attempt)?;
-                    let exec_log =
-                        storage::create_execution_log(conn, &step.id, attempt, None, None)?;
-                    let msg = format!(
-                        "insufficient disk space: {have_gb:.1} GB free, \
-                         need >= {need_gb:.1} GB"
-                    );
-                    storage::update_execution_log(
-                        conn,
-                        exec_log.id,
-                        Some(0.0),
-                        None,
-                        &[msg],
-                        false,
-                        false,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(TerminationReason::InsufficientDiskSpace),
-                        Some(TestStatus::NotRun),
-                    )?;
-                    storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
-                    return Ok(StepResult {
-                        outcome: StepOutcome::Failed,
-                        step_id: step.id.clone(),
-                        attempts_used: attempt,
-                        commit_hash: None,
-                        needs_review: None,
-                    });
-                }
-            }
-            Err(e) => {
-                // Probe failure (non-unix, weird FS) — log and continue.
-                // We'd rather run than block on an inscrutable error.
-                eprintln!("> Disk space probe failed, continuing: {e}");
-            }
-        }
-    }
-
     let timeout = config.timeout_secs.map(Duration::from_secs);
 
     // Resolve harness once (doesn't change between retries).
@@ -1473,15 +1453,77 @@ pub async fn execute_step(
         json_output: exec_opts.json_output,
     };
 
-    // Resolve the step's retry strategy once: it's static for the lifetime
-    // of this step execution (step > plan > default `Keep`; Step 21/22).
-    //  - `Rollback`: a failed attempt reverts the working tree before the
-    //    retry, and the rolled-back diff/files are fed into the next prompt
-    //    so the agent can learn from — without inheriting — that work.
-    //  - `Keep` (default): a failed attempt leaves the dirty tree in place;
-    //    the next attempt sees the prior work directly on disk (`git diff`),
-    //    so the prompt OMITS the now-redundant diff/files sections.
-    let retry_strategy = step.effective_retry_strategy(plan);
+    // Per-step disk-space gate.
+    //
+    // A nearly-full filesystem is the class of failure where we don't want to
+    // even start work — past that point, SQLite writes start failing with
+    // SQLITE_FULL and ralph's own state (execution_logs, run_locks) can be
+    // corrupted. Check before the retry loop so a FS that filled between
+    // preflight and now still bails out cleanly.
+    //
+    // `min_free_disk_mb = 0` disables the check (user opt-out).
+    //
+    // Route via [`raise_retry_exhausted_blocker`] (NOT terminal Failed): disk
+    // pressure is a recoverable environmental failure — the human frees disk
+    // and resolves with `RETRY_EXHAUSTED_OPTION_RETRY` to retry from scratch.
+    // Going terminal Failed (the pre-fix shape) burned the entire retry budget
+    // on a single transient FS hiccup; the blocker preserves it.
+    if config.min_free_disk_mb > 0 {
+        match crate::preflight::disk_space(workdir) {
+            Ok(ds) => {
+                let required_bytes = config.min_free_disk_mb.saturating_mul(1_048_576);
+                if ds.available_bytes < required_bytes {
+                    let have_gb = ds.available_gb();
+                    let need_gb = config.min_free_disk_mb as f64 / 1024.0;
+                    eprintln!(
+                        "> Step blocked: only {have_gb:.1} GB free, need >= {need_gb:.1} GB \
+                         (config: min_free_disk_mb) — raising recoverable blocker"
+                    );
+                    let attempt = step.attempts + 1;
+                    set_step_attempts(conn, &step.id, attempt)?;
+                    let exec_log =
+                        storage::create_execution_log(conn, &step.id, attempt, None, None)?;
+                    let msg = format!(
+                        "insufficient disk space: {have_gb:.1} GB free, \
+                         need >= {need_gb:.1} GB (required = {required_bytes} bytes, \
+                         available = {} bytes)",
+                        ds.available_bytes,
+                    );
+                    let test_results = vec![msg];
+                    let parsed = ParsedHarnessOutput::default();
+                    let fail_output = FailureOutput {
+                        diff: None,
+                        test_results: &test_results,
+                        stdout: "",
+                        stderr: "",
+                        parsed: &parsed,
+                        has_changes: false,
+                    };
+                    return raise_retry_exhausted_blocker(
+                        &ctx,
+                        exec_log.id,
+                        0.0,
+                        attempt,
+                        &fail_output,
+                        FailureReason::InsufficientDiskSpace,
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                // Probe failure (non-unix, weird FS) — log and continue.
+                // We'd rather run than block on an inscrutable error.
+                eprintln!("> Disk space probe failed, continuing: {e}");
+            }
+        }
+    }
+
+    // `RetryStrategy` is vestigial post test-then-commit (both Keep and
+    // Rollback preserve the dirty tree between attempts; slated for removal
+    // in a follow-up PR). The retry path no longer branches on it — the
+    // `agent_committed_clean` mixed-reset runs unconditionally — so we
+    // intentionally don't resolve `step.effective_retry_strategy(plan)`
+    // here.
 
     // Previous attempt context for retries. Post test-then-commit (Phase A)
     // the dirty tree is always on disk between attempts, so the retry prompt
@@ -2492,11 +2534,34 @@ pub async fn execute_step(
                     }
                     let mut commit_hash = git::get_commit_hash(workdir)?;
 
-                    // Vestigial post test-then-commit (at most one commit per step). Removal in follow-up PR.
+                    // Vestigial post test-then-commit (at most one commit per
+                    // step). The condition gate (`squash_on_complete` AND a
+                    // recorded `step_base_sha` AND >1 commit since the base)
+                    // cannot fire today because test-then-commit guarantees at
+                    // most one commit per step — `step_base_sha` is set lazily
+                    // on the first iteration commit and we only reach here on
+                    // the (single) iteration that finally commits, so
+                    // `count_commits_since` is at most 1. The whole block is
+                    // slated for removal in a follow-up PR alongside the
+                    // `squash_on_complete` column + CLI flag.
+                    //
+                    // Guard with a `debug_assert!` so any future change that
+                    // re-introduces multi-commit-per-step trips this in debug
+                    // / test builds before silently routing through dead code;
+                    // release builds keep the original behavior as
+                    // defense-in-depth (never crash production on a vestigial
+                    // path that, if it ever did fire again, would still
+                    // produce a valid single squashed commit).
                     if plan.squash_on_complete
                         && let Some(base) = &step_base_sha
                         && git::count_commits_since(workdir, base)? > 1
                     {
+                        debug_assert!(
+                            false,
+                            "squash path is vestigial and unreachable post-test-then-commit \
+                             (at most one commit per step) — see CLAUDE.md and the \
+                             `squash_on_complete` removal follow-up PR"
+                        );
                         write_phase(
                             conn,
                             plan,
@@ -2720,8 +2785,9 @@ pub async fn execute_step(
                 // `git diff`), passing only the failure reason + previous
                 // test output to the next prompt.
                 //
-                // `RetryStrategy` is now vestigial — both arms preserve the
-                // dirty tree. Removal in follow-up PR.
+                // `RetryStrategy` is vestigial post test-then-commit — both
+                // arms preserve the dirty tree (slated for removal in a
+                // follow-up PR), so this branch is strategy-independent.
                 //
                 // EDGE CASE — `agent_committed_clean`: the agent committed
                 // its OWN work, so `has_changes == false` and HEAD advanced
@@ -2729,38 +2795,30 @@ pub async fn execute_step(
                 // pre-attempt HEAD un-commits it but keeps every changed
                 // file on disk as uncommitted work — so the next attempt's
                 // post-test commit picks it up sitting on the right base.
-                let rolled_back = match retry_strategy {
-                    RetryStrategy::Rollback => {
-                        // RetryStrategy is vestigial post test-then-commit; both arms preserve the dirty tree. Removal in follow-up PR.
-                        false
-                    }
-                    RetryStrategy::Keep => {
-                        // EDGE CASE — `agent_committed_clean`: the agent
-                        // committed its OWN work, so HEAD advanced this
-                        // attempt with no diff left for ralph. Mixed-reset
-                        // back to the pre-attempt HEAD so the agent's
-                        // changes survive as uncommitted work — the next
-                        // attempt's post-test commit then sits on the right
-                        // base. (Must remain: same fix as pre-Phase-A.)
-                        if agent_committed_clean && let Some(before) = &head_before_harness {
-                            write_phase(
-                                conn,
-                                plan,
-                                &step.id,
-                                step_num,
-                                attempt,
-                                max_attempts,
-                                Some(exec_log.id),
-                                Phase::Rollback,
-                                None,
-                                ChildUpdate::Clear,
-                                exec_opts.json_output,
-                            )?;
-                            git::reset_mixed_to(workdir, before)?;
-                        }
-                        false
-                    }
-                };
+                // This reset MUST be unconditional (run under both Keep and
+                // Rollback): under Rollback, leaving the agent's orphan
+                // commit at HEAD would let the next attempt build on top of
+                // it, ralph's eventual single commit would land on
+                // parent=orphan, and `step reset` (which reverts only
+                // ralph's commit) would leave the orphan in history — also
+                // inflating the reviewer's fixed-SHA diff.
+                if agent_committed_clean && let Some(before) = &head_before_harness {
+                    write_phase(
+                        conn,
+                        plan,
+                        &step.id,
+                        step_num,
+                        attempt,
+                        max_attempts,
+                        Some(exec_log.id),
+                        Phase::Rollback,
+                        None,
+                        ChildUpdate::Clear,
+                        exec_opts.json_output,
+                    )?;
+                    git::reset_mixed_to(workdir, before)?;
+                }
+                let rolled_back = false;
                 let test_output_summary = test_result_strings.join("\n");
                 // This row describes *this* attempt's termination even though
                 // the step will retry — record why this attempt failed. Same
@@ -7343,6 +7401,215 @@ mod tests {
         );
     }
 
+    /// REGRESSION (the bug this commit fixes): the `agent_committed_clean`
+    /// mixed-reset on a failed attempt must run under BOTH retry strategies,
+    /// not just `Keep`. Previously the match made it Keep-only; under
+    /// `Rollback` the agent's orphan commit stayed at HEAD and the next
+    /// attempt built on top of it, ralph's eventual single commit landed on
+    /// `parent = orphan`, and `step reset` (which reverts only ralph's
+    /// commit) would leave the orphan in history — also inflating the
+    /// reviewer's fixed-SHA diff.
+    ///
+    /// This mirrors `test_keep_agent_committed_clean_single_final_commit`
+    /// but with `retry_strategy = Rollback`. The assertions are identical:
+    /// HEAD ends one commit above the pre-step base, the new commit is
+    /// ralph's `.2` iteration commit (NOT the agent's orphan), both lines
+    /// are present, and attempt 1's classification is `NoChanges`. With the
+    /// pre-fix Keep-only behavior, ralph's commit would parent on the
+    /// orphan and commit_count would be `base + 2`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_rollback_agent_committed_clean_unconditional_mixed_reset() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+        fs::write(dir.join("acc.txt"), "").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "seed",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let base_commits = commit_count(&dir);
+        let base_head = crate::git::get_commit_hash(&dir).unwrap();
+
+        // Invocation 1: append line + commit it ourselves
+        // (agent_committed_clean). Invocation 2+: append another line, no
+        // commit.
+        let shared = TempDir::new().unwrap();
+        let count_path = shared.path().join("n.txt");
+        let harness_tmp = TempDir::new().unwrap();
+        let harness_path = harness_tmp.path().join("commit-then-dirty.sh");
+        let script = format!(
+            "#!/bin/sh\n\
+             echo x >> {count}\n\
+             N=$(wc -l < {count})\n\
+             echo line >> {acc}\n\
+             if [ \"$N\" -eq 1 ]; then\n\
+               cd {dir}\n\
+               git add -A\n\
+               git -c user.email=a@a -c user.name=a commit -m 'agent commit' >/dev/null\n\
+             fi\n\
+             exit 0\n",
+            count = count_path.to_string_lossy(),
+            acc = dir.join("acc.txt").to_string_lossy(),
+            dir = dir.to_string_lossy(),
+        );
+        fs::write(&harness_path, script).unwrap();
+        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&harness_path, perms).unwrap();
+
+        let conn = crate::db::open_memory().unwrap();
+        let test_cmd = format!(
+            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
+            dir.to_string_lossy()
+        );
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("poly"),
+            None,
+            &[test_cmd],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let (mut step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Acc",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Force Rollback strategy — the bug's load-bearing input.
+        step.retry_strategy = Some(RetryStrategy::Rollback);
+        assert_eq!(
+            step.effective_retry_strategy(&plan),
+            RetryStrategy::Rollback
+        );
+
+        let mut config = Config::default();
+        config
+            .harnesses
+            .insert("poly".to_string(), harness_config_for_script(&harness_path));
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.outcome,
+            StepOutcome::Success,
+            "attempt 2 should pass once attempt 1's mixed-reset-but-on-disk \
+             line is carried forward and a second line is added",
+        );
+        assert_eq!(result.attempts_used, 2);
+
+        // THE key assertion: exactly ONE new commit total. With the bug,
+        // Rollback skipped the mixed-reset, so ralph's commit would land on
+        // top of the agent's orphan commit and commit_count would be
+        // `base + 2`.
+        assert_eq!(
+            commit_count(&dir),
+            base_commits + 1,
+            "exactly one step commit — the agent's orphan commit must be \
+             mixed-reset away (regardless of retry strategy), so ralph's \
+             single commit parents on the original base, not the orphan"
+        );
+
+        // Parent of the single new commit is the pre-step base SHA — i.e.
+        // ralph's commit did NOT build on the orphan agent commit.
+        let head = crate::git::get_commit_hash(&dir).unwrap();
+        assert_ne!(head, base_head);
+        assert_eq!(
+            result.commit_hash.as_deref(),
+            Some(head.as_str()),
+            "the success commit is the step commit ralph created"
+        );
+        let parent = {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD^"])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(
+            parent, base_head,
+            "ralph's final commit must parent on the pre-step base, NOT on \
+             the agent's orphan commit"
+        );
+
+        // The final commit is ralph's `.2` iteration commit, not the
+        // agent's orphan.
+        let msg = {
+            let out = std::process::Command::new("git")
+                .args(["log", "-1", "--pretty=%s"])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert!(
+            msg.starts_with(&format!("ralph {}.2 - Acc", step.short_id)),
+            "the final commit must be ralph's per-iteration step commit, \
+             not the agent's orphan 'agent commit'; got: {msg}"
+        );
+
+        // Attempt 1 was agent_committed_clean → NoChanges, and the working
+        // tree was preserved (the mixed-reset is not a working-tree
+        // rollback).
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
+        assert_eq!(a1.termination_reason, Some(TerminationReason::NoChanges));
+        let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
+        assert_eq!(
+            final_lines.lines().count(),
+            2,
+            "both attempts' lines are present in the final tree under \
+             Rollback (mixed-reset un-commits but keeps changes on disk)"
+        );
+    }
+
     /// Build an executable harness script at `harness_dir` that appends one
     /// line to `acc.txt` in `workdir` per invocation. Written OUTSIDE the
     /// workdir so the script isn't counted as a step change.
@@ -10482,6 +10749,176 @@ mod tests {
         );
     }
 
+    /// Fix #1 (disk-space gate routes to recoverable blocker, not terminal
+    /// Failed): set `min_free_disk_mb` to a value any reasonable host can't
+    /// possibly satisfy, then drive `execute_step` and assert it raises a
+    /// `Blocker` interruption with the two ranked
+    /// `RETRY_EXHAUSTED_OPTION_RETRY` / `RETRY_EXHAUSTED_OPTION_FAIL`
+    /// options instead of going terminal `Failed`. Verifies (a) the step's
+    /// stored status stays `Pending` (the derived `Blocked` overlay shadows
+    /// it), (b) the blocker carries the disk-space context, and (c) Phase C
+    /// resolution paths (Retry resets attempts to 0; Fail flips to Failed)
+    /// behave on this auto-blocker exactly as they do for the test-fail and
+    /// commit-fail flavors.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_disk_space_gate_raises_recoverable_blocker() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        // max_retries=0 → max_attempts=1: under the pre-fix code a single
+        // disk pressure trip burned the whole budget terminally.
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Pick a min_free_disk_mb so large that no test host can satisfy it.
+        // 1 EB (1 048 576 TB) is far above any production disk.
+        let config = Config {
+            min_free_disk_mb: 1024 * 1024 * 1024,
+            ..Config::default()
+        };
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let (_tx, rx) = watch::channel(None);
+        let result = execute_step(
+            &conn,
+            &plan,
+            &step,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // (a) Outcome reuses PausedForQuestion (matches the auto-blocker
+        // contract — runner moves to another runnable branch).
+        assert_eq!(
+            result.outcome,
+            StepOutcome::PausedForQuestion,
+            "disk pressure must NOT be terminal Failed",
+        );
+
+        // (b) A kind=Blocker interruption exists with the two expected
+        // ranked options.
+        let open = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(open.len(), 1, "exactly one open interruption");
+        let blocker = &open[0];
+        assert_eq!(blocker.kind, InterruptionKind::Blocker);
+        assert_eq!(blocker.options.len(), 2);
+        assert_eq!(blocker.options[0].text, RETRY_EXHAUSTED_OPTION_RETRY);
+        assert_eq!(blocker.options[0].priority, 1);
+        assert_eq!(blocker.options[1].text, RETRY_EXHAUSTED_OPTION_FAIL);
+        assert_eq!(blocker.options[1].priority, 2);
+        // Body mentions disk-space context (the FailureReason-specific
+        // preamble in `build_retry_exhausted_body`).
+        assert!(
+            blocker.body.contains("disk space"),
+            "body must mention disk space; got:\n{}",
+            blocker.body,
+        );
+
+        // Step's stored status is Pending (derived Blocked overlay covers it).
+        let reloaded = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(reloaded.status, StepStatus::Pending);
+
+        // (c) Retry resolution: attempts reset to 0, status remains Pending,
+        // scheduler is free to re-pick.
+        let blocker_id = blocker.id.clone();
+        let acted = crate::commands::interruption::apply_retry_exhausted_resolution(
+            &conn,
+            &dir.to_string_lossy(),
+            &blocker_id,
+            RETRY_EXHAUSTED_OPTION_RETRY,
+        )
+        .unwrap();
+        assert!(acted, "Retry must be recognized on the disk auto-blocker");
+        let reloaded = storage::get_step(&conn, &step.id).unwrap();
+        assert_eq!(reloaded.attempts, 0, "Retry resets the attempt counter");
+        assert_eq!(reloaded.status, StepStatus::Pending);
+
+        // Mark Failed resolution: needs a fresh blocker since the prior one
+        // is now resolved.
+        let (step2, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step2",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let (_tx2, rx2) = watch::channel(None);
+        let result2 = execute_step(
+            &conn,
+            &plan,
+            &step2,
+            &config,
+            &dir,
+            &hook_ctx,
+            rx2,
+            ExecuteOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result2.outcome, StepOutcome::PausedForQuestion);
+        let open2 = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        let blocker2 = open2.iter().find(|b| b.step_id == step2.id).unwrap();
+        let acted_fail = crate::commands::interruption::apply_retry_exhausted_resolution(
+            &conn,
+            &dir.to_string_lossy(),
+            &blocker2.id,
+            RETRY_EXHAUSTED_OPTION_FAIL,
+        )
+        .unwrap();
+        assert!(acted_fail);
+        let reloaded2 = storage::get_step(&conn, &step2.id).unwrap();
+        assert_eq!(
+            reloaded2.status,
+            StepStatus::Failed,
+            "Mark Failed resolution must transition the step to terminal Failed",
+        );
+    }
+
     // -- Phase E follow-ups ------------------------------------------------
 
     /// Phase E Fix 1: the executor's retry-exhausted auto-blocker must fire
@@ -10743,6 +11180,212 @@ mod tests {
         assert!(
             final_pos < older_pos,
             "final attempt must be rendered first; got:\n{body}",
+        );
+    }
+
+    // ---- Phase E Fix 4: finalize_paused_for_question is transactional ----
+
+    /// Source-shape assertion: `finalize_paused_for_question` MUST wrap its
+    /// three state writes (delete_execution_log + set_step_attempts +
+    /// update_step_status) in an `unchecked_transaction`. The pre-Phase-E
+    /// shape did them as three independent writes, letting a concurrent
+    /// scheduler tick observe the half-state `(status=Pending, attempts
+    /// still bumped, no open interruption)` and re-pick the step. The
+    /// sibling `raise_retry_exhausted_blocker` already uses the
+    /// `unchecked_transaction`+`commit` pattern for the structurally
+    /// identical writes; this test pins the shape so a future refactor
+    /// can't silently regress.
+    ///
+    /// Driving the async function end-to-end would require constructing an
+    /// `ExecCtx` (Connection, Config, Plan, Step, workdir, HookContext,
+    /// abort_rx, etc.) which is heavy and would still observe the writes
+    /// via post-conditions rather than the transaction itself. A source
+    /// assertion is the cleanest check that the *atomicity invariant* is
+    /// preserved — it fires at `cargo test --lib` if either the helper is
+    /// reshaped without a transaction or the transaction commit is dropped.
+    #[test]
+    fn test_finalize_paused_for_question_is_transactional() {
+        let src = include_str!("executor.rs");
+        // Locate the function body.
+        let signature = "async fn finalize_paused_for_question(";
+        let fn_start = src
+            .find(signature)
+            .expect("finalize_paused_for_question must exist");
+        // Take a slice that includes the entire body but stops before the
+        // next top-level item (`raise_retry_exhausted_blocker`'s comment
+        // block / `#[allow(clippy::too_many_arguments)]`).
+        let after_sig = &src[fn_start..];
+        let next_fn = after_sig
+            .find("\n/// Phase B — auto-raise a `Blocker` interruption")
+            .expect("expected the next sibling helper's doc comment");
+        let body = &after_sig[..next_fn];
+
+        assert!(
+            body.contains("ctx.conn.unchecked_transaction()"),
+            "finalize_paused_for_question must open an unchecked_transaction \
+             before its delete/set/update writes; without the transaction a \
+             scheduler tick can observe the half-state and re-pick the step",
+        );
+        assert!(
+            body.contains("tx.commit()"),
+            "finalize_paused_for_question must commit the transaction it \
+             opens (otherwise rusqlite's Drop rolls it back and the pause \
+             does not persist)",
+        );
+        // The three writes must target the `tx`, not the original `ctx.conn`.
+        assert!(
+            body.contains("delete_execution_log(&tx,"),
+            "delete_execution_log must run inside the transaction",
+        );
+        assert!(
+            body.contains("set_step_attempts(&tx,"),
+            "set_step_attempts must run inside the transaction",
+        );
+        assert!(
+            body.contains("update_step_status(&tx,"),
+            "update_step_status must run inside the transaction",
+        );
+        // Negative assertion: the three writes must not also run against the
+        // bare `ctx.conn` (would split the transaction across two writers).
+        assert!(
+            !body.contains("delete_execution_log(ctx.conn,"),
+            "the post-fix shape uses `&tx`, never `ctx.conn`, for the three writes",
+        );
+        assert!(
+            !body.contains("set_step_attempts(ctx.conn,"),
+            "the post-fix shape uses `&tx`, never `ctx.conn`, for the three writes",
+        );
+        assert!(
+            !body.contains("update_step_status(ctx.conn, &ctx.step.id, StepStatus::Pending"),
+            "the post-fix shape uses `&tx`, never `ctx.conn`, for the three writes",
+        );
+    }
+
+    // ----- park / restore preserves the user's pre-existing untracked files
+    // (Cluster 3 Fix #1) ---------------------------------------------------
+
+    /// Repro: a harness raises `ralph question ask` mid-step.
+    /// `finalize_paused_for_question` parks the dirty tree via
+    /// `park_step_worktree_for_interruption`. Before the fix, the park
+    /// stashed `--include-untracked` *unconditionally*, sweeping up the
+    /// user's pre-existing `notes.txt` along with the harness's WIP — if
+    /// an admin later ran `git stash clear` (or the pop conflicted),
+    /// `notes.txt` was gone. The fix routes through
+    /// `git::stash_push_with_untracked_except` with
+    /// `ExecCtx.pre_existing_untracked`, so `notes.txt` stays in the
+    /// worktree and is never in the stash to begin with. The resume path
+    /// (`restore_parked_step_worktree`) then restores the harness's WIP on
+    /// top, leaving the user's file untouched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_park_step_worktree_for_interruption_preserves_pre_existing_untracked() {
+        use crate::hooks::HookContext;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "park-preserve",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "d",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // The user's pre-existing untracked file (existed BEFORE `ralph
+        // run`). This is what `executor::execute_step` snapshots via
+        // `git::get_untracked_files(workdir)` at the top of the function
+        // and threads through `ExecCtx.pre_existing_untracked`.
+        std::fs::write(dir.join("notes.txt"), "user-owned notes").unwrap();
+
+        // The harness's WIP: a tracked modification + a new untracked file.
+        std::fs::write(dir.join("README.md"), "modified by harness").unwrap();
+        std::fs::write(dir.join("harness-output.rs"), "fn wip() {}").unwrap();
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let pre = vec!["notes.txt".to_string()];
+        let ctx = ExecCtx {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            workdir: &dir,
+            pre_existing_untracked: &pre,
+            hook_ctx: &hook_ctx,
+            step_num: 1,
+            max_attempts: 3,
+            json_output: false,
+        };
+
+        // Park.
+        park_step_worktree_for_interruption(&ctx, 1, "interruption").unwrap();
+
+        // The user's pre-existing file MUST still be on disk with its
+        // original contents — the whole point of the fix.
+        assert!(
+            dir.join("notes.txt").exists(),
+            "park must NOT stash the user's pre-existing untracked file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
+            "user-owned notes"
+        );
+
+        // The harness's tracked modification was parked (file reverted to
+        // HEAD) and its new untracked file is gone (now lives in the stash).
+        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "init");
+        assert!(!dir.join("harness-output.rs").exists());
+
+        // The parked-worktree row was persisted.
+        let parked = storage::get_step_parked_worktree(&conn, &step.id)
+            .unwrap()
+            .expect("park must persist a parked worktree row");
+
+        // Now run the resume path to re-apply the parked stash. We invoke
+        // `git::stash_pop` directly with the SHA — same code path
+        // `restore_parked_step_worktree` takes for the apply step.
+        let stash_ref = crate::git::StashRef(parked.stash_sha.clone());
+        let outcome = crate::git::stash_pop(&dir, &stash_ref).unwrap();
+        assert_eq!(outcome, crate::git::StashPopOutcome::Clean);
+
+        // After resume the harness's WIP is back AND the user's pre-existing
+        // file is *still* there (it never left).
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "modified by harness"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("harness-output.rs")).unwrap(),
+            "fn wip() {}"
+        );
+        assert!(dir.join("notes.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("notes.txt")).unwrap(),
+            "user-owned notes",
+            "the user's pre-existing file must round-trip through park+restore untouched"
         );
     }
 }

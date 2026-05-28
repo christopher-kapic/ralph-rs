@@ -1138,6 +1138,30 @@ mod tests {
         }
     }
 
+    /// Poll `list_worktree_paths(dir).len()` until it converges to
+    /// `expected` (or a 5s deadline fires). `ReviewWorktree::Drop`
+    /// detaches its cleanup onto `spawn_blocking` / `std::thread::spawn`
+    /// so the runtime worker isn't blocked on two sync git subprocess
+    /// calls under abort. As a side effect, the cleanup is no longer
+    /// synchronous with `Drop` returning — tests that assert the
+    /// worktree is gone must give the detached task a beat to run. 5s is
+    /// orders of magnitude more than the two `git worktree` calls take
+    /// in practice; in CI the loop converges in a single iteration on a
+    /// quiet runner.
+    async fn await_worktree_count(dir: &Path, expected: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let wts = crate::git::list_worktree_paths(dir).unwrap();
+            if wts.len() == expected {
+                return wts;
+            }
+            if std::time::Instant::now() >= deadline {
+                return wts;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     fn json_out() -> OutputContext {
         OutputContext {
             format: OutputFormat::Json,
@@ -1232,7 +1256,8 @@ mod tests {
              commit would sweep it in (the corruption §9-inv-2 prevents)"
         );
         // No orphan review worktree left behind on a passing review.
-        let wts = crate::git::list_worktree_paths(dir).unwrap();
+        // `Drop` detaches cleanup; poll briefly via `await_worktree_count`.
+        let wts = await_worktree_count(dir, 1).await;
         assert_eq!(
             wts.len(),
             1,
@@ -1287,7 +1312,9 @@ mod tests {
     /// LIFECYCLE PROOF: the throwaway review worktree is removed (no orphan
     /// `git worktree list` entry, no leftover dir) after BOTH a passing
     /// review AND a failing/erroring one — RAII `Drop` + unconditional prune
-    /// on every exit path.
+    /// on every exit path. `Drop` detaches its cleanup to a blocking thread
+    /// so the runtime worker isn't blocked under abort — see
+    /// `await_worktree_count`.
     #[tokio::test]
     async fn test_review_worktree_cleaned_up_on_pass_and_failure() {
         // (a) passing review.
@@ -1301,7 +1328,7 @@ mod tests {
             run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out())
                 .await
                 .unwrap();
-            let wts = crate::git::list_worktree_paths(dir).unwrap();
+            let wts = await_worktree_count(dir, 1).await;
             assert_eq!(
                 wts.len(),
                 1,
@@ -1319,7 +1346,7 @@ mod tests {
             run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out())
                 .await
                 .unwrap();
-            let wts = crate::git::list_worktree_paths(dir).unwrap();
+            let wts = await_worktree_count(dir, 1).await;
             assert_eq!(
                 wts.len(),
                 1,
@@ -1341,7 +1368,7 @@ mod tests {
             let res =
                 run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out()).await;
             assert!(res.is_err(), "spawn of a missing harness must error");
-            let wts = crate::git::list_worktree_paths(dir).unwrap();
+            let wts = await_worktree_count(dir, 1).await;
             assert_eq!(
                 wts.len(),
                 1,
@@ -1387,7 +1414,8 @@ mod tests {
              the 60s reviewer sleep"
         );
         // No orphan review worktree left behind on the timeout path.
-        let wts = crate::git::list_worktree_paths(dir).unwrap();
+        // `Drop` now detaches cleanup; poll briefly.
+        let wts = await_worktree_count(dir, 1).await;
         assert_eq!(
             wts.len(),
             1,

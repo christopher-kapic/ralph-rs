@@ -242,7 +242,7 @@ async fn run_plan_inner(
     config: &Config,
     workdir: &Path,
     options: &RunOptions,
-    abort_rx: watch::Receiver<CancelState>,
+    mut abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
 ) -> Result<PlanRunResult> {
     let effective_plan = effective_plan.clone();
@@ -423,6 +423,22 @@ async fn run_plan_inner(
             *abort_rx.borrow(),
             Some(crate::signal::CancelReason::Aborted)
         ) {
+            // Best-effort drain of any review verdicts that already
+            // completed before the abort latched, then `shutdown()` the
+            // still-in-flight ones so `kill_on_drop` fires on each review
+            // child. Without this, a review whose subprocess finished but
+            // whose verdict hasn't been drained would be silently dropped:
+            //   * no `update_step_review_status` write,
+            //   * no git-note annotation,
+            //   * no V29 corrective-step request row,
+            // leaving the reviewed step `review_status=InFlight`. The next
+            // run's stale-InProgress sweep would then re-implement the
+            // step and re-run the reviewer (burning tokens), and a Fail
+            // verdict that lost its bridge row would silently skip the
+            // §10 corrective step entirely — the §9-inv-2 violation the
+            // pipeline guards against.
+            drain_reviews_on_abort(conn, &effective_plan, &mut reviews, workdir, out, &mut abort_rx)
+                .await;
             eprintln!("Aborted");
             storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
             result.final_status = PlanStatus::Aborted;
@@ -526,6 +542,7 @@ async fn run_plan_inner(
                     workdir,
                     out,
                     true, // block: wait for at least one review to finish
+                    &mut abort_rx,
                 )
                 .await?
                 {
@@ -557,8 +574,28 @@ async fn run_plan_inner(
             continue;
         }
 
+        // Cluster 3 Fix #2: per-step granularity on parked-restore failure.
+        // A NotFound (admin `git stash clear`) or Conflicted apply used to
+        // bail the whole run via `?`, killing every other branch in the
+        // DAG. The new outcome raises a blocker on JUST this step and
+        // skips it; the scheduler then picks another runnable branch on
+        // the next tick (the blocker's open interruption shadows the step
+        // via the derived `Blocked` overlay, so `pick_next_step` excludes
+        // it).
         let resumed_parked_worktree =
-            restore_parked_step_worktree(conn, &current_step, workdir).await?;
+            match restore_parked_step_worktree(conn, &current_step, workdir, out).await? {
+                RestoreParkedOutcome::Resumed => true,
+                RestoreParkedOutcome::NotParked => false,
+                RestoreParkedOutcome::BlockedAfterFailure => {
+                    // Mark as "seen this tick" so the immediate re-pick
+                    // doesn't return the same step (defense-in-depth — the
+                    // blocked-set query below will also exclude it once the
+                    // open interruption is visible, but the in-tick
+                    // bookkeeping makes the skip immediate and explicit).
+                    executed_step_ids.insert(current_step.id.clone());
+                    continue;
+                }
+            };
         if resumed_parked_worktree && out.format != OutputFormat::Json {
             eprintln!(
                 "> Restored parked worktree for step {} '{}' before re-running.",
@@ -634,6 +671,18 @@ async fn run_plan_inner(
         )
         .await?;
         drop(_in_flight);
+
+        // Fix #4: widen the `run_locks.step_id` window between consecutive
+        // steps to be honest about the gap. `update_live_phase` uses
+        // COALESCE on the per-step fields, so absent this call
+        // `run_locks.step_id` would still name the *previous* step until
+        // the next step's first `write_phase` fires. An orphan subprocess
+        // from the prior step calling `ralph question ask` during that
+        // window would bind the question to the wrong step (already
+        // Complete). `bind_live_run_to_plan` widens the same row to "no
+        // live step" on a cross-plan rebind; this is the within-plan
+        // equivalent.
+        storage::clear_live_run_step(conn, &effective_plan.project)?;
 
         // Release the implementation slot BEFORE any review (§9-inv-2 /
         // §3.5 item 3): a read-only review must never hold the
@@ -731,8 +780,16 @@ async fn run_plan_inner(
         // verdicts (§9-inv-3): finalize verdict + git-note, promote a passed
         // step to `Complete`, and consume corrective requests (§10). On a
         // review error the run fails exactly like a hard step failure.
-        if let Some(fs) =
-            drain_finished_reviews(conn, &effective_plan, &mut reviews, workdir, out, false).await?
+        if let Some(fs) = drain_finished_reviews(
+            conn,
+            &effective_plan,
+            &mut reviews,
+            workdir,
+            out,
+            false,
+            &mut abort_rx,
+        )
+        .await?
         {
             result.final_status = fs;
             result.step_results.push(step_result);
@@ -915,10 +972,35 @@ async fn run_plan_inner(
     // that step's outstanding review here so its status is finalized before
     // we compute terminal status / return.
     while !reviews.is_empty() {
-        if let Some(fs) =
-            drain_finished_reviews(conn, &effective_plan, &mut reviews, workdir, out, true).await?
+        if let Some(fs) = drain_finished_reviews(
+            conn,
+            &effective_plan,
+            &mut reviews,
+            workdir,
+            out,
+            true,
+            &mut abort_rx,
+        )
+        .await?
         {
             result.final_status = fs;
+            return Ok(result);
+        }
+        // If the abort signal latched while we were parked on a reviewer,
+        // `drain_finished_reviews` returns `Ok(None)` early. Route through
+        // the same teardown path the in-loop Aborted branch uses: best-
+        // effort drain finished verdicts, then `shutdown()` the rest so
+        // `kill_on_drop` fires on each review child. This keeps the
+        // §3.3-no-in-flight-review invariant satisfied even on Ctrl+C.
+        if matches!(
+            *abort_rx.borrow(),
+            Some(crate::signal::CancelReason::Aborted)
+        ) {
+            drain_reviews_on_abort(conn, &effective_plan, &mut reviews, workdir, out, &mut abort_rx)
+                .await;
+            eprintln!("Aborted");
+            storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
+            result.final_status = PlanStatus::Aborted;
             return Ok(result);
         }
     }
@@ -2126,13 +2208,36 @@ pub(crate) fn discard_parked_worktree_state(
     git::drop_stash(workdir, &StashRef(parked.stash_sha))
 }
 
+/// Result of a parked-worktree restore attempt at the top of a scheduler
+/// tick. Per-step granularity: a single bad stash MUST NOT abort the whole
+/// run (Cluster 3 Fix #2). Branch B (independent of the affected step) keeps
+/// going.
+#[derive(Debug)]
+enum RestoreParkedOutcome {
+    /// No parked-worktree row for this step — nothing to do, proceed with
+    /// normal execution.
+    NotParked,
+    /// The parked stash was applied cleanly; the worktree carries the
+    /// resumed WIP and the bridge row was cleared.
+    Resumed,
+    /// The parked stash could not be applied: NotFound (admin `git stash
+    /// clear` / IDE plugin dropped it) or Conflicted (apply ran but left
+    /// conflict markers, or returned non-zero). A `kind=Blocker`
+    /// interruption was raised on the step so a human can decide whether
+    /// to mark it Failed or restart it from a clean slate; the now-stale
+    /// bridge row was dropped. The caller must skip this step and let the
+    /// scheduler tick another branch.
+    BlockedAfterFailure,
+}
+
 async fn restore_parked_step_worktree(
     conn: &Connection,
     step: &Step,
     workdir: &Path,
-) -> Result<bool> {
+    out: &OutputContext,
+) -> Result<RestoreParkedOutcome> {
     let Some(parked) = storage::get_step_parked_worktree(conn, &step.id)? else {
-        return Ok(false);
+        return Ok(RestoreParkedOutcome::NotParked);
     };
 
     let workdir_owned = workdir.to_path_buf();
@@ -2142,25 +2247,104 @@ async fn restore_parked_step_worktree(
     match outcome {
         StashPopOutcome::Clean => {
             storage::clear_step_parked_worktree(conn, &step.id)?;
-            Ok(true)
+            Ok(RestoreParkedOutcome::Resumed)
         }
-        StashPopOutcome::Conflicted(stderr) => bail!(
-            "Restoring the parked interruption stash for step '{}' conflicted. \
-             The preserved work is still available at {} — resolve it manually \
-             with `git stash pop {}` before re-running.\n{}",
-            step.title,
-            stash_ref.as_str(),
-            stash_ref.as_str(),
-            stderr,
-        ),
-        StashPopOutcome::NotFound => bail!(
-            "The parked interruption stash for step '{}' was not found on the \
-             stash stack (expected {}). The step cannot be resumed safely until \
-             you recover or intentionally discard that parked work.",
-            step.title,
-            stash_ref.as_str(),
-        ),
+        StashPopOutcome::Conflicted(stderr) => {
+            // Cluster 3 Fix #2: per-step blocker, NOT a whole-run bail.
+            // Apply ran but conflicted; the stash is still on the stack so
+            // the user can recover it manually. We surface that exact
+            // recovery in the blocker body. The bridge row is preserved
+            // (the stash is preserved) so a future restart can retry the
+            // pop after the user resolves whatever conflict the apply
+            // surfaced.
+            let body = format!(
+                "Applying the parked interruption stash for step '{}' conflicted. \
+                 The preserved work is still available at {} — resolve it \
+                 manually with `git stash pop {}` before continuing.\n{}",
+                step.title,
+                stash_ref.as_str(),
+                stash_ref.as_str(),
+                stderr,
+            );
+            raise_parked_restore_blocker(conn, step, &body, /*drop_bridge_row=*/ false, out)?;
+            Ok(RestoreParkedOutcome::BlockedAfterFailure)
+        }
+        StashPopOutcome::NotFound => {
+            // Cluster 3 Fix #2: per-step blocker, NOT a whole-run bail.
+            // The stash was dropped out from under us (admin `git stash
+            // clear`, IDE plugin) — the WIP is gone and we have no honest
+            // way to resume. Drop the orphaned bridge row so the next
+            // scheduler pass doesn't re-fire the same error, then raise a
+            // blocker with two recovery hints.
+            let body = format!(
+                "Parked worktree stash '{}' for step '{}' was not found in `git stash list` — \
+                 an admin may have run `git stash clear` or another tool dropped it. The \
+                 preserved WIP is unrecoverable. Resolve this blocker with either \
+                 'Skip and Mark Failed' (leave the step terminal) or 'Skip and Mark Pending' \
+                 (run the step fresh from scratch — the previous in-flight work is lost).",
+                stash_ref.as_str(),
+                step.title,
+            );
+            raise_parked_restore_blocker(conn, step, &body, /*drop_bridge_row=*/ true, out)?;
+            Ok(RestoreParkedOutcome::BlockedAfterFailure)
+        }
     }
+}
+
+/// Insert a `kind=Blocker` interruption on `step` for a parked-worktree
+/// restore failure. Optionally drops the bridge row first when the stash
+/// is gone (NotFound) so we don't re-trip the same error on the next
+/// scheduler pass; for Conflicted we leave the row alone (the stash is
+/// still recoverable). Best-effort NDJSON emit mirrors the existing
+/// review-loop / retry-exhausted patterns.
+fn raise_parked_restore_blocker(
+    conn: &Connection,
+    step: &Step,
+    body: &str,
+    drop_bridge_row: bool,
+    out: &OutputContext,
+) -> Result<()> {
+    // Raise + (optionally) clear the bridge row in one transaction so a
+    // racing scheduler tick can never see (bridge-cleared, blocker-not-yet-
+    // visible) — that window would let it re-enter `restore_parked_step_worktree`
+    // and silently re-pick the step with no parked row at all. The
+    // `attempt` value is `step.attempts` (matching the executor's
+    // retry-exhausted blocker which uses the *current* attempt counter as
+    // its `attempt` field).
+    let interruption_id = crate::db::with_tx(conn, |conn| {
+        let id = storage::insert_interruption(
+            conn,
+            &step.id,
+            step.attempts,
+            crate::plan::InterruptionKind::Blocker,
+            body,
+            &[],
+        )?;
+        if drop_bridge_row {
+            storage::clear_step_parked_worktree(conn, &step.id)?;
+        }
+        Ok(id)
+    })?;
+
+    output::emit_interruption_raised(
+        conn,
+        out.format == OutputFormat::Json,
+        &interruption_id,
+        &step.id,
+        crate::plan::InterruptionKind::Blocker.as_str(),
+        /*auto_raised=*/ true,
+        step.attempts,
+    );
+
+    if out.format != OutputFormat::Json {
+        eprintln!(
+            "Warning: could not restore parked worktree for step {} '{}' — raised a blocker; \
+             scheduler will move to other runnable branches.",
+            step.short_id, step.title,
+        );
+    }
+
+    Ok(())
 }
 
 /// Set up the git branch for the plan.
@@ -2337,11 +2521,35 @@ fn find_resume_point(steps: &[Step]) -> Result<usize> {
 }
 
 /// True if a step is in a status that the runner loop will attempt to execute.
-/// Pre-existing Complete / Skipped steps are non-actionable.
+///
+/// Pre-existing Complete / Skipped steps are non-actionable, and as of Phase E
+/// Fix 2 **Failed is non-actionable too**. Pre-Phase-E, the scheduler would
+/// re-pick a Failed step (which is exactly what a `Mark Failed` resolution on
+/// the retry-exhausted auto-blocker leaves), `executor::execute_step`'s budget
+/// guard would bail with "already used all N attempts", and the whole run
+/// would terminate. The user-approved semantics are "plan continues, step
+/// stays Failed" — making Failed non-actionable here implements that:
+///
+///   - The scheduler skips the Failed step and runs any independent branches
+///     to completion.
+///   - Dependents of the Failed step stay `Pending` forever (the runnable
+///     filter requires every dep `Complete` — see `deps_satisfied`), so the
+///     plan finalizes as `InProgress` per the §3.5 terminal shapes (an
+///     incomplete plan with no open interruptions, not Complete and not
+///     Interrupted). That matches the design intent: a Failed branch fences
+///     off its dependents from the rest of the run without the run itself
+///     blowing up.
+///   - `ralph step reset` still transitions Failed → Pending explicitly,
+///     after which the scheduler picks it back up on the next run/resume.
+///
+/// `InProgress` and `Aborted` remain actionable: `InProgress` is the
+/// belt-and-suspenders for a row the stale-in-progress sweep missed (the
+/// sweep normally converts these to `Aborted`); `Aborted` is the post-Ctrl+C
+/// state that should retry transparently on the next run.
 fn is_actionable(status: StepStatus) -> bool {
     matches!(
         status,
-        StepStatus::Pending | StepStatus::Failed | StepStatus::InProgress | StepStatus::Aborted
+        StepStatus::Pending | StepStatus::InProgress | StepStatus::Aborted
     )
 }
 
@@ -2597,6 +2805,47 @@ fn pick_next_step<'a>(
         .min_by(|a, b| step_schedule_cmp(a, b, depths))
 }
 
+/// Teardown helper for Ctrl+C / abort. Single non-blocking drain pass so
+/// every review whose subprocess already finished gets its verdict
+/// finalized (status + git-note + V29 corrective bridge), then
+/// `JoinSet::shutdown` aborts the rest so `kill_on_drop` fires on each
+/// review child. The two arms together close the §3.3 invariant on the
+/// abort path: no review verdict is silently discarded, and no review
+/// child is left orphaned. Failures inside the drain are logged but not
+/// propagated — the caller is already on the teardown path and the abort
+/// status set immediately after is the authoritative outcome.
+async fn drain_reviews_on_abort(
+    conn: &Connection,
+    plan: &Plan,
+    reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
+    workdir: &Path,
+    out: &OutputContext,
+    abort_rx: &mut watch::Receiver<CancelState>,
+) {
+    let before = reviews.len();
+    // Non-blocking drain: absorb every verdict that is already finished.
+    // We deliberately pass `block=false` so the abort isn't held up by a
+    // still-in-flight reviewer.
+    let drained_result =
+        drain_finished_reviews(conn, plan, reviews, workdir, out, false, abort_rx).await;
+    if let Err(e) = drained_result {
+        eprintln!("Warning: failed to drain finished reviews on abort: {e:#}");
+    }
+    let aborted = reviews.len();
+    let drained = before.saturating_sub(aborted);
+    if before > 0 {
+        eprintln!(
+            "Reviews on abort: drained {} verdict(s), aborting {} still-in-flight reviewer(s).",
+            drained, aborted
+        );
+    }
+    // Shutdown the rest: aborts every still-running review task and waits
+    // for them to be cancelled. Each spawned review owns its
+    // `tokio::process::Child` via `kill_on_drop(true)`, so abort propagates
+    // through to the harness subprocess.
+    reviews.shutdown().await;
+}
+
 /// Drain finished concurrent reviews as the SOLE DAG writer
 /// (docs/dag-redesign.md §3.5 item 3 / §9-inv-3 / §10).
 ///
@@ -2619,6 +2868,12 @@ fn pick_next_step<'a>(
 ///    return. This is what lets a passed review un-gate dependents / a
 ///    failed review's corrective step re-enter scheduling, and guarantees
 ///    the plan is never finalized with a review pending (§3.3).
+///    The blocking wait is also abort-cancellable: a Ctrl+C that arrives
+///    while we are parked on `join_next` returns early so the orchestrator
+///    can hit the Aborted-branch drain instead of waiting on a reviewer
+///    that may have no built-in timeout (`config.review.timeout_secs` is
+///    `None` by default — without this select, Ctrl+C would be silently
+///    ignored until the reviewer naturally returns).
 ///
 /// For each finished review it calls [`crate::review::finalize_review`] (the
 /// sole-writer verdict sink): `Pass` ⇒ promote the reviewed step
@@ -2642,6 +2897,7 @@ async fn drain_finished_reviews(
     workdir: &Path,
     out: &OutputContext,
     block: bool,
+    abort_rx: &mut watch::Receiver<CancelState>,
 ) -> Result<Option<PlanStatus>> {
     if reviews.is_empty() {
         consume_open_corrective_requests(conn, plan, out)?;
@@ -2651,12 +2907,41 @@ async fn drain_finished_reviews(
     // If asked to block, wait for the first one; otherwise reap only what is
     // already done. After the (optional) blocking wait, greedily drain every
     // other already-finished task in this same call.
+    //
+    // The blocking wait races on `abort_rx.changed()` so a Ctrl+C that
+    // arrives while we are parked on `join_next` returns early rather than
+    // waiting on a reviewer that may have no built-in timeout. The
+    // orchestrator's loop then re-checks `abort_rx` at the top of the next
+    // tick and falls into the Aborted-branch drain (which itself runs
+    // `drain_finished_reviews` with `block=false`).
     let mut joined: Vec<std::result::Result<crate::review::SpawnedReview, tokio::task::JoinError>> =
         Vec::new();
     if block {
-        match reviews.join_next().await {
-            Some(j) => joined.push(j),
-            None => return Ok(None), // emptied concurrently — nothing to do
+        // Short-circuit if the abort signal is already latched: don't park
+        // on `join_next` at all. The caller will see `Ok(None)` and re-loop
+        // straight into its cancel check.
+        if matches!(*abort_rx.borrow(), Some(crate::signal::CancelReason::Aborted)) {
+            return Ok(None);
+        }
+        tokio::select! {
+            biased;
+            // If the abort signal changes (e.g. to Aborted) while we are
+            // parked, bail out so the caller can re-check and start the
+            // teardown drain. The reviewer task is left in the JoinSet for
+            // the caller to handle (shutdown / continue draining).
+            res = abort_rx.changed() => {
+                // `changed()` returns `Err` only when the sender was
+                // dropped — at run-teardown time. Either way we should not
+                // keep blocking on a reviewer that may never return.
+                let _ = res;
+                return Ok(None);
+            }
+            j_opt = reviews.join_next() => {
+                match j_opt {
+                    Some(j) => joined.push(j),
+                    None => return Ok(None), // emptied concurrently — nothing to do
+                }
+            }
         }
     }
     while let Some(j) = reviews.try_join_next() {
@@ -2941,6 +3226,50 @@ mod tests {
             squash_on_complete: false,
             max_review_corrections: None,
         }
+    }
+
+    /// Fix #4: source-shape proof that the orchestrator loop in
+    /// `run_plan_inner` clears `run_locks.step_id` immediately after
+    /// `execute_step` returns and BEFORE the next iteration's pick + execute.
+    /// Without this call, `run_locks.step_id` would still name the previous
+    /// step until the next step's first `write_phase` fires (COALESCE
+    /// semantics in `update_live_phase`), letting an orphan subprocess from
+    /// the prior step bind a question to the wrong step.
+    ///
+    /// The full integration drive (A→NULL→B transition observed in the DB)
+    /// lives in `storage::tests::test_clear_live_run_step_models_orchestrator_a_to_b_transition`
+    /// — wiring an end-to-end orchestrator-loop test would require a real
+    /// harness subprocess, multiple steps, and exec timing. This source-shape
+    /// test catches drift: a future refactor that drops the call (or moves
+    /// it to the wrong place) will trip here.
+    #[test]
+    fn test_orchestrator_clears_live_run_step_between_iterations() {
+        let src = include_str!("runner.rs");
+        // The clear must appear in `run_plan_inner` AFTER the `execute_step`
+        // await and BEFORE the impl-permit drop (so the next iteration's
+        // pick can't observe a stale step_id).
+        let exec_step_pos = src
+            .find(".await?;\n        drop(_in_flight);")
+            .expect("execute_step .await? followed by drop(_in_flight) not found");
+        let after = &src[exec_step_pos..];
+        let clear_pos = after
+            .find("storage::clear_live_run_step(")
+            .expect(
+                "clear_live_run_step must be called immediately after execute_step returns \
+                 (Fix #4: widen the run_locks.step_id window between consecutive steps)",
+            );
+        // And it must precede the impl_permit drop further down — the impl
+        // permit's drop is logically "we are leaving this step's slot", so the
+        // clear must happen first to make the "no live step" snapshot durable
+        // before another scheduler tick can run.
+        let permit_drop = after
+            .find("drop(impl_permit);")
+            .expect("impl_permit drop site not found");
+        assert!(
+            clear_pos < permit_drop,
+            "clear_live_run_step must precede `drop(impl_permit)` so the gap \
+             snapshot is durable before another scheduler tick observes it",
+        );
     }
 
     // -- validate_plan_status tests --
@@ -4999,10 +5328,14 @@ mod tests {
         storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &staged_files)
             .unwrap();
 
-        let restored = restore_parked_step_worktree(&conn, &step, &dir)
+        let out = OutputContext::from_cli(false, false, false);
+        let restored = restore_parked_step_worktree(&conn, &step, &dir, &out)
             .await
             .unwrap();
-        assert!(restored, "a parked row must be restored");
+        assert!(
+            matches!(restored, RestoreParkedOutcome::Resumed),
+            "a parked row must be restored cleanly; got {restored:?}"
+        );
         assert_eq!(
             fs::read_to_string(dir.join("README.md")).unwrap(),
             "# staged change
@@ -5021,6 +5354,193 @@ mod tests {
             storage::get_step_parked_worktree(&conn, &step.id)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Cluster 3 Fix #2 — NotFound branch.
+    ///
+    /// Pre-fix: a stale `step_parked_worktrees` row (admin ran `git stash
+    /// clear`, IDE plugin dropped it, etc.) made
+    /// `restore_parked_step_worktree` bail with `anyhow!(...)`. The call
+    /// site at the top of the scheduler loop used `?` propagation, so a
+    /// single bad row killed the entire `run_plan_inner` and abandoned
+    /// every other branch in the DAG.
+    ///
+    /// Post-fix: per-step blocker, no bail. The function returns
+    /// `BlockedAfterFailure`, the bridge row is dropped (so a re-tick
+    /// can't re-fire the same error), and an `InterruptionKind::Blocker`
+    /// row is inserted on the step. The caller (`run_plan_inner`) treats
+    /// `BlockedAfterFailure` like the harness raising a blocker mid-step:
+    /// skip this step, let the scheduler pick another runnable branch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_restore_parked_step_worktree_notfound_raises_blocker_no_bail() {
+        let (_tmp, dir) = init_git_repo();
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            "demo",
+            &dir.to_string_lossy(),
+            "demo",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Persist a parked-worktree row pointing at a SHA that does NOT
+        // exist on the stash stack. Mirrors the post-admin-`git stash
+        // clear` state exactly.
+        let bogus_sha = "deadbeef0000000000000000000000000000beef";
+        storage::set_step_parked_worktree(&conn, &step.id, bogus_sha, &[]).unwrap();
+
+        let out = OutputContext::from_cli(false, false, false);
+        let outcome = restore_parked_step_worktree(&conn, &step, &dir, &out)
+            .await
+            .expect("must not bail — the per-step blocker is the new failure shape");
+        assert!(
+            matches!(outcome, RestoreParkedOutcome::BlockedAfterFailure),
+            "NotFound must yield BlockedAfterFailure; got {outcome:?}",
+        );
+
+        // The orphaned bridge row was dropped so the next scheduler pass
+        // doesn't re-trip the same error.
+        assert!(
+            storage::get_step_parked_worktree(&conn, &step.id)
+                .unwrap()
+                .is_none(),
+            "NotFound branch must drop the orphaned parked-worktree row",
+        );
+
+        // A `kind=Blocker` interruption is open on the step.
+        let opens =
+            storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(opens.len(), 1, "exactly one blocker interruption raised");
+        assert_eq!(opens[0].step_id, step.id);
+        assert_eq!(opens[0].kind, crate::plan::InterruptionKind::Blocker);
+        assert!(
+            opens[0].body.contains("was not found"),
+            "blocker body must explain the failure: {:?}",
+            opens[0].body,
+        );
+
+        // The blocker's open interruption makes the step appear in the
+        // scheduler's `blocked_step_ids` set, which `pick_next_step`
+        // excludes — so the scheduler picks ANOTHER branch on the next
+        // tick instead of the broken one.
+        let blocked = blocked_step_ids(&conn, &plan.id).unwrap();
+        assert!(
+            blocked.contains(&step.id),
+            "the step must appear in blocked_step_ids so the scheduler skips it",
+        );
+    }
+
+    /// Cluster 3 Fix #2 — Conflicted branch.
+    ///
+    /// Same per-step-blocker disposition as the NotFound branch, with one
+    /// difference: the parked stash is still on the stack (the user can
+    /// `git stash pop` it manually), so we KEEP the bridge row. That way
+    /// the user has both the recovery instructions in the blocker body
+    /// AND a working bridge row a future restart could retry.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_restore_parked_step_worktree_conflict_raises_blocker_keeps_bridge() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        let conn = setup();
+        let plan = storage::create_plan(
+            &conn,
+            "demo",
+            &dir.to_string_lossy(),
+            "demo",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Build a stash whose pop will conflict with HEAD: write version A
+        // and stash; then COMMIT a divergent version B so the parked stash
+        // can't apply cleanly. This is the exact fixture used by
+        // `test_stash_pop_conflict_leaves_stash_intact` in src/git.rs.
+        fs::write(dir.join("README.md"), "version-A\n").unwrap();
+        let stash_ref = git::stash_push_with_untracked(&dir, "ralph: conflict-park-test")
+            .unwrap()
+            .expect("expected parked stash");
+        fs::write(dir.join("README.md"), "version-B\n").unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-am", "divergent"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[]).unwrap();
+
+        let out = OutputContext::from_cli(false, false, false);
+        let outcome = restore_parked_step_worktree(&conn, &step, &dir, &out)
+            .await
+            .expect("conflicted apply must not bail the whole run");
+        assert!(
+            matches!(outcome, RestoreParkedOutcome::BlockedAfterFailure),
+            "Conflicted apply must yield BlockedAfterFailure; got {outcome:?}",
+        );
+
+        // Bridge row is KEPT so the stash on disk has a pointer the user
+        // can follow / a future restart can retry.
+        assert!(
+            storage::get_step_parked_worktree(&conn, &step.id)
+                .unwrap()
+                .is_some(),
+            "Conflicted branch must preserve the parked-worktree row \
+             (the stash is still recoverable on disk)",
+        );
+
+        // The stash itself is still on the stack (recoverable via `git
+        // stash pop <sha>` per the blocker body's instructions).
+        assert!(
+            git::find_stash_by_message(&dir, "ralph: conflict-park-test")
+                .unwrap()
+                .is_some(),
+            "the conflicted stash must survive on the stack so the user can recover",
+        );
+
+        let opens =
+            storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].kind, crate::plan::InterruptionKind::Blocker);
+        assert!(
+            opens[0].body.contains("conflicted"),
+            "blocker body must explain the conflict: {:?}",
+            opens[0].body,
         );
     }
 
@@ -5850,9 +6370,15 @@ mod tests {
     #[test]
     fn test_is_actionable_statuses() {
         assert!(is_actionable(StepStatus::Pending));
-        assert!(is_actionable(StepStatus::Failed));
         assert!(is_actionable(StepStatus::InProgress));
         assert!(is_actionable(StepStatus::Aborted));
+        // Phase E Fix 2: Failed is non-actionable. A user-requested `Mark
+        // Failed` resolution on the retry-exhausted auto-blocker leaves a
+        // Failed step at `attempts == max`; if the scheduler re-picked it,
+        // `executor::execute_step`'s budget guard would bail and terminate
+        // the run. The "plan continues, step stays Failed" semantics are
+        // implemented here by excluding Failed from the actionable set.
+        assert!(!is_actionable(StepStatus::Failed));
         assert!(!is_actionable(StepStatus::Complete));
         assert!(!is_actionable(StepStatus::Skipped));
     }
@@ -5947,6 +6473,85 @@ mod tests {
         // Full walk reproduces the authored order.
         let order = schedule_order(&mut steps, &edges, &full_window());
         assert_eq!(order, vec!["s0", "s1", "s2", "s3"]);
+    }
+
+    // ---- Phase E Fix 2: Failed is non-actionable ----
+
+    /// `pick_next_step` must NOT return a step in `StepStatus::Failed`. Pre-Phase-E
+    /// Failed was actionable, and a `Mark Failed` resolution on the
+    /// retry-exhausted auto-blocker left a step at `attempts == max` — the
+    /// scheduler would re-pick the Failed step, the executor's budget guard
+    /// would bail, and the whole run would terminate.
+    #[test]
+    fn test_pick_next_step_skips_failed_step() {
+        let mut steps = make_steps(2);
+        steps[0].status = StepStatus::Failed;
+        steps[0].attempts = 3;
+        let deps_of: HashMap<String, Vec<String>> = HashMap::new();
+        let depths = compute_step_depths(&steps, &deps_of);
+
+        let executed = HashSet::new();
+        let blocked = HashSet::new();
+        // s1 (Pending, no deps) must be picked, NOT s0 (Failed).
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &executed,
+            &blocked,
+        );
+        assert_eq!(
+            pick.map(|s| s.id.as_str()),
+            Some("s1"),
+            "scheduler must skip the Failed root and pick the independent Pending step",
+        );
+    }
+
+    /// End-to-end scheduler walk: a plan with one Failed root and one
+    /// independent Pending branch must drain the Pending branch and stop —
+    /// the Failed step is fenced off (never picked), and its dependents (if
+    /// any) starve naturally on `deps_satisfied` (the Failed dep is not
+    /// Complete).
+    #[test]
+    fn test_scheduler_walks_around_failed_step() {
+        // Two independent branches: branch A is just s0 (Failed); branch B
+        // is s1 -> s2 (s2 depends on s1).
+        let mut steps = make_steps(3);
+        steps[0].status = StepStatus::Failed;
+        steps[0].attempts = 3;
+        let edges = [(2, 1)]; // s2 depends on s1
+
+        let order = schedule_order(&mut steps, &edges, &full_window());
+
+        // Branch B drained; Failed s0 was never picked.
+        assert_eq!(
+            order,
+            vec!["s1".to_string(), "s2".to_string()],
+            "scheduler runs the independent Pending branch around the Failed root",
+        );
+        assert!(
+            !order.contains(&"s0".to_string()),
+            "Failed step must not be re-picked",
+        );
+    }
+
+    /// Dependents of a Failed step starve (their dep is not Complete). The
+    /// plan finalizes via the §3.5 "InProgress" terminal shape (incomplete
+    /// + no open interruptions).
+    #[test]
+    fn test_dependents_of_failed_step_starve() {
+        // s0 Failed; s1 depends on s0. s1 must not be picked.
+        let mut steps = make_steps(2);
+        steps[0].status = StepStatus::Failed;
+        steps[0].attempts = 3;
+        let edges = [(1, 0)];
+
+        let order = schedule_order(&mut steps, &edges, &full_window());
+        assert!(
+            order.is_empty(),
+            "dependent of a Failed step is starved (not picked); got: {order:?}",
+        );
     }
 
     // ---- STEP 25: scheduler interruption integration (§3.4/§3.5) ----
@@ -6889,5 +7494,82 @@ mod tests {
             "short_id is the stable final discriminator under a sort_key tie"
         );
         assert_reproducible(&steps, &id_pairs, &expected);
+    }
+
+    /// Source-shape assertions for the abort-path / review-pipeline
+    /// teardown wiring. The behavioral path (a real Ctrl+C while a review
+    /// is parked) needs a live tokio runtime + spawned review harnesses,
+    /// which can't be cleanly constructed in a unit test — so we assert
+    /// the source shape: the abort branches must call
+    /// `drain_reviews_on_abort` (FIX #1) and the blocking
+    /// `drain_finished_reviews` call must race on `abort_rx.changed()`
+    /// (FIX #2).
+    #[test]
+    fn test_abort_branch_drains_reviews_before_returning() {
+        let src = include_str!("runner.rs");
+        // The in-loop Aborted branch in `run_plan_inner`.
+        let sig = "async fn run_plan_inner(";
+        let start = src.find(sig).expect("run_plan_inner must exist");
+        let after = &src[start..];
+        // Bound at the next top-level async/fn item.
+        let end_rel = after[sig.len()..]
+            .find("\n// ---")
+            .or_else(|| after[sig.len()..].find("\nasync fn "))
+            .or_else(|| after[sig.len()..].find("\nfn "))
+            .expect("expected a sibling item after run_plan_inner");
+        let body = &after[..sig.len() + end_rel];
+        assert!(
+            body.contains("drain_reviews_on_abort("),
+            "the Aborted branch in run_plan_inner must call \
+             drain_reviews_on_abort before returning so finished review \
+             verdicts aren't silently discarded and still-in-flight \
+             reviewers are aborted (kill_on_drop fires on the child)"
+        );
+    }
+
+    #[test]
+    fn test_drain_finished_reviews_blocking_wait_is_abort_cancellable() {
+        let src = include_str!("runner.rs");
+        let sig = "async fn drain_finished_reviews(";
+        let start = src.find(sig).expect("drain_finished_reviews must exist");
+        let after = &src[start..];
+        // Take enough to cover the blocking arm.
+        let body = &after[..after.len().min(8192)];
+        assert!(
+            body.contains("abort_rx: &mut watch::Receiver<CancelState>"),
+            "drain_finished_reviews must accept an abort_rx so its blocking \
+             join_next call can race on the cancel signal"
+        );
+        assert!(
+            body.contains("tokio::select!") && body.contains("abort_rx.changed()"),
+            "drain_finished_reviews(block=true) must race join_next against \
+             abort_rx.changed() — otherwise Ctrl+C is silently ignored \
+             until the reviewer naturally returns"
+        );
+    }
+
+    #[test]
+    fn test_drain_reviews_on_abort_uses_joinset_shutdown() {
+        let src = include_str!("runner.rs");
+        let sig = "async fn drain_reviews_on_abort(";
+        let start = src.find(sig).expect("drain_reviews_on_abort must exist");
+        let after = &src[start..];
+        // Bound at the next `async fn`.
+        let end_rel = after[sig.len()..]
+            .find("\nasync fn ")
+            .expect("expected a sibling async fn after drain_reviews_on_abort");
+        let body = &after[..sig.len() + end_rel];
+        assert!(
+            body.contains("drain_finished_reviews(") && body.contains("false"),
+            "drain_reviews_on_abort must do a non-blocking drain pass \
+             (block=false) so finished verdicts are absorbed before \
+             aborting the rest"
+        );
+        assert!(
+            body.contains("reviews.shutdown()"),
+            "drain_reviews_on_abort must call JoinSet::shutdown so \
+             still-in-flight review tasks are aborted (and kill_on_drop \
+             fires on each review child)"
+        );
     }
 }

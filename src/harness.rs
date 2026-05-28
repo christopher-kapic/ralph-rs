@@ -440,7 +440,16 @@ pub async fn spawn_harness_with_delivery(
     cmd.args(args)
         .current_dir(cwd)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // Defense-in-depth: `wait_capped` already SIGKILLs the process group on
+        // timeout and `signal::forward` propagates SIGINT to it, so today every
+        // Child reaches `wait()` before drop. `kill_on_drop(true)` makes the
+        // invariant structural — any future caller that drops the Child
+        // without going through `wait_capped` (e.g. a spawn-then-early-return
+        // path, a panic unwinding through the spawn site) reaps the harness
+        // child instead of orphaning it. Mirrors `hooks.rs`, `tui/events.rs`,
+        // and `io_util.rs`.
+        .kill_on_drop(true);
 
     // Attach a stdin pipe only when we have prompt bytes to send;
     // otherwise close it so the child doesn't block on an empty TTY read.
@@ -524,7 +533,13 @@ pub async fn spawn_harness_interactive(
         .current_dir(cwd)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        .stderr(std::process::Stdio::inherit())
+        // Defense-in-depth: the interactive planner inherits stdio and the
+        // terminal forwards Ctrl+C directly, so today every Child is `wait`ed
+        // on by the caller before drop. `kill_on_drop(true)` makes the
+        // invariant structural for any future caller that drops the Child
+        // without waiting (e.g. a `?` propagation between spawn and wait).
+        .kill_on_drop(true);
 
     for (key, value) in env_vars {
         cmd.env(key, value);
@@ -1399,5 +1414,57 @@ mod tests {
         // Sanity: the actual prompt text rides inline as argv (no spill).
         assert!(args.iter().any(|a| a == "tiny prompt"));
         assert!(matches!(delivery, PromptDelivery::Argv));
+    }
+
+    /// Source-shape assertions for `kill_on_drop` on harness spawns.
+    ///
+    /// `wait_capped` SIGKILLs the process group on timeout and
+    /// `signal::forward` propagates SIGINT to it, so today every Child
+    /// reaches `wait()` before drop. `kill_on_drop(true)` is the
+    /// defense-in-depth guarantee: any future caller that drops the
+    /// Child without going through `wait_capped` (a `?` propagation
+    /// between spawn and wait, a panic unwinding through the spawn site)
+    /// reaps the harness child instead of orphaning it. Behavioral
+    /// regression would require constructing a real harness subprocess
+    /// and observing PID reaping; the source assertion is the cleanest
+    /// way to catch a future refactor that drops the flag.
+    #[test]
+    fn test_spawn_harness_sets_kill_on_drop() {
+        let src = include_str!("harness.rs");
+
+        let sig = "pub async fn spawn_harness_with_delivery(";
+        let start = src.find(sig).expect("spawn_harness_with_delivery must exist");
+        let after = &src[start..];
+        // Bound at the next `pub async fn` (the interactive variant).
+        let end_rel = after[sig.len()..]
+            .find("\npub async fn ")
+            .expect("expected a sibling pub async fn after spawn_harness_with_delivery");
+        let body = &after[..sig.len() + end_rel];
+        assert!(
+            body.contains(".kill_on_drop(true)"),
+            "spawn_harness_with_delivery must build its Command with \
+             kill_on_drop(true) so a Child dropped without going through \
+             wait_capped reaps instead of orphaning the harness subprocess",
+        );
+    }
+
+    #[test]
+    fn test_spawn_harness_interactive_sets_kill_on_drop() {
+        let src = include_str!("harness.rs");
+
+        let sig = "pub async fn spawn_harness_interactive(";
+        let start = src.find(sig).expect("spawn_harness_interactive must exist");
+        let after = &src[start..];
+        // Bound at the next `pub` item.
+        let end_rel = after[sig.len()..]
+            .find("\npub ")
+            .expect("expected a sibling pub item after spawn_harness_interactive");
+        let body = &after[..sig.len() + end_rel];
+        assert!(
+            body.contains(".kill_on_drop(true)"),
+            "spawn_harness_interactive must build its Command with \
+             kill_on_drop(true) so a Child dropped without being waited on \
+             reaps instead of orphaning the harness subprocess",
+        );
     }
 }

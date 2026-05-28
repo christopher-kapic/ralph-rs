@@ -245,50 +245,34 @@ fn classify_bundle(steps: &[ImportedStep]) -> BundleShape {
 /// Builds the edge set incrementally in a deterministic order (steps in
 /// array order, each step's `depends_on` in listed order); before adding
 /// each edge `s -> d` it asks the same question
-/// [`storage::would_create_step_cycle`] asks — "is `s` already reachable
-/// from `d`?" — over the edges added so far, using the identical
-/// stack/visited DFS. A self-edge (`s == d`) is a cycle, mirroring that
-/// function's early return. Returns the offending `(s, d)` pair on the
-/// first edge that would close a cycle.
+/// [`storage::would_create_step_cycle`] asks — "would adding `s -> d` close
+/// a cycle over the edges added so far?" — funneled through the shared
+/// [`crate::dag_util::would_create_cycle_generic`] DFS (the same algorithm
+/// the two storage wrappers use; the closure here resolves dependencies
+/// against the in-memory `built` map instead of the DB). A self-edge
+/// (`s == d`) is a cycle, handled by the generic. Returns the offending
+/// `(s, d)` pair on the first edge that would close a cycle.
 fn find_imported_cycle(steps: &[ImportedStep]) -> Option<(String, String)> {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     // short_id -> already-added dependency short_ids.
-    let mut built: HashMap<&str, Vec<&str>> = HashMap::new();
-
-    // Identical stack/visited DFS to `storage::would_create_step_cycle`:
-    // is `target` reachable from `from` over the edges added so far?
-    fn reachable(built: &HashMap<&str, Vec<&str>>, from: &str, target: &str) -> bool {
-        let mut stack: Vec<&str> = vec![from];
-        let mut visited: HashSet<&str> = HashSet::new();
-        while let Some(cur) = stack.pop() {
-            if !visited.insert(cur) {
-                continue;
-            }
-            if cur == target {
-                return true;
-            }
-            if let Some(deps) = built.get(cur) {
-                for d in deps {
-                    if !visited.contains(d) {
-                        stack.push(d);
-                    }
-                }
-            }
-        }
-        false
-    }
+    let mut built: HashMap<String, Vec<String>> = HashMap::new();
 
     for step in steps {
         let Some(s) = step.short_id.as_deref() else {
             continue;
         };
         for d in &step.depends_on {
-            let d = d.as_str();
-            if s == d || reachable(&built, d, s) {
-                return Some((s.to_string(), d.to_string()));
+            // The generic returns `Result`; this closure never fails
+            // (pure in-memory HashMap lookup), so `expect` is unreachable.
+            let closes_cycle = crate::dag_util::would_create_cycle_generic(s, d, |id| {
+                Ok(built.get(id).cloned().unwrap_or_default())
+            })
+            .expect("in-memory cycle check cannot fail");
+            if closes_cycle {
+                return Some((s.to_string(), d.clone()));
             }
-            built.entry(s).or_default().push(d);
+            built.entry(s.to_string()).or_default().push(d.clone());
         }
     }
     None

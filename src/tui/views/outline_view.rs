@@ -13,6 +13,7 @@
 // never writes the DB and never affects the scheduler (§12.2): scheduling
 // still spans the whole DAG; focus only narrows what is *drawn*.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -111,6 +112,23 @@ pub struct OutlineState {
     focus_stack: Vec<String>,
     /// Cursor index into the *currently visible* rows.
     cursor: usize,
+    /// **Frame-scoped cache** of the last [`Self::visible_rows`] result.
+    /// `visible_rows` used to rebuild the full pipeline (project_outline →
+    /// focus filter → tree_layout) on every call, and a single keystroke
+    /// could fan out into 4–6 of those calls (navigate, render, sync,
+    /// selected_step_id, …). The cache populates lazily on the first call
+    /// and is invalidated by every mutator that changes a `visible_rows`
+    /// input — `sync` (steps/edges/blocked), `focus_cursor`/`pop_focus`/
+    /// `pop_focus_to_root`/`focus_to_crumb` (focus stack). Cursor-only
+    /// moves (`navigate_up`/`down`/`set_cursor`) deliberately do **not**
+    /// invalidate: the row vector is independent of cursor position.
+    ///
+    /// `RefCell` so an `&self` read path (the render loop, every
+    /// `selected_step_id`) can populate it without forcing the API to
+    /// `&mut`. `Clone` propagates the *cleared* cache (a clone is treated
+    /// as a fresh state) — the inner `None` is what gets cloned, and any
+    /// `Some(rows)` belongs to the original's "frame" anyway.
+    cache: RefCell<Option<Vec<OutlineRow>>>,
 }
 
 /// Reorder visible entries into **DFS-by-subtree** order and assign each
@@ -289,7 +307,15 @@ impl OutlineState {
             blocked_ids,
             focus_stack: Vec::new(),
             cursor: 0,
+            cache: RefCell::new(None),
         }
+    }
+
+    /// Clear the [`Self::cache`]. Called by every mutator whose change
+    /// affects what `visible_rows` would return (steps/edges/blocked
+    /// set/focus stack); cursor-only moves don't call it.
+    fn invalidate_cache(&mut self) {
+        self.cache.get_mut().take();
     }
 
     /// Replace the step set / edges / blocked set after a DB poll, preserving
@@ -310,6 +336,8 @@ impl OutlineState {
         self.steps = steps;
         self.deps_of = deps_of;
         self.blocked_ids = blocked_ids;
+        // New steps/edges/blocked set → previous frame's cache is stale.
+        self.invalidate_cache();
         // Restore cursor by id within the (possibly changed) visible set.
         let rows = self.visible_rows();
         if let Some(id) = cursor_id
@@ -385,7 +413,29 @@ impl OutlineState {
     /// continuous `│` columns and no cross-subtree interleaving — the
     /// scheduler still walks `(depth, sort_key, short_id)` independently
     /// off of `compute_step_depths`, so this is purely a display order.
+    ///
+    /// Frame-scoped memoization: the first call populates [`Self::cache`]
+    /// with a clone of the projection; subsequent calls within the same
+    /// frame just clone the cached vec (cheap — `OutlineRow` is a handful
+    /// of `String`s) instead of re-running the full pipeline. Any mutator
+    /// that changes a pipeline input (`sync`, the focus push/pop family)
+    /// calls [`Self::invalidate_cache`]; cursor-only moves don't, so the
+    /// hot keystroke path (navigate → render → selected_step_id → …) only
+    /// pays for one projection per frame.
     pub fn visible_rows(&self) -> Vec<OutlineRow> {
+        if let Some(rows) = self.cache.borrow().as_ref() {
+            return rows.clone();
+        }
+        let rows = self.build_visible_rows();
+        *self.cache.borrow_mut() = Some(rows.clone());
+        rows
+    }
+
+    /// Run the full project_outline → focus filter → tree_layout pipeline,
+    /// producing the `Vec<OutlineRow>` `visible_rows` returns. Separated
+    /// from `visible_rows` purely so the memoization layer stays small;
+    /// nothing else calls this directly.
+    fn build_visible_rows(&self) -> Vec<OutlineRow> {
         let entries: Vec<OutlineEntry> = project_outline(&self.steps, &self.deps_of);
         let cone = self.focus_root().map(|r| self.downstream_cone(r));
         let filtered: Vec<OutlineEntry> = entries
@@ -476,6 +526,8 @@ impl OutlineState {
             return false;
         }
         self.focus_stack.push(id);
+        // Focus stack changed → rebuild the visible rows on next read.
+        self.invalidate_cache();
         // The new root is always the first visible row of its own cone.
         self.cursor = 0;
         true
@@ -489,6 +541,7 @@ impl OutlineState {
         let Some(popped) = self.focus_stack.pop() else {
             return false;
         };
+        self.invalidate_cache();
         let rows = self.visible_rows();
         self.cursor = rows.iter().position(|r| r.step_id == popped).unwrap_or(0);
         true
@@ -503,6 +556,7 @@ impl OutlineState {
         }
         let first_root = self.focus_stack.first().cloned();
         self.focus_stack.clear();
+        self.invalidate_cache();
         let rows = self.visible_rows();
         self.cursor = first_root
             .and_then(|id| rows.iter().position(|r| r.step_id == id))
@@ -519,6 +573,7 @@ impl OutlineState {
         let keep = crumb_index + 1;
         let new_top = self.focus_stack[crumb_index].clone();
         self.focus_stack.truncate(keep);
+        self.invalidate_cache();
         let rows = self.visible_rows();
         self.cursor = rows.iter().position(|r| r.step_id == new_top).unwrap_or(0);
         true
@@ -997,5 +1052,131 @@ mod tests {
         let rows = st.visible_rows();
         assert_eq!(ids(&rows), vec!["aaaa", "cccc"]);
         assert!(st.cursor() < rows.len());
+    }
+
+    // -- Item F: visible_rows() frame-scoped cache ------------------------
+
+    /// A fresh `OutlineState` has no cached projection; the first
+    /// `visible_rows()` call populates it, and subsequent calls reuse it
+    /// (the cached vec contents are still correct). Cursor-only moves
+    /// (`navigate_up`/`down`/`set_cursor`) deliberately do not invalidate
+    /// — the row vector is independent of cursor position, so the hot
+    /// keystroke path only pays for one projection per frame.
+    #[test]
+    fn visible_rows_cache_populates_lazily_and_survives_cursor_moves() {
+        let mut st = diamond();
+        assert!(
+            st.cache.borrow().is_none(),
+            "fresh state must not have a populated cache"
+        );
+        let rows1 = st.visible_rows();
+        assert!(
+            st.cache.borrow().is_some(),
+            "first visible_rows() call must populate the cache"
+        );
+        // Cursor moves do not invalidate.
+        st.navigate_down();
+        assert!(
+            st.cache.borrow().is_some(),
+            "cursor move must NOT invalidate the cache"
+        );
+        st.navigate_up();
+        st.set_cursor(0);
+        assert!(
+            st.cache.borrow().is_some(),
+            "set_cursor must NOT invalidate the cache"
+        );
+        // Subsequent reads return the same rows.
+        let rows2 = st.visible_rows();
+        assert_eq!(ids(&rows1), ids(&rows2));
+    }
+
+    /// Every mutator that changes a `visible_rows` input invalidates the
+    /// cache (so the next call rebuilds against the fresh state): `sync`
+    /// (steps/edges/blocked), `focus_cursor`, `pop_focus`,
+    /// `pop_focus_to_root`, `focus_to_crumb`. Each test arm primes the
+    /// cache, runs the mutator, and asserts the next visible_rows reflects
+    /// the new state (the right thing to verify — `sync` and the focus
+    /// mutators repopulate the cache internally for cursor restoration,
+    /// so checking `cache.borrow().is_none()` would race against that).
+    #[test]
+    fn visible_rows_cache_invalidates_on_state_changes() {
+        // sync: steps/edges/blocked changed → cache rebuilds against the
+        // new step set.
+        let mut st = diamond();
+        let _ = st.visible_rows();
+        assert!(st.cache.borrow().is_some());
+        let steps = vec![step("aaaa", "a0")];
+        st.sync(steps, HashMap::new(), HashSet::new());
+        let rows = st.visible_rows();
+        assert_eq!(
+            ids(&rows),
+            vec!["aaaa"],
+            "sync must invalidate the cache; visible_rows must reflect the new state"
+        );
+
+        // focus_cursor: focus stack changed → cache reflects the cone.
+        let mut st = diamond();
+        st.navigate_down(); // bbbb
+        let _ = st.visible_rows();
+        assert!(st.cache.borrow().is_some());
+        assert!(st.focus_cursor());
+        let rows = st.visible_rows();
+        assert_eq!(
+            ids(&rows),
+            vec!["bbbb", "dddd"],
+            "focus_cursor must invalidate the cache; cone-restricted rows must appear"
+        );
+
+        // pop_focus: focus stack changed → cache rebuilds against full
+        // DAG.
+        let mut st = diamond();
+        st.navigate_down();
+        st.focus_cursor();
+        let _ = st.visible_rows();
+        assert!(st.cache.borrow().is_some());
+        assert!(st.pop_focus());
+        let rows = st.visible_rows();
+        assert_eq!(
+            ids(&rows),
+            vec!["aaaa", "bbbb", "cccc", "dddd"],
+            "pop_focus must invalidate the cache; full DAG must reappear"
+        );
+
+        // pop_focus_to_root: focus stack changed → cache rebuilds against
+        // full DAG (this exercise the multi-level pop path).
+        let mut st = diamond();
+        st.navigate_down();
+        st.focus_cursor();
+        let _ = st.visible_rows();
+        assert!(st.cache.borrow().is_some());
+        assert!(st.pop_focus_to_root());
+        let rows = st.visible_rows();
+        assert_eq!(
+            ids(&rows),
+            vec!["aaaa", "bbbb", "cccc", "dddd"],
+            "pop_focus_to_root must invalidate the cache; full DAG must reappear"
+        );
+
+        // focus_to_crumb: focus stack changed (need two crumbs to allow
+        // a meaningful truncate — focus_to_crumb returns false if the
+        // crumb is the current top).
+        let mut st = diamond();
+        st.navigate_down();
+        st.focus_cursor(); // bbbb
+        st.navigate_down();
+        st.focus_cursor(); // dddd
+        assert_eq!(st.focus_stack.len(), 2);
+        let _ = st.visible_rows();
+        assert!(st.cache.borrow().is_some());
+        assert!(st.focus_to_crumb(0));
+        // After truncating to crumb 0, focus is back to bbbb's cone
+        // (bbbb + dddd).
+        let rows = st.visible_rows();
+        assert_eq!(
+            ids(&rows),
+            vec!["bbbb", "dddd"],
+            "focus_to_crumb must invalidate the cache; new cone must appear"
+        );
     }
 }

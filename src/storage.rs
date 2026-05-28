@@ -1069,6 +1069,13 @@ pub struct InboxRow {
 /// first), then RESOLVED items (most-recently resolved first) which the TUI
 /// keeps visible but dimmed for recent context (§12.3). `resolved_limit`
 /// bounds the trailing resolved tail so the inbox doesn't grow unbounded.
+///
+/// The bound is **SQL-side**: a `UNION ALL` of "all open rows (oldest
+/// first)" + "the most-recent `resolved_limit` resolved rows" — neither
+/// branch ever fetches a row past its own bound. The pre-fix implementation
+/// pulled *every* row in the project and discarded the post-limit resolved
+/// tail in Rust, which scaled poorly once a project accumulated thousands
+/// of resolved interruptions. The Rust side is now a thin row-mapper.
 pub fn list_inbox_rows(
     conn: &Connection,
     project: &str,
@@ -1079,21 +1086,42 @@ pub fn list_inbox_rows(
         .map(|c| format!("i.{c}"))
         .collect::<Vec<_>>()
         .join(", ");
-    // Open first (asked_at ASC), then resolved (resolved_at DESC) capped.
-    let sql = format!(
+    // Open branch + resolved branch UNION ALL'd; each branch carries its
+    // own ORDER BY + (for resolved) LIMIT, and a final ORDER BY on a
+    // synthesized `bucket` column re-imposes the "open first, then
+    // resolved" wrapper. Open rows order by `asked_at ASC` (oldest first,
+    // the §12.3 inbox UX); resolved rows order by `resolved_at DESC`
+    // (most-recently resolved first) — same ordering the Rust filter
+    // produced post-fetch, now done by SQLite.
+    //
+    // `resolved_limit = 0` legitimately means "no resolved tail" — the
+    // resolved branch's LIMIT 0 returns nothing and the Rust loop never
+    // sees a resolved row.
+    // Two prepared statements (open, resolved) executed back-to-back —
+    // simpler than a UNION ALL that would need a column shift to keep
+    // `Interruption::from_row` happy, and gives the resolved branch its
+    // own `LIMIT ?` natively without juggling parameter positions across
+    // dialect quirks. Both queries share the same projection shape, so
+    // the row mapper is one closure.
+    let open_sql = format!(
         "SELECT {cols}, p.slug, s.short_id, i.state, i.resolved_at \
          FROM interruptions i \
          JOIN steps s ON s.id = i.step_id \
          JOIN plans p ON p.id = s.plan_id \
-         WHERE p.project = ?1 \
-         ORDER BY (i.state = 'open') DESC, \
-                  CASE WHEN i.state = 'open' THEN i.asked_at END ASC, \
-                  CASE WHEN i.state = 'resolved' THEN i.resolved_at END DESC, \
-                  i.id ASC"
+         WHERE p.project = ?1 AND i.state = 'open' \
+         ORDER BY i.asked_at ASC, i.id ASC"
     );
-    let mut stmt = conn.prepare(&sql)?;
+    let resolved_sql = format!(
+        "SELECT {cols}, p.slug, s.short_id, i.state, i.resolved_at \
+         FROM interruptions i \
+         JOIN steps s ON s.id = i.step_id \
+         JOIN plans p ON p.id = s.plan_id \
+         WHERE p.project = ?1 AND i.state = 'resolved' \
+         ORDER BY i.resolved_at DESC, i.id ASC \
+         LIMIT ?2"
+    );
     let n_cols = INTERRUPTION_COLUMNS.split(", ").count();
-    let rows = stmt.query_map(params![project], |row| {
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<InboxRow> {
         let interruption = Interruption::from_row(row)?;
         let plan_slug: String = row.get(n_cols)?;
         let step_short_id: String = row.get(n_cols + 1)?;
@@ -1102,19 +1130,25 @@ pub fn list_inbox_rows(
             plan_slug,
             step_short_id,
         })
-    })?;
-    let mut open = Vec::new();
-    let mut resolved = Vec::new();
-    for row in rows {
-        let r = row?;
-        if r.interruption.state == crate::plan::InterruptionState::Open {
-            open.push(r);
-        } else if resolved.len() < resolved_limit {
-            resolved.push(r);
-        }
+    };
+
+    let mut out = Vec::new();
+    let mut open_stmt = conn.prepare(&open_sql)?;
+    let open_rows = open_stmt.query_map(params![project], map_row)?;
+    for row in open_rows {
+        out.push(row?);
     }
-    open.extend(resolved);
-    Ok(open)
+    // Resolved branch: SQL-side LIMIT means even when the project has
+    // 10k resolved rows we only fetch `resolved_limit` of them. `LIMIT 0`
+    // is a legitimate "no resolved tail" request — SQLite returns zero
+    // rows and the loop is a no-op.
+    let mut resolved_stmt = conn.prepare(&resolved_sql)?;
+    let resolved_rows =
+        resolved_stmt.query_map(params![project, resolved_limit as i64], map_row)?;
+    for row in resolved_rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 /// The **bounded** resolved-interruption query — the centerpiece of the §4
@@ -2702,33 +2736,14 @@ pub fn list_dependent_plans(conn: &Connection, plan_id: &str) -> Result<Vec<Stri
 
 /// Check whether adding `plan_id -> new_dep_id` would create a cycle.
 ///
-/// Walks the transitive dependencies of `new_dep_id`; if `plan_id` appears in
-/// that set, the edge would close a cycle. A self-edge (`plan_id == new_dep_id`)
-/// is also reported as a cycle.
+/// Thin DB-backed wrapper around [`crate::dag_util::would_create_cycle_generic`]:
+/// the per-node dependency accessor delegates to [`list_plan_dependencies`].
+/// A self-edge (`plan_id == new_dep_id`) is reported as a cycle (handled by
+/// the generic).
 pub fn would_create_cycle(conn: &Connection, plan_id: &str, new_dep_id: &str) -> Result<bool> {
-    if plan_id == new_dep_id {
-        return Ok(true);
-    }
-
-    let mut stack: Vec<String> = vec![new_dep_id.to_string()];
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    while let Some(current) = stack.pop() {
-        if !visited.insert(current.clone()) {
-            continue;
-        }
-        if current == plan_id {
-            return Ok(true);
-        }
-        let deps = list_plan_dependencies(conn, &current)?;
-        for d in deps {
-            if !visited.contains(&d) {
-                stack.push(d);
-            }
-        }
-    }
-
-    Ok(false)
+    crate::dag_util::would_create_cycle_generic(plan_id, new_dep_id, |id| {
+        list_plan_dependencies(conn, id)
+    })
 }
 
 /// Topologically sort the given plan IDs so that dependencies come before
@@ -2916,35 +2931,17 @@ pub fn list_step_dependents(conn: &Connection, step_id: &str) -> Result<Vec<Stri
 
 /// Check whether adding `step_id -> new_dep_id` would create a cycle.
 ///
-/// A direct structural clone of [`would_create_cycle`] against the V25
-/// `step_dependencies` table (docs/dag-redesign.md §6): walks the transitive
-/// dependencies of `new_dep_id`; if `step_id` appears in that set, the edge
-/// would close a cycle. A self-edge (`step_id == new_dep_id`) is also reported
-/// as a cycle. Reused by import validation (docs/dag-redesign.md §13.3).
+/// Step-graph analogue of [`would_create_cycle`]: a thin DB-backed wrapper
+/// around [`crate::dag_util::would_create_cycle_generic`] whose per-node
+/// dependency accessor delegates to [`list_step_dependencies`]. A self-edge
+/// (`step_id == new_dep_id`) is reported as a cycle. Reused by import
+/// validation (docs/dag-redesign.md §13.3 — see
+/// `import::find_imported_cycle`, which is the in-memory analogue layered
+/// on the same generic DFS).
 pub fn would_create_step_cycle(conn: &Connection, step_id: &str, new_dep_id: &str) -> Result<bool> {
-    if step_id == new_dep_id {
-        return Ok(true);
-    }
-
-    let mut stack: Vec<String> = vec![new_dep_id.to_string()];
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    while let Some(current) = stack.pop() {
-        if !visited.insert(current.clone()) {
-            continue;
-        }
-        if current == step_id {
-            return Ok(true);
-        }
-        let deps = list_step_dependencies(conn, &current)?;
-        for d in deps {
-            if !visited.contains(&d) {
-                stack.push(d);
-            }
-        }
-    }
-
-    Ok(false)
+    crate::dag_util::would_create_cycle_generic(step_id, new_dep_id, |id| {
+        list_step_dependencies(conn, id)
+    })
 }
 
 /// Load every step-dependency edge for `plan_id` as an adjacency map
@@ -3131,35 +3128,46 @@ pub fn consume_corrective_step_request(conn: &Connection, request_id: &str) -> R
 /// A ordinary) returns 1; A″ correcting A′ returns 2; and so on. The
 /// recursion-cap check (§10 item 4 / §14.5) compares the chain length the
 /// *next* correction would have against the per-plan
-/// `max_review_corrections`. A `visited` guard bounds the walk even if a
-/// `corrects_step_id` pointer is ever cyclic (it cannot be under normal
-/// operation — corrective steps only ever point *backward* at an
-/// already-existing step).
+/// `max_review_corrections`. Implemented as a single SQLite recursive CTE
+/// (one query for the whole chain instead of one SELECT per hop) — the
+/// per-hop loop was called from `consume_corrective_request` on every
+/// review-failure tick and turned the per-plan cap into N round-trips for
+/// a chain of length N. The CTE's `hops` accumulator is the chain length;
+/// `MAX(hops)` is the final answer.
+///
+/// The `WHERE hops < 1024` clause is a defense-in-depth bound: in normal
+/// operation a corrective chain points strictly backward at an existing
+/// step (never cyclic), but the bounded WHERE guarantees termination
+/// even on a corrupted `corrects_step_id` pointer (same role the
+/// pre-CTE `visited` HashSet played). 1024 is several orders of
+/// magnitude above any plausible `max_review_corrections` ceiling.
+///
+/// Returns `Ok(0)` for an ordinary step (no `corrects_step_id`) and for
+/// a non-existent `step_id` (the anchor returns no rows; the CTE yields
+/// the empty set; `MAX(...)` over the empty set is SQL NULL, which we
+/// coalesce to 0).
 pub fn corrective_chain_len(conn: &Connection, step_id: &str) -> Result<usize> {
-    let mut len = 0usize;
-    let mut current = step_id.to_string();
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    loop {
-        if !visited.insert(current.clone()) {
-            break;
-        }
-        let corrects: Option<String> = conn
-            .query_row(
-                "SELECT corrects_step_id FROM steps WHERE id = ?1",
-                params![current],
-                |r| r.get(0),
-            )
-            .ok()
-            .flatten();
-        match corrects {
-            Some(parent) => {
-                len += 1;
-                current = parent;
-            }
-            None => break,
-        }
-    }
-    Ok(len)
+    // The anchor selects the start step's `corrects_step_id` (1 hop in if
+    // it is corrective, NULL otherwise — terminated immediately). Each
+    // recursive row walks one more `corrects_step_id` link. `hops <
+    // 1024` bounds the walk against any pathological pointer; the
+    // outer COALESCE turns the empty-set MAX (NULL) into 0 so an
+    // ordinary or non-existent step is reported as length 0.
+    let sql = "
+        WITH RECURSIVE chain(id, hops) AS (
+            SELECT s.corrects_step_id, 1
+              FROM steps s
+             WHERE s.id = ?1 AND s.corrects_step_id IS NOT NULL
+            UNION ALL
+            SELECT s.corrects_step_id, c.hops + 1
+              FROM chain c
+              JOIN steps s ON s.id = c.id
+             WHERE s.corrects_step_id IS NOT NULL AND c.hops < 1024
+        )
+        SELECT COALESCE(MAX(hops), 0) FROM chain
+    ";
+    let len: i64 = conn.query_row(sql, params![step_id], |r| r.get(0))?;
+    Ok(len.max(0) as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -3363,6 +3371,56 @@ pub fn bind_live_run_to_plan(
             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE project = ?4",
         params![plan_id, plan_slug, Phase::Idle.as_str(), project],
+    )?;
+
+    if affected == 0 {
+        anyhow::bail!("No run_locks row for project: {project}");
+    }
+    Ok(())
+}
+
+/// Clear every per-step field on the live-run lock row, returning the row
+/// to a "no live step" snapshot while keeping the plan binding intact.
+///
+/// **Why this exists.** `update_live_phase` uses COALESCE on `step_id`,
+/// `step_num`, `attempt`, `max_attempts`, and `execution_log_id`, so passing
+/// `None` for any of them *preserves* the prior value. Between two
+/// consecutive steps within the same plan there is a small window — from
+/// when `execute_step` returns to the scheduler to when the next step's
+/// first `write_phase` fires — during which `run_locks.step_id` still names
+/// the previous step. An orphaned subprocess from step A's harness calling
+/// `ralph question ask` during that window would bind the question to A
+/// (already `Complete`), not to B. `bind_live_run_to_plan` widens the same
+/// row to "no live step", but only on a **cross-plan** rebind; the
+/// within-plan case had no equivalent. This function fills that gap.
+///
+/// **What it clears.** Every per-step field on the lock row:
+/// `step_id`, `step_num`, `attempt`, `max_attempts`, `execution_log_id`,
+/// `current_command`, `child_pid`, `child_start_token`. The plan binding
+/// (`plan_id`, `plan_slug`), the process pid, and the run-start columns
+/// stay untouched.
+///
+/// Called by `runner::run_plan_inner` between consecutive `execute_step`
+/// invocations within a plan (and a defensive cross-process bridge — see
+/// the `Fix #4` comment at the call site).
+///
+/// Errors when no row exists for `project` — the run_locks row is created
+/// by [`crate::run_lock::acquire`] before the executor starts, so a missing
+/// row indicates a programming error (likely a test forgot to seed the row).
+pub fn clear_live_run_step(conn: &Connection, project: &str) -> Result<()> {
+    let affected = conn.execute(
+        "UPDATE run_locks SET
+            step_id = NULL,
+            step_num = NULL,
+            attempt = NULL,
+            max_attempts = NULL,
+            execution_log_id = NULL,
+            current_command = NULL,
+            child_pid = NULL,
+            child_start_token = NULL,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE project = ?1",
+        params![project],
     )?;
 
     if affected == 0 {
@@ -6813,6 +6871,132 @@ mod tests {
         assert!(live.updated_at.is_some());
     }
 
+    /// Fix #4: `clear_live_run_step` widens the row to "no live step" while
+    /// preserving the plan binding. Seed every per-step field, call clear,
+    /// and assert every per-step field is NULL while plan_id/plan_slug/pid
+    /// stay intact.
+    #[test]
+    fn test_clear_live_run_step_nulls_step_fields_keeps_plan() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, plan_id, plan_slug, step_id, step_num,
+                                    attempt, max_attempts, phase, current_command,
+                                    execution_log_id, child_pid, child_start_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                "/proj-clear",
+                1i64,
+                "plan-A",
+                "plan-A-slug",
+                "step-A",
+                3i32,
+                1i32,
+                3i32,
+                Phase::Harness.as_str(),
+                "claude-code",
+                42i64,
+                12345i64,
+                "tok-A",
+            ],
+        )
+        .unwrap();
+
+        clear_live_run_step(&conn, "/proj-clear").unwrap();
+
+        let live = get_live_run(&conn, "/proj-clear").unwrap().unwrap();
+        // Plan binding preserved.
+        assert_eq!(live.plan_id.as_deref(), Some("plan-A"));
+        assert_eq!(live.plan_slug.as_deref(), Some("plan-A-slug"));
+        assert_eq!(live.pid, 1);
+        // Every per-step field is NULL.
+        assert_eq!(live.step_id, None);
+        assert_eq!(live.step_num, None);
+        assert_eq!(live.attempt, None);
+        assert_eq!(live.max_attempts, None);
+        assert_eq!(live.execution_log_id, None);
+        assert_eq!(live.current_command, None);
+        assert_eq!(live.child_pid, None);
+        assert_eq!(live.child_start_token, None);
+    }
+
+    /// Simulate the orchestrator loop's A → clear → B transition: write
+    /// step A's per-step fields, clear (mirrors the new
+    /// `runner::run_plan_inner` call after `execute_step` returns), then
+    /// write step B's fields. Asserts step_id transitions A → NULL → B
+    /// (NOT A → B, which is what COALESCE produced before the fix).
+    #[test]
+    fn test_clear_live_run_step_models_orchestrator_a_to_b_transition() {
+        let conn = setup();
+        seed_run_lock(&conn, "/proj-a-to-b");
+
+        // Step A bound to the live-run row.
+        update_live_phase(
+            &conn,
+            "/proj-a-to-b",
+            Phase::Harness,
+            Some("step-A"),
+            Some(1),
+            Some(1),
+            Some(3),
+            Some(10),
+            Some("claude-A"),
+            ChildUpdate::Set {
+                pid: 100,
+                start_token: Some("tok-A"),
+            },
+        )
+        .unwrap();
+        let live_a = get_live_run(&conn, "/proj-a-to-b").unwrap().unwrap();
+        assert_eq!(live_a.step_id.as_deref(), Some("step-A"));
+
+        // Orchestrator: A returned to the scheduler — clear the per-step
+        // window before picking B (the "no live step" snapshot).
+        clear_live_run_step(&conn, "/proj-a-to-b").unwrap();
+        let live_gap = get_live_run(&conn, "/proj-a-to-b").unwrap().unwrap();
+        assert_eq!(
+            live_gap.step_id, None,
+            "step_id must transition through NULL between consecutive steps \
+             so an orphaned subprocess can't bind a question to the wrong step",
+        );
+
+        // Step B's first phase write.
+        update_live_phase(
+            &conn,
+            "/proj-a-to-b",
+            Phase::Harness,
+            Some("step-B"),
+            Some(2),
+            Some(1),
+            Some(3),
+            Some(11),
+            Some("claude-B"),
+            ChildUpdate::Set {
+                pid: 200,
+                start_token: Some("tok-B"),
+            },
+        )
+        .unwrap();
+        let live_b = get_live_run(&conn, "/proj-a-to-b").unwrap().unwrap();
+        assert_eq!(live_b.step_id.as_deref(), Some("step-B"));
+        assert_eq!(live_b.step_num, Some(2));
+        assert_eq!(live_b.execution_log_id, Some(11));
+        // Sanity: the *previous* step's child pid is gone (cleared in the gap).
+        assert_eq!(live_b.child_pid, Some(200));
+    }
+
+    /// `clear_live_run_step` on a project with no row errors with the same
+    /// shape as `update_live_phase` / `bind_live_run_to_plan`. Defensive: a
+    /// test forgetting to seed should fail loudly, not silently no-op.
+    #[test]
+    fn test_clear_live_run_step_missing_row_errors() {
+        let conn = setup();
+        let err = clear_live_run_step(&conn, "/proj-missing").unwrap_err();
+        assert!(
+            err.to_string().contains("No run_locks row"),
+            "missing-row error must mention the gap; got: {err}",
+        );
+    }
+
     // -- finalize_execution_log_as_interrupted_if_exists tests --
 
     #[test]
@@ -7656,6 +7840,170 @@ mod tests {
         let all_resolved =
             list_resolved_interruptions_for_step(&conn, &step_id, total + 100).unwrap();
         assert_eq!(all_resolved.len(), total);
+    }
+
+    /// `list_inbox_rows` enforces `resolved_limit` **SQL-side** via a
+    /// `LIMIT ?` on the resolved branch — even with 100 resolved rows in
+    /// the project, asking for the top 5 returns exactly 5 (and the
+    /// inbox always carries all open rows ahead of them).
+    #[test]
+    fn test_list_inbox_rows_enforces_sql_side_resolved_limit() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        // 100 resolved interruptions, with monotonically increasing
+        // `resolved_at` so "newest first" is deterministic.
+        const TOTAL_RESOLVED: usize = 100;
+        const RESOLVED_LIMIT: usize = 5;
+        let mut ids = Vec::new();
+        for i in 0..TOTAL_RESOLVED {
+            let id = insert_interruption(
+                &conn,
+                &step_id,
+                i as i32,
+                InterruptionKind::Question,
+                &format!("Q{i}"),
+                &[],
+            )
+            .unwrap();
+            resolve_interruption(&conn, &id, &format!("A{i}"), None).unwrap();
+            // 2026-01-01T00:0M:SS — monotonic.
+            stamp_resolved_at(
+                &conn,
+                &id,
+                &format!("2026-01-01T00:{:02}:{:02}.000Z", i / 60, i % 60),
+            );
+            ids.push(id);
+        }
+
+        // Also insert two *open* interruptions — these must all come
+        // through (the SQL-side limit only bounds the resolved tail).
+        // Stamp explicit, monotonically-spaced `asked_at` so the
+        // ordering assertion below doesn't race the per-row
+        // `strftime('now')` clock when multiple tests run in parallel
+        // and the millisecond resolution collides.
+        let open1 = insert_interruption(
+            &conn,
+            &step_id,
+            200,
+            InterruptionKind::Question,
+            "open Q1",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE interruptions SET asked_at = ?1 WHERE id = ?2",
+            params!["2026-02-01T00:00:01.000Z", open1],
+        )
+        .unwrap();
+        let open2 = insert_interruption(
+            &conn,
+            &step_id,
+            201,
+            InterruptionKind::Blocker,
+            "open B1",
+            &[],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE interruptions SET asked_at = ?1 WHERE id = ?2",
+            params!["2026-02-01T00:00:02.000Z", open2],
+        )
+        .unwrap();
+
+        let rows = list_inbox_rows(&conn, "/proj", RESOLVED_LIMIT).unwrap();
+        let open_count = rows
+            .iter()
+            .filter(|r| r.interruption.state == crate::plan::InterruptionState::Open)
+            .count();
+        let resolved_count = rows.len() - open_count;
+        assert_eq!(open_count, 2, "all open rows must be returned");
+        assert_eq!(
+            resolved_count, RESOLVED_LIMIT,
+            "resolved tail must be SQL-side capped to {RESOLVED_LIMIT}, not {TOTAL_RESOLVED}",
+        );
+        // Open rows precede resolved rows in the output (the §12.3 inbox
+        // UX).
+        for (i, r) in rows.iter().enumerate() {
+            if i < open_count {
+                assert_eq!(r.interruption.state, crate::plan::InterruptionState::Open);
+            } else {
+                assert_eq!(r.interruption.state, crate::plan::InterruptionState::Resolved);
+            }
+        }
+        // The two open ids land in the open block in `asked_at ASC`
+        // order, oldest first — open1 was stamped earlier than open2.
+        let open_ids: Vec<&String> = rows[..open_count].iter().map(|r| &r.interruption.id).collect();
+        assert_eq!(open_ids, vec![&open1, &open2]);
+
+        // The resolved tail is the LAST `RESOLVED_LIMIT` inserted ids,
+        // newest first.
+        let expected_resolved: Vec<&String> = ids.iter().rev().take(RESOLVED_LIMIT).collect();
+        let got_resolved: Vec<&String> = rows[open_count..]
+            .iter()
+            .map(|r| &r.interruption.id)
+            .collect();
+        assert_eq!(got_resolved, expected_resolved);
+
+        // `resolved_limit = 0` returns no resolved rows but still every
+        // open one.
+        let rows_no_tail = list_inbox_rows(&conn, "/proj", 0).unwrap();
+        assert_eq!(rows_no_tail.len(), 2);
+        assert!(
+            rows_no_tail
+                .iter()
+                .all(|r| r.interruption.state == crate::plan::InterruptionState::Open)
+        );
+    }
+
+    /// `corrective_chain_len` walks every `corrects_step_id` hop with a
+    /// single SQLite recursive CTE — one query for the whole chain, no
+    /// per-hop round-trip. Verified across a range of depths.
+    #[test]
+    fn test_corrective_chain_len_recursive_cte_handles_long_chains() {
+        let conn = setup();
+        let plan = create_plan(&conn, "chain", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        // Build a chain of 10 corrective steps: s0 (ordinary) <- s1
+        // (corrects s0) <- s2 (corrects s1) <- … <- s10 (corrects s9).
+        let mut ids = Vec::new();
+        for i in 0..=10 {
+            let (step, _) = create_step(
+                &conn,
+                &plan.id,
+                &format!("S{i}"),
+                "d",
+                None,
+                None,
+                &[],
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            ids.push(step.id);
+        }
+        for i in 1..=10 {
+            // s_i corrects s_{i-1}.
+            set_step_corrects_step_id(&conn, &ids[i], Some(&ids[i - 1])).unwrap();
+        }
+
+        // Ordinary step (no corrects link).
+        assert_eq!(corrective_chain_len(&conn, &ids[0]).unwrap(), 0);
+        // 1-hop chain.
+        assert_eq!(corrective_chain_len(&conn, &ids[1]).unwrap(), 1);
+        // Mid-chain.
+        assert_eq!(corrective_chain_len(&conn, &ids[5]).unwrap(), 5);
+        // Full chain of 10.
+        assert_eq!(corrective_chain_len(&conn, &ids[10]).unwrap(), 10);
+
+        // A non-existent step returns 0 (the COALESCE-NULL path).
+        assert_eq!(
+            corrective_chain_len(&conn, "does-not-exist").unwrap(),
+            0,
+            "non-existent step must return 0 via COALESCE(MAX(NULL), 0)",
+        );
     }
 
     #[test]

@@ -482,12 +482,16 @@ fn format_retry_context(ctx: &RetryContext) -> String {
     }
 
     if let Some(diff) = &ctx.previous_diff {
-        let truncated = truncate_text(diff, 200);
+        // 200 lines × ~256 bytes-per-line headroom ≈ 50 KiB cap on the diff
+        // pane — large but bounded so a single attempt's previous-diff
+        // section can't blow the prompt up.
+        let truncated = truncate_text(diff, 200, 50 * 1024);
         parts.push(format!("## Previous Diff\n\n```diff\n{truncated}\n```"));
     }
 
     if let Some(test_output) = &ctx.previous_test_output {
-        let truncated = truncate_text(test_output, 100);
+        // 100 lines × ~256 bytes headroom ≈ 25 KiB cap.
+        let truncated = truncate_text(test_output, 100, 25 * 1024);
         parts.push(format!("## Previous Test Output\n\n```\n{truncated}\n```"));
     }
 
@@ -546,7 +550,11 @@ fn format_resolved_interruptions(resolved: &[Interruption]) -> String {
     let mut lines = vec!["## Resolved interruptions".to_string(), String::new()];
     let last = resolved.len().saturating_sub(1);
     for (i, intr) in resolved.iter().enumerate() {
-        let body = truncate_text(&intr.body, RESOLVED_INTERRUPTION_FIELD_MAX_LINES);
+        let body = truncate_text(
+            &intr.body,
+            RESOLVED_INTERRUPTION_FIELD_MAX_LINES,
+            RESOLVED_INTERRUPTION_FIELD_MAX_BYTES,
+        );
         lines.push(format!("> **{kind}**", kind = intr.kind.as_str()));
         // Each multi-line field is re-quoted line-by-line so the blockquote
         // stays well-formed even after truncation inserts its elision line.
@@ -554,7 +562,11 @@ fn format_resolved_interruptions(resolved: &[Interruption]) -> String {
             lines.push(format!("> {bl}"));
         }
         if let Some(resolution) = &intr.resolution {
-            let r = truncate_text(resolution, RESOLVED_INTERRUPTION_FIELD_MAX_LINES);
+            let r = truncate_text(
+                resolution,
+                RESOLVED_INTERRUPTION_FIELD_MAX_LINES,
+                RESOLVED_INTERRUPTION_FIELD_MAX_BYTES,
+            );
             lines.push(">".to_string());
             for (j, rl) in r.lines().enumerate() {
                 lines.push(if j == 0 {
@@ -565,7 +577,11 @@ fn format_resolved_interruptions(resolved: &[Interruption]) -> String {
             }
         }
         if let Some(comment) = &intr.comment {
-            let c = truncate_text(comment, RESOLVED_INTERRUPTION_FIELD_MAX_LINES);
+            let c = truncate_text(
+                comment,
+                RESOLVED_INTERRUPTION_FIELD_MAX_LINES,
+                RESOLVED_INTERRUPTION_FIELD_MAX_BYTES,
+            );
             lines.push(">".to_string());
             for (j, cl) in c.lines().enumerate() {
                 lines.push(if j == 0 {
@@ -677,19 +693,81 @@ fn format_focus_instruction(step: &Step) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Truncate text to a maximum number of lines, appending an elision marker
-/// when truncated. Keeps the first `max_lines` because the top of a diff or
-/// test output usually carries the most context — file headers, the first
-/// failing assertion — and losing the tail is the cheaper choice.
-fn truncate_text(text: &str, max_lines: usize) -> String {
+/// Per-field byte cap for the bounded "Resolved interruptions" section.
+/// 8 KiB ≈ ~2k tokens — generous for a single body/resolution/comment while
+/// keeping the total per-step prompt growth bounded even when a single
+/// pathological line slips past the line cap (e.g. a multi-MB base64 blob
+/// pasted into a resolution comment). Three fields × `MAX_RESOLVED_INTERRUPTIONS`
+/// (capped upstream by the storage query) × this cap is the real upper bound
+/// on the section's contribution to the prompt.
+pub(crate) const RESOLVED_INTERRUPTION_FIELD_MAX_BYTES: usize = 8 * 1024;
+
+/// Truncate text to both a maximum number of lines AND a maximum byte count,
+/// appending an elision marker when truncated. Keeps the **head** (first
+/// `max_lines` / first `max_bytes`) because the top of a diff or test output
+/// usually carries the most context — file headers, the first failing
+/// assertion — and losing the tail is the cheaper choice.
+///
+/// The byte cap closes the §4 prompt-growth hole that the pre-fix
+/// line-only cap left open: a single line of arbitrarily large size
+/// (multi-MB JSON dump, base64 blob, output-without-newlines) used to slip
+/// straight through unmodified. The byte cap is enforced on the head slice
+/// (or on the whole text on the no-line-cap-hit path) at a UTF-8 char
+/// boundary so we never slice mid-codepoint.
+fn truncate_text(text: &str, max_lines: usize, max_bytes: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= max_lines {
-        text.to_string()
-    } else {
-        let omitted = lines.len() - max_lines;
-        let head = &lines[..max_lines];
-        format!("{}\n... ({omitted} lines omitted) ...", head.join("\n"))
+    let line_overflow = lines.len() > max_lines;
+    let byte_overflow = text.len() > max_bytes;
+
+    // Fast path — neither bound exceeded.
+    if !line_overflow && !byte_overflow {
+        return text.to_string();
     }
+
+    // Decide the body to truncate by line bound first. If lines overflow,
+    // take the first `max_lines`; otherwise keep the whole text. Then apply
+    // the byte cap on whatever's left.
+    let (line_body, omitted_lines) = if line_overflow {
+        let head = &lines[..max_lines];
+        (head.join("\n"), lines.len() - max_lines)
+    } else {
+        (text.to_string(), 0)
+    };
+
+    let original_bytes = text.len();
+    let original_lines = lines.len();
+    let body_bytes_truncated = line_body.len() > max_bytes;
+    let body = if body_bytes_truncated {
+        // Walk char boundaries to a cut <= max_bytes (UTF-8-safe).
+        let mut cut = 0;
+        for (i, _) in line_body.char_indices() {
+            if i > max_bytes {
+                break;
+            }
+            cut = i;
+        }
+        line_body[..cut].to_string()
+    } else {
+        line_body
+    };
+
+    // Build the elision marker. Mention whichever cap(s) tripped so a human
+    // reading the prompt can tell why context was lost.
+    let marker = if line_overflow && body_bytes_truncated {
+        format!(
+            "\n... [truncated; original was {original_lines} lines, {original_bytes} bytes; \
+             {omitted_lines} lines omitted then byte-capped at {max_bytes}] ..."
+        )
+    } else if line_overflow {
+        format!("\n... ({omitted_lines} lines omitted) ...")
+    } else {
+        format!(
+            "\n... [truncated; original was {original_lines} lines, {original_bytes} bytes; \
+             byte-capped at {max_bytes}] ..."
+        )
+    };
+
+    format!("{body}{marker}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,7 +1289,7 @@ mod tests {
     #[test]
     fn test_truncate_text_short() {
         let text = "line 1\nline 2\nline 3";
-        let result = truncate_text(text, 10);
+        let result = truncate_text(text, 10, 8 * 1024);
         assert_eq!(result, text);
     }
 
@@ -1219,7 +1297,7 @@ mod tests {
     fn test_truncate_text_long_keeps_head() {
         let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
         let text = lines.join("\n");
-        let result = truncate_text(&text, 5);
+        let result = truncate_text(&text, 5, 8 * 1024);
 
         assert!(result.contains("(15 lines omitted)"));
         // First five lines preserved in order.
@@ -1240,6 +1318,74 @@ mod tests {
         let head_end = result.find("line 4").unwrap();
         let marker = result.find("lines omitted").unwrap();
         assert!(head_end < marker);
+    }
+
+    /// Fix #2: a single line of arbitrarily large size used to slip through
+    /// the line-only cap unmodified — `lines().count() == 1` short-circuits
+    /// the head-truncation path. The byte cap closes that hole. 100 KiB of
+    /// one-line text must come back capped to roughly `max_bytes` (plus the
+    /// elision marker).
+    #[test]
+    fn test_truncate_text_single_huge_line_byte_capped() {
+        let max_bytes = 8 * 1024;
+        let text: String = "x".repeat(100 * 1024);
+        let result = truncate_text(&text, 100, max_bytes);
+
+        // The text payload must NOT exceed max_bytes; the elision marker
+        // adds a bounded suffix on top.
+        assert!(
+            result.starts_with(&"x".repeat(max_bytes)),
+            "head must be the byte-capped prefix",
+        );
+        assert!(
+            result.contains("truncated"),
+            "elision marker must mark the truncation",
+        );
+        // The overall length is the cap plus the elision marker — call it
+        // `cap + 512` to be safe.
+        assert!(
+            result.len() <= max_bytes + 512,
+            "total length must be within cap + marker; got {} (cap {})",
+            result.len(),
+            max_bytes,
+        );
+    }
+
+    /// Multi-byte UTF-8 inputs must never be sliced mid-codepoint. Feed a
+    /// long stream of 4-byte chars and confirm the cap lands on a char
+    /// boundary (the cut bytes are a valid UTF-8 string in the output).
+    #[test]
+    fn test_truncate_text_utf8_safe() {
+        let max_bytes = 1000;
+        let text: String = "\u{1F600}".repeat(2000); // grinning-face = 4 bytes each
+        let result = truncate_text(&text, 100, max_bytes);
+
+        // Output is still valid UTF-8 (we'd panic on a malformed slice in
+        // the `format!` above; this assertion documents the invariant).
+        assert!(!result.is_empty());
+        // The leading run of chars is whole grinning-faces, not partial.
+        let leading: String = result.chars().take_while(|c| *c == '\u{1F600}').collect();
+        assert!(!leading.is_empty(), "the head must contain whole chars");
+        assert_eq!(
+            leading.len() % 4,
+            0,
+            "leading byte count must be a multiple of the 4-byte char width",
+        );
+    }
+
+    /// Both bounds tripped → the elision marker calls both out.
+    #[test]
+    fn test_truncate_text_both_bounds_tripped() {
+        let max_lines = 3;
+        let max_bytes = 50;
+        // 10 lines of 100 bytes each — exceeds both caps.
+        let text: String = (0..10)
+            .map(|i| format!("{:0>100}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = truncate_text(&text, max_lines, max_bytes);
+        assert!(result.contains("truncated"));
+        assert!(result.contains("lines omitted") || result.contains("byte-capped"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod cli;
 mod commands;
 mod config;
+mod dag_util;
 mod db;
 mod executor;
 mod export;

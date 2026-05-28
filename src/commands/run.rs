@@ -4539,25 +4539,19 @@ where
                 let step_id_for_event = storage::get_interruption(conn, &interruption_id)
                     .ok()
                     .map(|i| i.step_id);
-                // Phase-2 bounded-injection path (§8): the resolution +
-                // comment land in the step's next prompt; resolving drops
-                // the step's open-interruption count to zero which
-                // un-shadows its `Blocked` overlay at the next tick.
-                storage::resolve_interruption(
-                    conn,
-                    &interruption_id,
-                    &resolution,
-                    comment.as_deref(),
-                )?;
-                // Phase C: if this was the Phase B auto-raised
-                // retry-exhausted blocker, apply the chosen side-effect
-                // (Retry → reset attempts + Pending; Fail → terminal
-                // Failed). No-op for normal interruptions.
-                crate::commands::interruption::apply_retry_exhausted_resolution(
+                // Phase E Fix 1: resolve + retry-exhausted side-effect run
+                // in a SINGLE transaction (Phase-2 bounded-injection path —
+                // §8 — and Phase C side-effect, atomic). The pre-Phase-E
+                // shape ran them in two separate writes, letting a peer
+                // `ralph run` observe (resolved interruption + Pending
+                // status + attempts==max) between the writes and bail in
+                // the executor's budget guard.
+                crate::commands::interruption::resolve_interruption_with_retry_handling(
                     conn,
                     project,
                     &interruption_id,
                     &resolution,
+                    comment.as_deref(),
                 )?;
                 // Phase E Fix 4: emit `InterruptionResolved` for inbox-side
                 // resolutions too. The TUI's own stdout is the alternate

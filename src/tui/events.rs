@@ -337,8 +337,15 @@ where
 /// right-pane state (current phase, harness/test tail buffers, step
 /// timer). Pure aside from the App mutation — no I/O.
 ///
-/// Events that don't drive the right pane (e.g. `PromptPrepared`,
-/// `StaleStepsSwept`) are observed but produce no state change.
+/// **No wildcard arm.** Every [`RunEvent`] variant is matched explicitly so a
+/// new variant added to [`RunEvent`] is a compile error here instead of being
+/// silently dropped by the live-event path (a regression that previously left
+/// the TUI's right pane lagging behind the run by up to one DB-poll tick for
+/// the DAG-redesign review / interruption events). Variants whose state is
+/// already covered by the DB-poll sync (the orchestrator's sole-writer DAG
+/// mutations are visible there) are matched to no-op arms with a comment
+/// explaining why; this keeps the exhaustive-match guarantee without forcing
+/// every variant into a state update.
 pub fn dispatch_event(app: &mut PlanDetailApp, event: &RunEvent) {
     match event {
         RunEvent::RunStarted { started_at, .. } => {
@@ -373,10 +380,119 @@ pub fn dispatch_event(app: &mut PlanDetailApp, event: &RunEvent) {
                 std::time::Instant::now(),
             );
         }
-        // Other events (PromptPrepared, StaleStepsSwept, PlanGrew) update
-        // book-keeping handled by the DB-side sync; the right pane has no
-        // dedicated rendering for them.
-        _ => {}
+        RunEvent::AttemptCancelled { .. } => {
+            // The attempt is being retried at the same `attempt` number; the
+            // tail buffers stay so the user can see what the cancelled attempt
+            // produced. No state mutation here — the next `PhaseChanged` /
+            // `HarnessChunk` from the retry refreshes the right pane.
+        }
+        RunEvent::PromptPrepared { .. } => {
+            // Prompt preview surfaces in `execution_logs`; the DB-poll sync
+            // (`ensure_preview_cached` / `refresh_steps`) is the canonical
+            // path. No live mutation.
+        }
+        RunEvent::StaleStepsSwept { .. } | RunEvent::PlanGrew { .. } => {
+            // Step-list mutations are observed via the DB-poll
+            // `sync_steps_from_db` path on the next tick. We avoid mutating
+            // `app.steps` here because the orchestrator is the source of
+            // truth for the DAG and the NDJSON payload only carries the
+            // changed-id list, not the full re-projection.
+        }
+        RunEvent::ReviewStarted { .. } | RunEvent::ReviewFinished { .. } => {
+            // The review badge is derived from each step's persisted
+            // `review_status` column, which the DB-poll sync re-reads on the
+            // next tick. Surfacing a transient toast here gives the user the
+            // "review fired" feedback without polling.
+            //
+            // The DB write itself is performed by the orchestrator (§9-inv-3
+            // sole DAG writer); the TUI must not race it.
+            let msg = match event {
+                RunEvent::ReviewStarted { iteration, .. } => {
+                    format!("Review started (iteration {iteration})")
+                }
+                RunEvent::ReviewFinished {
+                    iteration, passed, ..
+                } => {
+                    if *passed {
+                        format!("Review passed (iteration {iteration})")
+                    } else {
+                        format!("Review failed (iteration {iteration}) — corrective step requested")
+                    }
+                }
+                _ => unreachable!(),
+            };
+            let kind = matches!(event, RunEvent::ReviewFinished { passed: false, .. })
+                .then_some(crate::tui::toast::ToastKind::Error)
+                .unwrap_or(crate::tui::toast::ToastKind::Info);
+            app.toasts.push(msg, kind, std::time::Instant::now());
+        }
+        RunEvent::CorrectiveStepRequested { .. } => {
+            // Reviewer-side request; the orchestrator drains it at the next
+            // scheduler tick and emits `CorrectiveStepInserted` once the §10
+            // re-parent is done. No state mutation yet — the inserted step
+            // event is the one the outline must react to.
+        }
+        RunEvent::CorrectiveStepInserted {
+            corrective_short_id,
+            ..
+        } => {
+            // The DAG outline gains a new corrective step; the DB-poll sync
+            // re-reads `list_steps` + `list_step_dependency_edges` on the
+            // next tick. Surface a toast so the user sees the insertion
+            // without diffing two outline renders.
+            app.toasts.push(
+                format!("Corrective step inserted: {corrective_short_id}"),
+                crate::tui::toast::ToastKind::Info,
+                std::time::Instant::now(),
+            );
+        }
+        RunEvent::ReviewLoopEscalated {
+            chain_len, cap, ..
+        } => {
+            // The review→correction chain hit the per-plan cap and was
+            // converted to a `kind=blocker` interruption. Surface this as
+            // an error toast — it's a human-actionable terminal state for
+            // that branch.
+            app.toasts.push(
+                format!(
+                    "Review loop escalated: chain length {chain_len} > cap {cap}; \
+                     blocker raised"
+                ),
+                crate::tui::toast::ToastKind::Error,
+                std::time::Instant::now(),
+            );
+        }
+        RunEvent::InterruptionRaised {
+            kind, auto_raised, ..
+        } => {
+            // The inbox badge is derived from `list_open_interruptions_for_plan`
+            // / `set_open_questions`, refreshed on the DB-poll. Surface a
+            // toast so the user sees the raise without polling. The
+            // `auto_raised=true` variant (executor's retry-exhausted
+            // auto-blocker) is the one a TUI/log-shipper most wants to react
+            // to immediately — surface as Error so the inbox is checked.
+            let label = if *auto_raised { "auto " } else { "" };
+            let kind_label = kind;
+            let toast_kind = if *auto_raised {
+                crate::tui::toast::ToastKind::Error
+            } else {
+                crate::tui::toast::ToastKind::Info
+            };
+            app.toasts.push(
+                format!("Interruption raised: {label}{kind_label}"),
+                toast_kind,
+                std::time::Instant::now(),
+            );
+        }
+        RunEvent::InterruptionResolved { .. } => {
+            // The inbox badge will drop on the next DB-poll; surface a
+            // success toast so the user sees the close-out immediately.
+            app.toasts.push(
+                "Interruption resolved",
+                crate::tui::toast::ToastKind::Success,
+                std::time::Instant::now(),
+            );
+        }
     }
 }
 
@@ -583,6 +699,167 @@ mod tests {
         );
         assert!(!app.is_run_live());
         assert_eq!(app.subscribed_step_num, None);
+    }
+
+    // -- Fix #3: DAG-redesign event variants must NOT be silently dropped --
+
+    /// Each new DAG-redesign event variant must be dispatched (not wildcard-
+    /// eaten). We can't easily inspect every state-mutation target without
+    /// spinning up a real terminal, so we assert the load-bearing observable
+    /// effects: (a) `dispatch_event` doesn't panic on any variant, (b) the
+    /// review/interruption/corrective-step events all push a transient toast
+    /// (the user-visible "live" feedback the wildcard-arm regression
+    /// suppressed).
+    #[test]
+    fn test_dispatch_dag_redesign_events_push_toasts() {
+        let mut app = make_app();
+        let start = app.toasts.len();
+
+        for evt in [
+            RunEvent::ReviewStarted {
+                step_id: "s0".into(),
+                step_num: 1,
+                commit_sha: "deadbee".into(),
+                iteration: 1,
+            },
+            RunEvent::ReviewFinished {
+                step_id: "s0".into(),
+                step_num: 1,
+                commit_sha: "deadbee".into(),
+                iteration: 1,
+                passed: true,
+            },
+            RunEvent::ReviewFinished {
+                step_id: "s0".into(),
+                step_num: 1,
+                commit_sha: "deadbee".into(),
+                iteration: 2,
+                passed: false,
+            },
+            RunEvent::CorrectiveStepInserted {
+                corrective_step_id: "s-new".into(),
+                corrective_short_id: "abcd1234".into(),
+                corrects_step_id: "s0".into(),
+            },
+            RunEvent::ReviewLoopEscalated {
+                step_id: "s0".into(),
+                step_num: 1,
+                chain_len: 4,
+                cap: 3,
+            },
+            RunEvent::InterruptionRaised {
+                interruption_id: "i-1".into(),
+                step_id: "s0".into(),
+                plan_slug: "live".into(),
+                kind: "blocker".into(),
+                auto_raised: true,
+                attempt: 1,
+                raised_at: Utc::now(),
+            },
+            RunEvent::InterruptionResolved {
+                interruption_id: "i-1".into(),
+                step_id: "s0".into(),
+                plan_slug: "live".into(),
+                resolution: "Retry step with parked changes".into(),
+                comment: None,
+                resolved_at: Utc::now(),
+            },
+        ] {
+            dispatch_event(&mut app, &evt);
+        }
+        // 6 events that push a toast (CorrectiveStepRequested doesn't, but
+        // we didn't include it here): ReviewStarted, 2x ReviewFinished,
+        // CorrectiveStepInserted, ReviewLoopEscalated, InterruptionRaised,
+        // InterruptionResolved = 7. Loose assert: at least one toast per
+        // variant we expected to surface.
+        assert!(
+            app.toasts.len() >= start + 7,
+            "DAG-redesign events must push live toasts; pushed {} (expected >= 7)",
+            app.toasts.len() - start,
+        );
+    }
+
+    /// CorrectiveStepRequested intentionally surfaces no toast (the matching
+    /// `CorrectiveStepInserted` is what the user actually needs to see — the
+    /// request is internal handshake to the orchestrator). But it MUST still
+    /// dispatch (no wildcard, no panic).
+    #[test]
+    fn test_dispatch_corrective_step_requested_no_panic() {
+        let mut app = make_app();
+        let evt = RunEvent::CorrectiveStepRequested {
+            reviewed_step_id: "s0".into(),
+            reviewed_step_num: 1,
+            commit_sha: "deadbee".into(),
+            iteration: 1,
+            issues: 3,
+        };
+        // Must not panic.
+        dispatch_event(&mut app, &evt);
+    }
+
+    /// AttemptCancelled, PromptPrepared, StaleStepsSwept, PlanGrew used to
+    /// be wildcard-arm absorbed too — they remain no-op state-wise but
+    /// MUST dispatch.
+    #[test]
+    fn test_dispatch_no_op_events_no_panic() {
+        let mut app = make_app();
+        for evt in [
+            RunEvent::AttemptCancelled {
+                step_id: "s0".into(),
+                step_num: 1,
+                attempt: 1,
+                at: Utc::now(),
+            },
+            RunEvent::PromptPrepared {
+                step_id: "s0".into(),
+                attempt: 1,
+                prompt_chars: 100,
+                prompt_preview: "hi".into(),
+            },
+            RunEvent::StaleStepsSwept { steps: vec![] },
+            RunEvent::PlanGrew { steps: vec![] },
+        ] {
+            dispatch_event(&mut app, &evt);
+        }
+    }
+
+    /// Source-shape test: enforce that the **outer** `match event { … }` in
+    /// `dispatch_event` has NO wildcard arm. A wildcard would silently
+    /// swallow any future `RunEvent` variant added to the enum — the exact
+    /// regression Fix #3 corrects. This test is the belt-and-braces
+    /// complement to the compile-time exhaustiveness check (which only fires
+    /// when the enum gains a variant; this test fires on every test run).
+    ///
+    /// We scan only arms at the OUTER match's indent (8 spaces inside
+    /// `dispatch_event`'s body). Nested matches inside an arm can still use
+    /// `_ =>` patterns (e.g. the `unreachable!()` guard inside the
+    /// ReviewStarted / ReviewFinished arm) without tripping this check.
+    #[test]
+    fn test_dispatch_event_has_no_wildcard_arm() {
+        let src = include_str!("events.rs");
+        let needle = "pub fn dispatch_event(app: &mut PlanDetailApp, event: &RunEvent) {";
+        let start = src
+            .find(needle)
+            .expect("dispatch_event signature not found");
+        let after = &src[start..];
+        let end_rel = after.find("\n}").expect("dispatch_event end not found");
+        let body = &after[..end_rel];
+        // The outer match's arms are at exactly 8-space indent; a wildcard
+        // there is `        _ => `. Anything deeper is a nested match.
+        for (i, line) in body.lines().enumerate() {
+            let trimmed = line.trim_end();
+            // Skip arms not at 8-space indent (nested or comment-only lines).
+            let leading_spaces = line.len() - line.trim_start().len();
+            if leading_spaces != 8 {
+                continue;
+            }
+            assert!(
+                !trimmed.starts_with("        _ =>"),
+                "line {i} has a wildcard arm in the outer `match event {{ … }}`: \
+                 `{line}` — every RunEvent variant must dispatch explicitly so a \
+                 new variant added in output.rs is a compile error here."
+            );
+        }
     }
 
     // -- consume_lines integration with an in-memory pipe --

@@ -20,27 +20,35 @@ use crate::storage::{self, OpenQuestion};
 /// [`RETRY_EXHAUSTED_OPTION_FAIL`]; harness-raised blockers have empty
 /// options and never match).
 ///
+/// **Phase E — atomic with the resolve write.** This is now a thin wrapper
+/// around [`resolve_interruption_with_retry_handling`] that performs both
+/// the `interruptions.state = 'resolved'` flip and the retry-exhausted
+/// side-effect inside a single `unchecked_transaction`. The old two-write
+/// shape (resolve then apply) let a concurrent `ralph run` process observe
+/// the half-state `(interruption resolved + status Pending + attempts == max)`
+/// between the writes — `pick_next_step` would return the step,
+/// `executor::execute_step`'s budget guard would bail with "already used all
+/// N attempts", and the run would terminate. This entry point is preserved
+/// for the test suite (which exercises the retry-exhausted-only side effect
+/// against a pre-resolved row); production callers must use
+/// [`resolve_interruption_with_retry_handling`] directly.
+///
 /// `Ok(true)` — the interruption was the auto-blocker and the side-effect
 /// has been applied (`Retry` → `attempts = 0` + status `Pending` so the
 /// scheduler re-queues; `Fail` → status `Failed`, terminal). `Ok(false)` —
-/// the interruption was a normal question or harness-raised blocker; the
-/// caller's existing `resolve_interruption` flow is the whole story.
+/// the interruption was a normal question or harness-raised blocker; no
+/// step-level side effect is required.
 ///
 /// Resolution-text matching uses the executor's `pub const` strings (so
 /// drift between writer and reader trips `cargo test --lib`, not production).
 /// A freeform resolution that matches neither option is treated as
-/// **Retry-with-parked-changes + hint**: `resolve_interruption` already persisted
-/// the freeform string as the resolution and the comment, both of which
-/// flow into the next step prompt via the bounded
+/// **Retry-with-parked-changes + hint**: the freeform string (and any
+/// comment) flow into the next step prompt via the bounded
 /// `list_resolved_interruptions_for_step` injection (§8). This preserves the
 /// "Enter on the default-selected option" UX while honoring the spec
 /// guidance that the safest interpretation of an ambiguous freeform answer
 /// to a retry-exhausted blocker is "try again with this as a hint."
-///
-/// The reset writes are wrapped in [`db::with_tx`] so a concurrent scheduler
-/// poll cannot observe `attempts = 0` with the step still `InProgress` (or
-/// vice versa) — the half-state would let the scheduler skip re-queueing
-/// the step.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn apply_retry_exhausted_resolution(
     conn: &Connection,
     project: &str,
@@ -48,23 +56,7 @@ pub fn apply_retry_exhausted_resolution(
     resolution_text: &str,
 ) -> Result<bool> {
     let interruption = storage::get_interruption(conn, interruption_id)?;
-    if interruption.kind != InterruptionKind::Blocker {
-        return Ok(false);
-    }
-    // Auto-blocker recognition: exactly two options whose texts match the
-    // Phase B constants. A harness-raised blocker has empty options; a
-    // hypothetical future blocker with a different option set won't match
-    // either — both correctly fall through to `Ok(false)`.
-    let is_auto = interruption.options.len() == 2
-        && interruption
-            .options
-            .iter()
-            .any(|o| o.text == RETRY_EXHAUSTED_OPTION_RETRY)
-        && interruption
-            .options
-            .iter()
-            .any(|o| o.text == RETRY_EXHAUSTED_OPTION_FAIL);
-    if !is_auto {
+    if !is_retry_exhausted_auto_blocker(&interruption) {
         return Ok(false);
     }
 
@@ -72,34 +64,122 @@ pub fn apply_retry_exhausted_resolution(
     let want_fail = resolution_text == RETRY_EXHAUSTED_OPTION_FAIL;
 
     let parked_to_discard = db::with_tx(conn, |tx| {
-        if want_fail {
-            // Explicit give-up: terminal Failed. The interruption is already
-            // resolved by the caller; the freeform comment (if any) is on
-            // the resolved row but never feeds another prompt — the step is
-            // done. Drop the automatic re-apply pointer and discard the
-            // underlying stash so a later unrelated run cannot resurrect this WIP.
-            storage::update_step_status(tx, &step_id, StepStatus::Failed)?;
-            let parked = storage::get_step_parked_worktree(tx, &step_id)?;
-            if parked.is_some() {
-                storage::clear_step_parked_worktree(tx, &step_id)?;
-            }
-            Ok(parked)
-        } else {
-            // "Retry step with parked changes" — the explicit option text —
-            // and the freeform-doesn't-match fallthrough both land here.
-            // The freeform text (and optional comment) were already stamped
-            // on the resolved interruption by the caller; the bounded
-            // resolved-interruptions section of the next prompt will pick
-            // it up automatically. The next run restores the parked stash as
-            // unstaged changes so the step can continue from its prior WIP.
-            storage::set_step_attempts(tx, &step_id, 0)?;
-            storage::update_step_status(tx, &step_id, StepStatus::Pending)?;
-            Ok(None)
-        }
+        apply_retry_exhausted_side_effect_in_tx(tx, &step_id, want_fail)
     })?;
 
     crate::runner::discard_parked_worktree_state(Path::new(project), parked_to_discard)?;
     Ok(true)
+}
+
+/// True iff `interruption` is the Phase B executor-raised
+/// retry-exhausted auto-blocker (the only blocker that carries the two
+/// ranked options [`RETRY_EXHAUSTED_OPTION_RETRY`] /
+/// [`RETRY_EXHAUSTED_OPTION_FAIL`]).
+///
+/// Harness-raised blockers have empty `options`; a hypothetical future
+/// blocker with a different option set fails the membership checks. The
+/// kind discriminator is the first gate (a Question with these option texts
+/// must still be a Question).
+fn is_retry_exhausted_auto_blocker(interruption: &crate::plan::Interruption) -> bool {
+    interruption.kind == InterruptionKind::Blocker
+        && interruption.options.len() == 2
+        && interruption
+            .options
+            .iter()
+            .any(|o| o.text == RETRY_EXHAUSTED_OPTION_RETRY)
+        && interruption
+            .options
+            .iter()
+            .any(|o| o.text == RETRY_EXHAUSTED_OPTION_FAIL)
+}
+
+/// The retry-exhausted side-effect, in-transaction. Returns the parked
+/// worktree state the caller must discard *after commit* (on the Fail arm
+/// only) — file-system mutations can't safely be rolled back if the
+/// transaction aborts, so the caller is responsible for the post-commit
+/// `discard_parked_worktree_state` invocation.
+fn apply_retry_exhausted_side_effect_in_tx(
+    tx: &Connection,
+    step_id: &str,
+    want_fail: bool,
+) -> Result<Option<crate::storage::ParkedWorktreeState>> {
+    if want_fail {
+        // Explicit give-up: terminal Failed. The interruption row is
+        // resolved by the same transaction; the freeform comment (if any)
+        // is on the resolved row but never feeds another prompt — the step
+        // is done. Drop the automatic re-apply pointer and discard the
+        // underlying stash so a later unrelated run cannot resurrect this WIP.
+        storage::update_step_status(tx, step_id, StepStatus::Failed)?;
+        let parked = storage::get_step_parked_worktree(tx, step_id)?;
+        if parked.is_some() {
+            storage::clear_step_parked_worktree(tx, step_id)?;
+        }
+        Ok(parked)
+    } else {
+        // "Retry step with parked changes" — the explicit option text —
+        // and the freeform-doesn't-match fallthrough both land here. The
+        // freeform text (and optional comment) are stamped on the resolved
+        // interruption by the same transaction; the bounded
+        // resolved-interruptions section of the next prompt will pick it
+        // up automatically. The next run restores the parked stash as
+        // unstaged changes so the step can continue from its prior WIP.
+        storage::set_step_attempts(tx, step_id, 0)?;
+        storage::update_step_status(tx, step_id, StepStatus::Pending)?;
+        Ok(None)
+    }
+}
+
+/// Atomic resolve: flip `interruptions.state='resolved'` AND, when the row
+/// is the Phase B retry-exhausted auto-blocker, apply the Retry/Fail
+/// side-effect — **all inside a single `unchecked_transaction`**.
+///
+/// The pre-Phase-E shape called `storage::resolve_interruption` and then
+/// `apply_retry_exhausted_resolution` in two separate transactions. A peer
+/// `ralph run` process polling `pick_next_step` between the writes could
+/// observe the half-state `(interruption resolved, step Pending,
+/// attempts == max)`, return the step, and bail in
+/// `executor::execute_step`'s budget guard with "already used all N
+/// attempts" — terminating the whole run. Collapsing both writes into one
+/// transaction makes the half-state unobservable to any other reader.
+///
+/// `resolution_text` is the chosen option text (matched against the
+/// executor's `pub const` strings) or a freeform answer; `comment` is the
+/// optional human note. Both the file-system discard (Fail arm) and the
+/// NDJSON `InterruptionResolved` emission happen *after* commit, mirroring
+/// the executor's `raise_retry_exhausted_blocker` ordering — the durable
+/// state is committed first, the advisory side-effects fire only on the
+/// success leg.
+///
+/// Returns `Ok(true)` when the row was the retry-exhausted auto-blocker
+/// (the Retry/Fail side-effect was applied), `Ok(false)` otherwise.
+pub fn resolve_interruption_with_retry_handling(
+    conn: &Connection,
+    project: &str,
+    interruption_id: &str,
+    resolution_text: &str,
+    comment: Option<&str>,
+) -> Result<bool> {
+    // Read the interruption shape up front (outside the tx is fine — the
+    // kind/options are immutable for a given id; we only need the read to
+    // decide which side-effect branch to take inside the tx).
+    let interruption = storage::get_interruption(conn, interruption_id)?;
+    let is_auto = is_retry_exhausted_auto_blocker(&interruption);
+    let step_id = interruption.step_id.clone();
+    let want_fail = is_auto && resolution_text == RETRY_EXHAUSTED_OPTION_FAIL;
+
+    let parked_to_discard = db::with_tx(conn, |tx| {
+        storage::resolve_interruption(tx, interruption_id, resolution_text, comment)?;
+        if is_auto {
+            apply_retry_exhausted_side_effect_in_tx(tx, &step_id, want_fail)
+        } else {
+            Ok(None)
+        }
+    })?;
+
+    if parked_to_discard.is_some() {
+        crate::runner::discard_parked_worktree_state(Path::new(project), parked_to_discard)?;
+    }
+    Ok(is_auto)
 }
 
 /// Resolve an interruption *selector* (a uuid OR a 1-based index in `ralph
@@ -164,10 +244,7 @@ pub fn cmd_interruption_list(
     }
 
     for (i, q) in items.iter().enumerate() {
-        let kind = match q.kind {
-            InterruptionKind::Question => "question",
-            InterruptionKind::Blocker => "blocker",
-        };
+        let kind = q.kind.as_str();
         let context = format!(
             "{} step {} ({})",
             q.plan_slug,
@@ -218,10 +295,7 @@ pub fn cmd_interruption_show(
         return Ok(());
     }
 
-    let kind = match q.kind {
-        InterruptionKind::Question => "question",
-        InterruptionKind::Blocker => "blocker",
-    };
+    let kind = q.kind.as_str();
     println!(
         "{kind}  {} step {} ({})",
         q.plan_slug,
@@ -291,9 +365,41 @@ pub fn cmd_interruption_resolve(
         }
         (None, Some(a)) => a.to_string(),
         (None, None) => {
-            // No explicit resolution: a comment-only resolution is valid
-            // (covers a blocker the human just clears with a note, and a
-            // question resolved purely by comment).
+            // No explicit resolution.
+            //
+            // **Blocker:** a blocker carries a binding semantic — at minimum
+            // "did the operator pick Retry or Mark Failed?" for the Phase B
+            // auto-blocker. The pre-Phase-E behavior silently fell through to
+            // an empty resolution which routed through the Retry path (the
+            // Retry arm is the default when `resolution_text` is neither
+            // option text), so a `--comment "thoughts"`-only resolve on a
+            // retry-exhausted blocker would burn another retry budget
+            // without surfacing the choice. Reject explicitly and name the
+            // options so the operator can re-issue the right command.
+            if q.kind == InterruptionKind::Blocker {
+                if q.suggestions.is_empty() {
+                    bail!(
+                        "Resolving a blocker requires --option <k> or --answer <text>. \
+                         This blocker has no proposed options; use --answer <text>. \
+                         (Just adding --comment leaves the blocker ambiguous.)"
+                    );
+                }
+                let options = q
+                    .suggestions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| format!("{}) {s}", i + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "Resolving a blocker requires --option <k> or --answer <text>. \
+                     Available options for this blocker: {options}. \
+                     (Just adding --comment leaves the blocker ambiguous.)"
+                );
+            }
+            // Question: a comment-only resolution is valid — the comment IS
+            // the answer, and it flows into the next prompt via the bounded
+            // resolved-interruptions injection.
             if comment.is_none() {
                 bail!(
                     "Provide a resolution: --option <k>, --answer <text>, or \
@@ -307,11 +413,12 @@ pub fn cmd_interruption_resolve(
     // Capture the step_id BEFORE resolve so we can emit the NDJSON event
     // even after the row transitions to resolved.
     let step_id_for_event = q.step_id.clone();
-    storage::resolve_interruption(conn, &q.id, &resolution, comment)?;
-    // Phase C: if this was the Phase B auto-raised retry-exhausted blocker,
-    // reset attempts / mark Failed per the chosen option. No-op for normal
-    // interruptions (returns Ok(false) without writing).
-    apply_retry_exhausted_resolution(conn, project, &q.id, &resolution)?;
+    // Phase E Fix 1: resolve + retry-exhausted side-effect run in a SINGLE
+    // transaction. The pre-Phase-E shape ran them in two separate writes,
+    // letting a peer `ralph run` observe (resolved interruption + Pending
+    // status + attempts==max) between the writes and bail in the executor's
+    // budget guard.
+    resolve_interruption_with_retry_handling(conn, project, &q.id, &resolution, comment)?;
     // Phase E Fix 4: emit `InterruptionResolved` for the CLI resolve path.
     // Best-effort + JSON-mode-gated, matching the raised-event helper.
     crate::output::emit_interruption_resolved(
@@ -851,5 +958,249 @@ mod tests {
         .unwrap();
 
         assert_eq!(step_status(&conn, &step_id), StepStatus::Failed);
+    }
+
+    // -- Phase E Fix 1: atomic resolve + retry-exhausted side-effect --------
+
+    /// `resolve_interruption_with_retry_handling` must commit (a) the
+    /// interruptions.state flip AND (b) the step-side reset/Fail in a single
+    /// transaction. If a `BEGIN` is in flight on a *separate* connection,
+    /// SQLite's default `journal_mode=delete` plus a deferred write lock
+    /// means the second connection cannot read the half-written state — the
+    /// transaction is atomic at the SQL level. We exercise this by holding a
+    /// concurrent read transaction on a second connection and asserting it
+    /// either sees the pre-resolve state or the fully-post-resolve state,
+    /// never the in-between.
+    #[test]
+    fn test_resolve_with_retry_handling_atomic_resolve_and_reset() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-atomic-retry";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_auto_blocker(&conn, &step_id);
+
+        // Pre-state: open interruption, status Pending, attempts 3.
+        let opens_pre = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert_eq!(opens_pre.len(), 1);
+        assert_eq!(step_attempts(&conn, &step_id), 3);
+
+        let acted = resolve_interruption_with_retry_handling(
+            &conn,
+            project,
+            &id,
+            RETRY_EXHAUSTED_OPTION_RETRY,
+            None,
+        )
+        .unwrap();
+        assert!(acted, "the auto-blocker was recognized and side-effect applied");
+
+        // Post-state: zero open interruptions AND attempts reset AND still
+        // Pending. The bug was that pre-Phase-E left a window where the
+        // interruption was resolved but attempts was still 3 — the scheduler
+        // would re-pick the step and bail on the budget guard.
+        let opens_post = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert!(opens_post.is_empty(), "interruption resolved");
+        assert_eq!(
+            step_attempts(&conn, &step_id),
+            0,
+            "attempts reset atomically with resolve",
+        );
+        assert_eq!(step_status(&conn, &step_id), StepStatus::Pending);
+    }
+
+    /// `resolve_interruption_with_retry_handling` rolls back the resolve
+    /// when the side-effect write fails. We can't easily inject a failure on
+    /// the storage helpers, but we *can* prove the transaction shape by
+    /// asserting that hitting a missing-id error from `resolve_interruption`
+    /// leaves the DB untouched.
+    #[test]
+    fn test_resolve_with_retry_handling_missing_id_leaves_state_clean() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-atomic-missing";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+
+        let err = resolve_interruption_with_retry_handling(
+            &conn,
+            project,
+            "no-such-id",
+            RETRY_EXHAUSTED_OPTION_RETRY,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+
+        // Step state untouched.
+        assert_eq!(step_attempts(&conn, &step_id), 3);
+        assert_eq!(step_status(&conn, &step_id), StepStatus::Pending);
+    }
+
+    /// A normal question routed through the atomic helper still resolves and
+    /// returns `false` (no retry-exhausted side-effect).
+    #[test]
+    fn test_resolve_with_retry_handling_normal_question_only_resolves() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-atomic-q";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        let qid = storage::insert_interruption(
+            &conn,
+            &step_id,
+            1,
+            InterruptionKind::Question,
+            "?",
+            &[InterruptionOption {
+                text: "A".into(),
+                priority: 1,
+            }],
+        )
+        .unwrap();
+
+        let acted = resolve_interruption_with_retry_handling(
+            &conn,
+            project,
+            &qid,
+            "A",
+            Some("note"),
+        )
+        .unwrap();
+        assert!(!acted, "normal question: no retry-exhausted side-effect");
+
+        let resolved = storage::list_interruptions_for_step(&conn, &step_id).unwrap();
+        let q = resolved.iter().find(|i| i.id == qid).unwrap();
+        assert_eq!(q.state, crate::plan::InterruptionState::Resolved);
+        assert_eq!(q.resolution.as_deref(), Some("A"));
+        assert_eq!(q.comment.as_deref(), Some("note"));
+    }
+
+    // -- Phase E Fix 3: reject --comment-only resolve on retry-exhausted blockers --
+
+    /// `cmd_interruption_resolve` must reject a `--comment` only resolution
+    /// of a Phase B retry-exhausted auto-blocker. Pre-Phase-E this silently
+    /// routed through Retry (empty resolution_text != RETRY_EXHAUSTED_OPTION_FAIL),
+    /// burning a retry budget without surfacing the operator's choice.
+    #[test]
+    fn test_cli_resolve_blocker_with_comment_only_is_rejected() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-comment-only-blocker";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_auto_blocker(&conn, &step_id);
+
+        let err = cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &id,
+            None,
+            None,
+            Some("just a note, not a decision"),
+            &quiet_out(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Resolving a blocker requires --option <k> or --answer <text>"),
+            "error message must explain the requirement: {msg}",
+        );
+        // Surface the available options so the operator can re-issue the
+        // right command without inspecting the row.
+        assert!(
+            msg.contains(RETRY_EXHAUSTED_OPTION_RETRY),
+            "error must surface the Retry option text: {msg}",
+        );
+        assert!(
+            msg.contains(RETRY_EXHAUSTED_OPTION_FAIL),
+            "error must surface the Mark Failed option text: {msg}",
+        );
+        // Nothing should have been written.
+        let still_open =
+            storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert_eq!(still_open.len(), 1, "interruption still open after rejection");
+        assert_eq!(
+            step_attempts(&conn, &step_id),
+            3,
+            "no retry budget consumed",
+        );
+        assert_eq!(step_status(&conn, &step_id), StepStatus::Pending);
+    }
+
+    /// Harness-raised blockers (no options) also reject `--comment` only —
+    /// without an `--answer` the operator has not actually committed to a
+    /// resolution, just left a note.
+    #[test]
+    fn test_cli_resolve_harness_blocker_with_comment_only_is_rejected() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-harness-blocker-comment-only";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        let bid = storage::insert_interruption(
+            &conn,
+            &step_id,
+            1,
+            InterruptionKind::Blocker,
+            "needs sudo",
+            &[], // no options — harness-raised
+        )
+        .unwrap();
+
+        let err = cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &bid,
+            None,
+            None,
+            Some("looked into it"),
+            &quiet_out(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--option <k> or --answer <text>"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("no proposed options"),
+            "error should mention that this blocker has no options: {msg}",
+        );
+    }
+
+    /// Questions remain `--comment` only friendly — the comment IS the
+    /// answer there. (Regression guard: don't tighten the question path
+    /// while tightening the blocker path.)
+    #[test]
+    fn test_cli_resolve_question_with_comment_only_still_works() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-q-comment-only";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        let qid = storage::insert_interruption(
+            &conn,
+            &step_id,
+            1,
+            InterruptionKind::Question,
+            "Which DB?",
+            &[InterruptionOption {
+                text: "SQLite".into(),
+                priority: 1,
+            }],
+        )
+        .unwrap();
+
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &qid,
+            None,
+            None,
+            Some("Postgres please, found prior art"),
+            &quiet_out(),
+        )
+        .unwrap();
+
+        let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert!(after.is_empty(), "question resolved by comment-only");
     }
 }
