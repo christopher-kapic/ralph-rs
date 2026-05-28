@@ -2168,8 +2168,11 @@ async fn stash_if_dirty(
 /// staged at stash time. Called once at the end of the top-level run
 /// regardless of outcome.
 ///
-/// On `stash pop` conflict, we leave the stash on the stack and return a
-/// non-zero error — the user pops manually.
+/// On `stash pop` conflict, git has already half-applied the stash into the
+/// working tree (with conflict markers) and left the stash on the stack. We
+/// surface an error telling the user to resolve the markers in place and then
+/// drop the now-redundant stash — re-running `git stash pop` against the
+/// conflicted tree would only fail or compound the conflict.
 async fn restore_working_tree(workdir: &Path, state: Option<&StashedState>) -> Result<()> {
     if let Some(state) = state {
         let workdir_owned = workdir.to_path_buf();
@@ -2203,12 +2206,15 @@ async fn restore_working_tree(workdir: &Path, state: Option<&StashedState>) -> R
             }
             StashPopOutcome::Conflicted(stderr) => {
                 bail!(
-                    "Pop of ralph's stash conflicts with committed work. \
-                     Your changes are preserved at {} — resolve manually with \
-                     `git stash pop {}`.\n{}",
-                    state.stash_ref.as_str(),
-                    state.stash_ref.as_str(),
-                    stderr,
+                    "Restoring your pre-run uncommitted changes conflicted with work \
+                     committed during the run. The changes are partially applied with \
+                     conflict markers already in the working tree, and the original \
+                     stash is preserved at {sha}. Resolve the conflict markers in place, \
+                     then run `git stash drop {sha}` to remove the now-redundant stash. \
+                     (Do not re-run `git stash pop` — it will fail against the conflicted \
+                     tree.)\n{stderr}",
+                    sha = state.stash_ref.as_str(),
+                    stderr = stderr,
                 );
             }
             StashPopOutcome::NotFound => {
@@ -2275,26 +2281,56 @@ async fn restore_parked_step_worktree(
             storage::clear_step_parked_worktree(conn, &step.id)?;
             Ok(RestoreParkedOutcome::Resumed)
         }
-        StashPopOutcome::Conflicted(stderr) => {
+        StashPopOutcome::Conflicted(_stderr) => {
             // Cluster 3 Fix #2: per-step blocker, NOT a whole-run bail.
-            // Apply ran but conflicted; the stash is still on the stack so
-            // the user can recover it manually. We surface that exact
-            // recovery in the blocker body. The bridge row is preserved
-            // (the stash is preserved) so a future restart can retry the
-            // pop after the user resolves whatever conflict the apply
-            // surfaced.
+            // Apply ran but conflicted, leaving the working tree with
+            // conflict markers / a partial apply / unmerged index entries.
+            // The executor does NOT clean the tree at step start, so leaving
+            // those markers in place would feed them to a re-run harness and
+            // a Mark-Pending re-run would never start clean — the blocker
+            // would re-fire forever (the loop bug). We hold the run lock and
+            // the impl-semaphore here (this runs in the scheduler before any
+            // `execute_step`, semaphore=1 — see §9), so this is the safe
+            // place to touch the tree: `git reset --hard HEAD` discards the
+            // conflicted apply + unmerged entries while leaving pre-existing
+            // untracked files (preserved during park) in place. The stash
+            // itself stays on the stack (the WIP source of truth) and the
+            // bridge row is kept so the resolver can find + drop it.
+            //
+            // If the reset itself errors we log and continue to raise the
+            // blocker anyway — bailing here would resurrect the original
+            // whole-run-abort bug we are fixing.
+            let workdir_for_reset = workdir.to_path_buf();
+            // `blocking_git` collapses the spawn-join error and the git
+            // error into one `Result`; we deliberately do NOT `?` it —
+            // either failure mode should be logged-and-continued so the
+            // blocker still gets raised (bailing here would resurrect the
+            // whole-run-abort bug this path fixes).
+            let reset_res =
+                blocking_git(move || git::reset_hard_to_head(&workdir_for_reset)).await;
+            if let Err(err) = reset_res
+                && out.format != OutputFormat::Json
+            {
+                eprintln!(
+                    "Warning: could not reset the working tree after a conflicted parked-restore \
+                     for step {} '{}': {err:#}. Raising the blocker anyway; the tree may carry \
+                     conflict markers until you resolve it manually.",
+                    step.short_id, step.title,
+                );
+            }
             let body = format!(
                 "{PARKED_RESTORE_BLOCKER_MARKER}\n\
-                 Applying the parked interruption stash for step '{}' conflicted. \
-                 The preserved work is still available at {} — resolve it \
-                 manually with `git stash pop {}` before continuing, then resolve \
-                 this blocker with '{}' to retry the step or '{}' to give up.\n{}",
-                step.title,
-                stash_ref.as_str(),
-                stash_ref.as_str(),
-                PARKED_RESTORE_OPTION_MARK_PENDING,
-                PARKED_RESTORE_OPTION_MARK_FAILED,
-                stderr,
+                 Could not restore this step's parked work-in-progress: applying stash {sha} \
+                 conflicted with commits made since it was parked. The working tree has been \
+                 reset to a clean state; the parked WIP is preserved in git stash {sha}. \
+                 Resolve with '{fail}' (fence this step off — run `ralph step reset {short_id}` \
+                 later to retry) or '{pending}' (re-run the step from scratch; the parked WIP \
+                 in stash {sha} will be discarded). To salvage the WIP manually, inspect \
+                 `git stash show -p {sha}` before resolving.",
+                sha = stash_ref.as_str(),
+                short_id = step.short_id,
+                fail = PARKED_RESTORE_OPTION_MARK_FAILED,
+                pending = PARKED_RESTORE_OPTION_MARK_PENDING,
             );
             raise_parked_restore_blocker(conn, step, &body, /*drop_bridge_row=*/ false, out)?;
             Ok(RestoreParkedOutcome::BlockedAfterFailure)
@@ -2307,18 +2343,21 @@ async fn restore_parked_step_worktree(
             // scheduler pass doesn't re-fire the same error, then raise a
             // blocker with two recovery options that the interruption
             // resolver actually wires through (Bug #2 fix — pre-fix the
-            // options were empty and resolution had no side-effect).
+            // options were empty and resolution had no side-effect). The
+            // working tree is untouched here (no apply ran), so there is
+            // nothing to reset.
             let body = format!(
                 "{PARKED_RESTORE_BLOCKER_MARKER}\n\
-                 Parked worktree stash '{}' for step '{}' was not found in `git stash list` — \
-                 an admin may have run `git stash clear` or another tool dropped it. The \
-                 preserved WIP is unrecoverable. Resolve with '{}' (leave the step terminal) \
-                 or '{}' (run the step fresh from scratch — the previous in-flight work \
-                 is lost).",
-                stash_ref.as_str(),
-                step.title,
-                PARKED_RESTORE_OPTION_MARK_FAILED,
-                PARKED_RESTORE_OPTION_MARK_PENDING,
+                 Could not restore this step's parked work-in-progress: stash {sha} was not \
+                 found in `git stash list` — an admin may have run `git stash clear` or another \
+                 tool dropped it. The parked WIP is unrecoverable. Resolve with '{fail}' \
+                 (fence this step off — run `ralph step reset {short_id}` later to retry) or \
+                 '{pending}' (run the step fresh from scratch; the previous in-flight work is \
+                 already lost).",
+                sha = stash_ref.as_str(),
+                short_id = step.short_id,
+                fail = PARKED_RESTORE_OPTION_MARK_FAILED,
+                pending = PARKED_RESTORE_OPTION_MARK_PENDING,
             );
             raise_parked_restore_blocker(conn, step, &body, /*drop_bridge_row=*/ true, out)?;
             Ok(RestoreParkedOutcome::BlockedAfterFailure)
@@ -2338,16 +2377,18 @@ pub const PARKED_RESTORE_BLOCKER_MARKER: &str = "[ralph:parked-restore]";
 
 /// Priority-1 option on the parked-restore blocker — "give up on this
 /// step." Resolves the interruption AND flips status to `Failed`,
-/// terminating the step. The bridge row is already cleared (NotFound) or
-/// the caller may want to drop the stash manually (Conflicted).
+/// terminating the step. The resolver clears any surviving bridge row and
+/// drops the preserved stash (Conflicted); on NotFound the bridge row was
+/// already dropped at raise time and there is no stash to drop.
 pub const PARKED_RESTORE_OPTION_MARK_FAILED: &str = "Skip and Mark Failed";
 
 /// Priority-2 option on the parked-restore blocker — "start the step
 /// fresh, abandoning the parked WIP." Resolves the interruption; the step
 /// stays `Pending` with attempts unchanged so the scheduler re-picks it on
-/// the next tick with a clean slate (the bridge row was already cleared
-/// at NotFound; for Conflicted the operator is expected to have run `git
-/// stash drop` manually before resolving).
+/// the next tick with a clean slate. The resolver clears any surviving
+/// bridge row and drops the preserved stash (Conflicted — the tree was
+/// already reset clean at raise time, so the re-run starts fresh); on
+/// NotFound the bridge row was already dropped at raise time.
 pub const PARKED_RESTORE_OPTION_MARK_PENDING: &str = "Skip and Mark Pending";
 
 /// Insert a `kind=Blocker` interruption on `step` for a parked-worktree
@@ -5787,8 +5828,22 @@ mod tests {
             "Conflicted apply must yield BlockedAfterFailure; got {outcome:?}",
         );
 
+        // Fix #1(a): the working tree is reset clean at raise time so a
+        // re-run harness never sees the conflict markers. No uncommitted
+        // changes / unmerged paths; the committed (version-B) content is
+        // restored.
+        assert!(
+            !git::has_uncommitted_changes(&dir).unwrap(),
+            "Conflicted restore must reset the tree clean (no unmerged paths)",
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "version-B\n",
+            "the reset must restore the committed content, discarding the partial apply",
+        );
+
         // Bridge row is KEPT so the stash on disk has a pointer the user
-        // can follow / a future restart can retry.
+        // can follow / the resolver can find + drop.
         assert!(
             storage::get_step_parked_worktree(&conn, &step.id)
                 .unwrap()
@@ -5797,8 +5852,7 @@ mod tests {
              (the stash is still recoverable on disk)",
         );
 
-        // The stash itself is still on the stack (recoverable via `git
-        // stash pop <sha>` per the blocker body's instructions).
+        // The stash itself is still on the stack (the WIP source of truth).
         assert!(
             git::find_stash_by_message(&dir, "ralph: conflict-park-test")
                 .unwrap()
@@ -5814,6 +5868,152 @@ mod tests {
             "blocker body must explain the conflict: {:?}",
             opens[0].body,
         );
+        // Fix #2: the body must NOT recommend a manual `git stash pop`
+        // (re-running the just-conflicted pop compounds the conflict).
+        assert!(
+            !opens[0].body.contains("git stash pop"),
+            "blocker body must not recommend `git stash pop`: {:?}",
+            opens[0].body,
+        );
+    }
+
+    /// Fix #1(b): resolving a Conflicted parked-restore blocker with "Mark
+    /// Pending" must clear the bridge row AND drop the preserved stash, so a
+    /// subsequent scheduler tick finds no parked row and re-runs the step
+    /// fresh (no re-raise loop).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_resolve_conflicted_parked_restore_mark_pending_clears_row_and_stash() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        let conn = setup();
+        let project = dir.to_string_lossy().to_string();
+        let plan =
+            storage::create_plan(&conn, "demo", &project, "demo", "d", None, None, &[]).unwrap();
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Step", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        // Build a conflicting parked stash, exactly as the conflict test does.
+        fs::write(dir.join("README.md"), "version-A\n").unwrap();
+        let stash_ref = git::stash_push_with_untracked(&dir, "ralph: conflict-resolve-test")
+            .unwrap()
+            .expect("expected parked stash");
+        fs::write(dir.join("README.md"), "version-B\n").unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-am", "divergent"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[]).unwrap();
+
+        let out = OutputContext::from_cli(false, false, false);
+        let outcome = restore_parked_step_worktree(&conn, &step, &dir, &out)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, RestoreParkedOutcome::BlockedAfterFailure));
+
+        // Resolve the open blocker with Mark Pending.
+        let opens = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        assert_eq!(opens.len(), 1);
+        let blocker_id = opens[0].id.clone();
+        crate::commands::interruption::resolve_interruption_with_retry_handling(
+            &conn,
+            &project,
+            &blocker_id,
+            crate::runner::PARKED_RESTORE_OPTION_MARK_PENDING,
+            None,
+        )
+        .unwrap();
+
+        // Bridge row cleared (no loop) ...
+        assert!(
+            storage::get_step_parked_worktree(&conn, &step.id)
+                .unwrap()
+                .is_none(),
+            "Mark-Pending resolution must clear the bridge row",
+        );
+        // ... stash dropped ...
+        assert!(
+            git::find_stash_by_message(&dir, "ralph: conflict-resolve-test")
+                .unwrap()
+                .is_none(),
+            "Mark-Pending resolution must drop the preserved stash",
+        );
+        // ... step Pending ...
+        let refreshed = storage::get_step_by_id(&conn, &step.id).unwrap().unwrap();
+        assert_eq!(refreshed.status, StepStatus::Pending);
+
+        // ... and a subsequent restore returns NotParked (no re-raise loop).
+        let again = restore_parked_step_worktree(&conn, &refreshed, &dir, &out)
+            .await
+            .unwrap();
+        assert!(
+            matches!(again, RestoreParkedOutcome::NotParked),
+            "after resolution there is no parked row, so restore is a no-op; got {again:?}",
+        );
+    }
+
+    /// Fix #1(b): resolving a Conflicted parked-restore blocker with "Mark
+    /// Failed" must also clear the bridge row + drop the stash and flip the
+    /// step to terminal Failed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_resolve_conflicted_parked_restore_mark_failed_clears_row_and_stash() {
+        use std::fs;
+
+        let (_tmp, dir) = init_git_repo();
+        let conn = setup();
+        let project = dir.to_string_lossy().to_string();
+        let plan =
+            storage::create_plan(&conn, "demo", &project, "demo", "d", None, None, &[]).unwrap();
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Step", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        fs::write(dir.join("README.md"), "version-A\n").unwrap();
+        let stash_ref = git::stash_push_with_untracked(&dir, "ralph: conflict-fail-test")
+            .unwrap()
+            .expect("expected parked stash");
+        fs::write(dir.join("README.md"), "version-B\n").unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-am", "divergent"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[]).unwrap();
+
+        let out = OutputContext::from_cli(false, false, false);
+        restore_parked_step_worktree(&conn, &step, &dir, &out)
+            .await
+            .unwrap();
+
+        let opens = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        let blocker_id = opens[0].id.clone();
+        crate::commands::interruption::resolve_interruption_with_retry_handling(
+            &conn,
+            &project,
+            &blocker_id,
+            crate::runner::PARKED_RESTORE_OPTION_MARK_FAILED,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            storage::get_step_parked_worktree(&conn, &step.id)
+                .unwrap()
+                .is_none(),
+            "Mark-Failed resolution must clear the bridge row",
+        );
+        assert!(
+            git::find_stash_by_message(&dir, "ralph: conflict-fail-test")
+                .unwrap()
+                .is_none(),
+            "Mark-Failed resolution must drop the preserved stash",
+        );
+        let refreshed = storage::get_step_by_id(&conn, &step.id).unwrap().unwrap();
+        assert_eq!(refreshed.status, StepStatus::Failed);
     }
 
     /// Default (auto_stash=true) stash-push + stash-pop round trip: the

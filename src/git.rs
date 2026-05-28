@@ -379,6 +379,20 @@ pub fn rollback_changes(workdir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `git reset --hard HEAD` — discard tracked-file modifications, unmerged
+/// index entries, and any partial/conflicted stash apply, returning the
+/// working tree to its committed state.
+///
+/// **Untracked files are left in place** (unlike [`rollback_changes`],
+/// which also runs `git clean -fd`). This is intentional: the parked-restore
+/// blocker path uses it to undo a conflicted `git stash pop` while preserving
+/// the user's pre-existing untracked files that park deliberately carried
+/// forward.
+pub fn reset_hard_to_head(workdir: &Path) -> Result<()> {
+    git(workdir, &["reset", "--hard", "HEAD"]).context("git reset --hard HEAD failed")?;
+    Ok(())
+}
+
 /// Return a list of untracked files (respecting .gitignore).
 pub fn get_untracked_files(workdir: &Path) -> Result<Vec<String>> {
     let out = git(workdir, &["ls-files", "--others", "--exclude-standard"])
@@ -1836,6 +1850,79 @@ mod tests {
         fs::write(dir.join("file.txt"), "content").unwrap();
         commit_changes(&dir, "add file").unwrap();
         assert!(!has_uncommitted_changes(&dir).unwrap());
+    }
+
+    #[test]
+    fn test_reset_hard_to_head_discards_tracked_changes() {
+        let (_tmp, dir) = init_repo();
+        // Dirty a tracked file.
+        fs::write(dir.join("README.md"), "# tampered\n").unwrap();
+        assert!(has_uncommitted_changes(&dir).unwrap());
+
+        reset_hard_to_head(&dir).unwrap();
+
+        // Tracked file is back to its committed content; no unmerged paths.
+        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "# hello");
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "reset --hard must leave a clean tree (no unmerged paths): {status:?}",
+        );
+    }
+
+    #[test]
+    fn test_reset_hard_to_head_preserves_untracked_files() {
+        let (_tmp, dir) = init_repo();
+        // Untracked file the user wants kept.
+        fs::write(dir.join("scratch.txt"), "keep me\n").unwrap();
+        // Also dirty a tracked file so the reset has something to undo.
+        fs::write(dir.join("README.md"), "# tampered\n").unwrap();
+
+        reset_hard_to_head(&dir).unwrap();
+
+        // The tracked file was reset...
+        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "# hello");
+        // ...but the untracked file survives (reset --hard, not clean -fd).
+        assert_eq!(
+            fs::read_to_string(dir.join("scratch.txt")).unwrap(),
+            "keep me\n",
+        );
+    }
+
+    #[test]
+    fn test_reset_hard_clears_conflicted_stash_apply() {
+        let (_tmp, dir) = init_repo();
+        // Reproduce a conflicted stash pop: stash version-A, commit
+        // divergent version-B, then apply the stash so the tree carries
+        // conflict markers / unmerged entries.
+        fs::write(dir.join("README.md"), "version-A\n").unwrap();
+        let stash_ref = stash_push_with_untracked(&dir, "ralph: conflict-reset-test")
+            .unwrap()
+            .expect("expected parked stash");
+        fs::write(dir.join("README.md"), "version-B\n").unwrap();
+        commit_changes(&dir, "divergent").unwrap();
+        let outcome = stash_pop(&dir, &stash_ref).unwrap();
+        assert!(
+            matches!(outcome, StashPopOutcome::Conflicted(_)),
+            "fixture must produce a conflicted apply; got {outcome:?}",
+        );
+        // Sanity: the tree is dirty / has unmerged paths now.
+        let dirty = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(!dirty.trim().is_empty());
+
+        reset_hard_to_head(&dir).unwrap();
+
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "reset --hard must clear the conflicted apply (no unmerged paths): {status:?}",
+        );
+        assert!(!has_conflict_marker(&status));
+        // The committed (version-B) content is restored.
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "version-B\n",
+        );
     }
 
     #[test]

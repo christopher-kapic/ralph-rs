@@ -139,25 +139,54 @@ fn apply_retry_exhausted_side_effect_in_tx(
 /// `pub const` in the same defended way the retry-exhausted set is, and a
 /// body marker is the minimum-invasive shape matching the existing pattern.
 ///
+/// **Legacy fallback (Fix #3):** an earlier in-session build of this branch
+/// raised the same blocker without the marker prefix. Those markerless
+/// bodies carry one of two distinctive phrases that appear nowhere else —
+/// `"parked interruption stash"` (Conflicted) / `"parked worktree stash"`
+/// (NotFound). We also match those (case-insensitively) so a markerless
+/// legacy blocker still routes through this resolver instead of being
+/// treated as an unwired harness blocker. The feature is unreleased, so the
+/// only DBs that can hold such a row are dev DBs from this session.
+///
 /// The kind discriminator is the first gate (a Question that happens to
 /// carry the marker text by accident is still a Question — the marker is
 /// only meaningful on a Blocker).
 fn is_parked_restore_blocker(interruption: &crate::plan::Interruption) -> bool {
-    interruption.kind == InterruptionKind::Blocker
-        && interruption.body.starts_with(PARKED_RESTORE_BLOCKER_MARKER)
+    if interruption.kind != InterruptionKind::Blocker {
+        return false;
+    }
+    if interruption.body.starts_with(PARKED_RESTORE_BLOCKER_MARKER) {
+        return true;
+    }
+    let lower = interruption.body.to_ascii_lowercase();
+    lower.contains("parked interruption stash") || lower.contains("parked worktree stash")
 }
 
-/// The parked-restore side-effect, in-transaction. Returns `Ok(())` — there
-/// is no parked-worktree state to discard here (the bridge row was already
-/// cleared by `raise_parked_restore_blocker` on the NotFound path; on the
-/// Conflicted path the stash is the operator's responsibility).
+/// The parked-restore side-effect, in-transaction. Mirrors
+/// [`apply_retry_exhausted_side_effect_in_tx`]: reads any surviving parked
+/// bridge row, clears it IN the transaction, and **returns the
+/// `ParkedWorktreeState`** so the caller drops the underlying stash
+/// post-commit via [`crate::runner::discard_parked_worktree_state`]
+/// (file-system mutations can't be rolled back if the tx aborts, so they
+/// must happen on the success leg only).
+///
+/// Why this clears the row + drops the stash on BOTH arms (Fix #1(b)): the
+/// runner's Conflicted branch keeps the bridge row + stash and resets the
+/// working tree clean at raise time. If resolution left that row behind,
+/// the next scheduler tick would re-enter `restore_parked_step_worktree`,
+/// re-attempt the (still-conflicting) pop, and re-raise the blocker —
+/// the loop bug. Clearing the row here breaks the loop; dropping the stash
+/// keeps the stack tidy. On the NotFound path the bridge row was already
+/// dropped at raise time, so `get_step_parked_worktree` returns `None`,
+/// `clear` is skipped, and `discard_parked_worktree_state(None)` is a
+/// harmless no-op (the stash was already gone).
 ///
 /// Dispatch rules:
 /// - [`PARKED_RESTORE_OPTION_MARK_FAILED`] (or a freeform answer matching
 ///   that exact text): flip the step to terminal `Failed`.
 /// - [`PARKED_RESTORE_OPTION_MARK_PENDING`]: leave the step `Pending`
 ///   with attempts unchanged so the scheduler re-picks it fresh on the
-///   next tick.
+///   next tick (the tree was already reset clean at raise time).
 /// - Any other freeform answer: treat as "Mark Pending" (start fresh, with
 ///   the freeform string flowing into the next prompt via the bounded
 ///   "Resolved interruptions" section — same convention as the
@@ -166,7 +195,15 @@ fn apply_parked_restore_side_effect_in_tx(
     tx: &Connection,
     step_id: &str,
     resolution_text: &str,
-) -> Result<()> {
+) -> Result<Option<crate::storage::ParkedWorktreeState>> {
+    // Clear any surviving bridge row (Conflicted) so the scheduler can't
+    // re-enter the restore path and re-raise the blocker, and capture the
+    // parked state so the caller drops the stash after commit.
+    let parked = storage::get_step_parked_worktree(tx, step_id)?;
+    if parked.is_some() {
+        storage::clear_step_parked_worktree(tx, step_id)?;
+    }
+
     if resolution_text == PARKED_RESTORE_OPTION_MARK_FAILED {
         // Explicit give-up: terminal Failed. The step's `attempts` value
         // is left alone — the row records whatever attempt count the
@@ -174,12 +211,10 @@ fn apply_parked_restore_side_effect_in_tx(
         storage::update_step_status(tx, step_id, StepStatus::Failed)?;
     }
     // MARK_PENDING and any freeform fallthrough: step stays Pending, the
-    // scheduler re-picks on the next tick. The bridge row was cleared at
-    // raise time (NotFound) or is the operator's responsibility
-    // (Conflicted). The interruption row's `resolution` (the freeform
-    // text) plus `comment` get injected into the next prompt by
-    // `list_resolved_interruptions_for_step`.
-    Ok(())
+    // scheduler re-picks on the next tick on a clean tree. The interruption
+    // row's `resolution` (the freeform text) plus `comment` get injected
+    // into the next prompt by `list_resolved_interruptions_for_step`.
+    Ok(parked)
 }
 
 /// Atomic resolve: flip `interruptions.state='resolved'` AND, when the row
@@ -235,8 +270,11 @@ pub fn resolve_interruption_with_retry_handling(
         if is_auto {
             apply_retry_exhausted_side_effect_in_tx(tx, &step_id, want_fail)
         } else if is_parked_restore {
-            apply_parked_restore_side_effect_in_tx(tx, &step_id, resolution_text)?;
-            Ok(None)
+            // Fix #1(b): the parked-restore side-effect now clears the
+            // surviving bridge row (breaking the Conflicted re-raise loop)
+            // and returns the parked state so the stash is dropped
+            // post-commit, mirroring the retry-exhausted Fail arm.
+            apply_parked_restore_side_effect_in_tx(tx, &step_id, resolution_text)
         } else {
             Ok(None)
         }
@@ -1364,6 +1402,62 @@ mod tests {
         assert!(
             !is_parked_restore_blocker(&base),
             "no marker prefix => false"
+        );
+    }
+
+    /// Fix #3: a legacy markerless parked-restore blocker (raised by an
+    /// earlier in-session build before the marker existed) is still detected
+    /// via its distinctive body phrase, so it routes through the
+    /// parked-restore resolver instead of being treated as an unwired
+    /// harness blocker.
+    #[test]
+    fn test_is_parked_restore_blocker_legacy_markerless_detection() {
+        use crate::plan::{Interruption, InterruptionState};
+        use chrono::Utc;
+
+        let mut base = Interruption {
+            id: "x".into(),
+            step_id: "s".into(),
+            attempt: 1,
+            kind: InterruptionKind::Blocker,
+            // Legacy Conflicted body (no marker prefix).
+            body: "Applying the parked interruption stash for step 'Foo' conflicted. \
+                   The preserved work is still available at abc123."
+                .into(),
+            options: vec![],
+            resolution: None,
+            comment: None,
+            state: InterruptionState::Open,
+            asked_at: Utc::now(),
+            resolved_at: None,
+        };
+        assert!(
+            is_parked_restore_blocker(&base),
+            "legacy markerless Conflicted body must match via the legacy phrase"
+        );
+
+        // Legacy NotFound body (no marker prefix).
+        base.body =
+            "Parked worktree stash 'abc123' for step 'Foo' was not found in `git stash list`."
+                .into();
+        assert!(
+            is_parked_restore_blocker(&base),
+            "legacy markerless NotFound body must match via the legacy phrase"
+        );
+
+        // An unrelated harness blocker still does NOT match.
+        base.body = "Need credentials to push to the registry.".into();
+        assert!(
+            !is_parked_restore_blocker(&base),
+            "unrelated harness blocker must not be mis-routed"
+        );
+
+        // A Question carrying the legacy phrase is still a Question.
+        base.kind = InterruptionKind::Question;
+        base.body = "Should I keep the parked worktree stash?".into();
+        assert!(
+            !is_parked_restore_blocker(&base),
+            "Question kind never matches even with the legacy phrase"
         );
     }
 
