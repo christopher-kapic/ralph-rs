@@ -12,6 +12,9 @@ use crate::db;
 use crate::executor::{RETRY_EXHAUSTED_OPTION_FAIL, RETRY_EXHAUSTED_OPTION_RETRY};
 use crate::output::{OutputContext, OutputFormat};
 use crate::plan::{InterruptionKind, StepStatus};
+use crate::runner::{PARKED_RESTORE_BLOCKER_MARKER, PARKED_RESTORE_OPTION_MARK_FAILED};
+#[cfg(test)]
+use crate::runner::PARKED_RESTORE_OPTION_MARK_PENDING;
 use crate::storage::{self, OpenQuestion};
 
 /// Phase C: react to the human-side resolution of the **Phase B auto-raised
@@ -129,6 +132,56 @@ fn apply_retry_exhausted_side_effect_in_tx(
     }
 }
 
+/// True iff `interruption` is the parked-worktree-restore blocker
+/// (`runner::raise_parked_restore_blocker`). Detected by the
+/// [`PARKED_RESTORE_BLOCKER_MARKER`] prefix on the body — chosen over an
+/// option-content check because the parked-restore option set is not
+/// `pub const` in the same defended way the retry-exhausted set is, and a
+/// body marker is the minimum-invasive shape matching the existing pattern.
+///
+/// The kind discriminator is the first gate (a Question that happens to
+/// carry the marker text by accident is still a Question — the marker is
+/// only meaningful on a Blocker).
+fn is_parked_restore_blocker(interruption: &crate::plan::Interruption) -> bool {
+    interruption.kind == InterruptionKind::Blocker
+        && interruption.body.starts_with(PARKED_RESTORE_BLOCKER_MARKER)
+}
+
+/// The parked-restore side-effect, in-transaction. Returns `Ok(())` — there
+/// is no parked-worktree state to discard here (the bridge row was already
+/// cleared by `raise_parked_restore_blocker` on the NotFound path; on the
+/// Conflicted path the stash is the operator's responsibility).
+///
+/// Dispatch rules:
+/// - [`PARKED_RESTORE_OPTION_MARK_FAILED`] (or a freeform answer matching
+///   that exact text): flip the step to terminal `Failed`.
+/// - [`PARKED_RESTORE_OPTION_MARK_PENDING`]: leave the step `Pending`
+///   with attempts unchanged so the scheduler re-picks it fresh on the
+///   next tick.
+/// - Any other freeform answer: treat as "Mark Pending" (start fresh, with
+///   the freeform string flowing into the next prompt via the bounded
+///   "Resolved interruptions" section — same convention as the
+///   retry-exhausted blocker's freeform fallthrough).
+fn apply_parked_restore_side_effect_in_tx(
+    tx: &Connection,
+    step_id: &str,
+    resolution_text: &str,
+) -> Result<()> {
+    if resolution_text == PARKED_RESTORE_OPTION_MARK_FAILED {
+        // Explicit give-up: terminal Failed. The step's `attempts` value
+        // is left alone — the row records whatever attempt count the
+        // executor had reached before parking.
+        storage::update_step_status(tx, step_id, StepStatus::Failed)?;
+    }
+    // MARK_PENDING and any freeform fallthrough: step stays Pending, the
+    // scheduler re-picks on the next tick. The bridge row was cleared at
+    // raise time (NotFound) or is the operator's responsibility
+    // (Conflicted). The interruption row's `resolution` (the freeform
+    // text) plus `comment` get injected into the next prompt by
+    // `list_resolved_interruptions_for_step`.
+    Ok(())
+}
+
 /// Atomic resolve: flip `interruptions.state='resolved'` AND, when the row
 /// is the Phase B retry-exhausted auto-blocker, apply the Retry/Fail
 /// side-effect — **all inside a single `unchecked_transaction`**.
@@ -164,6 +217,16 @@ pub fn resolve_interruption_with_retry_handling(
     // decide which side-effect branch to take inside the tx).
     let interruption = storage::get_interruption(conn, interruption_id)?;
     let is_auto = is_retry_exhausted_auto_blocker(&interruption);
+    // Bug #2 fix: dispatch parked-restore blockers (body-prefix-marked) to
+    // the matching side-effect. Pre-fix these were inserted with empty
+    // options and the resolver had no branch — resolution just closed the
+    // row, the step stayed Pending with the same Conflicted/NotFound
+    // condition, and the scheduler re-fired the same restore error on the
+    // next tick. The two dispatch branches are mutually exclusive (a
+    // single interruption is either retry-exhausted OR parked-restore, never
+    // both — they're raised by different code paths with different option
+    // sets / body markers).
+    let is_parked_restore = !is_auto && is_parked_restore_blocker(&interruption);
     let step_id = interruption.step_id.clone();
     let want_fail = is_auto && resolution_text == RETRY_EXHAUSTED_OPTION_FAIL;
 
@@ -171,6 +234,9 @@ pub fn resolve_interruption_with_retry_handling(
         storage::resolve_interruption(tx, interruption_id, resolution_text, comment)?;
         if is_auto {
             apply_retry_exhausted_side_effect_in_tx(tx, &step_id, want_fail)
+        } else if is_parked_restore {
+            apply_parked_restore_side_effect_in_tx(tx, &step_id, resolution_text)?;
+            Ok(None)
         } else {
             Ok(None)
         }
@@ -179,6 +245,11 @@ pub fn resolve_interruption_with_retry_handling(
     if parked_to_discard.is_some() {
         crate::runner::discard_parked_worktree_state(Path::new(project), parked_to_discard)?;
     }
+    // The return-bool's pre-Phase-E meaning was "was this the retry-exhausted
+    // auto-blocker?" — only one caller (a Phase C compat wrapper) inspects
+    // it. We keep that contract here; parked-restore returns `false`
+    // (callers that care about parked-restore detection should call
+    // `is_parked_restore_blocker` directly).
     Ok(is_auto)
 }
 
@@ -1202,5 +1273,241 @@ mod tests {
 
         let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
         assert!(after.is_empty(), "question resolved by comment-only");
+    }
+
+    // -- Bug #2: parked-restore blocker resolution side-effects ----------
+
+    /// Helper: insert a parked-restore blocker the way
+    /// `runner::raise_parked_restore_blocker` would (the marker-prefixed
+    /// body + the two ranked options). Mirrors the executor's
+    /// `seed_auto_blocker` pattern.
+    fn seed_parked_restore_blocker(conn: &Connection, step_id: &str) -> String {
+        let body = format!(
+            "{PARKED_RESTORE_BLOCKER_MARKER}\nParked stash gone; mark Failed or mark Pending."
+        );
+        storage::insert_interruption(
+            conn,
+            step_id,
+            1,
+            InterruptionKind::Blocker,
+            &body,
+            &[
+                InterruptionOption {
+                    text: PARKED_RESTORE_OPTION_MARK_FAILED.into(),
+                    priority: 1,
+                },
+                InterruptionOption {
+                    text: PARKED_RESTORE_OPTION_MARK_PENDING.into(),
+                    priority: 2,
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    fn step_status_q(conn: &Connection, step_id: &str) -> StepStatus {
+        let s: String = conn
+            .query_row(
+                "SELECT status FROM steps WHERE id = ?1",
+                rusqlite::params![step_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        use std::str::FromStr;
+        StepStatus::from_str(&s).unwrap()
+    }
+
+    fn step_attempts_q(conn: &Connection, step_id: &str) -> i32 {
+        conn.query_row(
+            "SELECT attempts FROM steps WHERE id = ?1",
+            rusqlite::params![step_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Marker detection: only a Blocker that starts with the marker matches.
+    #[test]
+    fn test_is_parked_restore_blocker_marker_detection() {
+        use crate::plan::{Interruption, InterruptionState};
+        use chrono::Utc;
+
+        let mut base = Interruption {
+            id: "x".into(),
+            step_id: "s".into(),
+            attempt: 1,
+            kind: InterruptionKind::Blocker,
+            body: format!("{PARKED_RESTORE_BLOCKER_MARKER}\nrest of body"),
+            options: vec![],
+            resolution: None,
+            comment: None,
+            state: InterruptionState::Open,
+            asked_at: Utc::now(),
+            resolved_at: None,
+        };
+        assert!(
+            is_parked_restore_blocker(&base),
+            "marker prefix + Blocker => true"
+        );
+
+        // Wrong kind: a Question carrying the marker text is still a Question.
+        base.kind = InterruptionKind::Question;
+        assert!(
+            !is_parked_restore_blocker(&base),
+            "Question kind never matches"
+        );
+        base.kind = InterruptionKind::Blocker;
+
+        // No marker: a harness-raised blocker without the prefix does not match.
+        base.body = "needs sudo".into();
+        assert!(
+            !is_parked_restore_blocker(&base),
+            "no marker prefix => false"
+        );
+    }
+
+    /// `--option 1` (MARK_FAILED) flips the step to terminal Failed and
+    /// resolves the interruption. Pre-fix this was a no-op (options were
+    /// empty, no side effect wired) and the step stayed Pending; the
+    /// scheduler then re-fired the same restore error on the next tick.
+    #[test]
+    fn test_parked_restore_blocker_mark_failed_resolution() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-pr-fail";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        // Simulate the executor's pre-park state.
+        storage::set_step_attempts(&conn, &step_id, 2).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_parked_restore_blocker(&conn, &step_id);
+
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &id,
+            Some(1), // priority 1 = MARK_FAILED
+            None,
+            None,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        // Interruption resolved.
+        let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert!(after.is_empty(), "interruption resolved");
+        // Side-effect applied.
+        assert_eq!(
+            step_status_q(&conn, &step_id),
+            StepStatus::Failed,
+            "MARK_FAILED flips status to terminal Failed",
+        );
+        // attempts is untouched — the row records whatever counter the
+        // executor reached before parking.
+        assert_eq!(step_attempts_q(&conn, &step_id), 2);
+    }
+
+    /// `--option 2` (MARK_PENDING) leaves the step Pending (attempts
+    /// unchanged) and resolves the interruption. The scheduler can then
+    /// re-pick the step on the next tick with a clean slate.
+    #[test]
+    fn test_parked_restore_blocker_mark_pending_resolution() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-pr-pending";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 2).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_parked_restore_blocker(&conn, &step_id);
+
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &id,
+            Some(2), // priority 2 = MARK_PENDING
+            None,
+            None,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert!(after.is_empty(), "interruption resolved");
+        assert_eq!(
+            step_status_q(&conn, &step_id),
+            StepStatus::Pending,
+            "MARK_PENDING leaves status Pending so the scheduler re-picks",
+        );
+        assert_eq!(step_attempts_q(&conn, &step_id), 2, "attempts unchanged");
+    }
+
+    /// `--answer "<freeform>"` falls through to MARK_PENDING semantics
+    /// (start fresh with the hint), matching the retry-exhausted
+    /// freeform-with-hint convention. The freeform string is persisted on
+    /// the resolved interruption row so the bounded "Resolved
+    /// interruptions" prompt section picks it up on the next attempt.
+    #[test]
+    fn test_parked_restore_blocker_freeform_resolution() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-pr-freeform";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 1).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_parked_restore_blocker(&conn, &step_id);
+
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &id,
+            None,
+            Some("the disk was full"),
+            None,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert!(after.is_empty(), "freeform resolution still resolves the row");
+        assert_eq!(
+            step_status_q(&conn, &step_id),
+            StepStatus::Pending,
+            "freeform falls through to MARK_PENDING (start fresh)",
+        );
+        assert_eq!(step_attempts_q(&conn, &step_id), 1);
+
+        // The freeform text is persisted as the resolution, so the bounded
+        // "Resolved interruptions" prompt section sees it on the next run.
+        let rows = storage::list_interruptions_for_step(&conn, &step_id).unwrap();
+        let row = rows.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(row.resolution.as_deref(), Some("the disk was full"));
+    }
+
+    /// Atomic-resolver direct entry point: same dispatch as the CLI
+    /// handler, exercised here without the clap layer. Asserts that the
+    /// auto-blocker return-bool stays `false` for a parked-restore blocker
+    /// (the bool only flags the retry-exhausted shape — the Phase C
+    /// `apply_retry_exhausted_resolution` wrapper inspects it; parked-restore
+    /// callers should call `is_parked_restore_blocker` directly).
+    #[test]
+    fn test_resolve_with_retry_handling_parked_restore_returns_false() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-pr-helper";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        let id = seed_parked_restore_blocker(&conn, &step_id);
+
+        let acted = resolve_interruption_with_retry_handling(
+            &conn,
+            project,
+            &id,
+            PARKED_RESTORE_OPTION_MARK_FAILED,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !acted,
+            "return-bool is the retry-exhausted flag only; parked-restore returns false"
+        );
+        // But the side-effect still happened.
+        assert_eq!(step_status_q(&conn, &step_id), StepStatus::Failed);
     }
 }

@@ -1560,12 +1560,24 @@ pub async fn resume_plan(
     let steps = storage::list_steps(conn, &plan.id)?;
     let resume_idx = find_resume_point(&steps)?;
 
-    // Reset the failed/in-progress step to pending.
+    // Defense-in-depth: `find_resume_point` no longer returns a `Failed`
+    // step (a Mark-Failed decision is a human fence we must honor across
+    // runs — see the doc comment on `find_resume_point`). Bail loudly if
+    // someone re-introduces a Failed branch upstream, rather than silently
+    // calling `reset_step` and un-doing the operator's choice.
     let step = &steps[resume_idx];
-    if step.status == StepStatus::Failed
-        || step.status == StepStatus::InProgress
-        || step.status == StepStatus::Aborted
-    {
+    if step.status == StepStatus::Failed {
+        bail!(
+            "Step '{}' is Failed. Resume will not automatically reset a Failed step \
+             (the Mark-Failed decision is preserved across runs). To retry it, run \
+             `ralph step reset {}` first.",
+            step.title,
+            step.short_id,
+        );
+    }
+
+    // Reset the in-progress/aborted step to pending.
+    if step.status == StepStatus::InProgress || step.status == StepStatus::Aborted {
         let parked = storage::reset_step(conn, &step.id)?;
         discard_parked_worktree_state(workdir, parked)?;
     }
@@ -2258,12 +2270,16 @@ async fn restore_parked_step_worktree(
             // pop after the user resolves whatever conflict the apply
             // surfaced.
             let body = format!(
-                "Applying the parked interruption stash for step '{}' conflicted. \
+                "{PARKED_RESTORE_BLOCKER_MARKER}\n\
+                 Applying the parked interruption stash for step '{}' conflicted. \
                  The preserved work is still available at {} — resolve it \
-                 manually with `git stash pop {}` before continuing.\n{}",
+                 manually with `git stash pop {}` before continuing, then resolve \
+                 this blocker with '{}' to retry the step or '{}' to give up.\n{}",
                 step.title,
                 stash_ref.as_str(),
                 stash_ref.as_str(),
+                PARKED_RESTORE_OPTION_MARK_PENDING,
+                PARKED_RESTORE_OPTION_MARK_FAILED,
                 stderr,
             );
             raise_parked_restore_blocker(conn, step, &body, /*drop_bridge_row=*/ false, out)?;
@@ -2275,15 +2291,20 @@ async fn restore_parked_step_worktree(
             // clear`, IDE plugin) — the WIP is gone and we have no honest
             // way to resume. Drop the orphaned bridge row so the next
             // scheduler pass doesn't re-fire the same error, then raise a
-            // blocker with two recovery hints.
+            // blocker with two recovery options that the interruption
+            // resolver actually wires through (Bug #2 fix — pre-fix the
+            // options were empty and resolution had no side-effect).
             let body = format!(
-                "Parked worktree stash '{}' for step '{}' was not found in `git stash list` — \
+                "{PARKED_RESTORE_BLOCKER_MARKER}\n\
+                 Parked worktree stash '{}' for step '{}' was not found in `git stash list` — \
                  an admin may have run `git stash clear` or another tool dropped it. The \
-                 preserved WIP is unrecoverable. Resolve this blocker with either \
-                 'Skip and Mark Failed' (leave the step terminal) or 'Skip and Mark Pending' \
-                 (run the step fresh from scratch — the previous in-flight work is lost).",
+                 preserved WIP is unrecoverable. Resolve with '{}' (leave the step terminal) \
+                 or '{}' (run the step fresh from scratch — the previous in-flight work \
+                 is lost).",
                 stash_ref.as_str(),
                 step.title,
+                PARKED_RESTORE_OPTION_MARK_FAILED,
+                PARKED_RESTORE_OPTION_MARK_PENDING,
             );
             raise_parked_restore_blocker(conn, step, &body, /*drop_bridge_row=*/ true, out)?;
             Ok(RestoreParkedOutcome::BlockedAfterFailure)
@@ -2291,12 +2312,46 @@ async fn restore_parked_step_worktree(
     }
 }
 
+/// Body-prefix marker on a parked-worktree-restore blocker. The
+/// `commands::interruption` resolver dispatches on this prefix to wire the
+/// two ranked options ([`PARKED_RESTORE_OPTION_MARK_FAILED`] /
+/// [`PARKED_RESTORE_OPTION_MARK_PENDING`]) to actual step-state side
+/// effects. Mirrors the retry-exhausted auto-blocker's option-content
+/// dispatch (`is_retry_exhausted_auto_blocker`), but uses a body marker
+/// because the parked-restore option set could plausibly drift while the
+/// retry-exhausted set is locked by `executor.rs`'s `pub const`.
+pub const PARKED_RESTORE_BLOCKER_MARKER: &str = "[ralph:parked-restore]";
+
+/// Priority-1 option on the parked-restore blocker — "give up on this
+/// step." Resolves the interruption AND flips status to `Failed`,
+/// terminating the step. The bridge row is already cleared (NotFound) or
+/// the caller may want to drop the stash manually (Conflicted).
+pub const PARKED_RESTORE_OPTION_MARK_FAILED: &str = "Skip and Mark Failed";
+
+/// Priority-2 option on the parked-restore blocker — "start the step
+/// fresh, abandoning the parked WIP." Resolves the interruption; the step
+/// stays `Pending` with attempts unchanged so the scheduler re-picks it on
+/// the next tick with a clean slate (the bridge row was already cleared
+/// at NotFound; for Conflicted the operator is expected to have run `git
+/// stash drop` manually before resolving).
+pub const PARKED_RESTORE_OPTION_MARK_PENDING: &str = "Skip and Mark Pending";
+
 /// Insert a `kind=Blocker` interruption on `step` for a parked-worktree
 /// restore failure. Optionally drops the bridge row first when the stash
 /// is gone (NotFound) so we don't re-trip the same error on the next
 /// scheduler pass; for Conflicted we leave the row alone (the stash is
 /// still recoverable). Best-effort NDJSON emit mirrors the existing
 /// review-loop / retry-exhausted patterns.
+///
+/// Bug #2 fix: this used to insert with `options = &[]`, which left the
+/// CLI/TUI resolver with nothing to dispatch on — resolution just closed
+/// the row and the scheduler re-fired the same restore error in a loop.
+/// We now insert the two ranked options
+/// [`PARKED_RESTORE_OPTION_MARK_FAILED`] (priority 1) /
+/// [`PARKED_RESTORE_OPTION_MARK_PENDING`] (priority 2) and prefix the body
+/// with [`PARKED_RESTORE_BLOCKER_MARKER`] so the resolver
+/// (`apply_parked_restore_resolution`) can detect the subkind and apply
+/// the matching side effect.
 fn raise_parked_restore_blocker(
     conn: &Connection,
     step: &Step,
@@ -2311,6 +2366,16 @@ fn raise_parked_restore_blocker(
     // `attempt` value is `step.attempts` (matching the executor's
     // retry-exhausted blocker which uses the *current* attempt counter as
     // its `attempt` field).
+    let options = [
+        crate::plan::InterruptionOption {
+            text: PARKED_RESTORE_OPTION_MARK_FAILED.to_string(),
+            priority: 1,
+        },
+        crate::plan::InterruptionOption {
+            text: PARKED_RESTORE_OPTION_MARK_PENDING.to_string(),
+            priority: 2,
+        },
+    ];
     let interruption_id = crate::db::with_tx(conn, |conn| {
         let id = storage::insert_interruption(
             conn,
@@ -2318,7 +2383,7 @@ fn raise_parked_restore_blocker(
             step.attempts,
             crate::plan::InterruptionKind::Blocker,
             body,
-            &[],
+            &options,
         )?;
         if drop_bridge_row {
             storage::clear_step_parked_worktree(conn, &step.id)?;
@@ -2491,7 +2556,16 @@ fn step_number_in_plan(all_steps: &[Step], step: &Step) -> usize {
 /// invoking this function, so in normal use no `InProgress` rows should ever
 /// be visible here. The `InProgress` arm is retained as a belt-and-suspenders
 /// guard in case the sweep is ever accidentally bypassed or reordered.
-/// Preference order: InProgress > Failed > Aborted > Pending.
+/// Preference order: InProgress > Aborted > Pending.
+///
+/// **Failed steps are NOT selected for resume.** A `Failed` row is a
+/// deliberate human decision (Mark Failed on the retry-exhausted auto-blocker
+/// — see [`is_actionable`] for the matching scheduler-side fence). Including
+/// it here would let `resume_plan` immediately call `reset_step` on it,
+/// flipping it back to `Pending` and silently un-doing the Mark-Failed
+/// choice on the very next run. The explicit recovery path is `ralph step
+/// reset <short_id>`, which calls `storage::reset_step` directly with the
+/// operator's opt-in.
 fn find_resume_point(steps: &[Step]) -> Result<usize> {
     // Belt-and-suspenders: sweep should have cleared any InProgress, but if
     // something skipped it, still prefer an in_progress step.
@@ -2499,11 +2573,6 @@ fn find_resume_point(steps: &[Step]) -> Result<usize> {
         .iter()
         .position(|s| s.status == StepStatus::InProgress)
     {
-        return Ok(idx);
-    }
-
-    // Then look for a failed step.
-    if let Some(idx) = steps.iter().position(|s| s.status == StepStatus::Failed) {
         return Ok(idx);
     }
 
@@ -2517,7 +2586,11 @@ fn find_resume_point(steps: &[Step]) -> Result<usize> {
         return Ok(idx);
     }
 
-    bail!("No failed, in-progress, or pending steps found to resume from")
+    // Note: `Failed` is deliberately excluded — see the doc comment above.
+    // A plan whose only remaining work is Failed (every other step Complete
+    // or Skipped) has no resumable work; the operator must `ralph step
+    // reset` the Failed rows first if they want to retry them.
+    bail!("No in-progress, aborted, or pending steps found to resume from")
 }
 
 /// True if a step is in a status that the runner loop will attempt to execute.
@@ -3463,21 +3536,41 @@ mod tests {
     }
 
     #[test]
-    fn test_find_resume_point_failed() {
+    fn test_find_resume_point_skips_failed() {
+        // Post-fix: a Failed row is a human Mark-Failed decision; resume
+        // must skip it (the explicit-recovery path is `ralph step reset`).
+        // Here we have Complete, Failed, Pending: resume targets the
+        // Pending row, not the Failed one.
         let mut steps = make_steps(3);
         steps[0].status = StepStatus::Complete;
         steps[1].status = StepStatus::Failed;
         let idx = find_resume_point(&steps).unwrap();
-        assert_eq!(idx, 1);
+        assert_eq!(idx, 2, "Failed step skipped; Pending step picked");
     }
 
     #[test]
-    fn test_find_resume_point_prefers_in_progress_over_failed() {
+    fn test_find_resume_point_in_progress_over_failed() {
+        // Post-fix: even when an InProgress row exists alongside Failed,
+        // the Failed row is ignored entirely (not just deprioritized) —
+        // InProgress is picked because it's the next non-Failed row, not
+        // because of any preference ordering vs Failed.
         let mut steps = make_steps(3);
         steps[0].status = StepStatus::Failed;
         steps[1].status = StepStatus::InProgress;
         let idx = find_resume_point(&steps).unwrap();
-        assert_eq!(idx, 1); // in_progress takes priority
+        assert_eq!(idx, 1, "Failed skipped; InProgress picked");
+    }
+
+    #[test]
+    fn test_find_resume_point_all_failed_errors() {
+        // Post-fix: a plan whose only non-Complete work is Failed has no
+        // resumable work. `find_resume_point` returns an error and
+        // `resume_plan` surfaces it as "no work to resume."
+        let mut steps = make_steps(2);
+        steps[0].status = StepStatus::Failed;
+        steps[1].status = StepStatus::Failed;
+        let result = find_resume_point(&steps);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -3539,16 +3632,138 @@ mod tests {
         let step = &steps[resume_idx];
         assert_eq!(step.status, StepStatus::Aborted);
 
-        // Replicate the reset condition from resume_plan
-        if step.status == StepStatus::Failed
-            || step.status == StepStatus::InProgress
-            || step.status == StepStatus::Aborted
-        {
+        // Replicate the (post-fix) reset condition from resume_plan: only
+        // InProgress / Aborted are reset; Failed is preserved.
+        if step.status == StepStatus::InProgress || step.status == StepStatus::Aborted {
             storage::reset_step(&conn, &step.id).unwrap();
         }
 
         let refreshed = storage::list_steps(&conn, &plan.id).unwrap();
         assert_eq!(refreshed[resume_idx].status, StepStatus::Pending);
+    }
+
+    /// BUG #1: `ralph resume` must NOT call `reset_step` on a Failed row.
+    /// Pre-fix, `find_resume_point` returned the Failed step and
+    /// `resume_plan` immediately reset it to Pending, silently un-doing the
+    /// operator's Mark-Failed decision. Post-fix, the Failed row is
+    /// excluded from the resumable set and the Pending sibling is picked
+    /// for resumption instead. We assert (a) the Failed step is untouched
+    /// (status / attempts / execution-logs preserved) and (b) the Pending
+    /// sibling is what resume picks.
+    #[test]
+    fn test_resume_skips_failed_steps() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "rsf", "/p", "b", "d", None, None, &[]).unwrap();
+        let (failed_step, _) = storage::create_step(
+            &conn, &plan.id, "Will fail", "d1", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        // Simulate the post-Mark-Failed shape: attempts at max, status
+        // Failed, an audit log row recording the exhausted cycle.
+        storage::set_step_attempts(&conn, &failed_step.id, 3).unwrap();
+        storage::update_step_status(&conn, &failed_step.id, StepStatus::Failed).unwrap();
+        storage::create_execution_log(
+            &conn,
+            &failed_step.id,
+            1,
+            Some("attempt that failed"),
+            None,
+        )
+        .unwrap();
+
+        let (pending_step, _) = storage::create_step(
+            &conn, &plan.id, "Independent", "d2", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        // pending_step is left Pending by create_step.
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let resume_idx = find_resume_point(&steps).unwrap();
+        // Resume must pick the Pending sibling, not the Failed step.
+        assert_eq!(steps[resume_idx].id, pending_step.id);
+
+        // The Failed step is unchanged: status / attempts / logs all
+        // preserved. (`resume_plan` would now route to the Pending step;
+        // we verify Failed was not reset by checking its state directly.)
+        let after = storage::list_steps(&conn, &plan.id).unwrap();
+        let failed_after = after.iter().find(|s| s.id == failed_step.id).unwrap();
+        assert_eq!(
+            failed_after.status,
+            StepStatus::Failed,
+            "Failed step must not be flipped to Pending by resume"
+        );
+        assert_eq!(failed_after.attempts, 3, "Failed step attempts preserved");
+        let logs = storage::list_execution_logs_for_step(&conn, &failed_step.id).unwrap();
+        assert_eq!(
+            logs.len(),
+            1,
+            "Failed step execution logs preserved (not wiped by reset)"
+        );
+    }
+
+    /// BUG #1: a plan whose only remaining work is Failed has no resumable
+    /// work — `find_resume_point` errors and the resume CLI surfaces it.
+    /// The Failed step is left untouched (no silent reset).
+    #[test]
+    fn test_resume_with_only_failed_steps_does_nothing() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "rof", "/p", "b", "d", None, None, &[]).unwrap();
+        let (s1, _) = storage::create_step(
+            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
+        let (s2, _) = storage::create_step(
+            &conn, &plan.id, "Second", "d2", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        storage::set_step_attempts(&conn, &s2.id, 3).unwrap();
+        storage::update_step_status(&conn, &s2.id, StepStatus::Failed).unwrap();
+
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let result = find_resume_point(&steps);
+        assert!(
+            result.is_err(),
+            "no resumable work when only Complete + Failed remain"
+        );
+
+        // Failed step still Failed; reset never fired.
+        let after = storage::list_steps(&conn, &plan.id).unwrap();
+        let s2_after = after.iter().find(|s| s.id == s2.id).unwrap();
+        assert_eq!(s2_after.status, StepStatus::Failed);
+        assert_eq!(s2_after.attempts, 3);
+    }
+
+    /// BUG #1 defense-in-depth: `ralph step reset` (the explicit human
+    /// opt-in) MUST still flip a Failed step to Pending and clear its
+    /// execution-logs. The fix narrowed `resume_plan`'s automatic reset
+    /// path; the explicit-recovery path is untouched.
+    #[test]
+    fn test_explicit_step_reset_still_works_on_failed() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "esr", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Failed step", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        storage::set_step_attempts(&conn, &step.id, 3).unwrap();
+        storage::update_step_status(&conn, &step.id, StepStatus::Failed).unwrap();
+        storage::create_execution_log(&conn, &step.id, 1, Some("a1"), None).unwrap();
+        storage::create_execution_log(&conn, &step.id, 2, Some("a2"), None).unwrap();
+
+        // Explicit reset (the path `ralph step reset` uses).
+        let parked = storage::reset_step(&conn, &step.id).unwrap();
+        assert!(parked.is_none(), "no parked worktree on this step");
+
+        let after = storage::list_steps(&conn, &plan.id).unwrap();
+        let step_after = after.iter().find(|s| s.id == step.id).unwrap();
+        assert_eq!(step_after.status, StepStatus::Pending);
+        assert_eq!(step_after.attempts, 0);
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert!(
+            logs.is_empty(),
+            "explicit reset still clears execution logs"
+        );
     }
 
     // -- find_current_step tests --
@@ -6381,6 +6596,51 @@ mod tests {
         assert!(!is_actionable(StepStatus::Failed));
         assert!(!is_actionable(StepStatus::Complete));
         assert!(!is_actionable(StepStatus::Skipped));
+    }
+
+    // -- Bug #2: parked-restore blocker insertion shape --
+
+    /// Source-shape proof that `raise_parked_restore_blocker` inserts the
+    /// two ranked options and prefixes the body with
+    /// `PARKED_RESTORE_BLOCKER_MARKER`. The interruption resolver
+    /// (`apply_parked_restore_resolution`) detects the subkind via this
+    /// marker; pre-fix the function inserted with empty options and the
+    /// resolver had no branch to dispatch on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_raise_parked_restore_blocker_inserts_marker_and_options() {
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "prb", "/p", "b", "d", None, None, &[]).unwrap();
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "s", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+
+        let body = format!(
+            "{PARKED_RESTORE_BLOCKER_MARKER}\nbody text mentioning '{}' and '{}'",
+            PARKED_RESTORE_OPTION_MARK_FAILED, PARKED_RESTORE_OPTION_MARK_PENDING,
+        );
+        let out = OutputContext::from_cli(false, true, false);
+        raise_parked_restore_blocker(&conn, &step, &body, /*drop_bridge_row=*/ false, &out)
+            .unwrap();
+
+        let rows = storage::list_interruptions_for_step(&conn, &step.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.kind, crate::plan::InterruptionKind::Blocker);
+        assert!(
+            row.body.starts_with(PARKED_RESTORE_BLOCKER_MARKER),
+            "body must start with the marker so the resolver can dispatch: {}",
+            row.body,
+        );
+        assert_eq!(
+            row.options.len(),
+            2,
+            "must insert both ranked recovery options",
+        );
+        assert_eq!(row.options[0].text, PARKED_RESTORE_OPTION_MARK_FAILED);
+        assert_eq!(row.options[0].priority, 1);
+        assert_eq!(row.options[1].text, PARKED_RESTORE_OPTION_MARK_PENDING);
+        assert_eq!(row.options[1].priority, 2);
     }
 
     // -- topological scheduler (docs/dag-redesign.md §3.5) --
