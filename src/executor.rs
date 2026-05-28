@@ -1031,11 +1031,8 @@ fn park_step_worktree_for_interruption(
     // on resume). `git stash push --include-untracked -- ':!<path>' …`
     // says "stash everything *except* these paths", which is exactly the
     // semantics we want.
-    let Some(stash_ref) = git::stash_push_with_untracked_except(
-        ctx.workdir,
-        &label,
-        ctx.pre_existing_untracked,
-    )?
+    let Some(stash_ref) =
+        git::stash_push_with_untracked_except(ctx.workdir, &label, ctx.pre_existing_untracked)?
     else {
         return Ok(());
     };
@@ -11356,7 +11353,10 @@ mod tests {
 
         // The harness's tracked modification was parked (file reverted to
         // HEAD) and its new untracked file is gone (now lives in the stash).
-        assert_eq!(std::fs::read_to_string(dir.join("README.md")).unwrap(), "init");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("README.md")).unwrap(),
+            "init"
+        );
         assert!(!dir.join("harness-output.rs").exists());
 
         // The parked-worktree row was persisted.

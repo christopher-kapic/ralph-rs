@@ -12,9 +12,9 @@ use crate::db;
 use crate::executor::{RETRY_EXHAUSTED_OPTION_FAIL, RETRY_EXHAUSTED_OPTION_RETRY};
 use crate::output::{OutputContext, OutputFormat};
 use crate::plan::{InterruptionKind, StepStatus};
-use crate::runner::{PARKED_RESTORE_BLOCKER_MARKER, PARKED_RESTORE_OPTION_MARK_FAILED};
 #[cfg(test)]
 use crate::runner::PARKED_RESTORE_OPTION_MARK_PENDING;
+use crate::runner::{PARKED_RESTORE_BLOCKER_MARKER, PARKED_RESTORE_OPTION_MARK_FAILED};
 use crate::storage::{self, OpenQuestion};
 
 /// Phase C: react to the human-side resolution of the **Phase B auto-raised
@@ -1064,7 +1064,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(acted, "the auto-blocker was recognized and side-effect applied");
+        assert!(
+            acted,
+            "the auto-blocker was recognized and side-effect applied"
+        );
 
         // Post-state: zero open interruptions AND attempts reset AND still
         // Pending. The bug was that pre-Phase-E left a window where the
@@ -1128,14 +1131,9 @@ mod tests {
         )
         .unwrap();
 
-        let acted = resolve_interruption_with_retry_handling(
-            &conn,
-            project,
-            &qid,
-            "A",
-            Some("note"),
-        )
-        .unwrap();
+        let acted =
+            resolve_interruption_with_retry_handling(&conn, project, &qid, "A", Some("note"))
+                .unwrap();
         assert!(!acted, "normal question: no retry-exhausted side-effect");
 
         let resolved = storage::list_interruptions_for_step(&conn, &step_id).unwrap();
@@ -1187,9 +1185,12 @@ mod tests {
             "error must surface the Mark Failed option text: {msg}",
         );
         // Nothing should have been written.
-        let still_open =
-            storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
-        assert_eq!(still_open.len(), 1, "interruption still open after rejection");
+        let still_open = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert_eq!(
+            still_open.len(),
+            1,
+            "interruption still open after rejection"
+        );
         assert_eq!(
             step_attempts(&conn, &step_id),
             3,
@@ -1467,7 +1468,10 @@ mod tests {
         .unwrap();
 
         let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
-        assert!(after.is_empty(), "freeform resolution still resolves the row");
+        assert!(
+            after.is_empty(),
+            "freeform resolution still resolves the row"
+        );
         assert_eq!(
             step_status_q(&conn, &step_id),
             StepStatus::Pending,

@@ -36,11 +36,7 @@ use std::collections::HashSet;
 /// a node is expanded at most once even in dense graphs. Cycle reachable
 /// through `target`'s existing transitive deps is harmless to walking — we
 /// stop as soon as either `source` is found or the frontier drains.
-pub fn would_create_cycle_generic<F>(
-    source: &str,
-    target: &str,
-    mut get_deps: F,
-) -> Result<bool>
+pub fn would_create_cycle_generic<F>(source: &str, target: &str, mut get_deps: F) -> Result<bool>
 where
     F: FnMut(&str) -> Result<Vec<String>>,
 {
@@ -133,9 +129,8 @@ mod tests {
 
     #[test]
     fn closure_error_propagates() {
-        let result: Result<bool> = would_create_cycle_generic("a", "b", |_id| {
-            Err(anyhow::anyhow!("boom"))
-        });
+        let result: Result<bool> =
+            would_create_cycle_generic("a", "b", |_id| Err(anyhow::anyhow!("boom")));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("boom"));
     }

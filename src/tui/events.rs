@@ -446,9 +446,7 @@ pub fn dispatch_event(app: &mut PlanDetailApp, event: &RunEvent) {
                 std::time::Instant::now(),
             );
         }
-        RunEvent::ReviewLoopEscalated {
-            chain_len, cap, ..
-        } => {
+        RunEvent::ReviewLoopEscalated { chain_len, cap, .. } => {
             // The review→correction chain hit the per-plan cap and was
             // converted to a `kind=blocker` interruption. Surface this as
             // an error toast — it's a human-actionable terminal state for

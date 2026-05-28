@@ -437,8 +437,15 @@ async fn run_plan_inner(
             // verdict that lost its bridge row would silently skip the
             // §10 corrective step entirely — the §9-inv-2 violation the
             // pipeline guards against.
-            drain_reviews_on_abort(conn, &effective_plan, &mut reviews, workdir, out, &mut abort_rx)
-                .await;
+            drain_reviews_on_abort(
+                conn,
+                &effective_plan,
+                &mut reviews,
+                workdir,
+                out,
+                &mut abort_rx,
+            )
+            .await;
             eprintln!("Aborted");
             storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
             result.final_status = PlanStatus::Aborted;
@@ -996,8 +1003,15 @@ async fn run_plan_inner(
             *abort_rx.borrow(),
             Some(crate::signal::CancelReason::Aborted)
         ) {
-            drain_reviews_on_abort(conn, &effective_plan, &mut reviews, workdir, out, &mut abort_rx)
-                .await;
+            drain_reviews_on_abort(
+                conn,
+                &effective_plan,
+                &mut reviews,
+                workdir,
+                out,
+                &mut abort_rx,
+            )
+            .await;
             eprintln!("Aborted");
             storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
             result.final_status = PlanStatus::Aborted;
@@ -2993,7 +3007,10 @@ async fn drain_finished_reviews(
         // Short-circuit if the abort signal is already latched: don't park
         // on `join_next` at all. The caller will see `Ok(None)` and re-loop
         // straight into its cancel check.
-        if matches!(*abort_rx.borrow(), Some(crate::signal::CancelReason::Aborted)) {
+        if matches!(
+            *abort_rx.borrow(),
+            Some(crate::signal::CancelReason::Aborted)
+        ) {
             return Ok(None);
         }
         tokio::select! {
@@ -3325,12 +3342,10 @@ mod tests {
             .find(".await?;\n        drop(_in_flight);")
             .expect("execute_step .await? followed by drop(_in_flight) not found");
         let after = &src[exec_step_pos..];
-        let clear_pos = after
-            .find("storage::clear_live_run_step(")
-            .expect(
-                "clear_live_run_step must be called immediately after execute_step returns \
+        let clear_pos = after.find("storage::clear_live_run_step(").expect(
+            "clear_live_run_step must be called immediately after execute_step returns \
                  (Fix #4: widen the run_locks.step_id window between consecutive steps)",
-            );
+        );
         // And it must precede the impl_permit drop further down — the impl
         // permit's drop is logically "we are leaving this step's slot", so the
         // clear must happen first to make the "no live step" snapshot durable
@@ -3655,24 +3670,38 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "rsf", "/p", "b", "d", None, None, &[]).unwrap();
         let (failed_step, _) = storage::create_step(
-            &conn, &plan.id, "Will fail", "d1", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Will fail",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         // Simulate the post-Mark-Failed shape: attempts at max, status
         // Failed, an audit log row recording the exhausted cycle.
         storage::set_step_attempts(&conn, &failed_step.id, 3).unwrap();
         storage::update_step_status(&conn, &failed_step.id, StepStatus::Failed).unwrap();
-        storage::create_execution_log(
-            &conn,
-            &failed_step.id,
-            1,
-            Some("attempt that failed"),
-            None,
-        )
-        .unwrap();
+        storage::create_execution_log(&conn, &failed_step.id, 1, Some("attempt that failed"), None)
+            .unwrap();
 
         let (pending_step, _) = storage::create_step(
-            &conn, &plan.id, "Independent", "d2", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Independent",
+            "d2",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         // pending_step is left Pending by create_step.
@@ -3709,12 +3738,32 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "rof", "/p", "b", "d", None, None, &[]).unwrap();
         let (s1, _) = storage::create_step(
-            &conn, &plan.id, "First", "d1", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "First",
+            "d1",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
         let (s2, _) = storage::create_step(
-            &conn, &plan.id, "Second", "d2", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Second",
+            "d2",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         storage::set_step_attempts(&conn, &s2.id, 3).unwrap();
@@ -3743,7 +3792,17 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "esr", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Failed step", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Failed step",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         storage::set_step_attempts(&conn, &step.id, 3).unwrap();
@@ -5642,8 +5701,7 @@ mod tests {
         );
 
         // A `kind=Blocker` interruption is open on the step.
-        let opens =
-            storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        let opens = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
         assert_eq!(opens.len(), 1, "exactly one blocker interruption raised");
         assert_eq!(opens[0].step_id, step.id);
         assert_eq!(opens[0].kind, crate::plan::InterruptionKind::Blocker);
@@ -5748,8 +5806,7 @@ mod tests {
             "the conflicted stash must survive on the stack so the user can recover",
         );
 
-        let opens =
-            storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
+        let opens = storage::list_open_interruptions_for_plan(&conn, &plan.id).unwrap();
         assert_eq!(opens.len(), 1);
         assert_eq!(opens[0].kind, crate::plan::InterruptionKind::Blocker);
         assert!(
@@ -6611,7 +6668,17 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(&conn, "prb", "/p", "b", "d", None, None, &[]).unwrap();
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "s", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "s",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 

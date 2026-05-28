@@ -1433,7 +1433,9 @@ mod tests {
         let src = include_str!("harness.rs");
 
         let sig = "pub async fn spawn_harness_with_delivery(";
-        let start = src.find(sig).expect("spawn_harness_with_delivery must exist");
+        let start = src
+            .find(sig)
+            .expect("spawn_harness_with_delivery must exist");
         let after = &src[start..];
         // Bound at the next `pub async fn` (the interactive variant).
         let end_rel = after[sig.len()..]

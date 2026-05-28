@@ -7928,12 +7928,18 @@ mod tests {
             if i < open_count {
                 assert_eq!(r.interruption.state, crate::plan::InterruptionState::Open);
             } else {
-                assert_eq!(r.interruption.state, crate::plan::InterruptionState::Resolved);
+                assert_eq!(
+                    r.interruption.state,
+                    crate::plan::InterruptionState::Resolved
+                );
             }
         }
         // The two open ids land in the open block in `asked_at ASC`
         // order, oldest first — open1 was stamped earlier than open2.
-        let open_ids: Vec<&String> = rows[..open_count].iter().map(|r| &r.interruption.id).collect();
+        let open_ids: Vec<&String> = rows[..open_count]
+            .iter()
+            .map(|r| &r.interruption.id)
+            .collect();
         assert_eq!(open_ids, vec![&open1, &open2]);
 
         // The resolved tail is the LAST `RESOLVED_LIMIT` inserted ids,

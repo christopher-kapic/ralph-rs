@@ -172,15 +172,8 @@ fn record_interruption(
         Err(outcome) => return Ok(outcome),
     };
 
-    let id = storage::insert_interruption(
-        conn,
-        &bound.step_id,
-        bound.attempt,
-        kind,
-        body,
-        options,
-    )
-    .with_context(|| format!("inserting {} interruption", kind.as_str()))?;
+    let id = storage::insert_interruption(conn, &bound.step_id, bound.attempt, kind, body, options)
+        .with_context(|| format!("inserting {} interruption", kind.as_str()))?;
 
     // Phase E Fix 4: harness-raised interruptions emit `InterruptionRaised`
     // (auto_raised=false) for observers wiring `--json` consumers. No-op
@@ -218,7 +211,14 @@ pub fn record_question_ask(
     out: &OutputContext,
 ) -> Result<QuestionAskOutcome> {
     let options = build_options(suggestions, priorities);
-    record_interruption(conn, project, InterruptionKind::Question, question, &options, out)
+    record_interruption(
+        conn,
+        project,
+        InterruptionKind::Question,
+        question,
+        &options,
+        out,
+    )
 }
 
 /// Implement `ralph block` against an open DB connection.
