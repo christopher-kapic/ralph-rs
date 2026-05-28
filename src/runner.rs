@@ -1777,6 +1777,7 @@ pub fn skip_step(
         );
     }
 
+    let dependent_count = storage::list_step_dependents(conn, &step.id)?.len();
     let workdir = Path::new(&plan.project);
     let parked = storage::mark_step_skipped(conn, &step.id, reason)?;
     discard_parked_worktree_state(workdir, parked)?;
@@ -1786,6 +1787,12 @@ pub fn skip_step(
             actual_num, step.title, r
         ),
         None => eprintln!("Skipped step {} '{}'", actual_num, step.title),
+    }
+    if dependent_count > 0 {
+        eprintln!(
+            "warning: skipped step {} '{}' has {} dependent step(s); that branch will remain blocked until you reset, remove, or rewire those dependents",
+            actual_num, step.title, dependent_count
+        );
     }
 
     Ok(actual_num)
@@ -2307,6 +2314,15 @@ async fn restore_parked_step_worktree(
     let outcome = blocking_git(move || git::stash_pop(&workdir_owned, &stash_ref_for_pop)).await?;
     match outcome {
         StashPopOutcome::Clean => {
+            if !parked.staged_files.is_empty() {
+                let workdir_owned = workdir.to_path_buf();
+                let staged_owned = parked.staged_files.clone();
+                blocking_git(move || {
+                    git::restage_files(&workdir_owned, &staged_owned);
+                    Ok(())
+                })
+                .await?;
+            }
             storage::clear_step_parked_worktree(conn, &step.id)?;
             Ok(RestoreParkedOutcome::Resumed)
         }
@@ -5766,9 +5782,10 @@ mod tests {
             "park me
 "
         );
-        assert!(
-            git::list_staged_files(&dir).unwrap().is_empty(),
-            "restored parked work must come back as unstaged changes"
+        assert_eq!(
+            git::list_staged_files(&dir).unwrap(),
+            vec!["README.md".to_string()],
+            "restored parked work must restore the prior staged/unstaged split"
         );
         assert!(
             storage::get_step_parked_worktree(&conn, &step.id)
@@ -6046,7 +6063,17 @@ mod tests {
         let plan =
             storage::create_plan(&conn, "demo", &project, "demo", "d", None, None, &[]).unwrap();
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Step", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Step",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -6123,7 +6150,17 @@ mod tests {
         let plan =
             storage::create_plan(&conn, "demo", &project, "demo", "d", None, None, &[]).unwrap();
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Step", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Step",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
 

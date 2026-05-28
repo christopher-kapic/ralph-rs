@@ -201,7 +201,7 @@ losing the per-step audit trail.
 - **Effect.** The executor inserts a `kind=Blocker` interruption with
   two ranked options (`text` is the literal recognition key the
   resolution handler matches against):
-  - priority 1 — `"Retry the step from scratch"`
+  - priority 1 — `"Retry step with parked changes"`
     (`executor::RETRY_EXHAUSTED_OPTION_RETRY`)
   - priority 2 — `"Mark step Failed"`
     (`executor::RETRY_EXHAUSTED_OPTION_FAIL`)

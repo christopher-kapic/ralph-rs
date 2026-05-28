@@ -1607,6 +1607,12 @@ fn random_short_id() -> String {
     String::from_utf8(buf.to_vec()).expect("base-62 alphabet is valid ASCII")
 }
 
+/// True when `s` is an all-digit token that the shared step-selector would
+/// also parse as a numeric position.
+fn is_numeric_only_short_id(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Mint a plan-unique 8-char base-62 `short_id`, re-rolling on collision
 /// against existing `steps.short_id` rows for `plan_id`.
 ///
@@ -1622,6 +1628,9 @@ fn random_short_id() -> String {
 pub fn mint_short_id(conn: &Connection, plan_id: &str) -> Result<String> {
     loop {
         let candidate = random_short_id();
+        if is_numeric_only_short_id(&candidate) {
+            continue;
+        }
         let exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM steps WHERE plan_id = ?1 AND short_id = ?2)",
             params![plan_id, candidate],
@@ -1649,6 +1658,26 @@ pub fn mint_short_id(conn: &Connection, plan_id: &str) -> Result<String> {
 /// byte length off 8 or fail the alphabet check.
 pub fn is_short_id_shaped(s: &str) -> bool {
     s.len() == SHORT_ID_LEN && s.bytes().all(|b| SHORT_ID_ALPHABET.contains(&b))
+}
+
+/// True when `s` is safe to persist as a step `short_id`.
+///
+/// Persisted `short_id`s are also user-facing selectors, so a pure-digit token
+/// is rejected even though it is syntactically base-62: the shared selector
+/// resolver accepts numeric positions and exact short-id matches under one
+/// token, and an all-digit short id would shadow the positional form.
+pub fn is_persistable_short_id(s: &str) -> bool {
+    is_short_id_shaped(s) && !is_numeric_only_short_id(s)
+}
+
+/// True when this plan already has a step whose persisted `short_id` exactly
+/// equals `short_id`.
+pub fn plan_has_step_short_id(conn: &Connection, plan_id: &str, short_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM steps WHERE plan_id = ?1 AND short_id = ?2)",
+        params![plan_id, short_id],
+        |r| r.get(0),
+    )?)
 }
 
 /// Create a new step appended at the end of the plan's step list.
@@ -2884,7 +2913,15 @@ pub fn add_step_dependency(
         "INSERT INTO step_dependencies (step_id, depends_on_step_id) VALUES (?1, ?2)",
         params![step_id, depends_on_step_id],
     )
-    .with_context(|| format!("Failed to add dependency {step_id} -> {depends_on_step_id}"))?;
+    .map_err(|e| {
+        if is_unique_violation(&e) {
+            anyhow::anyhow!("dependency already exists: {step_id} -> {depends_on_step_id}")
+        } else {
+            anyhow::Error::new(e).context(format!(
+                "Failed to add dependency {step_id} -> {depends_on_step_id}"
+            ))
+        }
+    })?;
 
     Ok(())
 }
@@ -3594,6 +3631,10 @@ mod tests {
             assert!(
                 sid.bytes().all(|b| SHORT_ID_ALPHABET.contains(&b)),
                 "short_id must be base-62 ([0-9A-Za-z]): {sid:?}"
+            );
+            assert!(
+                !sid.bytes().all(|b| b.is_ascii_digit()),
+                "minted short_id must not be all digits: {sid:?}"
             );
             assert!(seen.insert(sid.clone()), "duplicate short_id minted: {sid}");
             conn.execute(

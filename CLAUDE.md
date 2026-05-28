@@ -63,7 +63,7 @@ src/
   main.rs              — Entry point, clap CLI dispatch, resolve_plan helper
   cli.rs               — Clap command/arg definitions (ValueEnum for Lifecycle, PlanStatus)
   config.rs            — JSON config loading (~/.config/ralph-rs/config.json), harness definitions
-  db.rs                — SQLite connection, migrations (V1–V31)
+  db.rs                — SQLite connection, migrations (V1–V34)
   plan.rs              — Plan/Step/ExecutionLog models, enums (RetryStrategy {Keep, Rollback}; StepStatus incl. derived Blocked overlay; PlanStatus incl. derived Interrupted; ReviewStatus; Interruption domain model)
   frac_index.rs        — Base-62 fractional indexing for O(1) step reordering
   storage.rs           — High-level CRUD (plans, steps, step_dependencies + cycle check, short_id mint, interruptions CRUD, corrective-step request bridge, hooks, locks, project prompt)
@@ -392,9 +392,7 @@ view bindings don't fire under the overlay.
   re-checks in-process to surface precise errors (`Step not found` vs.
   cross-plan) on the common path — deliberate defense-in-depth that must
   stay in sync with the triggers.
-- **Schema/version:** migrations run through **V31** (the explicit
-  step-placement follow-up was logic/CLI only; the plan-local
-  step-dependency follow-up adds V31); `Cargo.toml` is **0.1.24**.
+- **Schema/version:** migrations run through **V34** (V32 drops the old `UNIQUE(step_id, attempt)` execution-log constraint, V33 adds per-step cycle indices for retry-from-scratch audit grouping, and V34 adds durable `step_parked_worktrees` stash state); `Cargo.toml` is **0.1.20**.
 
 ## Prompt model
 

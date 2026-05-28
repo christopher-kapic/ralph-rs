@@ -48,6 +48,10 @@ fn check_import_version(exported_version: &str, strict: bool) -> Result<()> {
     }
 }
 
+fn default_questions_enabled() -> bool {
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Import JSON schema (mirrors export but uses Deserialize)
 // ---------------------------------------------------------------------------
@@ -77,6 +81,11 @@ pub struct ImportedPlanMeta {
     pub agent: Option<String>,
     #[serde(default)]
     pub deterministic_tests: Vec<String>,
+    /// Whether steps in this plan may raise question/blocker interruptions.
+    /// Missing/absent field defaults to `true`, preserving the current import
+    /// behavior for legacy bundles that predate this field.
+    #[serde(default = "default_questions_enabled")]
+    pub questions_enabled: bool,
     /// Slugs of plans this plan directly depends on.
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -313,12 +322,12 @@ fn validate_dag_aware_steps(steps: &[ImportedStep]) -> Result<()> {
                 step.title
             )
         })?;
-        if !crate::storage::is_short_id_shaped(sid) {
+        if !crate::storage::is_persistable_short_id(sid) {
             return Err(anyhow!(
                 "DAG-aware import: step #{} ('{}') has an invalid short_id \
                  '{sid}'; a short_id must be exactly 8 base-62 characters \
-                 (a readable or numeric one would import but be \
-                 unselectable / shadow a step position)",
+                 and not be all digits (a readable or numeric one would \
+                 import but be unselectable / shadow a step position)",
                 i + 1,
                 step.title
             ));
@@ -515,6 +524,9 @@ fn import_plan_inner(
     if let Some(rs) = data.plan.retry_strategy {
         storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
     }
+    if !data.plan.questions_enabled {
+        storage::set_plan_questions_enabled(conn, &plan.id, false)?;
+    }
 
     // Restore the plan-level review on/off override only when carried
     // (`None` is the column default — round-trip: None stays None).
@@ -544,10 +556,11 @@ fn import_plan_inner(
     let mut created_ids: Vec<String> = Vec::with_capacity(data.steps.len());
     let mut short_to_id: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
     for step_data in &data.steps {
-        let tags_arg: Option<&[String]> = if step_data.tags.is_empty() {
+        let normalized_tags = crate::commands::normalize_tag_inputs(&step_data.tags)?;
+        let tags_arg: Option<&[String]> = if normalized_tags.is_empty() {
             None
         } else {
-            Some(&step_data.tags)
+            Some(&normalized_tags)
         };
         let (step, _pos) = storage::create_step(
             conn,
@@ -1688,6 +1701,77 @@ mod tests {
         let steps = storage::list_steps(&conn, &plan_id).unwrap();
         assert_eq!(steps.len(), 1);
         assert!(steps[0].tags.is_empty());
+    }
+
+    #[test]
+    fn test_import_normalizes_and_validates_tags() {
+        let conn = setup();
+
+        let json = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {
+                "slug": "tag-normalize",
+                "branch_name": "branch",
+                "description": "desc"
+            },
+            "steps": [
+                {"title": "Tagged", "description": "d", "tags": [" FIX ", "REGRESSION"]}
+            ]
+        }"#;
+        let data: ImportedPlan = serde_json::from_str(json).unwrap();
+        let options = ImportOptions {
+            slug: None,
+            branch: None,
+            harness: None,
+            project: "/tmp/proj",
+            strict: false,
+            review_harness_configured: false,
+            global_review_enabled: false,
+        };
+
+        let plan_id = import_plan_from_data(&conn, &data, &options).unwrap();
+        let steps = storage::list_steps(&conn, &plan_id).unwrap();
+        assert_eq!(
+            steps[0].tags,
+            vec!["FIX".to_string(), "REGRESSION".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_import_roundtrip_preserves_questions_enabled() {
+        let conn = setup();
+        let original = storage::create_plan(
+            &conn,
+            "questions-rt",
+            "/tmp/src",
+            "branch",
+            "desc",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        storage::set_plan_questions_enabled(&conn, &original.id, false).unwrap();
+
+        let original = storage::get_plan_by_id(&conn, &original.id).unwrap();
+        let steps = storage::list_steps(&conn, &original.id).unwrap();
+        let exported = export::build_exported_plan(&original, &steps, Vec::new(), &[]);
+        let json = serde_json::to_string(&exported).unwrap();
+        let imported_data: ImportedPlan = serde_json::from_str(&json).unwrap();
+        let options = ImportOptions {
+            slug: Some("questions-rt-copy"),
+            branch: None,
+            harness: None,
+            project: "/tmp/dst",
+            strict: false,
+            review_harness_configured: false,
+            global_review_enabled: false,
+        };
+
+        let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
+        let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
+        assert!(!imported_plan.questions_enabled);
     }
 
     #[test]

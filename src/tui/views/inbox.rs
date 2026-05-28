@@ -230,10 +230,11 @@ impl InboxState {
         self.advance_or_finish();
     }
 
-    /// Advance the run-through to the next still-open item, or finish (back
-    /// to the list, modal cleared) when the queue is empty.
+    /// Advance the run-through to the next still-open item *after the current
+    /// cursor*, or finish (back to the list, modal cleared) when the remaining
+    /// queue is empty. This keeps the run-through a single forward pass.
     fn advance_or_finish(&mut self) {
-        match self.next_open_from(0) {
+        match self.next_open_from(self.cursor.saturating_add(1)) {
             Some(idx) => {
                 self.cursor = idx;
                 self.modal = Some(InterruptionModal::from_interruption(

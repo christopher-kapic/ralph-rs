@@ -279,17 +279,24 @@ impl InterruptionModal {
         self.kind == InterruptionKind::Blocker
     }
 
-    /// The currently-chosen resolution text. **Independent of `self.focus`**:
-    /// an explicitly-typed freeform answer is the deliberate §12.4 escape
-    /// hatch and wins; otherwise the highlighted option (the agent's #1 is
-    /// pre-selected, §12.4) is the answer even when focus has moved to the
-    /// Comment/Freeform field. Keying this off focus was a data-loss bug —
-    /// picking an option then Tab-ing to the Comment field to add a note
-    /// discarded the option and (freeform being empty) blocked submission, so
-    /// a ranked answer + comment could not be submitted together. `None` only
-    /// when there is genuinely nothing chosen (no options *and* empty
-    /// freeform — e.g. a blocker the human hasn't written a resolution for).
+    /// The currently-chosen resolution text. A typed freeform answer is the
+    /// deliberate §12.4 escape hatch and usually wins, but when focus is back
+    /// on the option list the highlighted option is the active choice: a user
+    /// who types something, then re-focuses the ranked list and presses Enter
+    /// expects the selected option to win. Focus leaving `Options` still must
+    /// not discard the selected option entirely — picking an option then
+    /// Tab-ing to the Comment field to add a note is valid and should submit
+    /// that option when freeform is blank. `None` only when there is genuinely
+    /// nothing chosen (no options *and* empty freeform — e.g. a blocker the
+    /// human hasn't written a resolution for).
     pub fn chosen_resolution(&self) -> Option<String> {
+        if self.focus == InterruptionFocus::Options {
+            return self
+                .options
+                .get(self.selected_option)
+                .map(|o| o.text.clone());
+        }
+
         let freeform = self.freeform.trim();
         if !freeform.is_empty() {
             return Some(freeform.to_string());
@@ -703,6 +710,21 @@ mod tests {
         // distinct from Tab-ing away to freeform and pressing Enter (which
         // must stay Pending — see no_agent_decide_shortcut_*).
         let mut m = InterruptionModal::from_interruption(&question(&[("best", 1), ("other", 2)]));
+        assert_eq!(m.focus, InterruptionFocus::Options);
+        assert_eq!(
+            m.handle_key(key(KeyCode::Enter)),
+            InterruptionModalAction::Resolve {
+                interruption_id: "i1".to_string(),
+                resolution: "best".to_string(),
+                comment: None,
+            }
+        );
+    }
+
+    #[test]
+    fn focused_options_override_stale_freeform_text() {
+        let mut m = InterruptionModal::from_interruption(&question(&[("best", 1), ("fail", 2)]));
+        m.freeform = "stale hint".to_string();
         assert_eq!(m.focus, InterruptionFocus::Options);
         assert_eq!(
             m.handle_key(key(KeyCode::Enter)),

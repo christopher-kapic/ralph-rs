@@ -470,6 +470,39 @@ fn import_json_numeric_short_id_rejected() {
     assert_eq!(step_count(&proj), 0);
 }
 
+/// Even a well-shaped 8-digit `short_id` must be rejected: persisted short ids
+/// cannot shadow positional step selectors.
+#[test]
+fn import_json_eight_digit_short_id_rejected() {
+    let (_dir, proj) = setup_project();
+    let out = import_json(&proj, r#"[{"title": "X", "short_id": "00000001"}]"#);
+    assert!(!out.status.success(), "8-digit short_id must be rejected");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid `short_id`"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(step_count(&proj), 0);
+}
+
+/// Batch-local `id` labels are authoring-only handles and must not look like
+/// real step selectors, or `depends_on` could silently shadow existing steps.
+#[test]
+fn import_json_selector_shaped_id_rejected() {
+    let (_dir, proj) = setup_project();
+    let out = import_json(&proj, r#"[{"title": "X", "id": "00000001"}]"#);
+    assert!(
+        !out.status.success(),
+        "selector-shaped batch id must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("invalid `id`"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(step_count(&proj), 0);
+}
+
 /// Full-bundle `ralph import` enforces the same shape guard: a real export
 /// round-trips, but the same bundle with a hand-tampered readable short_id
 /// is rejected (and imports no partial plan).

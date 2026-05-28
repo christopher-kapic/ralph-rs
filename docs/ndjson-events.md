@@ -628,7 +628,7 @@ Payload:
   "interruption_id": "c0ffee…",
   "step_id": "9b8c4…",
   "plan_slug": "dag-redesign",
-  "resolution": "Retry the step from scratch",
+  "resolution": "Retry step with parked changes",
   "comment": "tweaked the failing assertion in test::foo",
   "resolved_at": "2026-05-25T10:05:00Z"
 }

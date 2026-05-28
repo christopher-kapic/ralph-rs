@@ -64,7 +64,7 @@ pub fn apply_retry_exhausted_resolution(
     }
 
     let step_id = interruption.step_id.clone();
-    let want_fail = resolution_text == RETRY_EXHAUSTED_OPTION_FAIL;
+    let want_fail = resolution_matches_option(resolution_text, RETRY_EXHAUSTED_OPTION_FAIL);
 
     let parked_to_discard = db::with_tx(conn, |tx| {
         apply_retry_exhausted_side_effect_in_tx(tx, &step_id, want_fail)
@@ -94,6 +94,10 @@ fn is_retry_exhausted_auto_blocker(interruption: &crate::plan::Interruption) -> 
             .options
             .iter()
             .any(|o| o.text == RETRY_EXHAUSTED_OPTION_FAIL)
+}
+
+fn resolution_matches_option(resolution_text: &str, option_text: &str) -> bool {
+    resolution_text.trim().eq_ignore_ascii_case(option_text)
 }
 
 /// The retry-exhausted side-effect, in-transaction. Returns the parked
@@ -139,27 +143,12 @@ fn apply_retry_exhausted_side_effect_in_tx(
 /// `pub const` in the same defended way the retry-exhausted set is, and a
 /// body marker is the minimum-invasive shape matching the existing pattern.
 ///
-/// **Legacy fallback (Fix #3):** an earlier in-session build of this branch
-/// raised the same blocker without the marker prefix. Those markerless
-/// bodies carry one of two distinctive phrases that appear nowhere else —
-/// `"parked interruption stash"` (Conflicted) / `"parked worktree stash"`
-/// (NotFound). We also match those (case-insensitively) so a markerless
-/// legacy blocker still routes through this resolver instead of being
-/// treated as an unwired harness blocker. The feature is unreleased, so the
-/// only DBs that can hold such a row are dev DBs from this session.
-///
 /// The kind discriminator is the first gate (a Question that happens to
 /// carry the marker text by accident is still a Question — the marker is
 /// only meaningful on a Blocker).
 fn is_parked_restore_blocker(interruption: &crate::plan::Interruption) -> bool {
-    if interruption.kind != InterruptionKind::Blocker {
-        return false;
-    }
-    if interruption.body.starts_with(PARKED_RESTORE_BLOCKER_MARKER) {
-        return true;
-    }
-    let lower = interruption.body.to_ascii_lowercase();
-    lower.contains("parked interruption stash") || lower.contains("parked worktree stash")
+    interruption.kind == InterruptionKind::Blocker
+        && interruption.body.starts_with(PARKED_RESTORE_BLOCKER_MARKER)
 }
 
 /// The parked-restore side-effect, in-transaction. Mirrors
@@ -204,7 +193,7 @@ fn apply_parked_restore_side_effect_in_tx(
         storage::clear_step_parked_worktree(tx, step_id)?;
     }
 
-    if resolution_text == PARKED_RESTORE_OPTION_MARK_FAILED {
+    if resolution_matches_option(resolution_text, PARKED_RESTORE_OPTION_MARK_FAILED) {
         // Explicit give-up: terminal Failed. The step's `attempts` value
         // is left alone — the row records whatever attempt count the
         // executor had reached before parking.
@@ -263,7 +252,8 @@ pub fn resolve_interruption_with_retry_handling(
     // sets / body markers).
     let is_parked_restore = !is_auto && is_parked_restore_blocker(&interruption);
     let step_id = interruption.step_id.clone();
-    let want_fail = is_auto && resolution_text == RETRY_EXHAUSTED_OPTION_FAIL;
+    let want_fail =
+        is_auto && resolution_matches_option(resolution_text, RETRY_EXHAUSTED_OPTION_FAIL);
 
     let parked_to_discard = db::with_tx(conn, |tx| {
         storage::resolve_interruption(tx, interruption_id, resolution_text, comment)?;
@@ -795,6 +785,20 @@ mod tests {
             StepStatus::Pending,
             "status stays Pending so the scheduler re-queues"
         );
+    }
+
+    #[test]
+    fn test_apply_retry_exhausted_resolution_fail_match_is_trimmed_and_case_insensitive() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-rer-fail-normalized";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        let id = seed_auto_blocker(&conn, &step_id);
+
+        let acted =
+            apply_retry_exhausted_resolution(&conn, project, &id, "  mark step failed  ").unwrap();
+        assert!(acted);
+        assert_eq!(step_status(&conn, &step_id), StepStatus::Failed);
     }
 
     #[test]
@@ -1405,13 +1409,8 @@ mod tests {
         );
     }
 
-    /// Fix #3: a legacy markerless parked-restore blocker (raised by an
-    /// earlier in-session build before the marker existed) is still detected
-    /// via its distinctive body phrase, so it routes through the
-    /// parked-restore resolver instead of being treated as an unwired
-    /// harness blocker.
     #[test]
-    fn test_is_parked_restore_blocker_legacy_markerless_detection() {
+    fn test_is_parked_restore_blocker_requires_marker_prefix() {
         use crate::plan::{Interruption, InterruptionState};
         use chrono::Utc;
 
@@ -1420,10 +1419,7 @@ mod tests {
             step_id: "s".into(),
             attempt: 1,
             kind: InterruptionKind::Blocker,
-            // Legacy Conflicted body (no marker prefix).
-            body: "Applying the parked interruption stash for step 'Foo' conflicted. \
-                   The preserved work is still available at abc123."
-                .into(),
+            body: "Applying the parked interruption stash for step 'Foo' conflicted.".into(),
             options: vec![],
             resolution: None,
             comment: None,
@@ -1432,39 +1428,42 @@ mod tests {
             resolved_at: None,
         };
         assert!(
-            is_parked_restore_blocker(&base),
-            "legacy markerless Conflicted body must match via the legacy phrase"
-        );
-
-        // Legacy NotFound body (no marker prefix).
-        base.body =
-            "Parked worktree stash 'abc123' for step 'Foo' was not found in `git stash list`."
-                .into();
-        assert!(
-            is_parked_restore_blocker(&base),
-            "legacy markerless NotFound body must match via the legacy phrase"
-        );
-
-        // An unrelated harness blocker still does NOT match.
-        base.body = "Need credentials to push to the registry.".into();
-        assert!(
             !is_parked_restore_blocker(&base),
-            "unrelated harness blocker must not be mis-routed"
+            "markerless blocker bodies must not be auto-routed"
         );
 
-        // A Question carrying the legacy phrase is still a Question.
-        base.kind = InterruptionKind::Question;
-        base.body = "Should I keep the parked worktree stash?".into();
-        assert!(
-            !is_parked_restore_blocker(&base),
-            "Question kind never matches even with the legacy phrase"
-        );
+        base.body = format!("{PARKED_RESTORE_BLOCKER_MARKER}\nconflicted");
+        assert!(is_parked_restore_blocker(&base));
     }
 
     /// `--option 1` (MARK_FAILED) flips the step to terminal Failed and
     /// resolves the interruption. Pre-fix this was a no-op (options were
     /// empty, no side effect wired) and the step stayed Pending; the
     /// scheduler then re-fired the same restore error on the next tick.
+    #[test]
+    fn test_parked_restore_blocker_mark_failed_match_is_trimmed_and_case_insensitive() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-pr-fail-normalized";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 2).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_parked_restore_blocker(&conn, &step_id);
+
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &id,
+            None,
+            Some("  skip and mark failed  "),
+            None,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        assert_eq!(step_status_q(&conn, &step_id), StepStatus::Failed);
+    }
+
     #[test]
     fn test_parked_restore_blocker_mark_failed_resolution() {
         let conn = db::open_memory().unwrap();

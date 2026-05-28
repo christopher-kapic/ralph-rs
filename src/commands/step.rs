@@ -412,6 +412,10 @@ pub(crate) fn parse_bulk_steps(raw: &str) -> Result<Vec<ImportedStep>> {
     Ok(vec![single])
 }
 
+fn batch_label_conflicts_with_step_selector(label: &str) -> bool {
+    storage::is_short_id_shaped(label) || label.parse::<usize>().is_ok()
+}
+
 /// Bulk-add steps from a JSON source. `source` is either `-` (stdin) or a
 /// filesystem path. All inserts happen inside a single DB transaction so
 /// the batch is atomic: any failure rolls the whole batch back.
@@ -467,16 +471,17 @@ pub fn step_add_bulk(
             bail!("Step #{} is missing a non-empty `title`", i + 1);
         }
         if let Some(sid) = s.short_id.as_deref() {
-            if !storage::is_short_id_shaped(sid) {
+            if !storage::is_persistable_short_id(sid) {
                 bail!(
                     "Step #{} has an invalid `short_id` '{sid}': a persisted \
-                     short id must be exactly 8 base-62 characters. Omit \
-                     `short_id` to have ralph mint one, and use `id` for a \
-                     readable label to wire `depends_on` within this payload.",
+                     short id must be exactly 8 base-62 characters and not be \
+                     all digits. Omit `short_id` to have ralph mint one, and \
+                     use `id` for a readable label to wire `depends_on` within \
+                     this payload.",
                     i + 1
                 );
             }
-            if resolve_step(conn, &plan.id, Some(sid), None).is_ok() {
+            if storage::plan_has_step_short_id(conn, &plan.id, sid)? {
                 bail!(
                     "`short_id` '{sid}' (step #{}) already exists in plan \
                      '{plan_slug}' — choose a fresh id",
@@ -494,6 +499,14 @@ pub fn step_add_bulk(
         if let Some(rid) = s.id.as_deref() {
             if rid.trim().is_empty() {
                 bail!("Step #{} has an empty `id`", i + 1);
+            }
+            if batch_label_conflicts_with_step_selector(rid) {
+                bail!(
+                    "Step #{} has an invalid `id` '{rid}': batch-local labels \
+                     must not look like step selectors (numbers or 8-character \
+                     short ids). Use a readable label like 'parser_step' instead.",
+                    i + 1
+                );
             }
             if !batch_handles.insert(rid) {
                 bail!(
@@ -534,10 +547,11 @@ pub fn step_add_bulk(
         let mut by_batch_handle: std::collections::HashMap<&str, String> =
             std::collections::HashMap::new();
         for s in &steps {
-            let tags_arg: Option<&[String]> = if s.tags.is_empty() {
+            let normalized_tags = normalize_tag_inputs(&s.tags)?;
+            let tags_arg: Option<&[String]> = if normalized_tags.is_empty() {
                 None
             } else {
-                Some(&s.tags)
+                Some(&normalized_tags)
             };
             let (mut step, pos) = storage::create_step(
                 conn,
@@ -1163,10 +1177,19 @@ pub fn step_dependency_add(
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
     let (step, _) = resolve_step(conn, &plan.id, Some(step_sel), None)?;
+    let resolved_deps: Vec<Step> = depends_on_sels
+        .iter()
+        .map(|dep_sel| resolve_step(conn, &plan.id, Some(dep_sel.as_str()), None).map(|x| x.0))
+        .collect::<Result<_>>()?;
 
-    for dep_sel in depends_on_sels {
-        let (dep, _) = resolve_step(conn, &plan.id, Some(dep_sel.as_str()), None)?;
-        storage::add_step_dependency(conn, &step.id, &dep.id)?;
+    crate::db::with_tx(conn, |conn| {
+        for dep in &resolved_deps {
+            storage::add_step_dependency(conn, &step.id, &dep.id)?;
+        }
+        Ok(())
+    })?;
+
+    for dep in &resolved_deps {
         eprintln!(
             "{} Added dependency: {} -> {}",
             output::check_icon(out.color),
@@ -1195,10 +1218,19 @@ pub fn step_dependency_remove(
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
     let (step, _) = resolve_step(conn, &plan.id, Some(step_sel), None)?;
+    let resolved_deps: Vec<Step> = depends_on_sels
+        .iter()
+        .map(|dep_sel| resolve_step(conn, &plan.id, Some(dep_sel.as_str()), None).map(|x| x.0))
+        .collect::<Result<_>>()?;
 
-    for dep_sel in depends_on_sels {
-        let (dep, _) = resolve_step(conn, &plan.id, Some(dep_sel.as_str()), None)?;
-        storage::remove_step_dependency(conn, &step.id, &dep.id)?;
+    crate::db::with_tx(conn, |conn| {
+        for dep in &resolved_deps {
+            storage::remove_step_dependency(conn, &step.id, &dep.id)?;
+        }
+        Ok(())
+    })?;
+
+    for dep in &resolved_deps {
         eprintln!(
             "{} Removed dependency: {} -> {}",
             output::check_icon(out.color),
@@ -1646,6 +1678,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_step_add_bulk_rejects_invalid_tags() {
+        let (conn, project) = setup_with_plan();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("steps.json");
+        std::fs::write(&path, r#"[{"title":"x","tags":["FIX","  "]}]"#).unwrap();
+
+        let err = step_add_bulk(
+            &conn,
+            "bulk-plan",
+            &project,
+            path.to_str().unwrap(),
+            &test_out(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Bulk step insert failed; rolled back")
+        );
+        assert!(format!("{err:#}").contains("Tag values cannot be empty or whitespace-only"));
     }
 
     #[test]
@@ -2424,6 +2478,65 @@ mod tests {
         let mut expected = vec![a.id.clone(), b.id.clone()];
         expected.sort();
         assert_eq!(deps, expected);
+    }
+
+    #[test]
+    fn test_step_dependency_add_is_atomic_on_mixed_validity_input() {
+        let (conn, project) = setup_with_plan();
+        add_plain(&conn, &project, "a", &[]);
+        add_plain(&conn, &project, "b", &[]);
+
+        let err = step_dependency_add(
+            &conn,
+            "bulk-plan",
+            &project,
+            "2",
+            &["1".to_string(), "99".to_string()],
+            &test_out(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let b = steps.iter().find(|s| s.title == "b").unwrap();
+        assert!(
+            storage::list_step_dependencies(&conn, &b.id)
+                .unwrap()
+                .is_empty(),
+            "no dependency should be persisted on partial failure"
+        );
+    }
+
+    #[test]
+    fn test_step_dependency_remove_is_atomic_on_mixed_validity_input() {
+        let (conn, project) = setup_with_plan();
+        add_plain(&conn, &project, "a", &[]);
+        add_plain(&conn, &project, "b", &["1".to_string()]);
+
+        let err = step_dependency_remove(
+            &conn,
+            "bulk-plan",
+            &project,
+            "2",
+            &["1".to_string(), "99".to_string()],
+            &test_out(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+
+        let plan = storage::get_plan_by_slug(&conn, "bulk-plan", &project)
+            .unwrap()
+            .unwrap();
+        let steps = storage::list_steps(&conn, &plan.id).unwrap();
+        let a = steps.iter().find(|s| s.title == "a").unwrap();
+        let b = steps.iter().find(|s| s.title == "b").unwrap();
+        assert_eq!(
+            storage::list_step_dependencies(&conn, &b.id).unwrap(),
+            vec![a.id.clone()]
+        );
     }
 
     #[test]

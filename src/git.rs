@@ -1914,7 +1914,10 @@ mod tests {
         reset_hard_to_head(&dir).unwrap();
 
         // Tracked file is back to its committed content; no unmerged paths.
-        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "# hello");
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
         let status = git(&dir, &["status", "--porcelain"]).unwrap();
         assert!(
             status.trim().is_empty(),
@@ -1933,7 +1936,10 @@ mod tests {
         reset_hard_to_head(&dir).unwrap();
 
         // The tracked file was reset...
-        assert_eq!(fs::read_to_string(dir.join("README.md")).unwrap(), "# hello");
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "# hello"
+        );
         // ...but the untracked file survives (reset --hard, not clean -fd).
         assert_eq!(
             fs::read_to_string(dir.join("scratch.txt")).unwrap(),
@@ -2026,7 +2032,10 @@ mod tests {
         // file are present after the conflicted apply.
         assert!(dir.join("new.txt").exists());
         let dirty = git(&dir, &["status", "--porcelain"]).unwrap();
-        assert!(has_conflict_marker(&dirty), "expected unmerged paths: {dirty:?}");
+        assert!(
+            has_conflict_marker(&dirty),
+            "expected unmerged paths: {dirty:?}"
+        );
 
         // The cleanup the runner now performs.
         rollback_except(&dir, &pre_apply_untracked).unwrap();

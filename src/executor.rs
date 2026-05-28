@@ -158,7 +158,7 @@ fn build_retry_exhausted_body(
         ),
         FailureReason::InsufficientDiskSpace => format!(
             "Step blocked: insufficient disk space (see attempt detail below). Free up disk \
-             space and resolve with `{RETRY_EXHAUSTED_OPTION_RETRY}` to retry from scratch.\n",
+             space and resolve with `{RETRY_EXHAUSTED_OPTION_RETRY}` to resume with the parked changes.\n",
         ),
         _ => format!("Step failed after {max_attempts} attempts.\n"),
     };
@@ -873,6 +873,13 @@ async fn finalize_skipped(
     )?;
 
     storage::update_step_status(ctx.conn, &ctx.step.id, StepStatus::Skipped)?;
+    let dependent_count = storage::list_step_dependents(ctx.conn, &ctx.step.id)?.len();
+    if dependent_count > 0 && !ctx.json_output {
+        eprintln!(
+            "warning: skipped step {} '{}' has {} dependent step(s); that branch will remain blocked until you reset, remove, or rewire those dependents",
+            ctx.step_num, ctx.step.title, dependent_count
+        );
+    }
     // A skipped step's pending question/blocker is moot — resolve it so the
     // step does not stay derived-`Blocked` and the plan can finalize
     // `Complete` (a skipped step counts as done). Mirrors the resolution
@@ -1089,9 +1096,10 @@ async fn finalize_paused_for_question(
     // back AND the `execution_logs` row this attempt created is **deleted**,
     // exactly like the skip-dialog cancel path (`cancel_skipped_attempt`):
     //
-    //  - Leaving the row would collide on `UNIQUE(step_id, attempt)` when
-    //    the resolved step re-runs at the *same* attempt number (the §3.2
-    //    pipeline loops back to iteration `n`, it does not advance to
+    //  - Leaving the row would preserve a cancelled/pause-only attempt
+    //    that consumed no retry budget and would duplicate the audit trail
+    //    when the resolved step re-runs at the *same* attempt number (the
+    //    §3.2 pipeline loops back to iteration `n`, it does not advance to
     //    `n+1`).
     //  - Leaving the bumped counter would make a later resume think the
     //    budget was consumed.
@@ -1462,7 +1470,7 @@ pub async fn execute_step(
     //
     // Route via [`raise_retry_exhausted_blocker`] (NOT terminal Failed): disk
     // pressure is a recoverable environmental failure — the human frees disk
-    // and resolves with `RETRY_EXHAUSTED_OPTION_RETRY` to retry from scratch.
+    // and resolves with `RETRY_EXHAUSTED_OPTION_RETRY` to resume with parked changes.
     // Going terminal Failed (the pre-fix shape) burned the entire retry budget
     // on a single transient FS hiccup; the blocker preserves it.
     if config.min_free_disk_mb > 0 {
@@ -3630,6 +3638,7 @@ fn resolve_step_num(conn: &Connection, plan: &Plan, step: &Step) -> Result<i32> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HarnessConfig;
 
     // -- Prompt preview rendering ------------------------------------------
 
@@ -3856,6 +3865,7 @@ mod tests {
             .unwrap();
 
         let conn = crate::db::open_memory().unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
         let plan = storage::create_plan(
             &conn,
             "slug",
@@ -3867,10 +3877,6 @@ mod tests {
             &[],
         )
         .unwrap();
-        // Seed the run_locks row that `acquire` would have created. The
-        // abort branch bails before any `write_phase` call, but downstream
-        // observers still expect the row to exist.
-        seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
@@ -4107,7 +4113,6 @@ mod tests {
     /// no crash, hook stderr captured in test_results, using max_retries=0.
     #[tokio::test(flavor = "current_thread")]
     async fn test_commit_failure_terminal_reason() {
-        use crate::config::HarnessConfig;
         use crate::plan::{TerminationReason, TestStatus};
         use tempfile::TempDir;
 
@@ -4150,6 +4155,7 @@ mod tests {
         let harness_path = write_simple_harness(harness_tmp.path(), &dir, true);
 
         let conn = crate::db::open_memory().unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
         let plan = storage::create_plan(
             &conn,
             "slug",
@@ -4161,7 +4167,6 @@ mod tests {
             &[],
         )
         .unwrap();
-        seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
@@ -4256,7 +4261,6 @@ mod tests {
     /// terminate the log with NoChanges + NotRun.
     #[tokio::test(flavor = "current_thread")]
     async fn test_no_changes_reason() {
-        use crate::config::HarnessConfig;
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -4394,7 +4398,6 @@ mod tests {
     /// `harness_stdout` contains content.
     #[tokio::test(flavor = "current_thread")]
     async fn test_large_harness_output_does_not_deadlock() {
-        use crate::config::HarnessConfig;
         use std::time::Duration;
         use tempfile::TempDir;
 
@@ -4506,7 +4509,6 @@ mod tests {
     /// truncation marker.
     #[tokio::test(flavor = "current_thread")]
     async fn test_large_harness_output_truncates_to_cap() {
-        use crate::config::HarnessConfig;
         use crate::io_util::TRUNCATION_MARKER_PREFIX;
         use std::time::Duration;
         use tempfile::TempDir;
@@ -4624,7 +4626,6 @@ mod tests {
     /// the observer subcommands need.
     #[tokio::test(flavor = "current_thread")]
     async fn test_execute_step_writes_phase_transitions() {
-        use crate::config::HarnessConfig;
         use std::time::Duration;
         use tempfile::TempDir;
 
@@ -4756,7 +4757,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn test_abort_kills_harness_process_group() {
-        use crate::config::HarnessConfig;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
@@ -4915,7 +4915,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn test_skip_kills_harness_and_marks_skipped() {
-        use crate::config::HarnessConfig;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
@@ -5104,7 +5103,6 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)]
     async fn test_natural_exit_with_pending_skip_resolves_to_skip_not_abort() {
-        use crate::config::HarnessConfig;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
@@ -5294,7 +5292,6 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)]
     async fn test_non_skip_terminal_clears_pending_skip_state() {
-        use crate::config::HarnessConfig;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
@@ -5419,7 +5416,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn test_fast_completed_attempt_clears_unconsumed_db_skip_request() {
-        use crate::config::HarnessConfig;
         use crate::plan::ChangePolicy;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
@@ -5573,7 +5569,6 @@ mod tests {
         String,
         std::sync::MutexGuard<'static, ()>,
     ) {
-        use crate::config::HarnessConfig;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
@@ -5687,11 +5682,12 @@ mod tests {
         // acquired on (and returned from) the test's own runtime thread —
         // only the skip trigger moves off it, so that invariant is preserved.
         let skip_thread = std::thread::spawn(move || {
-            // Wait for the harness to have ACTUALLY dirtied the worktree, not
-            // merely for it to have written its pid. The pid file alone is a
-            // racy proxy: gating on a genuinely dirty tree ensures the skip
-            // lands with real work present (so `park_relevant` is true and
-            // the discard path's `rolled_back=true` is actually recorded).
+            // Wait for the harness to have ACTUALLY produced the fixture
+            // changes this test asserts on: the tracked README edit and the
+            // new untracked file. A generic "tree is dirty" check is still a
+            // little too weak under heavy parallel load: the skip can race in
+            // after some unrelated write but before the exact discardable
+            // work exists, which makes the `rolled_back=true` assertion flaky.
             // The bound is generous (≈30s of attempts) because the only
             // failure mode worth surfacing is the harness never running at
             // all, which the outer 15s `execute_step` timeout already covers.
@@ -5701,7 +5697,11 @@ mod tests {
                     && fs::read_to_string(&pid_path_clone)
                         .map(|s| !s.trim().is_empty())
                         .unwrap_or(false);
-                if pid_ready && crate::git::has_uncommitted_changes(&dir_clone).unwrap_or(false) {
+                let readme_ready = fs::read_to_string(dir_clone.join("README.md"))
+                    .map(|s| s.contains("harness edit"))
+                    .unwrap_or(false);
+                let agent_ready = dir_clone.join("agent-new.txt").exists();
+                if pid_ready && readme_ready && agent_ready {
                     dirtied = true;
                     break;
                 }
@@ -5709,7 +5709,7 @@ mod tests {
             }
             assert!(
                 dirtied,
-                "harness never dirtied the worktree before skip — test setup race"
+                "harness never produced the expected worktree changes before skip — test setup race"
             );
             // Mark a step in-flight and request the skip exactly like
             // runner::skip_step's in-flight branch. Both calls are synchronous
@@ -5871,7 +5871,87 @@ mod tests {
         );
         assert!(!logs[0].committed);
         assert!(logs[0].commit_hash.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_finalize_skipped_discard_records_rolled_back() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+        init_git_repo(&dir);
+
+        let conn = crate::db::open_memory().unwrap();
+        seed_run_lock_row(&conn, &dir.to_string_lossy());
+        let plan = storage::create_plan(
+            &conn,
+            "slug",
+            &dir.to_string_lossy(),
+            "branch",
+            "desc",
+            Some("skip"),
+            None,
+            &[],
+        )
+        .unwrap();
+        let (step, _) = storage::create_step(
+            &conn,
+            &plan.id,
+            "Step",
+            "desc",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        std::fs::write(dir.join("README.md"), "modified by harness").unwrap();
+        std::fs::write(dir.join("agent-new.txt"), "agent output").unwrap();
+
+        let hook_ctx = HookContext {
+            applicable: vec![],
+            project_dir: dir.clone(),
+            hook_timeout_secs: 30,
+        };
+        let pre: Vec<String> = vec![];
+        let ctx = ExecCtx {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            workdir: &dir,
+            pre_existing_untracked: &pre,
+            hook_ctx: &hook_ctx,
+            step_num: 1,
+            max_attempts: 1,
+            json_output: false,
+        };
+        let exec_log_id = storage::create_execution_log(&conn, &step.id, 1, None, None)
+            .unwrap()
+            .id;
+
+        let result = finalize_skipped(
+            &ctx,
+            exec_log_id,
+            0.1,
+            1,
+            "",
+            "",
+            crate::git::ParkStrategyKind::Discard,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.outcome, StepOutcome::Skipped);
+        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
+        assert_eq!(logs.len(), 1);
         assert!(logs[0].rolled_back, "discard records rolled_back=true");
+        assert!(!logs[0].committed);
+        assert!(logs[0].commit_hash.is_none());
     }
 
     /// STEP 18: the TUI skip dialog's Esc/cancel path. A skip request
@@ -5893,7 +5973,6 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[allow(clippy::await_holding_lock)]
     async fn test_tui_skip_cancel_reenters_same_attempt_no_budget_no_log_row() {
-        use crate::config::HarnessConfig;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
@@ -6212,7 +6291,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn test_graceful_shutdown_kills_sigterm_resistant_descendant() {
-        use crate::config::HarnessConfig;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
@@ -9208,7 +9286,6 @@ mod tests {
     /// Build a minimal Config registering the given harness path under `name`.
     #[cfg(test)]
     fn config_with_harness(name: &str, harness_path: &std::path::Path) -> Config {
-        use crate::config::HarnessConfig;
         let mut config = Config::default();
         config.harnesses.insert(
             name.to_string(),
@@ -10035,7 +10112,6 @@ mod tests {
     /// (Phase B will reroute this to a blocker).
     #[tokio::test(flavor = "current_thread")]
     async fn test_commit_hook_rejection_is_retryable() {
-        use crate::config::HarnessConfig;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
@@ -10420,7 +10496,6 @@ mod tests {
     /// carry the hook stderr diagnostic.
     #[tokio::test(flavor = "current_thread")]
     async fn test_commit_hook_failure_exhaustion_raises_blocker() {
-        use crate::config::HarnessConfig;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use std::process::Command;
@@ -10570,7 +10645,6 @@ mod tests {
     /// step is `Failed` with no interruption.
     #[tokio::test(flavor = "current_thread")]
     async fn test_harness_failure_exhaustion_still_terminal() {
-        use crate::config::HarnessConfig;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
@@ -10926,7 +11000,6 @@ mod tests {
     /// burned" without round-tripping through the DB.
     #[tokio::test(flavor = "current_thread")]
     async fn test_test_fail_exhaustion_fires_retry_exhausted_hook_label() {
-        use crate::config::HarnessConfig;
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;

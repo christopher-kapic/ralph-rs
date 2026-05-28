@@ -2959,10 +2959,21 @@ pub(crate) fn plan_detail_apply_skip(
     match storage::mark_step_skipped(conn, step_id, None) {
         Ok(parked) => {
             runner::discard_parked_worktree_state(Path::new(&app.plan.project), parked)?;
+            let dependent_count = storage::list_step_dependents(conn, step_id)?.len();
             let plan_id = app.plan.id.clone();
             app.refresh_steps(storage::list_steps(conn, &plan_id)?);
             app.toasts
                 .push("Step skipped.", ToastKind::Success, Instant::now());
+            if dependent_count > 0 {
+                app.toasts.push(
+                    format!(
+                        "Skipped step still has {} dependent step(s); that branch will remain blocked until you reset, remove, or rewire them",
+                        dependent_count
+                    ),
+                    ToastKind::Info,
+                    Instant::now(),
+                );
+            }
         }
         Err(e) => {
             app.toasts.push(
