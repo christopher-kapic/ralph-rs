@@ -2262,6 +2262,35 @@ enum RestoreParkedOutcome {
     BlockedAfterFailure,
 }
 
+/// Remove the stash's own untracked files (the paths from `<stash>^3`) after a
+/// conflicted parked-restore has been reset to HEAD.
+///
+/// A `NotFound` error is expected and ignored — the conflicted `git stash
+/// apply` may not have written every file the stash carried. Any OTHER error
+/// (`PermissionDenied`, `IsADirectory`, …) means real stash residue is still
+/// on disk; it is collected and returned as an error so the caller's
+/// `cleanup_error` is populated and the blocker body stays honest (never
+/// claims "reset to a clean state" while leftover stash files remain).
+fn remove_stash_residue_files(workdir: &Path, rel_paths: &[String]) -> Result<()> {
+    let mut residue: Vec<String> = Vec::new();
+    for rel in rel_paths {
+        match std::fs::remove_file(workdir.join(rel)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => residue.push(format!("{rel}: {e}")),
+        }
+    }
+    if residue.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to remove {} stash-owned file(s): {}",
+            residue.len(),
+            residue.join("; ")
+        )
+    }
+}
+
 async fn restore_parked_step_worktree(
     conn: &Connection,
     step: &Step,
@@ -2335,15 +2364,7 @@ async fn restore_parked_step_worktree(
                 git::reset_hard_to_head(&workdir_for_cleanup)?;
                 let stash_untracked =
                     git::list_stash_untracked_files(&workdir_for_cleanup, &stash_sha_for_cleanup)?;
-                for rel in &stash_untracked {
-                    // Ignore per-file errors: the conflicted apply may not have
-                    // written every file the stash carried, so a missing path
-                    // is expected and fine. Removing only these exact paths
-                    // leaves the user's pre-existing untracked files and any
-                    // concurrently-created file untouched.
-                    let _ = std::fs::remove_file(workdir_for_cleanup.join(rel));
-                }
-                Ok(())
+                remove_stash_residue_files(&workdir_for_cleanup, &stash_untracked)
             })
             .await;
             let cleanup_error = match &cleanup_res {
@@ -7087,6 +7108,39 @@ mod tests {
         assert!(
             !failed.contains("reset to a clean state"),
             "failure body must NOT claim the tree was reset clean: {failed}",
+        );
+    }
+
+    #[test]
+    fn test_remove_stash_residue_files_error_handling() {
+        // A real deletion failure must surface (so cleanup_error is populated
+        // and the blocker body stays honest); a NotFound is expected and
+        // ignored; a present file is removed cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Present file → removed, no error.
+        std::fs::write(root.join("present.txt"), b"x").unwrap();
+        // Missing file → NotFound, must be ignored.
+        // Directory at a stash-owned path → remove_file errors (IsADirectory
+        // on Linux); must be reported as residue.
+        std::fs::create_dir(root.join("isadir")).unwrap();
+        std::fs::write(root.join("isadir").join("inner"), b"y").unwrap();
+
+        // Only present.txt + missing.txt → all handled, no residue error.
+        remove_stash_residue_files(root, &["present.txt".into(), "missing.txt".into()]).unwrap();
+        assert!(
+            !root.join("present.txt").exists(),
+            "present file should have been removed",
+        );
+
+        // A path that can't be removed as a file must surface as an error.
+        let err = remove_stash_residue_files(root, &["isadir".into()])
+            .expect_err("a non-removable stash-owned path must error, not be silently ignored");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("isadir") && msg.contains("stash-owned file"),
+            "error must name the offending path: {msg}",
         );
     }
 
