@@ -384,10 +384,14 @@ pub fn rollback_changes(workdir: &Path) -> Result<()> {
 /// working tree to its committed state.
 ///
 /// **Untracked files are left in place** (unlike [`rollback_changes`],
-/// which also runs `git clean -fd`). This is intentional: the parked-restore
-/// blocker path uses it to undo a conflicted `git stash pop` while preserving
-/// the user's pre-existing untracked files that park deliberately carried
-/// forward.
+/// which also runs `git clean -fd`). This is intentional: the
+/// conflicted-parked-restore cleanup uses it to clear tracked-file conflict
+/// markers and unmerged index entries WITHOUT deleting any untracked file —
+/// neither the user's pre-existing untracked files nor any file created
+/// concurrently. The stash's own new untracked files are then removed
+/// surgically by path (via [`list_stash_untracked_files`]), so the cleanup
+/// never has to snapshot-and-diff the untracked set (which risked deleting a
+/// concurrently-created file).
 pub fn reset_hard_to_head(workdir: &Path) -> Result<()> {
     git(workdir, &["reset", "--hard", "HEAD"]).context("git reset --hard HEAD failed")?;
     Ok(())
@@ -491,6 +495,54 @@ fn remove_untracked_except(
         }
     }
     Ok(())
+}
+
+/// List the untracked files captured by a `--include-untracked` stash.
+///
+/// A `git stash push --include-untracked` commit has up to **three** parents:
+/// `^1` = the base commit, `^2` = the stashed index, and `^3` = a tree of the
+/// captured untracked files. Park created the parked stash with
+/// `--include-untracked -- ':!<pre_existing>'`
+/// ([`stash_push_with_untracked_except`]), so `<stash>^3` contains EXACTLY the
+/// harness-created untracked WIP and never the user's pre-existing untracked
+/// files. Listing it gives us the precise set of files a conflicted
+/// `git stash apply` would have written into the working tree on its own,
+/// which the conflicted-restore cleanup can remove without touching anything
+/// the user (or a concurrent tool) created.
+///
+/// Returns `Ok(vec![])` when the stash carried no untracked files. Depending
+/// on the git version this manifests as either a missing `^3` parent (older
+/// git) or a `^3` parent whose tree is empty (git 2.43 still synthesizes the
+/// `^3` parent even with nothing to capture); both collapse to an empty list.
+/// The missing-`^3` case is explicitly **not** an error — we probe with
+/// `git rev-parse --verify --quiet <stash>^3` (which exits non-zero rather
+/// than printing to stderr) before listing.
+///
+/// `format!("{stash_sha}^3")` is passed as a single argv element, so the `^3`
+/// suffix needs no shell escaping.
+pub fn list_stash_untracked_files(workdir: &Path, stash_sha: &str) -> Result<Vec<String>> {
+    let untracked_ref = format!("{stash_sha}^3");
+
+    // Probe for the `^3` parent without bailing: `--verify --quiet` exits
+    // non-zero (and silent) when the revision doesn't resolve, which is the
+    // legitimate "stash captured no untracked files" case on git versions
+    // that omit the parent entirely.
+    let probe = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &untracked_ref])
+        .current_dir(workdir)
+        .output()
+        .with_context(|| format!("failed to execute git rev-parse {untracked_ref}"))?;
+    if !probe.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let out = git(workdir, &["ls-tree", "-r", "--name-only", &untracked_ref])
+        .with_context(|| format!("could not list untracked files in stash {stash_sha}^3"))?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect())
 }
 
 /// Return the full SHA of the current HEAD commit.
@@ -1922,6 +1974,138 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.join("README.md")).unwrap(),
             "version-B\n",
+        );
+    }
+
+    /// BUG #1 (conflicted parked-restore cleanup): a parked stash pushed with
+    /// `--include-untracked` can carry NEW untracked files the harness made.
+    /// When applying it conflicts, the cleanup must (a) clear the unmerged
+    /// tracked-file conflict, (b) remove the stash's new untracked file, and
+    /// (c) preserve the user's pre-existing untracked file. `git reset --hard
+    /// HEAD` clears (a) but leaves the stash's new untracked file behind;
+    /// `rollback_except(workdir, &pre_apply_untracked)` does all three.
+    #[test]
+    fn test_rollback_except_cleans_conflicted_stash_apply_keeps_preexisting() {
+        let (_tmp, dir) = init_repo();
+
+        // Pre-existing user untracked file: must survive the cleanup.
+        fs::write(dir.join("preexisting.txt"), "user pre-existing\n").unwrap();
+        // Snapshot taken BEFORE the apply (the runner captures exactly this):
+        // at this instant the only untracked file is the pre-existing one,
+        // because the stash's new untracked file is still inside the stash.
+        fs::write(dir.join("README.md"), "version-A\n").unwrap();
+        fs::write(dir.join("new.txt"), "harness-created untracked\n").unwrap();
+        // Park: stash everything (incl. the new untracked file) EXCEPT the
+        // pre-existing user file.
+        let stash_ref = stash_push_with_untracked_except(
+            &dir,
+            "ralph: conflict-clean-test",
+            &["preexisting.txt".to_string()],
+        )
+        .unwrap()
+        .expect("expected parked stash");
+        assert!(dir.join("preexisting.txt").exists());
+        assert!(!dir.join("new.txt").exists());
+
+        // The pre-apply snapshot the runner would capture right here.
+        let pre_apply_untracked = get_untracked_files(&dir).unwrap();
+        assert_eq!(pre_apply_untracked, vec!["preexisting.txt".to_string()]);
+
+        // Divergent commit so the stash apply conflicts. Commit only the
+        // tracked README change (`commit -am`) — NOT `git add -A`, which would
+        // sweep the still-untracked `preexisting.txt`/`new.txt` into the
+        // commit and change the fixture from the real runner's situation.
+        fs::write(dir.join("README.md"), "version-B\n").unwrap();
+        git(&dir, &["commit", "-am", "divergent"]).unwrap();
+        let outcome = stash_pop(&dir, &stash_ref).unwrap();
+        assert!(
+            matches!(outcome, StashPopOutcome::Conflicted(_)),
+            "fixture must produce a conflicted apply; got {outcome:?}",
+        );
+        // Sanity: both the tracked conflict and the stash's new untracked
+        // file are present after the conflicted apply.
+        assert!(dir.join("new.txt").exists());
+        let dirty = git(&dir, &["status", "--porcelain"]).unwrap();
+        assert!(has_conflict_marker(&dirty), "expected unmerged paths: {dirty:?}");
+
+        // The cleanup the runner now performs.
+        rollback_except(&dir, &pre_apply_untracked).unwrap();
+
+        let status = git(&dir, &["status", "--porcelain"]).unwrap();
+        // Only the pre-existing untracked file remains; conflict cleared, the
+        // stash's new untracked file removed.
+        assert_eq!(
+            status.trim(),
+            "?? preexisting.txt",
+            "cleanup must leave only the pre-existing untracked file: {status:?}",
+        );
+        assert!(!has_conflict_marker(&status));
+        assert!(
+            !dir.join("new.txt").exists(),
+            "the stash's new untracked file must be removed (BUG #1)",
+        );
+        assert!(
+            dir.join("preexisting.txt").exists(),
+            "the user's pre-existing untracked file must be preserved",
+        );
+        // Tracked content is back to the committed (version-B) state.
+        assert_eq!(
+            fs::read_to_string(dir.join("README.md")).unwrap(),
+            "version-B\n",
+        );
+    }
+
+    /// `list_stash_untracked_files` reads `<stash>^3` and returns EXACTLY the
+    /// untracked files the stash captured — never tracked changes (those live
+    /// in `^1`/`^2`) and never the user's pre-existing untracked files (park
+    /// excludes them via the pathspec).
+    #[test]
+    fn test_list_stash_untracked_files_returns_only_captured_untracked() {
+        let (_tmp, dir) = init_repo();
+
+        // A pre-existing untracked file the user already had: park excludes it,
+        // so it must NOT show up in `^3`.
+        fs::write(dir.join("preexisting.txt"), "user pre-existing\n").unwrap();
+        // A tracked-file modification: lands in `^1`/`^2`, never `^3`.
+        fs::write(dir.join("README.md"), "tracked change\n").unwrap();
+        // A NEW untracked file the harness created: the only thing `^3` should
+        // list.
+        fs::write(dir.join("new.txt"), "harness-created untracked\n").unwrap();
+
+        let stash_ref = stash_push_with_untracked_except(
+            &dir,
+            "ralph: list-untracked-test",
+            &["preexisting.txt".to_string()],
+        )
+        .unwrap()
+        .expect("expected parked stash");
+
+        let untracked = list_stash_untracked_files(&dir, stash_ref.as_str()).unwrap();
+        assert_eq!(
+            untracked,
+            vec!["new.txt".to_string()],
+            "must list only the harness-created untracked file (not the tracked \
+             change, not the user's pre-existing untracked file): {untracked:?}",
+        );
+    }
+
+    /// A stash with NO untracked files must yield an empty list. Depending on
+    /// the git version this is either a missing `^3` parent or a `^3` whose
+    /// tree is empty; both must collapse to `Ok(vec![])` (never an error).
+    #[test]
+    fn test_list_stash_untracked_files_empty_when_no_untracked() {
+        let (_tmp, dir) = init_repo();
+
+        // Only a tracked change, no untracked files at all.
+        fs::write(dir.join("README.md"), "tracked change\n").unwrap();
+        let stash_ref = stash_push_with_untracked(&dir, "ralph: list-untracked-empty-test")
+            .unwrap()
+            .expect("expected parked stash");
+
+        let untracked = list_stash_untracked_files(&dir, stash_ref.as_str()).unwrap();
+        assert!(
+            untracked.is_empty(),
+            "a stash with no untracked files must yield an empty list: {untracked:?}",
         );
     }
 

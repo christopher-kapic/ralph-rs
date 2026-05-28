@@ -2284,53 +2284,86 @@ async fn restore_parked_step_worktree(
         StashPopOutcome::Conflicted(_stderr) => {
             // Cluster 3 Fix #2: per-step blocker, NOT a whole-run bail.
             // Apply ran but conflicted, leaving the working tree with
-            // conflict markers / a partial apply / unmerged index entries.
-            // The executor does NOT clean the tree at step start, so leaving
-            // those markers in place would feed them to a re-run harness and
-            // a Mark-Pending re-run would never start clean — the blocker
-            // would re-fire forever (the loop bug). We hold the run lock and
-            // the impl-semaphore here (this runs in the scheduler before any
-            // `execute_step`, semaphore=1 — see §9), so this is the safe
-            // place to touch the tree: `git reset --hard HEAD` discards the
-            // conflicted apply + unmerged entries while leaving pre-existing
-            // untracked files (preserved during park) in place. The stash
-            // itself stays on the stack (the WIP source of truth) and the
-            // bridge row is kept so the resolver can find + drop it.
+            // conflict markers / a partial apply / unmerged index entries —
+            // and, because the parked stash was pushed with
+            // `--include-untracked`, with any NEW untracked files the stash
+            // carried written into the tree. The executor does NOT clean the
+            // tree at step start, so leaving any of that in place would feed
+            // it to a re-run harness and a Mark-Pending re-run would never
+            // start clean — the blocker would re-fire forever (the loop bug).
+            // We hold the run lock and the impl-semaphore here (this runs in
+            // the scheduler before any `execute_step`, semaphore=1 — see §9),
+            // so this is the safe place to touch the tree.
             //
-            // If the reset itself errors we log and continue to raise the
+            // Cleanup, in two surgical steps that never snapshot-and-diff the
+            // untracked set (the prior approach's data-loss + extra-abort risk):
+            //
+            //   1. `git::reset_hard_to_head(workdir)` clears the unmerged index
+            //      entries and restores tracked files to HEAD content (dropping
+            //      the conflict markers), while leaving ALL untracked files in
+            //      place — so it can never delete anything the user, their
+            //      editor, or a concurrent tool created.
+            //   2. Remove EXACTLY the files the stash itself carried as new
+            //      untracked WIP, read from `<stash>^3` via
+            //      `git::list_stash_untracked_files`. Park excluded the user's
+            //      pre-existing untracked files from the stash, so `^3` lists
+            //      only the harness-created WIP — never the user's files and
+            //      never a concurrently-created file. A plain `git reset --hard`
+            //      alone would leave those stash-introduced untracked files
+            //      behind (the "fresh from scratch" regression we moved off
+            //      plain reset for); removing them by path restores that
+            //      guarantee without the snapshot's collateral damage.
+            //
+            // The stash itself stays on the stack (the WIP source of truth) and
+            // the bridge row is kept so the resolver can find + drop it.
+            //
+            // If the cleanup itself errors we log and continue to raise the
             // blocker anyway — bailing here would resurrect the original
-            // whole-run-abort bug we are fixing.
-            let workdir_for_reset = workdir.to_path_buf();
+            // whole-run-abort bug we are fixing — but the blocker body is made
+            // honest about the failure (BUG #2) so the user isn't told the
+            // tree is clean when it isn't.
+            let workdir_for_cleanup = workdir.to_path_buf();
+            let stash_sha_for_cleanup = parked.stash_sha.clone();
             // `blocking_git` collapses the spawn-join error and the git
             // error into one `Result`; we deliberately do NOT `?` it —
-            // either failure mode should be logged-and-continued so the
+            // any failure mode should be logged-and-continued so the
             // blocker still gets raised (bailing here would resurrect the
-            // whole-run-abort bug this path fixes).
-            let reset_res =
-                blocking_git(move || git::reset_hard_to_head(&workdir_for_reset)).await;
-            if let Err(err) = reset_res
+            // whole-run-abort bug this path fixes). The reset + list + remove
+            // all run inside ONE blocking closure (mirroring how the prior
+            // cleanup was wrapped) and fold into a single combined Result.
+            let cleanup_res = blocking_git(move || {
+                git::reset_hard_to_head(&workdir_for_cleanup)?;
+                let stash_untracked =
+                    git::list_stash_untracked_files(&workdir_for_cleanup, &stash_sha_for_cleanup)?;
+                for rel in &stash_untracked {
+                    // Ignore per-file errors: the conflicted apply may not have
+                    // written every file the stash carried, so a missing path
+                    // is expected and fine. Removing only these exact paths
+                    // leaves the user's pre-existing untracked files and any
+                    // concurrently-created file untouched.
+                    let _ = std::fs::remove_file(workdir_for_cleanup.join(rel));
+                }
+                Ok(())
+            })
+            .await;
+            let cleanup_error = match &cleanup_res {
+                Ok(()) => None,
+                Err(err) => Some(format!("{err:#}")),
+            };
+            if let Some(err) = &cleanup_error
                 && out.format != OutputFormat::Json
             {
                 eprintln!(
-                    "Warning: could not reset the working tree after a conflicted parked-restore \
-                     for step {} '{}': {err:#}. Raising the blocker anyway; the tree may carry \
+                    "Warning: could not clean the working tree after a conflicted parked-restore \
+                     for step {} '{}': {err}. Raising the blocker anyway; the tree may carry \
                      conflict markers until you resolve it manually.",
                     step.short_id, step.title,
                 );
             }
-            let body = format!(
-                "{PARKED_RESTORE_BLOCKER_MARKER}\n\
-                 Could not restore this step's parked work-in-progress: applying stash {sha} \
-                 conflicted with commits made since it was parked. The working tree has been \
-                 reset to a clean state; the parked WIP is preserved in git stash {sha}. \
-                 Resolve with '{fail}' (fence this step off — run `ralph step reset {short_id}` \
-                 later to retry) or '{pending}' (re-run the step from scratch; the parked WIP \
-                 in stash {sha} will be discarded). To salvage the WIP manually, inspect \
-                 `git stash show -p {sha}` before resolving.",
-                sha = stash_ref.as_str(),
-                short_id = step.short_id,
-                fail = PARKED_RESTORE_OPTION_MARK_FAILED,
-                pending = PARKED_RESTORE_OPTION_MARK_PENDING,
+            let body = parked_restore_conflict_body(
+                stash_ref.as_str(),
+                &step.short_id,
+                cleanup_error.as_deref(),
             );
             raise_parked_restore_blocker(conn, step, &body, /*drop_bridge_row=*/ false, out)?;
             Ok(RestoreParkedOutcome::BlockedAfterFailure)
@@ -2390,6 +2423,57 @@ pub const PARKED_RESTORE_OPTION_MARK_FAILED: &str = "Skip and Mark Failed";
 /// already reset clean at raise time, so the re-run starts fresh); on
 /// NotFound the bridge row was already dropped at raise time.
 pub const PARKED_RESTORE_OPTION_MARK_PENDING: &str = "Skip and Mark Pending";
+
+/// Build the blocker body for a *conflicted* parked-restore (BUG #2).
+///
+/// The Conflicted branch tries to clean the working tree before raising the
+/// blocker, but that cleanup is log-and-continue: if the `git` op fails the
+/// tree may still carry conflict markers / leftover stash files. The body
+/// must tell the truth about which case happened so the user does not pick
+/// "Mark Pending" (which drops the preserved stash) while the tree is still
+/// dirty.
+///
+/// Both variants keep the [`PARKED_RESTORE_BLOCKER_MARKER`] prefix so the
+/// resolver (`apply_parked_restore_resolution`) still detects the subkind.
+fn parked_restore_conflict_body(
+    stash_sha: &str,
+    short_id: &str,
+    cleanup_error: Option<&str>,
+) -> String {
+    match cleanup_error {
+        None => format!(
+            "{PARKED_RESTORE_BLOCKER_MARKER}\n\
+             Could not restore this step's parked work-in-progress: applying stash {sha} \
+             conflicted with commits made since it was parked. The working tree has been \
+             reset to a clean state; the parked WIP is preserved in git stash {sha}. \
+             Resolve with '{fail}' (fence this step off — run `ralph step reset {short_id}` \
+             later to retry) or '{pending}' (re-run the step from scratch; the parked WIP \
+             in stash {sha} will be discarded). To salvage the WIP manually, inspect \
+             `git stash show -p {sha}` before resolving.",
+            sha = stash_sha,
+            short_id = short_id,
+            fail = PARKED_RESTORE_OPTION_MARK_FAILED,
+            pending = PARKED_RESTORE_OPTION_MARK_PENDING,
+        ),
+        Some(err) => format!(
+            "{PARKED_RESTORE_BLOCKER_MARKER}\n\
+             Could not restore this step's parked work-in-progress (stash {sha} conflicted \
+             with intervening commits), AND the automatic cleanup of the conflicted working \
+             tree ALSO FAILED ({err}). The working tree may still contain conflict markers \
+             or leftover files. Resolve them manually before resolving this blocker. The \
+             parked WIP is preserved in git stash {sha}. Resolve with '{fail}' (fence this \
+             step off — run `ralph step reset {short_id}` later to retry) or '{pending}' \
+             (note: Mark Pending will re-run the step and DROP stash {sha} — do NOT choose \
+             it until the tree is clean). To salvage the WIP manually, inspect \
+             `git stash show -p {sha}` before resolving.",
+            sha = stash_sha,
+            err = err,
+            short_id = short_id,
+            fail = PARKED_RESTORE_OPTION_MARK_FAILED,
+            pending = PARKED_RESTORE_OPTION_MARK_PENDING,
+        ),
+    }
+}
 
 /// Insert a `kind=Blocker` interruption on `step` for a parked-worktree
 /// restore failure. Optionally drops the bridge row first when the stash
@@ -5802,14 +5886,27 @@ mod tests {
         )
         .unwrap();
 
-        // Build a stash whose pop will conflict with HEAD: write version A
-        // and stash; then COMMIT a divergent version B so the parked stash
-        // can't apply cleanly. This is the exact fixture used by
-        // `test_stash_pop_conflict_leaves_stash_intact` in src/git.rs.
+        // Build a stash whose pop will conflict with HEAD AND carries a NEW
+        // untracked file the harness created (`new.txt`), exactly as park does
+        // (`git stash push --include-untracked`), while a pre-existing
+        // untracked user file (`preexisting.txt`) is excluded so it stays in
+        // the tree. Write version A + the new untracked file, stash everything
+        // except the pre-existing file; then COMMIT a divergent version B so
+        // the parked stash can't apply cleanly.
+        fs::write(dir.join("preexisting.txt"), "user pre-existing\n").unwrap();
         fs::write(dir.join("README.md"), "version-A\n").unwrap();
-        let stash_ref = git::stash_push_with_untracked(&dir, "ralph: conflict-park-test")
-            .unwrap()
-            .expect("expected parked stash");
+        fs::write(dir.join("new.txt"), "harness-created untracked\n").unwrap();
+        let stash_ref = git::stash_push_with_untracked_except(
+            &dir,
+            "ralph: conflict-park-test",
+            &["preexisting.txt".to_string()],
+        )
+        .unwrap()
+        .expect("expected parked stash");
+        // The stash excluded the pre-existing file, so it is still on disk;
+        // the new untracked file went into the stash.
+        assert!(dir.join("preexisting.txt").exists());
+        assert!(!dir.join("new.txt").exists());
         fs::write(dir.join("README.md"), "version-B\n").unwrap();
         std::process::Command::new("git")
             .args(["commit", "-am", "divergent"])
@@ -5818,6 +5915,16 @@ mod tests {
             .unwrap();
 
         storage::set_step_parked_worktree(&conn, &step.id, stash_ref.as_str(), &[]).unwrap();
+
+        // Regression for the snapshot-based-cleanup data-loss bug: simulate a
+        // file created "after the (old) snapshot" — concurrently, by the
+        // user/editor/another tool — in the window before the cleanup runs. It
+        // is NOT in the stash and NOT the pre-existing file, so the old
+        // snapshot-diff cleanup (`rollback_except` with a pre-pop snapshot)
+        // would have treated it as stash residue and DELETED it. The
+        // stash-object cleanup removes only `<stash>^3`'s exact paths, so it
+        // must survive.
+        fs::write(dir.join("concurrent.txt"), "created concurrently\n").unwrap();
 
         let out = OutputContext::from_cli(false, false, false);
         let outcome = restore_parked_step_worktree(&conn, &step, &dir, &out)
@@ -5828,18 +5935,45 @@ mod tests {
             "Conflicted apply must yield BlockedAfterFailure; got {outcome:?}",
         );
 
-        // Fix #1(a): the working tree is reset clean at raise time so a
-        // re-run harness never sees the conflict markers. No uncommitted
-        // changes / unmerged paths; the committed (version-B) content is
-        // restored.
+        // Fix #1(a): the working tree is cleaned at raise time so a re-run
+        // harness never sees the conflict markers. No unmerged paths; the
+        // committed (version-B) content is restored.
+        let porcelain_out = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let porcelain = String::from_utf8(porcelain_out.stdout).unwrap();
+        // BUG #1: the stash's NEW untracked file (`new.txt`) must be gone, and
+        // there must be no unmerged / dirty tracked paths. The residual
+        // untracked entries permitted are the user's pre-existing file AND the
+        // concurrently-created file (which the cleanup must not touch).
+        let mut residual: Vec<&str> = porcelain.lines().map(str::trim).collect();
+        residual.sort_unstable();
+        assert_eq!(
+            residual,
+            vec!["?? concurrent.txt", "?? preexisting.txt"],
+            "Conflicted cleanup must clear the tracked conflict and the stash's \
+             new untracked file, while leaving the user's pre-existing AND any \
+             concurrently-created untracked file in place: {porcelain:?}",
+        );
         assert!(
-            !git::has_uncommitted_changes(&dir).unwrap(),
-            "Conflicted restore must reset the tree clean (no unmerged paths)",
+            !dir.join("new.txt").exists(),
+            "the stash's new untracked file must be removed by the cleanup (BUG #1)",
+        );
+        assert!(
+            dir.join("preexisting.txt").exists(),
+            "the user's pre-existing untracked file must survive the cleanup",
+        );
+        assert!(
+            dir.join("concurrent.txt").exists(),
+            "a concurrently-created untracked file (not in the stash) must \
+             survive the cleanup — the snapshot-diff approach would have deleted it",
         );
         assert_eq!(
             std::fs::read_to_string(dir.join("README.md")).unwrap(),
             "version-B\n",
-            "the reset must restore the committed content, discarding the partial apply",
+            "the cleanup must restore the committed content, discarding the partial apply",
         );
 
         // Bridge row is KEPT so the stash on disk has a pointer the user
@@ -6908,6 +7042,52 @@ mod tests {
         assert_eq!(row.options[0].priority, 1);
         assert_eq!(row.options[1].text, PARKED_RESTORE_OPTION_MARK_PENDING);
         assert_eq!(row.options[1].priority, 2);
+    }
+
+    /// BUG #2: the conflicted-restore blocker body must be honest about
+    /// whether the automatic cleanup succeeded. The Conflicted branch's
+    /// cleanup is log-and-continue; if the `git` op fails the tree may still
+    /// carry conflict markers, so a "reset to a clean state" claim would be a
+    /// lie that could lead the user to Mark-Pending (dropping the stash) over
+    /// a dirty tree. `parked_restore_conflict_body` has two branches keyed on
+    /// `cleanup_error`.
+    #[test]
+    fn test_parked_restore_conflict_body_honest_on_cleanup_outcome() {
+        let sha = "deadbeef";
+        let short_id = "ab12cd34";
+
+        // Success: claims the tree was reset clean; keeps the marker.
+        let ok = parked_restore_conflict_body(sha, short_id, None);
+        assert!(ok.starts_with(PARKED_RESTORE_BLOCKER_MARKER));
+        assert!(
+            ok.contains("reset to a clean state"),
+            "success body should state the tree is clean: {ok}",
+        );
+        assert!(
+            !ok.contains("ALSO FAILED") && !ok.contains("may still contain conflict markers"),
+            "success body must not warn of a failed cleanup: {ok}",
+        );
+
+        // Failure: must warn the tree may still be dirty, surface the error,
+        // and keep the marker — never claim the tree is clean.
+        let failed = parked_restore_conflict_body(sha, short_id, Some("git reset failed: boom"));
+        assert!(failed.starts_with(PARKED_RESTORE_BLOCKER_MARKER));
+        assert!(
+            failed.contains("ALSO FAILED"),
+            "failure body must say the cleanup ALSO FAILED: {failed}",
+        );
+        assert!(
+            failed.contains("git reset failed: boom"),
+            "failure body must surface the cleanup error: {failed}",
+        );
+        assert!(
+            failed.contains("may still contain conflict markers"),
+            "failure body must warn the tree may still be dirty: {failed}",
+        );
+        assert!(
+            !failed.contains("reset to a clean state"),
+            "failure body must NOT claim the tree was reset clean: {failed}",
+        );
     }
 
     // -- topological scheduler (docs/dag-redesign.md §3.5) --
