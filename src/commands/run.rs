@@ -3641,13 +3641,7 @@ pub(crate) fn plan_detail_apply_palette_action(
                         .iter()
                         .position(|r| r.step_id == step_id);
                     if let Some(p) = pos {
-                        while app.outline.cursor() != p {
-                            if app.outline.cursor() < p {
-                                app.outline.navigate_down();
-                            } else {
-                                app.outline.navigate_up();
-                            }
-                        }
+                        app.outline.set_cursor(p);
                         app.outline.focus_cursor();
                         app.realign_selection_to_outline();
                     }

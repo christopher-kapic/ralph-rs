@@ -338,7 +338,10 @@ fn validate_dag_aware_steps(steps: &[ImportedStep]) -> Result<()> {
             if !seen.contains(dep.as_str()) {
                 return Err(anyhow!(
                     "DAG-aware import: step '{sid}' depends on '{dep}', \
-                     which is not a short_id present in the bundle (dangling edge)"
+                     which is not a short_id present in the bundle (dangling edge); \
+                     note that full-bundle `ralph import` wires `depends_on` by `short_id`, \
+                     not by a batch-local `id` (the batch-local `id` wiring label is only \
+                     accepted by `ralph step add --import-json`)"
                 ));
             }
         }

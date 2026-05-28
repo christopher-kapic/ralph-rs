@@ -5,7 +5,7 @@
 // harness-side context plumbing required. See TUI-plan.md §17 for the full
 // design.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 
 use crate::output::{self, OutputContext, OutputFormat};
@@ -87,15 +87,32 @@ fn resolve_bound_step(
 /// past the last supplied priority defaults to its 1-based append order
 /// (so no `--priority` at all yields 1,2,3,… in listed order — the same
 /// rule the V26 cutover used).
-fn build_options(suggestions: &[String], priorities: &[i32]) -> Vec<InterruptionOption> {
-    suggestions
+///
+/// Validates the inputs rather than silently dropping malformed ones:
+///   - more `--priority` values than suggestions is an error (the excess
+///     priorities would otherwise be silently discarded, masking a typo);
+///   - any priority < 1 is rejected (priorities are 1-based ranks).
+fn build_options(suggestions: &[String], priorities: &[i32]) -> Result<Vec<InterruptionOption>> {
+    if priorities.len() > suggestions.len() {
+        bail!(
+            "too many --priority values: {} priorities for {} suggestion(s). Each --priority binds to one --suggest by position.",
+            priorities.len(),
+            suggestions.len()
+        );
+    }
+    for &p in priorities {
+        if p < 1 {
+            bail!("invalid --priority {p}: priorities must be >= 1 (1 is highest rank)");
+        }
+    }
+    Ok(suggestions
         .iter()
         .enumerate()
         .map(|(i, text)| InterruptionOption {
             text: text.clone(),
             priority: priorities.get(i).copied().unwrap_or((i as i32) + 1),
         })
-        .collect()
+        .collect())
 }
 
 /// Shared body of `record_question_ask` / `record_block` — gates via
@@ -117,6 +134,14 @@ fn record_interruption(
     options: &[InterruptionOption],
     out: &OutputContext,
 ) -> Result<QuestionAskOutcome> {
+    // Reject an empty/whitespace-only body for both questions and blockers
+    // (mirrors the bulk-step title guard in commands::step). An empty
+    // interruption is unactionable by a human and was previously accepted
+    // silently — including via empty stdin.
+    if body.trim().is_empty() {
+        bail!("{} text must not be empty", kind.as_str());
+    }
+
     let bound = match resolve_bound_step(conn, project)? {
         Ok(b) => b,
         Err(outcome) => return Ok(outcome),
@@ -160,7 +185,7 @@ pub fn record_question_ask(
     priorities: &[i32],
     out: &OutputContext,
 ) -> Result<QuestionAskOutcome> {
-    let options = build_options(suggestions, priorities);
+    let options = build_options(suggestions, priorities)?;
     record_interruption(
         conn,
         project,
@@ -559,5 +584,143 @@ mod tests {
         let rows = storage::list_interruptions_for_step(&conn, &step_id).unwrap();
         let b = rows.iter().find(|i| i.id == bid).unwrap();
         assert_eq!(b.kind, InterruptionKind::Blocker);
+    }
+
+    // -----------------------------------------------------------------
+    // `build_options` input validation (recently added): reject malformed
+    // --priority / --suggest pairings rather than silently dropping them.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_options_errors_when_more_priorities_than_suggestions() {
+        let suggestions = vec!["only".to_string()];
+        let err = build_options(&suggestions, &[1, 2]).expect_err("must reject excess priorities");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("priority"),
+            "error should mention --priority, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_options_errors_on_zero_priority() {
+        let suggestions = vec!["a".to_string()];
+        let err = build_options(&suggestions, &[0]).expect_err("priority 0 must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("priority") && msg.contains(">= 1"),
+            "error should mention priorities must be >= 1, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_options_errors_on_negative_priority() {
+        let suggestions = vec!["a".to_string(), "b".to_string()];
+        let err = build_options(&suggestions, &[1, -3]).expect_err("negative priority must be rejected");
+        assert!(
+            err.to_string().contains("priority"),
+            "error should mention priority"
+        );
+    }
+
+    #[test]
+    fn build_options_ok_when_counts_match_with_valid_priorities() {
+        let suggestions = vec!["a".to_string(), "b".to_string()];
+        let opts = build_options(&suggestions, &[2, 1]).expect("equal counts, valid priorities");
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0].text, "a");
+        assert_eq!(opts[0].priority, 2);
+        assert_eq!(opts[1].text, "b");
+        assert_eq!(opts[1].priority, 1);
+    }
+
+    #[test]
+    fn build_options_ok_when_fewer_priorities_than_suggestions() {
+        // The valid "partial priorities" case: supplied priorities bind by
+        // position, the rest default to 1-based append order.
+        let suggestions = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let opts = build_options(&suggestions, &[5]).expect("fewer priorities is valid");
+        assert_eq!(opts.len(), 3);
+        assert_eq!(opts[0].priority, 5);
+        assert_eq!(opts[1].priority, 2, "defaults to index+1");
+        assert_eq!(opts[2].priority, 3, "defaults to index+1");
+    }
+
+    // -----------------------------------------------------------------
+    // `record_interruption` empty-body guard (recently added): an empty /
+    // whitespace-only body is rejected for BOTH question and block paths,
+    // and no row is persisted.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn question_ask_rejects_empty_body() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-empty-q";
+        let (plan_id, step_id) = seed_plan_and_step(&conn, "p-empty-q", project);
+        seed_run_lock(&conn, project, &plan_id, "p-empty-q", &step_id, 1);
+
+        let err = record_question_ask(&conn, project, "", &[], &[], &quiet_out())
+            .expect_err("empty question body must be rejected");
+        assert!(
+            err.to_string().contains("empty"),
+            "error should mention empty, got: {err}"
+        );
+        assert_eq!(
+            open_count(&conn),
+            0,
+            "no interruption row may be written on empty body"
+        );
+    }
+
+    #[test]
+    fn question_ask_rejects_whitespace_only_body() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-ws-q";
+        let (plan_id, step_id) = seed_plan_and_step(&conn, "p-ws-q", project);
+        seed_run_lock(&conn, project, &plan_id, "p-ws-q", &step_id, 1);
+
+        let err = record_question_ask(&conn, project, "   ", &[], &[], &quiet_out())
+            .expect_err("whitespace-only question body must be rejected");
+        assert!(err.to_string().contains("empty"));
+        assert_eq!(open_count(&conn), 0);
+    }
+
+    #[test]
+    fn block_rejects_empty_body() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-empty-b";
+        let (plan_id, step_id) = seed_plan_and_step(&conn, "p-empty-b", project);
+        seed_run_lock(&conn, project, &plan_id, "p-empty-b", &step_id, 1);
+
+        let err = record_block(&conn, project, "", &quiet_out())
+            .expect_err("empty block body must be rejected");
+        assert!(err.to_string().contains("empty"));
+        assert_eq!(open_count(&conn), 0);
+    }
+
+    #[test]
+    fn block_rejects_whitespace_only_body() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-ws-b";
+        let (plan_id, step_id) = seed_plan_and_step(&conn, "p-ws-b", project);
+        seed_run_lock(&conn, project, &plan_id, "p-ws-b", &step_id, 1);
+
+        let err = record_block(&conn, project, "\t \n ", &quiet_out())
+            .expect_err("whitespace-only block body must be rejected");
+        assert!(err.to_string().contains("empty"));
+        assert_eq!(open_count(&conn), 0);
+    }
+
+    #[test]
+    fn non_empty_body_is_accepted() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-nonempty";
+        let (plan_id, step_id) = seed_plan_and_step(&conn, "p-nonempty", project);
+        seed_run_lock(&conn, project, &plan_id, "p-nonempty", &step_id, 1);
+
+        let outcome = record_question_ask(&conn, project, "real question?", &[], &[], &quiet_out())
+            .expect("non-empty body must be accepted");
+        assert!(matches!(outcome, QuestionAskOutcome::Recorded { .. }));
+        assert_eq!(open_count(&conn), 1);
     }
 }

@@ -1238,6 +1238,10 @@ fn migrate_v31(conn: &Connection) -> Result<()> {
     // false → the FK check still rejects it). Keeping `IS NOT` (vs. `=`/`!=`)
     // is what makes the both-missing case fall through to the FK instead of
     // silently passing the trigger.
+    //
+    // This same-plan invariant is encoded twice: here (the DB-boundary
+    // triggers) and in `storage::add_step_dependency` (the in-process
+    // defense-in-depth check). If the invariant ever changes, update both.
     conn.execute_batch(
         "
         DELETE FROM step_dependencies
@@ -1439,6 +1443,14 @@ fn migrate_v36(conn: &Connection) -> Result<()> {
     // generated-column dependency (the V16 indexes are on `step_questions`,
     // a separate table dropped in V26), so a direct `DROP COLUMN` is safe on
     // the bundled modern SQLite and avoids a full table rebuild.
+    //
+    // `ALTER TABLE ... DROP COLUMN` requires SQLite >= 3.35.0. We rely on the
+    // `rusqlite` `bundled` feature in Cargo.toml (currently rusqlite 0.39,
+    // which bundles SQLite 3.50.x) to guarantee that floor at compile time, so
+    // there is no runtime version guard here. Unlike V32's portable
+    // table-rebuild recipe this takes the direct path *because* the bundled
+    // floor is assured; if `bundled` is ever dropped, this migration (and the
+    // direct DROP COLUMNs in V21/V22) would need a version guard or rebuild.
     conn.execute_batch("ALTER TABLE plans DROP COLUMN questions_enabled;")?;
     Ok(())
 }

@@ -52,48 +52,58 @@ pub fn plan_create(
         resolved_deps.push((dep_slug.clone(), dep.id));
     }
 
-    let plan = storage::create_plan(
-        conn,
-        slug,
-        project,
-        branch_name,
-        desc,
-        harness,
-        agent,
-        tests,
-    )?;
+    // Create the plan and apply every config setter + dependency wiring
+    // atomically (mirrors `step_add` / `step_add_bulk`). If any setter or a
+    // late dependency error fails, the whole transaction rolls back so no
+    // partially-configured plan row is left persisted. All storage functions
+    // below take the tx connection directly and open no nested transaction of
+    // their own, so this is safe.
+    let plan = crate::db::with_tx(conn, |conn| {
+        let plan = storage::create_plan(
+            conn,
+            slug,
+            project,
+            branch_name,
+            desc,
+            harness,
+            agent,
+            tests,
+        )?;
 
-    // Persist a plan-level retry-strategy override when the user supplied
-    // one. `None` is the column default (no override) so we skip the write
-    // entirely in that case, mirroring how `plan_harness` is only set when
-    // present.
-    if let Some(rs) = retry_strategy {
-        storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
-    }
+        // Persist a plan-level retry-strategy override when the user supplied
+        // one. `None` is the column default (no override) so we skip the write
+        // entirely in that case, mirroring how `plan_harness` is only set when
+        // present.
+        if let Some(rs) = retry_strategy {
+            storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
+        }
 
-    // Persist the `--squash-on-complete` toggle only when the user opted in.
-    // Default OFF (the column default NULL → `false`) is identical to the
-    // step 32/33 keep-every-iteration-commit behavior, so we skip the write
-    // entirely in that case (mirrors the `retry_strategy` handling above).
-    if squash_on_complete {
-        storage::set_plan_squash_on_complete(conn, &plan.id, true)?;
-    }
+        // Persist the `--squash-on-complete` toggle only when the user opted in.
+        // Default OFF (the column default NULL → `false`) is identical to the
+        // step 32/33 keep-every-iteration-commit behavior, so we skip the write
+        // entirely in that case (mirrors the `retry_strategy` handling above).
+        if squash_on_complete {
+            storage::set_plan_squash_on_complete(conn, &plan.id, true)?;
+        }
 
-    // Persist the per-plan review recursion cap only when explicitly given.
-    // `None` is the column default (NULL → built-in
-    // `review::DEFAULT_MAX_REVIEW_CORRECTIONS`), so skipping the write keeps
-    // the common case identical (mirrors `retry_strategy` / `squash` above).
-    if let Some(cap) = max_review_corrections {
-        storage::set_plan_max_review_corrections(conn, &plan.id, Some(cap))?;
-    }
+        // Persist the per-plan review recursion cap only when explicitly given.
+        // `None` is the column default (NULL → built-in
+        // `review::DEFAULT_MAX_REVIEW_CORRECTIONS`), so skipping the write keeps
+        // the common case identical (mirrors `retry_strategy` / `squash` above).
+        if let Some(cap) = max_review_corrections {
+            storage::set_plan_max_review_corrections(conn, &plan.id, Some(cap))?;
+        }
 
-    // Attach each resolved dependency. Self-references and cycles are
-    // rejected by the storage layer (the new plan has no deps yet, so a
-    // cycle is impossible, but self-reference is guarded anyway).
-    for (dep_slug, dep_id) in &resolved_deps {
-        storage::add_plan_dependency(conn, &plan.id, dep_id)
-            .with_context(|| format!("Failed to add dependency on '{dep_slug}'"))?;
-    }
+        // Attach each resolved dependency. Self-references and cycles are
+        // rejected by the storage layer (the new plan has no deps yet, so a
+        // cycle is impossible, but self-reference is guarded anyway).
+        for (dep_slug, dep_id) in &resolved_deps {
+            storage::add_plan_dependency(conn, &plan.id, dep_id)
+                .with_context(|| format!("Failed to add dependency on '{dep_slug}'"))?;
+        }
+
+        Ok(plan)
+    })?;
 
     eprintln!(
         "{} Created plan: {}",
@@ -471,6 +481,15 @@ pub fn plan_delete(
 /// over the global `config.review.enabled` and is itself overridden by a
 /// per-step `--review` (precedence step > plan > config > false, resolved
 /// by [`crate::config::effective_review_enabled`]).
+///
+/// Intentional asymmetry with `ralph step edit --review on|off|inherit`:
+/// the plan-level command only takes `on`/`off` (`OnOffState`), so there is
+/// no value that clears the override back to NULL (inherit-from-global). This
+/// is deliberate — the documented surface is `ralph plan review <on|off>`,
+/// and adding an `inherit` arm would mean a new tri-state value enum + a
+/// `bool` → `Option<bool>` signature change here, expanding the CLI surface.
+/// The underlying `set_plan_review_enabled` already accepts `None`, so a
+/// future `inherit` is a small follow-up if the asymmetry proves annoying.
 pub fn cmd_plan_review(
     conn: &Connection,
     plan_slug: &str,
@@ -906,5 +925,76 @@ mod tests {
             .unwrap()
             .expect("plan row must exist");
         assert_eq!(plan.branch_name, "feat/ok");
+    }
+
+    // ----------------------------------------------------------------------
+    // Transactional `plan_create`: a failure raised *after* the plan row is
+    // inserted (inside the `db::with_tx` block) must roll the whole thing
+    // back so no partially-configured plan row survives.
+    //
+    // The injectable late failure used here: passing the *same* dependency
+    // slug twice. `plan_create` resolves each dep slug independently (no
+    // dedup), so both copies clear the pre-tx existence check. Inside the
+    // tx, `create_plan` inserts the plan row and the first
+    // `add_plan_dependency` succeeds; the second INSERT then violates
+    // `plan_dependencies`'s `PRIMARY KEY (plan_id, depends_on_plan_id)`. That
+    // error propagates out of the `with_tx` closure, the transaction is
+    // dropped without commit, and the plan row must NOT persist.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_plan_create_rolls_back_plan_row_on_late_dependency_failure() {
+        let conn = crate::db::open_memory().expect("open_memory");
+        let project = "/tmp/pc-rollback";
+
+        // A pre-existing dependency plan that the new plan will depend on.
+        storage::create_plan(&conn, "dep-a", project, "dep-a", "dep", None, None, &[]).unwrap();
+
+        // Trigger a late failure by listing the same dependency twice: the
+        // second `add_plan_dependency` INSERT hits the PRIMARY KEY constraint
+        // *after* the plan row has already been inserted in the same tx.
+        let err = plan_create(
+            &conn,
+            "rolled-back",
+            project,
+            Some("desc"),
+            Some("feat/rb"),
+            None,
+            None,
+            None,
+            false,
+            None,
+            &[],
+            &["dep-a".to_string(), "dep-a".to_string()],
+            &quiet_out(),
+        )
+        .expect_err("a duplicate dependency must fail inside the transaction");
+        // The failure must come from the dependency-wiring step, not the
+        // pre-tx validation (which would not exercise the rollback path).
+        assert!(
+            err.to_string().contains("Failed to add dependency on 'dep-a'"),
+            "failure must originate from the in-tx dependency wiring: {err}"
+        );
+
+        // Full rollback: the plan row inserted earlier in the same tx must
+        // NOT have persisted.
+        assert!(
+            storage::get_plan_by_slug(&conn, "rolled-back", project)
+                .unwrap()
+                .is_none(),
+            "the plan row must be rolled back when a later in-tx step fails"
+        );
+
+        // And only the original dependency plan remains.
+        let slugs: Vec<String> = storage::list_plans(&conn, project, true)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.slug)
+            .collect();
+        assert_eq!(
+            slugs,
+            vec!["dep-a".to_string()],
+            "no partial plan should leak: {slugs:?}"
+        );
     }
 }

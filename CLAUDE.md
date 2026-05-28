@@ -298,18 +298,22 @@ view bindings don't fire under the overlay.
   (commit-hook stderr is treated as a test failure), the executor
   **automatically raises a `kind=Blocker` interruption** instead of going
   terminal. The blocker carries two ranked options — priority 1 = `"Retry
-  the step from scratch"`, priority 2 = `"Mark step Failed"` — and a body
+  step with parked changes"`, priority 2 = `"Mark step Failed"` — and a body
   of `"Step failed after N attempts."` plus the last attempt's test
   output (and hook stderr when applicable). The step's stored status
   stays `Pending` with `attempts == max_attempts`; the derived `Blocked`
   overlay shadows it while the blocker is open. The scheduler moves to
   another runnable branch (consumes no further retry budget). Resolution
   (TUI inbox or `ralph interruption resolve`):
-  `RETRY_EXHAUSTED_OPTION_RETRY` → reset `attempts = 0`, status
-  `Pending`, scheduler re-picks; `RETRY_EXHAUSTED_OPTION_FAIL` → status
-  `Failed` terminal; a freeform answer matching neither is treated as
-  retry-with-hint (the hint flows into the next prompt via the bounded
-  "Resolved interruptions" section). Other failure modes —
+  `RETRY_EXHAUSTED_OPTION_RETRY` → reset `attempts = 0` and status
+  `Pending` **while preserving the parked dirty WIP tree** (the failed
+  attempts' on-disk changes are kept, restored from the parked stash on
+  the next pick — this is *retry-with-parked-changes*, not a fresh start),
+  scheduler re-picks; `RETRY_EXHAUSTED_OPTION_FAIL` → status `Failed`
+  terminal (any surviving parked worktree state is discarded); a freeform
+  answer matching neither is treated as retry-with-hint (attempts reset,
+  parked changes preserved; the hint flows into the next prompt via the
+  bounded "Resolved interruptions" section). Other failure modes —
   `HarnessFailed`, `Timeout`, `NoChanges` — remain terminal `Failed`.
   Recognition contract lives in
   `commands::interruption::apply_retry_exhausted_resolution`; the option
@@ -392,7 +396,7 @@ view bindings don't fire under the overlay.
   re-checks in-process to surface precise errors (`Step not found` vs.
   cross-plan) on the common path — deliberate defense-in-depth that must
   stay in sync with the triggers.
-- **Schema/version:** migrations run through **V34** (V32 drops the old `UNIQUE(step_id, attempt)` execution-log constraint, V33 adds per-step cycle indices for retry-from-scratch audit grouping, and V34 adds durable `step_parked_worktrees` stash state); `Cargo.toml` is **0.1.20**.
+- **Schema/version:** migrations run through **V34** (V32 drops the old `UNIQUE(step_id, attempt)` execution-log constraint, V33 adds per-step cycle indices for retry-cycle audit grouping (the parked-changes retry resets `attempts` to start a new cycle), and V34 adds durable `step_parked_worktrees` stash state); `Cargo.toml` is **0.1.20**.
 
 ## Prompt model
 

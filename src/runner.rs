@@ -874,6 +874,25 @@ async fn run_plan_inner(
                         step_num, total_now, current_step.title
                     );
                 }
+                // Mirror the top-of-loop abort handler: best-effort drain of
+                // any review verdicts that already completed before this abort
+                // latched, then `shutdown()` the still-in-flight ones. Without
+                // this, a review whose subprocess finished but whose verdict
+                // hasn't been drained would be silently dropped (no
+                // `update_step_review_status` write, no git-note annotation, no
+                // V29 corrective-step request row), leaving the reviewed step
+                // `review_status=InFlight`. This arm fires when the executor
+                // observes the abort *inside* a step, so it can leave undrained
+                // reviews just like the between-steps check does.
+                drain_reviews_on_abort(
+                    conn,
+                    &effective_plan,
+                    &mut reviews,
+                    workdir,
+                    out,
+                    &mut abort_rx,
+                )
+                .await;
                 storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
                 result.final_status = PlanStatus::Aborted;
                 result.step_results.push(step_result);
@@ -8363,12 +8382,33 @@ mod tests {
             .or_else(|| after[sig.len()..].find("\nfn "))
             .expect("expected a sibling item after run_plan_inner");
         let body = &after[..sig.len() + end_rel];
+        // The top-of-loop between-steps abort check.
         assert!(
             body.contains("drain_reviews_on_abort("),
             "the Aborted branch in run_plan_inner must call \
              drain_reviews_on_abort before returning so finished review \
              verdicts aren't silently discarded and still-in-flight \
              reviewers are aborted (kill_on_drop fires on the child)"
+        );
+        // Tighten: the in-loop `StepOutcome::Aborted =>` arm (fired when the
+        // executor observes the abort *inside* a step) must ALSO drain. Scope
+        // the search to that arm specifically (from its match marker up to the
+        // next `StepOutcome::Skipped =>` arm) so a drain that only lives in the
+        // between-steps check doesn't satisfy this assertion.
+        let arm_start = body
+            .find("StepOutcome::Aborted => {")
+            .expect("the in-loop StepOutcome::Aborted arm must exist");
+        let arm = &body[arm_start..];
+        let arm_end = arm
+            .find("StepOutcome::Skipped => {")
+            .expect("expected a StepOutcome::Skipped arm after the Aborted arm");
+        let aborted_arm = &arm[..arm_end];
+        assert!(
+            aborted_arm.contains("drain_reviews_on_abort("),
+            "the in-loop StepOutcome::Aborted arm must call \
+             drain_reviews_on_abort before returning so finished review \
+             verdicts aren't silently discarded when the executor aborts \
+             mid-step"
         );
     }
 
@@ -8390,6 +8430,123 @@ mod tests {
             "drain_finished_reviews(block=true) must race join_next against \
              abort_rx.changed() — otherwise Ctrl+C is silently ignored \
              until the reviewer naturally returns"
+        );
+    }
+
+    /// BEHAVIORAL coverage for the abort-path review drain (closes the
+    /// "source-shape only" gap left by
+    /// `test_abort_branch_drains_reviews_before_returning`).
+    ///
+    /// We don't drive a full Ctrl+C through `run_plan_inner` with live
+    /// review subprocesses (that needs a multi-thread runtime, real review
+    /// harnesses, and exec timing — inherently flaky). Instead we exercise
+    /// `drain_reviews_on_abort` directly with a `reviews` JoinSet seeded so
+    /// that:
+    ///   - one task is ALREADY FINISHED with a `Pass` verdict ready to
+    ///     drain (just an async block returning a `SpawnedReview` — no real
+    ///     subprocess), and
+    ///   - one task is STILL IN FLIGHT (parks forever).
+    ///
+    /// The abort drain must (a) apply the finished verdict to the DB
+    /// (`review_status` InFlight → Passed, status InProgress → Complete via
+    /// `finalize_review`) rather than silently lose it, and (b) shut down
+    /// the in-flight task without hanging, leaving the JoinSet empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_drain_reviews_on_abort_applies_finished_verdict_and_aborts_inflight() {
+        use crate::review::{ReviewTaskResult, ReviewVerdict, SpawnedReview};
+        use std::time::Duration;
+
+        let conn = setup();
+        let plan = storage::create_plan(&conn, "abrt", "/tmp/proj", "b", "d", None, None, &[])
+            .unwrap();
+        // The reviewed step is mid-review: InProgress + review_status =
+        // InFlight, exactly the state the runner leaves it in after spawning
+        // a detached review (see run_plan_inner around line 742).
+        let (step, _) = storage::create_step(
+            &conn, &plan.id, "Reviewed", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        storage::update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();
+        storage::update_step_review_status(&conn, &step.id, crate::plan::ReviewStatus::InFlight)
+            .unwrap();
+
+        let out = OutputContext {
+            format: OutputFormat::Plain,
+            quiet: true,
+            color: false,
+        };
+        let (_abort_tx, mut abort_rx) = watch::channel::<CancelState>(None);
+        let workdir = std::path::PathBuf::from("/tmp/proj");
+
+        let mut reviews: tokio::task::JoinSet<SpawnedReview> = tokio::task::JoinSet::new();
+
+        // (1) A FINISHED review: a Pass verdict ready to drain. No real
+        // subprocess — just an async block that returns the struct the
+        // spawnable reviewer would have produced.
+        let finished_step_id = step.id.clone();
+        reviews.spawn(async move {
+            SpawnedReview {
+                step_id: finished_step_id.clone(),
+                iteration: 1,
+                result: Ok(ReviewTaskResult {
+                    step_id: finished_step_id,
+                    step_num: 1,
+                    // `/tmp/proj` isn't a git repo, so the best-effort
+                    // git-note annotation just warns; the DB verdict (the
+                    // source of truth) still lands.
+                    commit_sha: "deadbeef".to_string(),
+                    iteration: 1,
+                    short_sha: "deadbee".to_string(),
+                    verdict: ReviewVerdict::Pass,
+                    verdict_body: Some("looks good".to_string()),
+                }),
+            }
+        });
+
+        // (2) A STILL-IN-FLIGHT review that would never return on its own.
+        // The abort drain must shut it down rather than block forever.
+        reviews.spawn(async move {
+            // Park effectively forever; only JoinSet::shutdown should end it.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            unreachable!("the in-flight review must be aborted by shutdown, not run to completion");
+        });
+
+        // Make sure the finished task has actually completed before we drain,
+        // so the non-blocking pass reaps it deterministically (not racing the
+        // scheduler). Yielding repeatedly lets the spawned async block run.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+
+        // The behavior under test: must not hang, and must drain the finished
+        // verdict. Wrap in a timeout so a regression that reintroduces a
+        // blocking wait surfaces as a test failure rather than a hung suite.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            drain_reviews_on_abort(&conn, &plan, &mut reviews, &workdir, &out, &mut abort_rx),
+        )
+        .await
+        .expect("drain_reviews_on_abort must not hang on a still-in-flight reviewer");
+
+        // The finished Pass verdict was applied: InFlight → Passed and the
+        // reviewed step promoted InProgress → Complete (finalize_review).
+        let refreshed = storage::get_step_by_id(&conn, &step.id).unwrap().unwrap();
+        assert_eq!(
+            refreshed.review_status,
+            Some(crate::plan::ReviewStatus::Passed),
+            "the finished review verdict must be drained to the DB on abort, not lost"
+        );
+        assert_eq!(
+            refreshed.status,
+            StepStatus::Complete,
+            "a passed review must promote the reviewed step to Complete even on abort"
+        );
+
+        // The in-flight reviewer was aborted and the set fully drained.
+        assert!(
+            reviews.is_empty(),
+            "drain_reviews_on_abort must shut down the still-in-flight reviewer, \
+             leaving the JoinSet empty"
         );
     }
 
