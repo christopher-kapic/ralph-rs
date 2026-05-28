@@ -31,9 +31,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use crate::cli::{
-    AgentsCommand, Cli, Command, HooksCommand, InterruptionCommand, PlanCommand,
-    OnOffState, PlanDependencyCommand, PlanHarnessCommand, PromptCommand, QuestionCommand,
-    StepCommand, StepDependencyCommand,
+    AgentsCommand, Cli, Command, HooksCommand, InterruptionCommand, OnOffState, PlanCommand,
+    PlanDependencyCommand, PlanHarnessCommand, PromptCommand, QuestionCommand, StepCommand,
+    StepDependencyCommand,
 };
 
 use crate::commands::{resolve_plan, resolve_project};

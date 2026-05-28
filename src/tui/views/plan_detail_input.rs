@@ -643,8 +643,7 @@ mod tests {
         let mut deps: HashMap<String, Vec<String>> = HashMap::new();
         deps.insert("s1".to_string(), vec!["s0".to_string()]);
         deps.insert("s2".to_string(), vec!["s1".to_string()]);
-        app.outline
-            .sync(app.steps.clone(), deps, HashSet::new());
+        app.outline.sync(app.steps.clone(), deps, HashSet::new());
 
         // Cursor on s1, then focus → cone = {s1, s2}; s0 is OUT of the cone.
         app.outline.set_cursor(1);

@@ -1795,11 +1795,31 @@ mod tests {
         let plan = storage::get_plan_by_id(&conn, &plan.id).unwrap();
 
         let (a, _) = storage::create_step(
-            &conn, &plan.id, "A", "d", None, None, &[], Some(0), None, None, None,
+            &conn,
+            &plan.id,
+            "A",
+            "d",
+            None,
+            None,
+            &[],
+            Some(0),
+            None,
+            None,
+            None,
         )
         .unwrap();
         let (b, _) = storage::create_step(
-            &conn, &plan.id, "B", "d", None, None, &[], Some(1), None, None, None,
+            &conn,
+            &plan.id,
+            "B",
+            "d",
+            None,
+            None,
+            &[],
+            Some(1),
+            None,
+            None,
+            None,
         )
         .unwrap();
         storage::add_step_dependency(&conn, &b.id, &a.id).unwrap();
@@ -1823,13 +1843,14 @@ mod tests {
             .into_iter()
             .find(|r| r.human_approved)
             .expect("human-approved request present");
-        let a_prime_id =
-            match consume_corrective_request(&conn, &plan, &approved, &silent_out()).unwrap() {
-                CorrectiveConsumeOutcome::Inserted {
-                    corrective_step_id, ..
-                } => corrective_step_id,
-                other => panic!("human-approved request must bypass the cap and Insert, got {other:?}"),
-            };
+        let a_prime_id = match consume_corrective_request(&conn, &plan, &approved, &silent_out())
+            .unwrap()
+        {
+            CorrectiveConsumeOutcome::Inserted {
+                corrective_step_id, ..
+            } => corrective_step_id,
+            other => panic!("human-approved request must bypass the cap and Insert, got {other:?}"),
+        };
 
         // A becomes Complete (review_status Failed); A′ exists and corrects A.
         let a_after = storage::get_step(&conn, &a.id).unwrap();
@@ -1894,7 +1915,8 @@ mod tests {
         )
         .unwrap();
 
-        storage::insert_corrective_step_request(&conn, &step.id, 1, "sha1", 1, None, false).unwrap();
+        storage::insert_corrective_step_request(&conn, &step.id, 1, "sha1", 1, None, false)
+            .unwrap();
         let req = storage::list_open_corrective_step_requests_for_plan(&conn, &plan.id).unwrap()[0]
             .clone();
         let res = consume_corrective_request(&conn, &plan, &req, &json_out()).unwrap();

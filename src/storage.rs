@@ -660,11 +660,7 @@ pub fn clear_skip_request(conn: &Connection, plan_id: &str) -> Result<()> {
 /// step. Used by the executor's `Completed` arm to tidy a request for the step
 /// that just finished naturally without clobbering a request a concurrent
 /// `ralph skip` queued for a different, not-yet-running step.
-pub fn clear_skip_request_for_step(
-    conn: &Connection,
-    plan_id: &str,
-    step_id: &str,
-) -> Result<()> {
+pub fn clear_skip_request_for_step(conn: &Connection, plan_id: &str, step_id: &str) -> Result<()> {
     conn.execute(
         "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL \
          WHERE id = ?1 AND skip_requested_step_id = ?2",
@@ -6586,7 +6582,17 @@ mod tests {
 
         // A: InProgress + an OPEN corrective request → must be preserved.
         let (a, _) = create_step(
-            &conn, &plan.id, "A", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "A",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         update_step_status(&conn, &a.id, StepStatus::InProgress).unwrap();
@@ -6594,7 +6600,17 @@ mod tests {
 
         // B: InProgress, no request → swept as the orphan it is.
         let (b, _) = create_step(
-            &conn, &plan.id, "B", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "B",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         update_step_status(&conn, &b.id, StepStatus::InProgress).unwrap();
@@ -6608,10 +6624,7 @@ mod tests {
             StepStatus::InProgress,
             "a step with an open corrective request must survive the sweep"
         );
-        assert_eq!(
-            get_step(&conn, &b.id).unwrap().status,
-            StepStatus::Aborted
-        );
+        assert_eq!(get_step(&conn, &b.id).unwrap().status, StepStatus::Aborted);
     }
 
     #[test]

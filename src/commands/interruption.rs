@@ -1788,7 +1788,11 @@ mod tests {
     /// Helper: insert a review-loop escalation blocker the way
     /// `review::consume_corrective_request` would — the marker-prefixed body
     /// + empty options (the human resolves it with `--answer`).
-    fn seed_review_loop_escalation_blocker(conn: &Connection, step_id: &str, attempt: i32) -> String {
+    fn seed_review_loop_escalation_blocker(
+        conn: &Connection,
+        step_id: &str,
+        attempt: i32,
+    ) -> String {
         let body = format!(
             "{}\nreview loop — needs human: step has been corrected 1 time(s) and still fails.",
             crate::review::REVIEW_LOOP_ESCALATION_MARKER
@@ -1831,8 +1835,7 @@ mod tests {
         assert!(after.is_empty(), "escalation blocker resolved");
 
         // Exactly one open corrective request, human-approved, for this step.
-        let reqs =
-            storage::list_open_corrective_step_requests_for_plan(&conn, &plan_id).unwrap();
+        let reqs = storage::list_open_corrective_step_requests_for_plan(&conn, &plan_id).unwrap();
         assert_eq!(reqs.len(), 1, "exactly one corrective request inserted");
         assert!(reqs[0].human_approved, "request must be human-approved");
         assert_eq!(reqs[0].reviewed_step_id, step_id);
@@ -1871,8 +1874,7 @@ mod tests {
         )
         .unwrap();
 
-        let reqs =
-            storage::list_open_corrective_step_requests_for_plan(&conn, &plan_id).unwrap();
+        let reqs = storage::list_open_corrective_step_requests_for_plan(&conn, &plan_id).unwrap();
         assert!(
             reqs.is_empty(),
             "a plain blocker must not insert a corrective request"

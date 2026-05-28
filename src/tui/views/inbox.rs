@@ -459,8 +459,7 @@ mod tests {
     /// that resolve out of `asked_at` order.
     fn item_at(id: &str, open: bool, asked_secs: i64) -> InboxItem {
         let mut it = item(id, open);
-        it.interruption.asked_at =
-            chrono::DateTime::<Utc>::from_timestamp(asked_secs, 0).unwrap();
+        it.interruption.asked_at = chrono::DateTime::<Utc>::from_timestamp(asked_secs, 0).unwrap();
         it
     }
 
@@ -472,8 +471,7 @@ mod tests {
             (a.interruption.asked_at, &a.interruption.id)
                 .cmp(&(b.interruption.asked_at, &b.interruption.id))
         });
-        let resolved: Vec<InboxItem> =
-            items.iter().filter(|i| !i.is_open()).cloned().collect();
+        let resolved: Vec<InboxItem> = items.iter().filter(|i| !i.is_open()).cloned().collect();
         open.into_iter().chain(resolved).collect()
     }
 

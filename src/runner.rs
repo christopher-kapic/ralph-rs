@@ -7650,8 +7650,7 @@ mod tests {
         // reviewed, so there's no verdict to wait on, and its dependents
         // must become runnable rather than being gated forever.
         for unblocking in [StepStatus::Complete, StepStatus::Skipped] {
-            let win_status: HashMap<&str, StepStatus> =
-                [("s0", unblocking)].into_iter().collect();
+            let win_status: HashMap<&str, StepStatus> = [("s0", unblocking)].into_iter().collect();
             assert!(
                 deps_satisfied("s1", &deps_of, &win_status),
                 "{unblocking:?} dep must satisfy its dependent's edge"
