@@ -892,36 +892,18 @@ pub(crate) fn render_tile(
         .as_deref()
         .map(|s| s.chars().count())
         .unwrap_or(0);
-    // §5: when `questions_enabled` is on, reserve 2 cols at the left of the
-    // title row for a `?` glyph + space separator (top-left corner badge).
-    let q_cols: usize = if tile.plan.questions_enabled { 2 } else { 0 };
-    let title_max = (inner.width as usize).saturating_sub(badge_cols + q_cols);
+    let title_max = (inner.width as usize).saturating_sub(badge_cols);
     let title = Paragraph::new(Line::from(Span::styled(
         truncate(tile.plan.slug.as_str(), title_max),
         title_style,
     )));
     let title_area = Rect {
-        x: inner.x.saturating_add(q_cols as u16),
+        x: inner.x,
         y: inner.y,
-        width: inner.width.saturating_sub(q_cols as u16),
+        width: inner.width,
         height: 1,
     };
     title.render(title_area, buf);
-    if tile.plan.questions_enabled && inner.width > 0 {
-        let q_para = Paragraph::new(Span::styled(
-            "?",
-            Style::default()
-                .fg(theme::plan_status_color(PlanStatus::Interrupted))
-                .add_modifier(Modifier::BOLD),
-        ));
-        let q_area = Rect {
-            x: inner.x,
-            y: inner.y,
-            width: 1,
-            height: 1,
-        };
-        q_para.render(q_area, buf);
-    }
     if let Some(text) = badge_text
         && (inner.width as usize) >= badge_cols
     {
@@ -1043,7 +1025,6 @@ mod tests {
             plan_harness: None,
             created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
             updated_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -1434,67 +1415,33 @@ mod tests {
         assert!(row1.contains("[1]"), "expected [1] badge: {row1:?}");
     }
 
-    // -- `?` corner badge for questions_enabled (TUI-plan.md §5) -----------
+    // -- Title row layout ---------------------------------------------------
 
     #[test]
-    fn render_tile_with_questions_enabled_renders_corner_question_glyph() {
-        // §5: when `questions_enabled` is true, the tile shows a `?` glyph
-        // in the top-LEFT corner of the title row (inner.x, inner.y).
-        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
-        let area = buf.area;
-        let mut tile = make_tile("plan");
-        tile.plan.questions_enabled = true;
-        render_tile(&mut buf, area, &tile, false, None, "UTC");
-        // Title row is row 1 (inner.y = 1 with single-cell border).
-        // First inner column (x=1) should hold the `?`.
-        assert_eq!(buf[(1, 1)].symbol(), "?");
-        // §12.5: the corner `?` glyph is the open-interruption concept and
-        // now routes through the single mapping (orange, not the retired
-        // purple STATUS_QUESTION).
-        assert_eq!(
-            buf[(1, 1)].style().fg,
-            Some(theme::plan_status_color(PlanStatus::Interrupted))
-        );
-    }
-
-    #[test]
-    fn render_tile_without_questions_enabled_omits_corner_question_glyph() {
-        // questions_enabled = false → no `?` in the top-left, and the title
-        // starts flush at inner.x as before.
+    fn render_tile_anchors_title_flush_left() {
+        // The title row is flush-left at inner.x (the questions_enabled `?`
+        // corner badge was removed with the always-on questions cutover).
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
         let area = buf.area;
         let tile = make_tile("plan");
-        assert!(!tile.plan.questions_enabled);
         render_tile(&mut buf, area, &tile, false, None, "UTC");
-        // No `?` at the top-left inner cell.
-        assert_ne!(buf[(1, 1)].symbol(), "?");
-        // Title still anchored at inner.x — first slug char "p" sits at x=1.
+        // First slug char "p" sits at inner.x (x=1) — no left-edge badge.
         assert_eq!(buf[(1, 1)].symbol(), "p");
+        assert_ne!(buf[(1, 1)].symbol(), "?");
     }
 
     #[test]
-    fn render_tile_selected_with_questions_enabled_renders_both_badges() {
-        // §5: a selected, questions-enabled tile shows BOTH the `?` glyph
-        // (top-left) and the `[N]` selection-order badge (top-right). The
-        // two badges live on opposite sides of the title row and don't
-        // collide.
+    fn render_tile_selected_renders_selection_badge() {
+        // A selected tile shows the `[N]` selection-order badge on the
+        // top-right while keeping the title flush-left.
         let mut buf = Buffer::empty(Rect::new(0, 0, 30, 6));
         let area = buf.area;
-        let mut tile = make_tile("plan");
-        tile.plan.questions_enabled = true;
+        let tile = make_tile("plan");
         render_tile(&mut buf, area, &tile, false, Some(2), "UTC");
-        // Top-left: `?` glyph.
-        assert_eq!(buf[(1, 1)].symbol(), "?");
-        assert_eq!(
-            buf[(1, 1)].style().fg,
-            Some(theme::plan_status_color(PlanStatus::Interrupted))
-        );
-        // Top-right: `[2]` badge somewhere on the title row.
         let row1 = (0..30).map(|x| buf[(x, 1)].symbol()).collect::<String>();
         assert!(row1.contains("[2]"), "expected [2] badge: {row1:?}");
-        // Title slug shifts right by 2 cols to leave room for `?` + space.
-        // First slug char "p" now sits at x = inner.x + 2 = 3.
-        assert_eq!(buf[(3, 1)].symbol(), "p");
+        // Title slug still anchored at inner.x.
+        assert_eq!(buf[(1, 1)].symbol(), "p");
     }
 
     // -- Cursor target ------------------------------------------------------
@@ -1556,15 +1503,12 @@ mod tests {
         let mut app = PlanListApp::new(make_tiles(3), "/proj", "UTC");
         app.selected_index = 1;
         let mut updated = make_plan("plan-1");
-        updated.status = PlanStatus::Ready;
-        updated.questions_enabled = true;
+        updated.status = PlanStatus::Complete;
         app.update_plan_in_place(updated);
         let tile = &app.tiles[1];
-        assert_eq!(tile.plan.status, PlanStatus::Ready);
-        assert!(tile.plan.questions_enabled);
+        assert_eq!(tile.plan.status, PlanStatus::Complete);
         // Other tiles unchanged.
         assert_eq!(app.tiles[0].plan.status, PlanStatus::Ready);
-        assert!(!app.tiles[0].plan.questions_enabled);
     }
 
     #[test]

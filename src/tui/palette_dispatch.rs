@@ -10,8 +10,6 @@
 // `/plan delete <slug>`, `/plan approve [<slug>]`.
 //
 // Step #31 wires the v1-deferred routes per TUI-plan.md §9:
-// * `/plan questions on|off [<slug>]` — flips `plans.questions_enabled` via
-//   the surrounding view's storage helper.
 // * `/step add <title>` — appends a new step to the focused plan.
 // * `/step skip [<num>]` — mirrors the `s` keybinding's `runner::skip_step`.
 // * `/step move <num> --to <m>` — re-keys a step into a new position.
@@ -163,14 +161,6 @@ pub enum PaletteAction {
     /// `/plan approve [<slug>]` — flip `Planning` → `Ready` (toast otherwise).
     /// No confirm — mirrors the plan-list `A` keybinding.
     Approve { plan_id: String, slug: String },
-    /// `/plan questions on|off [<slug>]` — flip `plans.questions_enabled` via
-    /// `storage::set_plan_questions_enabled`. Mirrors the `Q` keybinding on
-    /// the plan-list tile.
-    SetQuestionsEnabled {
-        plan_id: String,
-        slug: String,
-        enabled: bool,
-    },
     /// `/step add <title>` — append a new step to the focused plan via
     /// `storage::create_step`. The caller defaults the rest of the column
     /// values (no agent, no harness override, empty criteria, etc.) — the
@@ -305,14 +295,6 @@ pub fn dispatch(cmd: &PaletteCommand, ctx: &PaletteContext<'_>) -> PaletteAction
 
         // -- /plan approve [<slug>] ---------------------------------------
         PaletteCommand::PlanApprove(slug) => dispatch_plan_approve(slug.as_deref(), ctx),
-
-        // -- /plan questions on|off [<slug>] ------------------------------
-        PaletteCommand::PlanQuestionsOn(slug) => {
-            dispatch_plan_questions(slug.as_deref(), true, ctx)
-        }
-        PaletteCommand::PlanQuestionsOff(slug) => {
-            dispatch_plan_questions(slug.as_deref(), false, ctx)
-        }
 
         // -- /step add <title> --------------------------------------------
         PaletteCommand::StepAdd(title) => dispatch_step_add(title, ctx),
@@ -535,25 +517,6 @@ fn dispatch_plan_approve(slug: Option<&str>, ctx: &PaletteContext<'_>) -> Palett
                 }
             }
         }
-        ResolvedSlug::Missing => PaletteAction::Toast {
-            message: "No plan selected.".to_string(),
-            kind: ToastKind::Info,
-        },
-        ResolvedSlug::Unknown(name) => unknown_plan_toast(&name),
-    }
-}
-
-fn dispatch_plan_questions(
-    slug: Option<&str>,
-    enabled: bool,
-    ctx: &PaletteContext<'_>,
-) -> PaletteAction {
-    match resolve_slug(slug, ctx) {
-        ResolvedSlug::Some(target) => PaletteAction::SetQuestionsEnabled {
-            plan_id: target.id,
-            slug: target.slug,
-            enabled,
-        },
         ResolvedSlug::Missing => PaletteAction::Toast {
             message: "No plan selected.".to_string(),
             kind: ToastKind::Info,
@@ -1366,73 +1329,6 @@ mod tests {
         );
     }
 
-    // -- /plan questions on|off -------------------------------------------
-
-    #[test]
-    fn plan_questions_on_named_flips_flag() {
-        let mut c = Ctx::new();
-        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
-        let action = dispatch_str("/plan questions on alpha", &c);
-        assert_eq!(
-            action,
-            PaletteAction::SetQuestionsEnabled {
-                plan_id: "id-alpha".to_string(),
-                slug: "alpha".to_string(),
-                enabled: true,
-            }
-        );
-    }
-
-    #[test]
-    fn plan_questions_off_named_flips_flag() {
-        let mut c = Ctx::new();
-        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
-        let action = dispatch_str("/plan questions off alpha", &c);
-        assert_eq!(
-            action,
-            PaletteAction::SetQuestionsEnabled {
-                plan_id: "id-alpha".to_string(),
-                slug: "alpha".to_string(),
-                enabled: false,
-            }
-        );
-    }
-
-    #[test]
-    fn plan_questions_on_omitted_uses_focus() {
-        let mut c = Ctx::new();
-        c.plans = vec![plan_ref("alpha", PlanStatus::Ready)];
-        c.focused_slug = Some("alpha".to_string());
-        let action = dispatch_str("/plan questions on", &c);
-        assert_eq!(
-            action,
-            PaletteAction::SetQuestionsEnabled {
-                plan_id: "id-alpha".to_string(),
-                slug: "alpha".to_string(),
-                enabled: true,
-            }
-        );
-    }
-
-    #[test]
-    fn plan_questions_unknown_slug_toasts_error() {
-        let c = Ctx::new();
-        let action = dispatch_str("/plan questions on ghost", &c);
-        assert_eq!(action, unknown_plan_toast("ghost"));
-    }
-
-    #[test]
-    fn plan_questions_omitted_with_no_focus_toasts_info() {
-        let c = Ctx::new();
-        let action = dispatch_str("/plan questions off", &c);
-        assert_eq!(
-            action,
-            PaletteAction::Toast {
-                message: "No plan selected.".to_string(),
-                kind: ToastKind::Info,
-            }
-        );
-    }
 
     // -- /step add --------------------------------------------------------
 

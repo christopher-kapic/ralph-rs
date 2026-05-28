@@ -51,15 +51,9 @@ pub fn create_plan(
     let id = Uuid::new_v4().to_string();
     let tests_json = serde_json::to_string(deterministic_tests)?;
 
-    // `questions_enabled` is set explicitly to 1 here rather than relying on
-    // the V16 column `DEFAULT 0`. New plans opt INTO the pause-for-question
-    // feature by default; existing rows are untouched (no migration), so only
-    // plans created via this path get the new default. The SQL column default
-    // stays 0 so a bare INSERT (e.g. an import path that omits the column)
-    // still behaves as before.
     conn.execute(
-        "INSERT INTO plans (id, slug, project, branch_name, description, harness, agent, deterministic_tests, questions_enabled)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+        "INSERT INTO plans (id, slug, project, branch_name, description, harness, agent, deterministic_tests)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![id, slug, project, branch_name, description, harness, agent, tests_json],
     )
     .with_context(|| format!("Failed to insert plan '{slug}' for project '{project}'"))?;
@@ -283,22 +277,6 @@ pub fn update_plan_status(conn: &Connection, plan_id: &str, status: PlanStatus) 
     Ok(())
 }
 
-/// Set the `plans.questions_enabled` flag and bump `updated_at`.
-///
-/// Drives the `Q` keybinding in the TUI plan list (TUI-plan.md §17) and the
-/// `ralph plan questions on|off` CLI commands. SQLite has no native bool, so
-/// the value is stored as INTEGER 0/1.
-pub fn set_plan_questions_enabled(conn: &Connection, plan_id: &str, enabled: bool) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE plans SET questions_enabled = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![enabled as i64, plan_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Plan not found: {plan_id}");
-    }
-    Ok(())
-}
-
 /// Record the git branch the plan most recently started a run on AND the
 /// wall-clock timestamp at which that run started.
 ///
@@ -311,7 +289,7 @@ pub fn set_plan_questions_enabled(conn: &Connection, plan_id: &str, enabled: boo
 /// The same UPDATE also stamps `last_run_started_at` so the resume
 /// resolver's `ORDER BY` can sort by "when did this plan last actually run"
 /// rather than `updated_at` (which is bumped by unrelated edits like
-/// toggling `questions_enabled` or `pause_requested`).
+/// toggling `pause_requested`).
 pub fn set_plan_last_run_branch(conn: &Connection, plan_id: &str, branch: &str) -> Result<()> {
     let affected = conn.execute(
         "UPDATE plans SET last_run_branch = ?1, \
@@ -673,6 +651,24 @@ pub fn clear_skip_request(conn: &Connection, plan_id: &str) -> Result<()> {
         "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL \
          WHERE id = ?1",
         params![plan_id],
+    )?;
+    Ok(())
+}
+
+/// Clear a pending skip request only when it targets `step_id`. Idempotent —
+/// a no-op when nothing is pending or the pending request targets a different
+/// step. Used by the executor's `Completed` arm to tidy a request for the step
+/// that just finished naturally without clobbering a request a concurrent
+/// `ralph skip` queued for a different, not-yet-running step.
+pub fn clear_skip_request_for_step(
+    conn: &Connection,
+    plan_id: &str,
+    step_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE plans SET skip_requested_step_id = NULL, skip_changes = NULL \
+         WHERE id = ?1 AND skip_requested_step_id = ?2",
+        params![plan_id, step_id],
     )?;
     Ok(())
 }
@@ -2272,6 +2268,16 @@ pub fn reset_step(conn: &Connection, step_id: &str) -> Result<Option<ParkedWorkt
 /// interruption. Leaving it `InProgress` is correct: the scheduler keeps it
 /// gated, the plan reads derived `Interrupted`, and resolving the
 /// interruption lets the run pick it back up.
+///
+/// **A step with an open corrective request is NOT swept either.** After a
+/// human resolves the review-loop escalation blocker the escalated step is
+/// `InProgress` with NO open interruption (just resolved) but DOES carry an
+/// open `corrective_step_requests` row; the orchestrator converts it to
+/// `Complete` only when it drains that request. Since the run/resume sweep
+/// runs *before* the drain, aborting here would discard the step's committed
+/// work and strand the pending corrective request (this also hardens the
+/// pre-existing stranded-request-on-resume case for ordinary reviewer
+/// requests).
 pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
     // Also reset a stranded `review_status = in_flight` back to `pending`
     // in the SAME atomic UPDATE. A crash *during a concurrent review*
@@ -2292,6 +2298,10 @@ pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<S
            AND NOT EXISTS (
                SELECT 1 FROM interruptions i
                WHERE i.step_id = steps.id AND i.state = 'open'
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM corrective_step_requests c
+               WHERE c.reviewed_step_id = steps.id AND c.state = 'open'
            )
          RETURNING {STEP_COLUMNS}",
     );
@@ -3071,6 +3081,10 @@ pub struct CorrectiveStepRequest {
     pub commit_sha: String,
     pub issues: i32,
     pub verdict_body: Option<String>,
+    /// `true` when a human resolved a review-loop-escalation blocker, which
+    /// grants exactly ONE more review→correction cycle. `consume_corrective_request`
+    /// bypasses the recursion cap for a human-approved request (V35).
+    pub human_approved: bool,
 }
 
 /// Insert an OPEN corrective-step request (V29 bridge — docs/dag-redesign.md
@@ -3087,19 +3101,21 @@ pub fn insert_corrective_step_request(
     commit_sha: &str,
     issues: i32,
     verdict_body: Option<&str>,
+    human_approved: bool,
 ) -> Result<String> {
     let id = Uuid::new_v4().to_string();
     conn.execute(
         "INSERT INTO corrective_step_requests \
-            (id, reviewed_step_id, reviewed_iteration, commit_sha, issues, verdict_body, state, requested_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            (id, reviewed_step_id, reviewed_iteration, commit_sha, issues, verdict_body, human_approved, state, requested_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         params![
             id,
             reviewed_step_id,
             reviewed_iteration,
             commit_sha,
             issues,
-            verdict_body
+            verdict_body,
+            human_approved
         ],
     )?;
     Ok(id)
@@ -3114,7 +3130,7 @@ pub fn list_open_corrective_step_requests_for_plan(
     plan_id: &str,
 ) -> Result<Vec<CorrectiveStepRequest>> {
     let mut stmt = conn.prepare(
-        "SELECT r.id, r.reviewed_step_id, r.reviewed_iteration, r.commit_sha, r.issues, r.verdict_body \
+        "SELECT r.id, r.reviewed_step_id, r.reviewed_iteration, r.commit_sha, r.issues, r.verdict_body, r.human_approved \
          FROM corrective_step_requests r \
          JOIN steps s ON s.id = r.reviewed_step_id \
          WHERE r.state = 'open' AND s.plan_id = ?1 \
@@ -3128,6 +3144,7 @@ pub fn list_open_corrective_step_requests_for_plan(
             commit_sha: row.get(3)?,
             issues: row.get(4)?,
             verdict_body: row.get(5)?,
+            human_approved: row.get::<_, i64>(6)? != 0,
         })
     })?;
     let mut out = Vec::new();
@@ -4045,22 +4062,6 @@ mod tests {
         assert!(found.updated_at >= plan.updated_at);
     }
 
-    #[test]
-    fn test_set_plan_questions_enabled_flips_column() {
-        let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        assert!(plan.questions_enabled, "new plans default to on");
-
-        set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
-        let off = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
-        assert!(!off.questions_enabled);
-        assert!(off.updated_at >= plan.updated_at);
-
-        set_plan_questions_enabled(&conn, &plan.id, true).unwrap();
-        let on = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
-        assert!(on.questions_enabled);
-    }
-
     /// STEP 44 / docs/dag-redesign.md §13.3: `any_review_enabled` drives
     /// the doctor review-harness warning. It is true iff some plan OR step
     /// has `review_enabled = 1`; an explicit `Some(false)` or NULL/inherit
@@ -4430,7 +4431,7 @@ mod tests {
         // first; under the new ordering anchored on
         // `last_run_started_at`, `fresh` still wins.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        set_plan_questions_enabled(&conn, &stale.id, true).unwrap();
+        set_plan_pause_requested(&conn, &stale.id, true).unwrap();
 
         let candidates = find_resumable_plans_for_branch(&conn, "/proj", "master").unwrap();
         let slugs: Vec<&str> = candidates.iter().map(|p| p.slug.as_str()).collect();
@@ -4494,7 +4495,7 @@ mod tests {
         set_plan_last_run_branch(&conn, &fresh.id, "main").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
         // Bumping unrelated flag on the older plan must not change ranking.
-        set_plan_questions_enabled(&conn, &stale.id, true).unwrap();
+        set_plan_pause_requested(&conn, &stale.id, true).unwrap();
 
         let p = find_resumable_plan(&conn, "/proj").unwrap().unwrap();
         assert_eq!(p.slug, "fresh");
@@ -4765,13 +4766,6 @@ mod tests {
             plan_effective_status(&conn, &plan.id).unwrap(),
             PlanStatus::Complete,
         );
-    }
-
-    #[test]
-    fn test_set_plan_questions_enabled_missing_plan_errs() {
-        let conn = setup();
-        let err = set_plan_questions_enabled(&conn, "no-such-id", true).unwrap_err();
-        assert!(err.to_string().contains("Plan not found"));
     }
 
     #[test]
@@ -6576,6 +6570,47 @@ mod tests {
             swept_a.review_status,
             Some(crate::plan::ReviewStatus::Pending),
             "the returned row snapshot must show the reset review_status"
+        );
+    }
+
+    /// An InProgress step carrying an OPEN corrective request must NOT be
+    /// swept. After a human resolves a review-loop escalation blocker the
+    /// step is InProgress with NO open interruption but an open corrective
+    /// request; the orchestrator converts it to Complete only when it drains
+    /// that request, and run/resume sweeps BEFORE the drain — so aborting it
+    /// here would strand the pending correction.
+    #[test]
+    fn test_sweep_skips_step_with_open_corrective_request() {
+        let conn = setup();
+        let plan = create_plan(&conn, "sweep-corr", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        // A: InProgress + an OPEN corrective request → must be preserved.
+        let (a, _) = create_step(
+            &conn, &plan.id, "A", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        update_step_status(&conn, &a.id, StepStatus::InProgress).unwrap();
+        insert_corrective_step_request(&conn, &a.id, 1, "", 0, None, true).unwrap();
+
+        // B: InProgress, no request → swept as the orphan it is.
+        let (b, _) = create_step(
+            &conn, &plan.id, "B", "d", None, None, &[], None, None, None, None,
+        )
+        .unwrap();
+        update_step_status(&conn, &b.id, StepStatus::InProgress).unwrap();
+
+        let swept = sweep_stale_in_progress(&conn, &plan.id).unwrap();
+        assert_eq!(swept.len(), 1, "only B (no corrective request) is swept");
+        assert_eq!(swept[0].id, b.id);
+
+        assert_eq!(
+            get_step(&conn, &a.id).unwrap().status,
+            StepStatus::InProgress,
+            "a step with an open corrective request must survive the sweep"
+        );
+        assert_eq!(
+            get_step(&conn, &b.id).unwrap().status,
+            StepStatus::Aborted
         );
     }
 

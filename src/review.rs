@@ -45,6 +45,24 @@ const REVIEW_OUTPUT_TAIL_BYTES: usize = 4 * 1024 * 1024;
 /// of the same step still fail review, a human needs to look.
 pub const DEFAULT_MAX_REVIEW_CORRECTIONS: usize = 3;
 
+/// Machine-recognizable body prefix on the "review loop — needs human"
+/// escalation blocker raised by [`consume_corrective_request`] when a
+/// corrective chain exceeds `max_review_corrections` (§10 item 4 / §14.5).
+/// The interruption resolver (`commands::interruption`) dispatches on this
+/// prefix to grant exactly ONE more review→correction cycle (inserting a
+/// `human_approved = true` corrective request). Mirrors
+/// [`crate::runner::PARKED_RESTORE_BLOCKER_MARKER`] — a body marker (not an
+/// option-content check) because this blocker carries empty options.
+pub const REVIEW_LOOP_ESCALATION_MARKER: &str = "[ralph:review-loop-escalation]";
+
+/// True iff `body` is a "review loop — needs human" escalation blocker body
+/// (detected by the [`REVIEW_LOOP_ESCALATION_MARKER`] prefix). Mirrors
+/// `commands::interruption::is_parked_restore_blocker` but takes the body
+/// string directly so callers that only have the body can use it too.
+pub fn is_review_loop_escalation_blocker(body: &str) -> bool {
+    body.starts_with(REVIEW_LOOP_ESCALATION_MARKER)
+}
+
 /// Parsed reviewer verdict (the structured contract documented in
 /// [`prompt::REVIEW_VERDICT_CONTRACT`] and embedded verbatim in the reviewer
 /// prompt). The parser keys off the leading `REVIEW PASS` / `REVIEW FAIL`
@@ -497,8 +515,21 @@ pub fn finalize_review(
                 Ok(())
             })?;
             // History-safe verdict annotation (note on a fixed SHA — never an
-            // amend, see git::annotate_review_verdict).
-            git::annotate_review_verdict(workdir, commit_sha, "passed")?;
+            // amend, see git::annotate_review_verdict). Best-effort: the
+            // verdict is already DURABLY committed above (DB status is the
+            // source of truth), and the note is advisory audit only. A failed
+            // note write (ref-lock contention on `refs/notes`, a transient git
+            // error) must NOT abort the run over a passing review — warn and
+            // continue so an operator can notice the note is missing.
+            if let Err(e) = git::annotate_review_verdict(workdir, commit_sha, "passed")
+                && out.format != OutputFormat::Json
+            {
+                eprintln!(
+                    "  warning: review of {short_sha} (.{iteration}) passed but the \
+                     git note could not be written: {e:#} (advisory audit only; the \
+                     DB review_status is the source of truth)"
+                );
+            }
             if out.format == OutputFormat::Json {
                 output::emit_ndjson(&RunEvent::ReviewFinished {
                     step_id: step_id.clone(),
@@ -542,13 +573,29 @@ pub fn finalize_review(
                     commit_sha,
                     issues,
                     verdict_body.as_deref(),
+                    // A reviewer-originated request is never human-approved:
+                    // it must still be capped. Only the escalation-blocker
+                    // resolver inserts a `human_approved = true` request.
+                    false,
                 )?;
                 Ok(request_id)
             })?;
             // The git note is a non-DB audit annotation; do it only after
             // the verdict is durably committed so a crashed/rolled-back
             // verdict leaves no contradictory `failed` note either.
-            git::annotate_review_verdict(workdir, commit_sha, "failed")?;
+            // Best-effort: the `Failed` verdict + corrective-request bridge
+            // row are already DURABLY committed above (the source of truth);
+            // a failed note write must NOT abort the run — warn and continue.
+            if let Err(e) = git::annotate_review_verdict(workdir, commit_sha, "failed")
+                && out.format != OutputFormat::Json
+            {
+                eprintln!(
+                    "  warning: review of {short_sha} (.{iteration}) failed and the \
+                     corrective step was requested, but the git note could not be \
+                     written: {e:#} (advisory audit only; the DB review_status + \
+                     corrective request are the source of truth)"
+                );
+            }
 
             if out.format == OutputFormat::Json {
                 output::emit_ndjson(&RunEvent::ReviewFinished {
@@ -700,9 +747,17 @@ pub fn consume_corrective_request(
         // `reviewed` is itself a corrective step A′ (chain_len 1), inserting
         // A″ would be chain_len 2, etc. Escalate when that would exceed the
         // cap.
+        //
+        // WHY the bypass: a human-approved request is the resolution of a
+        // prior escalation blocker — the human explicitly granted ONE more
+        // review→correction cycle, so we skip the cap entirely for this hop.
+        // The resulting corrective step is itself reviewed; if THAT review
+        // fails, `finalize_review` inserts a NORMAL (human_approved=false)
+        // request, the cap check below fires again, and we re-escalate — so
+        // the human stays the loop gate (no unbounded spawning).
         let cap = effective_max_review_corrections(plan);
         let next_chain_len = storage::corrective_chain_len(conn, &reviewed.id)? + 1;
-        if next_chain_len > cap {
+        if !request.human_approved && next_chain_len > cap {
             // Raise exactly ONE blocker interruption and stop spawning.
             let interruption_id = storage::insert_interruption(
                 conn,
@@ -710,9 +765,12 @@ pub fn consume_corrective_request(
                 request.reviewed_iteration,
                 InterruptionKind::Blocker,
                 &format!(
-                    "review loop — needs human: step '{}' has been corrected {} time(s) \
-                     and still fails review (cap {}). A human must intervene; ralph will \
-                     not spawn further corrective steps for this chain.",
+                    "{REVIEW_LOOP_ESCALATION_MARKER}\n\
+                     review loop — needs human: step '{}' has been corrected {} time(s) \
+                     and still fails review (cap {}). A human must intervene. Resolving \
+                     this blocker grants exactly ONE more review→correction cycle; if \
+                     that also fails review and re-exceeds the cap, ralph will escalate \
+                     again.",
                     reviewed.title,
                     next_chain_len - 1,
                     cap
@@ -974,7 +1032,6 @@ mod tests {
             plan_harness: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -1139,15 +1196,12 @@ mod tests {
     }
 
     /// Poll `list_worktree_paths(dir).len()` until it converges to
-    /// `expected` (or a 5s deadline fires). `ReviewWorktree::Drop`
-    /// detaches its cleanup onto `spawn_blocking` / `std::thread::spawn`
-    /// so the runtime worker isn't blocked on two sync git subprocess
-    /// calls under abort. As a side effect, the cleanup is no longer
-    /// synchronous with `Drop` returning — tests that assert the
-    /// worktree is gone must give the detached task a beat to run. 5s is
-    /// orders of magnitude more than the two `git worktree` calls take
-    /// in practice; in CI the loop converges in a single iteration on a
-    /// quiet runner.
+    /// `expected` (or a 5s deadline fires). `ReviewWorktree::Drop` now
+    /// cleans up SYNCHRONOUSLY (the worktree is gone before `Drop`
+    /// returns), so this normally converges on the first poll. The bounded
+    /// poll is retained only as a cheap hedge against filesystem-visibility
+    /// lag on slow CI runners; it is no longer load-bearing for
+    /// correctness.
     async fn await_worktree_count(dir: &Path, expected: usize) -> Vec<String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -1256,7 +1310,8 @@ mod tests {
              commit would sweep it in (the corruption §9-inv-2 prevents)"
         );
         // No orphan review worktree left behind on a passing review.
-        // `Drop` detaches cleanup; poll briefly via `await_worktree_count`.
+        // `Drop` cleans up synchronously; `await_worktree_count` converges
+        // immediately (the poll is a CI-lag hedge, not load-bearing).
         let wts = await_worktree_count(dir, 1).await;
         assert_eq!(
             wts.len(),
@@ -1312,8 +1367,9 @@ mod tests {
     /// LIFECYCLE PROOF: the throwaway review worktree is removed (no orphan
     /// `git worktree list` entry, no leftover dir) after BOTH a passing
     /// review AND a failing/erroring one — RAII `Drop` + unconditional prune
-    /// on every exit path. `Drop` detaches its cleanup to a blocking thread
-    /// so the runtime worker isn't blocked under abort — see
+    /// on every exit path. `Drop` cleans up synchronously (`block_in_place`
+    /// on a multi-thread runtime so it doesn't starve the scheduler), so the
+    /// worktree is gone before the guard drop returns — see
     /// `await_worktree_count`.
     #[tokio::test]
     async fn test_review_worktree_cleaned_up_on_pass_and_failure() {
@@ -1549,6 +1605,7 @@ mod tests {
             "deadbeef",
             1,
             Some("missing X"),
+            false,
         )
         .unwrap();
         let req = storage::list_open_corrective_step_requests_for_plan(&conn, &plan.id).unwrap()[0]
@@ -1647,7 +1704,8 @@ mod tests {
 
         // 1st failed review of A ⇒ A′ inserted (chain_len 1 ≤ cap 1).
         let req = {
-            storage::insert_corrective_step_request(&conn, &a.id, 1, "sha1", 1, None).unwrap();
+            storage::insert_corrective_step_request(&conn, &a.id, 1, "sha1", 1, None, false)
+                .unwrap();
             storage::list_open_corrective_step_requests_for_plan(&conn, &plan.id).unwrap()[0]
                 .clone()
         };
@@ -1663,7 +1721,7 @@ mod tests {
         // ESCALATE to a blocker, NO new step.
         let steps_before = storage::list_steps(&conn, &plan.id).unwrap().len();
         let req2 = {
-            storage::insert_corrective_step_request(&conn, &a_prime_id, 1, "sha2", 1, None)
+            storage::insert_corrective_step_request(&conn, &a_prime_id, 1, "sha2", 1, None, false)
                 .unwrap();
             storage::list_open_corrective_step_requests_for_plan(&conn, &plan.id).unwrap()[0]
                 .clone()
@@ -1711,6 +1769,97 @@ mod tests {
         );
     }
 
+    /// §10 item 4 / §14.5: a `human_approved = true` request (the resolution
+    /// of a review-loop escalation blocker) BYPASSES the recursion cap for one
+    /// hop — it inserts the corrective step + re-parents + finalizes the
+    /// reviewed step Complete EVEN when `corrective_chain_len + 1 > cap`.
+    #[test]
+    fn test_human_approved_request_bypasses_recursion_cap() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        let conn = crate::db::open_memory().unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            "cap-bypass",
+            &dir.to_string_lossy(),
+            "b",
+            "d",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        // Cap 0: a normal request would escalate immediately.
+        storage::set_plan_max_review_corrections(&conn, &plan.id, Some(0)).unwrap();
+        let plan = storage::get_plan_by_id(&conn, &plan.id).unwrap();
+
+        let (a, _) = storage::create_step(
+            &conn, &plan.id, "A", "d", None, None, &[], Some(0), None, None, None,
+        )
+        .unwrap();
+        let (b, _) = storage::create_step(
+            &conn, &plan.id, "B", "d", None, None, &[], Some(1), None, None, None,
+        )
+        .unwrap();
+        storage::add_step_dependency(&conn, &b.id, &a.id).unwrap();
+
+        // Sanity: a NORMAL request at cap 0 escalates (no bypass).
+        storage::insert_corrective_step_request(&conn, &a.id, 1, "sha1", 1, None, false).unwrap();
+        let normal = storage::list_open_corrective_step_requests_for_plan(&conn, &plan.id).unwrap()
+            [0]
+        .clone();
+        assert!(!normal.human_approved);
+        assert!(matches!(
+            consume_corrective_request(&conn, &plan, &normal, &silent_out()).unwrap(),
+            CorrectiveConsumeOutcome::Escalated { cap: 0, .. }
+        ));
+
+        // A human-approved request for the SAME step (still chain_len+1 > cap)
+        // must instead insert + re-parent + finalize-Complete.
+        storage::insert_corrective_step_request(&conn, &a.id, 1, "", 0, None, true).unwrap();
+        let approved = storage::list_open_corrective_step_requests_for_plan(&conn, &plan.id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.human_approved)
+            .expect("human-approved request present");
+        let a_prime_id =
+            match consume_corrective_request(&conn, &plan, &approved, &silent_out()).unwrap() {
+                CorrectiveConsumeOutcome::Inserted {
+                    corrective_step_id, ..
+                } => corrective_step_id,
+                other => panic!("human-approved request must bypass the cap and Insert, got {other:?}"),
+            };
+
+        // A becomes Complete (review_status Failed); A′ exists and corrects A.
+        let a_after = storage::get_step(&conn, &a.id).unwrap();
+        assert_eq!(a_after.status, StepStatus::Complete);
+        assert_eq!(a_after.review_status, Some(ReviewStatus::Failed));
+        let a_prime = storage::get_step(&conn, &a_prime_id).unwrap();
+        assert_eq!(a_prime.corrects_step_id.as_deref(), Some(a.id.as_str()));
+
+        // Re-parent: B now depends on A′ as well.
+        let b_deps = storage::list_step_dependencies(&conn, &b.id).unwrap();
+        assert!(
+            b_deps.contains(&a_prime_id),
+            "B must be re-parented onto A′ after a human-approved correction"
+        );
+
+        // Chaining: if A′ then fails review, a NORMAL request re-escalates
+        // (cap fires again — the human stays the loop gate).
+        storage::insert_corrective_step_request(&conn, &a_prime_id, 1, "sha2", 1, None, false)
+            .unwrap();
+        let again = storage::list_open_corrective_step_requests_for_plan(&conn, &plan.id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.reviewed_step_id == a_prime_id)
+            .expect("normal request on A′ present");
+        assert!(matches!(
+            consume_corrective_request(&conn, &plan, &again, &silent_out()).unwrap(),
+            CorrectiveConsumeOutcome::Escalated { .. }
+        ));
+    }
+
     #[test]
     fn test_recursion_cap_escalation_json_mode_still_commits_blocker() {
         let tmp = TempDir::new().unwrap();
@@ -1745,7 +1894,7 @@ mod tests {
         )
         .unwrap();
 
-        storage::insert_corrective_step_request(&conn, &step.id, 1, "sha1", 1, None).unwrap();
+        storage::insert_corrective_step_request(&conn, &step.id, 1, "sha1", 1, None, false).unwrap();
         let req = storage::list_open_corrective_step_requests_for_plan(&conn, &plan.id).unwrap()[0]
             .clone();
         let res = consume_corrective_request(&conn, &plan, &req, &json_out()).unwrap();

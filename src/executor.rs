@@ -92,6 +92,28 @@ fn truncate_tail_bytes(text: &str, max_bytes: usize) -> String {
     )
 }
 
+/// Render a single test-command result for the execution-log `test_results`
+/// vector (and, via that, the retry prompt's "Previous Test Output" section
+/// and the retry-exhausted blocker body).
+///
+/// Passing commands stay terse (`cmd: pass`). Failing commands keep
+/// `cmd: FAIL` as the FIRST line — so prefix-based consumers still parse —
+/// then append the command's `output_tail` (already tail-bounded by the test
+/// runner) so the retrying agent and the human triaging the blocker see the
+/// actual assertion text / compiler error rather than a bare `FAIL`.
+fn format_test_result_line(r: &test_runner::TestResult) -> String {
+    if r.passed {
+        format!("{}: pass", r.command)
+    } else {
+        let tail = r.output_tail.trim_end();
+        if tail.is_empty() {
+            format!("{}: FAIL", r.command)
+        } else {
+            format!("{}: FAIL\n{tail}", r.command)
+        }
+    }
+}
+
 /// Phase E Fix 5: build the retry-exhausted auto-blocker's body from the
 /// last up-to-3 attempts in the step's CURRENT cycle. Returns the body
 /// already truncated to fit within [`RETRY_EXHAUSTED_BODY_MAX_BYTES`].
@@ -1899,7 +1921,13 @@ pub async fn execute_step(
                         }
                     }
                 }
-                storage::clear_skip_request(conn, &plan.id)?;
+                // Step-scoped tidy: this step finished naturally. The
+                // step-targeted poll already consumed any request aimed at
+                // THIS step (we'd be in the Skipped branch above otherwise), so
+                // the only request that can still be present targets a
+                // DIFFERENT, not-yet-running step — clear ours by predicate so
+                // a sibling step's queued `ralph skip` survives.
+                storage::clear_skip_request_for_step(conn, &plan.id, &step.id)?;
 
                 let parsed = parse_harness_json(&output.stdout);
 
@@ -2134,9 +2162,7 @@ pub async fn execute_step(
                     let strings: Vec<String> = test_results
                         .results
                         .iter()
-                        .map(|r| {
-                            format!("{}: {}", r.command, if r.passed { "pass" } else { "FAIL" })
-                        })
+                        .map(format_test_result_line)
                         .collect();
 
                     // Post-test hook.

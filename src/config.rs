@@ -2505,7 +2505,6 @@ mod tests {
             plan_harness: None,
             created_at: now,
             updated_at: now,
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,

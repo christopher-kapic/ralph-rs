@@ -6,7 +6,7 @@
 // design.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
 use crate::output::{self, OutputContext, OutputFormat};
 use crate::plan::{InterruptionKind, InterruptionOption};
@@ -34,10 +34,6 @@ pub enum QuestionAskOutcome {
     /// treat a lock row with NULL `step_id` the same way: there's no
     /// step to bind a question to.
     NoActiveRun,
-    /// The plan has `questions_enabled = false`. Caller should print the
-    /// encouraging "do your best, document assumptions" message and exit
-    /// non-zero. **No DB write is performed.**
-    Disabled,
 }
 
 /// Stderr message for [`QuestionAskOutcome::NoActiveRun`].
@@ -46,34 +42,8 @@ pub const NO_ACTIVE_RUN_MESSAGE: &str = "ralph question ask: no active ralph run
 /// Stderr message for [`QuestionAskOutcome::NoActiveRun`] on `ralph block`.
 pub const BLOCK_NO_ACTIVE_RUN_MESSAGE: &str = "ralph block: no active ralph run found for this project. This command only works while a step is being executed by `ralph run`.";
 
-/// Stderr message for [`QuestionAskOutcome::Disabled`]. Tone is encouraging
-/// rather than adversarial — the harness will see this in stderr and we want
-/// it to fall back to "make a reasonable guess and flag it" rather than retry
-/// in a loop. Verbatim from TUI-plan.md §17 "Behavior when questions are
-/// disabled".
-pub const DISABLED_MESSAGE: &str = "ralph question ask: questions are not enabled for this plan.
-
-Continue with the work as best you can given the information you have.
-Document any assumption you make in a comment near the relevant code so
-the user can review and adjust. A reasonable guess that's clearly
-flagged is preferable to halting; do not retry this command.
-
-(If the user wants to enable questions, they can press `Q` on this plan
-in the ralph TUI, or run `ralph plan questions on <slug>`.)";
-
-/// Stderr message for [`QuestionAskOutcome::Disabled`] on `ralph block`.
-pub const BLOCK_DISABLED_MESSAGE: &str =
-    "ralph block: question/blocker interruptions are not enabled for this plan.
-
-Do not continue past this blocker silently. Stop, surface the missing
-prerequisite to the user, and explain that ralph's interruption feature
-is disabled for this plan. Do not retry this command.
-
-(If the user wants to enable interruptions, they can press `Q` on this
-plan in the ralph TUI, or run `ralph plan questions on <slug>`.)";
-
 /// The (step_id, attempt) an interruption-raising CLI call binds to, after
-/// the run-lock + `questions_enabled` gate has passed.
+/// the run-lock gate has passed.
 struct BoundStep {
     step_id: String,
     attempt: i32,
@@ -88,10 +58,8 @@ struct BoundStep {
 /// 2. Read `step_id` and the current attempt from the lock row. The lock
 ///    column mirrors the in-flight `execution_logs.attempt`; a missing
 ///    attempt falls back to 1 (the runner's first-attempt behavior).
-/// 3. Read `plans.questions_enabled` for that step's plan. If false, return
-///    [`QuestionAskOutcome::Disabled`] **without touching the DB** — the
-///    same guard, byte-identical, that the pre-DAG `question ask` enforced
-///    for *both* questions and blockers.
+///
+/// Questions/blockers are always enabled — there is no per-plan opt-out.
 ///
 /// `Ok(Ok(BoundStep))` means the gate passed; `Ok(Err(outcome))` is a
 /// short-circuit the caller must return as-is.
@@ -110,24 +78,6 @@ fn resolve_bound_step(
     };
 
     let attempt = live.attempt.unwrap_or(1);
-
-    // Look up the plan via the step (rather than `live.plan_id`) so a
-    // bound-but-unsynced lock row in `--all` mode still works: the step row
-    // is the source of truth for plan membership.
-    let step = storage::get_step_by_id(conn, &step_id)?
-        .with_context(|| format!("Step {step_id} from run lock not found"))?;
-
-    let questions_enabled: bool = conn
-        .query_row(
-            "SELECT questions_enabled FROM plans WHERE id = ?1",
-            params![&step.plan_id],
-            |row| row.get::<_, i64>(0).map(|v| v != 0),
-        )
-        .with_context(|| format!("Plan {} not found for step {}", step.plan_id, step_id))?;
-
-    if !questions_enabled {
-        return Ok(Err(QuestionAskOutcome::Disabled));
-    }
 
     Ok(Ok(BoundStep { step_id, attempt }))
 }
@@ -197,8 +147,8 @@ fn record_interruption(
 
 /// Implement `ralph question ask` against an open DB connection.
 ///
-/// Gates via [`resolve_bound_step`] (the pre-DAG binding model + the
-/// `questions_enabled` guard, unchanged), then inserts a fresh **open
+/// Gates via [`resolve_bound_step`] (the pre-DAG binding model, run-lock
+/// only), then inserts a fresh **open
 /// native `interruptions` row** (`kind=question`, options synthesized from
 /// `suggestions`/`priorities`). The orchestrator's cross-process bridge
 /// observes the open row after the harness returns.
@@ -224,9 +174,9 @@ pub fn record_question_ask(
 /// Implement `ralph block` against an open DB connection.
 ///
 /// Same gate as [`record_question_ask`] (a blocker is rejected outside a
-/// run / when the feature is off, exactly like a question — preserving the
-/// pre-DAG guard), then inserts a fresh **open native `interruptions` row**
-/// (`kind=blocker`, no options). docs/dag-redesign.md §3.4/§7.
+/// run, exactly like a question — preserving the pre-DAG binding), then
+/// inserts a fresh **open native `interruptions` row** (`kind=blocker`, no
+/// options). docs/dag-redesign.md §3.4/§7.
 pub fn record_block(
     conn: &Connection,
     project: &str,
@@ -315,7 +265,8 @@ mod tests {
 
     // -----------------------------------------------------------------
     // `ralph question ask` — native interruptions write + the preserved
-    // run-lock / questions_enabled guard (STEP 21).
+    // run-lock guard (STEP 21). Questions are always enabled — there is
+    // no per-plan opt-out.
     // -----------------------------------------------------------------
 
     #[test]
@@ -341,12 +292,13 @@ mod tests {
     }
 
     #[test]
-    fn questions_disabled_returns_disabled_with_no_db_write() {
+    fn questions_always_raise_an_interruption_in_an_active_run() {
+        // Questions are always enabled now — there is no per-plan opt-out, so
+        // any `question ask` inside a live run raises an interruption.
         let conn = db::open_memory().unwrap();
-        let project = "/proj-disabled";
-        let (plan_id, step_id) = seed_plan_and_step(&conn, "p-disabled", project);
-        storage::set_plan_questions_enabled(&conn, &plan_id, false).unwrap();
-        seed_run_lock(&conn, project, &plan_id, "p-disabled", &step_id, 2);
+        let project = "/proj-always-on";
+        let (plan_id, step_id) = seed_plan_and_step(&conn, "p-always-on", project);
+        seed_run_lock(&conn, project, &plan_id, "p-always-on", &step_id, 2);
 
         let outcome = record_question_ask(
             &conn,
@@ -357,11 +309,11 @@ mod tests {
             &quiet_out(),
         )
         .expect("ok");
-        assert!(matches!(outcome, QuestionAskOutcome::Disabled));
+        assert!(matches!(outcome, QuestionAskOutcome::Recorded { .. }));
         assert_eq!(
             open_count(&conn),
-            0,
-            "questions disabled must not insert an interruption"
+            1,
+            "questions are always enabled — the interruption must be raised"
         );
     }
 
@@ -377,23 +329,23 @@ mod tests {
     }
 
     #[test]
-    fn block_is_rejected_when_questions_disabled() {
+    fn block_always_raises_an_interruption_in_an_active_run() {
+        // `ralph block` mirrors `question ask`: always enabled, so a blocker
+        // inside a live run always raises an interruption.
         let conn = db::open_memory().unwrap();
-        let project = "/proj-blk-disabled";
+        let project = "/proj-blk-always-on";
         let (plan_id, step_id) = seed_plan_and_step(&conn, "p-blk", project);
-        storage::set_plan_questions_enabled(&conn, &plan_id, false).unwrap();
         seed_run_lock(&conn, project, &plan_id, "p-blk", &step_id, 1);
         let outcome = record_block(&conn, project, "needs access", &quiet_out()).expect("ok");
-        assert!(matches!(outcome, QuestionAskOutcome::Disabled));
-        assert_eq!(open_count(&conn), 0);
+        assert!(matches!(outcome, QuestionAskOutcome::Recorded { .. }));
+        assert_eq!(open_count(&conn), 1);
     }
 
     #[test]
-    fn questions_enabled_inserts_native_question_interruption() {
+    fn question_ask_inserts_native_question_interruption() {
         let conn = db::open_memory().unwrap();
         let project = "/proj-enabled";
         let (plan_id, step_id) = seed_plan_and_step(&conn, "p-enabled", project);
-        storage::set_plan_questions_enabled(&conn, &plan_id, true).unwrap();
         seed_run_lock(&conn, project, &plan_id, "p-enabled", &step_id, 2);
 
         let suggestions = vec!["Option A".to_string(), "Option B".to_string()];
@@ -440,7 +392,6 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let project = "/proj-prio";
         let (plan_id, step_id) = seed_plan_and_step(&conn, "p-prio", project);
-        storage::set_plan_questions_enabled(&conn, &plan_id, true).unwrap();
         seed_run_lock(&conn, project, &plan_id, "p-prio", &step_id, 1);
 
         let suggestions = vec!["best".into(), "second".into(), "third".into()];
@@ -473,7 +424,6 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let project = "/proj-block";
         let (plan_id, step_id) = seed_plan_and_step(&conn, "p-block", project);
-        storage::set_plan_questions_enabled(&conn, &plan_id, true).unwrap();
         seed_run_lock(&conn, project, &plan_id, "p-block", &step_id, 3);
 
         let outcome =
@@ -514,7 +464,6 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let project = "/proj-no-suggestions";
         let (plan_id, step_id) = seed_plan_and_step(&conn, "p-empty", project);
-        storage::set_plan_questions_enabled(&conn, &plan_id, true).unwrap();
         seed_run_lock(&conn, project, &plan_id, "p-empty", &step_id, 1);
 
         let outcome = record_question_ask(
@@ -540,7 +489,6 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let project = "/proj-no-attempt";
         let (plan_id, step_id) = seed_plan_and_step(&conn, "p-na", project);
-        storage::set_plan_questions_enabled(&conn, &plan_id, true).unwrap();
         conn.execute(
             "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug, step_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -583,7 +531,6 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let project = "/proj-json-q";
         let (plan_id, step_id) = seed_plan_and_step(&conn, "p-json-q", project);
-        storage::set_plan_questions_enabled(&conn, &plan_id, true).unwrap();
         seed_run_lock(&conn, project, &plan_id, "p-json-q", &step_id, 1);
 
         let outcome =
@@ -602,7 +549,6 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let project = "/proj-json-b";
         let (plan_id, step_id) = seed_plan_and_step(&conn, "p-json-b", project);
-        storage::set_plan_questions_enabled(&conn, &plan_id, true).unwrap();
         seed_run_lock(&conn, project, &plan_id, "p-json-b", &step_id, 2);
 
         let outcome = record_block(&conn, project, "json-blk", &json_out()).expect("ok");

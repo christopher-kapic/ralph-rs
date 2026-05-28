@@ -44,10 +44,6 @@ pub enum PaletteCommand {
     PlanDelete(String),
     /// `/plan approve [<slug>]`.
     PlanApprove(Option<String>),
-    /// `/plan questions on [<slug>]`.
-    PlanQuestionsOn(Option<String>),
-    /// `/plan questions off [<slug>]`.
-    PlanQuestionsOff(Option<String>),
     /// `/plan dependency add` — routes to the plan-dependency sub-view.
     PlanDependencyAdd,
     /// `/plan dependency remove` — routes to the plan-dependency sub-view.
@@ -109,8 +105,6 @@ impl PaletteCommand {
             PaletteCommand::PlanUnarchive(_) => "/plan unarchive",
             PaletteCommand::PlanDelete(_) => "/plan delete",
             PaletteCommand::PlanApprove(_) => "/plan approve",
-            PaletteCommand::PlanQuestionsOn(_) => "/plan questions on",
-            PaletteCommand::PlanQuestionsOff(_) => "/plan questions off",
             PaletteCommand::PlanDependencyAdd => "/plan dependency add",
             PaletteCommand::PlanDependencyRemove => "/plan dependency remove",
             PaletteCommand::PlanDependencyList => "/plan dependency list",
@@ -211,16 +205,6 @@ pub fn parse(input: &str) -> Result<PaletteCommand, ParseError> {
         // /plan approve [<slug>]
         ["plan", "approve"] => Ok(PaletteCommand::PlanApprove(None)),
         ["plan", "approve", slug] => Ok(PaletteCommand::PlanApprove(Some((*slug).to_string()))),
-
-        // /plan questions on|off [<slug>]
-        ["plan", "questions", "on"] => Ok(PaletteCommand::PlanQuestionsOn(None)),
-        ["plan", "questions", "on", slug] => {
-            Ok(PaletteCommand::PlanQuestionsOn(Some((*slug).to_string())))
-        }
-        ["plan", "questions", "off"] => Ok(PaletteCommand::PlanQuestionsOff(None)),
-        ["plan", "questions", "off", slug] => {
-            Ok(PaletteCommand::PlanQuestionsOff(Some((*slug).to_string())))
-        }
 
         // /plan dependency add|remove|list
         ["plan", "dependency", "add"] => Ok(PaletteCommand::PlanDependencyAdd),
@@ -382,14 +366,6 @@ const VERB_SPECS: &[VerbSpec] = &[
     },
     VerbSpec {
         tokens: &["plan", "approve"],
-        arg: ArgSource::PlanSlug,
-    },
-    VerbSpec {
-        tokens: &["plan", "questions", "on"],
-        arg: ArgSource::PlanSlug,
-    },
-    VerbSpec {
-        tokens: &["plan", "questions", "off"],
         arg: ArgSource::PlanSlug,
     },
     VerbSpec {
@@ -966,18 +942,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_plan_questions_on_off() {
-        assert_eq!(
-            parse("/plan questions on"),
-            Ok(PaletteCommand::PlanQuestionsOn(None))
-        );
-        assert_eq!(
-            parse("/plan questions off p"),
-            Ok(PaletteCommand::PlanQuestionsOff(Some("p".to_string())))
-        );
-    }
-
-    #[test]
     fn parses_plan_dependency_subcommands() {
         assert_eq!(
             parse("/plan dependency add"),
@@ -1274,11 +1238,11 @@ mod tests {
 
     #[test]
     fn completion_prefers_longer_verb_match() {
-        // "/plan questions on " should complete plan slugs (the deeper
-        // verb) — NOT cycle through verbs starting with "plan questions".
-        let c = build_completion("/plan questions on ", &ctx(&[], &["alpha", "beta"], &[]))
+        // "/plan approve " should complete plan slugs (the matched verb's
+        // PlanSlug arg) — NOT cycle through verbs starting with "plan".
+        let c = build_completion("/plan approve ", &ctx(&[], &["alpha", "beta"], &[]))
             .expect("candidates");
-        assert_eq!(c.stem, "/plan questions on ");
+        assert_eq!(c.stem, "/plan approve ");
         assert_eq!(c.candidates.len(), 2);
     }
 
@@ -1476,8 +1440,6 @@ mod tests {
             PaletteCommand::PlanUnarchive(String::new()),
             PaletteCommand::PlanDelete(String::new()),
             PaletteCommand::PlanApprove(None),
-            PaletteCommand::PlanQuestionsOn(None),
-            PaletteCommand::PlanQuestionsOff(None),
             PaletteCommand::PlanDependencyAdd,
             PaletteCommand::PlanDependencyRemove,
             PaletteCommand::PlanDependencyList,

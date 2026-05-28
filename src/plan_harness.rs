@@ -494,10 +494,6 @@ atomic and independently verifiable.
 - `ralph step add ... --model <name>` — per-step model override (forwarded to
   the harness's `model_args` template, e.g. `--model sonnet-4.6`); silently
   ignored if the resolved harness has no `model_args` configured.
-- `ralph plan questions on <slug>` — opt in to mid-step harness questions.
-  Without this, the harness's `ralph question ask` / `ralph block` calls fail
-  with a disabled-feature error. Turn it on if any step's prompt expects to
-  raise a question or blocker.
 - `ralph config review set [--harness <h>] [--model <m>] [--enabled <bool>]` —
   the global built-in-review harness/model/default (only the fields you pass
   are written).

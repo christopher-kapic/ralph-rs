@@ -819,17 +819,17 @@ impl std::str::FromStr for TestStatus {
 ///
 /// Matches the physical table layout after all migrations: V1 defined every
 /// column through `updated_at`, V5 appended `plan_harness`,
-/// V16 appended `questions_enabled`, V18 appended `pause_requested`,
+/// V18 appended `pause_requested`,
 /// V19 appended `last_run_branch`, V20 appended `last_run_started_at`,
 /// V23 appended `skip_requested_step_id` + `skip_changes`, V24
 /// appended `retry_strategy`, and V27 appended `review_enabled` via
 /// `ALTER TABLE ... ADD COLUMN`. V10's
 /// `prompt_prefix`/`prompt_suffix` and V14's `context_prepend` were
-/// dropped again by V21 (preserving the physical order of the remaining
-/// columns). Every `Plan`-returning query MUST use this list so
-/// [`Plan::from_row`]'s indices line up — a raw `SELECT *` would
-/// otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, questions_enabled, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, retry_strategy, review_enabled, squash_on_complete, max_review_corrections";
+/// dropped again by V21, and V16's `questions_enabled` was dropped by V36
+/// (preserving the physical order of the remaining columns). Every
+/// `Plan`-returning query MUST use this list so [`Plan::from_row`]'s indices
+/// line up — a raw `SELECT *` would otherwise swap columns.
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, retry_strategy, review_enabled, squash_on_complete, max_review_corrections";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -846,15 +846,6 @@ pub struct Plan {
     pub plan_harness: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// Per-plan opt-in for the pause-for-question feature. When `false`
-    /// (default), `ralph question ask` / `ralph block` invocations from a
-    /// harness against a step in this plan are rejected and no
-    /// `interruptions` rows are written. When `true`, the runner inspects
-    /// open interruptions after each attempt and blocks the branch. Toggled
-    /// via `ralph plan questions on|off` and the `Q` keybinding in the TUI
-    /// plan list.
-    #[serde(default)]
-    pub questions_enabled: bool,
     /// Operator-requested graceful pause flag. When `true`, the runner
     /// finishes the currently-executing step, then exits with
     /// `TerminationReason::PausedByUser` between steps and clears the flag
@@ -876,7 +867,7 @@ pub struct Plan {
     /// (written by the runner alongside `last_run_branch`). Provides the
     /// resume resolver with a stable "last actually ran" anchor, so its
     /// `ORDER BY` can ignore unrelated bumps to `updated_at` (e.g. toggling
-    /// `questions_enabled` or `pause_requested`). `None` for never-run plans.
+    /// `pause_requested`). `None` for never-run plans.
     #[serde(default)]
     pub last_run_started_at: Option<String>,
     /// Step UUID of a pending cross-process skip request, or `None` when no
@@ -939,9 +930,9 @@ impl Plan {
     /// Expected column order matches [`PLAN_COLUMNS`]:
     /// id, slug, project, branch_name, description, status, harness, agent,
     /// deterministic_tests, created_at, updated_at, plan_harness,
-    /// questions_enabled, pause_requested, last_run_branch,
-    /// last_run_started_at, skip_requested_step_id, skip_changes,
-    /// retry_strategy, review_enabled, squash_on_complete
+    /// pause_requested, last_run_branch, last_run_started_at,
+    /// skip_requested_step_id, skip_changes, retry_strategy, review_enabled,
+    /// squash_on_complete, max_review_corrections
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -963,20 +954,18 @@ impl Plan {
             rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e))
         })?;
 
-        // `questions_enabled` and `pause_requested` are INTEGER NOT NULL
-        // DEFAULT 0 on disk; SQLite has no native bool, so read as i64 and
-        // coerce.
-        let questions_enabled_int: i64 = row.get(12)?;
-        let pause_requested_int: i64 = row.get(13)?;
+        // `pause_requested` is INTEGER NOT NULL DEFAULT 0 on disk; SQLite has
+        // no native bool, so read as i64 and coerce.
+        let pause_requested_int: i64 = row.get(12)?;
 
         // `retry_strategy` is a nullable TEXT column (V24). NULL means "no
         // plan-level override" — resolution falls through to the global
         // default. A non-null value must parse to a known variant.
-        let retry_strategy_str: Option<String> = row.get(18)?;
+        let retry_strategy_str: Option<String> = row.get(17)?;
         let retry_strategy = match retry_strategy_str {
             Some(s) => Some(s.parse::<RetryStrategy>().map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    18,
+                    17,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
@@ -984,33 +973,32 @@ impl Plan {
             None => None,
         };
 
-        // `review_enabled` is a nullable INTEGER column (V27) at index 19.
+        // `review_enabled` is a nullable INTEGER column (V27) at index 18.
         // NULL means "no plan-level override" — resolution falls through to
         // the global `config.review.enabled` (then `false`). SQLite has no
         // native bool, so read as `Option<i64>` and coerce non-null to a
-        // bool (any non-zero = true), mirroring the `questions_enabled`
-        // integer-to-bool handling above.
-        let review_enabled: Option<bool> = row.get::<_, Option<i64>>(19)?.map(|v| v != 0);
+        // bool (any non-zero = true).
+        let review_enabled: Option<bool> = row.get::<_, Option<i64>>(18)?.map(|v| v != 0);
 
         // `squash_on_complete` is a nullable INTEGER column (V28) at index
-        // 20. NULL (pre-V28 / never-set) coerces to `false` — the default-OFF
+        // 19. NULL (pre-V28 / never-set) coerces to `false` — the default-OFF
         // behavior. SQLite has no native bool, so read as `Option<i64>` and
-        // treat any non-zero as true (same pattern as `review_enabled` /
-        // `questions_enabled`). `.ok()`-tolerant for SELECTs/raw test inserts
-        // that predate the column.
+        // treat any non-zero as true (same pattern as `review_enabled`).
+        // `.ok()`-tolerant for SELECTs/raw test inserts that predate the
+        // column.
         let squash_on_complete: bool = row
-            .get::<_, Option<i64>>(20)
+            .get::<_, Option<i64>>(19)
             .ok()
             .flatten()
             .map(|v| v != 0)
             .unwrap_or(false);
 
         // `max_review_corrections` is a nullable INTEGER column (V30) at
-        // index 21. NULL (pre-V30 / never-set) stays `None` — the runner
+        // index 20. NULL (pre-V30 / never-set) stays `None` — the runner
         // then uses the built-in default. `.ok()`-tolerant for raw test
         // inserts / SELECTs that predate the column.
         let max_review_corrections: Option<i32> = row
-            .get::<_, Option<i64>>(21)
+            .get::<_, Option<i64>>(20)
             .ok()
             .flatten()
             .map(|v| v as i32);
@@ -1028,12 +1016,11 @@ impl Plan {
             plan_harness: row.get(11)?,
             created_at,
             updated_at,
-            questions_enabled: questions_enabled_int != 0,
             pause_requested: pause_requested_int != 0,
-            last_run_branch: row.get(14)?,
-            last_run_started_at: row.get(15)?,
-            skip_requested_step_id: row.get(16)?,
-            skip_changes: row.get(17)?,
+            last_run_branch: row.get(13)?,
+            last_run_started_at: row.get(14)?,
+            skip_requested_step_id: row.get(15)?,
+            skip_changes: row.get(16)?,
             retry_strategy,
             review_enabled,
             squash_on_complete,
@@ -1204,7 +1191,7 @@ impl Step {
         // (mirrors the `short_id` / `tags` handling above).
         //
         // - `review_enabled` (19): nullable INTEGER tri-state bool; non-null
-        //   coerces to a bool (any non-zero = true), like `questions_enabled`
+        //   coerces to a bool (any non-zero = true), like `review_enabled`
         //   on `Plan`.
         // - `review_status` (20): nullable TEXT; a non-null value must parse
         //   to a known `ReviewStatus` variant (NULL = pending).
@@ -2353,7 +2340,6 @@ mod tests {
                 plan_harness: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
-                questions_enabled: false,
                 pause_requested: false,
                 last_run_branch: None,
                 last_run_started_at: None,

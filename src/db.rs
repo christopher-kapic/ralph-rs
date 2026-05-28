@@ -44,6 +44,8 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v32,
     migrate_v33,
     migrate_v34,
+    migrate_v35,
+    migrate_v36,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -681,7 +683,7 @@ fn migrate_v20(conn: &Connection) -> Result<()> {
     // `last_run_branch`). It exists so resume-resolver ordering can use a
     // stable "last actually ran" timestamp instead of the easily-bumped
     // `updated_at` (which is also touched by unrelated edits like toggling
-    // `questions_enabled` or `pause_requested`).
+    // `pause_requested`).
     //
     // Nullable with no backfill: pre-V20 plans report NULL until their next
     // run. The resume resolver's `ORDER BY` lists this column first with
@@ -1276,16 +1278,25 @@ fn migrate_v31(conn: &Connection) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Migration V32: allow duplicate logical attempt numbers in execution_logs
+// Migration V32: rebuild execution_logs (structural no-op, retained for
+// version continuity)
 // ---------------------------------------------------------------------------
 
 fn migrate_v32(conn: &Connection) -> Result<()> {
     // Retry-with-parked-changes on the retry-exhausted blocker resets
     // `steps.attempts` to 0 but keeps the historical `execution_logs` rows
-    // as the per-step audit trail. The old `UNIQUE(step_id, attempt)`
-    // constraint made that impossible: the next logical attempt=1 row would
-    // fail to insert. Rebuild the table without the uniqueness constraint,
-    // preserving every row and its id chronology.
+    // as the per-step audit trail — so duplicate logical `(step_id, attempt)`
+    // values (e.g. a second attempt=1 after a from-scratch retry) must be
+    // allowed. This rebuild was intended to drop a `UNIQUE(step_id, attempt)`
+    // constraint, but — see the migration history (V1 `CREATE TABLE
+    // execution_logs` and every later Vxx) — that constraint was never
+    // actually created: `(step_id, attempt)` only ever had the *non-unique*
+    // `CREATE INDEX idx_logs_step_attempt`. So duplicates were already
+    // permitted and this rebuild is a structural no-op. It is kept (not
+    // removed/renumbered) for upgrade-ordering continuity: renumbering a
+    // shipped migration would corrupt the version sequence for anyone already
+    // past V32. The rebuild faithfully copies every column and row (ordered
+    // by id) into an identically-shaped table, so it is harmless.
     conn.execute_batch(
         "
         CREATE TABLE execution_logs_v32 (
@@ -1386,6 +1397,49 @@ fn migrate_v34(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V35: human-approved corrective requests (review-loop escalation)
+// ---------------------------------------------------------------------------
+
+fn migrate_v35(conn: &Connection) -> Result<()> {
+    // docs/dag-redesign.md §10 item 4 / §14.5: when a corrective chain
+    // exceeds `max_review_corrections`, `consume_corrective_request` raises a
+    // "review loop — needs human" blocker and leaves the step non-terminal.
+    // Resolving that blocker now grants exactly ONE more review→correction
+    // cycle: the resolver inserts a corrective request flagged
+    // `human_approved = 1`, which `consume_corrective_request` honors by
+    // bypassing the recursion-cap check for that single hop. If the resulting
+    // corrective step also fails review, `finalize_review` inserts a NORMAL
+    // (human_approved = 0) request → the cap check fires again → re-escalates,
+    // so the human stays the loop gate.
+    //
+    // Constant `DEFAULT 0` keeps this a valid SQLite `ADD COLUMN` (additive,
+    // old DBs migrate forward untouched; every pre-existing request is a
+    // not-human-approved reviewer request).
+    conn.execute_batch(
+        "ALTER TABLE corrective_step_requests ADD COLUMN human_approved INTEGER NOT NULL DEFAULT 0;",
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V36: drop the per-plan questions_enabled toggle (always-on)
+// ---------------------------------------------------------------------------
+
+fn migrate_v36(conn: &Connection) -> Result<()> {
+    // Questions/blockers are now ALWAYS enabled — a harness's `ralph question
+    // ask` / `ralph block` always raises an interruption and the
+    // question-ask instruction is always present in the step prompt. The
+    // per-plan opt-out (`plans.questions_enabled`, added in V16) is gone.
+    //
+    // V16 added it as a plain INTEGER column with no index/trigger/view/
+    // generated-column dependency (the V16 indexes are on `step_questions`,
+    // a separate table dropped in V26), so a direct `DROP COLUMN` is safe on
+    // the bundled modern SQLite and avoids a full table rebuild.
+    conn.execute_batch("ALTER TABLE plans DROP COLUMN questions_enabled;")?;
     Ok(())
 }
 
@@ -3832,6 +3886,174 @@ mod tests {
     }
 
     #[test]
+    fn test_migration_v35_adds_human_approved_to_corrective_requests() {
+        // Mirror of `test_migration_v29`/`v30`: seed a pre-V35 DB (a plan + a
+        // step + an open corrective request), run V35, verify the existing
+        // request row defaults `human_approved` to 0, a fresh explicit value
+        // round-trips, the schema carries the column, user_version lands at
+        // CURRENT_VERSION, and re-open is a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v34.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v34 only.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(34) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["p1", "old", "/proj", "b", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO corrective_step_requests \
+                (id, reviewed_step_id, reviewed_iteration, commit_sha, issues, verdict_body, requested_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            rusqlite::params!["r1", "s1", 1_i64, "deadbeef", 1_i64, "defect"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V35 applies. The pre-V35 row must default human_approved to 0.
+        let conn = open_at(&path).unwrap();
+        let approved: i64 = conn
+            .query_row(
+                "SELECT human_approved FROM corrective_step_requests WHERE id = ?1",
+                ["r1"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            approved, 0,
+            "pre-V35 corrective requests must default human_approved to 0"
+        );
+
+        // The schema actually carries the column.
+        let cols: Vec<String> = conn
+            .prepare("SELECT * FROM corrective_step_requests LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(
+            cols.iter().any(|c| c == "human_approved"),
+            "corrective_step_requests must have a human_approved column post-V35 (cols: {cols:?})"
+        );
+
+        // A fresh insert with an explicit value round-trips.
+        conn.execute(
+            "INSERT INTO corrective_step_requests \
+                (id, reviewed_step_id, reviewed_iteration, commit_sha, issues, verdict_body, human_approved, requested_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            rusqlite::params!["r2", "s1", 2_i64, "cafe", 1_i64, "human", 1_i64],
+        )
+        .unwrap();
+        let approved2: i64 = conn
+            .query_row(
+                "SELECT human_approved FROM corrective_step_requests WHERE id = ?1",
+                ["r2"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(approved2, 1);
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v36_drops_questions_enabled_column() {
+        // Mirror of `test_migration_v35`: seed a pre-V36 DB (a plan still
+        // carrying the questions_enabled column), run V36, verify the column
+        // is gone, the plan row and its other columns survive, user_version
+        // lands at CURRENT_VERSION, and re-open is a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v35.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v35 only — the schema still has the column.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(35) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        // Seed a plan with an explicit (now-doomed) questions_enabled value
+        // plus other columns whose data must survive the drop.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, questions_enabled, max_review_corrections)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["p1", "old", "/proj", "b", "desc", 1_i64, 7_i64],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V36 applies and drops the column.
+        let conn = open_at(&path).unwrap();
+        let cols: Vec<String> = conn
+            .prepare("SELECT * FROM plans LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(
+            !cols.iter().any(|c| c == "questions_enabled"),
+            "plans must NOT have a questions_enabled column post-V36 (cols: {cols:?})"
+        );
+
+        // The row and its surviving columns are intact.
+        let (slug, desc, mrc): (String, String, i64) = conn
+            .query_row(
+                "SELECT slug, description, max_review_corrections FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(slug, "old");
+        assert_eq!(desc, "desc");
+        assert_eq!(mrc, 7, "other plan columns/data must survive the drop");
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
     fn test_migration_v31_enforces_plan_local_step_dependencies() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("old_v30.db");
@@ -3923,14 +4145,21 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_v32_allows_duplicate_log_attempts_per_step() {
+    fn test_migration_v32_preserves_rows_and_keeps_duplicate_attempts_allowed() {
+        // V32 is a structural no-op: it rebuilds execution_logs but the
+        // `UNIQUE(step_id, attempt)` it was meant to drop never existed
+        // (`(step_id, attempt)` only ever had the non-unique
+        // `idx_logs_step_attempt`). This test asserts what is actually true:
+        // duplicate logical `(step_id, attempt)` rows are accepted BOTH
+        // before V32 (proving no UNIQUE existed) AND after it, and the
+        // rebuild preserves every row in id order.
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("old_v31.db");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
-        // Apply migrations v1..=v31 only so the old UNIQUE(step_id, attempt)
-        // schema is present before V32 rebuilds the table.
+        // Apply migrations v1..=v31 only, so the pre-V32 execution_logs schema
+        // is present (the one V32 rebuilds).
         for (i, migration) in MIGRATIONS.iter().enumerate().take(31) {
             let version = (i as u32) + 1;
             conn.execute_batch("BEGIN;").unwrap();
@@ -3949,17 +4178,26 @@ mod tests {
             rusqlite::params!["s1", "p1", "a0", "Step", "d"],
         )
         .unwrap();
+        // PROOF no UNIQUE(step_id, attempt) existed pre-V32: two rows with the
+        // SAME (step_id, attempt) both insert successfully on the v31 schema.
         conn.execute(
             "INSERT INTO execution_logs (step_id, attempt, prompt_text) VALUES (?1, ?2, ?3)",
             rusqlite::params!["s1", 1_i64, "first cycle"],
         )
         .unwrap();
-        drop(conn);
-
-        let conn = open_at(&path).unwrap();
         conn.execute(
             "INSERT INTO execution_logs (step_id, attempt, prompt_text) VALUES (?1, ?2, ?3)",
             rusqlite::params!["s1", 1_i64, "second cycle"],
+        )
+        .expect("pre-V32 schema already allows duplicate (step_id, attempt) rows");
+        drop(conn);
+
+        // Run V32 (the rebuild). It must preserve both existing rows...
+        let conn = open_at(&path).unwrap();
+        // ...and continue to accept further duplicates afterwards.
+        conn.execute(
+            "INSERT INTO execution_logs (step_id, attempt, prompt_text) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["s1", 1_i64, "third cycle"],
         )
         .unwrap();
 
@@ -3972,7 +4210,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             prompts,
-            vec!["first cycle".to_string(), "second cycle".to_string()]
+            vec![
+                "first cycle".to_string(),
+                "second cycle".to_string(),
+                "third cycle".to_string()
+            ],
+            "the rebuild must preserve all pre-V32 rows in id order"
         );
 
         let version: u32 = conn
@@ -4130,40 +4373,29 @@ mod tests {
 
     #[test]
     fn test_migration_v16_runs_clean_on_fresh_db() {
-        // A fresh in-memory DB applies every migration including V16
-        // without requiring the staged-from-V15 path above.
+        // A fresh in-memory DB applies every migration, including V16's
+        // questions_enabled add and V36's subsequent drop. A basic plan
+        // insert must succeed and the questions_enabled column must be gone
+        // at HEAD (V36).
         let conn = open_memory().expect("open_memory");
 
-        // questions_enabled defaults to 0 on fresh inserts.
         conn.execute(
             "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params!["p1", "slug", "/proj", "b", "d"],
         )
         .unwrap();
-        let qe: i64 = conn
-            .query_row(
-                "SELECT questions_enabled FROM plans WHERE id = ?1",
-                ["p1"],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(qe, 0);
 
-        // Explicit 1 round-trips.
-        conn.execute(
-            "INSERT INTO plans (id, slug, project, branch_name, description, questions_enabled)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params!["p2", "slug2", "/proj", "b", "d", 1i64],
-        )
-        .unwrap();
-        let qe: i64 = conn
-            .query_row(
-                "SELECT questions_enabled FROM plans WHERE id = ?1",
-                ["p2"],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(qe, 1);
+        let cols: Vec<String> = conn
+            .prepare("SELECT * FROM plans LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(
+            !cols.iter().any(|c| c == "questions_enabled"),
+            "questions_enabled must be dropped by V36 (cols: {cols:?})"
+        );
     }
 
     #[test]

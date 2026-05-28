@@ -96,8 +96,18 @@ fn is_retry_exhausted_auto_blocker(interruption: &crate::plan::Interruption) -> 
             .any(|o| o.text == RETRY_EXHAUSTED_OPTION_FAIL)
 }
 
+/// Match a resolution against a special option's exact stored text.
+///
+/// `--option K` selection maps to the option's exact `.text` (see
+/// `cmd_interruption_resolve`), so an exact (case-sensitive) compare still
+/// recognizes a deliberate option pick. The match is intentionally
+/// case-SENSITIVE: a freeform `--answer "mark step failed"` must NOT be
+/// coerced into the terminal option branch — a freeform answer that matches
+/// neither option text is the documented retry-with-hint path (it flows into
+/// the next prompt via the bounded "Resolved interruptions" section). `trim()`
+/// is kept so leading/trailing whitespace on an exact pick is forgiven.
 fn resolution_matches_option(resolution_text: &str, option_text: &str) -> bool {
-    resolution_text.trim().eq_ignore_ascii_case(option_text)
+    resolution_text.trim() == option_text
 }
 
 /// The retry-exhausted side-effect, in-transaction. Returns the parked
@@ -149,6 +159,16 @@ fn apply_retry_exhausted_side_effect_in_tx(
 fn is_parked_restore_blocker(interruption: &crate::plan::Interruption) -> bool {
     interruption.kind == InterruptionKind::Blocker
         && interruption.body.starts_with(PARKED_RESTORE_BLOCKER_MARKER)
+}
+
+/// True iff `interruption` is the review-loop escalation blocker
+/// (`review::consume_corrective_request`'s cap-exceeded path). Detected by the
+/// [`crate::review::REVIEW_LOOP_ESCALATION_MARKER`] body prefix, mirroring
+/// [`is_parked_restore_blocker`] (the blocker carries empty options, so a
+/// body marker — not an option-content check — is the recognition contract).
+fn is_review_loop_escalation_blocker(interruption: &crate::plan::Interruption) -> bool {
+    interruption.kind == InterruptionKind::Blocker
+        && crate::review::is_review_loop_escalation_blocker(&interruption.body)
 }
 
 /// The parked-restore side-effect, in-transaction. Mirrors
@@ -206,6 +226,37 @@ fn apply_parked_restore_side_effect_in_tx(
     Ok(parked)
 }
 
+/// The review-loop-escalation side-effect, in-transaction (§10 item 4 /
+/// §14.5). Resolving the "review loop — needs human" blocker grants exactly
+/// ONE more review→correction cycle: we insert a `human_approved = true`
+/// corrective request for the escalated step so the orchestrator's drain
+/// (`review::consume_corrective_request`) inserts the corrective step +
+/// re-parents + finalizes the escalated step `Complete`, bypassing the
+/// recursion cap for this single hop. If that corrective step also fails
+/// review, `finalize_review` inserts a NORMAL (human_approved = false)
+/// request → the cap fires again → re-escalates, so the human stays the gate.
+///
+/// `commit_sha` / `issues` / `verdict_body` are audit-only (never read by
+/// `insert_corrective_step`, which builds the corrective step purely from the
+/// reviewed step's criteria), so a best-effort placeholder suffices — we do
+/// NOT add git plumbing just to fill an unused audit field.
+fn apply_review_loop_escalation_side_effect_in_tx(
+    tx: &Connection,
+    step_id: &str,
+    iteration: i32,
+) -> Result<()> {
+    storage::insert_corrective_step_request(
+        tx,
+        step_id,
+        iteration,
+        "", // commit_sha: audit-only, unused on insert
+        0,  // issues: audit-only
+        Some("human approved one more correction cycle after review-loop escalation"),
+        true, // human_approved → consume_corrective_request bypasses the cap for this hop
+    )?;
+    Ok(())
+}
+
 /// Atomic resolve: flip `interruptions.state='resolved'` AND, when the row
 /// is the Phase B retry-exhausted auto-blocker, apply the Retry/Fail
 /// side-effect — **all inside a single `unchecked_transaction`**.
@@ -251,7 +302,13 @@ pub fn resolve_interruption_with_retry_handling(
     // both — they're raised by different code paths with different option
     // sets / body markers).
     let is_parked_restore = !is_auto && is_parked_restore_blocker(&interruption);
+    // Review-loop escalation blocker (§10 item 4 / §14.5): resolving it grants
+    // exactly ONE more review→correction cycle. Mutually exclusive with the
+    // other two (raised by a different path with a distinct body marker).
+    let is_review_loop_escalation =
+        !is_auto && !is_parked_restore && is_review_loop_escalation_blocker(&interruption);
     let step_id = interruption.step_id.clone();
+    let escalation_iteration = interruption.attempt;
     let want_fail =
         is_auto && resolution_matches_option(resolution_text, RETRY_EXHAUSTED_OPTION_FAIL);
 
@@ -265,6 +322,16 @@ pub fn resolve_interruption_with_retry_handling(
             // and returns the parked state so the stash is dropped
             // post-commit, mirroring the retry-exhausted Fail arm.
             apply_parked_restore_side_effect_in_tx(tx, &step_id, resolution_text)
+        } else if is_review_loop_escalation {
+            // Insert a `human_approved = true` corrective request in the SAME
+            // transaction as the resolve. This is a *request* write (not a DAG
+            // write), so the CLI/TUI process may do it; the orchestrator
+            // drains it as the sole writer on the next scheduler tick (same
+            // run) or on `ralph resume`, bypassing the cap for this one hop.
+            // commit_sha/issues/verdict_body are audit-only (unused by
+            // `insert_corrective_step`), so a best-effort placeholder is fine.
+            apply_review_loop_escalation_side_effect_in_tx(tx, &step_id, escalation_iteration)?;
+            Ok(None)
         } else {
             Ok(None)
         }
@@ -290,6 +357,34 @@ pub fn resolve_interruption_with_retry_handling(
 /// the numbered-list UX); anything else is treated as an id. An id that does
 /// not match any *open* interruption falls through to the caller's
 /// resolve/show, which produces a precise native error.
+/// A short, human-readable preview of an interruption body for the resolve
+/// echo: strip any internal body marker
+/// ([`PARKED_RESTORE_BLOCKER_MARKER`] /
+/// [`crate::review::REVIEW_LOOP_ESCALATION_MARKER`], each a prefix on its own
+/// line) so the operator sees the readable text rather than the machine
+/// marker, take the first non-empty line, then char-truncate.
+fn body_preview(body: &str) -> String {
+    let mut text = body.trim_start();
+    for marker in [
+        PARKED_RESTORE_BLOCKER_MARKER,
+        crate::review::REVIEW_LOOP_ESCALATION_MARKER,
+    ] {
+        if let Some(rest) = text.strip_prefix(marker) {
+            text = rest.trim_start();
+            break;
+        }
+    }
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let first = first.trim();
+    const MAX: usize = 80;
+    if first.chars().count() > MAX {
+        let truncated: String = first.chars().take(MAX).collect();
+        format!("{truncated}…")
+    } else {
+        first.to_string()
+    }
+}
+
 fn resolve_selector<'a>(opens: &'a [OpenQuestion], selector: &str) -> Option<&'a OpenQuestion> {
     if let Ok(idx) = selector.parse::<usize>() {
         if idx >= 1 && idx <= opens.len() {
@@ -529,6 +624,11 @@ pub fn cmd_interruption_resolve(
         comment,
     );
 
+    // Echo which interruption was actually resolved. The selector may be a
+    // 1-based index, and indices shift if a concurrent `ralph run` raises a
+    // new interruption between the user's `list` and `resolve` — surfacing the
+    // resolved target's id/plan/step/kind/body makes a mismatch obvious.
+    let preview = body_preview(&q.question);
     if out.format == OutputFormat::Json {
         let json = serde_json::json!({
             "resolved": true,
@@ -536,15 +636,25 @@ pub fn cmd_interruption_resolve(
             "kind": q.kind.as_str(),
             "plan_slug": q.plan_slug,
             "step_num": q.step_num,
+            "step_title": q.step_title,
+            "body": preview,
             "resolution": resolution,
             "comment": comment,
         });
         println!("{}", serde_json::to_string(&json)?);
     } else {
+        let id_prefix: String = q.id.chars().take(8).collect();
         println!(
-            "Resolved interruption on plan '{}' step {}.",
-            q.plan_slug, q.step_num
+            "Resolved {} interruption {} on plan '{}' step {} ({}).",
+            q.kind.as_str(),
+            id_prefix,
+            q.plan_slug,
+            q.step_num,
+            q.step_title.trim()
         );
+        if !preview.is_empty() {
+            println!("    {preview}");
+        }
     }
     Ok(())
 }
@@ -787,18 +897,47 @@ mod tests {
         );
     }
 
+    /// Fix 1: the Fail option match is EXACT (case-sensitive) but trims
+    /// surrounding whitespace. A whitespace-padded EXACT pick still flips to
+    /// Failed; a case-mismatched freeform string is NOT coerced into Fail.
     #[test]
-    fn test_apply_retry_exhausted_resolution_fail_match_is_trimmed_and_case_insensitive() {
+    fn test_apply_retry_exhausted_resolution_fail_match_is_trimmed_exact() {
         let conn = db::open_memory().unwrap();
         let project = "/proj-rer-fail-normalized";
         let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
         storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_auto_blocker(&conn, &step_id);
+
+        // Whitespace-padded but otherwise EXACT option text => Fail.
+        let padded = format!("  {RETRY_EXHAUSTED_OPTION_FAIL}  ");
+        let acted = apply_retry_exhausted_resolution(&conn, project, &id, &padded).unwrap();
+        assert!(acted);
+        assert_eq!(step_status(&conn, &step_id), StepStatus::Failed);
+    }
+
+    /// Fix 1: a case-mismatched freeform answer (`"mark step failed"` lower)
+    /// must NOT terminally fail the step — it falls through to
+    /// retry-with-hint (status stays Pending, attempts reset). Pre-fix the
+    /// match was `eq_ignore_ascii_case`, which mis-classified this as Fail.
+    #[test]
+    fn test_apply_retry_exhausted_resolution_case_mismatch_freeform_is_retry() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-rer-case-mismatch";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 3).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
         let id = seed_auto_blocker(&conn, &step_id);
 
         let acted =
             apply_retry_exhausted_resolution(&conn, project, &id, "  mark step failed  ").unwrap();
-        assert!(acted);
-        assert_eq!(step_status(&conn, &step_id), StepStatus::Failed);
+        assert!(acted, "auto-blocker still recognized regardless of text");
+        assert_eq!(
+            step_status(&conn, &step_id),
+            StepStatus::Pending,
+            "case-mismatched freeform is retry-with-hint, not Fail",
+        );
+        assert_eq!(step_attempts(&conn, &step_id), 0);
     }
 
     #[test]
@@ -1440,10 +1579,42 @@ mod tests {
     /// resolves the interruption. Pre-fix this was a no-op (options were
     /// empty, no side effect wired) and the step stayed Pending; the
     /// scheduler then re-fired the same restore error on the next tick.
+    /// Fix 1: the MARK_FAILED match is EXACT (case-sensitive) but trims
+    /// surrounding whitespace. A whitespace-padded EXACT freeform answer
+    /// still flips the step to Failed.
     #[test]
-    fn test_parked_restore_blocker_mark_failed_match_is_trimmed_and_case_insensitive() {
+    fn test_parked_restore_blocker_mark_failed_match_is_trimmed_exact() {
         let conn = db::open_memory().unwrap();
         let project = "/proj-pr-fail-normalized";
+        let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        storage::set_step_attempts(&conn, &step_id, 2).unwrap();
+        storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
+        let id = seed_parked_restore_blocker(&conn, &step_id);
+
+        let padded = format!("  {PARKED_RESTORE_OPTION_MARK_FAILED}  ");
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &id,
+            None,
+            Some(&padded),
+            None,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        assert_eq!(step_status_q(&conn, &step_id), StepStatus::Failed);
+    }
+
+    /// Fix 1: a case-mismatched freeform answer (`"skip and mark failed"`
+    /// lower) must NOT terminally fail the step — it falls through to the
+    /// MARK_PENDING (start-fresh-with-hint) path. Pre-fix the match was
+    /// `eq_ignore_ascii_case`, which mis-classified this as Fail.
+    #[test]
+    fn test_parked_restore_blocker_case_mismatch_freeform_is_pending() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-pr-case-mismatch";
         let (_plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
         storage::set_step_attempts(&conn, &step_id, 2).unwrap();
         storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
@@ -1461,7 +1632,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(step_status_q(&conn, &step_id), StepStatus::Failed);
+        assert_eq!(
+            step_status_q(&conn, &step_id),
+            StepStatus::Pending,
+            "case-mismatched freeform falls through to MARK_PENDING, not Fail",
+        );
     }
 
     #[test]
@@ -1606,5 +1781,101 @@ mod tests {
         );
         // But the side-effect still happened.
         assert_eq!(step_status_q(&conn, &step_id), StepStatus::Failed);
+    }
+
+    // -- §10 item 4: review-loop escalation blocker resolution ----------
+
+    /// Helper: insert a review-loop escalation blocker the way
+    /// `review::consume_corrective_request` would — the marker-prefixed body
+    /// + empty options (the human resolves it with `--answer`).
+    fn seed_review_loop_escalation_blocker(conn: &Connection, step_id: &str, attempt: i32) -> String {
+        let body = format!(
+            "{}\nreview loop — needs human: step has been corrected 1 time(s) and still fails.",
+            crate::review::REVIEW_LOOP_ESCALATION_MARKER
+        );
+        storage::insert_interruption(
+            conn,
+            step_id,
+            attempt,
+            InterruptionKind::Blocker,
+            &body,
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// Resolving the escalation blocker inserts exactly ONE
+    /// `human_approved = true` open corrective request for the escalated step
+    /// and marks the interruption resolved.
+    #[test]
+    fn test_resolve_escalation_blocker_inserts_one_human_approved_request() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-escalation";
+        let (plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        let id = seed_review_loop_escalation_blocker(&conn, &step_id, 3);
+
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &id,
+            None,
+            Some("approved, take one more pass"),
+            None,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        // The blocker is resolved.
+        let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
+        assert!(after.is_empty(), "escalation blocker resolved");
+
+        // Exactly one open corrective request, human-approved, for this step.
+        let reqs =
+            storage::list_open_corrective_step_requests_for_plan(&conn, &plan_id).unwrap();
+        assert_eq!(reqs.len(), 1, "exactly one corrective request inserted");
+        assert!(reqs[0].human_approved, "request must be human-approved");
+        assert_eq!(reqs[0].reviewed_step_id, step_id);
+        assert_eq!(
+            reqs[0].reviewed_iteration, 3,
+            "iteration carried from the blocker's attempt"
+        );
+    }
+
+    /// A non-escalation blocker resolution must NOT insert a corrective
+    /// request (the marker gate is exact).
+    #[test]
+    fn test_resolve_plain_blocker_inserts_no_corrective_request() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-plain-blocker";
+        let (plan_id, step_id) = seed_plan_and_step(&conn, "p", project);
+        let id = storage::insert_interruption(
+            &conn,
+            &step_id,
+            1,
+            InterruptionKind::Blocker,
+            "needs sudo",
+            &[],
+        )
+        .unwrap();
+
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            None,
+            &id,
+            None,
+            Some("granted"),
+            None,
+            &quiet_out(),
+        )
+        .unwrap();
+
+        let reqs =
+            storage::list_open_corrective_step_requests_for_plan(&conn, &plan_id).unwrap();
+        assert!(
+            reqs.is_empty(),
+            "a plain blocker must not insert a corrective request"
+        );
     }
 }

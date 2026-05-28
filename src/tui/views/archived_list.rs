@@ -432,7 +432,6 @@ mod tests {
             plan_harness: None,
             created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
             updated_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,

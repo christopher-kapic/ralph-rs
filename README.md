@@ -231,7 +231,6 @@ The full list lives behind `?` in each view; this is the cheat sheet.
 | Create                                  | `i` / `a`      | —         | `i` (above) / `a` (below) | — (palette: `/step add`) |
 | Delete                                  | `d` (archive)  | `d` (delete) | `d`             | —             |
 | Approve plan                            | `A`            | —         | (palette `/plan approve`) | —      |
-| Toggle questions on plan                | `Q`            | —         | (palette `/plan questions on\|off`) | — |
 | Run / resume                            | (palette `/run`) | —       | `R`                | —             |
 | Stop the live run                       | —              | —         | `S`                | —             |
 | Skip running step                       | —              | —         | `s`                | —             |
@@ -273,10 +272,10 @@ phase transitions, and the final summary. See
 [docs/ndjson-events.md](docs/ndjson-events.md) for the event schema —
 the same stream is what `--json` / `--jsonl` emit on stdout.
 
-If `questions_enabled` is on for the plan, the harness can pause the
-run with `ralph question ask "..."`. The TUI surfaces a `❓` indicator
-on the step, opens an answer modal on `A` or `a`, and offers to resume
-the implementation once the last open question is answered.
+The harness can pause the run at any time with `ralph question ask
+"..."` (or `ralph block "..."`). The TUI surfaces a `❓` indicator on the
+step, opens an answer modal on `A` or `a`, and offers to resume the
+implementation once the last open question is answered.
 
 For the full UX spec, see [TUI-plan.md](TUI-plan.md).
 

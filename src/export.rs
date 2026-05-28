@@ -36,10 +36,6 @@ pub struct ExportedPlanMeta {
     pub harness: Option<String>,
     pub agent: Option<String>,
     pub deterministic_tests: Vec<String>,
-    /// Whether steps in this plan may raise question/blocker interruptions.
-    /// Exported explicitly so a cloned plan preserves its interruptibility
-    /// semantics instead of silently reverting to the local new-plan default.
-    pub questions_enabled: bool,
     /// Slugs of plans this plan directly depends on (empty by default).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
@@ -222,7 +218,6 @@ pub fn build_exported_plan(
         harness: plan.harness.clone(),
         agent: plan.agent.clone(),
         deterministic_tests: plan.deterministic_tests.clone(),
-        questions_enabled: plan.questions_enabled,
         depends_on: depends_on_slugs,
         plan_harness: plan.plan_harness.clone(),
         retry_strategy: plan.retry_strategy,
@@ -650,7 +645,9 @@ mod tests {
     }
 
     #[test]
-    fn test_export_includes_questions_enabled() {
+    fn test_export_omits_questions_enabled() {
+        // questions_enabled was fully removed (V36): the exported JSON must
+        // no longer carry the key at all.
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
@@ -663,16 +660,16 @@ mod tests {
             &[],
         )
         .unwrap();
-        storage::set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
 
-        let plan = storage::get_plan_by_id(&conn, &plan.id).unwrap();
         let steps = storage::list_steps(&conn, &plan.id).unwrap();
         let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
-        assert!(!exported.plan.questions_enabled);
 
         let json = serde_json::to_string(&exported).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["plan"]["questions_enabled"], false);
+        assert!(
+            parsed["plan"].get("questions_enabled").is_none(),
+            "exported plan must not carry questions_enabled"
+        );
     }
 
     #[test]

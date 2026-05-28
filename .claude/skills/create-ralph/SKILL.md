@@ -262,7 +262,6 @@ Don't compress a big task into a handful of mega-steps — you lose the per-step
 - `ralph step add ... --max-retries <n>` — per-step retry override.
 - `ralph step add ... --harness <name>` — per-step harness override.
 - `ralph step add ... --model <name>` — per-step model override (forwarded to the harness's `model_args` template, e.g. `--model sonnet-4.6`); silently ignored if the resolved harness has no `model_args` configured.
-- `ralph plan questions on <slug>` — opt in to mid-step harness questions. Without this, the harness's `ralph question ask` / `ralph block` calls fail with a disabled-feature error. Turn it on if any step's prompt expects to raise a question or blocker.
 - `ralph config review set [--harness <h>] [--model <m>] [--enabled <bool>]` — the global built-in-review harness/model/default (only the fields you pass are written).
 - `ralph plan review <on|off> <slug>` — per-plan review toggle. `ralph step edit <sel> --review <on|off|inherit>` — per-step override. Precedence: step > plan > global > off (off by default).
 - `ralph plan create ... --max-review-corrections <n>` — cap the review→correction recursion (default 3); over the cap, ralph raises a blocker for a human instead of looping.

@@ -12,6 +12,7 @@
 // raw-mode / event loop, the `storage::resolve_interruption` write, and the
 // `$EDITOR` handoff; this module only decides *what* to do.
 
+use chrono::{DateTime, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 
 use crate::plan::{Interruption, InterruptionState};
@@ -32,7 +33,21 @@ impl InboxItem {
     pub fn is_open(&self) -> bool {
         self.interruption.state == InterruptionState::Open
     }
+
+    /// The stable run-through ordering key: `(asked_at, id)`, matching the
+    /// `list_inbox_rows` open-branch `ORDER BY i.asked_at ASC, i.id ASC`.
+    /// Run-through advancement keys off this — NOT a positional index — so a
+    /// poll that re-buckets the list (open-first) can't skip an open item or
+    /// finish early.
+    fn run_through_key(&self) -> RunThroughKey {
+        (self.interruption.asked_at, self.interruption.id.clone())
+    }
 }
+
+/// `(asked_at, id)` — a stable, total ordering over interruptions that is
+/// independent of in-memory list position and survives the open-first
+/// re-bucketing on each poll.
+type RunThroughKey = (DateTime<Utc>, String);
 
 /// Run-through mode: after answering one interruption, auto-advance to the
 /// next open one (§12.3). `Esc` exits back to the list.
@@ -77,6 +92,11 @@ pub struct InboxState {
     mode: InboxMode,
     /// The active §12.4 modal while in run-through.
     modal: Option<InterruptionModal>,
+    /// The current run-through target's stable `(asked_at, id)` key. Kept even
+    /// after the target is resolved so advancement is "next open item strictly
+    /// after THIS key in stable order" — robust against the open-first
+    /// re-bucketing each poll applies (the §12.3 single-forward-pass guarantee).
+    run_through_target: Option<RunThroughKey>,
     /// `?` help overlay state (per-view, per CLAUDE.md).
     pub help: HelpState,
     /// Pop request latch.
@@ -92,14 +112,17 @@ impl InboxState {
             cursor: 0,
             mode: InboxMode::List,
             modal: None,
+            run_through_target: None,
             help: HelpState::new(),
             should_pop: false,
         }
     }
 
     /// Replace the item list after a DB poll, preserving the cursor by
-    /// interruption id. If a run-through modal is active and its target
-    /// vanished (resolved out-of-band), the run-through ends gracefully.
+    /// interruption id. If a run-through is active and its target is no longer
+    /// open (resolved out-of-band by an external process), advance to the next
+    /// open item by stable order — NOT finish early — so a poll that
+    /// re-buckets the list can't drop a still-open interruption.
     pub fn sync(&mut self, items: Vec<InboxItem>) {
         let cursor_id = self
             .items
@@ -115,14 +138,23 @@ impl InboxState {
         } else if self.cursor >= self.items.len() {
             self.cursor = self.items.len() - 1;
         }
-        if self.mode == InboxMode::RunThrough
-            && let Some(m) = &self.modal
-            && !self
-                .items
-                .iter()
-                .any(|i| i.interruption.id == m.interruption_id && i.is_open())
-        {
-            self.advance_or_finish();
+        // Advancement keys off `run_through_target` (the stable key), so it
+        // remains correct even when the target row was resolved out-of-band
+        // (its key is the boundary; `next_open_after` looks strictly past it).
+        if self.mode == InboxMode::RunThrough {
+            let target_still_open = self.modal.as_ref().is_some_and(|m| {
+                self.items
+                    .iter()
+                    .any(|i| i.interruption.id == m.interruption_id && i.is_open())
+            });
+            if target_still_open {
+                // Keep the visible cursor pinned to the modal target.
+                if let Some(id) = self.modal.as_ref().map(|m| m.interruption_id.clone()) {
+                    self.focus_cursor_on(&id);
+                }
+            } else {
+                self.advance_or_finish();
+            }
         }
     }
 
@@ -176,36 +208,62 @@ impl InboxState {
         };
     }
 
-    /// Index of the first OPEN item at or after `from` (wrapping is *not*
-    /// done — run-through is a single forward pass through the queue, §12.3).
-    fn next_open_from(&self, from: usize) -> Option<usize> {
+    /// The open item with the smallest stable `(asked_at, id)` key (the head
+    /// of the run-through pass).
+    fn first_open(&self) -> Option<&InboxItem> {
         self.items
             .iter()
-            .enumerate()
-            .skip(from)
-            .find(|(_, i)| i.is_open())
-            .map(|(idx, _)| idx)
+            .filter(|i| i.is_open())
+            .min_by(|a, b| a.run_through_key().cmp(&b.run_through_key()))
+    }
+
+    /// The open item with the smallest stable key strictly *after* `key`.
+    /// Run-through advancement uses this so the next target is chosen by the
+    /// stable `(asked_at, id)` order, never by current list position — a poll
+    /// that re-buckets the list (open-first) can no longer skip an open item
+    /// nor finish the pass while open items remain (§12.3 single forward pass).
+    fn next_open_after(&self, key: &RunThroughKey) -> Option<&InboxItem> {
+        self.items
+            .iter()
+            .filter(|i| i.is_open() && i.run_through_key() > *key)
+            .min_by(|a, b| a.run_through_key().cmp(&b.run_through_key()))
+    }
+
+    /// Move the cursor onto the item with `id`, if present (run-through keeps
+    /// the visible cursor on the modal's target).
+    fn focus_cursor_on(&mut self, id: &str) {
+        if let Some(idx) = self.items.iter().position(|i| i.interruption.id == id) {
+            self.cursor = idx;
+        }
     }
 
     /// Enter run-through starting at the cursor's item (or the first open
     /// item if the cursor is on a resolved one). No-op when nothing is open.
     pub fn start_run_through(&mut self) -> bool {
-        let start = if self.selected().map(|i| i.is_open()).unwrap_or(false) {
-            Some(self.cursor)
+        let start_id = if self.selected().map(|i| i.is_open()).unwrap_or(false) {
+            self.selected().map(|i| i.interruption.id.clone())
         } else {
-            self.next_open_from(0)
+            self.first_open().map(|i| i.interruption.id.clone())
         };
-        match start {
-            Some(idx) => {
-                self.cursor = idx;
-                self.mode = InboxMode::RunThrough;
-                self.modal = Some(InterruptionModal::from_interruption(
-                    &self.items[idx].interruption,
-                ));
+        match start_id {
+            Some(id) => {
+                self.enter_target(&id);
                 true
             }
             None => false,
         }
+    }
+
+    /// Make `id` the active run-through target: open its modal, record its
+    /// stable key, and park the cursor on it.
+    fn enter_target(&mut self, id: &str) {
+        let Some(item) = self.items.iter().find(|i| i.interruption.id == id) else {
+            return;
+        };
+        self.run_through_target = Some(item.run_through_key());
+        self.modal = Some(InterruptionModal::from_interruption(&item.interruption));
+        self.mode = InboxMode::RunThrough;
+        self.focus_cursor_on(id);
     }
 
     /// After a successful `storage::resolve_interruption`, mark the item
@@ -230,21 +288,23 @@ impl InboxState {
         self.advance_or_finish();
     }
 
-    /// Advance the run-through to the next still-open item *after the current
-    /// cursor*, or finish (back to the list, modal cleared) when the remaining
-    /// queue is empty. This keeps the run-through a single forward pass.
+    /// Advance the run-through to the next still-open item whose stable key is
+    /// strictly *after* the current target's, or finish (back to the list,
+    /// modal cleared) when none remain. Keying off the stable `(asked_at, id)`
+    /// order — not a list index — keeps the pass robust: resolving items out
+    /// of order, and the open-first re-bucketing each poll applies, can no
+    /// longer skip an open item or finish early (§12.3 single forward pass).
     fn advance_or_finish(&mut self) {
-        match self.next_open_from(self.cursor.saturating_add(1)) {
-            Some(idx) => {
-                self.cursor = idx;
-                self.modal = Some(InterruptionModal::from_interruption(
-                    &self.items[idx].interruption,
-                ));
-            }
-            None => {
-                self.mode = InboxMode::List;
-                self.modal = None;
-            }
+        // The boundary is the current target's key (kept even after the target
+        // resolved — see `run_through_target`). With no target recorded fall
+        // back to the stable-first open item.
+        let next_id = match &self.run_through_target {
+            Some(key) => self.next_open_after(key).map(|i| i.interruption.id.clone()),
+            None => self.first_open().map(|i| i.interruption.id.clone()),
+        };
+        match next_id {
+            Some(id) => self.enter_target(&id),
+            None => self.exit_run_through(),
         }
     }
 
@@ -253,6 +313,7 @@ impl InboxState {
     pub fn exit_run_through(&mut self) {
         self.mode = InboxMode::List;
         self.modal = None;
+        self.run_through_target = None;
     }
 
     /// Pure key handler. In `List` mode: j/k navigate, `enter`/`a` start
@@ -391,6 +452,29 @@ mod tests {
             plan_slug: "plan-a".to_string(),
             step_short_id: format!("s{id}"),
         }
+    }
+
+    /// Item with an explicit `asked_at` (seconds offset from a fixed epoch) so
+    /// the stable `(asked_at, id)` run-through order is deterministic in tests
+    /// that resolve out of `asked_at` order.
+    fn item_at(id: &str, open: bool, asked_secs: i64) -> InboxItem {
+        let mut it = item(id, open);
+        it.interruption.asked_at =
+            chrono::DateTime::<Utc>::from_timestamp(asked_secs, 0).unwrap();
+        it
+    }
+
+    /// Re-bucket a slice into the `list_inbox_rows` shape the dispatcher feeds
+    /// `sync`: open items first (oldest `asked_at` first), then resolved.
+    fn rebucketed(items: &[InboxItem]) -> Vec<InboxItem> {
+        let mut open: Vec<InboxItem> = items.iter().filter(|i| i.is_open()).cloned().collect();
+        open.sort_by(|a, b| {
+            (a.interruption.asked_at, &a.interruption.id)
+                .cmp(&(b.interruption.asked_at, &b.interruption.id))
+        });
+        let resolved: Vec<InboxItem> =
+            items.iter().filter(|i| !i.is_open()).cloned().collect();
+        open.into_iter().chain(resolved).collect()
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -589,5 +673,105 @@ mod tests {
         st.sync(vec![item("1", false), item("2", false)]);
         assert_eq!(*st.mode(), InboxMode::List);
         assert!(st.modal().is_none());
+    }
+
+    // -- FIX A: robust run-through under out-of-order resolution + re-bucketing.
+
+    /// The run-through must visit every still-open item exactly once and not
+    /// finish early, even when items resolve OUT OF `asked_at` order and the
+    /// poll re-buckets the list (open-first) on every tick. The run-through
+    /// resolves its own modal target; meanwhile an external process resolves
+    /// a *higher-asked_at* item early — exactly the case that, with the old
+    /// positional advance against the re-bucketed list, skipped a still-open
+    /// item or finished early.
+    #[test]
+    fn run_through_visits_every_open_item_under_out_of_order_resolution() {
+        // Stable order by asked_at: a(1) < b(2) < c(3) < d(4).
+        let mut live = vec![
+            item_at("a", true, 1),
+            item_at("b", true, 2),
+            item_at("c", true, 3),
+            item_at("d", true, 4),
+        ];
+        let mut st = InboxState::new(rebucketed(&live));
+        assert!(st.start_run_through());
+
+        // BEFORE the user touches anything, an external process resolves `c`
+        // (out of asked_at order — c comes after b). The next poll re-buckets:
+        // open {a, b, d}, then resolved {c}. With positional advance this
+        // shifted indices and could skip `b`.
+        for it in live.iter_mut() {
+            if it.interruption.id == "c" {
+                it.interruption.state = InterruptionState::Resolved;
+            }
+        }
+        st.sync(rebucketed(&live));
+        // Target unchanged (a still open) — external resolution didn't derail.
+        assert_eq!(st.modal().unwrap().interruption_id, "a");
+
+        let mut visited: Vec<String> = Vec::new();
+        // Now run the pass: each step resolves the CURRENT modal target.
+        loop {
+            let target = st.modal().unwrap().interruption_id.clone();
+            assert!(
+                !visited.contains(&target),
+                "run-through re-visited {target}; visited={visited:?}"
+            );
+            visited.push(target.clone());
+            for it in live.iter_mut() {
+                if it.interruption.id == target {
+                    it.interruption.state = InterruptionState::Resolved;
+                }
+            }
+            st.resolve_and_advance(&target, "ans", None);
+            // The dispatcher re-polls every tick: feed the re-bucketed list.
+            st.sync(rebucketed(&live));
+            if *st.mode() == InboxMode::List {
+                break;
+            }
+        }
+
+        // Visited exactly the three still-open items, each once, in stable
+        // asked_at order — `c` was externally resolved so it's skipped, `b`
+        // (which the positional bug dropped) is NOT skipped.
+        assert_eq!(visited, vec!["a", "b", "d"]);
+        assert!(st.modal().is_none());
+        assert_eq!(st.open_count(), 0, "all open items cleared in one pass");
+    }
+
+    /// An item resolved by an EXTERNAL process (it appears resolved on the
+    /// next `sync` WITHOUT going through `resolve_and_advance`) must advance
+    /// the run-through to a remaining open item, not finish early.
+    #[test]
+    fn sync_advances_past_externally_resolved_target_to_remaining_open() {
+        let all = vec![
+            item_at("a", true, 1),
+            item_at("b", true, 2),
+            item_at("c", true, 3),
+        ];
+        let mut st = InboxState::new(rebucketed(&all));
+        assert!(st.start_run_through());
+        assert_eq!(st.modal().unwrap().interruption_id, "a");
+
+        // Another process resolves the CURRENT target (a) out-of-band; b and c
+        // remain open. The poll re-buckets (open-first: b, c; then a resolved).
+        let after_external = vec![
+            item_at("b", true, 2),
+            item_at("c", true, 3),
+            item_at("a", false, 1),
+        ];
+        st.sync(rebucketed(&after_external));
+
+        // Must advance to the next stable-order open item (b), NOT finish.
+        assert_eq!(*st.mode(), InboxMode::RunThrough);
+        assert_eq!(
+            st.modal().unwrap().interruption_id,
+            "b",
+            "advanced to remaining open item, not finished early"
+        );
+
+        // Finish the rest normally to confirm c is still reachable.
+        st.resolve_and_advance("b", "ans", None);
+        assert_eq!(st.modal().unwrap().interruption_id, "c");
     }
 }

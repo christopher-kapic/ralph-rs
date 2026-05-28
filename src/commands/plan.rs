@@ -465,39 +465,12 @@ pub fn plan_delete(
 // Plan hook attachment commands
 // ---------------------------------------------------------------------------
 
-/// Toggle `plans.questions_enabled` for `slug`. Mirrors the `Q` keybinding
-/// in the TUI plan list (TUI-plan.md §17).
-pub fn cmd_plan_questions(
-    conn: &Connection,
-    plan_slug: &str,
-    project: &str,
-    enabled: bool,
-    out: &OutputContext,
-) -> Result<()> {
-    let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
-        .with_context(|| format!("Plan not found: {plan_slug}"))?;
-    storage::set_plan_questions_enabled(conn, &plan.id, enabled)?;
-
-    if out.format == OutputFormat::Json {
-        let json = serde_json::json!({
-            "plan": plan_slug,
-            "questions_enabled": enabled,
-        });
-        println!("{}", serde_json::to_string(&json)?);
-    } else {
-        let verb = if enabled { "enabled" } else { "disabled" };
-        println!("Questions {verb} for plan '{plan_slug}'.");
-    }
-    Ok(())
-}
-
 /// Set the plan-level `review_enabled` override (docs/dag-redesign.md
 /// §6/§7). `enabled` writes `Some(true)`/`Some(false)` to the nullable
 /// `plans.review_enabled` column — an explicit per-plan on/off that wins
 /// over the global `config.review.enabled` and is itself overridden by a
 /// per-step `--review` (precedence step > plan > config > false, resolved
-/// by [`crate::config::effective_review_enabled`]). Sibling of
-/// [`cmd_plan_questions`].
+/// by [`crate::config::effective_review_enabled`]).
 pub fn cmd_plan_review(
     conn: &Connection,
     plan_slug: &str,
@@ -731,44 +704,6 @@ mod tests {
             quiet: true,
             color: false,
         }
-    }
-
-    // ----------------------------------------------------------------------
-    // `ralph plan questions on|off` tests
-    // ----------------------------------------------------------------------
-
-    #[test]
-    fn test_cmd_plan_questions_toggles_on_then_off() {
-        let conn = crate::db::open_memory().expect("open_memory");
-        let project = "/tmp/q-toggle";
-        let plan =
-            storage::create_plan(&conn, "qp", project, "br", "desc", None, None, &[]).unwrap();
-        // New plans default to questions_enabled = true; force it off so the
-        // on→off toggle round-trip below is meaningful.
-        storage::set_plan_questions_enabled(&conn, &plan.id, false).unwrap();
-        let plan = storage::get_plan_by_id(&conn, &plan.id).unwrap();
-        assert!(!plan.questions_enabled, "forced off for the round-trip");
-
-        cmd_plan_questions(&conn, "qp", project, true, &quiet_out()).unwrap();
-        let on = storage::get_plan_by_slug(&conn, "qp", project)
-            .unwrap()
-            .unwrap();
-        assert!(on.questions_enabled, "after `on`, column must be true");
-
-        cmd_plan_questions(&conn, "qp", project, false, &quiet_out()).unwrap();
-        let off = storage::get_plan_by_slug(&conn, "qp", project)
-            .unwrap()
-            .unwrap();
-        assert!(!off.questions_enabled, "after `off`, column must be false");
-    }
-
-    #[test]
-    fn test_cmd_plan_questions_unknown_slug_errors() {
-        let conn = crate::db::open_memory().expect("open_memory");
-        // No plans created — the slug lookup must fail with a clear error.
-        let err = cmd_plan_questions(&conn, "nope", "/tmp/q-noplan", true, &quiet_out())
-            .expect_err("missing plan must error");
-        assert!(err.to_string().contains("Plan not found: nope"));
     }
 
     // ----------------------------------------------------------------------

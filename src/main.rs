@@ -32,7 +32,7 @@ use clap::Parser;
 
 use crate::cli::{
     AgentsCommand, Cli, Command, HooksCommand, InterruptionCommand, PlanCommand,
-    PlanDependencyCommand, PlanHarnessCommand, PromptCommand, QuestionCommand, QuestionsState,
+    OnOffState, PlanDependencyCommand, PlanHarnessCommand, PromptCommand, QuestionCommand,
     StepCommand, StepDependencyCommand,
 };
 
@@ -232,12 +232,8 @@ fn main() -> Result<()> {
                     std::process::exit(exit_code);
                 }
             },
-            PlanCommand::Questions { state, slug } => {
-                let enabled = matches!(state, QuestionsState::On);
-                commands::cmd_plan_questions(&conn, &slug, &project, enabled, &out)
-            }
             PlanCommand::Review { state, slug } => {
-                let enabled = matches!(state, QuestionsState::On);
+                let enabled = matches!(state, OnOffState::On);
                 commands::cmd_plan_review(&conn, &slug, &project, enabled, &out)
             }
         },
@@ -690,8 +686,7 @@ fn main() -> Result<()> {
                 priority,
             } => {
                 use crate::commands::question::{
-                    DISABLED_MESSAGE, NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome,
-                    record_question_ask,
+                    NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome, record_question_ask,
                 };
                 use std::io::Read;
 
@@ -714,10 +709,6 @@ fn main() -> Result<()> {
                         eprintln!("{NO_ACTIVE_RUN_MESSAGE}");
                         std::process::exit(1);
                     }
-                    QuestionAskOutcome::Disabled => {
-                        eprintln!("{DISABLED_MESSAGE}");
-                        std::process::exit(1);
-                    }
                     QuestionAskOutcome::Recorded { .. } => Ok(()),
                 }
             }
@@ -726,8 +717,7 @@ fn main() -> Result<()> {
         // -- Block (raise a blocker interruption) --
         Command::Block { text } => {
             use crate::commands::question::{
-                BLOCK_DISABLED_MESSAGE, BLOCK_NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome,
-                record_block,
+                BLOCK_NO_ACTIVE_RUN_MESSAGE, QuestionAskOutcome, record_block,
             };
             use std::io::Read;
 
@@ -745,10 +735,6 @@ fn main() -> Result<()> {
             match record_block(&conn, &project, &body, &out)? {
                 QuestionAskOutcome::NoActiveRun => {
                     eprintln!("{BLOCK_NO_ACTIVE_RUN_MESSAGE}");
-                    std::process::exit(1);
-                }
-                QuestionAskOutcome::Disabled => {
-                    eprintln!("{BLOCK_DISABLED_MESSAGE}");
                     std::process::exit(1);
                 }
                 QuestionAskOutcome::Recorded { .. } => Ok(()),

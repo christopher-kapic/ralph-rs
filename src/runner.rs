@@ -785,8 +785,9 @@ async fn run_plan_inner(
         // Drain any reviews that finished while this step implemented
         // (non-blocking). This is the SOLE DAG-writer point for review
         // verdicts (§9-inv-3): finalize verdict + git-note, promote a passed
-        // step to `Complete`, and consume corrective requests (§10). On a
-        // review error the run fails exactly like a hard step failure.
+        // step to `Complete`, and consume corrective requests (§10). A review
+        // *error* (reviewer failed to execute) raises a recoverable blocker
+        // and the run continues; only a task *panic* returns `Some(Failed)`.
         if let Some(fs) = drain_finished_reviews(
             conn,
             &effective_plan,
@@ -2974,11 +2975,13 @@ pub(crate) fn step_schedule_cmp(
 ///    unreachable from the DB; it only matters for the pure unit tests and
 ///    as defense-in-depth.
 ///
-/// (§3.1: runnable ⇔ every dependency `Complete`. Reviews/§10 come in
-/// Phase 3 and are not consulted here. A non-`Complete` terminal dep
-/// inside the window — e.g. `Skipped` — does *not* satisfy the edge; the
-/// skip-with-dependents semantics are the deferred §14 open question and
-/// are intentionally not special-cased here.)
+/// (§3.1: runnable ⇔ every dependency satisfied. Reviews/§10 come in
+/// Phase 3 and are not consulted here. Both `Complete` and `Skipped`
+/// satisfy the edge: a `Skipped` dependency now unblocks its dependents
+/// so the branch keeps flowing (a skipped step isn't reviewed, so there's
+/// no review verdict to wait on). Without this, a `ralph skip` of a step
+/// with dependents would gate them forever and leave the plan stuck
+/// `InProgress`.)
 fn deps_satisfied(
     step_id: &str,
     deps_of: &HashMap<String, Vec<String>>,
@@ -2988,7 +2991,7 @@ fn deps_satisfied(
         return true;
     };
     deps.iter().all(|d| match window_status.get(d.as_str()) {
-        Some(status) => *status == StepStatus::Complete,
+        Some(status) => matches!(*status, StepStatus::Complete | StepStatus::Skipped),
         None => true,
     })
 }
@@ -3131,11 +3134,18 @@ async fn drain_reviews_on_abort(
 /// request for the plan is consumed via
 /// [`crate::review::consume_corrective_request`] (§10 insert + re-parent +
 /// recursion cap), oldest-first for deterministic, reproducible scheduling
-/// (§3.5 item 4 / §11). A review **error** (e.g. the §9-inv-2 read-only
-/// invariant fired, or a misconfigured review harness) or a task **panic**
-/// must never silently pass un-reviewed work: the plan is marked `Failed`
-/// and `Some(PlanStatus::Failed)` is returned so the caller stops the run,
-/// exactly as a hard step failure does.
+/// (§3.5 item 4 / §11). Neither case ever silently passes un-reviewed work:
+/// a review **error** (e.g. the §9-inv-2 read-only invariant fired, or a
+/// misconfigured/timed-out review harness — the reviewer never produced a
+/// verdict) leaves the reviewed step non-terminal and raises a `kind=Blocker`
+/// interruption on it, exactly like an executor-raised blocker: the step
+/// renders derived `Blocked` (gating its dependents), the plan finalizes as
+/// derived `Interrupted`, and the run KEEPS GOING on other runnable branches
+/// rather than discarding healthy reviewed work — resolving the blocker
+/// re-runs that step from a clean state on the next run/resume. A task
+/// **panic** (the task died before handing back even its step id, so no
+/// targeted recovery is possible) is still fail-safe: the plan is marked
+/// `Failed` and `Some(PlanStatus::Failed)` is returned so the caller stops.
 ///
 /// Returns `Ok(None)` on success (drained, or nothing to drain) and
 /// `Ok(Some(final_status))` when the run must terminate.
@@ -3239,10 +3249,16 @@ async fn drain_finished_reviews(
                 //     state (re-implement + re-review) — safe and explicit,
                 //     never silent.
                 //
-                // The plan is still marked `Failed` and the run still stops,
-                // exactly as a hard step failure does (§9-inv-2 — never pass
-                // un-reviewed work). The blocker is what makes the *next* run
-                // recover cleanly rather than discard correct committed work.
+                // The blocker leaves the reviewed step derived-`Blocked` and
+                // (because an open interruption now exists) the plan finalizes
+                // as derived `Interrupted`, NOT terminal `Failed`. The run
+                // KEEPS GOING on other runnable branches: a transient
+                // reviewer-config hiccup must not kill healthy committed +
+                // reviewed work elsewhere in the DAG. §9-inv-2 still holds —
+                // the affected step stays non-terminal and its open blocker
+                // gates every dependent via `deps_satisfied`, so no unreviewed
+                // work is promoted. Resolving the blocker re-runs the step
+                // from a clean state on the next run/resume.
                 eprintln!("Review failed: {e:#}");
                 if storage::get_step_by_id(conn, &step_id)?.is_some() {
                     let interruption_id = crate::db::with_tx(conn, |conn| {
@@ -3277,8 +3293,10 @@ async fn drain_finished_reviews(
                         iteration,
                     );
                 }
-                storage::update_plan_status(conn, &plan.id, PlanStatus::Failed)?;
-                return Ok(Some(PlanStatus::Failed));
+                // This review is done; the blocker handles the step. Keep
+                // draining the remaining finished reviews and let the run
+                // continue (the function falls through to `Ok(None)` below).
+                continue;
             }
         };
 
@@ -3467,7 +3485,6 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -5109,7 +5126,6 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -5152,7 +5168,6 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -6254,7 +6269,6 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -6331,7 +6345,6 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -6737,6 +6750,7 @@ mod tests {
             "deadbeef",
             1,
             Some("missing fix"),
+            false,
         )
         .unwrap();
 
@@ -7618,12 +7632,12 @@ mod tests {
         let steps = make_steps(2);
         let deps_of = deps_map(&steps, &[(1, 0)]); // s1 depends on s0
 
+        // Non-terminal / failed deps still block their dependent.
         for blocking in [
             StepStatus::Pending,
             StepStatus::InProgress,
             StepStatus::Failed,
             StepStatus::Aborted,
-            StepStatus::Skipped, // §14 open question: Skipped does NOT unblock
         ] {
             let win_status: HashMap<&str, StepStatus> = [("s0", blocking)].into_iter().collect();
             assert!(
@@ -7632,14 +7646,48 @@ mod tests {
             );
         }
 
-        let win_status: HashMap<&str, StepStatus> =
-            [("s0", StepStatus::Complete)].into_iter().collect();
-        assert!(deps_satisfied("s1", &deps_of, &win_status));
+        // Both Complete and Skipped satisfy the edge: a skipped step isn't
+        // reviewed, so there's no verdict to wait on, and its dependents
+        // must become runnable rather than being gated forever.
+        for unblocking in [StepStatus::Complete, StepStatus::Skipped] {
+            let win_status: HashMap<&str, StepStatus> =
+                [("s0", unblocking)].into_iter().collect();
+            assert!(
+                deps_satisfied("s1", &deps_of, &win_status),
+                "{unblocking:?} dep must satisfy its dependent's edge"
+            );
+        }
 
         // A dep absent from window_status (out of window / deleted) does
         // not block — keeps the graph from deadlocking and preserves
         // `--from`/`--to`.
         assert!(deps_satisfied("s1", &deps_of, &HashMap::new()));
+    }
+
+    #[test]
+    fn test_skipped_dep_makes_dependent_runnable() {
+        // s1 depends on s0; s0 was skipped. s1 must become runnable so the
+        // branch keeps flowing instead of stranding the plan `InProgress`.
+        let mut steps = make_steps(2);
+        let edges = [(1, 0)];
+        let deps_of = deps_map(&steps, &edges);
+
+        steps[0].status = StepStatus::Skipped;
+
+        let depths = compute_step_depths(&steps, &deps_of);
+        let pick = pick_next_step(
+            &steps,
+            &deps_of,
+            &depths,
+            &full_window(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(
+            pick.map(|s| s.id.clone()),
+            Some("s1".to_string()),
+            "a Skipped dependency must make its dependent the next runnable step"
+        );
     }
 
     // ---- STEP 38: concurrency model (§9-inv-1/2, §3.5 item 2/3) ----

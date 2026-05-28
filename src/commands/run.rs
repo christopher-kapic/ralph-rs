@@ -796,9 +796,6 @@ pub fn run_plan_list_tui(
                     KeyCode::Char('A') if !locked => {
                         plan_list_approve_cursor(conn, project, &mut app)?;
                     }
-                    KeyCode::Char('Q') if !locked => {
-                        plan_list_toggle_questions_cursor(conn, project, &mut app)?;
-                    }
                     KeyCode::Char('r') => {
                         plan_list_refresh(conn, project, &mut app)?;
                     }
@@ -937,38 +934,6 @@ pub(crate) fn plan_list_approve_cursor(
             Instant::now(),
         );
     }
-    Ok(())
-}
-
-/// `Q` action in the plan-list view (TUI-plan.md §17): flip
-/// `plans.questions_enabled` on the cursor target via
-/// `set_plan_questions_enabled`, refresh the tile in place, and toast the new
-/// state. Cursor-only — selection is ignored.
-pub(crate) fn plan_list_toggle_questions_cursor(
-    conn: &Connection,
-    project: &str,
-    app: &mut crate::tui::views::plan_list::PlanListApp,
-) -> Result<()> {
-    use crate::tui::toast::ToastKind;
-    use std::time::Instant;
-
-    let target = app
-        .cursor_plan()
-        .map(|p| (p.id.clone(), p.slug.clone(), p.questions_enabled));
-    let Some((id, slug, current)) = target else {
-        return Ok(());
-    };
-    let next = !current;
-    storage::set_plan_questions_enabled(conn, &id, next)?;
-    if let Some(updated) = storage::get_plan_by_slug(conn, &slug, project)? {
-        app.update_plan_in_place(updated);
-    }
-    let msg = if next {
-        "Questions enabled."
-    } else {
-        "Questions disabled."
-    };
-    app.toasts.push(msg, ToastKind::Success, Instant::now());
     Ok(())
 }
 
@@ -1508,22 +1473,6 @@ pub(crate) fn plan_list_apply_palette_action(
             refresh_plan_list_state(conn, project, app)?;
             app.toasts
                 .push("Unarchived.", ToastKind::Success, Instant::now());
-        }
-        PaletteAction::SetQuestionsEnabled {
-            plan_id,
-            slug,
-            enabled,
-        } => {
-            storage::set_plan_questions_enabled(conn, &plan_id, enabled)?;
-            if let Some(updated) = storage::get_plan_by_slug(conn, &slug, project)? {
-                app.update_plan_in_place(updated);
-            }
-            let msg = if enabled {
-                "Questions enabled."
-            } else {
-                "Questions disabled."
-            };
-            app.toasts.push(msg, ToastKind::Success, Instant::now());
         }
         PaletteAction::Export { slug, output } => {
             apply_palette_export(&slug, output.as_deref(), conn, project, &mut app.toasts);
@@ -2151,7 +2100,7 @@ pub(crate) fn archived_list_apply_palette_action(
         PaletteAction::Unarchive { plan_id, .. } => {
             archived_list_apply_unarchive(conn, project, app, &[plan_id])?;
         }
-        PaletteAction::Approve { .. } | PaletteAction::SetQuestionsEnabled { .. } => {
+        PaletteAction::Approve { .. } => {
             app.toasts.push(
                 "Unarchive the plan first to edit it.",
                 ToastKind::Info,
@@ -2842,9 +2791,6 @@ where
             InputAction::OpenStepDetail(step_id) => {
                 run_step_detail_tui(terminal, conn, config, project, &mut app, &step_id)?;
             }
-            InputAction::ToggleQuestionsEnabled => {
-                plan_detail_apply_toggle_questions(conn, &mut app)?;
-            }
             InputAction::TogglePauseRequested => {
                 plan_detail_apply_toggle_pause(conn, &mut app)?;
             }
@@ -3501,31 +3447,6 @@ pub(crate) fn plan_detail_apply_toggle_pause(
     Ok(())
 }
 
-/// `Q` action in the plan-detail view (TUI-plan.md §17 'Toggle surfaces'):
-/// flip `plans.questions_enabled` for the focused plan via
-/// `set_plan_questions_enabled`, refresh `app.plan` in place from the DB, and
-/// toast the new state. Mirrors plan-list's Q binding.
-pub(crate) fn plan_detail_apply_toggle_questions(
-    conn: &Connection,
-    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
-) -> Result<()> {
-    use crate::tui::toast::ToastKind;
-    use std::time::Instant;
-
-    let next = !app.plan.questions_enabled;
-    storage::set_plan_questions_enabled(conn, &app.plan.id, next)?;
-    if let Some(updated) = storage::get_plan_by_slug(conn, &app.plan.slug, &app.plan.project)? {
-        app.plan = updated;
-    }
-    let msg = if next {
-        "Questions enabled."
-    } else {
-        "Questions disabled."
-    };
-    app.toasts.push(msg, ToastKind::Success, Instant::now());
-    Ok(())
-}
-
 /// Apply a [`PaletteAction`] inside the plan-detail view. Returns
 /// `Some(action)` for terminal-bound dialogs (`OpenConfirmArchive`,
 /// `OpenConfirmDelete`) so the dispatcher loop can render the confirm modal
@@ -3556,22 +3477,6 @@ pub(crate) fn plan_detail_apply_palette_action(
             }
             app.toasts
                 .push("Plan approved.", ToastKind::Success, Instant::now());
-        }
-        PaletteAction::SetQuestionsEnabled {
-            plan_id, enabled, ..
-        } => {
-            storage::set_plan_questions_enabled(conn, &plan_id, enabled)?;
-            if let Some(updated) =
-                storage::get_plan_by_slug(conn, &app.plan.slug, &app.plan.project)?
-            {
-                app.plan = updated;
-            }
-            let msg = if enabled {
-                "Questions enabled."
-            } else {
-                "Questions disabled."
-            };
-            app.toasts.push(msg, ToastKind::Success, Instant::now());
         }
         PaletteAction::Unarchive { plan_id, .. } => {
             storage::update_plan_status(conn, &plan_id, crate::plan::PlanStatus::Ready)?;
@@ -5125,22 +5030,6 @@ pub(crate) fn step_detail_apply_palette_action(
             }
             app.toasts
                 .push("Plan approved.", ToastKind::Success, Instant::now());
-        }
-        PaletteAction::SetQuestionsEnabled {
-            plan_id, enabled, ..
-        } => {
-            storage::set_plan_questions_enabled(conn, &plan_id, enabled)?;
-            if let Some(updated) =
-                storage::get_plan_by_slug(conn, &app.plan.slug, &app.plan.project)?
-            {
-                app.plan = updated;
-            }
-            let msg = if enabled {
-                "Questions enabled."
-            } else {
-                "Questions disabled."
-            };
-            app.toasts.push(msg, ToastKind::Success, Instant::now());
         }
         PaletteAction::Unarchive { plan_id, .. } => {
             storage::update_plan_status(conn, &plan_id, crate::plan::PlanStatus::Ready)?;
@@ -7904,7 +7793,6 @@ mod plan_detail_init_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -8103,10 +7991,10 @@ mod resume_parity_tests {
 
 #[cfg(test)]
 mod plan_list_action_tests {
-    //! Integration tests for the `A` (approve) and `Q` (toggle questions)
-    //! keybinding handlers in the plan-list TUI view. Exercise the public
-    //! action helpers end-to-end against an in-memory DB so the tests cover
-    //! both the storage write and the in-place tile update.
+    //! Integration tests for the `A` (approve) keybinding handler in the
+    //! plan-list TUI view. Exercise the public action helpers end-to-end
+    //! against an in-memory DB so the tests cover both the storage write and
+    //! the in-place tile update.
 
     use super::*;
     use crate::db;
@@ -8125,20 +8013,6 @@ mod plan_list_action_tests {
         storage::create_plan(&conn, "alpha", project, "b1", "d", None, None, &[]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
         storage::create_plan(&conn, "beta", project, "b2", "d", None, None, &[]).unwrap();
-        let tiles = build_plan_tiles(&conn, project).unwrap();
-        let app = PlanListApp::new(tiles, project, "UTC");
-        (conn, app)
-    }
-
-    /// Like `seed_app` but forces `questions_enabled = false` on every seeded
-    /// plan. New plans now default to questions-on; the toggle-mechanics tests
-    /// below need a known-off starting point so their on→off round-trips and
-    /// "non-cursor untouched" assertions stay meaningful.
-    fn seed_app_questions_off(project: &str) -> (Connection, PlanListApp) {
-        let (conn, _) = seed_app(project);
-        for p in storage::list_plans(&conn, project, false).unwrap() {
-            storage::set_plan_questions_enabled(&conn, &p.id, false).unwrap();
-        }
         let tiles = build_plan_tiles(&conn, project).unwrap();
         let app = PlanListApp::new(tiles, project, "UTC");
         (conn, app)
@@ -8197,64 +8071,6 @@ mod plan_list_action_tests {
         let conn = db::open_memory().unwrap();
         let mut app = PlanListApp::new(vec![], "/proj", "UTC");
         plan_list_approve_cursor(&conn, "/proj", &mut app).unwrap();
-        assert!(app.toasts.is_empty());
-    }
-
-    #[test]
-    fn toggle_questions_flips_column_and_toasts_new_state() {
-        let project = "/tmp/questions-toggle";
-        let (conn, mut app) = seed_app_questions_off(project);
-        let target_slug = app.cursor_plan().unwrap().slug.clone();
-        assert!(!app.cursor_plan().unwrap().questions_enabled);
-
-        // First press: off → on.
-        plan_list_toggle_questions_cursor(&conn, project, &mut app).unwrap();
-        let after_on = storage::get_plan_by_slug(&conn, &target_slug, project)
-            .unwrap()
-            .unwrap();
-        assert!(after_on.questions_enabled);
-        assert!(app.cursor_plan().unwrap().questions_enabled);
-        assert_eq!(app.toasts.current().unwrap().text, "Questions enabled.");
-
-        // Second press: on → off.
-        plan_list_toggle_questions_cursor(&conn, project, &mut app).unwrap();
-        let after_off = storage::get_plan_by_slug(&conn, &target_slug, project)
-            .unwrap()
-            .unwrap();
-        assert!(!after_off.questions_enabled);
-        assert!(!app.cursor_plan().unwrap().questions_enabled);
-        assert_eq!(app.toasts.current().unwrap().text, "Questions disabled.");
-    }
-
-    #[test]
-    fn toggle_questions_does_not_touch_non_cursor_tiles() {
-        let project = "/tmp/questions-cursor-only";
-        let (conn, mut app) = seed_app_questions_off(project);
-        let cursor_slug = app.cursor_plan().unwrap().slug.clone();
-        // The other tile.
-        let other_slug = app
-            .tiles
-            .iter()
-            .map(|t| t.plan.slug.clone())
-            .find(|s| s != &cursor_slug)
-            .unwrap();
-
-        plan_list_toggle_questions_cursor(&conn, project, &mut app).unwrap();
-
-        let other = storage::get_plan_by_slug(&conn, &other_slug, project)
-            .unwrap()
-            .unwrap();
-        assert!(
-            !other.questions_enabled,
-            "non-cursor plan must remain untouched"
-        );
-    }
-
-    #[test]
-    fn toggle_questions_empty_app_is_noop() {
-        let conn = db::open_memory().unwrap();
-        let mut app = PlanListApp::new(vec![], "/proj", "UTC");
-        plan_list_toggle_questions_cursor(&conn, "/proj", &mut app).unwrap();
         assert!(app.toasts.is_empty());
     }
 
@@ -8770,7 +8586,6 @@ mod step_detail_dispatcher_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -9229,19 +9044,6 @@ mod palette_action_tests {
         (conn, app)
     }
 
-    /// Like `seed_app` but forces `questions_enabled = false` on every seeded
-    /// plan. New plans now default to questions-on; the questions-toggle test
-    /// needs a known-off starting point for its on round-trip assertion.
-    fn seed_app_questions_off(project: &str) -> (Connection, PlanListApp) {
-        let (conn, _) = seed_app(project);
-        for p in storage::list_plans(&conn, project, false).unwrap() {
-            storage::set_plan_questions_enabled(&conn, &p.id, false).unwrap();
-        }
-        let tiles = build_plan_tiles(&conn, project).unwrap();
-        let app = PlanListApp::new(tiles, project, "UTC");
-        (conn, app)
-    }
-
     // -- Toast path -----------------------------------------------------
 
     #[test]
@@ -9316,36 +9118,6 @@ mod palette_action_tests {
             .unwrap();
         assert_eq!(tile.plan.status, PlanStatus::Ready);
         assert_eq!(app.toasts.current().unwrap().text, "Plan approved.");
-    }
-
-    #[test]
-    fn questions_toggle_via_palette_persists_and_refreshes_in_place() {
-        // The /plan questions on|off pair flips `questions_enabled` and
-        // updates the in-memory tile so the next render reflects the new
-        // state without a full refresh.
-        let project = "/tmp/palette-questions";
-        let (conn, mut app) = seed_app_questions_off(project);
-        let target_slug = app.cursor_plan().unwrap().slug.clone();
-        assert!(!app.cursor_plan().unwrap().questions_enabled);
-
-        let on_action = plan_list_palette_action(
-            &format!("/plan questions on {target_slug}"),
-            "claude",
-            &app,
-            &[],
-        );
-        plan_list_apply_palette_action(&conn, project, &mut app, on_action).unwrap();
-        let row = storage::get_plan_by_slug(&conn, &target_slug, project)
-            .unwrap()
-            .unwrap();
-        assert!(row.questions_enabled);
-        let tile = app
-            .tiles
-            .iter()
-            .find(|t| t.plan.slug == target_slug)
-            .unwrap();
-        assert!(tile.plan.questions_enabled);
-        assert_eq!(app.toasts.current().unwrap().text, "Questions enabled.");
     }
 
     // -- Archive path ---------------------------------------------------
@@ -9754,7 +9526,6 @@ mod sub_view_routing_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -10190,7 +9961,6 @@ mod mouse_routing_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -10218,7 +9988,6 @@ mod mouse_routing_tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,

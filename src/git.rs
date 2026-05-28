@@ -1677,9 +1677,13 @@ pub fn remove_worktree(workdir: &Path, path: &Path) {
 /// `.git/worktrees/` admin entry behind. Reviews are short-lived (a single
 /// read-only `git show` diff), so any `ralph-review-*` temp dir older than a
 /// few hours is unambiguously orphaned. We prune git's admin entries, then
-/// remove on-disk dirs older than the threshold. The mtime-age guard makes
-/// this safe under a *concurrent* ralph run: an in-flight review's worktree
-/// has a recent mtime and is left alone. Never fails the caller.
+/// remove on-disk dirs that are BOTH older than the threshold AND owned by a
+/// process that is no longer alive. The mtime-age guard makes this safe under
+/// a *concurrent* ralph run whose review started recently; the PID-liveness
+/// guard ([`review_dir_pid_is_alive`]) additionally protects a review that
+/// legitimately outlives the threshold or whose read-only worktree never
+/// advances its mtime — neither is reaped while its owner still runs. Never
+/// fails the caller.
 pub fn sweep_stale_review_worktrees(main_repo: &Path) {
     // 6h: orders of magnitude longer than any real review, far short of
     // anything that would race a live concurrent review.
@@ -1698,7 +1702,17 @@ pub fn sweep_stale_review_worktrees(main_repo: &Path) {
                 .and_then(|mtime| mtime.elapsed().ok())
                 .map(|age| age >= STALE_AFTER)
                 .unwrap_or(false);
-            if stale {
+            // WHY: the mtime guard alone can reap a worktree out from under a
+            // LIVE reviewer — a review that legitimately runs past the 6h
+            // threshold, or whose dir mtime never advances because the
+            // reviewer only reads, looks "stale" by age while still in use.
+            // The dir name embeds the creating PID (`ralph-review-<pid>-…`),
+            // so before reaping we skip any dir whose PID is still alive. Only
+            // reap when BOTH stale-by-mtime AND the owning process is gone.
+            // On platforms without `/proc` (or an unparseable name) we can't
+            // prove liveness, so we fall back to mtime-only — never regressing
+            // cleanup where the liveness signal is unavailable.
+            if stale && !review_dir_pid_is_alive(name) {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
@@ -1713,6 +1727,35 @@ pub fn sweep_stale_review_worktrees(main_repo: &Path) {
         .args(["worktree", "prune"])
         .current_dir(main_repo)
         .output();
+}
+
+/// Liveness guard for [`sweep_stale_review_worktrees`]: given a review
+/// worktree dir name (`ralph-review-<pid>-<sha12>-<nanos>`, minted by
+/// [`ReviewWorktree::create`]), report whether the embedded creating PID is
+/// still a running process.
+///
+/// Returns `false` (treat as reapable) when we *cannot prove* the PID is
+/// alive — an unparseable name, or a platform without `/proc`. That keeps the
+/// sweep's existing mtime-only behavior on platforms lacking a liveness
+/// signal, so the caller never regresses cleanup; the liveness check only
+/// *adds* protection (skips reaping) where we can positively confirm the
+/// owner is still running.
+fn review_dir_pid_is_alive(dir_name: &str) -> bool {
+    // `ralph-review-<pid>-<sha12>-<nanos>` → take the segment after the
+    // `ralph-review-` prefix, up to the next `-`.
+    let Some(rest) = dir_name.strip_prefix("ralph-review-") else {
+        return false;
+    };
+    let Some(pid_str) = rest.split('-').next() else {
+        return false;
+    };
+    if pid_str.parse::<u32>().is_err() {
+        return false;
+    }
+    // Linux-only liveness probe via procfs. On non-Linux (`/proc` absent) the
+    // path simply won't exist and we report not-alive, falling back to the
+    // mtime-only sweep — never blocking cleanup where we can't check.
+    std::path::Path::new(&format!("/proc/{pid_str}")).exists()
 }
 
 /// List the filesystem paths of every registered worktree (including the
@@ -1731,12 +1774,16 @@ pub fn list_worktree_paths(workdir: &Path) -> Result<Vec<String>> {
 /// RAII guard for a throwaway review worktree (docs/dag-redesign.md §8/§9-inv-2).
 ///
 /// Construction creates the detached worktree at the reviewed SHA; `Drop`
-/// removes it. Because `Drop` runs on **every** exit path of the function that
-/// holds the guard — normal return, `?`-propagated error, the spawn/await
-/// failing, a panic unwinding through the spawned review task, or the task
-/// being aborted/timed out — the throwaway tree is *always* torn down. There
-/// is no code path that creates one and leaks it. The path lives under the
-/// OS temp dir with a unique component so concurrent reviews never collide.
+/// removes it **synchronously** (best-effort). Because `Drop` runs on
+/// **every** exit path of the function that holds the guard — normal return,
+/// `?`-propagated error, the spawn/await failing, a panic unwinding through
+/// the spawned review task, or the task being aborted/timed out — and the
+/// removal runs to completion before `Drop` returns, the throwaway tree is
+/// *always* torn down before the value goes away. There is no code path that
+/// creates one and leaks it on a normal exit (a `SIGKILL`/forceful-exit that
+/// skips `Drop` entirely is the backstop's job — see
+/// `sweep_stale_review_worktrees`). The path lives under the OS temp dir with
+/// a unique component so concurrent reviews never collide.
 pub struct ReviewWorktree {
     /// The main repository the linked worktree is attached to (where
     /// `git worktree remove/prune` must run).
@@ -1778,35 +1825,48 @@ impl ReviewWorktree {
 impl Drop for ReviewWorktree {
     fn drop(&mut self) {
         // `remove_worktree` shells out to git twice (`worktree remove --force`,
-        // `worktree prune`) via the *sync* `std::process::Command`. Dropping a
-        // spawned review (e.g. via `JoinSet::shutdown` on Ctrl+C, or a
-        // panicking review task) runs this Drop on a tokio worker thread —
-        // blocking that worker on two sync subprocess calls (potentially much
-        // longer under a contended `.git/index.lock` or a slow filesystem) can
-        // starve the runtime when several reviews abort concurrently.
+        // `worktree prune`) via the *sync* `std::process::Command`. Those are
+        // quick subprocess calls, so we run them SYNCHRONOUSLY here and let
+        // `Drop` complete only after the worktree is actually gone. A previous
+        // version detached the cleanup onto a background task and returned
+        // immediately; on a short run that finalizes and exits promptly the
+        // detached task could be cut off before it ran, leaking the
+        // `<tmp>/ralph-review-*` dir + its `.git/worktrees/` admin entry until
+        // the 6h sweep reaped it. Running cleanup inline closes that leak.
         //
-        // Drop impls cannot be `async`, so we can't `spawn_blocking().await`.
-        // Instead, hand off cleanup to a context where blocking is allowed and
-        // detach. The dropping thread returns immediately.
+        // The hazard with a synchronous subprocess call is that `Drop` can run
+        // on a tokio worker thread (this guard is created inside the spawned,
+        // detached `run_review_subprocess` task — it is dropped there on the
+        // success/timeout/`?`/panic/abort paths). Blocking a multi-thread
+        // runtime worker on the two git calls (potentially longer under a
+        // contended `.git/index.lock`) would starve the scheduler. So when we
+        // are on a *multi-thread* runtime, wrap the call in `block_in_place`,
+        // which hands the worker's other tasks off to a sibling worker for the
+        // duration. On a current-thread runtime `block_in_place` would panic
+        // (there is no sibling to hand work to), and with no runtime at all
+        // there is nothing to starve — both fall through to a plain inline
+        // call. In every branch the removal finishes before `Drop` returns.
         //
-        // Best-effort: if the process exits before the handoff completes, the
-        // worktree leaks — `sweep_stale_review_worktrees` catches anything
-        // older than 6h. Errors from `remove_worktree` are already swallowed
-        // (`let _ = ...`), preserving the original idempotent semantics.
+        // Best-effort: `remove_worktree` swallows its own errors (`let _ =
+        // ...`); `sweep_stale_review_worktrees` remains the backstop for the
+        // `SIGKILL`/forceful-exit case that skips `Drop` entirely.
         let main_repo = std::mem::take(&mut self.main_repo);
         let path = std::mem::take(&mut self.path);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn_blocking(move || {
+        let on_multi_thread_runtime = matches!(
+            tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        );
+        if on_multi_thread_runtime {
+            // We are on a multi-thread runtime worker — tell tokio this thread
+            // is about to block so it can keep the rest of the runtime moving.
+            tokio::task::block_in_place(move || {
                 remove_worktree(&main_repo, &path);
             });
         } else {
-            // No tokio runtime in scope (e.g. dropped from a pure sync test
-            // or from a non-tokio thread): fall back to an OS thread so the
-            // dropping thread still doesn't block on subprocess calls. The
-            // thread is detached — cleanup is best-effort by design.
-            std::thread::spawn(move || {
-                remove_worktree(&main_repo, &path);
-            });
+            // Current-thread runtime (block_in_place would panic) or no
+            // runtime (e.g. a pure sync test / non-tokio thread): nothing to
+            // starve, so just run the quick subprocess calls inline.
+            remove_worktree(&main_repo, &path);
         }
     }
 }
@@ -3293,46 +3353,50 @@ mod tests {
 
     /// Source-shape assertion for `ReviewWorktree::Drop`.
     ///
-    /// `Drop` must not block the dropping thread on the two sync git
-    /// subprocess calls inside `remove_worktree` — under abort, the
-    /// dropping thread is a tokio worker, and several concurrent review
-    /// drops blocking on a contended `.git/index.lock` can starve the
-    /// runtime. The fix hands cleanup off to either
-    /// `tokio::runtime::Handle::spawn_blocking` (when a runtime is
-    /// available) or `std::thread::spawn` (the no-runtime fallback) and
-    /// returns immediately.
+    /// `Drop` must clean the worktree up **synchronously** — completing the
+    /// `remove_worktree` call before it returns — so a short run that
+    /// finalizes and exits promptly cannot leak the worktree. (A prior
+    /// version detached cleanup onto `spawn_blocking` / a fresh OS thread and
+    /// returned immediately, which leaked on fast exit.) Because `Drop` can
+    /// run on a tokio worker thread, the synchronous call must be wrapped in
+    /// `block_in_place` when on a multi-thread runtime so it doesn't starve
+    /// the scheduler, falling through to a plain inline call otherwise.
     ///
-    /// A behavioral test is hard: `Drop` is fire-and-forget by design and
-    /// the cleanup is best-effort. So we assert the source shape: the
-    /// Drop body must reference both handoff paths and must NOT call
-    /// `remove_worktree` synchronously in the impl body.
+    /// A behavioral test is covered in `review.rs` (it asserts the worktree
+    /// is gone right after the guard drops). Here we assert the source shape:
+    /// the Drop body must call `remove_worktree` inline (the synchronous
+    /// path), guard the multi-thread case with `block_in_place`, and must NOT
+    /// detach cleanup via `spawn_blocking` / `std::thread::spawn` (which would
+    /// reintroduce the fast-exit leak).
     #[test]
-    fn test_review_worktree_drop_does_not_block_dropping_thread() {
+    fn test_review_worktree_drop_cleans_up_synchronously() {
         let src = include_str!("git.rs");
         let sig = "impl Drop for ReviewWorktree {";
         let start = src.find(sig).expect("ReviewWorktree::Drop impl must exist");
         let after = &src[start..];
-        // The next top-level item after `impl Drop for ReviewWorktree` is
-        // the closing comment-divider for the file's section. We bound
-        // the slice at the impl's own closing brace, found by the next
-        // `// -----` divider OR the next `#[cfg(test)]`. A simple
-        // upper-bound: stop at the next `// ---` divider.
+        // Bound the slice at the impl's section: stop at the next `// ---`
+        // divider after the Drop impl.
         let end_rel = after
             .find("\n// ---")
             .expect("expected the next section divider after the Drop impl");
         let body = &after[..end_rel];
 
         assert!(
-            body.contains("spawn_blocking"),
-            "ReviewWorktree::Drop must hand cleanup off via tokio's \
-             spawn_blocking when a runtime is available; without this the \
-             dropping tokio worker blocks on two sync git subprocess calls",
+            body.contains("remove_worktree(&main_repo, &path)"),
+            "ReviewWorktree::Drop must call remove_worktree synchronously so \
+             cleanup completes before Drop returns (no fast-exit leak)",
         );
         assert!(
-            body.contains("std::thread::spawn"),
-            "ReviewWorktree::Drop must fall back to std::thread::spawn when \
-             no tokio runtime is in scope, so the dropping thread still \
-             doesn't block on subprocess calls",
+            body.contains("block_in_place"),
+            "ReviewWorktree::Drop must wrap the synchronous remove in \
+             block_in_place when on a multi-thread runtime so it doesn't \
+             starve the scheduler while the git subprocess calls run",
+        );
+        assert!(
+            !body.contains("spawn_blocking") && !body.contains("std::thread::spawn"),
+            "ReviewWorktree::Drop must NOT detach cleanup onto spawn_blocking \
+             / std::thread::spawn — a detached task can be cut off when a \
+             short run exits before it runs, leaking the worktree",
         );
     }
 }

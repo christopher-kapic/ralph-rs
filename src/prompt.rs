@@ -2,18 +2,14 @@
 
 use crate::plan::{Interruption, Plan, Step, StepStatus};
 
-/// Default "how to introspect this plan" block prepended to every step's
-/// prompt. Injected verbatim — there is no per-plan override.
-///
-/// Trailing instruction appended to every step prompt when the plan has
-/// `questions_enabled = true` (TUI-plan.md §17). Verbatim from the spec —
-/// case, punctuation, and line breaks are load-bearing.
+/// Trailing instruction appended to every step prompt (questions are always
+/// enabled — there is no per-plan opt-out). Verbatim from the spec — case,
+/// punctuation, and line breaks are load-bearing.
 pub const QUESTION_ASK_INSTRUCTION: &str = "\
 ## Asking the user a question
 
-This plan has questions enabled, so you may pause and ask the user for
-clarification when you're genuinely blocked on a decision they need to
-make.
+You may pause and ask the user for clarification when you're genuinely
+blocked on a decision they need to make.
 
 Before asking, seriously consider whether the answer is already
 recoverable from:
@@ -183,7 +179,7 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 ///    sequence without us paying O(n²) bytes for full prior descriptions
 /// 9. Deterministic tests (test commands that will be run after)
 /// 10. Focus instruction (reminder to stay focused on just this step)
-/// 11. Question-ask instruction (only if `plan.questions_enabled`)
+/// 11. Question-ask instruction (always appended — questions are always on)
 ///
 /// Assembly is pure prefix-stacking — there is no suffix stage and no
 /// auto-injected context prepend (the global layer carries that block).
@@ -278,12 +274,9 @@ pub fn build_step_prompt(
     // Focus instruction.
     sections.push(format_focus_instruction(step));
 
-    // Question-ask instruction — appended at the very end (after the
-    // focus instruction) when the plan opted into questions (TUI-plan.md §17
-    // "Prompt injection (when enabled)").
-    if plan.questions_enabled {
-        sections.push(QUESTION_ASK_INSTRUCTION.to_string());
-    }
+    // Question-ask instruction — appended at the very end (after the focus
+    // instruction). Questions are always enabled, so this always renders.
+    sections.push(QUESTION_ASK_INSTRUCTION.to_string());
 
     // Stack the global/project layers as prefix sections ahead of the joined
     // body. Each layer is inserted as its own `\n\n`-separated section,
@@ -820,7 +813,6 @@ mod tests {
             plan_harness: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            questions_enabled: false,
             pause_requested: false,
             last_run_branch: None,
             last_run_started_at: None,
@@ -1451,8 +1443,7 @@ mod tests {
 
     #[test]
     fn test_prompt_section_order() {
-        let mut plan = make_plan();
-        plan.questions_enabled = true;
+        let plan = make_plan();
         let s1 = make_step_with("s1", "Prior", StepStatus::Complete);
         let s2 = make_step();
         let all_steps = vec![s1, s2.clone()];
@@ -1546,14 +1537,13 @@ mod tests {
             "plan-layer text must sit inside the # Plan block"
         );
 
-        // Global layer is the very start; the body's focus instruction is
-        // the tail — nothing is appended after it.
+        // Global layer is the very start; the always-on question-ask
+        // instruction is the tail (it stacks after the focus instruction).
         assert!(prompt.starts_with("GLOBAL-LAYER"));
-        assert!(
-            prompt
-                .trim_end()
-                .ends_with(&format!("Focus on: {}", step.title))
-        );
+        let focus_pos = prompt.find(&format!("Focus on: {}", step.title)).unwrap();
+        let ask_pos = prompt.find("## Asking the user a question").unwrap();
+        assert!(focus_pos < ask_pos);
+        assert!(prompt.contains("## Asking the user a question"));
         // The configured plan-layer string appears exactly once (no bare
         // prefix + format_plan_context double-emission).
         assert_eq!(prompt.matches("PLAN-LAYER").count(), 1);
@@ -1584,20 +1574,18 @@ mod tests {
             !prompt.contains("\n\n\n"),
             "should not produce blank sections"
         );
-        // Pure prefix-stacking — focus instruction is still the tail.
-        assert!(
-            prompt
-                .trim_end()
-                .ends_with(&format!("Focus on: {}", step.title))
-        );
+        // Pure prefix-stacking — the always-on question-ask instruction is
+        // the tail, stacked after the focus instruction.
+        let focus_pos = prompt.find(&format!("Focus on: {}", step.title)).unwrap();
+        let ask_pos = prompt.find("## Asking the user a question").unwrap();
+        assert!(focus_pos < ask_pos);
     }
 
-    // ---- Question injection (TUI-plan.md §17) ----
+    // ---- Question injection (always on — no per-plan opt-out) ----
 
     #[test]
-    fn test_question_ask_instruction_appended_when_questions_enabled() {
-        let mut plan = make_plan();
-        plan.questions_enabled = true;
+    fn test_question_ask_instruction_always_appended() {
+        let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
 
@@ -1612,9 +1600,8 @@ mod tests {
             &[],
         );
 
-        // Header + a few load-bearing markers from the §17 spec text.
+        // Header + a few load-bearing markers from the ask block.
         assert!(prompt.contains("## Asking the user a question"));
-        assert!(prompt.contains("This plan has questions enabled"));
         assert!(prompt.contains("ralph question ask"));
         assert!(prompt.contains("Most decisions belong in the plan"));
 
@@ -1623,31 +1610,6 @@ mod tests {
         let focus_pos = prompt.find("Only modify files").unwrap();
         let ask_pos = prompt.find("## Asking the user a question").unwrap();
         assert!(focus_pos < ask_pos);
-    }
-
-    #[test]
-    fn test_question_ask_instruction_absent_when_questions_disabled() {
-        let plan = make_plan(); // make_plan() hard-codes questions_enabled = false
-        assert!(!plan.questions_enabled);
-        let step = make_step();
-        let all_steps = vec![step.clone()];
-
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
-
-        // No header, and no body text from the §17 ask block.
-        assert!(!prompt.contains("## Asking the user a question"));
-        assert!(!prompt.contains("This plan has questions enabled"));
-        // The body text uses unique phrasing — make sure it's gone too.
-        assert!(!prompt.contains("Most decisions belong in the plan"));
     }
 
     #[test]
@@ -1732,15 +1694,12 @@ mod tests {
     }
 
     #[test]
-    fn test_resolved_interruptions_independent_of_questions_enabled() {
-        // The "Resolved interruptions" section is gated on the
-        // `resolved_interruptions` slice, NOT on `questions_enabled`. If a
-        // plan had questions enabled, an interruption was resolved, and the
-        // user then toggled the flag off, the harness must still see the
-        // resolution — otherwise the human's input is silently dropped from
-        // the next retry. Conversely, enabling questions on a fresh plan
-        // must not synthesize an empty section.
-        let mut plan = make_plan();
+    fn test_resolved_interruptions_gated_only_on_the_slice() {
+        // The "Resolved interruptions" section is gated solely on the
+        // `resolved_interruptions` slice: present when there's a resolution,
+        // absent when empty. The ask-instruction is always present (questions
+        // are always enabled), independent of whether anything was resolved.
+        let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
         let resolved = vec![resolved_intr(
@@ -1750,9 +1709,8 @@ mod tests {
             None,
         )];
 
-        // Case 1: questions disabled, but a resolution exists. Section IS
-        // rendered; ask-instruction is NOT.
-        plan.questions_enabled = false;
+        // Case 1: a resolution exists. Section IS rendered; ask-instruction
+        // is ALSO rendered.
         let prompt = build_step_prompt(
             &plan,
             &step,
@@ -1764,11 +1722,10 @@ mod tests {
             &resolved,
         );
         assert!(prompt.contains("## Resolved interruptions"));
-        assert!(!prompt.contains("## Asking the user a question"));
+        assert!(prompt.contains("## Asking the user a question"));
 
-        // Case 2: questions enabled, but nothing resolved yet. Ask-
-        // instruction IS rendered; resolved section is NOT.
-        plan.questions_enabled = true;
+        // Case 2: nothing resolved yet. Ask-instruction IS rendered; resolved
+        // section is NOT.
         let prompt = build_step_prompt(
             &plan,
             &step,

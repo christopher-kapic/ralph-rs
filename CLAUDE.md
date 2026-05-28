@@ -454,7 +454,6 @@ ralph plan hooks <slug>
 ralph plan dependency add <slug> --depends-on <slug>...
 ralph plan dependency remove <slug> --depends-on <slug>...
 ralph plan dependency list <slug>
-ralph plan questions <on|off> [<slug>]
 ralph plan review <on|off> <slug>            # per-plan review toggle (precedence step > plan > config > false)
 ralph plan harness set <harness> [<slug>]
 ralph plan harness show [<slug>]

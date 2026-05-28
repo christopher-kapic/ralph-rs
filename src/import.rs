@@ -48,10 +48,6 @@ fn check_import_version(exported_version: &str, strict: bool) -> Result<()> {
     }
 }
 
-fn default_questions_enabled() -> bool {
-    true
-}
-
 // ---------------------------------------------------------------------------
 // Import JSON schema (mirrors export but uses Deserialize)
 // ---------------------------------------------------------------------------
@@ -81,11 +77,6 @@ pub struct ImportedPlanMeta {
     pub agent: Option<String>,
     #[serde(default)]
     pub deterministic_tests: Vec<String>,
-    /// Whether steps in this plan may raise question/blocker interruptions.
-    /// Missing/absent field defaults to `true`, preserving the current import
-    /// behavior for legacy bundles that predate this field.
-    #[serde(default = "default_questions_enabled")]
-    pub questions_enabled: bool,
     /// Slugs of plans this plan directly depends on.
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -523,9 +514,6 @@ fn import_plan_inner(
     // keeps an unset plan unset (round-trip: None stays None).
     if let Some(rs) = data.plan.retry_strategy {
         storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
-    }
-    if !data.plan.questions_enabled {
-        storage::set_plan_questions_enabled(conn, &plan.id, false)?;
     }
 
     // Restore the plan-level review on/off override only when carried
@@ -1739,39 +1727,39 @@ mod tests {
     }
 
     #[test]
-    fn test_import_roundtrip_preserves_questions_enabled() {
+    fn test_import_tolerates_legacy_questions_enabled_key() {
+        // questions_enabled was fully removed (V36). An OLD exported bundle
+        // still carries a `"questions_enabled"` key; import must IGNORE it
+        // (no `deny_unknown_fields`) and succeed — backward compatibility.
         let conn = setup();
-        let original = storage::create_plan(
-            &conn,
-            "questions-rt",
-            "/tmp/src",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
-        )
-        .unwrap();
-        storage::set_plan_questions_enabled(&conn, &original.id, false).unwrap();
+        let json = r#"{
+            "ralph_rs_version": "0.1.0",
+            "exported_at": "2025-01-01T00:00:00Z",
+            "plan": {
+                "slug": "legacy-q",
+                "branch_name": "b",
+                "description": "desc",
+                "questions_enabled": false
+            },
+            "steps": [
+                {"title": "S", "description": "d"}
+            ]
+        }"#;
 
-        let original = storage::get_plan_by_id(&conn, &original.id).unwrap();
-        let steps = storage::list_steps(&conn, &original.id).unwrap();
-        let exported = export::build_exported_plan(&original, &steps, Vec::new(), &[]);
-        let json = serde_json::to_string(&exported).unwrap();
-        let imported_data: ImportedPlan = serde_json::from_str(&json).unwrap();
+        let data: ImportedPlan = serde_json::from_str(json).expect("legacy key must deserialize");
         let options = ImportOptions {
-            slug: Some("questions-rt-copy"),
+            slug: None,
             branch: None,
             harness: None,
-            project: "/tmp/dst",
+            project: "/tmp/dst-legacy",
             strict: false,
             review_harness_configured: false,
             global_review_enabled: false,
         };
 
-        let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
+        let imported_id = import_plan_from_data(&conn, &data, &options).unwrap();
         let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
-        assert!(!imported_plan.questions_enabled);
+        assert_eq!(imported_plan.slug, "legacy-q");
     }
 
     #[test]

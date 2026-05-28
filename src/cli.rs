@@ -619,18 +619,6 @@ pub enum PlanCommand {
     #[command(subcommand)]
     Harness(PlanHarnessCommand),
 
-    /// Toggle the pause-for-question feature for a plan.
-    ///
-    /// `ralph plan questions on <slug>` enables the feature; off disables it.
-    /// Mirrors the `Q` keybinding in the TUI plan list.
-    Questions {
-        /// `on` to enable, `off` to disable.
-        state: QuestionsState,
-
-        /// Plan slug.
-        slug: String,
-    },
-
     /// Toggle the built-in nondeterministic review pipeline for a plan
     /// (docs/dag-redesign.md §3.3/§6/§7).
     ///
@@ -640,7 +628,7 @@ pub enum PlanCommand {
     /// a per-step `--review` (precedence step > plan > config > false).
     Review {
         /// `on` to force review on for the plan, `off` to force it off.
-        state: QuestionsState,
+        state: OnOffState,
 
         /// Plan slug.
         slug: String,
@@ -1321,14 +1309,13 @@ impl From<ChangeHandling> for crate::git::ParkStrategyKind {
     }
 }
 
-/// `on` / `off` value enum for `ralph plan questions` and
-/// `ralph plan review`.
+/// `on` / `off` value enum for `ralph plan review`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lowercase")]
-pub enum QuestionsState {
-    /// Enable the per-plan pause-for-question feature.
+pub enum OnOffState {
+    /// Enable the toggle.
     On,
-    /// Disable the feature (the default for new plans).
+    /// Disable the toggle.
     Off,
 }
 
@@ -3025,37 +3012,20 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_plan_questions_on() {
-        let cli = Cli::try_parse_from(["ralph-rs", "plan", "questions", "on", "my-plan"]).unwrap();
-        if let Command::Plan(PlanCommand::Questions { state, slug }) = cli.command.unwrap() {
-            assert_eq!(state, QuestionsState::On);
+    fn test_parse_plan_review_on() {
+        let cli = Cli::try_parse_from(["ralph-rs", "plan", "review", "on", "my-plan"]).unwrap();
+        if let Command::Plan(PlanCommand::Review { state, slug }) = cli.command.unwrap() {
+            assert_eq!(state, OnOffState::On);
             assert_eq!(slug, "my-plan");
         } else {
-            panic!("Expected Plan Questions");
+            panic!("Expected Plan Review");
         }
     }
 
     #[test]
-    fn test_parse_plan_questions_off() {
-        let cli = Cli::try_parse_from(["ralph-rs", "plan", "questions", "off", "my-plan"]).unwrap();
-        if let Command::Plan(PlanCommand::Questions { state, slug }) = cli.command.unwrap() {
-            assert_eq!(state, QuestionsState::Off);
-            assert_eq!(slug, "my-plan");
-        } else {
-            panic!("Expected Plan Questions");
-        }
-    }
-
-    #[test]
-    fn test_parse_plan_questions_invalid_state_rejected() {
+    fn test_parse_plan_review_invalid_state_rejected() {
         // Only `on`/`off` are valid; anything else must be rejected by clap.
-        let result = Cli::try_parse_from(["ralph-rs", "plan", "questions", "maybe", "my-plan"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_plan_questions_requires_slug() {
-        let result = Cli::try_parse_from(["ralph-rs", "plan", "questions", "on"]);
+        let result = Cli::try_parse_from(["ralph-rs", "plan", "review", "maybe", "my-plan"]);
         assert!(result.is_err());
     }
 

@@ -158,7 +158,6 @@ pub fn for_plan_list() -> HelpModel {
                 vec![
                     ("i / a", "Create new plan"),
                     ("A", "Approve highlighted plan"),
-                    ("Q", "Toggle questions on highlighted plan"),
                     ("d", "Archive selection or cursor target"),
                 ],
             ),
@@ -246,7 +245,6 @@ pub fn for_plan_detail() -> HelpModel {
                     ("r", "Reset highlighted step"),
                     ("Shift-J", "Move step down"),
                     ("Shift-K", "Move step up"),
-                    ("Q", "Toggle questions for this plan"),
                 ],
             ),
             Group::new(
