@@ -118,7 +118,7 @@ pub struct PlanListApp {
     /// a transient confirmation.
     pub toasts: ToastQueue,
     /// Read-only attach state (TUI-plan.md §13.2). When `Locked`, the edit
-    /// keybindings (`i`/`a`/`A`/`d`/`Q`) are suppressed and the persistent
+    /// keybindings (`i`/`a`/`A`/`d`) are suppressed and the persistent
     /// banner replaces the bottom hint line.
     pub read_only: ReadOnly,
     /// Help-overlay state. `?` toggles visibility; while visible the
@@ -448,7 +448,7 @@ impl PlanListApp {
     // -- Cursor target ----------------------------------------------------
 
     /// The plan currently under the cursor, if any. Used by single-target
-    /// keybindings (`A` approve, `Q` toggle questions) that act only on the
+    /// keybindings (`A` approve) that act only on the
     /// highlighted tile and ignore multi-selection. Returns `None` when the
     /// cursor is on the archived sentinel.
     pub fn cursor_plan(&self) -> Option<&Plan> {
@@ -477,7 +477,7 @@ impl PlanListApp {
     }
 
     /// Replace one plan's row in-place after a single-plan mutation (e.g. `A`
-    /// approve, `Q` questions toggle). Unlike [`Self::refresh_tiles`], this
+    /// approve). Unlike [`Self::refresh_tiles`], this
     /// preserves selection, cursor, and scroll — appropriate for cursor-only
     /// actions that do not consume the selection. No-op if `updated.id` is
     /// not currently in the tile list.
@@ -595,7 +595,7 @@ pub fn draw(frame: &mut Frame, app: &mut PlanListApp) {
     app.toasts.prune(Instant::now());
 
     let crumbs: [&str; 1] = ["ralph"];
-    let normal_hint = "[j/k] nav  [enter] open  [space] select  [i] new  [A] approve  [Q] questions  [d] archive  [/:] cmd  [q] quit";
+    let normal_hint = "[j/k] nav  [enter] open  [space] select  [i] new  [A] approve  [d] archive  [/:] cmd  [q] quit";
     let palette_hint = "[tab] complete  [enter] submit  [esc] cancel";
     let hint = if app.palette_active() {
         palette_hint
