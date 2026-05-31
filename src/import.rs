@@ -82,29 +82,15 @@ pub struct ImportedPlanMeta {
     pub depends_on: Vec<String>,
     #[serde(default)]
     pub plan_harness: Option<String>,
-    /// Optional plan-level retry-strategy override. Missing/absent field
-    /// deserializes to `None` via serde(default) (no override — steps fall
-    /// through to the global `keep` default), preserving backward
-    /// compatibility with plan JSON written before V24.
-    #[serde(default)]
-    pub retry_strategy: Option<crate::plan::RetryStrategy>,
     /// Optional plan-level review on/off override (docs/dag-redesign.md
     /// §13.3). Missing/absent field ⇒ `None` (inherit global) via
-    /// serde(default), so a legacy (pre-V27) bundle imports fine. Mirrors
-    /// `retry_strategy` exactly.
+    /// serde(default), so a legacy (pre-V27) bundle imports fine.
     #[serde(default)]
     pub review_enabled: Option<bool>,
-    /// Plan-level `--squash-on-complete` toggle (docs/dag-redesign.md
-    /// §13.3 / §14.1). Plan-template data. Missing/absent field ⇒ `false`
-    /// via serde(default), so a legacy (pre-V28) bundle imports back to the
-    /// default OFF — the boolean-template-field round-trip convention
-    /// (export emits it only when `true`).
-    #[serde(default)]
-    pub squash_on_complete: bool,
     /// Optional plan-level `max_review_corrections` recursion cap
-    /// (docs/dag-redesign.md §10 / §13.3). Plan-template data, sibling of
-    /// `retry_strategy`. Missing/absent field ⇒ `None` (use the built-in
-    /// default) via serde(default), so a legacy bundle imports fine.
+    /// (docs/dag-redesign.md §10 / §13.3). Plan-template data. Missing/absent
+    /// field ⇒ `None` (use the built-in default) via serde(default), so a
+    /// legacy bundle imports fine.
     #[serde(default)]
     pub max_review_corrections: Option<i32>,
 }
@@ -132,17 +118,11 @@ pub struct ImportedStep {
     /// with plan JSON written before V13.
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Optional step-level retry-strategy override. Missing/absent field
-    /// deserializes to `None` via serde(default) (inherit plan/global),
-    /// preserving backward compatibility with plan JSON written before
-    /// V24.
-    #[serde(default)]
-    pub retry_strategy: Option<crate::plan::RetryStrategy>,
     /// Optional step-level review on/off override (docs/dag-redesign.md
     /// §13.3). Missing/absent field ⇒ `None` (inherit plan/global) via
-    /// serde(default), so a legacy (pre-V27) bundle imports fine. Mirrors
-    /// `retry_strategy` exactly. The runtime `review_status` /
-    /// `corrects_step_id` are never carried in a bundle (runtime state).
+    /// serde(default), so a legacy (pre-V27) bundle imports fine. The
+    /// runtime `review_status` / `corrects_step_id` are never carried in a
+    /// bundle (runtime state).
     #[serde(default)]
     pub review_enabled: Option<bool>,
     /// Plan-unique portable edge handle (docs/dag-redesign.md §13.2/§13.3).
@@ -512,27 +492,13 @@ fn import_plan_inner(
         storage::set_plan_harness_gen(conn, &plan.id, data.plan.plan_harness.as_deref())?;
     }
 
-    // Restore the plan-level retry-strategy override only when the import
-    // carried one. `None` is the column default, so skipping the write
-    // keeps an unset plan unset (round-trip: None stays None).
-    if let Some(rs) = data.plan.retry_strategy {
-        storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
-    }
-
     // Restore the plan-level review on/off override only when carried
     // (`None` is the column default — round-trip: None stays None).
     if let Some(re) = data.plan.review_enabled {
         storage::set_plan_review_enabled(conn, &plan.id, Some(re))?;
     }
-    // `squash_on_complete` is a boolean-template field: write only the
-    // explicit `true` (false is the column default, so skipping the write
-    // keeps a legacy/default-OFF bundle OFF — round-trip preserved).
-    if data.plan.squash_on_complete {
-        storage::set_plan_squash_on_complete(conn, &plan.id, true)?;
-    }
-    // Plan-level review recursion cap, sibling of retry_strategy: write
-    // only when present so an unset bundle stays unset (uses the built-in
-    // default).
+    // Plan-level review recursion cap: write only when present so an unset
+    // bundle stays unset (uses the built-in default).
     if let Some(cap) = data.plan.max_review_corrections {
         storage::set_plan_max_review_corrections(conn, &plan.id, Some(cap))?;
     }
@@ -566,13 +532,8 @@ fn import_plan_inner(
             Some(step_data.change_policy),
             tags_arg,
         )?;
-        // Same rule for the step-level override: write only when present
-        // so an unset imported step stays unset (round-trip preserved).
-        if let Some(rs) = step_data.retry_strategy {
-            storage::set_step_retry_strategy(conn, &step.id, Some(rs))?;
-        }
-        // Same rule for the step-level review override (round-trip: an
-        // unset imported step stays unset / inherit).
+        // Write the step-level review override only when present so an
+        // unset imported step stays unset / inherit (round-trip preserved).
         if let Some(re) = step_data.review_enabled {
             storage::set_step_review_enabled(conn, &step.id, Some(re))?;
         }
@@ -1801,165 +1762,17 @@ mod tests {
         );
     }
 
-    /// Round-trip `retry_strategy` through export -> JSON -> import for all
-    /// three states: plan-set, step-set, and unset. The value (including
-    /// `None`) must survive the round-trip unchanged (Step 23).
-    #[test]
-    fn test_roundtrip_preserves_retry_strategy_all_states() {
-        use crate::plan::RetryStrategy;
-        let conn = setup();
-
-        let original = storage::create_plan(
-            &conn,
-            "rs-plan",
-            "/tmp/src",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
-        )
-        .unwrap();
-        // Plan-level override = rollback.
-        storage::set_plan_retry_strategy(&conn, &original.id, Some(RetryStrategy::Rollback))
-            .unwrap();
-
-        // step 1: explicit step-level keep override.
-        let (s1, _) = storage::create_step(
-            &conn,
-            &original.id,
-            "explicit",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        storage::set_step_retry_strategy(&conn, &s1.id, Some(RetryStrategy::Keep)).unwrap();
-        // step 2: no step-level override (unset -> None).
-        storage::create_step(
-            &conn,
-            &original.id,
-            "inherits",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        // Re-fetch so the in-memory Plan reflects the post-create
-        // set_plan_retry_strategy write (the original handle is stale).
-        let original = storage::get_plan_by_id(&conn, &original.id).unwrap();
-        let steps = storage::list_steps(&conn, &original.id).unwrap();
-        let exported = export::build_exported_plan(&original, &steps, Vec::new(), &[]);
-        let json = serde_json::to_string_pretty(&exported).unwrap();
-
-        // Plan override + the explicit step override are present; the unset
-        // step omits the field entirely (skip_serializing_if).
-        assert!(json.contains("\"retry_strategy\": \"rollback\""));
-        assert!(json.contains("\"retry_strategy\": \"keep\""));
-
-        // Import into a fresh project and verify all three states survived.
-        let imported_data: ImportedPlan = serde_json::from_str(&json).unwrap();
-        let options = ImportOptions {
-            slug: None,
-            branch: None,
-            harness: None,
-            project: "/tmp/dst",
-            strict: false,
-            review_harness_configured: false,
-
-            global_review_enabled: false,
-        };
-        let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
-        let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
-        let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
-
-        assert_eq!(imported_plan.retry_strategy, Some(RetryStrategy::Rollback));
-        assert_eq!(imported_steps[0].retry_strategy, Some(RetryStrategy::Keep));
-        assert!(
-            imported_steps[1].retry_strategy.is_none(),
-            "unset step-level override must round-trip as None"
-        );
-    }
-
-    /// An unset plan-level override exports without the `retry_strategy`
-    /// key at all (pre-V24 JSON shape preserved) and re-imports as `None`.
-    #[test]
-    fn test_roundtrip_unset_plan_retry_strategy_omitted_and_none() {
-        let conn = setup();
-        let original = storage::create_plan(
-            &conn,
-            "no-rs",
-            "/tmp/src",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
-        )
-        .unwrap();
-        storage::create_step(
-            &conn,
-            &original.id,
-            "s",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        let steps = storage::list_steps(&conn, &original.id).unwrap();
-        let exported = export::build_exported_plan(&original, &steps, Vec::new(), &[]);
-        let json = serde_json::to_string_pretty(&exported).unwrap();
-        assert!(
-            !json.contains("retry_strategy"),
-            "an all-unset plan must not emit retry_strategy at all; got:\n{json}"
-        );
-
-        let imported_data: ImportedPlan = serde_json::from_str(&json).unwrap();
-        let options = ImportOptions {
-            slug: None,
-            branch: None,
-            harness: None,
-            project: "/tmp/dst",
-            strict: false,
-            review_harness_configured: false,
-
-            global_review_enabled: false,
-        };
-        let imported_id = import_plan_from_data(&conn, &imported_data, &options).unwrap();
-        let imported_plan = storage::get_plan_by_id(&conn, &imported_id).unwrap();
-        let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
-        assert!(imported_plan.retry_strategy.is_none());
-        assert!(imported_steps[0].retry_strategy.is_none());
-    }
-
     // -----------------------------------------------------------------
-    // STEP 43 — review toggles + squash_on_complete + max_review_corrections
+    // STEP 43 — review toggles + max_review_corrections
     // round-trip (docs/dag-redesign.md §13.2-§13.3)
     // -----------------------------------------------------------------
 
     /// All plan-template review fields survive export -> JSON -> import:
-    /// plan/step `review_enabled`, `squash_on_complete`, and
-    /// `max_review_corrections`. Runtime state (`review_status`,
-    /// `corrects_step_id`) is stripped (the structs have no such fields).
+    /// plan/step `review_enabled` and `max_review_corrections`. Runtime
+    /// state (`review_status`, `corrects_step_id`) is stripped (the structs
+    /// have no such fields).
     #[test]
-    fn test_roundtrip_preserves_review_toggles_squash_and_max_corrections() {
+    fn test_roundtrip_preserves_review_toggles_and_max_corrections() {
         let conn = setup();
         let original = storage::create_plan(
             &conn,
@@ -1972,9 +1785,8 @@ mod tests {
             &[],
         )
         .unwrap();
-        // Plan-level: review ON, squash ON, cap = 5.
+        // Plan-level: review ON, cap = 5.
         storage::set_plan_review_enabled(&conn, &original.id, Some(true)).unwrap();
-        storage::set_plan_squash_on_complete(&conn, &original.id, true).unwrap();
         storage::set_plan_max_review_corrections(&conn, &original.id, Some(5)).unwrap();
 
         // step 1: explicit step-level review OFF override.
@@ -2017,7 +1829,6 @@ mod tests {
         // Plan + explicit step toggles are present; runtime state is NOT.
         assert!(json.contains("\"review_enabled\": true"));
         assert!(json.contains("\"review_enabled\": false"));
-        assert!(json.contains("\"squash_on_complete\": true"));
         assert!(json.contains("\"max_review_corrections\": 5"));
         assert!(
             !json.contains("review_status"),
@@ -2044,7 +1855,6 @@ mod tests {
         let imported_steps = storage::list_steps(&conn, &imported_id).unwrap();
 
         assert_eq!(imported_plan.review_enabled, Some(true));
-        assert!(imported_plan.squash_on_complete);
         assert_eq!(imported_plan.max_review_corrections, Some(5));
         assert_eq!(imported_steps[0].review_enabled, Some(false));
         assert!(
@@ -2056,10 +1866,10 @@ mod tests {
         assert!(imported_steps[0].corrects_step_id.is_none());
     }
 
-    /// A plan with NO review overrides and the default-OFF squash exports
-    /// without any of the new keys (pre-V27/V28 JSON shape preserved) and a
-    /// legacy bundle (none of the fields present) imports back to the
-    /// inherit/OFF defaults via `#[serde(default)]`.
+    /// A plan with NO review overrides exports without any of the new keys
+    /// (pre-V27 JSON shape preserved) and a legacy bundle (none of the
+    /// fields present) imports back to the inherit defaults via
+    /// `#[serde(default)]`.
     #[test]
     fn test_legacy_bundle_without_review_fields_imports_to_defaults() {
         let conn = setup();
@@ -2095,10 +1905,6 @@ mod tests {
         assert!(
             !json.contains("review_enabled"),
             "an all-unset plan must not emit review_enabled; got:\n{json}"
-        );
-        assert!(
-            !json.contains("squash_on_complete"),
-            "default-OFF squash must be omitted (boolean-template convention); got:\n{json}"
         );
         assert!(
             !json.contains("max_review_corrections"),
@@ -2137,7 +1943,6 @@ mod tests {
         let p = storage::get_plan_by_id(&conn, &id).unwrap();
         let st = storage::list_steps(&conn, &id).unwrap();
         assert_eq!(p.review_enabled, None, "legacy ⇒ inherit");
-        assert!(!p.squash_on_complete, "legacy ⇒ default OFF");
         assert_eq!(p.max_review_corrections, None, "legacy ⇒ built-in default");
         assert_eq!(st[0].review_enabled, None, "legacy step ⇒ inherit");
     }
@@ -2958,7 +2763,6 @@ mod tests {
                 model: None,
                 change_policy: crate::plan::ChangePolicy::default(),
                 tags: vec![],
-                retry_strategy: None,
                 review_enabled: None,
                 short_id: Some("aaaaaaaa".into()),
                 id: None,
@@ -2974,7 +2778,6 @@ mod tests {
                 model: None,
                 change_policy: crate::plan::ChangePolicy::default(),
                 tags: vec![],
-                retry_strategy: None,
                 review_enabled: None,
                 short_id: Some("bbbbbbbb".into()),
                 id: None,

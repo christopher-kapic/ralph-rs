@@ -30,7 +30,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::plan::{ExecutionLog, Interruption, Plan, RetryStrategy, Step, TerminationReason};
+use crate::plan::{ExecutionLog, Interruption, Plan, Step, TerminationReason};
 use crate::prompt::{self, Prompts, RetryContext};
 use crate::tui::help::{self, HelpState};
 use crate::tui::theme;
@@ -108,24 +108,23 @@ pub enum Outcome {
 /// fields (`previous_diff`, `previous_test_output`, `attempt`,
 /// `max_attempts`) match the executor exactly *for the inputs given*.
 ///
-/// Fidelity caveat: this is a "what would be sent now" preview. It
-/// re-renders from *current* plan/project/step text and the *current*
-/// answered-question set, so a historical attempt's preview reflects edits
-/// made after that attempt ran — it is not the point-in-time prompt the
-/// agent actually received. The exact prompt sent for each attempt is
-/// persisted verbatim in `execution_logs.prompt_text`; this view
-/// deliberately re-assembles instead, so layer edits are visible.
-/// `strategy` is the step's resolved [`RetryStrategy`] (step > plan >
-/// default `Keep`). It scopes the reconstruction exactly as the executor
-/// does (Step 22): under `Rollback` the diff/files are included (the agent
-/// no longer sees the reverted work); under `Keep` they are omitted (the
-/// work is still on disk). `previous_failure_reason` is reconstructed from
-/// the previous attempt's `termination_reason` under both strategies.
+/// Fidelity caveat: this reconstruction is a "what would be sent now"
+/// preview — it re-renders from *current* plan/project/step text and the
+/// *current* answered-question set, so it reflects edits made after the
+/// attempt ran rather than the point-in-time prompt. It is therefore used
+/// by `build_attempts` only as a FALLBACK, when an already-run attempt has
+/// no persisted `execution_logs.prompt_text` (a row predating prompt_text
+/// capture). For attempts that did persist their prompt, `build_attempts`
+/// shows that verbatim text instead.
+///
+/// Mirrors the executor's post-test-then-commit behavior: a failed attempt
+/// leaves its work on disk, so the retry context omits the diff/files (the
+/// agent inspects the dirty tree via `git diff`) and carries only the
+/// previous failure reason + previous test output.
 pub fn build_retry_context_for_attempt(
     log_index: usize,
     max_attempts: i32,
     logs: &[ExecutionLog],
-    strategy: RetryStrategy,
 ) -> Option<RetryContext> {
     let current = logs.get(log_index)?;
     let attempt = current.attempt;
@@ -148,13 +147,10 @@ pub fn build_retry_context_for_attempt(
         Some(prev.test_results.join("\n"))
     };
 
-    // Strategy-scoped, mirroring src/executor.rs's RetryContext build:
-    // Rollback re-sends the (now reverted) diff/files; Keep omits them
-    // because the work is still on disk for the agent to `git diff`.
-    let (previous_diff, files_modified) = match strategy {
-        RetryStrategy::Rollback => (prev.diff.clone(), files_from_diff(prev.diff.as_deref())),
-        RetryStrategy::Keep => (None, Vec::new()),
-    };
+    // Post test-then-commit, mirroring src/executor.rs's RetryContext build:
+    // the diff/files are omitted because the failed attempt's work is still
+    // on disk for the agent to `git diff`.
+    let (previous_diff, files_modified) = (None, Vec::new());
 
     let previous_failure_reason = prev.termination_reason.map(|r| {
         match r {
@@ -271,16 +267,20 @@ impl RenderedPromptApp {
         }
     }
 
-    /// Assemble the full per-attempt prompt list for `step` by calling
-    /// [`prompt::build_step_prompt`] once per attempt with that attempt's
-    /// retry context. This is the single place the preview is produced — it
-    /// passes the *real* plan/step/all_steps/agent/prompt-layers, so the
-    /// output is byte-identical to what the executor would send for the same
-    /// inputs.
+    /// Assemble the full per-attempt prompt list for `step`.
+    ///
+    /// For an **already-run** attempt the persisted `execution_logs.prompt_text`
+    /// is shown VERBATIM — the exact bytes the agent received for that attempt,
+    /// the most faithful thing for audit/debug. Only when a row predates
+    /// prompt_text capture (NULL/empty) do we fall back to re-assembling via
+    /// [`prompt::build_step_prompt`] with that attempt's reconstructed retry
+    /// context (a best-effort preview from *current* plan/step/prompt text).
     ///
     /// `logs` is the step's execution logs in chronological order (as
     /// returned by `storage::list_execution_logs_for_step`). When empty, a
-    /// single attempt-1 entry with no retry context is produced.
+    /// single attempt-1 entry is produced by re-assembly (no attempt has run,
+    /// so there is nothing persisted yet) — a genuine "what would be sent now"
+    /// preview.
     #[allow(clippy::too_many_arguments)]
     pub fn build_attempts(
         plan: &Plan,
@@ -316,21 +316,32 @@ impl RenderedPromptApp {
             return out;
         }
 
-        // Resolve the step's retry strategy once so each per-attempt preview
-        // scopes the diff/files exactly as the executor would (Step 22).
-        let strategy = step.effective_retry_strategy(plan);
         for (i, log) in logs.iter().enumerate() {
-            let retry = build_retry_context_for_attempt(i, max_attempts, logs, strategy);
-            let prompt = prompt::build_step_prompt(
-                plan,
-                step,
-                all_steps,
-                agent_name,
-                retry.as_ref(),
-                harness_supports_agent_file,
-                prompts,
-                resolved_interruptions,
-            );
+            // An already-run attempt: prefer the prompt VERBATIM as persisted
+            // for that attempt. That is exactly what the agent received,
+            // including point-in-time context a re-assembly from *current*
+            // text cannot reproduce — historical answered-question sets, plan/
+            // step text since edited, or (in an upgraded DB) a pre-redesign
+            // attempt whose retry context actually carried a rolled-back diff.
+            // Only fall back to re-assembling when the row predates
+            // prompt_text capture (NULL / empty), where a best-effort preview
+            // is the only thing available.
+            let prompt = match log.prompt_text.as_deref() {
+                Some(persisted) if !persisted.is_empty() => persisted.to_string(),
+                _ => {
+                    let retry = build_retry_context_for_attempt(i, max_attempts, logs);
+                    prompt::build_step_prompt(
+                        plan,
+                        step,
+                        all_steps,
+                        agent_name,
+                        retry.as_ref(),
+                        harness_supports_agent_file,
+                        prompts,
+                        resolved_interruptions,
+                    )
+                }
+            };
             out.push(AttemptPrompt {
                 attempt: log.attempt,
                 cycle_index: log.cycle_index,
@@ -692,9 +703,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         }
     }
@@ -719,7 +728,6 @@ mod tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
             review_enabled: None,
             review_status: None,
             corrects_step_id: None,
@@ -764,44 +772,14 @@ mod tests {
 
     #[test]
     fn attempt_one_has_no_retry_context() {
-        assert!(build_retry_context_for_attempt(0, 4, &[], RetryStrategy::Keep).is_none());
-        assert!(build_retry_context_for_attempt(0, 4, &[], RetryStrategy::Rollback).is_none());
+        assert!(build_retry_context_for_attempt(0, 4, &[]).is_none());
     }
 
     #[test]
-    fn later_attempt_pulls_previous_log_outcome_rollback() {
-        // Under Rollback the reverted diff/files are re-sent so the agent
-        // can learn from work it no longer sees on disk.
-        let mut l1 = make_log(1, Utc::now());
-        l1.diff = Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string());
-        l1.test_results = vec!["FAIL test_a".to_string(), "error: boom".to_string()];
-        l1.termination_reason = Some(TerminationReason::TestFailed);
-        let l2 = make_log(2, Utc::now());
-        let logs = vec![l1, l2];
-
-        let ctx = build_retry_context_for_attempt(1, 4, &logs, RetryStrategy::Rollback)
-            .expect("retry ctx for attempt 2");
-        assert_eq!(ctx.attempt, 2);
-        assert_eq!(ctx.max_attempts, 4);
-        assert_eq!(
-            ctx.previous_diff.as_deref(),
-            Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new")
-        );
-        // test_results joined with `\n`, exactly like the executor.
-        assert_eq!(
-            ctx.previous_test_output.as_deref(),
-            Some("FAIL test_a\nerror: boom")
-        );
-        // files_modified parsed from the diff's `diff --git ... b/<path>`.
-        assert_eq!(ctx.files_modified, vec!["src/foo.rs".to_string()]);
-        assert_eq!(ctx.previous_failure_reason.as_deref(), Some("tests failed"));
-    }
-
-    #[test]
-    fn later_attempt_keep_omits_diff_and_files_keeps_reason_and_output() {
-        // Step 22: under Keep the prior work is still on disk, so the preview
-        // mirrors the executor by omitting diff/files but keeping the test
-        // output and a reconstructed failure reason.
+    fn later_attempt_omits_diff_and_files_keeps_reason_and_output() {
+        // Post test-then-commit: the prior work is still on disk, so the
+        // preview mirrors the executor by omitting diff/files but keeping the
+        // test output and a reconstructed failure reason.
         let mut l1 = make_log(1, Utc::now());
         l1.diff = Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string());
         l1.test_results = vec!["FAIL test_a".to_string()];
@@ -809,16 +787,16 @@ mod tests {
         let l2 = make_log(2, Utc::now());
         let logs = vec![l1, l2];
 
-        let ctx = build_retry_context_for_attempt(1, 4, &logs, RetryStrategy::Keep)
-            .expect("retry ctx for attempt 2");
+        let ctx = build_retry_context_for_attempt(1, 4, &logs).expect("retry ctx for attempt 2");
         assert_eq!(ctx.attempt, 2);
+        assert_eq!(ctx.max_attempts, 4);
         assert!(
             ctx.previous_diff.is_none(),
-            "Keep must not re-send the diff"
+            "the diff is not re-sent (dirty tree is on disk)"
         );
         assert!(
             ctx.files_modified.is_empty(),
-            "Keep must not re-send the file list"
+            "the file list is not re-sent"
         );
         assert_eq!(ctx.previous_test_output.as_deref(), Some("FAIL test_a"));
         assert_eq!(ctx.previous_failure_reason.as_deref(), Some("tests failed"));
@@ -834,12 +812,18 @@ mod tests {
         let mut l1 = make_log(1, Utc::now() - Duration::seconds(30));
         l1.test_results = vec!["FAIL old cycle".to_string()];
         l1.termination_reason = Some(TerminationReason::TestFailed);
-        let l2 = make_log(2, Utc::now() - Duration::seconds(20));
-        let l3 = make_log(1, Utc::now() - Duration::seconds(10));
+        let mut l2 = make_log(2, Utc::now() - Duration::seconds(20));
+        let mut l3 = make_log(1, Utc::now() - Duration::seconds(10));
+        // Null the persisted prompt so `build_attempts` exercises the
+        // re-assembly FALLBACK path this test is about (the verbatim-prompt
+        // path is covered by `build_attempts_prefers_persisted_prompt_text`).
+        l1.prompt_text = None;
+        l2.prompt_text = None;
+        l3.prompt_text = None;
         let logs = vec![l1, l2, l3];
 
         assert!(
-            build_retry_context_for_attempt(2, 4, &logs, RetryStrategy::Keep).is_none(),
+            build_retry_context_for_attempt(2, 4, &logs).is_none(),
             "logical attempt=1 after a retry-from-scratch reset must not inherit retry context"
         );
 
@@ -917,7 +901,13 @@ mod tests {
         let mut l1 = make_log(1, Utc::now());
         l1.diff = Some("diff --git a/src/x.rs b/src/x.rs\n+change".to_string());
         l1.test_results = vec!["FAIL".to_string()];
-        let l2 = make_log(2, Utc::now());
+        let mut l2 = make_log(2, Utc::now());
+        // Null the persisted prompt so this test exercises the re-assembly
+        // FALLBACK (its purpose: verifying reconstructed retry context). The
+        // verbatim-prompt path is covered by
+        // `build_attempts_prefers_persisted_prompt_text`.
+        l1.prompt_text = None;
+        l2.prompt_text = None;
         let logs = vec![l1, l2];
 
         let attempts = RenderedPromptApp::build_attempts(
@@ -939,17 +929,54 @@ mod tests {
         assert!(!attempts[0].prompt.contains("# Retry Context"));
 
         // Attempt 2: retry context reconstructed from attempt 1's log.
-        // `build_attempts` resolves the strategy via
-        // `step.effective_retry_strategy(plan)`; make_step/make_plan both
-        // leave it None → default `Keep`, so mirror that here.
-        let ctx =
-            build_retry_context_for_attempt(1, 4, &logs, step.effective_retry_strategy(&plan))
-                .unwrap();
+        let ctx = build_retry_context_for_attempt(1, 4, &logs).unwrap();
         let exp2 =
             prompt::build_step_prompt(&plan, &step, &all, None, Some(&ctx), true, &prompts, &[]);
         assert_eq!(attempts[1].prompt, exp2);
         assert!(attempts[1].prompt.contains("# Retry Context"));
         assert!(attempts[1].prompt.contains("attempt 2 of 4"));
+    }
+
+    #[test]
+    fn build_attempts_prefers_persisted_prompt_text() {
+        let plan = make_plan();
+        let step = make_step();
+        let all = vec![step.clone()];
+        let prompts = prompts_for(&plan);
+
+        // Two already-run attempts: one with a persisted prompt (shown
+        // verbatim), one whose prompt_text is NULL (must fall back to a
+        // re-assembled preview).
+        let mut l1 = make_log(1, Utc::now());
+        l1.prompt_text = Some("VERBATIM PROMPT AS SENT TO THE AGENT".to_string());
+        let mut l2 = make_log(2, Utc::now());
+        l2.prompt_text = None;
+        let logs = vec![l1, l2];
+
+        let attempts = RenderedPromptApp::build_attempts(
+            &plan,
+            &step,
+            &all,
+            None,
+            true,
+            &prompts,
+            &[],
+            4,
+            &logs,
+        );
+        assert_eq!(attempts.len(), 2);
+
+        // Attempt 1: the persisted prompt is returned byte-for-byte — NOT a
+        // re-assembly (which would carry the plan/step layers, not this
+        // sentinel).
+        assert_eq!(attempts[0].prompt, "VERBATIM PROMPT AS SENT TO THE AGENT");
+
+        // Attempt 2: no persisted prompt → re-assembled fallback (carries the
+        // reconstructed retry context for attempt 2).
+        let ctx = build_retry_context_for_attempt(1, 4, &logs).unwrap();
+        let exp2 =
+            prompt::build_step_prompt(&plan, &step, &all, None, Some(&ctx), true, &prompts, &[]);
+        assert_eq!(attempts[1].prompt, exp2);
     }
 
     // -- attempt navigation ---------------------------------------------

@@ -616,7 +616,8 @@ mod tests {
     #[test]
     fn build_options_errors_on_negative_priority() {
         let suggestions = vec!["a".to_string(), "b".to_string()];
-        let err = build_options(&suggestions, &[1, -3]).expect_err("negative priority must be rejected");
+        let err =
+            build_options(&suggestions, &[1, -3]).expect_err("negative priority must be rejected");
         assert!(
             err.to_string().contains("priority"),
             "error should mention priority"

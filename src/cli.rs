@@ -5,7 +5,7 @@ use clap_complete::Shell;
 use std::path::PathBuf;
 
 use crate::hook_library::Lifecycle;
-use crate::plan::{ChangePolicy, PlanStatus, RetryStrategy};
+use crate::plan::{ChangePolicy, PlanStatus};
 
 /// Authoring tip surfaced via `--help` on plan/step creation commands and
 /// the top-level binary, so plan authors learn ralph's commit-ownership
@@ -489,33 +489,13 @@ pub enum PlanCommand {
         #[arg(long)]
         agent: Option<String>,
 
-        /// Plan-level default retry strategy for failed step attempts.
-        /// Effective value is resolved step > plan > default `keep`:
-        /// a step's own `--retry-strategy` wins, then this plan-level
-        /// default, then the built-in default (`keep`). `keep` = a failed
-        /// attempt leaves the working tree as-is so the next attempt
-        /// builds on it directly; `rollback` = a failed attempt rolls the
-        /// working tree back and feeds the prior diff into the next
-        /// attempt's prompt instead. Omit to leave the plan with no
-        /// override (steps then fall through to the global `keep`
-        /// default).
-        #[arg(long, value_name = "STRATEGY")]
-        retry_strategy: Option<RetryStrategy>,
-
-        /// Squash a step's per-iteration commits into a single commit when
-        /// the step reaches `Complete` (the `Ralph-*` trailers are preserved
-        /// on the squashed commit). Omit to keep every iteration commit
-        /// (the default — a full audit trail). docs/dag-redesign.md §14.1.
-        #[arg(long)]
-        squash_on_complete: bool,
-
         /// Cap the review→correction→review recursion depth for this plan
         /// (docs/dag-redesign.md §10 item 4 / §14.5). When a corrective
         /// step's own review keeps failing past this many corrections, ralph
         /// raises a `kind=blocker` interruption ("review loop — needs
         /// human") instead of spawning corrective steps indefinitely. Omit
-        /// to use the built-in default (3). Sibling of `--retry-strategy`:
-        /// the per-plan way to configure the review recursion bound.
+        /// to use the built-in default (3). The per-plan way to configure the
+        /// review recursion bound.
         #[arg(long, value_name = "N")]
         max_review_corrections: Option<i32>,
 
@@ -789,17 +769,6 @@ pub enum StepCommand {
         #[arg(long, value_name = "POLICY", conflicts_with = "import_json")]
         change_policy: Option<ChangePolicy>,
 
-        /// Step-level retry strategy for failed attempts. Effective value
-        /// is resolved step > plan > default `keep`: this step-level
-        /// override wins, then the plan's `--retry-strategy`, then the
-        /// built-in default (`keep`). `keep` = a failed attempt leaves the
-        /// working tree as-is so the next attempt builds on it directly;
-        /// `rollback` = a failed attempt rolls the working tree back and
-        /// feeds the prior diff into the next attempt's prompt instead.
-        /// Omit to inherit the plan/global value.
-        #[arg(long, value_name = "STRATEGY", conflicts_with = "import_json")]
-        retry_strategy: Option<RetryStrategy>,
-
         /// Attach a free-form tag to the new step (repeatable). Tags are
         /// user-defined labels for filtering with `ralph step list --tag`;
         /// they carry no execution-model semantics today. Empty/whitespace
@@ -829,7 +798,7 @@ pub enum StepCommand {
         /// Accepts a JSON array of step objects, or a single object. Each
         /// object requires `title`; `description`, `acceptance_criteria`,
         /// `agent`, `harness`, `model`, `max_retries`, `change_policy`,
-        /// `retry_strategy`, `review_enabled`, `tags`, `id`, `short_id`, and
+        /// `review_enabled`, `tags`, `id`, `short_id`, and
         /// `depends_on` are optional. The DAG is carried in the payload: give
         /// each step a readable `id` and list its parents' `id`s in
         /// `depends_on` (a parent may also be an existing plan step by short
@@ -929,24 +898,6 @@ pub enum StepCommand {
         /// another.
         #[arg(long, value_name = "POLICY")]
         change_policy: Option<ChangePolicy>,
-
-        /// Update the step-level retry strategy. Effective value is
-        /// resolved step > plan > default `keep`: this step-level override
-        /// wins, then the plan's `--retry-strategy`, then the built-in
-        /// default (`keep`). `keep` = a failed attempt leaves the working
-        /// tree as-is so the next attempt builds on it directly;
-        /// `rollback` = a failed attempt rolls the working tree back and
-        /// feeds the prior diff into the next attempt's prompt instead.
-        /// Omit to leave the existing override unchanged; use
-        /// `--clear-retry-strategy` to revert to plan/global inheritance.
-        #[arg(long, value_name = "STRATEGY")]
-        retry_strategy: Option<RetryStrategy>,
-
-        /// Explicitly clear the step-level retry-strategy override (sets to
-        /// NULL so the step inherits the plan/global default). Mirrors
-        /// `--clear-max-retries`; conflicts with `--retry-strategy`.
-        #[arg(long, conflicts_with = "retry_strategy")]
-        clear_retry_strategy: bool,
 
         /// Set the per-step nondeterministic-review override
         /// (docs/dag-redesign.md §6/§7). `on` forces review on for this
@@ -2633,150 +2584,6 @@ mod tests {
         } else {
             panic!("Expected Step Edit");
         }
-    }
-
-    #[test]
-    fn test_parse_plan_create_retry_strategy() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "plan",
-            "create",
-            "my-plan",
-            "--retry-strategy",
-            "rollback",
-        ])
-        .unwrap();
-        if let Command::Plan(PlanCommand::Create { retry_strategy, .. }) = cli.command.unwrap() {
-            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Rollback));
-        } else {
-            panic!("Expected Plan Create");
-        }
-    }
-
-    #[test]
-    fn test_parse_plan_create_retry_strategy_default_none() {
-        let cli = Cli::try_parse_from(["ralph-rs", "plan", "create", "my-plan"]).unwrap();
-        if let Command::Plan(PlanCommand::Create { retry_strategy, .. }) = cli.command.unwrap() {
-            assert!(retry_strategy.is_none());
-        } else {
-            panic!("Expected Plan Create");
-        }
-    }
-
-    #[test]
-    fn test_parse_step_add_retry_strategy() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "step",
-            "add",
-            "Implement",
-            "--retry-strategy",
-            "keep",
-        ])
-        .unwrap();
-        if let Command::Step(StepCommand::Add { retry_strategy, .. }) = cli.command.unwrap() {
-            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Keep));
-        } else {
-            panic!("Expected Step Add");
-        }
-    }
-
-    #[test]
-    fn test_parse_step_add_retry_strategy_invalid_rejected() {
-        let result = Cli::try_parse_from([
-            "ralph-rs",
-            "step",
-            "add",
-            "Implement",
-            "--retry-strategy",
-            "discard",
-        ]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_step_edit_retry_strategy() {
-        let cli = Cli::try_parse_from([
-            "ralph-rs",
-            "step",
-            "edit",
-            "1",
-            "--retry-strategy",
-            "rollback",
-        ])
-        .unwrap();
-        if let Command::Step(StepCommand::Edit {
-            retry_strategy,
-            clear_retry_strategy,
-            ..
-        }) = cli.command.unwrap()
-        {
-            assert_eq!(retry_strategy, Some(crate::plan::RetryStrategy::Rollback));
-            assert!(!clear_retry_strategy);
-        } else {
-            panic!("Expected Step Edit");
-        }
-    }
-
-    #[test]
-    fn test_parse_step_edit_clear_retry_strategy() {
-        let cli = Cli::try_parse_from(["ralph-rs", "step", "edit", "1", "--clear-retry-strategy"])
-            .unwrap();
-        if let Command::Step(StepCommand::Edit {
-            retry_strategy,
-            clear_retry_strategy,
-            ..
-        }) = cli.command.unwrap()
-        {
-            assert!(retry_strategy.is_none());
-            assert!(clear_retry_strategy);
-        } else {
-            panic!("Expected Step Edit");
-        }
-    }
-
-    #[test]
-    fn test_parse_step_edit_set_and_clear_retry_strategy_conflict() {
-        // Mirrors how `--criteria` + `--clear-criteria` conflict: clap must
-        // reject passing both `--retry-strategy` and `--clear-retry-strategy`
-        // in the same invocation.
-        let result = Cli::try_parse_from([
-            "ralph-rs",
-            "step",
-            "edit",
-            "1",
-            "--retry-strategy",
-            "keep",
-            "--clear-retry-strategy",
-        ]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_retry_strategy_help_explains_precedence() {
-        // Render the long help for `step add` and assert the precedence rule
-        // and both value meanings are documented (acceptance criterion:
-        // "help text explains the precedence"). We introspect the clap
-        // Command rather than shelling out so the test is hermetic.
-        let mut cmd = Cli::command();
-        let mut step_add = cmd
-            .find_subcommand_mut("step")
-            .and_then(|s| s.find_subcommand_mut("add"))
-            .expect("step add subcommand")
-            .clone();
-        let help = step_add.render_long_help().to_string();
-        assert!(
-            help.contains("step > plan > default"),
-            "help should state the step>plan>default precedence; got:\n{help}"
-        );
-        assert!(
-            help.contains("keep") && help.contains("rollback"),
-            "help should explain both keep and rollback; got:\n{help}"
-        );
-        assert!(
-            help.to_lowercase().contains("rolls the working tree back"),
-            "help should explain rollback semantics; got:\n{help}"
-        );
     }
 
     #[test]

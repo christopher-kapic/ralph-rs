@@ -237,7 +237,7 @@ ralph plan approve <slug>
 Plan slug is a trailing positional argument on every step command and defaults
 to the active plan when omitted.
 
-- `ralph step add "<title>" <slug> [--description "<desc>"] <placement> [--harness <h>] [--model <name>] [--change-policy {required|optional}] [--max-retries <n>] [--retry-strategy {keep|rollback}] [--import-json <FILE|->]` — on a non-empty plan exactly one `<placement>` is required (or the `--after` + `--before` splice combination): `--after <S>` (depend on S), `--before <S>` (insert before S), `--depends-on <S>` (depend on several — a join; **repeat the flag** once per parent: `--depends-on a --depends-on b`. Space-separated multi-value is not supported, it would swallow the trailing `<slug>` positional), or `--root` (explicit independent root). `--after` + `--before` together splices: the new step takes over `--before`'s incoming edges and `--before` then depends on the new step, while the new step depends on `--after` — useful for inserting a step in the middle of a chain. First step of an empty plan is the implied root.
+- `ralph step add "<title>" <slug> [--description "<desc>"] <placement> [--harness <h>] [--model <name>] [--change-policy {required|optional}] [--max-retries <n>] [--import-json <FILE|->]` — on a non-empty plan exactly one `<placement>` is required (or the `--after` + `--before` splice combination): `--after <S>` (depend on S), `--before <S>` (insert before S), `--depends-on <S>` (depend on several — a join; **repeat the flag** once per parent: `--depends-on a --depends-on b`. Space-separated multi-value is not supported, it would swallow the trailing `<slug>` positional), or `--root` (explicit independent root). `--after` + `--before` together splices: the new step takes over `--before`'s incoming edges and `--before` then depends on the new step, while the new step depends on `--after` — useful for inserting a step in the middle of a chain. First step of an empty plan is the implied root.
 - `ralph step list <slug>`
 - `ralph step edit <n> <slug> [--title "<title>"] [--description "<desc>"] [--review {on|off|inherit}]`
 - `ralph step remove <n> <slug> --force`
@@ -503,16 +503,6 @@ atomic and independently verifiable.
 - `ralph plan create ... --max-review-corrections <n>` — cap the
   review→correction recursion (default 3); over the cap, ralph raises a
   blocker for a human instead of looping.
-- `ralph plan create ... --retry-strategy {keep|rollback}` /
-  `ralph step add|edit ... --retry-strategy {keep|rollback}` — **vestigial
-  post-redesign**. With at most one commit per step (commit-on-test-pass),
-  both arms preserve the dirty tree between failed attempts; the flag is
-  kept for migration compatibility and is a no-op at runtime. Slated for
-  removal in a follow-up PR — prefer not to set it on new plans.
-- `ralph plan create ... --squash-on-complete` — **vestigial post-redesign**.
-  With one commit per step there is nothing to squash; the flag is a no-op
-  kept for migration compatibility. Slated for removal in a follow-up PR —
-  prefer not to set it on new plans.
 - `ralph skip [<slug>] [--step <n>] --changes {stash|commit|discard}` — skip
   a step; `--changes` (default `stash`) decides what happens to a killed
   harness's uncommitted work. `commit` writes a `[ralph wip]` commit with a

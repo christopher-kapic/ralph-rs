@@ -385,6 +385,19 @@ async fn run_plan_inner(
     let mut reviews: tokio::task::JoinSet<crate::review::SpawnedReview> =
         tokio::task::JoinSet::new();
 
+    // Per-run, per-step count of how many times the scheduler has (re-)spawned
+    // a step's review. A committed-but-unreviewed step whose review state is
+    // lost — a hard crash mid-review (recovered by the stale sweep, which now
+    // KEEPS such a step `InProgress` and resets `review_status` to `Pending`),
+    // or a transient reviewer error (the drain resets it to `Pending`) — is
+    // recovered by RE-RUNNING ONLY THE REVIEW against the durable committed
+    // SHA, never by re-implementing the step. `respawn_pending_reviews` retries
+    // up to `MAX_REVIEW_RESPAWNS` times and then escalates to a needs-human
+    // blocker, so a persistently-broken reviewer can't loop forever. In-memory
+    // (not durable): a fresh process / a human-resolved escalation grants a
+    // fresh budget, which is exactly the desired recovery semantics.
+    let mut review_respawns: HashMap<String, u32> = HashMap::new();
+
     // For `--one`, we need to stop after the first step actually executed;
     // capture its ID at the start (the step the topological scheduler would
     // pick first) and exit after it completes. Positions can shift due to
@@ -514,13 +527,40 @@ async fn run_plan_inner(
         // resolved-interruption section). An empty set ⇒ pre-interruption
         // behavior, so a linear plan is byte-identical.
         let blocked = blocked_step_ids(conn, &effective_plan.id)?;
+
+        // Recover/retry reviews for committed steps whose review is pending
+        // but not in flight — a crash mid-review or a transient reviewer
+        // error. This re-runs ONLY the review against the durable committed
+        // SHA; it never re-implements the step. The returned `under_review`
+        // set (every committed step whose review is pending or in flight) is
+        // unioned into the pick exclusion so the scheduler does not re-pick a
+        // committed step for re-implementation while its review is
+        // outstanding (mirrors how a freshly-reviewed step is excluded during
+        // a live run). Empty for any linear / no-review plan, so that path is
+        // byte-identical to before.
+        let under_review = respawn_pending_reviews(
+            conn,
+            &effective_plan,
+            &all_steps,
+            &blocked,
+            &mut reviews,
+            &mut review_respawns,
+            config,
+            workdir,
+            out,
+        )?;
+        let not_runnable: HashSet<String> = if under_review.is_empty() {
+            blocked.clone()
+        } else {
+            blocked.iter().chain(under_review.iter()).cloned().collect()
+        };
         let next = pick_next_step(
             &all_steps,
             &deps_of,
             &depths,
             &window,
             &executed_step_ids,
-            &blocked,
+            &not_runnable,
         )
         .cloned();
 
@@ -737,49 +777,18 @@ async fn run_plan_inner(
             ..
         } = step_result
         {
-            let commit_sha = commit_sha.clone();
-            // Orchestrator-side DB write (sole writer): Pending -> InFlight.
-            storage::update_step_review_status(
+            spawn_step_review(
                 conn,
-                &current_step.id,
-                crate::plan::ReviewStatus::InFlight,
+                &mut reviews,
+                &effective_plan,
+                &current_step,
+                config,
+                workdir,
+                commit_sha.clone(),
+                iteration,
+                step_num,
+                out,
             )?;
-            if out.format == OutputFormat::Json {
-                output::emit_ndjson(&RunEvent::ReviewStarted {
-                    step_id: current_step.id.clone(),
-                    step_num,
-                    commit_sha: commit_sha.clone(),
-                    iteration,
-                })?;
-            }
-            // Owned clones so the detached task is `'static` and `Send`.
-            let plan_for_review = effective_plan.clone();
-            let step_for_review = current_step.clone();
-            let config_for_review = config.clone();
-            let workdir_for_review = workdir.to_path_buf();
-            let review_step_id = step_for_review.id.clone();
-            reviews.spawn(async move {
-                let result = crate::review::run_review_subprocess(
-                    &plan_for_review,
-                    &step_for_review,
-                    &config_for_review,
-                    &workdir_for_review,
-                    &commit_sha,
-                    iteration,
-                    step_num,
-                )
-                .await;
-                // Carry the step identity back even on `Err` so the
-                // sole-writer drain can surface a review *error* cleanly
-                // (reset review_status + raise a blocker) instead of letting
-                // the next run's stale-InProgress sweep re-implement an
-                // implementation-complete step.
-                crate::review::SpawnedReview {
-                    step_id: review_step_id,
-                    iteration,
-                    result,
-                }
-            });
         }
 
         // Drain any reviews that finished while this step implemented
@@ -961,6 +970,13 @@ async fn run_plan_inner(
                 // while the interruption stays open `blocked` keeps it
                 // excluded, so this does not busy-spin.
                 executed_step_ids.remove(&current_step.id);
+                // Undo the unconditional `steps_executed += 1` above: this step
+                // did not complete an execution — it parked and will be
+                // re-picked (and re-counted) once the interruption is resolved.
+                // Without this, a step that pauses then succeeds is counted
+                // twice in the summary / "paused after N steps" totals. Mirrors
+                // the `executed_step_ids.remove` directly above.
+                result.steps_executed = result.steps_executed.saturating_sub(1);
                 result.step_results.push(step_result);
                 continue;
             }
@@ -3028,6 +3044,199 @@ fn blocked_step_ids(conn: &Connection, plan_id: &str) -> Result<HashSet<String>>
         .collect())
 }
 
+/// Max times the scheduler re-spawns a single step's review within one run
+/// before escalating to a needs-human blocker. A transient reviewer failure
+/// (mis-auth, flaky network, a one-off timeout) recovers by re-running the
+/// review against the already-committed work; a persistent one escalates
+/// rather than looping forever. Counted in-memory per run, so a fresh process
+/// — or a human resolving the escalation blocker — grants a fresh budget.
+const MAX_REVIEW_RESPAWNS: u32 = 3;
+
+/// Mark a committed step's review in flight (sole-writer DB write: Pending →
+/// InFlight), emit `ReviewStarted`, and spawn the detached read-only
+/// `run_review_subprocess` task into `reviews`.
+///
+/// Shared by the inline "step just committed" path and the recovery/retry
+/// scan ([`respawn_pending_reviews`]) so there is exactly one place that
+/// spawns a review. The task carries the step identity back even on `Err` so
+/// the sole-writer drain can reset `review_status` and let the scan re-run
+/// the review (never re-implement) — see [`drain_finished_reviews`].
+#[allow(clippy::too_many_arguments)]
+fn spawn_step_review(
+    conn: &Connection,
+    reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
+    plan: &Plan,
+    step: &Step,
+    config: &Config,
+    workdir: &Path,
+    commit_sha: String,
+    iteration: i32,
+    step_num: usize,
+    out: &OutputContext,
+) -> Result<()> {
+    // Orchestrator-side DB write (sole writer): Pending -> InFlight.
+    storage::update_step_review_status(conn, &step.id, crate::plan::ReviewStatus::InFlight)?;
+    if out.format == OutputFormat::Json {
+        output::emit_ndjson(&RunEvent::ReviewStarted {
+            step_id: step.id.clone(),
+            step_num,
+            commit_sha: commit_sha.clone(),
+            iteration,
+        })?;
+    }
+    // Owned clones so the detached task is `'static` and `Send`.
+    let plan_for_review = plan.clone();
+    let step_for_review = step.clone();
+    let config_for_review = config.clone();
+    let workdir_for_review = workdir.to_path_buf();
+    let review_step_id = step_for_review.id.clone();
+    reviews.spawn(async move {
+        let result = crate::review::run_review_subprocess(
+            &plan_for_review,
+            &step_for_review,
+            &config_for_review,
+            &workdir_for_review,
+            &commit_sha,
+            iteration,
+            step_num,
+        )
+        .await;
+        crate::review::SpawnedReview {
+            step_id: review_step_id,
+            iteration,
+            result,
+        }
+    });
+    Ok(())
+}
+
+/// Recover and retry reviews for committed steps whose review is pending but
+/// not in flight, and return the set of every step currently *under review*
+/// (review pending or in flight) so the caller can exclude them from
+/// implementation picking.
+///
+/// A step is "awaiting review" when it is `InProgress`, its `review_status` is
+/// `Pending`/`InFlight`, and it has a durable committed execution-log row. Two
+/// situations leave such a step with `review_status = Pending` and no live
+/// reviewer task in this process:
+///
+///  - a hard crash mid-review (the stale sweep now keeps the step `InProgress`
+///    and resets `InFlight` → `Pending` instead of aborting + re-implementing
+///    it); or
+///  - a transient reviewer error (the drain reset it to `Pending`).
+///
+/// For each, this re-spawns the review against the durable committed SHA —
+/// **never** re-implementing — bounded by [`MAX_REVIEW_RESPAWNS`]. On budget
+/// exhaustion it raises a single needs-human blocker (the step then renders
+/// derived `Blocked`, gating its dependents and finalizing the plan
+/// `Interrupted`) and resets the in-memory budget, so resolving that blocker
+/// grants a fresh round of review attempts.
+///
+/// Returns an empty set for any linear / no-review plan, so that path stays
+/// byte-identical to before.
+#[allow(clippy::too_many_arguments)]
+fn respawn_pending_reviews(
+    conn: &Connection,
+    plan: &Plan,
+    all_steps: &[Step],
+    blocked: &HashSet<String>,
+    reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
+    review_respawns: &mut HashMap<String, u32>,
+    config: &Config,
+    workdir: &Path,
+    out: &OutputContext,
+) -> Result<HashSet<String>> {
+    let mut under_review: HashSet<String> = HashSet::new();
+    for step in all_steps {
+        if step.status != StepStatus::InProgress {
+            continue;
+        }
+        if !matches!(
+            step.review_status,
+            Some(crate::plan::ReviewStatus::Pending) | Some(crate::plan::ReviewStatus::InFlight)
+        ) {
+            continue;
+        }
+        // The durable proof the implementation exists: the single committed
+        // attempt's SHA + iteration. Absent it, the step never committed
+        // (e.g. review-enabled but crashed mid-implementation) — it is NOT
+        // awaiting review and stays a normal runnable/implementable step.
+        let Some((commit_sha, iteration)) = storage::committed_review_target(conn, &step.id)?
+        else {
+            continue;
+        };
+        under_review.insert(step.id.clone());
+
+        // In flight in THIS process: a live reviewer task owns it; the drain
+        // will finalize or reset it. Don't double-spawn.
+        if step.review_status == Some(crate::plan::ReviewStatus::InFlight) {
+            continue;
+        }
+        // Pending + committed: needs a (re)spawn — unless it already carries
+        // an open interruption (e.g. a prior escalation blocker), in which
+        // case it is gated as derived-`Blocked` awaiting a human.
+        if blocked.contains(&step.id) {
+            continue;
+        }
+        let attempts = review_respawns.entry(step.id.clone()).or_insert(0);
+        if *attempts >= MAX_REVIEW_RESPAWNS {
+            // Persistent review failure: escalate to a human once, then reset
+            // the in-memory budget so resolving the blocker (which un-gates
+            // the step) grants a fresh round of attempts on the next tick.
+            raise_review_failed_blocker(conn, step, iteration, out)?;
+            *attempts = 0;
+            continue;
+        }
+        *attempts += 1;
+        let step_num = step_number_in_plan(all_steps, step);
+        spawn_step_review(
+            conn, reviews, plan, step, config, workdir, commit_sha, iteration, step_num, out,
+        )?;
+    }
+    Ok(under_review)
+}
+
+/// Raise the single needs-human blocker for a committed step whose review has
+/// failed to run [`MAX_REVIEW_RESPAWNS`] times. The step stays `InProgress`
+/// with its commit intact; the open interruption shadows it as derived
+/// `Blocked`, gating dependents and finalizing the plan `Interrupted`.
+/// Resolving the blocker re-runs ONLY the review (the scan picks the step back
+/// up) — it never re-implements.
+fn raise_review_failed_blocker(
+    conn: &Connection,
+    step: &Step,
+    iteration: i32,
+    out: &OutputContext,
+) -> Result<()> {
+    if storage::get_step_by_id(conn, &step.id)?.is_none() {
+        return Ok(());
+    }
+    let interruption_id = storage::insert_interruption(
+        conn,
+        &step.id,
+        iteration,
+        crate::plan::InterruptionKind::Blocker,
+        &format!(
+            "review could not run for this step after {MAX_REVIEW_RESPAWNS} attempts. The \
+             implementation is committed but UNREVIEWED. Fix the review configuration (e.g. \
+             review-harness auth/model), then resolve this blocker — ralph will re-run ONLY \
+             the review against the existing commit (it will NOT re-implement the step). \
+             ralph does not continue on unreviewed work."
+        ),
+        &[],
+    )?;
+    output::emit_interruption_raised(
+        conn,
+        out.format == OutputFormat::Json,
+        &interruption_id,
+        &step.id,
+        crate::plan::InterruptionKind::Blocker.as_str(),
+        false,
+        iteration,
+    );
+    Ok(())
+}
+
 /// One scheduler tick: pick the next step to execute, or `None` when the
 /// runnable set is empty.
 ///
@@ -3232,7 +3441,7 @@ async fn drain_finished_reviews(
     for j in joined {
         let crate::review::SpawnedReview {
             step_id,
-            iteration,
+            iteration: _iteration,
             result,
         } = match j {
             Ok(sr) => sr,
@@ -3249,72 +3458,36 @@ async fn drain_finished_reviews(
             Ok(r) => r,
             Err(e) => {
                 // The review SUBPROCESS errored (the §9-inv-2 read-only
-                // invariant fired, or the review harness is misconfigured) —
-                // the reviewer never produced a verdict. But the
-                // implementation itself SUCCEEDED and is committed; the step
-                // is `InProgress` + `review_status = InFlight`. Surface this
-                // cleanly instead of letting the next run's stale-InProgress
-                // sweep silently RE-IMPLEMENT an implementation-complete step:
+                // invariant fired, the review harness is misconfigured, or it
+                // timed out — see `ReviewConfig::effective_timeout_secs`) — the
+                // reviewer never produced a verdict. But the implementation
+                // itself SUCCEEDED and is committed; the step is `InProgress` +
+                // `review_status = InFlight`, with a durable committed SHA in
+                // its execution log.
                 //
-                //   * reset `review_status` InFlight -> Pending so there is no
-                //     phantom in-flight reviewer for a resume to trip over;
-                //   * raise ONE kind=blocker interruption on the reviewed step
-                //     so the failure is visible (`ralph interruption list` /
-                //     the TUI inbox) and — crucially — the step renders
-                //     derived `Blocked`: that gates every dependent AND keeps
-                //     the stale-InProgress sweep from aborting+re-implementing
-                //     it (the sweep now skips steps with an open interruption).
-                //     Resolving the blocker re-runs the step from a clean
-                //     state (re-implement + re-review) — safe and explicit,
-                //     never silent.
-                //
-                // The blocker leaves the reviewed step derived-`Blocked` and
-                // (because an open interruption now exists) the plan finalizes
-                // as derived `Interrupted`, NOT terminal `Failed`. The run
-                // KEEPS GOING on other runnable branches: a transient
-                // reviewer-config hiccup must not kill healthy committed +
-                // reviewed work elsewhere in the DAG. §9-inv-2 still holds —
-                // the affected step stays non-terminal and its open blocker
-                // gates every dependent via `deps_satisfied`, so no unreviewed
-                // work is promoted. Resolving the blocker re-runs the step
-                // from a clean state on the next run/resume.
-                eprintln!("Review failed: {e:#}");
+                // Reset `review_status` to `Pending` (KEEPING `InProgress` and
+                // the commit) so the scheduler RE-RUNS ONLY THE REVIEW against
+                // the existing commit on a later tick — it NEVER re-implements
+                // the step. The bounded respawn loop
+                // (`respawn_pending_reviews` / `MAX_REVIEW_RESPAWNS`) retries a
+                // transient failure and, only on a persistent one, escalates to
+                // a needs-human blocker. A committed-but-unreviewed step stays
+                // non-terminal and gates its dependents (`deps_satisfied`
+                // requires `Complete`), so no unreviewed work is ever promoted
+                // (§9-inv-2). The run keeps going on other runnable branches —
+                // a transient reviewer hiccup must not kill healthy work
+                // elsewhere in the DAG.
+                eprintln!("Review failed (will re-run the review): {e:#}");
                 if storage::get_step_by_id(conn, &step_id)?.is_some() {
-                    let interruption_id = crate::db::with_tx(conn, |conn| {
-                        storage::update_step_review_status(
-                            conn,
-                            &step_id,
-                            crate::plan::ReviewStatus::Pending,
-                        )?;
-                        storage::insert_interruption(
-                            conn,
-                            &step_id,
-                            iteration,
-                            crate::plan::InterruptionKind::Blocker,
-                            &format!(
-                                "review could not run for this step: {e:#}. The \
-                                 implementation is committed but UNREVIEWED. Fix the \
-                                 review configuration if it is misconfigured, then \
-                                 resolve this blocker — ralph will re-run \
-                                 (re-implement and re-review) this step from a clean \
-                                 state. ralph will not continue on unreviewed work."
-                            ),
-                            &[],
-                        )
-                    })?;
-                    output::emit_interruption_raised(
+                    storage::update_step_review_status(
                         conn,
-                        out.format == OutputFormat::Json,
-                        &interruption_id,
                         &step_id,
-                        crate::plan::InterruptionKind::Blocker.as_str(),
-                        false,
-                        iteration,
-                    );
+                        crate::plan::ReviewStatus::Pending,
+                    )?;
                 }
-                // This review is done; the blocker handles the step. Keep
-                // draining the remaining finished reviews and let the run
-                // continue (the function falls through to `Ok(None)` below).
+                // Keep draining the remaining finished reviews and let the run
+                // continue (falls through to `Ok(None)` below). The reset step
+                // is picked up by `respawn_pending_reviews` on the next tick.
                 continue;
             }
         };
@@ -3509,9 +3682,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         }
     }
@@ -3631,7 +3802,6 @@ mod tests {
                 skipped_reason: None,
                 change_policy: crate::plan::ChangePolicy::Required,
                 tags: vec![],
-                retry_strategy: None,
                 review_enabled: None,
                 review_status: None,
                 corrects_step_id: None,
@@ -5150,9 +5320,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         };
 
@@ -5192,9 +5360,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         };
 
@@ -6293,9 +6459,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
@@ -6369,9 +6533,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         };
         setup_branch(&dir, &plan, None).await.unwrap();
@@ -6942,7 +7104,6 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
             review_enabled: None,
             review_status: None,
             corrects_step_id: None,
@@ -8457,13 +8618,23 @@ mod tests {
         use std::time::Duration;
 
         let conn = setup();
-        let plan = storage::create_plan(&conn, "abrt", "/tmp/proj", "b", "d", None, None, &[])
-            .unwrap();
+        let plan =
+            storage::create_plan(&conn, "abrt", "/tmp/proj", "b", "d", None, None, &[]).unwrap();
         // The reviewed step is mid-review: InProgress + review_status =
         // InFlight, exactly the state the runner leaves it in after spawning
         // a detached review (see run_plan_inner around line 742).
         let (step, _) = storage::create_step(
-            &conn, &plan.id, "Reviewed", "d", None, None, &[], None, None, None, None,
+            &conn,
+            &plan.id,
+            "Reviewed",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
         )
         .unwrap();
         storage::update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();

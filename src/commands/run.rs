@@ -5546,7 +5546,7 @@ pub fn cmd_status(
         return Ok(());
     }
 
-    render_status_plain(&summary, &plan, &steps, verbose, out);
+    render_status_plain(&summary, &steps, verbose, out);
     Ok(())
 }
 
@@ -5629,7 +5629,6 @@ fn build_status_summary(
 /// capturing stdout.
 fn render_status_plain(
     summary: &output::StatusSummary,
-    plan: &crate::plan::Plan,
     steps: &[crate::plan::Step],
     verbose: bool,
     out: &OutputContext,
@@ -5683,10 +5682,6 @@ fn render_status_plain(
                 policy_tag,
                 output::colored_status(step.status, out.color),
                 step.attempts,
-            );
-            println!(
-                "       Retry strategy: {}",
-                crate::commands::step::retry_strategy_provenance(step, plan),
             );
             if step.status == StepStatus::Skipped
                 && let Some(reason) = step.skipped_reason.as_deref()
@@ -7262,7 +7257,6 @@ mod status_live_view_tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
             review_enabled: None,
             review_status: None,
             corrects_step_id: None,
@@ -7792,9 +7786,7 @@ mod plan_detail_init_tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         }
     }
@@ -8585,9 +8577,7 @@ mod step_detail_dispatcher_tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         };
         let steps = vec![Step {
@@ -8609,7 +8599,6 @@ mod step_detail_dispatcher_tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
             review_enabled: None,
             review_status: None,
             corrects_step_id: None,
@@ -9525,9 +9514,7 @@ mod sub_view_routing_tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         };
         let steps = vec![Step {
@@ -9549,7 +9536,6 @@ mod sub_view_routing_tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
             review_enabled: None,
             review_status: None,
             corrects_step_id: None,
@@ -9960,9 +9946,7 @@ mod mouse_routing_tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         };
         PlanDetailApp::new(plan, Vec::new(), &Config::default())
@@ -9987,9 +9971,7 @@ mod mouse_routing_tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         };
         let step = Step {
@@ -10011,7 +9993,6 @@ mod mouse_routing_tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
             review_enabled: None,
             review_status: None,
             corrects_step_id: None,

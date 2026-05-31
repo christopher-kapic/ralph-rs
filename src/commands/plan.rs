@@ -5,7 +5,7 @@ use rusqlite::Connection;
 
 use crate::hook_library::{self, Lifecycle};
 use crate::output::{self, OutputContext, OutputFormat};
-use crate::plan::{PlanStatus, RetryStrategy};
+use crate::plan::PlanStatus;
 use crate::storage;
 
 // ---------------------------------------------------------------------------
@@ -21,8 +21,6 @@ pub fn plan_create(
     branch: Option<&str>,
     harness: Option<&str>,
     agent: Option<&str>,
-    retry_strategy: Option<RetryStrategy>,
-    squash_on_complete: bool,
     max_review_corrections: Option<i32>,
     tests: &[String],
     depends_on: &[String],
@@ -70,26 +68,11 @@ pub fn plan_create(
             tests,
         )?;
 
-        // Persist a plan-level retry-strategy override when the user supplied
-        // one. `None` is the column default (no override) so we skip the write
-        // entirely in that case, mirroring how `plan_harness` is only set when
-        // present.
-        if let Some(rs) = retry_strategy {
-            storage::set_plan_retry_strategy(conn, &plan.id, Some(rs))?;
-        }
-
-        // Persist the `--squash-on-complete` toggle only when the user opted in.
-        // Default OFF (the column default NULL → `false`) is identical to the
-        // step 32/33 keep-every-iteration-commit behavior, so we skip the write
-        // entirely in that case (mirrors the `retry_strategy` handling above).
-        if squash_on_complete {
-            storage::set_plan_squash_on_complete(conn, &plan.id, true)?;
-        }
-
         // Persist the per-plan review recursion cap only when explicitly given.
         // `None` is the column default (NULL → built-in
         // `review::DEFAULT_MAX_REVIEW_CORRECTIONS`), so skipping the write keeps
-        // the common case identical (mirrors `retry_strategy` / `squash` above).
+        // the common case identical (mirrors how `plan_harness` is only set
+        // when present).
         if let Some(cap) = max_review_corrections {
             storage::set_plan_max_review_corrections(conn, &plan.id, Some(cap))?;
         }
@@ -335,10 +318,6 @@ pub fn plan_show(conn: &Connection, slug: &str, project: &str, out: &OutputConte
     }
     if let Some(ref a) = plan.agent {
         println!("  Agent:       {a}");
-    }
-    match plan.retry_strategy {
-        Some(rs) => println!("  Retry strategy: {rs}"),
-        None => println!("  Retry strategy: <unset — default keep>"),
     }
     if !plan.deterministic_tests.is_empty() {
         println!("  Tests:");
@@ -849,8 +828,6 @@ mod tests {
             None,
             None,
             None,
-            false,
-            None,
             &[],
             &[],
             &quiet_out(),
@@ -884,8 +861,6 @@ mod tests {
             None,
             None,
             None,
-            false,
-            None,
             &[],
             &[],
             &quiet_out(),
@@ -913,8 +888,6 @@ mod tests {
             Some("feat/ok"),
             None,
             None,
-            None,
-            false,
             None,
             &[],
             &[],
@@ -962,8 +935,6 @@ mod tests {
             None,
             None,
             None,
-            false,
-            None,
             &[],
             &["dep-a".to_string(), "dep-a".to_string()],
             &quiet_out(),
@@ -972,7 +943,8 @@ mod tests {
         // The failure must come from the dependency-wiring step, not the
         // pre-tx validation (which would not exercise the rollback path).
         assert!(
-            err.to_string().contains("Failed to add dependency on 'dep-a'"),
+            err.to_string()
+                .contains("Failed to add dependency on 'dep-a'"),
             "failure must originate from the in-tx dependency wiring: {err}"
         );
 

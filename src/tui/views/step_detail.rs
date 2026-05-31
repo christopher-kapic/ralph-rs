@@ -2423,9 +2423,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         }
     }
@@ -2457,7 +2455,6 @@ mod tests {
                 skipped_reason: None,
                 change_policy: ChangePolicy::Required,
                 tags: vec![],
-                retry_strategy: None,
                 review_enabled: None,
                 review_status: None,
                 corrects_step_id: None,

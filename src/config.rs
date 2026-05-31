@@ -242,6 +242,20 @@ fn default_harness_chunk_max_bytes() -> usize {
     4096
 }
 
+/// Default ceiling, in seconds, for a single reviewer-subprocess invocation
+/// ([`ReviewConfig::effective_timeout_secs`]).
+///
+/// Reviews are bounded *independently* of the global [`Config::timeout_secs`]
+/// (which may legitimately be `None` so a long implementation step isn't
+/// killed). The reason: the orchestrator blocks on the in-flight-review
+/// `JoinSet` once the runnable set empties (`runner::drain_finished_reviews`
+/// with `block=true`), so a reviewer that hangs with no timer would wedge the
+/// whole scheduler — holding the run lock — until Ctrl+C. A read-only diff
+/// review never legitimately needs more than a few minutes; 10 is generous.
+pub fn default_review_timeout_secs() -> u64 {
+    600
+}
+
 /// Top-level ralph-rs configuration.
 /// Global nondeterministic-review configuration (docs/dag-redesign.md §6).
 ///
@@ -256,8 +270,8 @@ fn default_harness_chunk_max_bytes() -> usize {
 ///
 /// - `enabled` is the **global default** in the precedence chain
 ///   step.review_enabled ?? plan.review_enabled ?? config.review.enabled
-///   ?? false (resolved by [`effective_review_enabled`], mirroring
-///   `RetryStrategy` step > plan > default precedence). It is `Option<bool>`
+///   ?? false (resolved by [`effective_review_enabled`], a step > plan >
+///   default precedence). It is `Option<bool>`
 ///   so "unset in config" (`None`) is distinguishable from an explicit
 ///   `false`; both fall through to `false` today but the distinction keeps
 ///   the precedence chain uniform with the per-plan / per-step columns.
@@ -278,6 +292,37 @@ pub struct ReviewConfig {
     /// Model the reviewer subprocess uses. Empty = harness default.
     #[serde(default)]
     pub model: String,
+    /// Ceiling, in seconds, for a single reviewer subprocess. Unlike the
+    /// global [`Config::timeout_secs`], a review is **never** run unbounded —
+    /// see [`default_review_timeout_secs`] for why. `None` (unset) or a `0`
+    /// value resolves to that default cap rather than disabling it; an
+    /// explicit positive value overrides it. Resolved via
+    /// [`ReviewConfig::effective_timeout_secs`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+impl ReviewConfig {
+    /// The reviewer-subprocess timeout actually applied, in seconds. Always a
+    /// finite, positive value: a review is never unbounded (an unbounded
+    /// reviewer can deadlock the scheduler — see [`default_review_timeout_secs`]).
+    ///
+    /// Resolution, given the global [`Config::timeout_secs`]:
+    ///  - an explicit positive `review.timeout_secs` wins outright (a
+    ///    deliberate per-review override);
+    ///  - else, if the global timeout is set (positive), honor it — but never
+    ///    above the built-in cap, so a large global can't reintroduce the hang;
+    ///  - else (global unset/`None`/`0`), use the built-in cap.
+    pub fn effective_timeout_secs(&self, global_timeout_secs: Option<u64>) -> u64 {
+        let cap = default_review_timeout_secs();
+        match self.timeout_secs {
+            Some(n) if n > 0 => n,
+            _ => match global_timeout_secs {
+                Some(g) if g > 0 => g.min(cap),
+                _ => cap,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -893,8 +938,7 @@ impl Default for Config {
 
 /// Resolve whether this step is nondeterministically reviewed.
 ///
-/// Precedence is **step > plan > global > false**, the §6 spec table and a
-/// direct analogue of [`crate::plan::Step::effective_retry_strategy`]
+/// Precedence is **step > plan > global > false**, the §6 spec table
 /// (step > plan > built-in default): a step-level override wins over a
 /// plan-level default, which wins over the global `config.review.enabled`,
 /// which finally falls through to `false` when nothing is set anywhere.
@@ -2510,9 +2554,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled,
-            squash_on_complete: false,
             max_review_corrections: None,
         }
     }
@@ -2539,7 +2581,6 @@ mod tests {
             skipped_reason: None,
             change_policy: crate::plan::ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
             review_enabled,
             review_status: None,
             corrects_step_id: None,
@@ -2554,9 +2595,8 @@ mod tests {
 
     #[test]
     fn test_effective_review_enabled_precedence() {
-        // Precedence is step > plan > config.review.enabled > false,
-        // mirroring `Step::effective_retry_strategy` (step > plan >
-        // default). Exercise EVERY combination of the three tri-state
+        // Precedence is step > plan > config.review.enabled > false
+        // (step > plan > default). Exercise EVERY combination of the three tri-state
         // levels (3^3 = 27) against the §6 chain
         // step ?? plan ?? global ?? false.
         for step in [None, Some(true), Some(false)] {

@@ -1557,35 +1557,6 @@ pub fn has_crash_residue_overlap_for_step(
     Ok(overlap)
 }
 
-/// Squash every commit reachable from HEAD back to (but excluding) `base_sha`
-/// into a single new commit with `message`, preserving the working tree.
-///
-/// Used by `--squash-on-complete` (docs/dag-redesign.md §14.1): when a step
-/// reaches `Complete`, its N per-iteration commits collapse into one. We
-/// `git reset --soft <base_sha>` (moves the branch ref back, keeps the index
-/// and working tree exactly as the last iteration left them) then commit the
-/// staged tree once. `base_sha` MUST be an ancestor of HEAD and is the SHA
-/// that immediately preceded the step's first iteration commit.
-pub fn squash_since(workdir: &Path, base_sha: &str, message: &str) -> Result<String> {
-    git(workdir, &["reset", "--soft", base_sha])
-        .with_context(|| format!("git reset --soft {base_sha} failed"))?;
-    git(workdir, &["commit", "-m", message]).context("git commit (squash) failed")?;
-    get_commit_hash(workdir)
-}
-
-/// Number of commits in the range `base_sha..HEAD` (commits reachable from
-/// HEAD but not from `base_sha`). Used by `--squash-on-complete` to skip the
-/// soft-reset+recommit churn when a step made only a single iteration commit
-/// (nothing to collapse). `base_sha` must be an ancestor of HEAD.
-pub fn count_commits_since(workdir: &Path, base_sha: &str) -> Result<usize> {
-    let out = git(
-        workdir,
-        &["rev-list", "--count", &format!("{base_sha}..HEAD")],
-    )
-    .with_context(|| format!("could not count commits since {base_sha}"))?;
-    Ok(out.trim().parse().unwrap_or(0))
-}
-
 /// Order an arbitrary set of `targets` SHAs by their position on `branch`,
 /// **newest-first** (`git rev-list` order). SHAs not reachable from `branch`
 /// are dropped. Used by `ralph step reset` so a mixed set of skip-WIP +
@@ -3285,69 +3256,6 @@ mod tests {
             fs::read_to_string(dir.join("b.txt")).unwrap(),
             "1",
             "B intact"
-        );
-    }
-
-    #[test]
-    fn test_squash_since_collapses_to_one_commit_preserving_tree() {
-        let (_tmp, dir) = init_repo();
-        let base = get_commit_hash(&dir).unwrap();
-
-        fs::write(dir.join("acc.txt"), "1\n").unwrap();
-        commit_changes(
-            &dir,
-            &build_iteration_commit_message("SQ123456", 1, "Acc", "p"),
-        )
-        .unwrap();
-        fs::write(dir.join("acc.txt"), "1\n2\n").unwrap();
-        commit_changes(
-            &dir,
-            &build_iteration_commit_message("SQ123456", 2, "Acc", "p"),
-        )
-        .unwrap();
-        fs::write(dir.join("acc.txt"), "1\n2\n3\n").unwrap();
-        commit_changes(
-            &dir,
-            &build_iteration_commit_message("SQ123456", 3, "Acc", "p"),
-        )
-        .unwrap();
-
-        let count_before = git(&dir, &["rev-list", "--count", "HEAD"])
-            .unwrap()
-            .trim()
-            .parse::<usize>()
-            .unwrap();
-
-        let squash_msg = build_iteration_commit_message("SQ123456", 3, "Acc", "p");
-        let sha = squash_since(&dir, &base, &squash_msg).unwrap();
-
-        let count_after = git(&dir, &["rev-list", "--count", "HEAD"])
-            .unwrap()
-            .trim()
-            .parse::<usize>()
-            .unwrap();
-        assert_eq!(
-            count_after,
-            count_before - 2,
-            "3 iteration commits collapse into 1"
-        );
-        // The squashed commit keeps the final tree state and the trailers.
-        assert_eq!(
-            fs::read_to_string(dir.join("acc.txt")).unwrap(),
-            "1\n2\n3\n"
-        );
-        assert_eq!(
-            parse_trailer(&dir, &sha, ITERATION_STEP_TRAILER)
-                .unwrap()
-                .as_deref(),
-            Some("SQ123456")
-        );
-        assert_eq!(
-            parse_trailer(&dir, &sha, ITERATION_NUM_TRAILER)
-                .unwrap()
-                .as_deref(),
-            Some("3"),
-            "Ralph-Iteration collapsed to the final n"
         );
     }
 

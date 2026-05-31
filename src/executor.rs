@@ -22,10 +22,6 @@ use crate::plan::{
     ChangePolicy, InterruptionKind, InterruptionOption, Phase, Plan, Step, StepStatus,
     TerminationReason, TestStatus,
 };
-// `RetryStrategy` is referenced only by tests (the runtime path no longer
-// branches on it post test-then-commit — vestigial, slated for removal).
-#[cfg(test)]
-use crate::plan::RetryStrategy;
 use crate::prompt::{self, Prompts, RetryContext};
 use crate::run_lock::process_start_token;
 use crate::signal::{CancelReason, CancelState};
@@ -1223,7 +1219,7 @@ async fn finalize_paused_for_question(
 #[allow(clippy::too_many_arguments)]
 async fn raise_retry_exhausted_blocker(
     ctx: &ExecCtx<'_>,
-    exec_log_id: i64,
+    exec_log_id: Option<i64>,
     duration_secs: f64,
     attempt: i32,
     failure_output: &FailureOutput<'_>,
@@ -1262,8 +1258,39 @@ async fn raise_retry_exhausted_blocker(
         FailureReason::InsufficientDiskSpace => TestStatus::NotRun,
         _ => TestStatus::NotRun,
     };
+    // Insert + park atomically. A scheduler tick observing
+    // (status=Pending, no open interruption) would immediately re-pick the
+    // step and burn another retry budget despite us already being out — the
+    // transaction collapses the read window so the tick can only ever see
+    // either the pre-exhaustion or the post-blocker state.
+    //
+    // Opened up front (before the diagnostic payload write and, for the
+    // disk-gate caller, before the attempt bump + log row) so *all* of these
+    // mutations commit or roll back together. Writes issued on `ctx.conn`
+    // while this transaction is open are part of it — autocommit stays off
+    // until `commit`. This matters most for the disk-gate caller
+    // (`exec_log_id == None`): on a near-full filesystem the interruption
+    // insert can itself fail with SQLITE_FULL, and a non-transactional
+    // attempt bump would otherwise leave the step `Pending` with `attempts`
+    // burned and no open interruption — the scheduler would then silently
+    // re-pick it and spend another attempt on nothing.
+    let tx = ctx.conn.unchecked_transaction()?;
+
+    // The retry-loop callers pass the execution-log row they already created
+    // across the exhausted attempts (and have already bumped `attempts` via
+    // the loop). The disk-gate / pre-loop caller passes `None`: it never
+    // entered the loop, so it mints its row and bumps the attempt counter
+    // here, inside the transaction.
+    let exec_log_id = match exec_log_id {
+        Some(id) => id,
+        None => {
+            set_step_attempts(&tx, &ctx.step.id, attempt)?;
+            storage::create_execution_log(&tx, &ctx.step.id, attempt, None, None)?.id
+        }
+    };
+
     storage::update_execution_log(
-        ctx.conn,
+        &tx,
         exec_log_id,
         Some(duration_secs),
         failure_output.diff,
@@ -1297,19 +1324,13 @@ async fn raise_retry_exhausted_blocker(
     // The persisted row for this attempt was updated just above; reading
     // the chronological tail gives us the canonical view.
     let body = build_retry_exhausted_body(
-        ctx.conn,
+        &tx,
         &ctx.step.id,
         ctx.max_attempts,
         failure_reason,
         failure_output,
     );
 
-    // Insert + park atomically. A scheduler tick observing
-    // (status=Pending, no open interruption) would immediately re-pick the
-    // step and burn another retry budget despite us already being out — the
-    // transaction collapses the read window so the tick can only ever see
-    // either the pre-exhaustion or the post-blocker state.
-    let tx = ctx.conn.unchecked_transaction()?;
     let options = vec![
         InterruptionOption {
             text: RETRY_EXHAUSTED_OPTION_RETRY.to_string(),
@@ -1507,9 +1528,6 @@ pub async fn execute_step(
                          (config: min_free_disk_mb) — raising recoverable blocker"
                     );
                     let attempt = step.attempts + 1;
-                    set_step_attempts(conn, &step.id, attempt)?;
-                    let exec_log =
-                        storage::create_execution_log(conn, &step.id, attempt, None, None)?;
                     let msg = format!(
                         "insufficient disk space: {have_gb:.1} GB free, \
                          need >= {need_gb:.1} GB (required = {required_bytes} bytes, \
@@ -1526,9 +1544,14 @@ pub async fn execute_step(
                         parsed: &parsed,
                         has_changes: false,
                     };
+                    // Pass `None`: the attempt bump and the execution-log row
+                    // are minted inside the blocker's transaction so a
+                    // SQLITE_FULL on the interruption insert (entirely
+                    // plausible on the near-full FS that tripped this gate)
+                    // can't leave a burned attempt with no open interruption.
                     return raise_retry_exhausted_blocker(
                         &ctx,
-                        exec_log.id,
+                        None,
                         0.0,
                         attempt,
                         &fail_output,
@@ -1545,29 +1568,12 @@ pub async fn execute_step(
         }
     }
 
-    // `RetryStrategy` is vestigial post test-then-commit (both Keep and
-    // Rollback preserve the dirty tree between attempts; slated for removal
-    // in a follow-up PR). The retry path no longer branches on it — the
-    // `agent_committed_clean` mixed-reset runs unconditionally — so we
-    // intentionally don't resolve `step.effective_retry_strategy(plan)`
-    // here.
-
     // Previous attempt context for retries. Post test-then-commit (Phase A)
     // the dirty tree is always on disk between attempts, so the retry prompt
     // omits the diff/files sections — only the failure reason + previous
     // test output (with any commit-hook output appended) ride this struct.
     let mut prev_test_output: Option<String> = None;
     let mut prev_failure_reason: Option<String> = None;
-
-    // The HEAD SHA that immediately precedes this step's FIRST per-iteration
-    // commit. Captured lazily the first time we make an iteration commit and
-    // used only by `--squash-on-complete` (docs/dag-redesign.md §14.1) to
-    // `git reset --soft` back here before the single squashed commit. `None`
-    // until the step has made at least one iteration commit; never reset
-    // across attempts (the step's whole iteration-commit run squashes as a
-    // unit). The `Keep` path leaves earlier iteration commits in place so a
-    // later attempt's success can still see the full base.
-    let mut step_base_sha: Option<String> = None;
 
     let mut attempt = step.attempts;
 
@@ -2010,9 +2016,9 @@ pub async fn execute_step(
                         .await;
                     }
 
-                    // Retry path. `RetryStrategy` is vestigial post
-                    // test-then-commit: even a crashing harness leaves its
-                    // partial work on disk for the next attempt to build on.
+                    // Retry path. Post test-then-commit, even a crashing
+                    // harness leaves its partial work on disk for the next
+                    // attempt to build on.
                     //
                     // The one special case that still needs repair is an
                     // agent that committed on its own before crashing:
@@ -2420,14 +2426,6 @@ pub async fn execute_step(
                         ChildUpdate::Clear,
                         exec_opts.json_output,
                     )?;
-                    // Record the pre-first-iteration HEAD exactly once so
-                    // the vestigial squash path (kept as no-op below) can
-                    // still see it if/when it's ever re-enabled. With
-                    // at-most-one-commit-per-step this is also the eventual
-                    // committed SHA's parent.
-                    if step_base_sha.is_none() {
-                        step_base_sha = git::get_commit_hash(workdir).ok();
-                    }
                     let commit_msg = git::build_iteration_commit_message(
                         &step.short_id,
                         attempt,
@@ -2527,7 +2525,7 @@ pub async fn execute_step(
                             // Failed.
                             return raise_retry_exhausted_blocker(
                                 &ctx,
-                                exec_log.id,
+                                Some(exec_log.id),
                                 duration_secs,
                                 attempt,
                                 &fail_output,
@@ -2563,57 +2561,7 @@ pub async fn execute_step(
                         prev_failure_reason = Some(failure_desc);
                         continue;
                     }
-                    let mut commit_hash = git::get_commit_hash(workdir)?;
-
-                    // Vestigial post test-then-commit (at most one commit per
-                    // step). The condition gate (`squash_on_complete` AND a
-                    // recorded `step_base_sha` AND >1 commit since the base)
-                    // cannot fire today because test-then-commit guarantees at
-                    // most one commit per step — `step_base_sha` is set lazily
-                    // on the first iteration commit and we only reach here on
-                    // the (single) iteration that finally commits, so
-                    // `count_commits_since` is at most 1. The whole block is
-                    // slated for removal in a follow-up PR alongside the
-                    // `squash_on_complete` column + CLI flag.
-                    //
-                    // Guard with a `debug_assert!` so any future change that
-                    // re-introduces multi-commit-per-step trips this in debug
-                    // / test builds before silently routing through dead code;
-                    // release builds keep the original behavior as
-                    // defense-in-depth (never crash production on a vestigial
-                    // path that, if it ever did fire again, would still
-                    // produce a valid single squashed commit).
-                    if plan.squash_on_complete
-                        && let Some(base) = &step_base_sha
-                        && git::count_commits_since(workdir, base)? > 1
-                    {
-                        debug_assert!(
-                            false,
-                            "squash path is vestigial and unreachable post-test-then-commit \
-                             (at most one commit per step) — see CLAUDE.md and the \
-                             `squash_on_complete` removal follow-up PR"
-                        );
-                        write_phase(
-                            conn,
-                            plan,
-                            &step.id,
-                            step_num,
-                            attempt,
-                            max_attempts,
-                            Some(exec_log.id),
-                            Phase::Commit,
-                            None,
-                            ChildUpdate::Clear,
-                            exec_opts.json_output,
-                        )?;
-                        let squash_msg = git::build_iteration_commit_message(
-                            &step.short_id,
-                            attempt,
-                            &step.title,
-                            &plan.slug,
-                        );
-                        commit_hash = git::squash_since(workdir, base, &squash_msg)?;
-                    }
+                    let commit_hash = git::get_commit_hash(workdir)?;
 
                     // When no deterministic tests are configured, we skip the
                     // test phase entirely — record NotConfigured so an observer
@@ -2788,7 +2736,7 @@ pub async fn execute_step(
                     if matches!(reason, FailureReason::TestFailed) {
                         return raise_retry_exhausted_blocker(
                             &ctx,
-                            exec_log.id,
+                            Some(exec_log.id),
                             duration_secs,
                             attempt,
                             &fail_output,
@@ -2815,10 +2763,6 @@ pub async fn execute_step(
                 // retry context omits the diff/files (already on disk via
                 // `git diff`), passing only the failure reason + previous
                 // test output to the next prompt.
-                //
-                // `RetryStrategy` is vestigial post test-then-commit — both
-                // arms preserve the dirty tree (slated for removal in a
-                // follow-up PR), so this branch is strategy-independent.
                 //
                 // EDGE CASE — `agent_committed_clean`: the agent committed
                 // its OWN work, so `has_changes == false` and HEAD advanced
@@ -6952,7 +6896,7 @@ mod tests {
         assert!(!logs[0].committed);
     }
 
-    // ---- Step 22: RetryStrategy honored in the retry loop ----
+    // ---- Step 22: retry loop preserves the dirty tree between attempts ----
 
     /// Count the commits reachable from HEAD (for double-commit assertions).
     #[cfg(test)]
@@ -7035,9 +6979,9 @@ mod tests {
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
-        // max_retries = 1 → 2 attempts. retry_strategy left None on both
-        // levels → resolves to the default `Keep`.
-        let (mut step, _) = storage::create_step(
+        // max_retries = 1 → 2 attempts. Failed attempts preserve the dirty
+        // tree (test-then-commit; nothing to roll back).
+        let (step, _) = storage::create_step(
             &conn,
             &plan.id,
             "Acc",
@@ -7051,12 +6995,6 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(
-            step.effective_retry_strategy(&plan),
-            RetryStrategy::Keep,
-            "default strategy must be Keep"
-        );
-        step.retry_strategy = None;
 
         let mut config = Config::default();
         config
@@ -7138,158 +7076,6 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("2")
-        );
-    }
-
-    /// Phase A: `RetryStrategy` is vestigial — both Keep and Rollback now
-    /// preserve the dirty tree between failed attempts (the per-iteration
-    /// commit moved to after tests pass, so there is no commit to revert
-    /// on a failed attempt). Same harness/test as the Keep test; attempt
-    /// 1's append survives into attempt 2 regardless of strategy, attempt
-    /// 2 appends the second line, the 2-line test passes, and ONE commit
-    /// lands. Removal of the dead RetryStrategy::Rollback branch is in a
-    /// follow-up PR.
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_rollback_strategy_now_vestigial_preserves_dirty_tree() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().to_path_buf();
-        init_git_repo(&dir);
-        fs::write(dir.join("acc.txt"), "").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "user.name=t",
-                "commit",
-                "-m",
-                "seed",
-            ])
-            .current_dir(&dir)
-            .output()
-            .unwrap();
-
-        let harness_tmp = TempDir::new().unwrap();
-        let harness_path = harness_tmp.path().join("append-harness.sh");
-        let script = format!(
-            "#!/bin/sh\necho line >> {0}/acc.txt\nexit 0\n",
-            dir.to_string_lossy()
-        );
-        fs::write(&harness_path, script).unwrap();
-        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&harness_path, perms).unwrap();
-
-        let conn = crate::db::open_memory().unwrap();
-        let test_cmd = format!(
-            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
-            dir.to_string_lossy()
-        );
-        let plan = storage::create_plan(
-            &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
-        )
-        .unwrap();
-        seed_run_lock_row(&conn, &dir.to_string_lossy());
-        let (mut step, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        // Force the step-level strategy to Rollback.
-        step.retry_strategy = Some(RetryStrategy::Rollback);
-        assert_eq!(
-            step.effective_retry_strategy(&plan),
-            RetryStrategy::Rollback
-        );
-
-        let mut config = Config::default();
-        config
-            .harnesses
-            .insert("poly".to_string(), harness_config_for_script(&harness_path));
-        let hook_ctx = HookContext {
-            applicable: vec![],
-            project_dir: dir.clone(),
-            hook_timeout_secs: 30,
-        };
-        let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result.outcome,
-            StepOutcome::Success,
-            "Phase A: Rollback is vestigial. The dirty tree carries forward \
-             so attempt 2 can see attempt 1's append and the 2-line test \
-             passes — same observable behavior as Keep.",
-        );
-        assert_eq!(result.attempts_used, 2);
-        // Phase A: at most one commit per step (only after final passing
-        // attempt). Even under Rollback, the dirty tree carries forward;
-        // no per-iteration commit was ever made for the failed attempt.
-        let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
-        assert_eq!(
-            final_lines.lines().count(),
-            2,
-            "both attempts' appends are present (vestigial Rollback no longer reverts)"
-        );
-        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
-        let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
-        assert!(
-            !a1.rolled_back,
-            "vestigial Rollback no longer rolls back — the dirty tree is preserved"
-        );
-        // Exactly one ralph commit landed — iteration 2.
-        let it_commits =
-            crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
-        assert_eq!(it_commits.len(), 1, "Phase A: exactly one commit per step");
-        assert_eq!(it_commits[0].iteration, 2);
-        // Attempt 2's prompt must include the retry context (failure
-        // reason + previous test output). The diff section is omitted now
-        // — the dirty tree is on disk for the agent to inspect.
-        let a2 = logs.iter().find(|l| l.attempt == 2).unwrap();
-        let a2_prompt = a2.prompt_text.as_deref().unwrap_or("");
-        assert!(
-            a2_prompt.contains("# Retry Context"),
-            "attempt 2 prompt must include the retry context"
-        );
-        assert!(
-            !a2_prompt.contains("## Previous Diff"),
-            "Phase A: diff section is omitted (dirty tree is on disk); got prompt:\n{a2_prompt}"
         );
     }
 
@@ -7393,8 +7179,6 @@ mod tests {
             None,
         )
         .unwrap();
-        // Default → Keep.
-        assert_eq!(step.effective_retry_strategy(&plan), RetryStrategy::Keep);
 
         let mut config = Config::default();
         config
@@ -7499,215 +7283,6 @@ mod tests {
             final_lines.lines().count(),
             2,
             "both attempts' lines are present in the final tree"
-        );
-    }
-
-    /// REGRESSION (the bug this commit fixes): the `agent_committed_clean`
-    /// mixed-reset on a failed attempt must run under BOTH retry strategies,
-    /// not just `Keep`. Previously the match made it Keep-only; under
-    /// `Rollback` the agent's orphan commit stayed at HEAD and the next
-    /// attempt built on top of it, ralph's eventual single commit landed on
-    /// `parent = orphan`, and `step reset` (which reverts only ralph's
-    /// commit) would leave the orphan in history — also inflating the
-    /// reviewer's fixed-SHA diff.
-    ///
-    /// This mirrors `test_keep_agent_committed_clean_single_final_commit`
-    /// but with `retry_strategy = Rollback`. The assertions are identical:
-    /// HEAD ends one commit above the pre-step base, the new commit is
-    /// ralph's `.2` iteration commit (NOT the agent's orphan), both lines
-    /// are present, and attempt 1's classification is `NoChanges`. With the
-    /// pre-fix Keep-only behavior, ralph's commit would parent on the
-    /// orphan and commit_count would be `base + 2`.
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_rollback_agent_committed_clean_unconditional_mixed_reset() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().to_path_buf();
-        init_git_repo(&dir);
-        fs::write(dir.join("acc.txt"), "").unwrap();
-        std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&dir)
-            .output()
-            .unwrap();
-        std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "user.name=t",
-                "commit",
-                "-m",
-                "seed",
-            ])
-            .current_dir(&dir)
-            .output()
-            .unwrap();
-        let base_commits = commit_count(&dir);
-        let base_head = crate::git::get_commit_hash(&dir).unwrap();
-
-        // Invocation 1: append line + commit it ourselves
-        // (agent_committed_clean). Invocation 2+: append another line, no
-        // commit.
-        let shared = TempDir::new().unwrap();
-        let count_path = shared.path().join("n.txt");
-        let harness_tmp = TempDir::new().unwrap();
-        let harness_path = harness_tmp.path().join("commit-then-dirty.sh");
-        let script = format!(
-            "#!/bin/sh\n\
-             echo x >> {count}\n\
-             N=$(wc -l < {count})\n\
-             echo line >> {acc}\n\
-             if [ \"$N\" -eq 1 ]; then\n\
-               cd {dir}\n\
-               git add -A\n\
-               git -c user.email=a@a -c user.name=a commit -m 'agent commit' >/dev/null\n\
-             fi\n\
-             exit 0\n",
-            count = count_path.to_string_lossy(),
-            acc = dir.join("acc.txt").to_string_lossy(),
-            dir = dir.to_string_lossy(),
-        );
-        fs::write(&harness_path, script).unwrap();
-        let mut perms = fs::metadata(&harness_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&harness_path, perms).unwrap();
-
-        let conn = crate::db::open_memory().unwrap();
-        let test_cmd = format!(
-            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
-            dir.to_string_lossy()
-        );
-        let plan = storage::create_plan(
-            &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
-        )
-        .unwrap();
-        seed_run_lock_row(&conn, &dir.to_string_lossy());
-        let (mut step, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        // Force Rollback strategy — the bug's load-bearing input.
-        step.retry_strategy = Some(RetryStrategy::Rollback);
-        assert_eq!(
-            step.effective_retry_strategy(&plan),
-            RetryStrategy::Rollback
-        );
-
-        let mut config = Config::default();
-        config
-            .harnesses
-            .insert("poly".to_string(), harness_config_for_script(&harness_path));
-        let hook_ctx = HookContext {
-            applicable: vec![],
-            project_dir: dir.clone(),
-            hook_timeout_secs: 30,
-        };
-        let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result.outcome,
-            StepOutcome::Success,
-            "attempt 2 should pass once attempt 1's mixed-reset-but-on-disk \
-             line is carried forward and a second line is added",
-        );
-        assert_eq!(result.attempts_used, 2);
-
-        // THE key assertion: exactly ONE new commit total. With the bug,
-        // Rollback skipped the mixed-reset, so ralph's commit would land on
-        // top of the agent's orphan commit and commit_count would be
-        // `base + 2`.
-        assert_eq!(
-            commit_count(&dir),
-            base_commits + 1,
-            "exactly one step commit — the agent's orphan commit must be \
-             mixed-reset away (regardless of retry strategy), so ralph's \
-             single commit parents on the original base, not the orphan"
-        );
-
-        // Parent of the single new commit is the pre-step base SHA — i.e.
-        // ralph's commit did NOT build on the orphan agent commit.
-        let head = crate::git::get_commit_hash(&dir).unwrap();
-        assert_ne!(head, base_head);
-        assert_eq!(
-            result.commit_hash.as_deref(),
-            Some(head.as_str()),
-            "the success commit is the step commit ralph created"
-        );
-        let parent = {
-            let out = std::process::Command::new("git")
-                .args(["rev-parse", "HEAD^"])
-                .current_dir(&dir)
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        assert_eq!(
-            parent, base_head,
-            "ralph's final commit must parent on the pre-step base, NOT on \
-             the agent's orphan commit"
-        );
-
-        // The final commit is ralph's `.2` iteration commit, not the
-        // agent's orphan.
-        let msg = {
-            let out = std::process::Command::new("git")
-                .args(["log", "-1", "--pretty=%s"])
-                .current_dir(&dir)
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        assert!(
-            msg.starts_with(&format!("ralph {}.2 - Acc", step.short_id)),
-            "the final commit must be ralph's per-iteration step commit, \
-             not the agent's orphan 'agent commit'; got: {msg}"
-        );
-
-        // Attempt 1 was agent_committed_clean → NoChanges, and the working
-        // tree was preserved (the mixed-reset is not a working-tree
-        // rollback).
-        let logs = storage::list_execution_logs_for_step(&conn, &step.id).unwrap();
-        let a1 = logs.iter().find(|l| l.attempt == 1).unwrap();
-        assert_eq!(a1.termination_reason, Some(TerminationReason::NoChanges));
-        let final_lines = fs::read_to_string(dir.join("acc.txt")).unwrap();
-        assert_eq!(
-            final_lines.lines().count(),
-            2,
-            "both attempts' lines are present in the final tree under \
-             Rollback (mixed-reset un-commits but keeps changes on disk)"
         );
     }
 
@@ -7954,11 +7529,11 @@ mod tests {
         );
     }
 
-    /// STEP 35 (default OFF): without `--squash-on-complete`, every
-    /// per-iteration commit is kept (full audit trail) — identical to the
-    /// step 32/33 output. A 2-iteration Keep run leaves 2 ralph commits.
+    /// Phase A: at most one commit per step regardless of how many attempts
+    /// it took — a 2-iteration run leaves exactly one ralph commit (the
+    /// final passing one).
     #[tokio::test(flavor = "current_thread")]
-    async fn test_squash_on_complete_default_off_keeps_iteration_commits() {
+    async fn test_at_most_one_commit_per_step() {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
@@ -7985,8 +7560,6 @@ mod tests {
             &[test_cmd],
         )
         .unwrap();
-        // squash_on_complete is the column default (NULL → false).
-        assert!(!plan.squash_on_complete);
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
@@ -8027,13 +7600,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.outcome, StepOutcome::Success);
-        // Phase A: at most one commit per step regardless of
-        // squash_on_complete — there is no multi-iteration run to collapse.
-        // The squash code path is now vestigial.
+        // Phase A: at most one commit per step — there is no multi-iteration
+        // run to collapse.
         assert_eq!(
             commit_count(&dir),
             base_commits + 1,
-            "Phase A: exactly one commit per step (squash_on_complete now vestigial)"
+            "Phase A: exactly one commit per step"
         );
         let its = crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
         assert_eq!(its.len(), 1, "exactly one commit (the final passing one)");
@@ -8175,116 +7747,6 @@ mod tests {
         let s = storage::get_step(&conn, &step.id).unwrap();
         assert_eq!(s.status, StepStatus::Complete);
         assert_eq!(s.review_status, Some(crate::plan::ReviewStatus::Disabled));
-    }
-
-    /// STEP 35 (`--squash-on-complete`): when the step reaches Complete its
-    /// per-iteration commits collapse into exactly ONE commit, with the
-    /// `Ralph-*` trailers preserved (Ralph-Iteration → the final n).
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_squash_on_complete_collapses_to_one_commit() {
-        use std::fs;
-        use tempfile::TempDir;
-
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().to_path_buf();
-        init_git_repo(&dir);
-        let base_commits = commit_count(&dir);
-
-        let harness_tmp = TempDir::new().unwrap();
-        let harness_path = write_append_line_harness(harness_tmp.path(), &dir);
-
-        let conn = crate::db::open_memory().unwrap();
-        let test_cmd = format!(
-            "test \"$(wc -l < {0}/acc.txt)\" -eq 2",
-            dir.to_string_lossy()
-        );
-        let plan = storage::create_plan(
-            &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
-        )
-        .unwrap();
-        storage::set_plan_squash_on_complete(&conn, &plan.id, true).unwrap();
-        let plan = storage::get_plan_by_id(&conn, &plan.id).unwrap();
-        assert!(plan.squash_on_complete);
-        seed_run_lock_row(&conn, &dir.to_string_lossy());
-        let (step, _) = storage::create_step(
-            &conn,
-            &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        let mut config = Config::default();
-        config
-            .harnesses
-            .insert("poly".to_string(), harness_config_for_script(&harness_path));
-        let hook_ctx = HookContext {
-            applicable: vec![],
-            project_dir: dir.clone(),
-            hook_timeout_secs: 30,
-        };
-        let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result.outcome, StepOutcome::Success);
-        assert_eq!(result.attempts_used, 2);
-        // 2 iterations → exactly 1 squashed commit for the completed step.
-        assert_eq!(
-            commit_count(&dir),
-            base_commits + 1,
-            "--squash-on-complete collapses the step's iteration commits into one"
-        );
-        let its = crate::git::iteration_commits_for_step(&dir, "HEAD", &step.short_id).unwrap();
-        assert_eq!(its.len(), 1, "exactly one commit for the completed step");
-        // Trailers preserved; Ralph-Iteration collapsed to the final n.
-        let sha = result.commit_hash.clone().unwrap();
-        assert_eq!(its[0].sha, sha);
-        assert_eq!(
-            crate::git::parse_trailer(&dir, &sha, crate::git::ITERATION_STEP_TRAILER)
-                .unwrap()
-                .as_deref(),
-            Some(step.short_id.as_str())
-        );
-        assert_eq!(
-            crate::git::parse_trailer(&dir, &sha, crate::git::ITERATION_NUM_TRAILER)
-                .unwrap()
-                .as_deref(),
-            Some("2"),
-            "Ralph-Iteration collapsed to the final iteration number"
-        );
-        // The final tree is correct (both lines present).
-        assert_eq!(
-            fs::read_to_string(dir.join("acc.txt"))
-                .unwrap()
-                .lines()
-                .count(),
-            2
-        );
     }
 
     /// Optional policy + no tests configured + no changes → Success with
@@ -8722,15 +8184,14 @@ mod tests {
         assert!(!logs[0].committed, "no commit on a crashed harness");
     }
 
-    /// Phase A: `RetryStrategy` is vestigial for harness failures too. A
-    /// crashing harness that leaves partial work on disk must let the next
-    /// attempt build on it even when the step still says `rollback`.
+    /// Phase A: a crashing harness that leaves partial work on disk must let
+    /// the next attempt build on it (failed attempts preserve the dirty
+    /// tree).
     ///
     /// Attempt 1 appends one line then exits 1; attempt 2 appends the second
-    /// line and exits 0 only if attempt 1's work survived. If the old rollback
-    /// branch regresses, this never reaches success.
+    /// line and exits 0 only if attempt 1's work survived.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_harness_failure_rollback_strategy_now_vestigial_preserves_dirty_tree() {
+    async fn test_harness_failure_preserves_dirty_tree() {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
         use tempfile::TempDir;
@@ -8787,7 +8248,7 @@ mod tests {
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
-        let (mut step, _) = storage::create_step(
+        let (step, _) = storage::create_step(
             &conn,
             &plan.id,
             "Acc",
@@ -8801,11 +8262,6 @@ mod tests {
             None,
         )
         .unwrap();
-        step.retry_strategy = Some(RetryStrategy::Rollback);
-        assert_eq!(
-            step.effective_retry_strategy(&plan),
-            RetryStrategy::Rollback
-        );
 
         let mut config = Config::default();
         config
@@ -8844,7 +8300,7 @@ mod tests {
         );
         assert!(
             !logs[0].rolled_back,
-            "rollback strategy is now vestigial here"
+            "failed attempts preserve the dirty tree"
         );
         assert_eq!(logs[1].termination_reason, Some(TerminationReason::Success));
         assert_eq!(

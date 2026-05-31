@@ -196,7 +196,15 @@ pub enum RunEvent {
         step_id: String,
         plan_slug: String,
         kind: String,
+        // `default` so a consumer built before these fields existed (or a
+        // future stream that drops them) still deserializes the event rather
+        // than having `consume_lines` silently discard the whole line. The
+        // emitter always writes them; the defaults only ever apply on the
+        // parse side under version skew. `false`/`0` are the safe readings:
+        // "not auto-raised, attempt unknown".
+        #[serde(default)]
         auto_raised: bool,
+        #[serde(default)]
         attempt: i32,
         raised_at: DateTime<Utc>,
     },

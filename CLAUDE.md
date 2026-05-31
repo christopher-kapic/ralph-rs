@@ -23,9 +23,10 @@ the built-in review pipeline, the scheduler, and the TUI outline/inbox. The
 intentionally differs from that draft. Two material deviations from §3.2 /
 §5 / §3.4 that landed post-redesign: (1) **test-then-commit + at-most-one
 commit per step** (replaces the draft's "commit per iteration, before the
-test" — with no per-iteration commits there is no `RetryStrategy::Keep`
+test" — with no per-iteration commits there was no `RetryStrategy::Keep`
 vs. `Rollback` distinction at runtime and nothing for
-`--squash-on-complete` to collapse; both are vestigial); (2) a
+`--squash-on-complete` to collapse, so both were removed in migration
+V37); (2) a
 **retry-exhaustion auto-blocker** (a `kind=Blocker` interruption with
 ranked Retry / Mark Failed options instead of the draft's terminal
 `StepStatus::Failed` transition on `TestFailed`/`CommitFailed`). Both are
@@ -64,7 +65,7 @@ src/
   cli.rs               — Clap command/arg definitions (ValueEnum for Lifecycle, PlanStatus)
   config.rs            — JSON config loading (~/.config/ralph-rs/config.json), harness definitions
   db.rs                — SQLite connection, migrations (V1–V34)
-  plan.rs              — Plan/Step/ExecutionLog models, enums (RetryStrategy {Keep, Rollback}; StepStatus incl. derived Blocked overlay; PlanStatus incl. derived Interrupted; ReviewStatus; Interruption domain model)
+  plan.rs              — Plan/Step/ExecutionLog models, enums (StepStatus incl. derived Blocked overlay; PlanStatus incl. derived Interrupted; ReviewStatus; Interruption domain model)
   frac_index.rs        — Base-62 fractional indexing for O(1) step reordering
   storage.rs           — High-level CRUD (plans, steps, step_dependencies + cycle check, short_id mint, interruptions CRUD, corrective-step request bridge, hooks, locks, project prompt)
   harness.rs           — Harness resolution, subprocess spawning, output parsing
@@ -85,8 +86,8 @@ src/
   output.rs            — Output formatting (JSON, plain, color detection, NDJSON events)
   commands/
     mod.rs             — Re-exports, shared helpers (resolve_project/step, init, doctor, confirm)
-    plan.rs            — Plan CRUD, dependency, plan-level hook, plan harness set/show, retry-strategy commands
-    step.rs            — Step CRUD, move, edit (agent/harness/criteria/max-retries/retry-strategy), step-level hooks
+    plan.rs            — Plan CRUD, dependency, plan-level hook, plan harness set/show, review-toggle commands
+    step.rs            — Step CRUD, move, edit (agent/harness/criteria/max-retries/review), step-level hooks
     run.rs             — Status, log (incl. WIP-skip + per-iteration commits w/ git-note verdict), skip (`--changes`) commands; TUI dispatchers (`run_inbox_tui`, …)
     prompt.rs          — `ralph prompt set/clear/show` (global/project scope; `.ralph/prompt.md`-aware)
     question.rs        — `ralph question ask --priority` / `ralph block` (harness raises an interruption)
@@ -218,7 +219,7 @@ view bindings don't fire under the overlay.
 - **Deterministic-only:** No built-in LLM; plans created manually or via harness delegation
 - **Multi-harness:** Pluggable harness support with different integration patterns (native agent file, env var, prompt injection)
 - **Git-integrated:** All steps are git commits; branches per plan
-- **Retry strategy:** `RetryStrategy {Keep, Rollback}` is **vestigial post-redesign** (slated for removal in a follow-up PR). Both arms now preserve the dirty tree between failed attempts — there is at most one commit per step (commit-on-test-pass), so there is nothing to keep/rollback across attempts. The enum + per-plan/per-step columns + CLI flags still exist for migration compatibility but are no-ops on the retry path
+- **Retry strategy:** the old `RetryStrategy {Keep, Rollback}` enum has been **removed** (migration V37 drops `plans.retry_strategy` / `steps.retry_strategy`). Failed attempts always preserve the dirty tree and there is at most one commit per step (commit-on-test-pass), so there was nothing to keep/rollback across attempts. The enum, the per-plan/per-step columns, the `--retry-strategy` / `--clear-retry-strategy` CLI flags, and the export/import fields are all gone
 - **SQLite storage** at platform-appropriate data dir (`~/.local/share/ralph-rs/ralph.db` on Linux)
 - **JSON config** at `~/.config/ralph-rs/config.json` (XDG semantics on all platforms)
 - **Signal-aware:** Two-stage Ctrl+C (graceful then forceful) via tokio watch channels
@@ -258,8 +259,8 @@ view bindings don't fire under the overlay.
   on resolution).
 - **Built-in review pipeline.** Off by default; effective =
   `step.review_enabled ?? plan.review_enabled ?? config.review.enabled ??
-  false` (V27 nullable columns; precedence step > plan > global, mirrors
-  `RetryStrategy`). The reviewer prompt is **separately assembled** (not
+  false` (V27 nullable columns; precedence step > plan > global). The
+  reviewer prompt is **separately assembled** (not
   `build_step_prompt`), O(1): plan/step context + a **single** `git show
   <sha>` diff (Decision 5 — no dependency diffs). Concurrency model:
   reviews run as a **detached task** (a tokio `JoinSet`); the
@@ -345,16 +346,16 @@ view bindings don't fire under the overlay.
   — the **`execution_logs` rows are the audit trail** (each row carries
   the attempt's prompt / harness stdout+stderr / test output / diff for
   every attempt including failed ones), and the single committed SHA
-  represents only the attempt that passed. `--squash-on-complete` / the
-  per-plan `squash_on_complete` column are **vestigial post-redesign**
-  (nothing to squash); kept for migration compatibility, slated for
-  removal in a follow-up PR. **§14.4:** scheduler reproducibility is
+  represents only the attempt that passed. The `--squash-on-complete`
+  flag and the per-plan `squash_on_complete` column have been **removed**
+  (migration V37 drops the column; there was nothing to squash post
+  test-then-commit). **§14.4:** scheduler reproducibility is
   timing-independent given identical human inputs; the wall-clock
   interleave of concurrent reviews is **not** part of the guarantee.
 - **Export/import** carry the DAG: `ExportedStep` gains `short_id`
   (always emitted) and `depends_on: Vec<short_id>`; plan+step
-  `review_enabled`, `squash_on_complete`, and `max_review_corrections`
-  round-trip via the `retry_strategy` `skip_serializing_if` pattern.
+  `review_enabled` and `max_review_corrections` round-trip via the
+  `skip_serializing_if` / `default` pattern.
   Runtime state (interruptions, `review_status`, attempts, iteration
   commits, `corrects_step_id` provenance) is not exported. Import
   validates the imported edge set (no dangling edges, unique short_ids,
@@ -371,7 +372,7 @@ view bindings don't fire under the overlay.
   of an empty plan is the implied root. `--import-json` now **carries the
   DAG** (per-object batch-local `id` + `depends_on`, validated
   unique/acyclic/no-dangling, whole batch atomic) instead of being
-  edge-free; it also wires `retry_strategy`/`review_enabled` (previously
+  edge-free; it also wires `review_enabled` (previously
   silently dropped). The hand-authored `id` is a **batch-local wiring
   label only** (never persisted); the persisted `short_id` is minted
   (auto, the common path) or — if explicitly supplied — validated
@@ -396,7 +397,7 @@ view bindings don't fire under the overlay.
   re-checks in-process to surface precise errors (`Step not found` vs.
   cross-plan) on the common path — deliberate defense-in-depth that must
   stay in sync with the triggers.
-- **Schema/version:** migrations run through **V34** (V32 drops the old `UNIQUE(step_id, attempt)` execution-log constraint, V33 adds per-step cycle indices for retry-cycle audit grouping (the parked-changes retry resets `attempts` to start a new cycle), and V34 adds durable `step_parked_worktrees` stash state); `Cargo.toml` is **0.1.20**.
+- **Schema/version:** migrations run through **V37** (V32 drops the old `UNIQUE(step_id, attempt)` execution-log constraint, V33 adds per-step cycle indices for retry-cycle audit grouping (the parked-changes retry resets `attempts` to start a new cycle), V34 adds durable `step_parked_worktrees` stash state, V35 adds the `human_approved` one-more-cycle grant for review-loop escalation, V36 drops the per-plan `questions_enabled` opt-out (interruptions are always enabled), and **V37 drops the vestigial `plans.retry_strategy` / `steps.retry_strategy` / `plans.squash_on_complete` columns**); `Cargo.toml` is **0.1.20**.
 
 ## Prompt model
 
@@ -445,7 +446,7 @@ configured.
 
 ```
 ralph init [--non-interactive] [--default-harness <name>] [--force] [--restore-prompts]
-ralph plan create <slug> [-d <desc>] [--test <cmd>]... [--harness <h>] [--agent <name>] [--branch <name>] [--depends-on <slug>]... [--retry-strategy <keep|rollback>] [--squash-on-complete] [--max-review-corrections <n>]
+ralph plan create <slug> [-d <desc>] [--test <cmd>]... [--harness <h>] [--agent <name>] [--branch <name>] [--depends-on <slug>]... [--max-review-corrections <n>]
 ralph plan list [--all] [--status <status>] [--archived]
 ralph plan show <slug>
 ralph plan approve <slug>
@@ -465,9 +466,9 @@ ralph plan harness generate [<description>] [<slug>] [--use-harness <h>]
 
 # Every <num> step selector ALSO accepts an 8-char short_id (DAG handle).
 ralph step list [<slug>]
-ralph step add <title> [<slug>] [-d <desc>] [--after <short_id|num>] [--before <short_id|num>] [--root] [--depends-on <short_id|num>]... [--agent <name>] [--harness <h>] [--criteria <c>]... [--max-retries <n>] [--retry-strategy <keep|rollback>] [--import-json <FILE|->]   # non-empty plan requires exactly one placement: --after | --before | --depends-on | --root (empty plan: implied root)
+ralph step add <title> [<slug>] [-d <desc>] [--after <short_id|num>] [--before <short_id|num>] [--root] [--depends-on <short_id|num>]... [--agent <name>] [--harness <h>] [--criteria <c>]... [--max-retries <n>] [--import-json <FILE|->]   # non-empty plan requires exactly one placement: --after | --before | --depends-on | --root (empty plan: implied root)
 ralph step remove <num|short_id>|--step-id <uuid> [<slug>] [--force/-y]
-ralph step edit <num|short_id>|--step-id <uuid> [<slug>] [--title <t>] [--description <d>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--clear-criteria] [--max-retries <n>] [--clear-max-retries] [--retry-strategy <keep|rollback>] [--clear-retry-strategy] [--review <on|off|inherit>]
+ralph step edit <num|short_id>|--step-id <uuid> [<slug>] [--title <t>] [--description <d>] [--agent <name>] [--harness <h>] [--criteria <c>]... [--clear-criteria] [--max-retries <n>] [--clear-max-retries] [--review <on|off|inherit>]
 ralph step reset <num|short_id>|--step-id <uuid> [<slug>] [--force/-y]
 ralph step move <num|short_id>|--step-id <uuid> --to <n> [<slug>]
 ralph step set-hook <num|short_id>|--step-id <uuid> [<slug>] --lifecycle <lifecycle> --hook <name>

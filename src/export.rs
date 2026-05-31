@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::path::Path;
 
-use crate::plan::{ChangePolicy, Plan, RetryStrategy, Step};
+use crate::plan::{ChangePolicy, Plan, Step};
 use crate::storage;
 
 // ---------------------------------------------------------------------------
@@ -41,12 +41,6 @@ pub struct ExportedPlanMeta {
     pub depends_on: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_harness: Option<String>,
-    /// Plan-level retry-strategy override. Omitted from the JSON when the
-    /// plan has no override (`None`) so an unset plan exports identically
-    /// to pre-V24 output; a `Some` value round-trips back via the matching
-    /// `#[serde(default)]` field on [`crate::import::ImportedPlanMeta`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retry_strategy: Option<RetryStrategy>,
     /// Plan-level review on/off override (docs/dag-redesign.md §13.2). The
     /// review *toggle* is plan-template data so it IS exported; the review
     /// *harness/model* is global config and is **never** exported (a bundle
@@ -54,36 +48,16 @@ pub struct ExportedPlanMeta {
     /// Omitted when the plan has no override (`None` = inherit global), so a
     /// plan with no review override exports identically to a pre-V27
     /// bundle; round-trips via the matching `#[serde(default)]` field on
-    /// [`crate::import::ImportedPlanMeta`] — exactly the `retry_strategy`
-    /// treatment.
+    /// [`crate::import::ImportedPlanMeta`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_enabled: Option<bool>,
-    /// Plan-level `--squash-on-complete` toggle (docs/dag-redesign.md
-    /// §13.2 / §14.1). Plan-template data, so it round-trips. It is a
-    /// `bool` (not an `Option`): emitted **only when `true`** via the
-    /// boolean-template-field convention (cf. `tags`/`depends_on`'s
-    /// `skip_serializing_if`), so a plan with the default OFF exports
-    /// identically to a pre-V28 bundle and a legacy bundle (field absent)
-    /// imports back to `false` through `#[serde(default)]`.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub squash_on_complete: bool,
     /// Plan-level `max_review_corrections` recursion cap
     /// (docs/dag-redesign.md §10 item 4 / §13.2). Plan-template data
-    /// (the per-plan way to configure the review recursion bound, sibling
-    /// of `retry_strategy`), so it round-trips. Omitted when the plan has
-    /// no override (`None` = use the built-in default), exactly the
-    /// `retry_strategy` treatment.
+    /// (the per-plan way to configure the review recursion bound), so it
+    /// round-trips. Omitted when the plan has no override (`None` = use the
+    /// built-in default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_review_corrections: Option<i32>,
-}
-
-/// `skip_serializing_if` predicate for boolean template fields that default
-/// OFF: a `false` value is omitted from the JSON so a plan with the default
-/// exports identically to a bundle written before the field existed (it
-/// re-imports to `false` via `#[serde(default)]`). Only an explicit `true`
-/// is emitted.
-fn is_false(b: &bool) -> bool {
-    !*b
 }
 
 /// Step stripped of internal fields.
@@ -105,22 +79,15 @@ pub struct ExportedStep {
     /// tags so pre-V13 export output is unchanged for untagged steps.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    /// Step-level retry-strategy override. Omitted from the JSON when the
-    /// step has no override (`None`) so an unset step exports identically
-    /// to pre-V24 output; a `Some` value round-trips back via the matching
-    /// `#[serde(default)]` field on [`crate::import::ImportedStep`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retry_strategy: Option<RetryStrategy>,
     /// Step-level review on/off override (docs/dag-redesign.md §13.2).
     /// Plan-template data (the per-step `--review on|off|inherit` value), so
     /// it IS exported; the review harness/model is global config and is
     /// never exported. Omitted when the step has no override (`None` =
     /// inherit plan/global), so an unset step exports identically to a
     /// pre-V27 bundle; round-trips via the matching `#[serde(default)]`
-    /// field on [`crate::import::ImportedStep`] — exactly the
-    /// `retry_strategy` treatment. The runtime `review_status` and the
-    /// `corrects_step_id` provenance pointer are NOT exported (runtime
-    /// state, by existing policy — §13.2).
+    /// field on [`crate::import::ImportedStep`]. The runtime `review_status`
+    /// and the `corrects_step_id` provenance pointer are NOT exported
+    /// (runtime state, by existing policy — §13.2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_enabled: Option<bool>,
     /// Plan-unique, portable edge handle (docs/dag-redesign.md §13.2).
@@ -220,9 +187,7 @@ pub fn build_exported_plan(
         deterministic_tests: plan.deterministic_tests.clone(),
         depends_on: depends_on_slugs,
         plan_harness: plan.plan_harness.clone(),
-        retry_strategy: plan.retry_strategy,
         review_enabled: plan.review_enabled,
-        squash_on_complete: plan.squash_on_complete,
         max_review_corrections: plan.max_review_corrections,
     };
 
@@ -239,7 +204,6 @@ pub fn build_exported_plan(
             model: s.model.clone(),
             change_policy: s.change_policy,
             tags: s.tags.clone(),
-            retry_strategy: s.retry_strategy,
             review_enabled: s.review_enabled,
             short_id: s.short_id.clone(),
             depends_on: step_depends_on.get(i).cloned().unwrap_or_default(),
@@ -863,8 +827,7 @@ mod tests {
     /// STEP 43 / docs/dag-redesign.md §13.2: the review *toggles* are
     /// plan-template data and ARE exported; the review harness/model and
     /// all runtime state (`review_status`, `corrects_step_id`) are NOT.
-    /// `squash_on_complete` is a boolean-template field (emitted only when
-    /// `true`); `max_review_corrections` mirrors `retry_strategy`.
+    /// `max_review_corrections` is plan-template data and round-trips.
     #[test]
     fn test_export_emits_review_toggles_and_strips_runtime_state() {
         let conn = setup();
@@ -880,7 +843,6 @@ mod tests {
         )
         .unwrap();
         storage::set_plan_review_enabled(&conn, &plan.id, Some(true)).unwrap();
-        storage::set_plan_squash_on_complete(&conn, &plan.id, true).unwrap();
         storage::set_plan_max_review_corrections(&conn, &plan.id, Some(7)).unwrap();
         let (s, _) = storage::create_step(
             &conn,
@@ -906,7 +868,6 @@ mod tests {
         let exported = build_exported_plan(&plan, &steps, Vec::new(), &[]);
 
         assert_eq!(exported.plan.review_enabled, Some(true));
-        assert!(exported.plan.squash_on_complete);
         assert_eq!(exported.plan.max_review_corrections, Some(7));
         assert_eq!(exported.steps[0].review_enabled, Some(false));
 
@@ -914,7 +875,6 @@ mod tests {
         // Toggles present; review harness/model + runtime state absent.
         assert!(json.contains("\"review_enabled\":true"));
         assert!(json.contains("\"review_enabled\":false"));
-        assert!(json.contains("\"squash_on_complete\":true"));
         assert!(json.contains("\"max_review_corrections\":7"));
         assert!(!json.contains("review_status"), "{json}");
         assert!(!json.contains("review_harness"), "{json}");
@@ -942,7 +902,6 @@ mod tests {
         let pj =
             serde_json::to_string(&build_exported_plan(&plain, &psteps, Vec::new(), &[])).unwrap();
         assert!(!pj.contains("review_enabled"), "{pj}");
-        assert!(!pj.contains("squash_on_complete"), "{pj}");
         assert!(!pj.contains("max_review_corrections"), "{pj}");
     }
 

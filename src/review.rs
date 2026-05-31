@@ -137,7 +137,7 @@ pub fn effective_max_review_corrections(plan: &Plan) -> usize {
 /// step A runs *concurrently with the next unrelated implementation*
 /// (step B), which legitimately commits — advancing `HEAD` and transiently
 /// dirtying the shared worktree (the explicitly-accepted §5 linear-history
-/// entanglement, the same `RetryStrategy::Keep` already tolerates). A
+/// entanglement the retry path's dirty-tree-preservation already tolerates). A
 /// live-HEAD / live-worktree snapshot around the reviewer therefore *cannot*
 /// distinguish "the reviewer mutated state" from "a concurrent sibling
 /// implementation legitimately committed" — it false-positives on the
@@ -439,13 +439,19 @@ pub async fn run_review_subprocess(
     )
     .await?;
 
-    // Bounded concurrent drain + optional timeout. `config.timeout_secs` is
-    // the same `Option<u64>` (seconds) the implementation harness honors:
-    // `None` ⇒ no timer (but STILL bounded-drained — the unbounded-memory
-    // half of the bug is fixed regardless), `Some(n)` ⇒ kill the reviewer's
-    // process group after n seconds and fail the review (a hung reviewer
-    // becomes a step failure / failed review upstream, the desired behavior).
-    let timeout = config.timeout_secs.map(Duration::from_secs);
+    // Bounded concurrent drain + an ALWAYS-PRESENT timeout. Unlike the
+    // implementation harness — which honors `config.timeout_secs` and may run
+    // untimed when that is `None` — a review is never unbounded: the
+    // orchestrator blocks on the in-flight-review `JoinSet` once the runnable
+    // set empties, so a reviewer that hangs with no timer would deadlock the
+    // whole scheduler (holding the run lock) until Ctrl+C. `effective_timeout_secs`
+    // applies the user's explicit `review.timeout_secs` if set, else the
+    // built-in default cap (`default_review_timeout_secs`). On expiry the
+    // reviewer's process group is SIGKILL'd and the review fails — which the
+    // orchestrator treats as a transient review failure (re-run the review,
+    // keeping the already-committed work), NOT a step re-implementation.
+    let review_timeout_secs = config.review.effective_timeout_secs(config.timeout_secs);
+    let timeout = Some(Duration::from_secs(review_timeout_secs));
     let wait = io_util::wait_capped(child, timeout, REVIEW_OUTPUT_TAIL_BYTES).await;
     if wait.timed_out {
         // The process group was already SIGKILL'd and the child reaped
@@ -467,10 +473,9 @@ pub async fn run_review_subprocess(
         // Tear the worktree down explicitly before erroring (Drop would also
         // do it on the `?`-return below).
         drop(review_wt);
-        let secs = config.timeout_secs.unwrap_or(0);
         return Err(anyhow!(
-            "review harness timed out after {secs}s for step '{}' and was killed \
-             (process group SIGKILL'd); treating the review as failed",
+            "review harness timed out after {review_timeout_secs}s for step '{}' and was \
+             killed (process group SIGKILL'd); treating the review as failed",
             step.title
         ));
     }
@@ -1083,9 +1088,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         }
     }

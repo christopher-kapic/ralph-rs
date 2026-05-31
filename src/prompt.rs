@@ -80,7 +80,7 @@ and inserting before the current step is a no-op for this execution.
 /// Post test-then-commit (Phase A): the per-iteration commit happens only
 /// after tests pass, so a failed attempt has no committed diff to feed back.
 /// The `previous_diff` and `files_modified` fields are retained for
-/// `RetryStrategy::Rollback`-style audit and external callers, but the
+/// audit and external callers, but the
 /// executor currently populates them lazily/never — the dirty tree is always
 /// on disk for the agent to inspect via `git diff`. The retry-context render
 /// is therefore typically just the failure reason + previous test output.
@@ -818,9 +818,7 @@ mod tests {
             last_run_started_at: None,
             skip_requested_step_id: None,
             skip_changes: None,
-            retry_strategy: None,
             review_enabled: None,
-            squash_on_complete: false,
             max_review_corrections: None,
         }
     }
@@ -845,7 +843,6 @@ mod tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
             review_enabled: None,
             review_status: None,
             corrects_step_id: None,
@@ -875,7 +872,6 @@ mod tests {
             skipped_reason: None,
             change_policy: ChangePolicy::Required,
             tags: vec![],
-            retry_strategy: None,
             review_enabled: None,
             review_status: None,
             corrects_step_id: None,

@@ -10,7 +10,7 @@ use crate::frac_index;
 use crate::plan::InterruptionState;
 use crate::plan::{
     ChangePolicy, ExecutionLog, Interruption, InterruptionKind, InterruptionOption, PLAN_COLUMNS,
-    Phase, Plan, PlanStatus, RetryStrategy, Step, StepStatus,
+    Phase, Plan, PlanStatus, Step, StepStatus,
 };
 use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 
@@ -20,7 +20,7 @@ use crate::run_lock::{LIVE_RUN_COLUMNS, LiveRun};
 /// can index by column position. Kept as a single shared constant so adding a
 /// new column (V13+ tags etc.) only requires editing one place instead of the
 /// dozen scattered SELECTs.
-const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy, short_id, review_enabled, review_status, corrects_step_id, current_cycle_index";
+const STEP_COLUMNS: &str = "id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, short_id, review_enabled, review_status, corrects_step_id, current_cycle_index";
 
 /// Durably parked working-tree state for a step paused on a human-side
 /// interruption. The stash SHA identifies the parked git stash entry;
@@ -1262,38 +1262,13 @@ pub fn set_plan_harness_gen(conn: &Connection, plan_id: &str, harness: Option<&s
     Ok(())
 }
 
-/// Set (or clear) the plan-level retry-strategy override and bump
-/// `updated_at`.
-///
-/// `Some(strategy)` records a plan-wide default; `None` writes SQL NULL,
-/// meaning "no plan-level override" — resolution then falls through to the
-/// global default ([`RetryStrategy::Keep`]) unless a step overrides it.
-/// Kept as a dedicated setter (rather than threaded through `create_plan`)
-/// to mirror [`set_plan_harness_gen`] and avoid churning every existing
-/// `create_plan` callsite.
-pub fn set_plan_retry_strategy(
-    conn: &Connection,
-    plan_id: &str,
-    strategy: Option<RetryStrategy>,
-) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE plans SET retry_strategy = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![strategy.map(|s| s.as_str()), plan_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Plan not found: {plan_id}");
-    }
-    Ok(())
-}
-
 /// Set (or clear) a plan's `review_enabled` override (V27,
 /// docs/dag-redesign.md §6/§7) and bump `updated_at`. Stored as a nullable
 /// INTEGER: `Some(true)`/`Some(false)` write 1/0 (an explicit per-plan
 /// on/off that wins over the global `config.review.enabled`), `None` writes
 /// NULL so the plan inherits the global default. `Plan::from_row` coerces
-/// the column back to `Option<bool>`. Sibling setter to
-/// [`set_plan_retry_strategy`] — the per-plan way to scope review on/off,
-/// resolved by [`crate::config::effective_review_enabled`].
+/// the column back to `Option<bool>`. The per-plan way to scope review
+/// on/off, resolved by [`crate::config::effective_review_enabled`].
 pub fn set_plan_review_enabled(
     conn: &Connection,
     plan_id: &str,
@@ -1342,28 +1317,11 @@ pub fn any_review_enabled(conn: &Connection, global_review_enabled: bool) -> Res
     Ok(found)
 }
 
-/// Set (or clear) a plan's `--squash-on-complete` toggle and bump
-/// `updated_at`. Stored as a nullable INTEGER (V28): `false` writes 0
-/// rather than NULL so the value round-trips explicitly; `Plan::from_row`
-/// coerces both NULL and 0 to `false`.
-pub fn set_plan_squash_on_complete(conn: &Connection, plan_id: &str, squash: bool) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE plans SET squash_on_complete = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![if squash { 1 } else { 0 }, plan_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Plan not found: {plan_id}");
-    }
-    Ok(())
-}
-
 /// Set (or clear) a plan's `max_review_corrections` cap (V30,
 /// docs/dag-redesign.md §10 item 4 / §14.5) and bump `updated_at`. `None`
 /// writes NULL → the runner uses the built-in default
 /// ([`crate::review::DEFAULT_MAX_REVIEW_CORRECTIONS`]); `Some(n)` pins the
-/// per-plan cap. Sibling setter to [`set_plan_squash_on_complete`] /
-/// [`set_plan_retry_strategy`] — the per-plan way to configure the review
-/// recursion bound, consistent with how `retry_strategy` is plan-configured.
+/// per-plan cap. The per-plan way to configure the review recursion bound.
 pub fn set_plan_max_review_corrections(
     conn: &Connection,
     plan_id: &str,
@@ -1634,6 +1592,55 @@ pub fn mint_short_id(conn: &Connection, plan_id: &str) -> Result<String> {
     }
 }
 
+/// Number of times [`insert_step_minting_short_id`] re-rolls a freshly minted
+/// `short_id` after a concurrent writer beat us to the same value. Collisions
+/// are astronomically unlikely (random 8-char base-62 ≈ 2.18e14 values), so a
+/// small bound is ample — exhausting it signals something pathological, not
+/// genuine space exhaustion.
+const SHORT_ID_MINT_RETRIES: u32 = 8;
+
+/// True when `err` is the `steps (plan_id, short_id)` uniqueness violation —
+/// i.e. a writer in another process committed the same minted handle between
+/// [`mint_short_id`]'s `SELECT EXISTS` check and our `INSERT`. We re-roll on
+/// exactly this error and surface every other error unchanged.
+fn is_short_id_unique_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, Some(msg))
+            if e.code == rusqlite::ErrorCode::ConstraintViolation
+                && msg.contains("short_id")
+    )
+}
+
+/// Mint a plan-unique `short_id` and run `insert` with it, re-rolling on a
+/// `short_id` uniqueness violation.
+///
+/// [`mint_short_id`]'s own collision check is *advisory*: it observes this
+/// connection's own (possibly uncommitted) writes, but it cannot see a
+/// concurrent uncommitted insert from another process sharing the same DB
+/// file. So two writers — e.g. a `ralph step add` racing the orchestrator's
+/// corrective-step insert — can both pass the check and then collide on the
+/// `idx_steps_short_id` unique index. Catching that here and re-minting keeps
+/// step creation robust instead of surfacing a generic "Failed to insert
+/// step" to the user (docs/dag-redesign.md §3.1).
+fn insert_step_minting_short_id(
+    conn: &Connection,
+    plan_id: &str,
+    mut insert: impl FnMut(&str) -> rusqlite::Result<usize>,
+) -> Result<()> {
+    let mut retries = 0;
+    loop {
+        let short_id = mint_short_id(conn, plan_id)?;
+        match insert(&short_id) {
+            Ok(_) => return Ok(()),
+            Err(e) if is_short_id_unique_violation(&e) && retries < SHORT_ID_MINT_RETRIES => {
+                retries += 1;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// True when `s` has the exact *shape* of a step `short_id`: precisely
 /// [`SHORT_ID_LEN`] characters, every one drawn from the base-62 alphabet
 /// (`[0-9A-Za-z]`).
@@ -1720,14 +1727,15 @@ pub fn create_step(
 
     // Mint the plan-unique short_id via the one shared helper so runtime
     // step creation and the V25 migration/import backfill produce the same
-    // handle for the same input (docs/dag-redesign.md §3.1, §13.3).
-    let short_id = mint_short_id(conn, plan_id)?;
-
-    conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags, short_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json, short_id],
-    )
+    // handle for the same input (docs/dag-redesign.md §3.1, §13.3). Re-rolls
+    // if a concurrent writer in another process raced us to the same handle.
+    insert_step_minting_short_id(conn, plan_id, |short_id| {
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags, short_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json, short_id],
+        )
+    })
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
     // The new step is always appended, so its position is the total step count.
@@ -2017,15 +2025,16 @@ pub fn create_step_at(
     let change_policy = change_policy.unwrap_or_default();
     let tags_json = serde_json::to_string(tags.unwrap_or(&[]))?;
 
-    // See [`create_step`]: same single-source short_id minting helper so
-    // every step-creation path is consistent (docs/dag-redesign.md §3.1).
-    let short_id = mint_short_id(conn, plan_id)?;
-
-    conn.execute(
-        "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags, short_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json, short_id],
-    )
+    // See [`create_step`]: same single-source short_id minting helper, with
+    // the same concurrent-collision re-roll, so every step-creation path is
+    // consistent (docs/dag-redesign.md §3.1).
+    insert_step_minting_short_id(conn, plan_id, |short_id| {
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, max_retries, model, change_policy, tags, short_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![id, plan_id, sort_key, title, description, agent, harness, criteria_json, max_retries, model, change_policy.as_str(), tags_json, short_id],
+        )
+    })
     .with_context(|| format!("Failed to insert step '{title}' for plan '{plan_id}'"))?;
 
     // Count steps with sort_key <= the new one to get the 1-based position.
@@ -2142,39 +2151,14 @@ pub fn update_step_fields_ext(
     Ok(())
 }
 
-/// Set (or clear) the step-level retry-strategy override and bump
-/// `updated_at`.
-///
-/// `Some(strategy)` records a per-step override; `None` writes SQL NULL,
-/// meaning "no step-level override" — resolution falls through to the
-/// plan's value and then the global default ([`RetryStrategy::Keep`]).
-/// Kept as a dedicated setter (rather than a new field on
-/// [`update_step_fields_ext`]) so the ~100 `create_step` callsites and the
-/// existing `update_step_fields_ext` callers stay untouched, mirroring how
-/// `plan_harness` is set via [`set_plan_harness_gen`] after `create_plan`.
-pub fn set_step_retry_strategy(
-    conn: &Connection,
-    step_id: &str,
-    strategy: Option<RetryStrategy>,
-) -> Result<()> {
-    let affected = conn.execute(
-        "UPDATE steps SET retry_strategy = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?2",
-        params![strategy.map(|s| s.as_str()), step_id],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("Step not found: {step_id}");
-    }
-    Ok(())
-}
-
 /// Set (or clear) a step's `review_enabled` override (V27,
 /// docs/dag-redesign.md §6/§7) and bump `updated_at`. Stored as a nullable
 /// INTEGER: `Some(true)`/`Some(false)` write 1/0 (an explicit per-step
 /// on/off that wins over the plan/global default), `None` writes NULL so
-/// the step inherits the plan (then global) default. Sibling setter to
-/// [`set_step_retry_strategy`] — the per-step way to scope review on/off,
-/// resolved by [`crate::config::effective_review_enabled`] (step > plan >
-/// config > false).
+/// the step inherits the plan (then global) default. The per-step way to
+/// scope review on/off, resolved by
+/// [`crate::config::effective_review_enabled`] (step > plan > config >
+/// false).
 pub fn set_step_review_enabled(
     conn: &Connection,
     step_id: &str,
@@ -2275,17 +2259,46 @@ pub fn reset_step(conn: &Connection, step_id: &str) -> Result<Option<ParkedWorkt
 /// pre-existing stranded-request-on-resume case for ordinary reviewer
 /// requests).
 pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
-    // Also reset a stranded `review_status = in_flight` back to `pending`
-    // in the SAME atomic UPDATE. A crash *during a concurrent review*
-    // (docs/dag-redesign.md §3.5 item 3) leaves a step `InProgress` +
-    // `review_status = InFlight`; sweeping only the step status would
-    // produce the impossible `Aborted` + `InFlight` combination (a review
-    // can never be in flight for an aborted step — its detached task died
-    // with the crashed runner). Resetting it to `pending` makes a
-    // subsequent re-run re-review the step from a clean state rather than
-    // believing a phantom reviewer is still running. Other review_status
-    // values (passed/failed/disabled/skipped) are durable verdicts and are
-    // left untouched.
+    // First, reclaim a review orphaned by a crash — WITHOUT aborting the step.
+    // A *committed* step left `InProgress` + `review_status = InFlight` was
+    // implementing-complete and mid-review when the runner died; its detached
+    // reviewer task is gone, but the work is on disk (a committed
+    // execution-log row proves it). Reset `review_status` InFlight → Pending
+    // but KEEP `InProgress`, so the scheduler re-spawns ONLY the review
+    // against the existing commit (`runner::respawn_pending_reviews`) instead
+    // of re-implementing the step. This must run before the abort sweep below,
+    // which then deliberately skips it.
+    conn.execute(
+        "UPDATE steps SET review_status = ?4,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE plan_id = ?1 AND status = ?2 AND review_status = ?3
+           AND EXISTS (
+               SELECT 1 FROM execution_logs e
+               WHERE e.step_id = steps.id AND e.commit_hash IS NOT NULL
+           )",
+        params![
+            plan_id,
+            StepStatus::InProgress.as_str(),
+            crate::plan::ReviewStatus::InFlight.as_str(),
+            crate::plan::ReviewStatus::Pending.as_str(),
+        ],
+    )?;
+
+    // Abort sweep. Flip stale `InProgress` rows to `Aborted` (and defensively
+    // reset any residual `review_status = in_flight` → `pending` — there
+    // should be none after the reclaim above, but the impossible
+    // `Aborted` + `InFlight` pairing must never persist).
+    //
+    // Three classes of `InProgress` step are deliberately NOT swept:
+    //   - one with an open interruption (a deliberately parked / blocked step);
+    //   - one with an open corrective request (an escalated review-loop step
+    //     the orchestrator promotes to `Complete` only when it drains the
+    //     request);
+    //   - a **committed step awaiting review** (`review_status` pending/in_flight
+    //     with a committed execution-log row). Aborting it would discard the
+    //     committed work and re-implement it on the next run; instead it stays
+    //     `InProgress` (reclaimed to `pending` above) and is recovered by
+    //     re-running only the review.
     let sql = format!(
         "UPDATE steps SET status = ?1,
              review_status = CASE WHEN review_status = ?4 THEN ?5 ELSE review_status END,
@@ -2298,6 +2311,13 @@ pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<S
            AND NOT EXISTS (
                SELECT 1 FROM corrective_step_requests c
                WHERE c.reviewed_step_id = steps.id AND c.state = 'open'
+           )
+           AND NOT (
+               review_status IN (?4, ?5)
+               AND EXISTS (
+                   SELECT 1 FROM execution_logs e
+                   WHERE e.step_id = steps.id AND e.commit_hash IS NOT NULL
+               )
            )
          RETURNING {STEP_COLUMNS}",
     );
@@ -2319,6 +2339,28 @@ pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<S
     // Sort by sort_key so callers can report them in plan order.
     swept.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
     Ok(swept)
+}
+
+/// The commit SHA and iteration (attempt number) of the single committed
+/// attempt for `step_id`, if any.
+///
+/// Post-DAG-redesign there is **at most one commit per step** (test-then-commit),
+/// so the committed execution-log row is unique. This is the **durable** source
+/// of a step's reviewed commit: the orchestrator normally spawns a review from
+/// an in-memory `needs_review` hand-off, but on a crash/restart — or after a
+/// transient review error — that hand-off is gone. The scheduler recovers the
+/// review target from here so a committed-but-unreviewed step is re-reviewed
+/// against its existing commit rather than re-implemented from scratch.
+pub fn committed_review_target(conn: &Connection, step_id: &str) -> Result<Option<(String, i32)>> {
+    Ok(conn
+        .query_row(
+            "SELECT commit_hash, attempt FROM execution_logs \
+             WHERE step_id = ?1 AND commit_hash IS NOT NULL \
+             ORDER BY attempt DESC LIMIT 1",
+            params![step_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?)),
+        )
+        .optional()?)
 }
 
 /// Update a step's sort_key (used for reordering).
@@ -6476,7 +6518,12 @@ mod tests {
         let conn = setup();
         let plan = create_plan(&conn, "sweep", "/proj", "b", "d", None, None, &[]).unwrap();
 
-        // Step A: crashed mid-review (InProgress + InFlight) — the bug case.
+        // Step A: InProgress + InFlight but with NO committed execution-log
+        // row. In real runs InFlight always implies a commit, but a row
+        // without one is treated as a stale implementation (not awaiting
+        // review): the sweep aborts it and resets InFlight -> Pending. The
+        // committed-and-awaiting-review case is covered by
+        // `test_sweep_keeps_committed_review_pending_step`.
         let (a, _) = create_step(
             &conn,
             &plan.id,
@@ -6567,6 +6614,65 @@ mod tests {
             Some(crate::plan::ReviewStatus::Pending),
             "the returned row snapshot must show the reset review_status"
         );
+    }
+
+    /// Blocker #2 (durable committed-review-pending recovery): a step that
+    /// committed its work and was mid-review when the runner crashed
+    /// (`InProgress` + `review_status = InFlight` + a committed execution-log
+    /// row) must NOT be aborted+re-implemented by the sweep. Instead it stays
+    /// `InProgress` and its orphaned `InFlight` resets to `Pending`, so the
+    /// scheduler re-runs ONLY the review against the existing commit.
+    #[test]
+    fn test_sweep_keeps_committed_review_pending_step() {
+        let conn = setup();
+        let plan = create_plan(&conn, "sweep2", "/proj", "b", "d", None, None, &[]).unwrap();
+
+        let (a, _) = create_step(
+            &conn,
+            &plan.id,
+            "A",
+            "d",
+            None,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        update_step_status(&conn, &a.id, StepStatus::InProgress).unwrap();
+        update_step_review_status(&conn, &a.id, crate::plan::ReviewStatus::InFlight).unwrap();
+        // Durable proof the implementation is committed: an execution-log row
+        // carrying a commit hash (the single committed attempt).
+        let log = create_execution_log(&conn, &a.id, 1, None, None).unwrap();
+        conn.execute(
+            "UPDATE execution_logs SET commit_hash = 'deadbeefcafe' WHERE id = ?1",
+            params![log.id],
+        )
+        .unwrap();
+
+        let swept = sweep_stale_in_progress(&conn, &plan.id).unwrap();
+        assert!(
+            swept.is_empty(),
+            "a committed-but-unreviewed step must NOT be swept to Aborted, got {swept:?}"
+        );
+
+        let a2 = get_step(&conn, &a.id).unwrap();
+        assert_eq!(
+            a2.status,
+            StepStatus::InProgress,
+            "the step must stay InProgress (recoverable by re-review), not Aborted"
+        );
+        assert_eq!(
+            a2.review_status,
+            Some(crate::plan::ReviewStatus::Pending),
+            "the orphaned InFlight reviewer must reset to Pending so the scheduler re-spawns it"
+        );
+
+        // The durable review target is recoverable for the re-spawn.
+        let target = committed_review_target(&conn, &a.id).unwrap();
+        assert_eq!(target, Some(("deadbeefcafe".to_string(), 1)));
     }
 
     /// An InProgress step carrying an OPEN corrective request must NOT be

@@ -245,58 +245,6 @@ impl std::str::FromStr for ChangePolicy {
 }
 
 // ---------------------------------------------------------------------------
-// RetryStrategy enum
-// ---------------------------------------------------------------------------
-
-/// How a step's working tree is treated between failed attempts.
-///
-/// Resolved per-step via [`Step::effective_retry_strategy`] with the
-/// precedence step > plan > default ([`RetryStrategy::Keep`]).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "snake_case")]
-#[value(rename_all = "kebab-case")]
-pub enum RetryStrategy {
-    /// Failed attempts leave the working tree as-is; the next attempt sees
-    /// the prior work directly via `git diff`. The retry context therefore
-    /// omits the diff (the changes are already on disk for the agent to
-    /// inspect and build on).
-    #[default]
-    Keep,
-    /// Failed attempts roll back the working tree before retrying; the prior
-    /// attempt's diff is fed into the next attempt's prompt via the retry
-    /// context so the agent can learn from — but doesn't inherit — the
-    /// rolled-back work.
-    Rollback,
-}
-
-impl RetryStrategy {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Keep => "keep",
-            Self::Rollback => "rollback",
-        }
-    }
-}
-
-impl std::fmt::Display for RetryStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for RetryStrategy {
-    type Err = ParseStatusError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "keep" => Ok(Self::Keep),
-            "rollback" => Ok(Self::Rollback),
-            other => Err(ParseStatusError(other.to_string())),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Interruption domain model (questions + blockers, unified)
 // ---------------------------------------------------------------------------
 
@@ -829,7 +777,7 @@ impl std::str::FromStr for TestStatus {
 /// (preserving the physical order of the remaining columns). Every
 /// `Plan`-returning query MUST use this list so [`Plan::from_row`]'s indices
 /// line up — a raw `SELECT *` would otherwise swap columns.
-pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, retry_strategy, review_enabled, squash_on_complete, max_review_corrections";
+pub const PLAN_COLUMNS: &str = "id, slug, project, branch_name, description, status, harness, agent, deterministic_tests, created_at, updated_at, plan_harness, pause_requested, last_run_branch, last_run_started_at, skip_requested_step_id, skip_changes, review_enabled, max_review_corrections";
 
 /// A plan represents a high-level task broken into ordered steps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -886,30 +834,15 @@ pub struct Plan {
     /// never silently destroys work.
     #[serde(default)]
     pub skip_changes: Option<String>,
-    /// Plan-level default retry strategy. `None` means "no plan-level
-    /// override" — the effective value falls through to the global default
-    /// ([`RetryStrategy::Keep`]) unless a step overrides it. Resolved via
-    /// [`Step::effective_retry_strategy`].
-    #[serde(default)]
-    pub retry_strategy: Option<RetryStrategy>,
     /// Plan-level review on/off override (V27). `None` means "no plan-level
     /// override" — the effective value falls through to the global
     /// `config.review.enabled` (then `false`) unless a step overrides it.
     /// Resolved via [`crate::config::effective_review_enabled`] with the
-    /// precedence step > plan > global > false (mirrors `RetryStrategy`).
-    /// Stored as a nullable INTEGER (tri-state bool) on disk; wired but not
-    /// yet consumed by the runner in this batch.
+    /// precedence step > plan > global > false. Stored as a nullable INTEGER
+    /// (tri-state bool) on disk; wired but not yet consumed by the runner in
+    /// this batch.
     #[serde(default)]
     pub review_enabled: Option<bool>,
-    /// Per-plan `--squash-on-complete` toggle (V28, docs/dag-redesign.md
-    /// §14.1). `false` (the default; on-disk NULL or 0) keeps every
-    /// per-iteration step commit (full audit trail — identical to the
-    /// step 32/33 output). `true` collapses a step's iteration commits into
-    /// a single commit when the step reaches `Complete`, preserving the
-    /// `Ralph-*` trailers on the squashed commit. Stored as a nullable
-    /// INTEGER; NULL is coerced to `false`.
-    #[serde(default)]
-    pub squash_on_complete: bool,
     /// Per-plan cap on the review→correction→review recursion depth (V30,
     /// docs/dag-redesign.md §10 item 4 / §14.5). `None` means "no plan-level
     /// override" — the runner uses the built-in default
@@ -931,8 +864,8 @@ impl Plan {
     /// id, slug, project, branch_name, description, status, harness, agent,
     /// deterministic_tests, created_at, updated_at, plan_harness,
     /// pause_requested, last_run_branch, last_run_started_at,
-    /// skip_requested_step_id, skip_changes, retry_strategy, review_enabled,
-    /// squash_on_complete, max_review_corrections
+    /// skip_requested_step_id, skip_changes, review_enabled,
+    /// max_review_corrections
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let status_str: String = row.get(5)?;
         let status: PlanStatus = status_str.parse().map_err(|e| {
@@ -958,47 +891,19 @@ impl Plan {
         // no native bool, so read as i64 and coerce.
         let pause_requested_int: i64 = row.get(12)?;
 
-        // `retry_strategy` is a nullable TEXT column (V24). NULL means "no
-        // plan-level override" — resolution falls through to the global
-        // default. A non-null value must parse to a known variant.
-        let retry_strategy_str: Option<String> = row.get(17)?;
-        let retry_strategy = match retry_strategy_str {
-            Some(s) => Some(s.parse::<RetryStrategy>().map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    17,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?),
-            None => None,
-        };
-
-        // `review_enabled` is a nullable INTEGER column (V27) at index 18.
+        // `review_enabled` is a nullable INTEGER column (V27) at index 17.
         // NULL means "no plan-level override" — resolution falls through to
         // the global `config.review.enabled` (then `false`). SQLite has no
         // native bool, so read as `Option<i64>` and coerce non-null to a
         // bool (any non-zero = true).
-        let review_enabled: Option<bool> = row.get::<_, Option<i64>>(18)?.map(|v| v != 0);
-
-        // `squash_on_complete` is a nullable INTEGER column (V28) at index
-        // 19. NULL (pre-V28 / never-set) coerces to `false` — the default-OFF
-        // behavior. SQLite has no native bool, so read as `Option<i64>` and
-        // treat any non-zero as true (same pattern as `review_enabled`).
-        // `.ok()`-tolerant for SELECTs/raw test inserts that predate the
-        // column.
-        let squash_on_complete: bool = row
-            .get::<_, Option<i64>>(19)
-            .ok()
-            .flatten()
-            .map(|v| v != 0)
-            .unwrap_or(false);
+        let review_enabled: Option<bool> = row.get::<_, Option<i64>>(17)?.map(|v| v != 0);
 
         // `max_review_corrections` is a nullable INTEGER column (V30) at
-        // index 20. NULL (pre-V30 / never-set) stays `None` — the runner
+        // index 18. NULL (pre-V30 / never-set) stays `None` — the runner
         // then uses the built-in default. `.ok()`-tolerant for raw test
         // inserts / SELECTs that predate the column.
         let max_review_corrections: Option<i32> = row
-            .get::<_, Option<i64>>(20)
+            .get::<_, Option<i64>>(18)
             .ok()
             .flatten()
             .map(|v| v as i32);
@@ -1021,9 +926,7 @@ impl Plan {
             last_run_started_at: row.get(14)?,
             skip_requested_step_id: row.get(15)?,
             skip_changes: row.get(16)?,
-            retry_strategy,
             review_enabled,
-            squash_on_complete,
             max_review_corrections,
         })
     }
@@ -1078,19 +981,12 @@ pub struct Step {
     /// exported plan JSON that lacks the field.
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Step-level retry-strategy override. `None` means "no step-level
-    /// override" — resolution falls through to the plan's value and then
-    /// the global default ([`RetryStrategy::Keep`]). Resolved via
-    /// [`Step::effective_retry_strategy`].
-    #[serde(default)]
-    pub retry_strategy: Option<RetryStrategy>,
     /// Step-level review on/off override (V27). `None` means "no step-level
     /// override" — resolution falls through to the plan's value and then
     /// the global `config.review.enabled` (then `false`). Resolved via
     /// [`crate::config::effective_review_enabled`] with the precedence
-    /// step then plan then global then false (mirroring `RetryStrategy`).
-    /// Stored as a nullable INTEGER tri-state bool; wired but not yet
-    /// consumed in this batch.
+    /// step then plan then global then false. Stored as a nullable INTEGER
+    /// tri-state bool; wired but not yet consumed in this batch.
     #[serde(default)]
     pub review_enabled: Option<bool>,
     /// Per-step nondeterministic-review verdict (V27). `None` (the on-disk
@@ -1113,8 +1009,7 @@ impl Step {
     /// id, plan_id, sort_key, title, description, agent, harness,
     /// acceptance_criteria, status, attempts, max_retries, created_at,
     /// updated_at, model, skipped_reason, change_policy, tags,
-    /// retry_strategy, short_id, review_enabled, review_status,
-    /// corrects_step_id
+    /// short_id, review_enabled, review_status, corrects_step_id
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let criteria_json: String = row.get(7)?;
         let acceptance_criteria: Vec<String> =
@@ -1163,53 +1058,38 @@ impl Step {
             })?,
         };
 
-        // `retry_strategy` is a nullable TEXT column (V24) at index 17. NULL
-        // means "no step-level override"; a non-null value must parse to a
-        // known variant.
-        let retry_strategy_str: Option<String> = row.get(17)?;
-        let retry_strategy = match retry_strategy_str {
-            Some(s) => Some(s.parse::<RetryStrategy>().map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    17,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?),
-            None => None,
-        };
-
-        // `short_id` is the V25 plan-unique handle on column 18. SELECTs
+        // `short_id` is the V25 plan-unique handle on column 17. SELECTs
         // that predate V25 omit the column and raw test inserts may leave
         // it NULL; either case is defensively mapped to an empty string so
         // legacy rows keep round-tripping (mirrors the `tags` handling).
-        let short_id: String = row.get::<_, String>(18).ok().unwrap_or_default();
+        let short_id: String = row.get::<_, String>(17).ok().unwrap_or_default();
 
-        // V27 review columns at indices 19/20/21. SELECTs that predate V27
+        // V27 review columns at indices 18/19/20. SELECTs that predate V27
         // omit them and raw test inserts may leave them NULL; `.get(..).ok()`
         // + the `Option` mapping defensively treats either case as the
         // inherit / pending default so legacy rows keep round-tripping
         // (mirrors the `short_id` / `tags` handling above).
         //
-        // - `review_enabled` (19): nullable INTEGER tri-state bool; non-null
+        // - `review_enabled` (18): nullable INTEGER tri-state bool; non-null
         //   coerces to a bool (any non-zero = true), like `review_enabled`
         //   on `Plan`.
-        // - `review_status` (20): nullable TEXT; a non-null value must parse
+        // - `review_status` (19): nullable TEXT; a non-null value must parse
         //   to a known `ReviewStatus` variant (NULL = pending).
-        // - `corrects_step_id` (21): nullable TEXT step-id pointer.
+        // - `corrects_step_id` (20): nullable TEXT step-id pointer.
         let review_enabled: Option<bool> =
-            row.get::<_, Option<i64>>(19).ok().flatten().map(|v| v != 0);
-        let review_status_str: Option<String> = row.get::<_, Option<String>>(20).ok().flatten();
+            row.get::<_, Option<i64>>(18).ok().flatten().map(|v| v != 0);
+        let review_status_str: Option<String> = row.get::<_, Option<String>>(19).ok().flatten();
         let review_status = match review_status_str {
             Some(s) => Some(s.parse::<ReviewStatus>().map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    20,
+                    19,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
             })?),
             None => None,
         };
-        let corrects_step_id: Option<String> = row.get::<_, Option<String>>(21).ok().flatten();
+        let corrects_step_id: Option<String> = row.get::<_, Option<String>>(20).ok().flatten();
 
         Ok(Step {
             id: row.get(0)?,
@@ -1230,24 +1110,10 @@ impl Step {
             skipped_reason: row.get(14)?,
             change_policy,
             tags,
-            retry_strategy,
             review_enabled,
             review_status,
             corrects_step_id,
         })
-    }
-
-    /// Resolve the effective retry strategy for this step.
-    ///
-    /// Precedence is **step > plan > default**: a step-level override wins
-    /// over a plan-level default, which in turn wins over the built-in
-    /// default ([`RetryStrategy::Keep`]). `None` at a level means "defer to
-    /// the next level down".
-    #[allow(dead_code)] // consumed by the executor retry loop in a later step
-    pub fn effective_retry_strategy(&self, plan: &Plan) -> RetryStrategy {
-        self.retry_strategy
-            .or(plan.retry_strategy)
-            .unwrap_or(RetryStrategy::Keep)
     }
 }
 
@@ -1713,7 +1579,7 @@ mod tests {
 
         let step = conn
             .query_row(
-                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, retry_strategy, short_id FROM steps WHERE id = ?1",
+                "SELECT id, plan_id, sort_key, title, description, agent, harness, acceptance_criteria, status, attempts, max_retries, created_at, updated_at, model, skipped_reason, change_policy, tags, short_id FROM steps WHERE id = ?1",
                 ["s1"],
                 Step::from_row,
             )
@@ -2050,45 +1916,6 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_strategy_roundtrip() {
-        let strategies = [RetryStrategy::Keep, RetryStrategy::Rollback];
-        for s in &strategies {
-            let token = s.as_str();
-            let parsed: RetryStrategy = token.parse().unwrap();
-            assert_eq!(*s, parsed);
-        }
-    }
-
-    #[test]
-    fn test_retry_strategy_default_is_keep() {
-        assert_eq!(RetryStrategy::default(), RetryStrategy::Keep);
-    }
-
-    #[test]
-    fn test_retry_strategy_display() {
-        assert_eq!(RetryStrategy::Keep.to_string(), "keep");
-        assert_eq!(RetryStrategy::Rollback.to_string(), "rollback");
-    }
-
-    #[test]
-    fn test_retry_strategy_serialize_snake_case() {
-        assert_eq!(
-            serde_json::to_string(&RetryStrategy::Keep).unwrap(),
-            r#""keep""#,
-        );
-        assert_eq!(
-            serde_json::to_string(&RetryStrategy::Rollback).unwrap(),
-            r#""rollback""#,
-        );
-    }
-
-    #[test]
-    fn test_invalid_retry_strategy() {
-        let result: Result<RetryStrategy, _> = "discard".parse();
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_review_status_roundtrip() {
         let statuses = [
             ReviewStatus::Pending,
@@ -2320,84 +2147,5 @@ mod tests {
         assert_eq!(blocker.resolution, None);
         assert_eq!(blocker.comment, None);
         assert_eq!(blocker.resolved_at, None);
-    }
-
-    #[test]
-    fn test_effective_retry_strategy_precedence() {
-        // Build a minimal Plan/Step pair and vary only the two
-        // retry_strategy fields across all four combinations.
-        fn make_plan(rs: Option<RetryStrategy>) -> Plan {
-            Plan {
-                id: "p1".into(),
-                slug: "s".into(),
-                project: "/p".into(),
-                branch_name: "b".into(),
-                description: "d".into(),
-                status: PlanStatus::Planning,
-                harness: None,
-                agent: None,
-                deterministic_tests: vec![],
-                plan_harness: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                pause_requested: false,
-                last_run_branch: None,
-                last_run_started_at: None,
-                skip_requested_step_id: None,
-                skip_changes: None,
-                retry_strategy: rs,
-                review_enabled: None,
-                squash_on_complete: false,
-                max_review_corrections: None,
-            }
-        }
-        fn make_step(rs: Option<RetryStrategy>) -> Step {
-            Step {
-                id: "st1".into(),
-                short_id: String::new(),
-                plan_id: "p1".into(),
-                sort_key: "a0".into(),
-                title: "t".into(),
-                description: "d".into(),
-                agent: None,
-                harness: None,
-                acceptance_criteria: vec![],
-                status: StepStatus::Pending,
-                attempts: 0,
-                max_retries: None,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                model: None,
-                skipped_reason: None,
-                change_policy: ChangePolicy::Required,
-                tags: vec![],
-                retry_strategy: rs,
-                review_enabled: None,
-                review_status: None,
-                corrects_step_id: None,
-            }
-        }
-
-        // (step None, plan None) -> default Keep
-        assert_eq!(
-            make_step(None).effective_retry_strategy(&make_plan(None)),
-            RetryStrategy::Keep,
-        );
-        // (step Some, plan None) -> step
-        assert_eq!(
-            make_step(Some(RetryStrategy::Rollback)).effective_retry_strategy(&make_plan(None)),
-            RetryStrategy::Rollback,
-        );
-        // (step None, plan Some) -> plan
-        assert_eq!(
-            make_step(None).effective_retry_strategy(&make_plan(Some(RetryStrategy::Rollback))),
-            RetryStrategy::Rollback,
-        );
-        // (step Some, plan Some) -> step wins
-        assert_eq!(
-            make_step(Some(RetryStrategy::Keep))
-                .effective_retry_strategy(&make_plan(Some(RetryStrategy::Rollback))),
-            RetryStrategy::Keep,
-        );
     }
 }

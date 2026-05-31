@@ -46,6 +46,7 @@ const MIGRATIONS: &[fn(&Connection) -> Result<()>] = &[
     migrate_v34,
     migrate_v35,
     migrate_v36,
+    migrate_v37,
 ];
 
 /// Current schema version — derived from the length of `MIGRATIONS` so that
@@ -1452,6 +1453,36 @@ fn migrate_v36(conn: &Connection) -> Result<()> {
     // floor is assured; if `bundled` is ever dropped, this migration (and the
     // direct DROP COLUMNs in V21/V22) would need a version guard or rebuild.
     conn.execute_batch("ALTER TABLE plans DROP COLUMN questions_enabled;")?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Migration V37: drop the vestigial retry_strategy + squash_on_complete columns
+// ---------------------------------------------------------------------------
+
+fn migrate_v37(conn: &Connection) -> Result<()> {
+    // Post-DAG-redesign, `RetryStrategy {Keep, Rollback}` and the
+    // `--squash-on-complete` toggle are dead surface. There is at most one
+    // commit per step (commit-on-test-pass) and failed attempts preserve the
+    // dirty tree, so there is nothing to keep/rollback across attempts and
+    // nothing for squash to collapse. These columns are never read or written
+    // by any live code path, so dropping them is a no-op for behavior.
+    //
+    // - `plans.retry_strategy` (TEXT, V24)
+    // - `steps.retry_strategy` (TEXT, V24)
+    // - `plans.squash_on_complete` (INTEGER, V28)
+    //
+    // All three were added as plain columns with no index/trigger/view/
+    // generated-column dependency, so a direct `DROP COLUMN` is safe on the
+    // bundled modern SQLite and avoids a full table rebuild.
+    //
+    // `ALTER TABLE ... DROP COLUMN` requires SQLite >= 3.35.0, guaranteed by
+    // the `rusqlite` `bundled` feature (same assurance V36 relies on).
+    conn.execute_batch(
+        "ALTER TABLE plans DROP COLUMN retry_strategy;
+         ALTER TABLE steps DROP COLUMN retry_strategy;
+         ALTER TABLE plans DROP COLUMN squash_on_complete;",
+    )?;
     Ok(())
 }
 
@@ -2961,118 +2992,9 @@ mod tests {
         assert_eq!(version, CURRENT_VERSION);
     }
 
-    #[test]
-    fn test_migration_v24_adds_retry_strategy_to_plans_and_steps() {
-        // Seed a pre-V24 DB with a plans row + a steps row, run V24, and
-        // verify the existing rows default `retry_strategy` to NULL (inherit
-        // / use default — the correct behavior), and that fresh values
-        // round-trip on both tables.
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("old_v23.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-
-        // Apply migrations v1..=v23 only.
-        for (i, migration) in MIGRATIONS.iter().enumerate().take(23) {
-            let version = (i as u32) + 1;
-            conn.execute_batch("BEGIN;").unwrap();
-            migration(&conn).unwrap();
-            conn.pragma_update(None, "user_version", version).unwrap();
-            conn.execute_batch("COMMIT;").unwrap();
-        }
-
-        conn.execute(
-            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["p1", "old", "/proj", "b", "d"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["s1", "p1", "a0", "Step", "d"],
-        )
-        .unwrap();
-
-        drop(conn);
-
-        // Re-open — V24 applies. Pre-V24 rows must default the column NULL on
-        // both tables.
-        let conn = open_at(&path).unwrap();
-        let plan_rs: Option<String> = conn
-            .query_row(
-                "SELECT retry_strategy FROM plans WHERE id = ?1",
-                ["p1"],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let step_rs: Option<String> = conn
-            .query_row(
-                "SELECT retry_strategy FROM steps WHERE id = ?1",
-                ["s1"],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            plan_rs.is_none() && step_rs.is_none(),
-            "pre-V24 rows must default retry_strategy to NULL (got plan={plan_rs:?}, step={step_rs:?})"
-        );
-
-        // Confirm the schema actually carries the column on both tables.
-        for table in ["plans", "steps"] {
-            let cols: Vec<String> = conn
-                .prepare(&format!("SELECT * FROM {table} LIMIT 0"))
-                .unwrap()
-                .column_names()
-                .into_iter()
-                .map(String::from)
-                .collect();
-            assert!(
-                cols.iter().any(|c| c == "retry_strategy"),
-                "{table} must have a retry_strategy column post-V24 (cols: {cols:?})"
-            );
-        }
-
-        // Fresh inserts can carry explicit values; they round-trip.
-        conn.execute(
-            "INSERT INTO plans (id, slug, project, branch_name, description, retry_strategy) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params!["p2", "new", "/proj", "b", "d", "rollback"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO steps (id, plan_id, sort_key, title, description, retry_strategy) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params!["s2", "p2", "a0", "Step", "d", "keep"],
-        )
-        .unwrap();
-        let plan_rs2: Option<String> = conn
-            .query_row(
-                "SELECT retry_strategy FROM plans WHERE id = ?1",
-                ["p2"],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let step_rs2: Option<String> = conn
-            .query_row(
-                "SELECT retry_strategy FROM steps WHERE id = ?1",
-                ["s2"],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(plan_rs2.as_deref(), Some("rollback"));
-        assert_eq!(step_rs2.as_deref(), Some("keep"));
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-
-        // Re-open is a no-op.
-        let conn = open_at(&path).expect("re-open must not reapply migrations");
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-    }
+    // (test_migration_v24_adds_retry_strategy_to_plans_and_steps removed: the
+    // retry_strategy columns it exercised are dropped at HEAD by V37, so the
+    // post-re-open `SELECT retry_strategy` assertions no longer apply.)
 
     #[test]
     fn test_migration_v25_adds_short_id_and_step_dependencies() {
@@ -3619,96 +3541,9 @@ mod tests {
         assert_eq!(version, CURRENT_VERSION);
     }
 
-    #[test]
-    fn test_migration_v28_adds_squash_on_complete_to_plans() {
-        // Mirror of `test_migration_v24`: seed a pre-V28 DB, run V28, verify
-        // the existing row defaults `squash_on_complete` to NULL (→ false /
-        // "off" — the correct default), a fresh explicit value round-trips,
-        // the schema carries the column, user_version lands at
-        // CURRENT_VERSION, and re-open is a no-op.
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("old_v27.db");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-
-        // Apply migrations v1..=v27 only.
-        for (i, migration) in MIGRATIONS.iter().enumerate().take(27) {
-            let version = (i as u32) + 1;
-            conn.execute_batch("BEGIN;").unwrap();
-            migration(&conn).unwrap();
-            conn.pragma_update(None, "user_version", version).unwrap();
-            conn.execute_batch("COMMIT;").unwrap();
-        }
-
-        conn.execute(
-            "INSERT INTO plans (id, slug, project, branch_name, description) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["p1", "old", "/proj", "b", "d"],
-        )
-        .unwrap();
-
-        drop(conn);
-
-        // Re-open — V28 applies. The pre-V28 row must default the column
-        // NULL (inherit → `false`).
-        let conn = open_at(&path).unwrap();
-        let plan_sq: Option<i64> = conn
-            .query_row(
-                "SELECT squash_on_complete FROM plans WHERE id = ?1",
-                ["p1"],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            plan_sq.is_none(),
-            "pre-V28 rows must default squash_on_complete to NULL (got {plan_sq:?})"
-        );
-
-        // The schema actually carries the column.
-        let cols: Vec<String> = conn
-            .prepare("SELECT * FROM plans LIMIT 0")
-            .unwrap()
-            .column_names()
-            .into_iter()
-            .map(String::from)
-            .collect();
-        assert!(
-            cols.iter().any(|c| c == "squash_on_complete"),
-            "plans must have a squash_on_complete column post-V28 (cols: {cols:?})"
-        );
-
-        // A fresh insert with an explicit value round-trips, and
-        // `Plan::from_row` coerces it to the typed `bool`.
-        conn.execute(
-            "INSERT INTO plans (id, slug, project, branch_name, description, squash_on_complete) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params!["p2", "new", "/proj", "b", "d", 1_i64],
-        )
-        .unwrap();
-        let plan_sq2: Option<i64> = conn
-            .query_row(
-                "SELECT squash_on_complete FROM plans WHERE id = ?1",
-                ["p2"],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(plan_sq2, Some(1));
-        let p1 = crate::storage::get_plan_by_id(&conn, "p1").unwrap();
-        let p2 = crate::storage::get_plan_by_id(&conn, "p2").unwrap();
-        assert!(!p1.squash_on_complete, "NULL coerces to false");
-        assert!(p2.squash_on_complete, "1 coerces to true");
-
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-
-        // Re-open is a no-op.
-        let conn = open_at(&path).expect("re-open must not reapply migrations");
-        let version: u32 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_VERSION);
-    }
+    // (test_migration_v28_adds_squash_on_complete_to_plans removed: the
+    // squash_on_complete column it exercised is dropped at HEAD by V37, so the
+    // post-re-open `SELECT squash_on_complete` assertions no longer apply.)
 
     #[test]
     fn test_migration_v29_adds_corrective_step_request_bridge() {
@@ -4051,6 +3886,110 @@ mod tests {
         assert_eq!(slug, "old");
         assert_eq!(desc, "desc");
         assert_eq!(mrc, 7, "other plan columns/data must survive the drop");
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Re-open is a no-op.
+        let conn = open_at(&path).expect("re-open must not reapply migrations");
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_v37_drops_retry_strategy_and_squash_columns() {
+        // Mirror of `test_migration_v36`: seed a pre-V37 DB (a plan + a step
+        // still carrying the vestigial retry_strategy / squash_on_complete
+        // columns), run V37, verify those columns are gone, the rows and their
+        // other columns survive, user_version lands at CURRENT_VERSION, and
+        // re-open is a no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old_v36.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        // Apply migrations v1..=v36 only — the schema still has the columns.
+        for (i, migration) in MIGRATIONS.iter().enumerate().take(36) {
+            let version = (i as u32) + 1;
+            conn.execute_batch("BEGIN;").unwrap();
+            migration(&conn).unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            conn.execute_batch("COMMIT;").unwrap();
+        }
+
+        // Seed a plan + step with explicit (now-doomed) retry_strategy /
+        // squash_on_complete values plus other columns whose data must survive.
+        conn.execute(
+            "INSERT INTO plans (id, slug, project, branch_name, description, retry_strategy, squash_on_complete, max_review_corrections)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params!["p1", "old", "/proj", "b", "desc", "rollback", 1_i64, 7_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (id, plan_id, sort_key, title, description, status, attempts, retry_strategy, short_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params!["s1", "p1", "a0", "title", "sdesc", "pending", 0_i64, "keep", "abcd1234"],
+        )
+        .unwrap();
+
+        drop(conn);
+
+        // Re-open — V37 applies and drops the columns.
+        let conn = open_at(&path).unwrap();
+
+        let plan_cols: Vec<String> = conn
+            .prepare("SELECT * FROM plans LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(
+            !plan_cols.iter().any(|c| c == "retry_strategy"),
+            "plans must NOT have a retry_strategy column post-V37 (cols: {plan_cols:?})"
+        );
+        assert!(
+            !plan_cols.iter().any(|c| c == "squash_on_complete"),
+            "plans must NOT have a squash_on_complete column post-V37 (cols: {plan_cols:?})"
+        );
+
+        let step_cols: Vec<String> = conn
+            .prepare("SELECT * FROM steps LIMIT 0")
+            .unwrap()
+            .column_names()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert!(
+            !step_cols.iter().any(|c| c == "retry_strategy"),
+            "steps must NOT have a retry_strategy column post-V37 (cols: {step_cols:?})"
+        );
+
+        // The rows and their surviving columns are intact.
+        let (slug, desc, mrc): (String, String, i64) = conn
+            .query_row(
+                "SELECT slug, description, max_review_corrections FROM plans WHERE id = ?1",
+                ["p1"],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(slug, "old");
+        assert_eq!(desc, "desc");
+        assert_eq!(mrc, 7, "other plan columns/data must survive the drop");
+
+        let (title, short_id): (String, String) = conn
+            .query_row(
+                "SELECT title, short_id FROM steps WHERE id = ?1",
+                ["s1"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "title");
+        assert_eq!(short_id, "abcd1234", "step data must survive the drop");
 
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
