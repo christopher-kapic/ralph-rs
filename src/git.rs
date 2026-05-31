@@ -430,12 +430,11 @@ pub fn commit_staged(workdir: &Path, message: &str) -> Result<()> {
 /// Mixed-reset HEAD back to `sha`, **keeping the working tree intact**.
 ///
 /// `git reset --mixed <sha>` moves the branch ref and unstages the index but
-/// leaves every file on disk exactly as it was. Used by the executor's
-/// `RetryStrategy::Keep` path when a prior attempt's agent committed on its
-/// own: we un-commit that orphan commit so it can't become a second,
-/// duplicate step commit, while still carrying the agent's work forward as
-/// uncommitted changes (Keep's contract). A later successful attempt then
-/// produces exactly one coherent `ralph:` step commit.
+/// leaves every file on disk exactly as it was. Used by the executor when a
+/// prior attempt's agent committed on its own: we un-commit that orphan commit
+/// so it can't become a second, duplicate step commit, while still carrying
+/// the agent's work forward as uncommitted changes. A later successful attempt
+/// then produces exactly one coherent `ralph:` step commit.
 pub fn reset_mixed_to(workdir: &Path, sha: &str) -> Result<()> {
     git(workdir, &["reset", "--mixed", sha])
         .with_context(|| format!("git reset --mixed {sha} failed"))?;

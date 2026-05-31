@@ -398,6 +398,16 @@ async fn run_plan_inner(
     // fresh budget, which is exactly the desired recovery semantics.
     let mut review_respawns: HashMap<String, u32> = HashMap::new();
 
+    // The most recent reviewer-subprocess error per step (e.g. "review harness
+    // auth failed: 401", a timeout, or the read-only-invariant tripping).
+    // Captured by `drain_finished_reviews` when a review task errors and
+    // surfaced in the needs-human escalation blocker raised by
+    // `respawn_pending_reviews` after `MAX_REVIEW_RESPAWNS`, so the human
+    // triaging the blocker can see *why* the review keeps failing instead of a
+    // generic "could not run". In-memory like `review_respawns`: advisory
+    // diagnostic context, not durable state.
+    let mut last_review_error: HashMap<String, String> = HashMap::new();
+
     // For `--one`, we need to stop after the first step actually executed;
     // capture its ID at the start (the step the topological scheduler would
     // pick first) and exit after it completes. Positions can shift due to
@@ -542,18 +552,21 @@ async fn run_plan_inner(
             conn,
             &effective_plan,
             &all_steps,
+            &window,
             &blocked,
             &mut reviews,
             &mut review_respawns,
+            &last_review_error,
             config,
             workdir,
             out,
         )?;
-        let not_runnable: HashSet<String> = if under_review.is_empty() {
-            blocked.clone()
-        } else {
-            blocked.iter().chain(under_review.iter()).cloned().collect()
-        };
+        // Steps excluded from this tick's pick: blocked (open interruption) or
+        // committed-and-awaiting-review. `chain` yields `blocked` verbatim when
+        // `under_review` is empty — i.e. byte-identical to the linear/no-review
+        // path — so no special-case branch is needed.
+        let not_runnable: HashSet<String> =
+            blocked.iter().chain(under_review.iter()).cloned().collect();
         let next = pick_next_step(
             &all_steps,
             &deps_of,
@@ -590,6 +603,7 @@ async fn run_plan_inner(
                     out,
                     true, // block: wait for at least one review to finish
                     &mut abort_rx,
+                    &mut last_review_error,
                 )
                 .await?
                 {
@@ -805,6 +819,7 @@ async fn run_plan_inner(
             out,
             false,
             &mut abort_rx,
+            &mut last_review_error,
         )
         .await?
         {
@@ -1023,6 +1038,7 @@ async fn run_plan_inner(
             out,
             true,
             &mut abort_rx,
+            &mut last_review_error,
         )
         .await?
         {
@@ -3052,6 +3068,24 @@ fn blocked_step_ids(conn: &Connection, plan_id: &str) -> Result<HashSet<String>>
 /// — or a human resolving the escalation blocker — grants a fresh budget.
 const MAX_REVIEW_RESPAWNS: u32 = 3;
 
+/// Upper bound on the reviewer-error text carried into a review-failed
+/// escalation blocker body. Enough to show a stack/auth message without
+/// letting a pathological error bloat the interruption row.
+const REVIEW_ERROR_MAX_BYTES: usize = 2000;
+
+/// Byte-bound a reviewer-error string on a UTF-8 char boundary for inclusion
+/// in an escalation blocker body.
+fn truncate_review_error(msg: &str) -> String {
+    if msg.len() <= REVIEW_ERROR_MAX_BYTES {
+        return msg.to_string();
+    }
+    let mut end = REVIEW_ERROR_MAX_BYTES;
+    while end > 0 && !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…(truncated)", &msg[..end])
+}
+
 /// Mark a committed step's review in flight (sole-writer DB write: Pending →
 /// InFlight), emit `ReviewStarted`, and spawn the detached read-only
 /// `run_review_subprocess` task into `reviews`.
@@ -3139,15 +3173,29 @@ fn respawn_pending_reviews(
     conn: &Connection,
     plan: &Plan,
     all_steps: &[Step],
+    window: &RunWindow,
     blocked: &HashSet<String>,
     reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
     review_respawns: &mut HashMap<String, u32>,
+    last_review_error: &HashMap<String, String>,
     config: &Config,
     workdir: &Path,
     out: &OutputContext,
 ) -> Result<HashSet<String>> {
     let mut under_review: HashSet<String> = HashSet::new();
     for step in all_steps {
+        // Respect the run window. A committed-but-unreviewed step outside the
+        // requested `--from`/`--to` range is not part of this run — the picker
+        // already excludes it from implementation, so recovering its review
+        // here would burn a review-harness invocation (and, on persistent
+        // failure, raise a needs-human blocker) for a step the user
+        // deliberately scoped out. `--one` keeps the full-plan window by
+        // design (`one_target_id` enforces single-step *implementation*, not
+        // review recovery), so this is a no-op for it and for any unwindowed
+        // run — preserving the linear/no-window behavior exactly.
+        if !window.contains_key(&step.sort_key) {
+            continue;
+        }
         if step.status != StepStatus::InProgress {
             continue;
         }
@@ -3183,7 +3231,13 @@ fn respawn_pending_reviews(
             // Persistent review failure: escalate to a human once, then reset
             // the in-memory budget so resolving the blocker (which un-gates
             // the step) grants a fresh round of attempts on the next tick.
-            raise_review_failed_blocker(conn, step, iteration, out)?;
+            raise_review_failed_blocker(
+                conn,
+                step,
+                iteration,
+                last_review_error.get(&step.id).map(String::as_str),
+                out,
+            )?;
             *attempts = 0;
             continue;
         }
@@ -3206,11 +3260,20 @@ fn raise_review_failed_blocker(
     conn: &Connection,
     step: &Step,
     iteration: i32,
+    last_error: Option<&str>,
     out: &OutputContext,
 ) -> Result<()> {
     if storage::get_step_by_id(conn, &step.id)?.is_none() {
         return Ok(());
     }
+    // Surface the last reviewer-subprocess error (captured by
+    // `drain_finished_reviews`) so the human can act on the actual cause —
+    // "review harness auth failed: 401", a timeout, etc. — instead of a
+    // generic "could not run".
+    let cause = match last_error {
+        Some(e) => format!("\n\nLast reviewer error:\n{e}"),
+        None => String::new(),
+    };
     let interruption_id = storage::insert_interruption(
         conn,
         &step.id,
@@ -3221,7 +3284,7 @@ fn raise_review_failed_blocker(
              implementation is committed but UNREVIEWED. Fix the review configuration (e.g. \
              review-harness auth/model), then resolve this blocker — ralph will re-run ONLY \
              the review against the existing commit (it will NOT re-implement the step). \
-             ralph does not continue on unreviewed work."
+             ralph does not continue on unreviewed work.{cause}"
         ),
         &[],
     )?;
@@ -3306,8 +3369,20 @@ async fn drain_reviews_on_abort(
     // Non-blocking drain: absorb every verdict that is already finished.
     // We deliberately pass `block=false` so the abort isn't held up by a
     // still-in-flight reviewer.
-    let drained_result =
-        drain_finished_reviews(conn, plan, reviews, workdir, out, false, abort_rx).await;
+    // On the teardown path no escalation will run, so the captured reviewer
+    // errors are discarded into a throwaway map.
+    let mut discarded_review_errors = HashMap::new();
+    let drained_result = drain_finished_reviews(
+        conn,
+        plan,
+        reviews,
+        workdir,
+        out,
+        false,
+        abort_rx,
+        &mut discarded_review_errors,
+    )
+    .await;
     if let Err(e) = drained_result {
         eprintln!("Warning: failed to drain finished reviews on abort: {e:#}");
     }
@@ -3377,6 +3452,7 @@ async fn drain_reviews_on_abort(
 ///
 /// Returns `Ok(None)` on success (drained, or nothing to drain) and
 /// `Ok(Some(final_status))` when the run must terminate.
+#[allow(clippy::too_many_arguments)]
 async fn drain_finished_reviews(
     conn: &Connection,
     plan: &Plan,
@@ -3385,6 +3461,7 @@ async fn drain_finished_reviews(
     out: &OutputContext,
     block: bool,
     abort_rx: &mut watch::Receiver<CancelState>,
+    last_review_error: &mut HashMap<String, String>,
 ) -> Result<Option<PlanStatus>> {
     if reviews.is_empty() {
         consume_open_corrective_requests(conn, plan, out)?;
@@ -3478,6 +3555,13 @@ async fn drain_finished_reviews(
                 // a transient reviewer hiccup must not kill healthy work
                 // elsewhere in the DAG.
                 eprintln!("Review failed (will re-run the review): {e:#}");
+                // Remember the cause so the eventual needs-human escalation
+                // blocker (`respawn_pending_reviews` after MAX_REVIEW_RESPAWNS)
+                // can surface it — otherwise the only record is this stderr
+                // line, which is invisible in a TUI-spawned runner and scrolls
+                // away in a CLI run. Bounded so a pathological error can't bloat
+                // the blocker body.
+                last_review_error.insert(step_id.clone(), truncate_review_error(&format!("{e:#}")));
                 if storage::get_step_by_id(conn, &step_id)?.is_some() {
                     storage::update_step_review_status(
                         conn,

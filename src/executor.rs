@@ -1032,13 +1032,27 @@ async fn handle_skipped_attempt(
 /// cancel path (`handle_skipped_attempt`'s `set_step_attempts(.. attempt -
 /// 1)`). An interruption is the agent asking for help, not a failed try —
 /// it must never burn a retry.
-fn park_step_worktree_for_interruption(
+/// A parked stash that has been pushed to git but whose DB pointer row has not
+/// yet been written. Pairs [`stash_step_worktree_for_interruption`] (the git
+/// side effect) with [`commit_park_atomically`] (the transactional pointer
+/// write) so the two can be made consistent: the stash is restored if the
+/// transaction that would have recorded it fails to commit.
+type ParkedStash = (git::StashRef, Vec<String>);
+
+/// Push the step's in-flight WIP onto the git stash so the working tree is
+/// clean while the branch is parked awaiting a human. This is a **pure git
+/// side effect** — it writes NO DB row. The caller records the pointer inside
+/// its own transaction via [`commit_park_atomically`], which restores this
+/// stash if the transaction fails to commit. Returns `None` when there is
+/// nothing to park (clean tree, or nothing left after excluding the user's
+/// pre-existing untracked files).
+fn stash_step_worktree_for_interruption(
     ctx: &ExecCtx<'_>,
     attempt: i32,
     reason: &str,
-) -> Result<()> {
+) -> Result<Option<ParkedStash>> {
     if !git::has_uncommitted_changes(ctx.workdir)? {
-        return Ok(());
+        return Ok(None);
     }
 
     let staged_files = git::list_staged_files(ctx.workdir)?;
@@ -1059,43 +1073,81 @@ fn park_step_worktree_for_interruption(
     let Some(stash_ref) =
         git::stash_push_with_untracked_except(ctx.workdir, &label, ctx.pre_existing_untracked)?
     else {
-        return Ok(());
+        return Ok(None);
     };
+    Ok(Some((stash_ref, staged_files)))
+}
 
-    if let Err(e) =
-        storage::set_step_parked_worktree(ctx.conn, &ctx.step.id, stash_ref.as_str(), &staged_files)
-    {
-        match git::stash_pop(ctx.workdir, &stash_ref)? {
-            git::StashPopOutcome::Clean => {
-                if !staged_files.is_empty() {
-                    git::restage_files(ctx.workdir, &staged_files);
-                }
+/// Pop a stash created by [`stash_step_worktree_for_interruption`] back onto
+/// the working tree. Used as the rollback for [`commit_park_atomically`] when
+/// the transaction that would have recorded the parked pointer never
+/// committed — so the WIP returns to the tree (and staged files are re-staged)
+/// rather than being stranded in a dangling stash with no pointer.
+fn restore_parked_stash(ctx: &ExecCtx<'_>, parked: &ParkedStash) -> Result<()> {
+    let (stash_ref, staged_files) = parked;
+    match git::stash_pop(ctx.workdir, stash_ref)? {
+        git::StashPopOutcome::Clean => {
+            if !staged_files.is_empty() {
+                git::restage_files(ctx.workdir, staged_files);
             }
-            git::StashPopOutcome::Conflicted(stderr) => {
-                bail!(
-                    "parked interruption worktree at {} but failed to persist its pointer; \
-                     stash re-apply also conflicted, so the preserved work remains on the stash stack.\n{}",
-                    stash_ref.as_str(),
-                    stderr,
-                );
-            }
-            git::StashPopOutcome::NotFound => {
-                bail!(
-                    "parked interruption worktree at {} but failed to persist its pointer, \
-                     and the stash entry disappeared before it could be restored",
-                    stash_ref.as_str(),
-                );
-            }
+            Ok(())
         }
-        return Err(e).with_context(|| {
-            format!(
-                "parked interruption worktree at {} but failed to persist its pointer; \
-                 restored the worktree so the WIP stays visible",
-                stash_ref.as_str()
-            )
-        });
+        git::StashPopOutcome::Conflicted(stderr) => bail!(
+            "restoring the parked worktree from stash {} conflicted, so the preserved work \
+             remains on the stash stack.\n{}",
+            stash_ref.as_str(),
+            stderr,
+        ),
+        git::StashPopOutcome::NotFound => bail!(
+            "the parked stash entry {} disappeared before it could be restored",
+            stash_ref.as_str(),
+        ),
     }
-    Ok(())
+}
+
+/// Run `write` inside a single transaction, joining the parked-stash pointer
+/// row (if any) to it, then commit. The git stash done by
+/// [`stash_step_worktree_for_interruption`] is the only piece that cannot live
+/// inside the SQLite transaction; if the transaction's writes OR its commit
+/// fail (e.g. `SQLITE_FULL` on a near-full disk — the case the interruption
+/// auto-blocker is most likely to hit), the stash is popped back onto the
+/// working tree so it never strands a parked pointer for a pause that didn't
+/// happen, nor a dangling stash with no pointer. Either both the DB state and
+/// the parked stash land, or neither does.
+fn commit_park_atomically<T>(
+    ctx: &ExecCtx<'_>,
+    parked: Option<ParkedStash>,
+    write: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let result = (|| -> Result<T> {
+        let tx = ctx.conn.unchecked_transaction()?;
+        let value = write(&tx)?;
+        if let Some((stash_ref, staged_files)) = &parked {
+            storage::set_step_parked_worktree(
+                &tx,
+                &ctx.step.id,
+                stash_ref.as_str(),
+                staged_files,
+            )?;
+        }
+        tx.commit()?;
+        Ok(value)
+    })();
+
+    match result {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            if let Some(parked) = &parked
+                && let Err(restore_err) = restore_parked_stash(ctx, parked)
+            {
+                return Err(e.context(format!(
+                    "failed to persist the parked interruption; additionally, restoring the \
+                     stashed WIP to the working tree failed: {restore_err:#}"
+                )));
+            }
+            Err(e)
+        }
+    }
 }
 
 async fn finalize_paused_for_question(
@@ -1106,8 +1158,12 @@ async fn finalize_paused_for_question(
     // Park any in-flight diff the harness produced before it raised the
     // interruption. This leaves the repository clean so the scheduler can
     // move on, while preserving the exact WIP for re-application when the
-    // step is picked again after the interruption is resolved.
-    park_step_worktree_for_interruption(ctx, attempt, "interruption")?;
+    // step is picked again after the interruption is resolved. The git stash
+    // happens here; its DB pointer row is written inside the transaction
+    // below (via `commit_park_atomically`) and the stash is popped back if
+    // that transaction fails to commit, so the stash and pointer stay
+    // consistent.
+    let parked = stash_step_worktree_for_interruption(ctx, attempt, "interruption")?;
 
     // Zero retry budget (HARD invariant — docs/dag-redesign.md §3.4 / §9
     // invariant 4). The pre-spawn `set_step_attempts(.. attempt)` is rolled
@@ -1130,20 +1186,23 @@ async fn finalize_paused_for_question(
     // non-negative.
     //
     // Phase E Fix 4: the three writes (delete the per-attempt log row,
-    // roll back the attempts counter, flip status to Pending) run inside a
-    // single `unchecked_transaction`. The same race the sibling
+    // roll back the attempts counter, flip status to Pending) — plus the
+    // parked-worktree pointer row — run inside a single
+    // `unchecked_transaction`. The same race the sibling
     // `raise_retry_exhausted_blocker` documents applies here too: between
     // any two of these writes, a scheduler tick in another process could
     // observe the half-state — most damagingly `(status=Pending, attempts
     // still at the bumped value, no open interruption yet visible)` —
     // re-pick the step, and either burn another attempt or trip the
     // executor's budget guard. Collapsing the writes into one transaction
-    // makes every observable state either pre-pause or post-pause.
-    let tx = ctx.conn.unchecked_transaction()?;
-    storage::delete_execution_log(&tx, exec_log_id)?;
-    set_step_attempts(&tx, &ctx.step.id, attempt - 1)?;
-    storage::update_step_status(&tx, &ctx.step.id, StepStatus::Pending)?;
-    tx.commit()?;
+    // makes every observable state either pre-pause or post-pause; the
+    // parked stash is restored if the commit fails.
+    commit_park_atomically(ctx, parked, |tx| {
+        storage::delete_execution_log(tx, exec_log_id)?;
+        set_step_attempts(tx, &ctx.step.id, attempt - 1)?;
+        storage::update_step_status(tx, &ctx.step.id, StepStatus::Pending)?;
+        Ok(())
+    })?;
 
     write_phase(
         ctx.conn,
@@ -1240,8 +1299,10 @@ async fn raise_retry_exhausted_blocker(
     // Park any dirty tree instead of throwing it away. The blocker pauses the
     // branch awaiting a human decision, so we keep the repository clean for
     // other work while preserving the in-progress WIP for automatic restore if
-    // the human chooses to continue.
-    park_step_worktree_for_interruption(ctx, attempt, "retry-exhausted")?;
+    // the human chooses to continue. This is the git stash only; its DB
+    // pointer row joins the transaction below and is restored if the commit
+    // fails (see `commit_park_atomically`).
+    let parked = stash_step_worktree_for_interruption(ctx, attempt, "retry-exhausted")?;
 
     // The execution_logs row is *kept* (it carries the full diagnostic
     // payload — stdout/stderr/diff/cost/test_results — captured during this
@@ -1264,73 +1325,19 @@ async fn raise_retry_exhausted_blocker(
     // transaction collapses the read window so the tick can only ever see
     // either the pre-exhaustion or the post-blocker state.
     //
-    // Opened up front (before the diagnostic payload write and, for the
-    // disk-gate caller, before the attempt bump + log row) so *all* of these
-    // mutations commit or roll back together. Writes issued on `ctx.conn`
-    // while this transaction is open are part of it — autocommit stays off
-    // until `commit`. This matters most for the disk-gate caller
-    // (`exec_log_id == None`): on a near-full filesystem the interruption
-    // insert can itself fail with SQLITE_FULL, and a non-transactional
-    // attempt bump would otherwise leave the step `Pending` with `attempts`
-    // burned and no open interruption — the scheduler would then silently
-    // re-pick it and spend another attempt on nothing.
-    let tx = ctx.conn.unchecked_transaction()?;
-
-    // The retry-loop callers pass the execution-log row they already created
-    // across the exhausted attempts (and have already bumped `attempts` via
-    // the loop). The disk-gate / pre-loop caller passes `None`: it never
-    // entered the loop, so it mints its row and bumps the attempt counter
-    // here, inside the transaction.
-    let exec_log_id = match exec_log_id {
-        Some(id) => id,
-        None => {
-            set_step_attempts(&tx, &ctx.step.id, attempt)?;
-            storage::create_execution_log(&tx, &ctx.step.id, attempt, None, None)?.id
-        }
-    };
-
-    storage::update_execution_log(
-        &tx,
-        exec_log_id,
-        Some(duration_secs),
-        failure_output.diff,
-        failure_output.test_results,
-        false, // parked in stash, not rolled back
-        false,
-        None,
-        Some(failure_output.stdout),
-        Some(failure_output.stderr),
-        failure_output.parsed.cost_usd,
-        failure_output.parsed.input_tokens,
-        failure_output.parsed.output_tokens,
-        failure_output.parsed.session_id.as_deref(),
-        Some(TerminationReason::PausedForQuestion),
-        Some(test_st),
-    )?;
-
-    // Phase E Fix 5: build the blocker body from the last 3 attempts in the
-    // CURRENT cycle (V33). Each attempt's section is independently bounded
-    // so the total stays under `RETRY_EXHAUSTED_BODY_MAX_BYTES` even when
-    // every attempt's output is huge. The final attempt's output is
-    // labeled "(final)" and rendered first so the most relevant context
-    // (the one the user is about to triage) is on top.
-    //
-    // The current attempt's diagnostic (`failure_output.test_results`) was
-    // captured live in this stack frame and is not yet persisted via
-    // `update_execution_log` (that happens above this call site does fire
-    // it but on the row at `exec_log_id`); we still prefer the *persisted*
-    // rows for the body so the final attempt's `harness_stderr` (the
-    // commit-hook stderr captured by the executor) is included verbatim.
-    // The persisted row for this attempt was updated just above; reading
-    // the chronological tail gives us the canonical view.
-    let body = build_retry_exhausted_body(
-        &tx,
-        &ctx.step.id,
-        ctx.max_attempts,
-        failure_reason,
-        failure_output,
-    );
-
+    // *All* of these mutations — the disk-gate caller's attempt bump + log
+    // row, the diagnostic payload write, the interruption insert, the status
+    // park, and the parked-worktree pointer — commit or roll back together.
+    // This matters most for the disk-gate caller (`exec_log_id == None`): on a
+    // near-full filesystem the interruption insert can itself fail with
+    // SQLITE_FULL, and a non-transactional attempt bump would otherwise leave
+    // the step `Pending` with `attempts` burned and no open interruption — the
+    // scheduler would then silently re-pick it and spend another attempt on
+    // nothing. `commit_park_atomically` also pops the parked stash back onto
+    // the working tree if the commit fails, so a rolled-back blocker never
+    // strands a pointer-less stash (the bug this structure replaced: the park
+    // used to commit its pointer row in autocommit *before* this transaction,
+    // surviving a SQLITE_FULL rollback that left no interruption behind it).
     let options = vec![
         InterruptionOption {
             text: RETRY_EXHAUSTED_OPTION_RETRY.to_string(),
@@ -1341,16 +1348,67 @@ async fn raise_retry_exhausted_blocker(
             priority: 2,
         },
     ];
-    let interruption_id = storage::insert_interruption(
-        &tx,
-        &ctx.step.id,
-        attempt,
-        InterruptionKind::Blocker,
-        &body,
-        &options,
-    )?;
-    storage::update_step_status(&tx, &ctx.step.id, StepStatus::Pending)?;
-    tx.commit()?;
+    let interruption_id = commit_park_atomically(ctx, parked, |tx| {
+        // The retry-loop callers pass the execution-log row they already
+        // created across the exhausted attempts (and have already bumped
+        // `attempts` via the loop). The disk-gate / pre-loop caller passes
+        // `None`: it never entered the loop, so it mints its row and bumps the
+        // attempt counter here, inside the transaction.
+        let exec_log_id = match exec_log_id {
+            Some(id) => id,
+            None => {
+                set_step_attempts(tx, &ctx.step.id, attempt)?;
+                storage::create_execution_log(tx, &ctx.step.id, attempt, None, None)?.id
+            }
+        };
+
+        storage::update_execution_log(
+            tx,
+            exec_log_id,
+            Some(duration_secs),
+            failure_output.diff,
+            failure_output.test_results,
+            false, // parked in stash, not rolled back
+            false,
+            None,
+            Some(failure_output.stdout),
+            Some(failure_output.stderr),
+            failure_output.parsed.cost_usd,
+            failure_output.parsed.input_tokens,
+            failure_output.parsed.output_tokens,
+            failure_output.parsed.session_id.as_deref(),
+            Some(TerminationReason::PausedForQuestion),
+            Some(test_st),
+        )?;
+
+        // Phase E Fix 5: build the blocker body from the last 3 attempts in
+        // the CURRENT cycle (V33). Each attempt's section is independently
+        // bounded so the total stays under `RETRY_EXHAUSTED_BODY_MAX_BYTES`
+        // even when every attempt's output is huge. The final attempt's
+        // output is labeled "(final)" and rendered first so the most relevant
+        // context (the one the user is about to triage) is on top. The
+        // persisted row for this attempt was updated just above; reading the
+        // chronological tail gives us the canonical view (including the final
+        // attempt's `harness_stderr` commit-hook output).
+        let body = build_retry_exhausted_body(
+            tx,
+            &ctx.step.id,
+            ctx.max_attempts,
+            failure_reason,
+            failure_output,
+        );
+
+        let interruption_id = storage::insert_interruption(
+            tx,
+            &ctx.step.id,
+            attempt,
+            InterruptionKind::Blocker,
+            &body,
+            &options,
+        )?;
+        storage::update_step_status(tx, &ctx.step.id, StepStatus::Pending)?;
+        Ok(interruption_id)
+    })?;
 
     // Phase E Fix 4: emit `InterruptionRaised` with `auto_raised=true` for
     // the executor's retry-exhausted auto-blocker. Surfaces post-commit so
@@ -2770,13 +2828,11 @@ pub async fn execute_step(
                 // pre-attempt HEAD un-commits it but keeps every changed
                 // file on disk as uncommitted work — so the next attempt's
                 // post-test commit picks it up sitting on the right base.
-                // This reset MUST be unconditional (run under both Keep and
-                // Rollback): under Rollback, leaving the agent's orphan
-                // commit at HEAD would let the next attempt build on top of
-                // it, ralph's eventual single commit would land on
-                // parent=orphan, and `step reset` (which reverts only
-                // ralph's commit) would leave the orphan in history — also
-                // inflating the reviewer's fixed-SHA diff.
+                // Leaving the agent's orphan commit at HEAD instead would let
+                // the next attempt build on top of it, ralph's eventual single
+                // commit would land on parent=orphan, and `step reset` (which
+                // reverts only ralph's commit) would leave the orphan in
+                // history — also inflating the reviewer's fixed-SHA diff.
                 if agent_committed_clean && let Some(before) = &head_before_harness {
                     write_phase(
                         conn,
@@ -2815,7 +2871,7 @@ pub async fn execute_step(
                     Some(duration_secs),
                     diff.as_deref(),
                     &test_result_strings,
-                    rolled_back, // strategy-gated (see retry branch above)
+                    rolled_back, // always false: failed attempts keep the dirty tree
                     false,       // not committed
                     None,
                     Some(&output.stdout),
@@ -10739,14 +10795,14 @@ mod tests {
 
     /// Source-shape assertion: `finalize_paused_for_question` MUST wrap its
     /// three state writes (delete_execution_log + set_step_attempts +
-    /// update_step_status) in an `unchecked_transaction`. The pre-Phase-E
-    /// shape did them as three independent writes, letting a concurrent
-    /// scheduler tick observe the half-state `(status=Pending, attempts
-    /// still bumped, no open interruption)` and re-pick the step. The
-    /// sibling `raise_retry_exhausted_blocker` already uses the
-    /// `unchecked_transaction`+`commit` pattern for the structurally
-    /// identical writes; this test pins the shape so a future refactor
-    /// can't silently regress.
+    /// update_step_status) in a single transaction. The pre-Phase-E shape did
+    /// them as three independent writes, letting a concurrent scheduler tick
+    /// observe the half-state `(status=Pending, attempts still bumped, no open
+    /// interruption)` and re-pick the step. The transaction now lives in the
+    /// shared `commit_park_atomically` helper (which also joins the parked
+    /// stash's pointer row and restores the stash on commit failure); this
+    /// test pins that the three writes route through it via a `tx`-bound
+    /// closure rather than running against the bare `ctx.conn`.
     ///
     /// Driving the async function end-to-end would require constructing an
     /// `ExecCtx` (Connection, Config, Plan, Step, workdir, HookContext,
@@ -10772,44 +10828,63 @@ mod tests {
             .expect("expected the next sibling helper's doc comment");
         let body = &after_sig[..next_fn];
 
+        // The three writes are routed through the transactional helper via a
+        // `tx`-bound closure.
         assert!(
-            body.contains("ctx.conn.unchecked_transaction()"),
-            "finalize_paused_for_question must open an unchecked_transaction \
-             before its delete/set/update writes; without the transaction a \
-             scheduler tick can observe the half-state and re-pick the step",
+            body.contains("commit_park_atomically(ctx, parked,"),
+            "finalize_paused_for_question must route its writes through \
+             commit_park_atomically so they (and the parked-stash pointer) \
+             commit or roll back together; without the transaction a scheduler \
+             tick can observe the half-state and re-pick the step",
         );
         assert!(
-            body.contains("tx.commit()"),
-            "finalize_paused_for_question must commit the transaction it \
-             opens (otherwise rusqlite's Drop rolls it back and the pause \
-             does not persist)",
-        );
-        // The three writes must target the `tx`, not the original `ctx.conn`.
-        assert!(
-            body.contains("delete_execution_log(&tx,"),
-            "delete_execution_log must run inside the transaction",
+            body.contains("delete_execution_log(tx,"),
+            "delete_execution_log must run inside the transaction closure",
         );
         assert!(
-            body.contains("set_step_attempts(&tx,"),
-            "set_step_attempts must run inside the transaction",
+            body.contains("set_step_attempts(tx,"),
+            "set_step_attempts must run inside the transaction closure",
         );
         assert!(
-            body.contains("update_step_status(&tx,"),
-            "update_step_status must run inside the transaction",
+            body.contains("update_step_status(tx,"),
+            "update_step_status must run inside the transaction closure",
         );
         // Negative assertion: the three writes must not also run against the
         // bare `ctx.conn` (would split the transaction across two writers).
         assert!(
             !body.contains("delete_execution_log(ctx.conn,"),
-            "the post-fix shape uses `&tx`, never `ctx.conn`, for the three writes",
+            "the post-fix shape uses the closure `tx`, never `ctx.conn`, for the three writes",
         );
         assert!(
             !body.contains("set_step_attempts(ctx.conn,"),
-            "the post-fix shape uses `&tx`, never `ctx.conn`, for the three writes",
+            "the post-fix shape uses the closure `tx`, never `ctx.conn`, for the three writes",
         );
         assert!(
             !body.contains("update_step_status(ctx.conn, &ctx.step.id, StepStatus::Pending"),
-            "the post-fix shape uses `&tx`, never `ctx.conn`, for the three writes",
+            "the post-fix shape uses the closure `tx`, never `ctx.conn`, for the three writes",
+        );
+
+        // And the helper they route through actually opens + commits a
+        // transaction (the atomicity now lives there for both pause paths).
+        let helper_start = src
+            .find("fn commit_park_atomically<T>(")
+            .expect("commit_park_atomically must exist");
+        let helper_after = &src[helper_start..];
+        let helper_end = helper_after
+            .find("\nasync fn finalize_paused_for_question(")
+            .expect("commit_park_atomically must precede finalize_paused_for_question");
+        let helper_body = &helper_after[..helper_end];
+        assert!(
+            helper_body.contains("ctx.conn.unchecked_transaction()"),
+            "commit_park_atomically must open an unchecked_transaction",
+        );
+        assert!(
+            helper_body.contains("tx.commit()"),
+            "commit_park_atomically must commit the transaction it opens",
+        );
+        assert!(
+            helper_body.contains("restore_parked_stash(ctx,"),
+            "commit_park_atomically must restore the parked stash if the commit fails",
         );
     }
 
@@ -10818,7 +10893,7 @@ mod tests {
 
     /// Repro: a harness raises `ralph question ask` mid-step.
     /// `finalize_paused_for_question` parks the dirty tree via
-    /// `park_step_worktree_for_interruption`. Before the fix, the park
+    /// `stash_step_worktree_for_interruption`. Before the fix, the park
     /// stashed `--include-untracked` *unconditionally*, sweeping up the
     /// user's pre-existing `notes.txt` along with the harness's WIP — if
     /// an admin later ran `git stash clear` (or the pop conflicted),
@@ -10892,8 +10967,13 @@ mod tests {
             json_output: false,
         };
 
-        // Park.
-        park_step_worktree_for_interruption(&ctx, 1, "interruption").unwrap();
+        // Park: stash the WIP, then record its pointer row (the two steps the
+        // production paths now run via `stash_step_worktree_for_interruption`
+        // + `commit_park_atomically`).
+        let parked = stash_step_worktree_for_interruption(&ctx, 1, "interruption")
+            .unwrap()
+            .expect("there is dirty WIP to park");
+        storage::set_step_parked_worktree(&conn, &step.id, parked.0.as_str(), &parked.1).unwrap();
 
         // The user's pre-existing file MUST still be on disk with its
         // original contents — the whole point of the fix.

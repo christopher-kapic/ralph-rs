@@ -117,10 +117,14 @@ pub enum Outcome {
 /// capture). For attempts that did persist their prompt, `build_attempts`
 /// shows that verbatim text instead.
 ///
-/// Mirrors the executor's post-test-then-commit behavior: a failed attempt
-/// leaves its work on disk, so the retry context omits the diff/files (the
-/// agent inspects the dirty tree via `git diff`) and carries only the
-/// previous failure reason + previous test output.
+/// Mirrors the executor's post-test-then-commit behavior for current rows: a
+/// failed attempt leaves its work on disk, so the retry context omits the
+/// diff/files (the agent inspects the dirty tree via `git diff`) and carries
+/// only the previous failure reason + previous test output.
+///
+/// Compatibility: when replaying a legacy row whose prior attempt was
+/// persisted as `rolled_back=true`, the diff/files are reconstructed from the
+/// stored diff so old retry prompts remain audit-faithful on upgraded DBs.
 pub fn build_retry_context_for_attempt(
     log_index: usize,
     max_attempts: i32,
@@ -147,10 +151,16 @@ pub fn build_retry_context_for_attempt(
         Some(prev.test_results.join("\n"))
     };
 
-    // Post test-then-commit, mirroring src/executor.rs's RetryContext build:
-    // the diff/files are omitted because the failed attempt's work is still
-    // on disk for the agent to `git diff`.
-    let (previous_diff, files_modified) = (None, Vec::new());
+    // Current post-test-then-commit rows keep the failed attempt's work on
+    // disk, so the retry context omits diff/files. But a historical
+    // pre-redesign row with `rolled_back=true` means the work was reverted
+    // before the next attempt, so reconstruct the stored diff/files for an
+    // audit-faithful fallback preview.
+    let (previous_diff, files_modified) = if prev.rolled_back {
+        (prev.diff.clone(), files_from_diff(prev.diff.as_deref()))
+    } else {
+        (None, Vec::new())
+    };
 
     let previous_failure_reason = prev.termination_reason.map(|r| {
         match r {
@@ -176,25 +186,16 @@ pub fn build_retry_context_for_attempt(
 
 /// Best-effort reconstruction of the previous attempt's modified-file list
 /// from its stored unified diff. Parses `diff --git a/<old> b/<new>` headers
-/// and returns the `b/` (post-image) path for each, deduplicated in first-seen
-/// order. Returns an empty vec when there is no diff.
-///
-/// This is an approximation of the executor's live `git status` snapshot (see
-/// [`build_retry_context_for_attempt`] for why an exact reproduction is not
-/// possible from persisted data).
+/// and returns the `b/` path for each, deduplicated in first-seen order.
 fn files_from_diff(diff: Option<&str>) -> Vec<String> {
     let Some(diff) = diff else {
         return Vec::new();
     };
-    let mut files: Vec<String> = Vec::new();
+    let mut files = Vec::new();
     for line in diff.lines() {
         let Some(rest) = line.strip_prefix("diff --git ") else {
             continue;
         };
-        // `rest` is `a/<old> b/<new>`. The post-image path is everything
-        // after the last ` b/`. Paths with spaces are uncommon in this
-        // codebase's diffs; the executor's git-status path can't disambiguate
-        // them either, so a simple split is acceptable for a preview.
         let path = match rest.rsplit_once(" b/") {
             Some((_, b)) => b.to_string(),
             None => rest.to_string(),
@@ -803,6 +804,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_rolled_back_attempt_restores_diff_and_files_in_fallback() {
+        let mut l1 = make_log(1, Utc::now());
+        l1.prompt_text = None;
+        l1.diff = Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new".to_string());
+        l1.test_results = vec!["FAIL test_a".to_string(), "error: boom".to_string()];
+        l1.termination_reason = Some(TerminationReason::TestFailed);
+        l1.rolled_back = true;
+        let mut l2 = make_log(2, Utc::now());
+        l2.prompt_text = None;
+        let logs = vec![l1, l2];
+
+        let ctx = build_retry_context_for_attempt(1, 4, &logs).expect("retry ctx for attempt 2");
+        assert_eq!(ctx.attempt, 2);
+        assert_eq!(ctx.max_attempts, 4);
+        assert_eq!(
+            ctx.previous_diff.as_deref(),
+            Some("diff --git a/src/foo.rs b/src/foo.rs\n@@ -1 +1 @@\n-old\n+new")
+        );
+        assert_eq!(
+            ctx.previous_test_output.as_deref(),
+            Some("FAIL test_a\nerror: boom")
+        );
+        assert_eq!(ctx.files_modified, vec!["src/foo.rs".to_string()]);
+        assert_eq!(ctx.previous_failure_reason.as_deref(), Some("tests failed"));
+    }
+
+    #[test]
     fn retry_context_uses_chronological_previous_log_after_attempt_reset() {
         let plan = make_plan();
         let step = make_step();
@@ -848,17 +876,6 @@ mod tests {
         let expected =
             prompt::build_step_prompt(&plan, &step, &all, None, None, true, &prompts, &[]);
         assert_eq!(attempts[2].prompt, expected);
-    }
-
-    #[test]
-    fn files_from_diff_dedupes_and_handles_none() {
-        assert!(files_from_diff(None).is_empty());
-        let d = "diff --git a/a.rs b/a.rs\n@@\n+x\ndiff --git a/a.rs b/a.rs\n@@\n+y\n\
-                 diff --git a/b.rs b/b.rs\n@@\n+z";
-        assert_eq!(
-            files_from_diff(Some(d)),
-            vec!["a.rs".to_string(), "b.rs".to_string()]
-        );
     }
 
     // -- assembly equals build_step_prompt ------------------------------
@@ -935,6 +952,17 @@ mod tests {
         assert_eq!(attempts[1].prompt, exp2);
         assert!(attempts[1].prompt.contains("# Retry Context"));
         assert!(attempts[1].prompt.contains("attempt 2 of 4"));
+    }
+
+    #[test]
+    fn files_from_diff_dedupes_and_handles_none() {
+        assert!(files_from_diff(None).is_empty());
+        let d = "diff --git a/a.rs b/a.rs\n@@\n+x\ndiff --git a/a.rs b/a.rs\n@@\n+y\n\
+                 diff --git a/b.rs b/b.rs\n@@\n+z";
+        assert_eq!(
+            files_from_diff(Some(d)),
+            vec!["a.rs".to_string(), "b.rs".to_string()]
+        );
     }
 
     #[test]

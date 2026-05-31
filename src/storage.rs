@@ -2259,6 +2259,14 @@ pub fn reset_step(conn: &Connection, step_id: &str) -> Result<Option<ParkedWorkt
 /// pre-existing stranded-request-on-resume case for ordinary reviewer
 /// requests).
 pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<Step>> {
+    // Correlated subquery: true when `steps.id` has a committed execution-log
+    // row — the test-then-commit invariant's durable proof the implementation
+    // landed. Shared by the reclaim sweep (which keeps such a step InProgress
+    // for re-review) and the abort sweep (which excludes it from abort) so the
+    // two predicates that must mirror each other cannot drift.
+    const HAS_COMMITTED_ATTEMPT: &str = "EXISTS (\
+        SELECT 1 FROM execution_logs e \
+        WHERE e.step_id = steps.id AND e.commit_hash IS NOT NULL)";
     // First, reclaim a review orphaned by a crash — WITHOUT aborting the step.
     // A *committed* step left `InProgress` + `review_status = InFlight` was
     // implementing-complete and mid-review when the runner died; its detached
@@ -2269,13 +2277,12 @@ pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<S
     // of re-implementing the step. This must run before the abort sweep below,
     // which then deliberately skips it.
     conn.execute(
-        "UPDATE steps SET review_status = ?4,
+        &format!(
+            "UPDATE steps SET review_status = ?4,
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE plan_id = ?1 AND status = ?2 AND review_status = ?3
-           AND EXISTS (
-               SELECT 1 FROM execution_logs e
-               WHERE e.step_id = steps.id AND e.commit_hash IS NOT NULL
-           )",
+           AND {HAS_COMMITTED_ATTEMPT}"
+        ),
         params![
             plan_id,
             StepStatus::InProgress.as_str(),
@@ -2314,10 +2321,7 @@ pub fn sweep_stale_in_progress(conn: &Connection, plan_id: &str) -> Result<Vec<S
            )
            AND NOT (
                review_status IN (?4, ?5)
-               AND EXISTS (
-                   SELECT 1 FROM execution_logs e
-                   WHERE e.step_id = steps.id AND e.commit_hash IS NOT NULL
-               )
+               AND {HAS_COMMITTED_ATTEMPT}
            )
          RETURNING {STEP_COLUMNS}",
     );
