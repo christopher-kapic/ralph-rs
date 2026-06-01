@@ -311,9 +311,16 @@ fn validate_dag_aware_steps(steps: &[ImportedStep]) -> Result<()> {
         }
     }
 
-    // Rule 1: no dangling edge.
+    // Rule 1: no dangling edge, and (1b) no duplicate edge within a single
+    // step's `depends_on`. A real export never emits a duplicate (edges are
+    // unique and sorted), but a hand-edited/tampered bundle with a repeated
+    // entry would otherwise pass validation and only fail later at the write
+    // pass on the `UNIQUE(step_id, depends_on_step_id)` constraint with a
+    // confusing "dependency already exists" message; catch it up front with a
+    // precise error (matching the fail-before-write contract).
     for step in steps {
         let sid = step.short_id.as_deref().expect("rule 0 ensured Some");
+        let mut seen_deps: HashSet<&str> = HashSet::new();
         for dep in &step.depends_on {
             if !seen.contains(dep.as_str()) {
                 return Err(anyhow!(
@@ -322,6 +329,12 @@ fn validate_dag_aware_steps(steps: &[ImportedStep]) -> Result<()> {
                      note that full-bundle `ralph import` wires `depends_on` by `short_id`, \
                      not by a batch-local `id` (the batch-local `id` wiring label is only \
                      accepted by `ralph step add --import-json`)"
+                ));
+            }
+            if !seen_deps.insert(dep.as_str()) {
+                return Err(anyhow!(
+                    "DAG-aware import: step '{sid}' lists dependency '{dep}' \
+                     more than once; each edge must be declared at most once"
                 ));
             }
         }
@@ -2748,6 +2761,28 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("duplicate short_id"), "got: {msg}");
         assert!(msg.contains("samesame"), "got: {msg}");
+        assert!(
+            storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Rule 1b: a step listing the same dependency twice aborts the import
+    /// up front (a real export never emits a duplicate edge) rather than
+    /// failing later at the write pass on the UNIQUE(step_id, depends_on)
+    /// constraint with a confusing message.
+    #[test]
+    fn test_import_rejects_duplicate_depends_on_edge() {
+        let conn = setup();
+        let data = dag_bundle(
+            r#"{"title": "A", "short_id": "aaaaaaaa"},
+               {"title": "B", "short_id": "bbbbbbbb", "depends_on": ["aaaaaaaa", "aaaaaaaa"]}"#,
+        );
+        let err = import_plan_from_data(&conn, &data, &opts()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("more than once"), "got: {msg}");
+        assert!(msg.contains("aaaaaaaa"), "got: {msg}");
         assert!(
             storage::get_plan_by_slug(&conn, "bad", "/tmp/bad")
                 .unwrap()

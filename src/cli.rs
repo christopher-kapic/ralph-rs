@@ -1038,8 +1038,12 @@ pub enum StepDependencyCommand {
         /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
-        /// A step (number or short id) this step depends on (repeatable).
-        #[arg(long = "depends-on", num_args = 1.., required = true)]
+        /// A step (number or short id) this step depends on. **Repeat the
+        /// flag once per parent** (`--depends-on a --depends-on b`);
+        /// space-separated multi-value (`--depends-on a b`) is *not*
+        /// supported because it would silently swallow the trailing `<plan>`
+        /// positional (the same footgun `ralph step add --depends-on` avoids).
+        #[arg(long = "depends-on", required = true)]
         depends_on: Vec<String>,
     },
 
@@ -1051,8 +1055,11 @@ pub enum StepDependencyCommand {
         /// Plan slug. Defaults to the active plan.
         plan: Option<String>,
 
-        /// A dependency step (number or short id) to remove (repeatable).
-        #[arg(long = "depends-on", num_args = 1.., required = true)]
+        /// A dependency step (number or short id) to remove. **Repeat the
+        /// flag once per edge** (`--depends-on a --depends-on b`);
+        /// space-separated multi-value is *not* supported because it would
+        /// silently swallow the trailing `<plan>` positional.
+        #[arg(long = "depends-on", required = true)]
         depends_on: Vec<String>,
     },
 
@@ -1135,8 +1142,9 @@ pub enum QuestionCommand {
     ///
     /// Designed to be invoked by the harness mid-step. Binds to the live
     /// `ralph run` for this project via the run lock; if no run is active,
-    /// or the plan does not have questions enabled, exits non-zero with an
-    /// explanatory message and writes nothing to the database.
+    /// exits non-zero with an explanatory message and writes nothing to the
+    /// database. (Interruptions are always enabled — the per-plan
+    /// `questions_enabled` opt-out was dropped in migration V36.)
     Ask {
         /// The question text. If omitted, read from stdin.
         question: Option<String>,
@@ -1740,6 +1748,71 @@ mod tests {
             );
         } else {
             panic!("Expected Step Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_does_not_swallow_trailing_plan_slug() {
+        // Regression (parity with step-add): `step dependency add` has the
+        // same `<step> [plan]`-then-`--depends-on` shape, so a greedy
+        // `num_args = 1..` would let `--depends-on 1 2 my-plan` swallow
+        // `my-plan` as a third dependency and operate on the wrong (active)
+        // plan. The trailing `<plan>` positional must be preserved;
+        // --depends-on takes exactly one value per occurrence.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "3",
+            "--depends-on",
+            "1",
+            "my-plan",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add {
+            step,
+            plan,
+            depends_on,
+        })) = cli.command.unwrap()
+        {
+            assert_eq!(step, "3");
+            assert_eq!(plan.as_deref(), Some("my-plan"));
+            assert_eq!(depends_on, vec!["1".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Add");
+        }
+    }
+
+    #[test]
+    fn test_parse_step_dependency_add_repeated_preserves_trailing_plan_slug() {
+        // The supported multi-edge form: repeat --depends-on once per edge.
+        let cli = Cli::try_parse_from([
+            "ralph-rs",
+            "step",
+            "dependency",
+            "add",
+            "abc12345",
+            "--depends-on",
+            "1",
+            "--depends-on",
+            "def67890",
+            "my-feature",
+        ])
+        .unwrap();
+
+        if let Command::Step(StepCommand::Dependency(StepDependencyCommand::Add {
+            step,
+            plan,
+            depends_on,
+        })) = cli.command.unwrap()
+        {
+            assert_eq!(step, "abc12345");
+            assert_eq!(plan.as_deref(), Some("my-feature"));
+            assert_eq!(depends_on, vec!["1".to_string(), "def67890".to_string()]);
+        } else {
+            panic!("Expected Step Dependency Add");
         }
     }
 

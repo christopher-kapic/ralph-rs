@@ -1706,6 +1706,15 @@ pub fn sweep_stale_review_worktrees(main_repo: &Path) {
 /// signal, so the caller never regresses cleanup; the liveness check only
 /// *adds* protection (skips reaping) where we can positively confirm the
 /// owner is still running.
+///
+/// This is a *liveness* probe, not an *ownership* probe: after the original
+/// reviewer exited, its PID can be recycled by an unrelated process, in which
+/// case a genuinely-orphaned (>6h) dir reads as "alive" and is skipped this
+/// sweep. The consequence is a bounded, benign disk-space leak of one stale
+/// temp dir — never data loss, and the unconditional `git worktree prune` in
+/// the caller still reaps the admin entry — and a later sweep reaps the dir
+/// once the recycled PID frees up. We accept that over the alternative
+/// (reaping a dir out from under a live reviewer).
 fn review_dir_pid_is_alive(dir_name: &str) -> bool {
     // `ralph-review-<pid>-<sha12>-<nanos>` → take the segment after the
     // `ralph-review-` prefix, up to the next `-`.

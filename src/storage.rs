@@ -1597,11 +1597,18 @@ const SHORT_ID_MINT_RETRIES: u32 = 8;
 /// [`mint_short_id`]'s `SELECT EXISTS` check and our `INSERT`. We re-roll on
 /// exactly this error and surface every other error unchanged.
 fn is_short_id_unique_violation(err: &rusqlite::Error) -> bool {
+    // The only unique constraint on `steps` involving short_id is the
+    // `idx_steps_short_id` index on `(plan_id, short_id)`; SQLite reports a
+    // column-based unique-index violation by naming the columns, e.g.
+    // "UNIQUE constraint failed: steps.plan_id, steps.short_id". Match the
+    // qualified `steps.short_id` rather than a bare `short_id` substring so an
+    // unrelated constraint message that merely contains the word can't
+    // mis-trigger a short_id re-roll.
     matches!(
         err,
         rusqlite::Error::SqliteFailure(e, Some(msg))
             if e.code == rusqlite::ErrorCode::ConstraintViolation
-                && msg.contains("short_id")
+                && msg.contains("steps.short_id")
     )
 }
 

@@ -1302,6 +1302,18 @@ fn migrate_v32(conn: &Connection) -> Result<()> {
     // shipped migration would corrupt the version sequence for anyone already
     // past V32. The rebuild faithfully copies every column and row (ordered
     // by id) into an identically-shaped table, so it is harmless.
+    //
+    // FK caveat: migrations run with `PRAGMA foreign_keys = ON` (set in
+    // `open_at`), whereas SQLite's canonical drop-and-rename table-rebuild
+    // recipe wants foreign_keys = OFF first. This rebuild is safe under FK-ON
+    // ONLY because no other table `REFERENCES execution_logs` — the one
+    // near-name, `run_locks.execution_log_id`, is a bare INTEGER with no
+    // REFERENCES clause — so `DROP TABLE execution_logs` triggers no
+    // parent-side CASCADE/abort, and the child FK (`execution_logs.step_id ->
+    // steps`) is re-declared identically in the new table. If any table ever
+    // gains a `REFERENCES execution_logs` FK, this rebuild must run with
+    // foreign_keys temporarily OFF (toggled outside the migration transaction)
+    // or it will silently corrupt that FK.
     conn.execute_batch(
         "
         CREATE TABLE execution_logs_v32 (

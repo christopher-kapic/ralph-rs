@@ -91,8 +91,17 @@ pub fn parse_review_verdict(stdout: &str) -> ReviewVerdict {
     for line in stdout.lines().rev() {
         let t = line.trim();
         let upper = t.to_ascii_uppercase();
-        if upper.starts_with("REVIEW PASS") {
-            return ReviewVerdict::Pass;
+        if let Some(rest) = upper.strip_prefix("REVIEW PASS") {
+            // The contract makes the PASS line *exactly* `REVIEW PASS` with
+            // nothing after it (only FAIL carries free text). Accept trailing
+            // punctuation/whitespace (`REVIEW PASS.`) but reject a word
+            // continuation (`REVIEW PASSED WITH 3 CAVEATS`): an ambiguous
+            // pass-with-caveats line must fall through to the fail-safe rather
+            // than silently passing un-reviewed work. A non-matching line just
+            // keeps the bottom-up scan going.
+            if !rest.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+                return ReviewVerdict::Pass;
+            }
         }
         if upper.starts_with("REVIEW FAIL") {
             // Best-effort defect count from the first integer after the
@@ -878,7 +887,18 @@ pub fn consume_corrective_request(
             if dep == corrective.id {
                 continue; // the A′ -> A edge we just added
             }
-            // Cycle-safe (would_create_step_cycle guards inside).
+            // Defensive parity with `delete_step`'s re-parent loop: never
+            // close a cycle to re-point a dependent. A′ is brand-new and
+            // depends only on A, and `dep` is a former *dependent* of A, so
+            // A′ can never be an ancestor of `dep` — this guard cannot fire
+            // on an acyclic DAG. But `add_step_dependency` *bails* on a
+            // cycle, which would roll back the whole drain transaction and
+            // leave the (still-open) corrective request to retry-loop every
+            // tick; skip-rather-than-abort matches `delete_step` and removes
+            // that failure mode entirely.
+            if storage::would_create_step_cycle(conn, &dep, &corrective.id)? {
+                continue;
+            }
             storage::add_step_dependency(conn, &dep, &corrective.id)?;
         }
 
@@ -1071,6 +1091,28 @@ mod tests {
                  Analysis...\n\
                  REVIEW FAIL — 2 issue(s)";
         assert_eq!(parse_review_verdict(t), ReviewVerdict::Fail { issues: 2 });
+    }
+
+    #[test]
+    fn test_parse_review_verdict_pass_with_trailing_punctuation() {
+        // The PASS line is exactly `REVIEW PASS` per the contract; trailing
+        // punctuation/whitespace is tolerated.
+        assert_eq!(parse_review_verdict("REVIEW PASS."), ReviewVerdict::Pass);
+        assert_eq!(parse_review_verdict("  REVIEW PASS  "), ReviewVerdict::Pass);
+    }
+
+    #[test]
+    fn test_parse_review_verdict_pass_word_continuation_is_fail_safe() {
+        // A word continuation (`REVIEW PASSED WITH 3 CAVEATS`) is NOT a clean
+        // PASS verdict — it must fall through to the fail-safe rather than
+        // silently passing un-reviewed work.
+        assert_eq!(
+            parse_review_verdict("REVIEW PASSED WITH 3 CAVEATS"),
+            ReviewVerdict::Fail { issues: 1 }
+        );
+        // ...but a real PASS line below such prose still wins (bottom-up scan).
+        let t = "REVIEW PASSED WITH CAVEATS (this is prose)\nREVIEW PASS";
+        assert_eq!(parse_review_verdict(t), ReviewVerdict::Pass);
     }
 
     #[test]

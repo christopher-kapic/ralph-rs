@@ -61,11 +61,20 @@ acceptance criteria are below.
 
 ## Adding follow-up steps
 
-- `ralph step add --next \"title\" -d \"...\"` — insert immediately after current
-- `ralph step add \"title\"` — append at end of plan
+If you discover work that should become its own step, add it with an
+explicit dependency so the scheduler runs it in the right order. Run
+`ralph step list` first to read each step's stable 8-char `short_id`.
 
-Do NOT use `--after <N>` during a run — positions shift as steps are added,
-and inserting before the current step is a no-op for this execution.
+- `ralph step add \"title\" -d \"...\" --after <short_id>` — new step runs
+  after `<short_id>` completes (use the current step's `short_id` to queue
+  follow-up work)
+- `ralph step add \"title\" -d \"...\" --depends-on <short_id>...` — new step
+  runs only after every listed step completes (a join)
+- `ralph step add \"title\" -d \"...\" --root` — independent step with no
+  dependencies
+
+Prefer `short_id` handles over list positions (`#N`): a `short_id` is
+stable for the life of the plan, but positions shift as steps are added.
 
 ---
 
@@ -472,8 +481,9 @@ fn format_retry_context(ctx: &RetryContext) -> String {
         max = ctx.max_attempts,
     );
     if let Some(reason) = &ctx.previous_failure_reason {
-        // Under `Keep` the diff section is omitted (the work is on disk), so
-        // this line is the only thing telling the agent *what* failed —
+        // Post test-then-commit the diff section is omitted (the failed
+        // attempt's work is on disk for the agent to inspect via `git diff`),
+        // so this line is the only thing telling the agent *what* failed —
         // keep it on the header so it's the first thing read.
         header.push_str(&format!("\n\nPrevious failure: {reason}."));
     }
@@ -1027,7 +1037,7 @@ mod tests {
 
         assert!(!prompt.contains("# Ralph context"));
         assert!(!prompt.contains("## Introspecting the plan"));
-        assert!(!prompt.contains("Do NOT use `--after <N>` during a run"));
+        assert!(!prompt.contains("## Adding follow-up steps"));
     }
 
     #[test]
@@ -1058,7 +1068,7 @@ mod tests {
         assert!(prompt.contains("# Ralph context"));
         assert!(prompt.contains("## Introspecting the plan"));
         assert!(prompt.contains("`ralph status`"));
-        assert!(prompt.contains("Do NOT use `--after <N>` during a run"));
+        assert!(prompt.contains("## Adding follow-up steps"));
         assert!(prompt.starts_with("# Ralph context"));
     }
 
@@ -1429,8 +1439,8 @@ mod tests {
     }
 
     #[test]
-    fn test_format_retry_context_keep_scoped_no_diff_but_reason_and_output() {
-        // Step 22: under `Keep` the executor passes diff=None / files=[] but
+    fn test_format_retry_context_no_diff_but_reason_and_output() {
+        // Post test-then-commit the executor passes diff=None / files=[] but
         // still sets previous_test_output + previous_failure_reason. The
         // formatter must convey attempt N/M, the failure reason, and the
         // test output, while OMITTING the diff/files sections entirely.
@@ -1447,7 +1457,7 @@ mod tests {
         assert!(result.contains("Previous failure: tests failed."));
         assert!(result.contains("Previous Test Output"));
         assert!(result.contains("assertion failed: foo == bar"));
-        // Diff/files sections are absent under Keep.
+        // Diff/files sections are absent post test-then-commit.
         assert!(!result.contains("Previous Diff"));
         assert!(!result.contains("Files Modified"));
     }

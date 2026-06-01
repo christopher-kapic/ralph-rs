@@ -52,9 +52,10 @@ pub enum InputAction {
     /// — first press sets it (runner stops after the current step), second
     /// press clears it (cancels the request before the boundary fires).
     TogglePauseRequested,
-    /// The user pressed `i` (open the cross-branch interruptions inbox —
-    /// docs/dag-redesign.md §12.3). Reachable from anywhere; the dispatcher
-    /// pushes `View::Inbox` via `run_inbox_tui`.
+    /// The user pressed `I` (Shift-i) to open the cross-branch interruptions
+    /// inbox — docs/dag-redesign.md §12.3. (Lowercase `i` is insert-above, so
+    /// the inbox deliberately uses `I`.) Reachable from anywhere; the
+    /// dispatcher pushes `View::Inbox` via `run_inbox_tui`.
     OpenInbox,
 }
 
