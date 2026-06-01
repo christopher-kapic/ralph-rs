@@ -1909,6 +1909,30 @@ pub fn set_step_attempts(conn: &Connection, step_id: &str, attempts: i32) -> Res
     Ok(())
 }
 
+/// Set the persisted attempt count WITHOUT touching `current_cycle_index`.
+///
+/// Used by the "no budget consumed" rollback paths — a harness interruption
+/// pause and a user `Cancel` skip — which decrement the pre-spawn attempt
+/// bump (e.g. `1 -> 0`) so a later resume doesn't think the budget was
+/// spent. Those are NOT a new retry cycle, so they must not trip the V33
+/// `> 0 -> 0` cycle bump that [`set_step_attempts`] applies (that bump is
+/// reserved for the retry-exhausted "retry from scratch" resolver).
+pub fn set_step_attempts_keep_cycle(conn: &Connection, step_id: &str, attempts: i32) -> Result<()> {
+    let affected = conn
+        .execute(
+            "UPDATE steps \
+             SET attempts = ?1, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?2",
+            params![attempts, step_id],
+        )
+        .with_context(|| format!("Failed to update step attempts for {step_id}"))?;
+    if affected == 0 {
+        anyhow::bail!("Step not found: {step_id}");
+    }
+    Ok(())
+}
+
 /// Atomically transition a step's status from `expected` to `new_status`.
 ///
 /// Unlike [`update_step_status`], this variant is a no-op (returns `Ok(false)`)
@@ -1962,6 +1986,12 @@ pub fn mark_step_skipped(
             step_id,
             "step skipped — interruption no longer applicable",
         )?;
+        // A skipped step is `Complete`-for-scheduling, so any open corrective
+        // request against it is no longer actionable. Close it here (symmetric
+        // with resolving its open interruptions) so it can't linger `open` on
+        // a skipped-but-not-deleted step and survive outside the CASCADE that
+        // only fires on step deletion.
+        close_open_corrective_step_requests_for_step(conn, step_id)?;
         let parked = get_step_parked_worktree(conn, step_id)?;
         if parked.is_some() {
             clear_step_parked_worktree(conn, step_id)?;
@@ -3257,6 +3287,24 @@ pub fn list_open_corrective_step_requests_for_plan(
         out.push(row?);
     }
     Ok(out)
+}
+
+/// Close (mark `consumed`) every OPEN corrective-step request against
+/// `step_id` without performing any DAG mutation. Used when the reviewed step
+/// is skipped: the correction is no longer actionable, so the row must leave
+/// the `open` state the orchestrator's drain query selects on. Returns the
+/// number of rows transitioned. Idempotent (the `state = 'open'` predicate
+/// makes a second call a no-op).
+pub fn close_open_corrective_step_requests_for_step(
+    conn: &Connection,
+    step_id: &str,
+) -> Result<usize> {
+    let affected = conn.execute(
+        "UPDATE corrective_step_requests SET state = 'consumed' \
+         WHERE reviewed_step_id = ?1 AND state = 'open'",
+        params![step_id],
+    )?;
+    Ok(affected)
 }
 
 /// Atomically mark a corrective-step request `consumed` **only when it is
@@ -9059,6 +9107,35 @@ mod tests {
 
         assert_eq!(parked.stash_sha, "deadbeef");
         assert!(get_step_parked_worktree(&conn, &step_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_mark_step_skipped_closes_open_corrective_request() {
+        let conn = setup();
+        let step_id = step_for_interruptions(&conn);
+
+        let req_id =
+            insert_corrective_step_request(&conn, &step_id, 1, "abc1234", 2, Some("issues"), false)
+                .unwrap();
+        let open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM corrective_step_requests WHERE id = ?1 AND state = 'open'",
+                params![req_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 1, "request should start open");
+
+        mark_step_skipped(&conn, &step_id, Some("abandoned")).unwrap();
+
+        let still_open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM corrective_step_requests WHERE id = ?1 AND state = 'open'",
+                params![req_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_open, 0, "skip must close the open corrective request");
     }
 
     /// Force a specific `resolved_at` (and `asked_at`) on a row so ordering

@@ -298,41 +298,6 @@ pub struct SpawnedReview {
     pub result: Result<ReviewTaskResult>,
 }
 
-/// Run the configured review harness/model against a **committed SHA** and
-/// return the parsed verdict — *without touching the DB* (STEP 37,
-/// docs/dag-redesign.md §3.5 item 3 / §9-inv-2/3).
-///
-/// This is the **spawnable** half of the review pipeline: it is `Send` (no
-/// `rusqlite::Connection`), so the runner can `tokio::spawn` it and let it
-/// run concurrently with the next unrelated implementation while the
-/// scheduler loop keeps advancing. It:
-///
-/// - Builds the dedicated read-only reviewer prompt
-///   ([`prompt::build_review_prompt`]) from the *single* `git show <sha>`
-///   diff (O(1) — Decision 5).
-/// - Reuses `harness.rs` spawn machinery with the **review** harness
-///   (`config.review.harness` / `.model`), not the implementation harness.
-/// - Spawns the reviewer in a THROWAWAY detached `git worktree` pinned at
-///   the reviewed SHA ([`git::ReviewWorktree`]) — *not* in the shared
-///   implementation `workdir`. This makes the §9-inv-2 read-only invariant
-///   *structural*: a reviewer that does `echo evil >> src/foo.rs` (no commit)
-///   writes into the disposable tree, which is torn down on every exit path
-///   (RAII `Drop`) and is never the directory the next implementation commits
-///   from. The throwaway tree cannot interfere with a concurrent unrelated
-///   implementation in the main workdir — which is the entire premise of
-///   §3.5-item-3 concurrent review.
-/// - Additionally captures a [`ReviewTreeGuard`] on the **main repo** before
-///   spawning and asserts the reviewed commit is still an ancestor of HEAD
-///   after — kept as cheap defense-in-depth for the history dimension (it
-///   catches a reviewer that somehow rewrote the reviewed line). With the
-///   reviewer isolated in its own worktree it cannot affect the main tree or
-///   HEAD anyway; the assertion is a belt-and-suspenders invariant check.
-///
-/// It does NOT write `review_status`, does NOT annotate the git note, and
-/// does NOT write the V29 bridge row — all of that is the orchestrator's
-/// job in [`finalize_review`], serialized on the single scheduler loop so
-/// the §9-inv-3 single-DAG-writer guarantee holds even with a review in
-/// flight.
 /// Run a synchronous closure (one or more blocking `git()` subprocess calls)
 /// without starving the tokio scheduler. `run_review_subprocess` is a DETACHED
 /// `tokio::spawn`ed task running on a runtime worker thread; the inline git
@@ -371,6 +336,41 @@ pub struct ReviewSubprocessArgs<'a> {
     pub step_num: usize,
 }
 
+/// Run the configured review harness/model against a **committed SHA** and
+/// return the parsed verdict — *without touching the DB* (STEP 37,
+/// docs/dag-redesign.md §3.5 item 3 / §9-inv-2/3).
+///
+/// This is the **spawnable** half of the review pipeline: it is `Send` (no
+/// `rusqlite::Connection`), so the runner can `tokio::spawn` it and let it
+/// run concurrently with the next unrelated implementation while the
+/// scheduler loop keeps advancing. It:
+///
+/// - Builds the dedicated read-only reviewer prompt
+///   ([`prompt::build_review_prompt`]) from the *single* `git show <sha>`
+///   diff (O(1) — Decision 5).
+/// - Reuses `harness.rs` spawn machinery with the **review** harness
+///   (`config.review.harness` / `.model`), not the implementation harness.
+/// - Spawns the reviewer in a THROWAWAY detached `git worktree` pinned at
+///   the reviewed SHA ([`git::ReviewWorktree`]) — *not* in the shared
+///   implementation `workdir`. This makes the §9-inv-2 read-only invariant
+///   *structural*: a reviewer that does `echo evil >> src/foo.rs` (no commit)
+///   writes into the disposable tree, which is torn down on every exit path
+///   (RAII `Drop`) and is never the directory the next implementation commits
+///   from. The throwaway tree cannot interfere with a concurrent unrelated
+///   implementation in the main workdir — which is the entire premise of
+///   §3.5-item-3 concurrent review.
+/// - Additionally captures a [`ReviewTreeGuard`] on the **main repo** before
+///   spawning and asserts the reviewed commit is still an ancestor of HEAD
+///   after — kept as cheap defense-in-depth for the history dimension (it
+///   catches a reviewer that somehow rewrote the reviewed line). With the
+///   reviewer isolated in its own worktree it cannot affect the main tree or
+///   HEAD anyway; the assertion is a belt-and-suspenders invariant check.
+///
+/// It does NOT write `review_status`, does NOT annotate the git note, and
+/// does NOT write the V29 bridge row — all of that is the orchestrator's
+/// job in [`finalize_review`], serialized on the single scheduler loop so
+/// the §9-inv-3 single-DAG-writer guarantee holds even with a review in
+/// flight.
 pub async fn run_review_subprocess(args: ReviewSubprocessArgs<'_>) -> Result<ReviewTaskResult> {
     let ReviewSubprocessArgs {
         plan,

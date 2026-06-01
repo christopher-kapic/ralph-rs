@@ -406,7 +406,7 @@ fn pid_is_alive(pid: i64) -> bool {
 /// read the live process's current token we conservatively assume same
 /// process, because blocking a duplicate run is strictly safer than
 /// clobbering a live one.
-fn is_same_live_process(pid: i64, stored_start_token: Option<&str>) -> bool {
+pub(crate) fn is_same_live_process(pid: i64, stored_start_token: Option<&str>) -> bool {
     if !pid_is_alive(pid) {
         return false;
     }

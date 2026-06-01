@@ -104,7 +104,6 @@ pub fn dispatch_run(
         config.auto_stash
     };
     let options = RunOptions {
-        all_plans: args.all,
         one: args.one,
         from: args.from,
         to: args.to,
@@ -593,6 +592,10 @@ pub fn run_plan_list_tui(
             }
             let event = event::read()?;
             if let Event::Mouse(m) = &event {
+                // Help overlay swallows mouse like it swallows keys.
+                if app.help.is_visible() {
+                    continue;
+                }
                 app.handle_mouse(*m);
                 // A click on the already-highlighted tile opens it — the
                 // mouse handler routes through `request_open()`, so honor
@@ -1874,6 +1877,10 @@ where
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Mouse(m) => {
+                // Help overlay swallows mouse like it swallows keys.
+                if app.help.is_visible() {
+                    continue;
+                }
                 app.handle_mouse(m);
                 // A click on the already-highlighted tile triggers the
                 // same path as `Enter` (unarchive the cursor target).
@@ -2744,6 +2751,10 @@ where
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Mouse(m) => {
+                // Help overlay swallows mouse like it swallows keys.
+                if app.help.is_visible() {
+                    continue;
+                }
                 app.handle_mouse(m);
                 // A click on the already-highlighted row drills into
                 // step-detail — same effect as the `Enter` keybinding's
@@ -4384,6 +4395,10 @@ where
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Mouse(m) => {
+                // Help overlay swallows mouse like it swallows keys.
+                if app.help.is_visible() {
+                    continue;
+                }
                 app.handle_mouse(m);
                 continue;
             }
@@ -4610,6 +4625,10 @@ where
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Mouse(m) => {
+                // Help overlay swallows mouse like it swallows keys.
+                if app.help.is_visible() {
+                    continue;
+                }
                 app.handle_mouse(m);
                 continue;
             }
@@ -4797,6 +4816,10 @@ where
         let key = match event::read()? {
             Event::Key(k) if k.kind == KeyEventKind::Press => k,
             Event::Mouse(m) => {
+                // Help overlay swallows mouse like it swallows keys.
+                if app.help.is_visible() {
+                    continue;
+                }
                 app.handle_mouse(m);
                 continue;
             }
@@ -5987,19 +6010,13 @@ fn collect_skip_wip_commits(conn: &Connection, plan: &crate::plan::Plan) -> Vec<
     commits
         .into_iter()
         .map(|c| {
-            // Resolve the trailer step-id back to a step. Prefer the ordered
-            // position in this plan; fall back to get_step_by_id so a step
-            // since-removed from the list still renders something sane.
+            // Resolve the trailer step-id back to its 1-based position in this
+            // plan. A step since-removed from the list resolves to 0 (the
+            // `[ralph wip]` commit still renders via its short SHA below).
             let num = steps
                 .iter()
                 .position(|s| s.id == c.step_id)
                 .map(|i| i + 1)
-                .or_else(|| {
-                    storage::get_step_by_id(conn, &c.step_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| steps.iter().position(|x| x.id == s.id).map(|i| i + 1))
-                })
                 .unwrap_or(0);
             let short = c.sha[..c.sha.len().min(8)].to_string();
             (num, short)

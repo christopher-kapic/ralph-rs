@@ -68,9 +68,12 @@ impl ResumeModal {
 // interruptions inbox (§12.3). It renders an interruption's proposed answers
 // in **priority order** (1 = the agent's best) with the agent's #1
 // **pre-selected**, plus an optional free-text comment field and a freeform
-// escape-hatch answer. The blocker variant has **no options** — only
-// resolve / resolve-with-comment. The chosen answer/option AND the comment
-// flow into the Phase-2 bounded `resolve_interruption` injection.
+// escape-hatch answer. A human-raised blocker (`ralph block`) has **no
+// options** — only resolve / resolve-with-comment — but the executor's
+// retry-exhausted auto-blocker is also a `Blocker` and DOES carry two ranked
+// options (Retry / Mark Failed), so option rendering keys off
+// `options.is_empty()`, not `is_blocker()`. The chosen answer/option AND the
+// comment flow into the Phase-2 bounded `resolve_interruption` injection.
 //
 // Deliberately NO "let the agent decide" shortcut (§12.4): resolving a
 // question needs an explicit human answer (a ranked option or freeform).
@@ -213,8 +216,10 @@ impl InterruptionModal {
         }
     }
 
-    /// Whether this is a blocker (no options — resolve / resolve-with-comment
-    /// only, §12.4).
+    /// Whether this is a blocker. Note: a human-raised blocker carries no
+    /// options, but the retry-exhausted auto-blocker is also a `Blocker` with
+    /// ranked options — gate option rendering on `options.is_empty()` rather
+    /// than this (§12.4).
     pub fn is_blocker(&self) -> bool {
         self.kind == InterruptionKind::Blocker
     }

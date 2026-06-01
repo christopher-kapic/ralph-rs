@@ -534,10 +534,18 @@ pub fn list_stash_untracked_files(workdir: &Path, stash_sha: &str) -> Result<Vec
         return Ok(Vec::new());
     }
 
-    let out = git(workdir, &["ls-tree", "-r", "--name-only", &untracked_ref])
-        .with_context(|| format!("could not list untracked files in stash {stash_sha}^3"))?;
+    // `-z` yields NUL-separated, *unquoted* paths. Without it, ls-tree
+    // octal-quotes paths containing tabs/quotes/non-ASCII bytes, and the
+    // residue-cleanup caller would then try to `remove_file` the literal
+    // quoted string (which doesn't exist on disk), silently leaving the real
+    // stash-introduced untracked file behind on the conflicted-restore path.
+    let out = git(
+        workdir,
+        &["ls-tree", "-r", "-z", "--name-only", &untracked_ref],
+    )
+    .with_context(|| format!("could not list untracked files in stash {stash_sha}^3"))?;
     Ok(out
-        .lines()
+        .split('\0')
         .filter(|l| !l.is_empty())
         .map(String::from)
         .collect())

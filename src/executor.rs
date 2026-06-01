@@ -1022,10 +1022,11 @@ async fn handle_skipped_attempt(
     let requested_kind = crate::signal::take_requested_park_kind();
     if requested_kind == Some(crate::git::ParkStrategyKind::Cancel) {
         cancel_skipped_attempt(ctx, exec_log_id, attempt)?;
-        // Reset the persisted attempt counter — `set_step_attempts` was
-        // bumped before the harness spawned; leaving it would make a later
-        // resume think the budget was consumed.
-        set_step_attempts(conn, &ctx.step.id, attempt - 1)?;
+        // Reset the persisted attempt counter — it was bumped before the
+        // harness spawned; leaving it would make a later resume think the
+        // budget was consumed. A Cancel consumes no budget and is not a new
+        // retry cycle, so keep `current_cycle_index` (don't trip the V33 bump).
+        set_step_attempts_keep_cycle(conn, &ctx.step.id, attempt - 1)?;
         storage::update_step_status(conn, &ctx.step.id, StepStatus::InProgress)?;
         return Ok(SkipDisposition::Reenter);
     }
@@ -1240,7 +1241,9 @@ async fn finalize_paused_for_question(
     // parked stash is restored if the commit fails.
     commit_park_atomically(ctx, parked, |tx| {
         storage::delete_execution_log(tx, exec_log_id)?;
-        set_step_attempts(tx, &ctx.step.id, attempt - 1)?;
+        // A pause consumes no retry budget and is not a new retry cycle, so
+        // keep `current_cycle_index` (don't trip the V33 `> 0 -> 0` bump).
+        set_step_attempts_keep_cycle(tx, &ctx.step.id, attempt - 1)?;
         storage::update_step_status(tx, &ctx.step.id, StepStatus::Pending)?;
         Ok(())
     })?;
@@ -1850,9 +1853,9 @@ async fn run_step_attempt(
         // directly via `git diff`. The prompt's diff/files sections are
         // therefore redundant — collapse the context to just attempt/max +
         // previous test output (including any commit-hook output) + previous
-        // failure reason. Both `Keep` and `Rollback` paths now produce the
-        // same shape; the diff-feeding `Rollback` behavior is vestigial
-        // (see the retry-tail block — removal in follow-up PR).
+        // failure reason. (The old per-attempt diff/files feeding belonged to
+        // the removed `RetryStrategy::Rollback` path — V37 dropped the enum —
+        // so `previous_diff`/`files_modified` are now always empty here.)
         let retry_context = if attempt > 1 {
             Some(RetryContext {
                 attempt,
@@ -3696,6 +3699,14 @@ fn resolve_agent_file(step: &Step, plan: &Plan) -> Option<PathBuf> {
 /// inside the hot loop.
 fn set_step_attempts(conn: &Connection, step_id: &str, attempts: i32) -> Result<()> {
     storage::set_step_attempts(conn, step_id, attempts)
+}
+
+/// Set the attempt count without bumping the V33 cycle index — for the
+/// "no budget consumed" rollback paths (interruption pause, `Cancel` skip)
+/// that undo the pre-spawn attempt bump and must NOT start a new retry cycle.
+/// See [`storage::set_step_attempts_keep_cycle`].
+fn set_step_attempts_keep_cycle(conn: &Connection, step_id: &str, attempts: i32) -> Result<()> {
+    storage::set_step_attempts_keep_cycle(conn, step_id, attempts)
 }
 
 /// Finalize an attempt that was cancelled *before* the harness ran (the
@@ -11180,8 +11191,8 @@ mod tests {
             "delete_execution_log must run inside the transaction closure",
         );
         assert!(
-            body.contains("set_step_attempts(tx,"),
-            "set_step_attempts must run inside the transaction closure",
+            body.contains("set_step_attempts_keep_cycle(tx,"),
+            "set_step_attempts_keep_cycle must run inside the transaction closure",
         );
         assert!(
             body.contains("update_step_status(tx,"),

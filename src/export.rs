@@ -173,9 +173,9 @@ fn resolve_step_depends_on(conn: &Connection, steps: &[Step]) -> Result<Vec<Vec<
 /// `depends_on_slugs` is the caller-supplied list of slugs this plan
 /// depends on (resolved by [`export_plan`] from the dependency graph).
 ///
-/// `step_depends_on` is parallel to `steps`: entry *i* is the (already
-/// chain-suppressed, sorted) list of dependency `short_id`s for `steps[i]`,
-/// as produced by [`resolve_step_depends_on`]. A shorter/empty slice is
+/// `step_depends_on` is parallel to `steps`: entry *i* is the sorted list of
+/// dependency `short_id`s for `steps[i]` — every real edge, no chain
+/// suppression — as produced by [`resolve_step_depends_on`]. A shorter/empty slice is
 /// treated as "no edges" for the unspecified steps, which keeps pure
 /// callers (tests, legacy linear plans) byte-stable.
 pub fn build_exported_plan(

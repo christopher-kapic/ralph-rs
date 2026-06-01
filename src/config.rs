@@ -948,9 +948,9 @@ impl Default for Config {
 /// step.review_enabled ?? plan.review_enabled ?? config.review.enabled ?? false
 /// ```
 ///
-/// Wired but not yet *consumed* by the runner in this batch — the review
-/// pipeline that calls this lands in a later Phase 3 step. Disabled at any
-/// level ⇒ the step is `Complete` straight from passing tests (§6).
+/// Consumed by the executor (`executor.rs`) to decide whether to gate a
+/// passing step on review. Disabled at any level ⇒ the step is `Complete`
+/// straight from passing tests (§6).
 pub fn effective_review_enabled(
     step: &crate::plan::Step,
     plan: &crate::plan::Plan,

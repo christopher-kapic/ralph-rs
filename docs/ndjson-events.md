@@ -342,7 +342,7 @@ emitting it the runner has:
   re-enter the retry loop at the **same** `attempt` number.
 
 Net effect: the cancelled attempt consumes **no** retry budget and
-leaves **no** `UNIQUE(step_id, attempt)` row behind. Another
+leaves **no** `execution_logs` row behind. Another
 `prompt_prepared` / `phase_changed` for the same `step_id` at the same
 `attempt` number follows.
 

@@ -200,7 +200,8 @@ Apply this at two scopes: the **plan-level test commands** (`--test <cmd>`) gate
 
 The **built-in review pipeline** handles the verdict/correction loop for
 you: the reviewer harness is told to emit a structured verdict, ralph
-parses pass/fail, records the verdict as a git note, and on a failure
+parses pass/fail, records the verdict as a git note (it never amends the
+commit), and on a failure
 auto-inserts a corrective step and re-parents dependents — you don't write
 the "append a fix step" logic yourself. Just pick a capable reviewer
 harness/model via `ralph config review set` and enable review at the plan
@@ -211,7 +212,7 @@ built-in pipeline doesn't cover:
 
 - Tell the reviewer to read `AGENTS.md` / `CLAUDE.md` and per-phase patterns explicitly — most harnesses don't load them by default.
 - Have it emit a **structured verdict** so a following step (or a human) can parse it: a single line of either `REVIEW PASS — <one-line summary>` or `REVIEW FAIL — N issue(s)`, followed by a numbered list when failing. (This is the same verdict shape the built-in reviewer is instructed to produce, so the convention is consistent.)
-- If that manual step must itself append fix steps via `ralph step add`, **describe the action in prose**, not as a copy-paste shell snippet — that re-introduces the embedded-quoting trap.
+- If that manual step must itself append fix steps via `ralph step add`, **describe the action in prose**, not as a copy-paste shell snippet — that re-introduces the embedded-quoting trap — and give it the `codex-orchestrator` harness so the out-of-workspace DB write isn't blocked.
 
 ## Branching
 

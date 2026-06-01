@@ -31,12 +31,12 @@ use crate::storage;
 // ---------------------------------------------------------------------------
 
 /// Options controlling a plan run.
+///
+/// Note: the `--all` (run-all-plans) decision is made by the caller, which
+/// dispatches directly to [`run_all_plans`]; there is intentionally no
+/// `all_plans` field here (it would be write-only).
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct RunOptions {
-    /// Run all plans in dependency order, chaining branches between plans.
-    /// Plan slug is ignored when set.
-    pub all_plans: bool,
     /// Run only the next pending step instead of all remaining steps.
     pub one: bool,
     /// Start from a specific step number (1-based).
@@ -1659,10 +1659,8 @@ async fn run_all_plans_inner(
 
         // Build the inner RunOptions. Force `current_branch: true` so the
         // inner run_plan doesn't try to re-do branch setup — we've already
-        // handled it at the orchestrator level. Also force `all_plans: false`
-        // to avoid any chance of recursion.
+        // handled it at the orchestrator level.
         let inner_options = RunOptions {
-            all_plans: false,
             one: options.one,
             from: options.from,
             to: options.to,
@@ -2051,7 +2049,7 @@ pub fn skip_step(
     }
     if dependent_count > 0 {
         eprintln!(
-            "warning: skipped step {} '{}' has {} dependent step(s); that branch will remain blocked until you reset, remove, or rewire those dependents",
+            "note: skipped step {} '{}' has {} dependent step(s); a Skipped step satisfies its outgoing edges, so that branch will proceed as if this step had completed",
             actual_num, step.title, dependent_count
         );
     }
@@ -2597,9 +2595,10 @@ async fn restore_parked_step_worktree(
             // tree at step start, so leaving any of that in place would feed
             // it to a re-run harness and a Mark-Pending re-run would never
             // start clean — the blocker would re-fire forever (the loop bug).
-            // We hold the run lock and the impl-semaphore here (this runs in
-            // the scheduler before any `execute_step`, semaphore=1 — see §9),
-            // so this is the safe place to touch the tree.
+            // This runs inline on the single scheduler loop, before any
+            // `execute_step` is spawned, and reviews only ever touch their own
+            // isolated worktree (§9) — so no other task can be mutating the
+            // live tree here. This is the safe place to touch it.
             //
             // Cleanup, in two surgical steps that never snapshot-and-diff the
             // untracked set (the prior approach's data-loss + extra-abort risk):
@@ -2931,7 +2930,7 @@ where
 /// - If `from`/`to` are set, return that inclusive range.
 /// - Otherwise, return all remaining steps (the new default).
 ///
-/// `all_plans` is orthogonal to this function and is handled by the
+/// Running all plans is orthogonal to this function and is handled by the
 /// multi-plan orchestrator, not the step selector.
 ///
 /// As of the mid-run-insert fix, `run_plan` no longer calls this function
@@ -5384,7 +5383,6 @@ mod tests {
     #[test]
     fn test_run_options_default() {
         let opts = RunOptions::default();
-        assert!(!opts.all_plans);
         assert!(!opts.one);
         assert!(opts.from.is_none());
         assert!(opts.to.is_none());
@@ -5704,7 +5702,6 @@ mod tests {
         let (_tx, rx) = watch::channel(None);
         let workdir = std::path::Path::new("/tmp");
         let options = RunOptions {
-            all_plans: true,
             dry_run: true,
             current_branch: true,
             ..Default::default()
@@ -5732,7 +5729,6 @@ mod tests {
         let (_tx, rx) = watch::channel(None);
         let workdir = std::path::Path::new("/tmp");
         let options = RunOptions {
-            all_plans: true,
             current_branch: true,
             ..Default::default()
         };
@@ -5831,7 +5827,6 @@ mod tests {
         let (_tx, rx) = tokio::sync::watch::channel(None);
         let out = OutputContext::from_cli(false, true, true);
         let options = RunOptions {
-            all_plans: true,
             current_branch: true,
             ..Default::default()
         };

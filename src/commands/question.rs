@@ -72,6 +72,14 @@ fn resolve_bound_step(
         None => return Ok(Err(QuestionAskOutcome::NoActiveRun)),
     };
 
+    // Guard against a stale lock row left by a crashed runner: binding a
+    // harness-raised interruption to a dead run's `step_id` (possibly already
+    // Complete) would silently mis-attribute it. `acquire_txn` already does
+    // this liveness check on the write path; mirror it on the read/bind path.
+    if !crate::run_lock::is_same_live_process(live.pid, live.pid_start_token.as_deref()) {
+        return Ok(Err(QuestionAskOutcome::NoActiveRun));
+    }
+
     let step_id = match live.step_id.as_deref() {
         Some(s) if !s.is_empty() => s.to_string(),
         _ => return Ok(Err(QuestionAskOutcome::NoActiveRun)),
@@ -255,7 +263,9 @@ mod tests {
 
     /// Insert a run_locks row with the provided step_id + attempt. Bypasses
     /// `run_lock::acquire` because the test pid is the live one and acquire's
-    /// liveness check would refuse to overwrite.
+    /// liveness check would refuse to overwrite. Writes the *real* start
+    /// token for the test pid so `resolve_bound_step`'s liveness guard
+    /// (`is_same_live_process`) sees the lock as belonging to this live run.
     fn seed_run_lock(
         conn: &Connection,
         project: &str,
@@ -265,11 +275,12 @@ mod tests {
         attempt: i32,
     ) {
         let pid = std::process::id() as i64;
+        let token = crate::run_lock::process_start_token(pid);
         conn.execute(
             "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug, step_id, step_num, phase, attempt, max_attempts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
-                project, pid, "test-token", plan_id, plan_slug, step_id, 1i32, "harness",
+                project, pid, token, plan_id, plan_slug, step_id, 1i32, "harness",
                 attempt, 3i32,
             ],
         )
@@ -483,9 +494,10 @@ mod tests {
     fn lock_row_with_null_step_id_returns_no_active_run() {
         let conn = db::open_memory().unwrap();
         let project = "/proj-unbound";
+        let pid = std::process::id() as i64;
         conn.execute(
             "INSERT INTO run_locks (project, pid, pid_start_token) VALUES (?1, ?2, ?3)",
-            params![project, std::process::id() as i64, "test-token"],
+            params![project, pid, crate::run_lock::process_start_token(pid)],
         )
         .unwrap();
 
@@ -527,13 +539,14 @@ mod tests {
         let conn = db::open_memory().unwrap();
         let project = "/proj-no-attempt";
         let (plan_id, step_id) = seed_plan_and_step(&conn, "p-na", project);
+        let pid = std::process::id() as i64;
         conn.execute(
             "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug, step_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 project,
-                std::process::id() as i64,
-                "tok",
+                pid,
+                crate::run_lock::process_start_token(pid),
                 plan_id,
                 "p-na",
                 step_id,
@@ -548,6 +561,28 @@ mod tests {
             other => panic!("expected Recorded, got {other:?}"),
         };
         assert_eq!(attempt, 1);
+    }
+
+    #[test]
+    fn stale_lock_from_dead_runner_returns_no_active_run() {
+        let conn = db::open_memory().unwrap();
+        let project = "/proj-stale";
+        let (plan_id, step_id) = seed_plan_and_step(&conn, "p-stale", project);
+        // A lock row left by a crashed runner: a dead pid but a fully
+        // populated step_id/attempt. Without the liveness guard this would
+        // mis-bind the interruption to the dead run's step.
+        conn.execute(
+            "INSERT INTO run_locks (project, pid, pid_start_token, plan_id, plan_slug, step_id, attempt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![project, 0x7FFF_FFFEi64, "dead-token", plan_id, "p-stale", step_id, 1i32],
+        )
+        .unwrap();
+
+        let outcome =
+            record_question_ask(&conn, project, "Q?", &[], &[], &quiet_out()).expect("ok");
+        assert!(matches!(outcome, QuestionAskOutcome::NoActiveRun));
+        let outcome = record_block(&conn, project, "blk", &quiet_out()).expect("ok");
+        assert!(matches!(outcome, QuestionAskOutcome::NoActiveRun));
     }
 
     // -----------------------------------------------------------------
