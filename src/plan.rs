@@ -153,7 +153,6 @@ impl StepStatus {
 /// (`Pending`/`InProgress`) take the overlay. This mirrors how
 /// `plan_effective_status` upgrades a still-running plan but leaves a
 /// completed one alone.
-#[allow(dead_code)] // scheduler + Phase 4 TUI status-rendering consumers land in later steps.
 pub fn effective_step_status(stored: StepStatus, has_open_interruption: bool) -> StepStatus {
     if !has_open_interruption {
         return stored;
@@ -1382,20 +1381,33 @@ mod tests {
         // DB and assert the column never holds 'blocked' even after deriving
         // a Blocked presentation from an open interruption.
         let conn = db::open_memory().unwrap();
-        let plan =
-            crate::storage::create_plan(&conn, "ov", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = crate::storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "ov",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = crate::storage::create_step(
             &conn,
             &plan.id,
-            "S",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "S",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 

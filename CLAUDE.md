@@ -127,7 +127,7 @@ src/
       step_detail_picker.rs — Bottom-row pickers (harness/model/agent/change_policy)
       rendered_prompt.rs — Read-only fully-assembled-prompt preview (`l`/`→` from StepPrompt pane; per-attempt nav)
       create_plan.rs   — Inline create-plan modal (slug → description → tests)
-      answer_modal.rs  — Legacy `❓` answer modal + post-answer resume modal (kept intact) **plus** the new `InterruptionModal` (ranked proposed answers with the agent's #1 pre-selected + freeform escape hatch + optional comment; blocker variant = resolve / resolve-with-comment, no options; deliberately no "let the agent decide" shortcut)
+      answer_modal.rs  — `InterruptionModal` (ranked proposed answers with the agent's #1 pre-selected + freeform escape hatch + optional comment; blocker variant = resolve / resolve-with-comment, no options; deliberately no "let the agent decide" shortcut) — used by **both** the Inbox and step-detail's inline open-question answer flow (built from a `storage::OpenQuestion` via `InterruptionModal::from_open_question`) — plus the post-answer `ResumeModal` (the separate "resume the run?" prompt). The legacy `AnswerModal` has been removed; both surfaces now render one shared `InterruptionModal` via `inbox_ui::render_interruption_modal`
       plan_dependencies.rs — Plan-dependency sub-view (List + Picker modes)
       plan_hooks.rs    — Plan-hook attachment sub-view
       step_hooks.rs    — Step-hook attachment sub-view
@@ -169,9 +169,14 @@ from anywhere via **`I`** (Shift-i; lowercase `i` is a pre-existing
 "insert/create" binding so the inbox deliberately uses `I`) with an
 open-count badge. Submitting an answer auto-advances to the next open
 interruption (run-through; `Esc` exits); resolved items stay dimmed for
-context. The ranked-answer UI is the new `InterruptionModal` in
-`answer_modal.rs` (the legacy `AnswerModal` is kept intact alongside
-it). Palette adds `/inbox` and `/focus`.
+context. The ranked-answer UI is the `InterruptionModal` in
+`answer_modal.rs`; the legacy `AnswerModal` has been removed and
+step-detail's inline open-question answer flow now drives the same
+`InterruptionModal` (built from a `storage::OpenQuestion` via
+`InterruptionModal::from_open_question`, rendered through the shared
+`inbox_ui::render_interruption_modal`). The post-answer `ResumeModal`
+(the "resume the run?" prompt) is unaffected. Palette adds `/inbox` and
+`/focus`.
 
 The step-detail screen exposes the **four user-facing prompt layers** as
 panes (`GlobalPrompt` / `ProjectPrompt` / `PlanPrompt` / `StepPrompt`) —

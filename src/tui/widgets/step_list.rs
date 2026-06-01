@@ -48,6 +48,18 @@ fn status_fg(status: StepStatus) -> Color {
     theme::step_status_color(status)
 }
 
+/// The presentational inputs to [`render`] besides the `frame` / `area` /
+/// `list_state` rendering handles: the `steps`, the `[N]`-badge `selection`,
+/// the optional `cursor_index`, the `active_run` flag, and the bordered block
+/// `title`.
+pub struct RenderSteps<'a> {
+    pub steps: &'a [Step],
+    pub selection: &'a Selection<String>,
+    pub cursor_index: Option<usize>,
+    pub active_run: bool,
+    pub title: &'a str,
+}
+
 /// Render the compact step list into `area`.
 ///
 /// - `cursor_index`: when `Some`, that row gets the `theme::CURSOR`
@@ -59,17 +71,14 @@ fn status_fg(status: StepStatus) -> Color {
 /// - `list_state`: carries the viewport offset across frames. Callers
 ///   should keep one `ListState` per logical list so scroll position
 ///   survives re-renders.
-#[allow(clippy::too_many_arguments)]
-pub fn render(
-    frame: &mut Frame,
-    area: Rect,
-    steps: &[Step],
-    selection: &Selection<String>,
-    cursor_index: Option<usize>,
-    active_run: bool,
-    title: &str,
-    list_state: &mut ListState,
-) {
+pub fn render(frame: &mut Frame, area: Rect, args: RenderSteps<'_>, list_state: &mut ListState) {
+    let RenderSteps {
+        steps,
+        selection,
+        cursor_index,
+        active_run,
+        title,
+    } = args;
     let items: Vec<ListItem> = steps
         .iter()
         .enumerate()
@@ -172,11 +181,13 @@ mod tests {
                 render(
                     frame,
                     area,
-                    steps,
-                    selection,
-                    cursor_index,
-                    active_run,
-                    title,
+                    RenderSteps {
+                        steps,
+                        selection,
+                        cursor_index,
+                        active_run,
+                        title,
+                    },
                     &mut list_state,
                 );
             })

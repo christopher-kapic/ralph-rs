@@ -345,16 +345,29 @@ fn review_blocking_git<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_review_subprocess(
-    plan: &Plan,
-    step: &Step,
-    config: &Config,
-    workdir: &Path,
-    commit_sha: &str,
-    iteration: i32,
-    step_num: usize,
-) -> Result<ReviewTaskResult> {
+/// Grouped inputs to [`run_review_subprocess`]: the plan/step under review,
+/// the config (which selects the review harness), the working dir, and the
+/// reviewed commit's SHA / iteration / 1-based step number.
+pub struct ReviewSubprocessArgs<'a> {
+    pub plan: &'a Plan,
+    pub step: &'a Step,
+    pub config: &'a Config,
+    pub workdir: &'a Path,
+    pub commit_sha: &'a str,
+    pub iteration: i32,
+    pub step_num: usize,
+}
+
+pub async fn run_review_subprocess(args: ReviewSubprocessArgs<'_>) -> Result<ReviewTaskResult> {
+    let ReviewSubprocessArgs {
+        plan,
+        step,
+        config,
+        workdir,
+        commit_sha,
+        iteration,
+        step_num,
+    } = args;
     // Resolve the REVIEW harness (distinct from the implementation harness).
     let review_harness_name = config.review.harness.trim();
     if review_harness_name.is_empty() {
@@ -683,22 +696,23 @@ pub fn finalize_review(
 /// kept for the focused unit tests in this module (and any future
 /// single-shot caller), composing the exact same steps as the concurrent
 /// path so the two cannot drift.
-#[allow(clippy::too_many_arguments)]
 // Used by this module's focused integration tests; the runner deliberately
 // uses the spawnable `run_review_subprocess` + `finalize_review` pair to get
 // concurrency, so the composed wrapper is dead in the non-test binary build.
 #[cfg_attr(not(test), allow(dead_code))]
 pub async fn run_review(
     conn: &Connection,
-    plan: &Plan,
-    step: &Step,
-    config: &Config,
-    workdir: &Path,
-    commit_sha: &str,
-    iteration: i32,
-    step_num: usize,
+    args: ReviewSubprocessArgs<'_>,
     out: &OutputContext,
 ) -> Result<ReviewOutcome> {
+    let ReviewSubprocessArgs {
+        step,
+        workdir,
+        commit_sha,
+        iteration,
+        step_num,
+        ..
+    } = args;
     storage::update_step_review_status(conn, &step.id, ReviewStatus::InFlight)?;
     if out.format == OutputFormat::Json {
         output::emit_ndjson(&RunEvent::ReviewStarted {
@@ -708,8 +722,7 @@ pub async fn run_review(
             iteration,
         })?;
     }
-    let result =
-        run_review_subprocess(plan, step, config, workdir, commit_sha, iteration, step_num).await?;
+    let result = run_review_subprocess(args).await?;
     finalize_review(conn, workdir, &result, out)
 }
 
@@ -995,15 +1008,17 @@ fn insert_corrective_step(
         conn,
         &plan.id,
         &sort_key,
-        &title,
-        &description,
-        reviewed.agent.as_deref(),
-        reviewed.harness.as_deref(),
-        &criteria,
-        reviewed.max_retries,
-        reviewed.model.as_deref(),
-        Some(crate::plan::ChangePolicy::Required),
-        None,
+        crate::storage::NewStep {
+            title: &title,
+            description: &description,
+            agent: reviewed.agent.as_deref(),
+            harness: reviewed.harness.as_deref(),
+            acceptance_criteria: &criteria,
+            max_retries: reviewed.max_retries,
+            model: reviewed.model.as_deref(),
+            change_policy: Some(crate::plan::ChangePolicy::Required),
+            tags: None,
+        },
     )
 }
 
@@ -1203,27 +1218,31 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "rev-plan",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "rev-plan",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Implement widget",
-            "build the widget",
-            None,
-            None,
-            &["The widget builds".to_string()],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Implement widget",
+                description: "build the widget",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &["The widget builds".to_string()],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         // A real committed iteration the reviewer runs `git show` against.
@@ -1284,9 +1303,21 @@ mod tests {
         let config = config_with_review_harness(&script);
         let (conn, plan, step, sha) = seed_committed_step(dir);
 
-        let outcome = run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out())
-            .await
-            .unwrap();
+        let outcome = run_review(
+            &conn,
+            ReviewSubprocessArgs {
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: dir,
+                commit_sha: &sha,
+                iteration: 1,
+                step_num: 1,
+            },
+            &silent_out(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ReviewOutcome::Passed);
         let s = storage::get_step(&conn, &step.id).unwrap();
@@ -1331,9 +1362,21 @@ mod tests {
 
         // The review itself "passes" (the harness printed PASS) — isolation,
         // not detection, is what protects the tree here.
-        let outcome = run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out())
-            .await
-            .unwrap();
+        let outcome = run_review(
+            &conn,
+            ReviewSubprocessArgs {
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: dir,
+                commit_sha: &sha,
+                iteration: 1,
+                step_num: 1,
+            },
+            &silent_out(),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, ReviewOutcome::Passed);
 
         // The injected untracked file NEVER appears in the live workdir.
@@ -1399,7 +1442,20 @@ mod tests {
         );
         let config = config_with_review_harness(&script);
 
-        let res = run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out()).await;
+        let res = run_review(
+            &conn,
+            ReviewSubprocessArgs {
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: dir,
+                commit_sha: &sha,
+                iteration: 1,
+                step_num: 1,
+            },
+            &silent_out(),
+        )
+        .await;
 
         assert!(
             res.is_err(),
@@ -1430,9 +1486,21 @@ mod tests {
             let script = write_stub(dir, "rev.sh", "echo 'REVIEW PASS'");
             let config = config_with_review_harness(&script);
             let (conn, plan, step, sha) = seed_committed_step(dir);
-            run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out())
-                .await
-                .unwrap();
+            run_review(
+                &conn,
+                ReviewSubprocessArgs {
+                    plan: &plan,
+                    step: &step,
+                    config: &config,
+                    workdir: dir,
+                    commit_sha: &sha,
+                    iteration: 1,
+                    step_num: 1,
+                },
+                &silent_out(),
+            )
+            .await
+            .unwrap();
             let wts = await_worktree_count(dir, 1).await;
             assert_eq!(
                 wts.len(),
@@ -1448,9 +1516,21 @@ mod tests {
             let script = write_stub(dir, "fail.sh", "echo 'REVIEW FAIL — 1 issue(s)'");
             let config = config_with_review_harness(&script);
             let (conn, plan, step, sha) = seed_committed_step(dir);
-            run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out())
-                .await
-                .unwrap();
+            run_review(
+                &conn,
+                ReviewSubprocessArgs {
+                    plan: &plan,
+                    step: &step,
+                    config: &config,
+                    workdir: dir,
+                    commit_sha: &sha,
+                    iteration: 1,
+                    step_num: 1,
+                },
+                &silent_out(),
+            )
+            .await
+            .unwrap();
             let wts = await_worktree_count(dir, 1).await;
             assert_eq!(
                 wts.len(),
@@ -1470,8 +1550,20 @@ mod tests {
             // Force a hard spawn failure: command that does not exist.
             config.harnesses.get_mut("reviewer").unwrap().command =
                 "/nonexistent/ralph-no-such-binary".to_string();
-            let res =
-                run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out()).await;
+            let res = run_review(
+                &conn,
+                ReviewSubprocessArgs {
+                    plan: &plan,
+                    step: &step,
+                    config: &config,
+                    workdir: dir,
+                    commit_sha: &sha,
+                    iteration: 1,
+                    step_num: 1,
+                },
+                &silent_out(),
+            )
+            .await;
             assert!(res.is_err(), "spawn of a missing harness must error");
             let wts = await_worktree_count(dir, 1).await;
             assert_eq!(
@@ -1501,7 +1593,16 @@ mod tests {
         let (_conn, plan, step, sha) = seed_committed_step(dir);
 
         let start = std::time::Instant::now();
-        let res = run_review_subprocess(&plan, &step, &config, dir, &sha, 1, 1).await;
+        let res = run_review_subprocess(ReviewSubprocessArgs {
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: dir,
+            commit_sha: &sha,
+            iteration: 1,
+            step_num: 1,
+        })
+        .await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -1575,7 +1676,16 @@ mod tests {
         config.timeout_secs = Some(1);
 
         let start = std::time::Instant::now();
-        let res = run_review_subprocess(&plan, &step, &config, dir, &sha, 1, 1).await;
+        let res = run_review_subprocess(ReviewSubprocessArgs {
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: dir,
+            commit_sha: &sha,
+            iteration: 1,
+            step_num: 1,
+        })
+        .await;
         let elapsed = start.elapsed();
 
         assert!(res.is_err(), "a hung reviewer must still error");
@@ -1630,9 +1740,21 @@ mod tests {
         let steps_before = storage::list_steps(&conn, &plan.id).unwrap().len();
         let edges_before = storage::list_step_dependency_edges(&conn, &plan.id).unwrap();
 
-        let outcome = run_review(&conn, &plan, &step, &config, dir, &sha, 1, 1, &silent_out())
-            .await
-            .unwrap();
+        let outcome = run_review(
+            &conn,
+            ReviewSubprocessArgs {
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: dir,
+                commit_sha: &sha,
+                iteration: 1,
+                step_num: 1,
+            },
+            &silent_out(),
+        )
+        .await
+        .unwrap();
 
         // The reviewer requested — but did NOT perform — a correction.
         match outcome {
@@ -1678,56 +1800,64 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "dag-plan",
-            &dir.to_string_lossy(),
-            "b",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "dag-plan",
+                project: &dir.to_string_lossy(),
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         // A -> B (B depends_on A), and a sibling C depends_on A too.
         let (a, _) = storage::create_step(
             &conn,
             &plan.id,
-            "A",
-            "d",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (b, _) = storage::create_step(
             &conn,
             &plan.id,
-            "B",
-            "d",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "B",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (c, _) = storage::create_step(
             &conn,
             &plan.id,
-            "C",
-            "d",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "C",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::add_step_dependency(&conn, &b.id, &a.id).unwrap();
@@ -1810,13 +1940,15 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "cap-plan",
-            &dir.to_string_lossy(),
-            "b",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "cap-plan",
+                project: &dir.to_string_lossy(),
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         // Tight cap: at most 1 correction in the chain.
@@ -1826,15 +1958,17 @@ mod tests {
         let (a, _) = storage::create_step(
             &conn,
             &plan.id,
-            "A",
-            "d",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -1917,13 +2051,15 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "cap-bypass",
-            &dir.to_string_lossy(),
-            "b",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "cap-bypass",
+                project: &dir.to_string_lossy(),
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         // Cap 0: a normal request would escalate immediately.
@@ -1933,29 +2069,33 @@ mod tests {
         let (a, _) = storage::create_step(
             &conn,
             &plan.id,
-            "A",
-            "d",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (b, _) = storage::create_step(
             &conn,
             &plan.id,
-            "B",
-            "d",
-            None,
-            None,
-            &[],
-            Some(1),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "B",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(1),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::add_step_dependency(&conn, &b.id, &a.id).unwrap();
@@ -2025,13 +2165,15 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "cap-json",
-            &dir.to_string_lossy(),
-            "b",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "cap-json",
+                project: &dir.to_string_lossy(),
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::set_plan_max_review_corrections(&conn, &plan.id, Some(0)).unwrap();
@@ -2039,15 +2181,17 @@ mod tests {
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "A",
-            "d",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 

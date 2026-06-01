@@ -221,20 +221,33 @@ mod tests {
 
     /// Set up an in-memory DB with a plan + step and return their ids.
     fn seed_plan_and_step(conn: &Connection, slug: &str, project: &str) -> (String, String) {
-        let plan = storage::create_plan(conn, slug, project, "br", "desc", None, None, &[])
-            .expect("create_plan");
+        let plan = storage::create_plan(
+            conn,
+            crate::storage::NewPlan {
+                slug,
+                project,
+                branch_name: "br",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .expect("create_plan");
         let (step, _) = storage::create_step(
             conn,
             &plan.id,
-            "title",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "title",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .expect("create_step");
         (plan.id, step.id)

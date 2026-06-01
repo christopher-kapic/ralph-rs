@@ -951,7 +951,6 @@ impl Default for Config {
 /// Wired but not yet *consumed* by the runner in this batch — the review
 /// pipeline that calls this lands in a later Phase 3 step. Disabled at any
 /// level ⇒ the step is `Complete` straight from passing tests (§6).
-#[allow(dead_code)] // consumed by the review pipeline in a later step
 pub fn effective_review_enabled(
     step: &crate::plan::Step,
     plan: &crate::plan::Plan,

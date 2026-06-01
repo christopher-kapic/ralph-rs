@@ -339,7 +339,6 @@ const PROMPT_PREVIEW_CHARS: usize = 512;
 
 /// Structured fields that a harness may emit in JSON output.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 struct ParsedHarnessOutput {
     cost_usd: Option<f64>,
     input_tokens: Option<i64>,
@@ -499,31 +498,48 @@ struct ExecCtx<'a> {
 /// When `json_output` is true, a [`crate::output::RunEvent::PhaseChanged`]
 /// is emitted to stdout after the storage update so NDJSON consumers (the
 /// TUI, meta-harnesses) can redraw the phase indicator without polling.
-#[allow(clippy::too_many_arguments)]
-fn write_phase(
-    conn: &Connection,
-    plan: &Plan,
-    step_id: &str,
+/// The fields of a single [`write_phase`] call. `conn` stays a separate lead
+/// argument (the DB handle); everything that describes *which* phase
+/// transition to record on the run_locks row is bundled here.
+struct PhaseWrite<'a> {
+    plan: &'a Plan,
+    step_id: &'a str,
     step_num: i32,
     attempt: i32,
     max_attempts: i32,
     execution_log_id: Option<i64>,
     phase: Phase,
-    current_command: Option<&str>,
-    child: ChildUpdate<'_>,
+    current_command: Option<&'a str>,
+    child: ChildUpdate<'a>,
     json_output: bool,
-) -> Result<()> {
+}
+
+fn write_phase(conn: &Connection, w: PhaseWrite<'_>) -> Result<()> {
+    let PhaseWrite {
+        plan,
+        step_id,
+        step_num,
+        attempt,
+        max_attempts,
+        execution_log_id,
+        phase,
+        current_command,
+        child,
+        json_output,
+    } = w;
     storage::update_live_phase(
         conn,
         &plan.project,
         phase,
-        Some(step_id),
-        Some(step_num),
-        Some(attempt),
-        Some(max_attempts),
-        execution_log_id,
-        current_command,
-        child,
+        crate::storage::LivePhase {
+            step_id: Some(step_id),
+            step_num: Some(step_num),
+            attempt: Some(attempt),
+            max_attempts: Some(max_attempts),
+            execution_log_id,
+            current_command,
+            child,
+        },
     )?;
     if json_output {
         crate::output::emit_ndjson(&crate::output::RunEvent::PhaseChanged {
@@ -551,17 +567,30 @@ struct FailureOutput<'a> {
 /// the terminal outcome is explicit. Callers choose these values because they
 /// have more context than [`FailureReason`] alone (e.g. whether the test phase
 /// ran at all, was aborted mid-flight, or was never configured).
-#[allow(clippy::too_many_arguments)]
-async fn finalize_failure(
-    ctx: &ExecCtx<'_>,
+/// The per-call inputs to [`finalize_failure`] (everything besides the
+/// ambient [`ExecCtx`]): which execution-log row / attempt / duration, the
+/// [`FailureReason`], optional harness output, and the explicit termination
+/// reason + test status to persist.
+struct FailureArgs<'a> {
     exec_log_id: i64,
     duration_secs: f64,
     attempt: i32,
     reason: FailureReason,
-    output: Option<&FailureOutput<'_>>,
+    output: Option<&'a FailureOutput<'a>>,
     termination_reason: TerminationReason,
     test_status: TestStatus,
-) -> Result<StepResult> {
+}
+
+async fn finalize_failure(ctx: &ExecCtx<'_>, args: FailureArgs<'_>) -> Result<StepResult> {
+    let FailureArgs {
+        exec_log_id,
+        duration_secs,
+        attempt,
+        reason,
+        output,
+        termination_reason,
+        test_status,
+    } = args;
     // Fix 3 (defensive, general): every non-skip terminal failure funnels
     // through here (Timeout, HarnessFailed, terminal test failure, the
     // `WaitResult::Aborted` arm). If a `Skipped` reason was pending but the
@@ -579,16 +608,18 @@ async fn finalize_failure(
         // observer sees *why* the runner is touching the tree.
         write_phase(
             ctx.conn,
-            ctx.plan,
-            &ctx.step.id,
-            ctx.step_num,
-            attempt,
-            ctx.max_attempts,
-            Some(exec_log_id),
-            Phase::Rollback,
-            None,
-            ChildUpdate::Clear,
-            ctx.json_output,
+            PhaseWrite {
+                plan: ctx.plan,
+                step_id: &ctx.step.id,
+                step_num: ctx.step_num,
+                attempt,
+                max_attempts: ctx.max_attempts,
+                execution_log_id: Some(exec_log_id),
+                phase: Phase::Rollback,
+                current_command: None,
+                child: ChildUpdate::Clear,
+                json_output: ctx.json_output,
+            },
         )?;
         git::rollback_except(ctx.workdir, ctx.pre_existing_untracked)?;
         true
@@ -601,55 +632,51 @@ async fn finalize_failure(
         storage::update_execution_log(
             ctx.conn,
             exec_log_id,
-            Some(duration_secs),
-            o.diff,
-            o.test_results,
-            o.has_changes,
-            false,
-            None,
-            Some(o.stdout),
-            Some(o.stderr),
-            o.parsed.cost_usd,
-            o.parsed.input_tokens,
-            o.parsed.output_tokens,
-            o.parsed.session_id.as_deref(),
-            Some(termination_reason),
-            Some(test_status),
+            crate::storage::ExecutionLogUpdate {
+                duration_secs: Some(duration_secs),
+                diff: o.diff,
+                test_results: o.test_results,
+                rolled_back: o.has_changes,
+                harness_stdout: Some(o.stdout),
+                harness_stderr: Some(o.stderr),
+                cost_usd: o.parsed.cost_usd,
+                input_tokens: o.parsed.input_tokens,
+                output_tokens: o.parsed.output_tokens,
+                session_id: o.parsed.session_id.as_deref(),
+                termination_reason: Some(termination_reason),
+                test_status: Some(test_status),
+                ..Default::default()
+            },
         )?;
     } else {
         storage::update_execution_log(
             ctx.conn,
             exec_log_id,
-            Some(duration_secs),
-            None,
-            &[],
-            rolled_back,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(termination_reason),
-            Some(test_status),
+            crate::storage::ExecutionLogUpdate {
+                duration_secs: Some(duration_secs),
+                rolled_back,
+                termination_reason: Some(termination_reason),
+                test_status: Some(test_status),
+                ..Default::default()
+            },
         )?;
     }
 
     storage::update_step_status(ctx.conn, &ctx.step.id, reason.to_step_status())?;
     write_phase(
         ctx.conn,
-        ctx.plan,
-        &ctx.step.id,
-        ctx.step_num,
-        attempt,
-        ctx.max_attempts,
-        Some(exec_log_id),
-        Phase::PostStepHook,
-        None,
-        ChildUpdate::Clear,
-        ctx.json_output,
+        PhaseWrite {
+            plan: ctx.plan,
+            step_id: &ctx.step.id,
+            step_num: ctx.step_num,
+            attempt,
+            max_attempts: ctx.max_attempts,
+            execution_log_id: Some(exec_log_id),
+            phase: Phase::PostStepHook,
+            current_command: None,
+            child: ChildUpdate::Clear,
+            json_output: ctx.json_output,
+        },
     )?;
     hooks::run_post_step(
         ctx.conn,
@@ -775,16 +802,27 @@ fn cancel_skipped_attempt(ctx: &ExecCtx<'_>, exec_log_id: i64, attempt: i32) -> 
 /// slot before `request_skip_in_flight`'s store landed, silently falling back
 /// to `Stash` (which, like `Discard`, also cleans the tree, so only the
 /// `rolled_back` bookkeeping diverged — a subtle, load-dependent bug).
-#[allow(clippy::too_many_arguments)]
-async fn finalize_skipped(
-    ctx: &ExecCtx<'_>,
+/// The per-call inputs to [`finalize_skipped`] besides the ambient
+/// [`ExecCtx`]: the execution-log row / attempt / duration, the killed
+/// harness's captured stdout+stderr, and the park strategy for its WIP.
+struct SkippedArgs<'a> {
     exec_log_id: i64,
     duration_secs: f64,
     attempt: i32,
-    stdout: &str,
-    stderr: &str,
+    stdout: &'a str,
+    stderr: &'a str,
     kind: crate::git::ParkStrategyKind,
-) -> Result<StepResult> {
+}
+
+async fn finalize_skipped(ctx: &ExecCtx<'_>, args: SkippedArgs<'_>) -> Result<StepResult> {
+    let SkippedArgs {
+        exec_log_id,
+        duration_secs,
+        attempt,
+        stdout,
+        stderr,
+        kind,
+    } = args;
     let parsed = parse_harness_json(stdout);
 
     // Capture the diff *before* any parking touches the tree so `ralph log`
@@ -810,16 +848,18 @@ async fn finalize_skipped(
         if kind == crate::git::ParkStrategyKind::Discard {
             write_phase(
                 ctx.conn,
-                ctx.plan,
-                &ctx.step.id,
-                ctx.step_num,
-                attempt,
-                ctx.max_attempts,
-                Some(exec_log_id),
-                Phase::Rollback,
-                None,
-                ChildUpdate::Clear,
-                ctx.json_output,
+                PhaseWrite {
+                    plan: ctx.plan,
+                    step_id: &ctx.step.id,
+                    step_num: ctx.step_num,
+                    attempt,
+                    max_attempts: ctx.max_attempts,
+                    execution_log_id: Some(exec_log_id),
+                    phase: Phase::Rollback,
+                    current_command: None,
+                    child: ChildUpdate::Clear,
+                    json_output: ctx.json_output,
+                },
             )?;
         }
 
@@ -874,20 +914,22 @@ async fn finalize_skipped(
     storage::update_execution_log(
         ctx.conn,
         exec_log_id,
-        Some(duration_secs),
-        diff.as_deref(),
-        &[],
-        rolled_back,
-        committed,
-        commit_hash.as_deref(),
-        Some(stdout),
-        Some(stderr),
-        parsed.cost_usd,
-        parsed.input_tokens,
-        parsed.output_tokens,
-        parsed.session_id.as_deref(),
-        Some(TerminationReason::UserSkipped),
-        Some(TestStatus::NotRun),
+        crate::storage::ExecutionLogUpdate {
+            duration_secs: Some(duration_secs),
+            diff: diff.as_deref(),
+            rolled_back,
+            committed,
+            commit_hash: commit_hash.as_deref(),
+            harness_stdout: Some(stdout),
+            harness_stderr: Some(stderr),
+            cost_usd: parsed.cost_usd,
+            input_tokens: parsed.input_tokens,
+            output_tokens: parsed.output_tokens,
+            session_id: parsed.session_id.as_deref(),
+            termination_reason: Some(TerminationReason::UserSkipped),
+            test_status: Some(TestStatus::NotRun),
+            ..Default::default()
+        },
     )?;
 
     storage::update_step_status(ctx.conn, &ctx.step.id, StepStatus::Skipped)?;
@@ -910,16 +952,18 @@ async fn finalize_skipped(
 
     write_phase(
         ctx.conn,
-        ctx.plan,
-        &ctx.step.id,
-        ctx.step_num,
-        attempt,
-        ctx.max_attempts,
-        Some(exec_log_id),
-        Phase::PostStepHook,
-        None,
-        ChildUpdate::Clear,
-        ctx.json_output,
+        PhaseWrite {
+            plan: ctx.plan,
+            step_id: &ctx.step.id,
+            step_num: ctx.step_num,
+            attempt,
+            max_attempts: ctx.max_attempts,
+            execution_log_id: Some(exec_log_id),
+            phase: Phase::PostStepHook,
+            current_command: None,
+            child: ChildUpdate::Clear,
+            json_output: ctx.json_output,
+        },
     )?;
     hooks::run_post_step(
         ctx.conn,
@@ -990,12 +1034,14 @@ async fn handle_skipped_attempt(
     let park_kind = requested_kind.unwrap_or(crate::git::ParkStrategyKind::Stash);
     let result = finalize_skipped(
         ctx,
-        exec_log_id,
-        duration_secs,
-        attempt,
-        stdout,
-        stderr,
-        park_kind,
+        SkippedArgs {
+            exec_log_id,
+            duration_secs,
+            attempt,
+            stdout,
+            stderr,
+            kind: park_kind,
+        },
     )
     .await?;
     // Reset the cancel watch channel now that this step is terminally
@@ -1123,12 +1169,7 @@ fn commit_park_atomically<T>(
         let tx = ctx.conn.unchecked_transaction()?;
         let value = write(&tx)?;
         if let Some((stash_ref, staged_files)) = &parked {
-            storage::set_step_parked_worktree(
-                &tx,
-                &ctx.step.id,
-                stash_ref.as_str(),
-                staged_files,
-            )?;
+            storage::set_step_parked_worktree(&tx, &ctx.step.id, stash_ref.as_str(), staged_files)?;
         }
         tx.commit()?;
         Ok(value)
@@ -1206,16 +1247,18 @@ async fn finalize_paused_for_question(
 
     write_phase(
         ctx.conn,
-        ctx.plan,
-        &ctx.step.id,
-        ctx.step_num,
-        attempt,
-        ctx.max_attempts,
-        None,
-        Phase::PostStepHook,
-        None,
-        ChildUpdate::Clear,
-        ctx.json_output,
+        PhaseWrite {
+            plan: ctx.plan,
+            step_id: &ctx.step.id,
+            step_num: ctx.step_num,
+            attempt,
+            max_attempts: ctx.max_attempts,
+            execution_log_id: None,
+            phase: Phase::PostStepHook,
+            current_command: None,
+            child: ChildUpdate::Clear,
+            json_output: ctx.json_output,
+        },
     )?;
     hooks::run_post_step(
         ctx.conn,
@@ -1275,7 +1318,6 @@ async fn finalize_paused_for_question(
 /// never observe the half-state `(status=Pending, no open interruption)` —
 /// which would otherwise let the scheduler immediately re-pick the step and
 /// burn another attempt despite our budget already being spent.
-#[allow(clippy::too_many_arguments)]
 async fn raise_retry_exhausted_blocker(
     ctx: &ExecCtx<'_>,
     exec_log_id: Option<i64>,
@@ -1365,20 +1407,20 @@ async fn raise_retry_exhausted_blocker(
         storage::update_execution_log(
             tx,
             exec_log_id,
-            Some(duration_secs),
-            failure_output.diff,
-            failure_output.test_results,
-            false, // parked in stash, not rolled back
-            false,
-            None,
-            Some(failure_output.stdout),
-            Some(failure_output.stderr),
-            failure_output.parsed.cost_usd,
-            failure_output.parsed.input_tokens,
-            failure_output.parsed.output_tokens,
-            failure_output.parsed.session_id.as_deref(),
-            Some(TerminationReason::PausedForQuestion),
-            Some(test_st),
+            crate::storage::ExecutionLogUpdate {
+                duration_secs: Some(duration_secs),
+                diff: failure_output.diff,
+                test_results: failure_output.test_results,
+                harness_stdout: Some(failure_output.stdout),
+                harness_stderr: Some(failure_output.stderr),
+                cost_usd: failure_output.parsed.cost_usd,
+                input_tokens: failure_output.parsed.input_tokens,
+                output_tokens: failure_output.parsed.output_tokens,
+                session_id: failure_output.parsed.session_id.as_deref(),
+                termination_reason: Some(TerminationReason::PausedForQuestion),
+                test_status: Some(test_st),
+                ..Default::default()
+            },
         )?;
 
         // Phase E Fix 5: build the blocker body from the last 3 attempts in
@@ -1434,16 +1476,18 @@ async fn raise_retry_exhausted_blocker(
     // but only counting harness-side pauses).
     write_phase(
         ctx.conn,
-        ctx.plan,
-        &ctx.step.id,
-        ctx.step_num,
-        attempt,
-        ctx.max_attempts,
-        None,
-        Phase::PostStepHook,
-        None,
-        ChildUpdate::Clear,
-        ctx.json_output,
+        PhaseWrite {
+            plan: ctx.plan,
+            step_id: &ctx.step.id,
+            step_num: ctx.step_num,
+            attempt,
+            max_attempts: ctx.max_attempts,
+            execution_log_id: None,
+            phase: Phase::PostStepHook,
+            current_command: None,
+            child: ChildUpdate::Clear,
+            json_output: ctx.json_output,
+        },
     )?;
     hooks::run_post_step(
         ctx.conn,
@@ -1477,6 +1521,62 @@ async fn raise_retry_exhausted_blocker(
 // Core executor
 // ---------------------------------------------------------------------------
 
+/// Per-step constants shared by every iteration of [`execute_step`]'s retry
+/// loop. Resolved once up front (harness/agent/timeout don't change between
+/// retries) and threaded into [`run_step_attempt`] so the per-attempt helper
+/// reads as a single "run one attempt" request alongside the ambient
+/// [`ExecCtx`]. Everything here is borrowed for the duration of the run.
+struct StepAttemptCtx<'a> {
+    config: &'a Config,
+    abort_rx: &'a watch::Receiver<CancelState>,
+    exec_opts: &'a ExecuteOptions,
+    timeout: Option<Duration>,
+    harness_name: &'a str,
+    harness_config: &'a crate::config::HarnessConfig,
+    agent_file_path: Option<&'a Path>,
+    all_steps: &'a [Step],
+}
+
+/// Every way the body of [`execute_step`]'s retry loop can finish a single
+/// attempt. Extracted from the loop body so the control flow that used to be
+/// expressed via `return` / `continue` / `attempt -= 1; continue` /
+/// fall-through is now explicit and provably exhaustive:
+///
+/// - [`AttemptOutcome::Return`] — the attempt reached a terminal state and
+///   produced a [`StepResult`] the caller must return immediately (every site
+///   that previously did `return Ok(...)` / `return finalize_*(...).await` /
+///   `return raise_retry_exhausted_blocker(...).await`).
+/// - [`AttemptOutcome::Retry`] — the attempt failed retryably; the caller
+///   advances to the next attempt (every former `continue`, plus the
+///   Completed-arm retry tail that used to fall through to the loop end). The
+///   `prev_test_output` / `prev_failure_reason` carried into the next prompt
+///   are written through the `&mut` params before this is returned, exactly
+///   as the inline code mutated the loop-scoped locals.
+/// - [`AttemptOutcome::Reenter`] — a cross-process/late `Skipped` cancel was
+///   resolved by re-entering the *same* attempt number (every former
+///   `attempt -= 1; continue`). The caller neutralizes the loop's top-of-loop
+///   `attempt += 1` bump.
+enum AttemptOutcome {
+    Return(StepResult),
+    Retry,
+    Reenter,
+}
+
+/// Grouped arguments to [`execute_step`]. Bundles the ambient handles
+/// (`conn` / `config` / `hook_ctx`), the plan/step/working-dir under
+/// execution, the abort receiver, and the per-run [`ExecuteOptions`] into one
+/// payload so the entry point reads as a single "run this step" request.
+pub struct ExecuteStepArgs<'a> {
+    pub conn: &'a Connection,
+    pub plan: &'a Plan,
+    pub step: &'a Step,
+    pub config: &'a Config,
+    pub workdir: &'a Path,
+    pub hook_ctx: &'a HookContext,
+    pub abort_rx: watch::Receiver<CancelState>,
+    pub exec_opts: ExecuteOptions,
+}
+
 /// Execute a single step through the full lifecycle.
 ///
 /// The flow:
@@ -1489,17 +1589,17 @@ async fn raise_retry_exhausted_blocker(
 /// 7. If tests pass → git commit with step metadata, log success
 /// 8. If tests fail → git rollback, log failure
 /// 9. Return [`StepResult`]
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_step(
-    conn: &Connection,
-    plan: &Plan,
-    step: &Step,
-    config: &Config,
-    workdir: &Path,
-    hook_ctx: &HookContext,
-    abort_rx: watch::Receiver<CancelState>,
-    exec_opts: ExecuteOptions,
-) -> Result<StepResult> {
+pub async fn execute_step(args: ExecuteStepArgs<'_>) -> Result<StepResult> {
+    let ExecuteStepArgs {
+        conn,
+        plan,
+        step,
+        config,
+        workdir,
+        hook_ctx,
+        abort_rx,
+        exec_opts,
+    } = args;
     let max_retries = step
         .max_retries
         .unwrap_or(config.max_retries_per_step as i32);
@@ -1635,9 +1735,91 @@ pub async fn execute_step(
 
     let mut attempt = step.attempts;
 
+    // Per-step constants for the retry loop. Bundled once here so the
+    // per-attempt body lives in [`run_step_attempt`] rather than inline.
+    let attempt_ctx = StepAttemptCtx {
+        config,
+        abort_rx: &abort_rx,
+        exec_opts: &exec_opts,
+        timeout,
+        harness_name,
+        harness_config,
+        agent_file_path: agent_file_path.as_deref(),
+        all_steps: &all_steps,
+    };
+
     while attempt < max_attempts {
         attempt += 1;
 
+        match run_step_attempt(
+            &attempt_ctx,
+            &ctx,
+            attempt,
+            &mut prev_test_output,
+            &mut prev_failure_reason,
+        )
+        .await?
+        {
+            AttemptOutcome::Return(result) => return Ok(result),
+            AttemptOutcome::Retry => continue,
+            AttemptOutcome::Reenter => {
+                // Re-enter at the SAME attempt: the loop bumps `attempt` at
+                // the top, so step back one to neutralize that bump.
+                attempt -= 1;
+                continue;
+            }
+        }
+    }
+
+    // Unreachable: the budget guard above rejects steps that enter with
+    // `attempts >= max_attempts`, so the while-loop always runs at least
+    // once, and every terminal state returns from inside the loop.
+    unreachable!("retry loop should always return via one of its inner branches")
+}
+
+/// Run a single attempt of a step's retry loop.
+///
+/// This is the body of [`execute_step`]'s `while attempt < max_attempts`
+/// loop, extracted verbatim. It spawns the harness, waits (racing abort +
+/// timeout + cross-process skip), runs deterministic tests, commits on pass
+/// (test-then-commit, Phase A), and routes every failure mode (retryable vs.
+/// terminal vs. retry-exhausted auto-blocker, Phase B). The caller bumped
+/// `attempt` before calling.
+///
+/// Control flow is reported via [`AttemptOutcome`] (see its doc comment for
+/// the mapping from the former inline `return` / `continue` / `attempt -= 1;
+/// continue` / fall-through). The retry context fed into the *next* attempt's
+/// prompt is written through `prev_test_output` / `prev_failure_reason`
+/// before an [`AttemptOutcome::Retry`] is returned, exactly as the inline
+/// code mutated the loop-scoped locals.
+#[allow(clippy::too_many_lines)]
+async fn run_step_attempt(
+    actx: &StepAttemptCtx<'_>,
+    ctx: &ExecCtx<'_>,
+    attempt: i32,
+    prev_test_output: &mut Option<String>,
+    prev_failure_reason: &mut Option<String>,
+) -> Result<AttemptOutcome> {
+    let StepAttemptCtx {
+        config,
+        abort_rx,
+        exec_opts,
+        timeout,
+        harness_name,
+        harness_config,
+        agent_file_path,
+        all_steps,
+    } = *actx;
+    let conn = ctx.conn;
+    let plan = ctx.plan;
+    let step = ctx.step;
+    let workdir = ctx.workdir;
+    let hook_ctx = ctx.hook_ctx;
+    let step_num = ctx.step_num;
+    let max_attempts = ctx.max_attempts;
+    let pre_existing_untracked = ctx.pre_existing_untracked;
+
+    {
         // Check cancel before starting. Persist the bumped attempt count and
         // drop an execution-log row so the DB reflects the same attempt number
         // that StepResult reports and the cancel has a visible audit trail.
@@ -1652,7 +1834,9 @@ pub async fn execute_step(
         // still alive on the same thread.
         let pending_reason = *abort_rx.borrow();
         if let Some(reason) = pending_reason {
-            return finalize_precancel(conn, &step.id, attempt, reason);
+            return Ok(AttemptOutcome::Return(finalize_precancel(
+                conn, &step.id, attempt, reason,
+            )?));
         }
 
         // Mark step as in-progress and bump attempts.
@@ -1711,16 +1895,16 @@ pub async fn execute_step(
         )?;
 
         // Build prompt.
-        let prompt_text = prompt::build_step_prompt(
+        let prompt_text = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
             plan,
             step,
-            &all_steps,
+            all_steps,
             agent_name,
-            retry_context.as_ref(),
-            harness_config.supports_agent_file,
-            &prompts,
-            &resolved_interruptions,
-        );
+            retry_context: retry_context.as_ref(),
+            harness_supports_agent_file: harness_config.supports_agent_file,
+            prompts: &prompts,
+            resolved_interruptions: &resolved_interruptions,
+        });
 
         // Create execution log entry.
         let exec_log =
@@ -1732,14 +1916,14 @@ pub async fn execute_step(
         // its own timestamped "started at" line. In NDJSON mode we emit
         // a structured `PromptPrepared` event instead.
         render_attempt_header(
-            &exec_opts,
+            exec_opts,
             config,
             harness_name,
             harness_config,
             attempt,
             max_attempts,
         );
-        render_prompt_preview(&exec_opts, step, attempt, &prompt_text)?;
+        render_prompt_preview(exec_opts, step, attempt, &prompt_text)?;
 
         // Record the step identity + attempt bookkeeping on the run_locks
         // row. Subsequent `write_phase` calls in this attempt can pass
@@ -1749,16 +1933,18 @@ pub async fn execute_step(
         // prior child is long dead.
         write_phase(
             conn,
-            plan,
-            &step.id,
-            step_num,
-            attempt,
-            max_attempts,
-            Some(exec_log.id),
-            Phase::PreStepHook,
-            None,
-            ChildUpdate::Clear,
-            exec_opts.json_output,
+            PhaseWrite {
+                plan,
+                step_id: &step.id,
+                step_num,
+                attempt,
+                max_attempts,
+                execution_log_id: Some(exec_log.id),
+                phase: Phase::PreStepHook,
+                current_command: None,
+                child: ChildUpdate::Clear,
+                json_output: exec_opts.json_output,
+            },
         )?;
 
         // Run pre-step hook.
@@ -1769,63 +1955,60 @@ pub async fn execute_step(
             storage::update_execution_log(
                 conn,
                 exec_log.id,
-                Some(started_at.elapsed().as_secs_f64()),
-                None,
-                &test_result_strings,
-                false,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(TerminationReason::HookFailed),
-                Some(TestStatus::NotRun),
+                crate::storage::ExecutionLogUpdate {
+                    duration_secs: Some(started_at.elapsed().as_secs_f64()),
+                    test_results: &test_result_strings,
+                    termination_reason: Some(TerminationReason::HookFailed),
+                    test_status: Some(TestStatus::NotRun),
+                    ..Default::default()
+                },
             )?;
             if attempt >= max_attempts {
                 storage::update_step_status(conn, &step.id, StepStatus::Failed)?;
                 write_phase(
                     conn,
-                    plan,
-                    &step.id,
-                    step_num,
-                    attempt,
-                    max_attempts,
-                    Some(exec_log.id),
-                    Phase::PostStepHook,
-                    None,
-                    ChildUpdate::Clear,
-                    exec_opts.json_output,
+                    PhaseWrite {
+                        plan,
+                        step_id: &step.id,
+                        step_num,
+                        attempt,
+                        max_attempts,
+                        execution_log_id: Some(exec_log.id),
+                        phase: Phase::PostStepHook,
+                        current_command: None,
+                        child: ChildUpdate::Clear,
+                        json_output: exec_opts.json_output,
+                    },
                 )?;
                 hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir)
                     .await?;
-                return Ok(StepResult {
+                return Ok(AttemptOutcome::Return(StepResult {
                     outcome: StepOutcome::Failed,
                     step_id: step.id.clone(),
                     attempts_used: attempt,
                     commit_hash: None,
                     needs_review: None,
-                });
+                }));
             }
-            prev_test_output = Some(format!("pre-step hook failed: {e}"));
-            prev_failure_reason = Some("pre-step hook failed".to_string());
+            *prev_test_output = Some(format!("pre-step hook failed: {e}"));
+            *prev_failure_reason = Some("pre-step hook failed".to_string());
             write_phase(
                 conn,
-                plan,
-                &step.id,
-                step_num,
-                attempt,
-                max_attempts,
-                Some(exec_log.id),
-                Phase::PostStepHook,
-                None,
-                ChildUpdate::Clear,
-                exec_opts.json_output,
+                PhaseWrite {
+                    plan,
+                    step_id: &step.id,
+                    step_num,
+                    attempt,
+                    max_attempts,
+                    execution_log_id: Some(exec_log.id),
+                    phase: Phase::PostStepHook,
+                    current_command: None,
+                    child: ChildUpdate::Clear,
+                    json_output: exec_opts.json_output,
+                },
             )?;
             hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "failed", workdir).await?;
-            continue;
+            return Ok(AttemptOutcome::Retry);
         }
 
         // Build harness args and env. `step.model` (if set) overrides the
@@ -1841,10 +2024,10 @@ pub async fn execute_step(
             harness_name,
             harness_config,
             &prompt_text,
-            agent_file_path.as_deref(),
+            agent_file_path,
             step.model.as_deref(),
         )?;
-        let env_vars = harness::build_harness_env(harness_config, agent_file_path.as_deref());
+        let env_vars = harness::build_harness_env(harness_config, agent_file_path);
 
         // Snapshot HEAD just before the harness runs so we can detect the
         // case where the harness committed on its own (clean worktree +
@@ -1861,16 +2044,18 @@ pub async fn execute_step(
         // until then.
         write_phase(
             conn,
-            plan,
-            &step.id,
-            step_num,
-            attempt,
-            max_attempts,
-            Some(exec_log.id),
-            Phase::Harness,
-            Some(harness_name),
-            ChildUpdate::Keep,
-            exec_opts.json_output,
+            PhaseWrite {
+                plan,
+                step_id: &step.id,
+                step_num,
+                attempt,
+                max_attempts,
+                execution_log_id: Some(exec_log.id),
+                phase: Phase::Harness,
+                current_command: Some(harness_name),
+                child: ChildUpdate::Keep,
+                json_output: exec_opts.json_output,
+            },
         )?;
 
         // Spawn harness subprocess. The tempfile (if any) must outlive
@@ -1893,22 +2078,24 @@ pub async fn execute_step(
         let child_token = child_pid_i64.and_then(process_start_token);
         write_phase(
             conn,
-            plan,
-            &step.id,
-            step_num,
-            attempt,
-            max_attempts,
-            Some(exec_log.id),
-            Phase::Harness,
-            Some(harness_name),
-            match child_pid_i64 {
-                Some(pid) => ChildUpdate::Set {
-                    pid,
-                    start_token: child_token.as_deref(),
+            PhaseWrite {
+                plan,
+                step_id: &step.id,
+                step_num,
+                attempt,
+                max_attempts,
+                execution_log_id: Some(exec_log.id),
+                phase: Phase::Harness,
+                current_command: Some(harness_name),
+                child: match child_pid_i64 {
+                    Some(pid) => ChildUpdate::Set {
+                        pid,
+                        start_token: child_token.as_deref(),
+                    },
+                    None => ChildUpdate::Keep,
                 },
-                None => ChildUpdate::Keep,
+                json_output: exec_opts.json_output,
             },
-            exec_opts.json_output,
         )?;
 
         // Wait with timeout and abort racing. Build the chunk-emitter
@@ -1968,7 +2155,7 @@ pub async fn execute_step(
                 // to drive the whole-run abort below.
                 if *abort_rx.borrow() == Some(CancelReason::Skipped) {
                     match handle_skipped_attempt(
-                        &ctx,
+                        ctx,
                         conn,
                         exec_log.id,
                         duration_secs,
@@ -1978,10 +2165,11 @@ pub async fn execute_step(
                     )
                     .await?
                     {
-                        SkipDisposition::Finalized(result) => return Ok(result),
+                        SkipDisposition::Finalized(result) => {
+                            return Ok(AttemptOutcome::Return(result));
+                        }
                         SkipDisposition::Reenter => {
-                            attempt -= 1;
-                            continue;
+                            return Ok(AttemptOutcome::Reenter);
                         }
                     }
                 }
@@ -2036,7 +2224,9 @@ pub async fn execute_step(
                     storage::count_unanswered_questions_for_attempt(conn, &step.id, attempt)?;
                 if unanswered > 0 {
                     let _ = changed_files; // unused on this path
-                    return finalize_paused_for_question(&ctx, exec_log.id, attempt).await;
+                    return Ok(AttemptOutcome::Return(
+                        finalize_paused_for_question(ctx, exec_log.id, attempt).await?,
+                    ));
                 }
 
                 // Harness exited non-zero (or was killed by a signal). Do not
@@ -2061,17 +2251,21 @@ pub async fn execute_step(
                             parsed: &parsed,
                             has_changes,
                         };
-                        return finalize_failure(
-                            &ctx,
-                            exec_log.id,
-                            duration_secs,
-                            attempt,
-                            FailureReason::HarnessFailed,
-                            Some(&fail_output),
-                            TerminationReason::HarnessFailed,
-                            TestStatus::NotRun,
-                        )
-                        .await;
+                        return Ok(AttemptOutcome::Return(
+                            finalize_failure(
+                                ctx,
+                                FailureArgs {
+                                    exec_log_id: exec_log.id,
+                                    duration_secs,
+                                    attempt,
+                                    reason: FailureReason::HarnessFailed,
+                                    output: Some(&fail_output),
+                                    termination_reason: TerminationReason::HarnessFailed,
+                                    test_status: TestStatus::NotRun,
+                                },
+                            )
+                            .await?,
+                        ));
                     }
 
                     // Retry path. Post test-then-commit, even a crashing
@@ -2086,16 +2280,18 @@ pub async fn execute_step(
                     if agent_committed_clean && let Some(before) = &head_before_harness {
                         write_phase(
                             conn,
-                            plan,
-                            &step.id,
-                            step_num,
-                            attempt,
-                            max_attempts,
-                            Some(exec_log.id),
-                            Phase::Rollback,
-                            None,
-                            ChildUpdate::Clear,
-                            exec_opts.json_output,
+                            PhaseWrite {
+                                plan,
+                                step_id: &step.id,
+                                step_num,
+                                attempt,
+                                max_attempts,
+                                execution_log_id: Some(exec_log.id),
+                                phase: Phase::Rollback,
+                                current_command: None,
+                                child: ChildUpdate::Clear,
+                                json_output: exec_opts.json_output,
+                            },
                         )?;
                         git::reset_mixed_to(workdir, before)?;
                     }
@@ -2103,26 +2299,27 @@ pub async fn execute_step(
                     storage::update_execution_log(
                         conn,
                         exec_log.id,
-                        Some(duration_secs),
-                        diff.as_deref(),
-                        &test_results,
-                        rolled_back,
-                        false,
-                        None,
-                        Some(&output.stdout),
-                        Some(&output.stderr),
-                        parsed.cost_usd,
-                        parsed.input_tokens,
-                        parsed.output_tokens,
-                        parsed.session_id.as_deref(),
-                        Some(TerminationReason::HarnessFailed),
-                        Some(TestStatus::NotRun),
+                        crate::storage::ExecutionLogUpdate {
+                            duration_secs: Some(duration_secs),
+                            diff: diff.as_deref(),
+                            test_results: &test_results,
+                            rolled_back,
+                            harness_stdout: Some(&output.stdout),
+                            harness_stderr: Some(&output.stderr),
+                            cost_usd: parsed.cost_usd,
+                            input_tokens: parsed.input_tokens,
+                            output_tokens: parsed.output_tokens,
+                            session_id: parsed.session_id.as_deref(),
+                            termination_reason: Some(TerminationReason::HarnessFailed),
+                            test_status: Some(TestStatus::NotRun),
+                            ..Default::default()
+                        },
                     )?;
                     let _ = diff; // dropped — Phase A omits diff from retry context
-                    prev_test_output = Some(test_results.join("\n"));
+                    *prev_test_output = Some(test_results.join("\n"));
                     let _ = changed_files; // dropped — Phase A omits files_modified
-                    prev_failure_reason = Some("harness exited non-zero".to_string());
-                    continue;
+                    *prev_failure_reason = Some("harness exited non-zero".to_string());
+                    return Ok(AttemptOutcome::Retry);
                 }
 
                 // ---------------------------------------------------------
@@ -2161,16 +2358,18 @@ pub async fn execute_step(
                     // the dead harness pid.
                     write_phase(
                         conn,
-                        plan,
-                        &step.id,
-                        step_num,
-                        attempt,
-                        max_attempts,
-                        Some(exec_log.id),
-                        Phase::PreTestHook,
-                        None,
-                        ChildUpdate::Clear,
-                        exec_opts.json_output,
+                        PhaseWrite {
+                            plan,
+                            step_id: &step.id,
+                            step_num,
+                            attempt,
+                            max_attempts,
+                            execution_log_id: Some(exec_log.id),
+                            phase: Phase::PreTestHook,
+                            current_command: None,
+                            child: ChildUpdate::Clear,
+                            json_output: exec_opts.json_output,
+                        },
                     )?;
                     if let Err(e) =
                         hooks::run_pre_test(conn, hook_ctx, plan, step, attempt, workdir).await
@@ -2182,16 +2381,18 @@ pub async fn execute_step(
                     // require plumbing callbacks into run_tests.
                     write_phase(
                         conn,
-                        plan,
-                        &step.id,
-                        step_num,
-                        attempt,
-                        max_attempts,
-                        Some(exec_log.id),
-                        Phase::Tests,
-                        None,
-                        ChildUpdate::Clear,
-                        exec_opts.json_output,
+                        PhaseWrite {
+                            plan,
+                            step_id: &step.id,
+                            step_num,
+                            attempt,
+                            max_attempts,
+                            execution_log_id: Some(exec_log.id),
+                            phase: Phase::Tests,
+                            current_command: None,
+                            child: ChildUpdate::Clear,
+                            json_output: exec_opts.json_output,
+                        },
                     )?;
                     // Build a chunk-emit config mirroring the harness path:
                     // share the per-run `chunk_seq` counter and the same
@@ -2232,16 +2433,18 @@ pub async fn execute_step(
                     // Post-test hook.
                     write_phase(
                         conn,
-                        plan,
-                        &step.id,
-                        step_num,
-                        attempt,
-                        max_attempts,
-                        Some(exec_log.id),
-                        Phase::PostTestHook,
-                        None,
-                        ChildUpdate::Clear,
-                        exec_opts.json_output,
+                        PhaseWrite {
+                            plan,
+                            step_id: &step.id,
+                            step_num,
+                            attempt,
+                            max_attempts,
+                            execution_log_id: Some(exec_log.id),
+                            phase: Phase::PostTestHook,
+                            current_command: None,
+                            child: ChildUpdate::Clear,
+                            json_output: exec_opts.json_output,
+                        },
                     )?;
                     hooks::run_post_test(
                         conn,
@@ -2308,7 +2511,7 @@ pub async fn execute_step(
                     // park sees a consistent tree (mirrors the Aborted arm's
                     // pre-finalize rollback intent).
                     match handle_skipped_attempt(
-                        &ctx,
+                        ctx,
                         conn,
                         exec_log.id,
                         duration_secs,
@@ -2318,10 +2521,11 @@ pub async fn execute_step(
                     )
                     .await?
                     {
-                        SkipDisposition::Finalized(result) => return Ok(result),
+                        SkipDisposition::Finalized(result) => {
+                            return Ok(AttemptOutcome::Return(result));
+                        }
                         SkipDisposition::Reenter => {
-                            attempt -= 1;
-                            continue;
+                            return Ok(AttemptOutcome::Reenter);
                         }
                     }
                 }
@@ -2349,18 +2553,20 @@ pub async fn execute_step(
                     if git::has_uncommitted_changes(workdir)? {
                         write_phase(
                             conn,
-                            plan,
-                            &step.id,
-                            step_num,
-                            attempt,
-                            max_attempts,
-                            Some(exec_log.id),
-                            Phase::Rollback,
-                            None,
-                            ChildUpdate::Clear,
-                            exec_opts.json_output,
+                            PhaseWrite {
+                                plan,
+                                step_id: &step.id,
+                                step_num,
+                                attempt,
+                                max_attempts,
+                                execution_log_id: Some(exec_log.id),
+                                phase: Phase::Rollback,
+                                current_command: None,
+                                child: ChildUpdate::Clear,
+                                json_output: exec_opts.json_output,
+                            },
                         )?;
-                        git::rollback_except(workdir, &pre_existing_untracked)?;
+                        git::rollback_except(workdir, pre_existing_untracked)?;
                     }
                     let fail_output = FailureOutput {
                         diff: diff.as_deref(),
@@ -2370,17 +2576,21 @@ pub async fn execute_step(
                         parsed: &parsed,
                         has_changes,
                     };
-                    return finalize_failure(
-                        &ctx,
-                        exec_log.id,
-                        duration_secs,
-                        attempt,
-                        FailureReason::Aborted,
-                        Some(&fail_output),
-                        TerminationReason::UserInterrupted,
-                        TestStatus::Aborted,
-                    )
-                    .await;
+                    return Ok(AttemptOutcome::Return(
+                        finalize_failure(
+                            ctx,
+                            FailureArgs {
+                                exec_log_id: exec_log.id,
+                                duration_secs,
+                                attempt,
+                                reason: FailureReason::Aborted,
+                                output: Some(&fail_output),
+                                termination_reason: TerminationReason::UserInterrupted,
+                                test_status: TestStatus::Aborted,
+                            },
+                        )
+                        .await?,
+                    ));
                 }
 
                 // Fix 3 (defensive, general): past both `test_aborted`
@@ -2412,41 +2622,42 @@ pub async fn execute_step(
                     storage::update_execution_log(
                         conn,
                         exec_log.id,
-                        Some(duration_secs),
-                        None, // no diff to record
-                        &test_result_strings,
-                        false, // not rolled back (nothing to rollback)
-                        false, // not committed
-                        None,  // no commit hash
-                        Some(&output.stdout),
-                        Some(&output.stderr),
-                        parsed.cost_usd,
-                        parsed.input_tokens,
-                        parsed.output_tokens,
-                        parsed.session_id.as_deref(),
-                        Some(TerminationReason::Success),
-                        Some(success_test_status),
+                        crate::storage::ExecutionLogUpdate {
+                            duration_secs: Some(duration_secs),
+                            test_results: &test_result_strings,
+                            harness_stdout: Some(&output.stdout),
+                            harness_stderr: Some(&output.stderr),
+                            cost_usd: parsed.cost_usd,
+                            input_tokens: parsed.input_tokens,
+                            output_tokens: parsed.output_tokens,
+                            session_id: parsed.session_id.as_deref(),
+                            termination_reason: Some(TerminationReason::Success),
+                            test_status: Some(success_test_status),
+                            ..Default::default()
+                        },
                     )?;
 
                     storage::update_step_status(conn, &step.id, StepStatus::Complete)?;
 
                     write_phase(
                         conn,
-                        plan,
-                        &step.id,
-                        step_num,
-                        attempt,
-                        max_attempts,
-                        Some(exec_log.id),
-                        Phase::PostStepHook,
-                        None,
-                        ChildUpdate::Clear,
-                        exec_opts.json_output,
+                        PhaseWrite {
+                            plan,
+                            step_id: &step.id,
+                            step_num,
+                            attempt,
+                            max_attempts,
+                            execution_log_id: Some(exec_log.id),
+                            phase: Phase::PostStepHook,
+                            current_command: None,
+                            child: ChildUpdate::Clear,
+                            json_output: exec_opts.json_output,
+                        },
                     )?;
                     hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir)
                         .await?;
 
-                    return Ok(StepResult {
+                    return Ok(AttemptOutcome::Return(StepResult {
                         outcome: StepOutcome::Success,
                         step_id: step.id.clone(),
                         attempts_used: attempt,
@@ -2459,7 +2670,7 @@ pub async fn execute_step(
                         // completes straight from passing tests exactly as
                         // before (linear-plan parity).
                         needs_review: None,
-                    });
+                    }));
                 }
 
                 if test_passed && has_changes {
@@ -2473,16 +2684,18 @@ pub async fn execute_step(
                     // output so the next attempt's prompt sees both.
                     write_phase(
                         conn,
-                        plan,
-                        &step.id,
-                        step_num,
-                        attempt,
-                        max_attempts,
-                        Some(exec_log.id),
-                        Phase::Commit,
-                        None,
-                        ChildUpdate::Clear,
-                        exec_opts.json_output,
+                        PhaseWrite {
+                            plan,
+                            step_id: &step.id,
+                            step_num,
+                            attempt,
+                            max_attempts,
+                            execution_log_id: Some(exec_log.id),
+                            phase: Phase::Commit,
+                            current_command: None,
+                            child: ChildUpdate::Clear,
+                            json_output: exec_opts.json_output,
+                        },
                     )?;
                     let commit_msg = git::build_iteration_commit_message(
                         &step.short_id,
@@ -2490,7 +2703,7 @@ pub async fn execute_step(
                         &step.title,
                         &plan.slug,
                     );
-                    let stage_and_commit = git::stage_except(workdir, &pre_existing_untracked)
+                    let stage_and_commit = git::stage_except(workdir, pre_existing_untracked)
                         .and_then(|_| git::commit_staged(workdir, &commit_msg));
                     if let Err(e) = stage_and_commit {
                         // Pre-commit hook rejection (or other git failure).
@@ -2581,15 +2794,17 @@ pub async fn execute_step(
                             // an auto-raised blocker just like an exhausted
                             // test fail — the human picks Retry / Mark
                             // Failed.
-                            return raise_retry_exhausted_blocker(
-                                &ctx,
-                                Some(exec_log.id),
-                                duration_secs,
-                                attempt,
-                                &fail_output,
-                                FailureReason::CommitFailed,
-                            )
-                            .await;
+                            return Ok(AttemptOutcome::Return(
+                                raise_retry_exhausted_blocker(
+                                    ctx,
+                                    Some(exec_log.id),
+                                    duration_secs,
+                                    attempt,
+                                    &fail_output,
+                                    FailureReason::CommitFailed,
+                                )
+                                .await?,
+                            ));
                         }
 
                         // Retry path: do NOT roll back, do NOT advance HEAD.
@@ -2598,26 +2813,26 @@ pub async fn execute_step(
                         storage::update_execution_log(
                             conn,
                             exec_log.id,
-                            Some(duration_secs),
-                            diff.as_deref(),
-                            &combined_result_strings,
-                            false, // not rolled back — dirty tree preserved
-                            false,
-                            None,
-                            Some(&output.stdout),
-                            Some(&output.stderr),
-                            parsed.cost_usd,
-                            parsed.input_tokens,
-                            parsed.output_tokens,
-                            parsed.session_id.as_deref(),
-                            Some(TerminationReason::CommitFailed),
-                            Some(TestStatus::NotRun),
+                            crate::storage::ExecutionLogUpdate {
+                                duration_secs: Some(duration_secs),
+                                diff: diff.as_deref(),
+                                test_results: &combined_result_strings,
+                                harness_stdout: Some(&output.stdout),
+                                harness_stderr: Some(&output.stderr),
+                                cost_usd: parsed.cost_usd,
+                                input_tokens: parsed.input_tokens,
+                                output_tokens: parsed.output_tokens,
+                                session_id: parsed.session_id.as_deref(),
+                                termination_reason: Some(TerminationReason::CommitFailed),
+                                test_status: Some(TestStatus::NotRun),
+                                ..Default::default()
+                            },
                         )?;
                         let _ = diff; // dropped — Phase A omits diff from retry context
-                        prev_test_output = Some(combined_output);
+                        *prev_test_output = Some(combined_output);
                         let _ = changed_files; // dropped — Phase A omits files_modified
-                        prev_failure_reason = Some(failure_desc);
-                        continue;
+                        *prev_failure_reason = Some(failure_desc);
+                        return Ok(AttemptOutcome::Retry);
                     }
                     let commit_hash = git::get_commit_hash(workdir)?;
 
@@ -2634,20 +2849,22 @@ pub async fn execute_step(
                     storage::update_execution_log(
                         conn,
                         exec_log.id,
-                        Some(duration_secs),
-                        diff.as_deref(),
-                        &test_result_strings,
-                        false, // not rolled back
-                        true,  // committed
-                        Some(&commit_hash),
-                        Some(&output.stdout),
-                        Some(&output.stderr),
-                        parsed.cost_usd,
-                        parsed.input_tokens,
-                        parsed.output_tokens,
-                        parsed.session_id.as_deref(),
-                        Some(TerminationReason::Success),
-                        Some(success_test_status),
+                        crate::storage::ExecutionLogUpdate {
+                            duration_secs: Some(duration_secs),
+                            diff: diff.as_deref(),
+                            test_results: &test_result_strings,
+                            committed: true,
+                            commit_hash: Some(&commit_hash),
+                            harness_stdout: Some(&output.stdout),
+                            harness_stderr: Some(&output.stderr),
+                            cost_usd: parsed.cost_usd,
+                            input_tokens: parsed.input_tokens,
+                            output_tokens: parsed.output_tokens,
+                            session_id: parsed.session_id.as_deref(),
+                            termination_reason: Some(TerminationReason::Success),
+                            test_status: Some(success_test_status),
+                            ..Default::default()
+                        },
                     )?;
 
                     // Review gate (docs/dag-redesign.md §3.2-§3.3 / §9-inv-2).
@@ -2703,27 +2920,29 @@ pub async fn execute_step(
 
                     write_phase(
                         conn,
-                        plan,
-                        &step.id,
-                        step_num,
-                        attempt,
-                        max_attempts,
-                        Some(exec_log.id),
-                        Phase::PostStepHook,
-                        None,
-                        ChildUpdate::Clear,
-                        exec_opts.json_output,
+                        PhaseWrite {
+                            plan,
+                            step_id: &step.id,
+                            step_num,
+                            attempt,
+                            max_attempts,
+                            execution_log_id: Some(exec_log.id),
+                            phase: Phase::PostStepHook,
+                            current_command: None,
+                            child: ChildUpdate::Clear,
+                            json_output: exec_opts.json_output,
+                        },
                     )?;
                     hooks::run_post_step(conn, hook_ctx, plan, step, attempt, "complete", workdir)
                         .await?;
 
-                    return Ok(StepResult {
+                    return Ok(AttemptOutcome::Return(StepResult {
                         outcome: StepOutcome::Success,
                         step_id: step.id.clone(),
                         attempts_used: attempt,
                         commit_hash: Some(commit_hash),
                         needs_review,
-                    });
+                    }));
                 }
 
                 // Terminal failure — exhausted all attempts.
@@ -2792,27 +3011,33 @@ pub async fn execute_step(
                     // missing-diff failure pattern that already burned the
                     // full retry budget.
                     if matches!(reason, FailureReason::TestFailed) {
-                        return raise_retry_exhausted_blocker(
-                            &ctx,
-                            Some(exec_log.id),
-                            duration_secs,
-                            attempt,
-                            &fail_output,
-                            reason,
-                        )
-                        .await;
+                        return Ok(AttemptOutcome::Return(
+                            raise_retry_exhausted_blocker(
+                                ctx,
+                                Some(exec_log.id),
+                                duration_secs,
+                                attempt,
+                                &fail_output,
+                                reason,
+                            )
+                            .await?,
+                        ));
                     }
-                    return finalize_failure(
-                        &ctx,
-                        exec_log.id,
-                        duration_secs,
-                        attempt,
-                        reason,
-                        Some(&fail_output),
-                        term_reason,
-                        test_st,
-                    )
-                    .await;
+                    return Ok(AttemptOutcome::Return(
+                        finalize_failure(
+                            ctx,
+                            FailureArgs {
+                                exec_log_id: exec_log.id,
+                                duration_secs,
+                                attempt,
+                                reason,
+                                output: Some(&fail_output),
+                                termination_reason: term_reason,
+                                test_status: test_st,
+                            },
+                        )
+                        .await?,
+                    ));
                 }
 
                 // Retry path. Post test-then-commit (Phase A): the failed
@@ -2836,16 +3061,18 @@ pub async fn execute_step(
                 if agent_committed_clean && let Some(before) = &head_before_harness {
                     write_phase(
                         conn,
-                        plan,
-                        &step.id,
-                        step_num,
-                        attempt,
-                        max_attempts,
-                        Some(exec_log.id),
-                        Phase::Rollback,
-                        None,
-                        ChildUpdate::Clear,
-                        exec_opts.json_output,
+                        PhaseWrite {
+                            plan,
+                            step_id: &step.id,
+                            step_num,
+                            attempt,
+                            max_attempts,
+                            execution_log_id: Some(exec_log.id),
+                            phase: Phase::Rollback,
+                            current_command: None,
+                            child: ChildUpdate::Clear,
+                            json_output: exec_opts.json_output,
+                        },
                     )?;
                     git::reset_mixed_to(workdir, before)?;
                 }
@@ -2868,28 +3095,29 @@ pub async fn execute_step(
                 storage::update_execution_log(
                     conn,
                     exec_log.id,
-                    Some(duration_secs),
-                    diff.as_deref(),
-                    &test_result_strings,
-                    rolled_back, // always false: failed attempts keep the dirty tree
-                    false,       // not committed
-                    None,
-                    Some(&output.stdout),
-                    Some(&output.stderr),
-                    parsed.cost_usd,
-                    parsed.input_tokens,
-                    parsed.output_tokens,
-                    parsed.session_id.as_deref(),
-                    Some(retry_term),
-                    Some(retry_test_status),
+                    crate::storage::ExecutionLogUpdate {
+                        duration_secs: Some(duration_secs),
+                        diff: diff.as_deref(),
+                        test_results: &test_result_strings,
+                        rolled_back,
+                        harness_stdout: Some(&output.stdout),
+                        harness_stderr: Some(&output.stderr),
+                        cost_usd: parsed.cost_usd,
+                        input_tokens: parsed.input_tokens,
+                        output_tokens: parsed.output_tokens,
+                        session_id: parsed.session_id.as_deref(),
+                        termination_reason: Some(retry_term),
+                        test_status: Some(retry_test_status),
+                        ..Default::default()
+                    },
                 )?;
                 let _ = diff; // dropped — Phase A omits diff from retry context
-                prev_test_output = Some(test_output_summary);
+                *prev_test_output = Some(test_output_summary);
                 let _ = changed_files; // dropped — Phase A omits files_modified
                 // Human-readable reason mirrors the termination classification
                 // so the prompt (which omits the diff) still states what
                 // went wrong.
-                prev_failure_reason = Some(
+                *prev_failure_reason = Some(
                     match retry_term {
                         TerminationReason::NoChanges if agent_committed_clean => {
                             "agent committed its own work instead of leaving \
@@ -2900,6 +3128,7 @@ pub async fn execute_step(
                     }
                     .to_string(),
                 );
+                Ok(AttemptOutcome::Retry)
             }
 
             WaitResult::Timeout { stdout, stderr } => {
@@ -2931,34 +3160,42 @@ pub async fn execute_step(
                     parsed: &parsed,
                     has_changes,
                 };
-                return finalize_failure(
-                    &ctx,
-                    exec_log.id,
-                    duration_secs,
-                    attempt,
-                    FailureReason::Timeout,
-                    Some(&fail_output),
-                    TerminationReason::Timeout,
-                    TestStatus::NotRun,
-                )
-                .await;
+                Ok(AttemptOutcome::Return(
+                    finalize_failure(
+                        ctx,
+                        FailureArgs {
+                            exec_log_id: exec_log.id,
+                            duration_secs,
+                            attempt,
+                            reason: FailureReason::Timeout,
+                            output: Some(&fail_output),
+                            termination_reason: TerminationReason::Timeout,
+                            test_status: TestStatus::NotRun,
+                        },
+                    )
+                    .await?,
+                ))
             }
 
             WaitResult::Aborted => {
                 // Harness was killed before we ever reached the test phase,
                 // so test_status is NotRun (the test runner itself was never
                 // invoked on this attempt). Aborted terminates the WHOLE run.
-                return finalize_failure(
-                    &ctx,
-                    exec_log.id,
-                    duration_secs,
-                    attempt,
-                    FailureReason::Aborted,
-                    None,
-                    TerminationReason::UserInterrupted,
-                    TestStatus::NotRun,
-                )
-                .await;
+                Ok(AttemptOutcome::Return(
+                    finalize_failure(
+                        ctx,
+                        FailureArgs {
+                            exec_log_id: exec_log.id,
+                            duration_secs,
+                            attempt,
+                            reason: FailureReason::Aborted,
+                            output: None,
+                            termination_reason: TerminationReason::UserInterrupted,
+                            test_status: TestStatus::NotRun,
+                        },
+                    )
+                    .await?,
+                ))
             }
 
             WaitResult::Skipped { stdout, stderr } => {
@@ -2990,7 +3227,7 @@ pub async fn execute_step(
                 // (after the cancel watch fired, which happens-after the
                 // park-kind store) guarantees we observe the stored value.
                 match handle_skipped_attempt(
-                    &ctx,
+                    ctx,
                     conn,
                     exec_log.id,
                     duration_secs,
@@ -3000,23 +3237,17 @@ pub async fn execute_step(
                 )
                 .await?
                 {
-                    SkipDisposition::Finalized(result) => return Ok(result),
+                    SkipDisposition::Finalized(result) => Ok(AttemptOutcome::Return(result)),
                     SkipDisposition::Reenter => {
-                        // Re-enter at the SAME attempt: the loop bumps
-                        // `attempt` at the top, so step back one to
-                        // neutralize that bump.
-                        attempt -= 1;
-                        continue;
+                        // Re-enter at the SAME attempt: the caller bumps
+                        // `attempt` at the top of the loop, so it steps back
+                        // one to neutralize that bump.
+                        Ok(AttemptOutcome::Reenter)
                     }
                 }
             }
         }
     }
-
-    // Unreachable: the budget guard above rejects steps that enter with
-    // `attempts >= max_attempts`, so the while-loop always runs at least
-    // once, and every terminal state returns from inside the loop.
-    unreachable!("retry loop should always return via one of its inner branches")
 }
 
 // ---------------------------------------------------------------------------
@@ -3505,20 +3736,12 @@ fn finalize_precancel(
     storage::update_execution_log(
         conn,
         exec_log.id,
-        Some(0.0),
-        None,
-        &[],
-        false, // not committed — no work ran (steps 17-18 add change-handling)
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(term_reason),
-        Some(TestStatus::NotRun),
+        crate::storage::ExecutionLogUpdate {
+            duration_secs: Some(0.0),
+            termination_reason: Some(term_reason),
+            test_status: Some(TestStatus::NotRun),
+            ..Default::default()
+        },
     )?;
     storage::update_step_status(conn, step_id, step_status)?;
     // Fix 3 (cross-process leak): a `Skipped` reason caught here at the
@@ -3830,19 +4053,33 @@ mod tests {
     #[test]
     fn test_set_step_attempts() {
         let conn = crate::db::open_memory().unwrap();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         assert_eq!(step.attempts, 0);
@@ -3894,27 +4131,31 @@ mod tests {
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("claude"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("claude"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         assert_eq!(step.attempts, 0);
@@ -3929,16 +4170,16 @@ mod tests {
             hook_timeout_secs: 120,
         };
 
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -4062,13 +4303,15 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("claude"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("claude"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
@@ -4076,15 +4319,17 @@ mod tests {
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4107,16 +4352,16 @@ mod tests {
         let (_tx, rx) = watch::channel(None);
 
         let config = Config::default();
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -4184,27 +4429,22 @@ mod tests {
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("changing"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("changing"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0), // no retries — commit failure is terminal on first attempt
-            None,
-            None,
-            None,
+            crate::storage::NewStep { title: "Step", description: "desc", agent: None, harness: None, acceptance_criteria: &[], max_retries: Some(0), model: // no retries — commit failure is terminal on first attempt
+            None, change_policy: None, tags: None },
         )
         .unwrap();
 
@@ -4238,16 +4478,16 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(None);
 
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -4301,28 +4541,23 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("noop"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("noop"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0), // no retries — single failure is terminal
-            None,
-            None,
-            None,
+            crate::storage::NewStep { title: "Step", description: "desc", agent: None, harness: None, acceptance_criteria: &[], max_retries: Some(0), model: // no retries — single failure is terminal
+            None, change_policy: None, tags: None },
         )
         .unwrap();
 
@@ -4356,16 +4591,16 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(None);
 
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -4437,28 +4672,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("bigout"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("bigout"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4495,16 +4734,16 @@ mod tests {
         // stalling the suite forever.
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            execute_step(
-                &conn,
-                &plan,
-                &step,
-                &config,
-                &dir,
-                &hook_ctx,
-                rx,
-                ExecuteOptions::default(),
-            ),
+            execute_step(ExecuteStepArgs {
+                conn: &conn,
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: &dir,
+                hook_ctx: &hook_ctx,
+                abort_rx: rx,
+                exec_opts: ExecuteOptions::default(),
+            }),
         )
         .await
         .expect("execute_step deadlocked on large harness output")
@@ -4551,13 +4790,15 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("hugeout"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("hugeout"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
@@ -4567,15 +4808,17 @@ mod tests {
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4610,16 +4853,16 @@ mod tests {
 
         let _result = tokio::time::timeout(
             Duration::from_secs(60),
-            execute_step(
-                &conn,
-                &plan,
-                &step,
-                &config,
-                &dir,
-                &hook_ctx,
-                rx,
-                ExecuteOptions::default(),
-            ),
+            execute_step(ExecuteStepArgs {
+                conn: &conn,
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: &dir,
+                hook_ctx: &hook_ctx,
+                abort_rx: rx,
+                exec_opts: ExecuteOptions::default(),
+            }),
         )
         .await
         .expect("execute_step deadlocked on >4 MiB harness output")
@@ -4668,28 +4911,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("phases"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("phases"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Phase Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Phase Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4724,16 +4971,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(30),
-            execute_step(
-                &conn,
-                &plan,
-                &step,
-                &config,
-                &dir,
-                &hook_ctx,
-                rx,
-                ExecuteOptions::default(),
-            ),
+            execute_step(ExecuteStepArgs {
+                conn: &conn,
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: &dir,
+                hook_ctx: &hook_ctx,
+                abort_rx: rx,
+                exec_opts: ExecuteOptions::default(),
+            }),
         )
         .await
         .expect("execute_step timed out")
@@ -4811,28 +5058,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("pgroup"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("pgroup"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4887,16 +5138,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_step(
-                &conn,
-                &plan,
-                &step,
-                &config,
-                &dir,
-                &hook_ctx,
-                rx,
-                ExecuteOptions::default(),
-            ),
+            execute_step(ExecuteStepArgs {
+                conn: &conn,
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: &dir,
+                hook_ctx: &hook_ctx,
+                abort_rx: rx,
+                exec_opts: ExecuteOptions::default(),
+            }),
         )
         .await
         .expect("execute_step did not return within 10s on abort")
@@ -4969,28 +5220,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("skip"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("skip"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5042,16 +5297,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_step(
-                &conn,
-                &plan,
-                &step,
-                &config,
-                &dir,
-                &hook_ctx,
-                rx,
-                ExecuteOptions::default(),
-            ),
+            execute_step(ExecuteStepArgs {
+                conn: &conn,
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: &dir,
+                hook_ctx: &hook_ctx,
+                abort_rx: rx,
+                exec_opts: ExecuteOptions::default(),
+            }),
         )
         .await
         .expect("execute_step did not return within 10s on skip")
@@ -5174,28 +5429,32 @@ mod tests {
         // reach the test phase → test_aborted → Aborted.
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("skip"),
-            None,
-            &["true".to_string()],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("skip"),
+                agent: None,
+                deterministic_tests: &["true".to_string()],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5251,16 +5510,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_step(
-                &conn,
-                &plan,
-                &step,
-                &config,
-                &dir,
-                &hook_ctx,
-                rx.clone(),
-                ExecuteOptions::default(),
-            ),
+            execute_step(ExecuteStepArgs {
+                conn: &conn,
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: &dir,
+                hook_ctx: &hook_ctx,
+                abort_rx: rx.clone(),
+                exec_opts: ExecuteOptions::default(),
+            }),
         )
         .await
         .expect("execute_step did not return within 10s")
@@ -5342,28 +5601,29 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("skip"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("skip"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0), // max_retries = 0 → a single attempt, terminal on failure
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                acceptance_criteria: &[],
+                // max_retries = 0 → a single attempt, terminal on failure
+                max_retries: Some(0),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -5405,16 +5665,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_step(
-                &conn,
-                &plan,
-                &step,
-                &config,
-                &dir,
-                &hook_ctx,
-                rx.clone(),
-                ExecuteOptions::default(),
-            ),
+            execute_step(ExecuteStepArgs {
+                conn: &conn,
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: &dir,
+                hook_ctx: &hook_ctx,
+                abort_rx: rx.clone(),
+                exec_opts: ExecuteOptions::default(),
+            }),
         )
         .await
         .expect("execute_step did not return within 10s")
@@ -5466,28 +5726,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("fast"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("fast"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5530,16 +5794,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_step(
-                &conn,
-                &plan,
-                &step,
-                &config,
-                &dir,
-                &hook_ctx,
-                rx,
-                ExecuteOptions::default(),
-            ),
+            execute_step(ExecuteStepArgs {
+                conn: &conn,
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: &dir,
+                hook_ctx: &hook_ctx,
+                abort_rx: rx,
+                exec_opts: ExecuteOptions::default(),
+            }),
         )
         .await
         .expect("execute_step did not return within 10s")
@@ -5631,28 +5895,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "demo-plan",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("skip"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "demo-plan",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("skip"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Wire the thing",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Wire the thing",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5751,16 +6019,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(15),
-            execute_step(
-                &conn,
-                &plan,
-                &step,
-                &config,
-                &dir,
-                &hook_ctx,
-                rx,
-                ExecuteOptions::default(),
-            ),
+            execute_step(ExecuteStepArgs {
+                conn: &conn,
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: &dir,
+                hook_ctx: &hook_ctx,
+                abort_rx: rx,
+                exec_opts: ExecuteOptions::default(),
+            }),
         )
         .await
         .expect("execute_step did not return within 15s on skip")
@@ -5912,27 +6180,31 @@ mod tests {
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("skip"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("skip"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5962,12 +6234,14 @@ mod tests {
 
         let result = finalize_skipped(
             &ctx,
-            exec_log_id,
-            0.1,
-            1,
-            "",
-            "",
-            crate::git::ParkStrategyKind::Discard,
+            SkippedArgs {
+                exec_log_id,
+                duration_secs: 0.1,
+                attempt: 1,
+                stdout: "",
+                stderr: "",
+                kind: crate::git::ParkStrategyKind::Discard,
+            },
         )
         .await
         .unwrap();
@@ -6042,28 +6316,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "demo-plan",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("skip"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "demo-plan",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("skip"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Wire the thing",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Wire the thing",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6147,16 +6425,16 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(20),
-            execute_step(
-                &conn,
-                &plan,
-                &step,
-                &config,
-                &dir,
-                &hook_ctx,
-                rx,
-                ExecuteOptions::default(),
-            ),
+            execute_step(ExecuteStepArgs {
+                conn: &conn,
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: &dir,
+                hook_ctx: &hook_ctx,
+                abort_rx: rx,
+                exec_opts: ExecuteOptions::default(),
+            }),
         )
         .await
         .expect("execute_step did not return within 20s on cancel+skip")
@@ -6237,27 +6515,31 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "demo-plan",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("skip"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "demo-plan",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("skip"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Wire the thing",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Wire the thing",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6352,28 +6634,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("trap"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("trap"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6426,16 +6712,16 @@ mod tests {
         // quick failure rather than a stalled suite.
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            execute_step(
-                &conn,
-                &plan,
-                &step,
-                &config,
-                &dir,
-                &hook_ctx,
-                rx,
-                ExecuteOptions::default(),
-            ),
+            execute_step(ExecuteStepArgs {
+                conn: &conn,
+                plan: &plan,
+                step: &step,
+                config: &config,
+                workdir: &dir,
+                hook_ctx: &hook_ctx,
+                abort_rx: rx,
+                exec_opts: ExecuteOptions::default(),
+            }),
         )
         .await
         .expect("execute_step did not return within 10s on abort")
@@ -6537,13 +6823,15 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
@@ -6552,15 +6840,17 @@ mod tests {
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         assert_eq!(step.change_policy, ChangePolicy::Required);
@@ -6576,16 +6866,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
@@ -6647,13 +6937,15 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
@@ -6661,15 +6953,17 @@ mod tests {
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         assert_eq!(step.change_policy, ChangePolicy::Required);
@@ -6685,16 +6979,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -6774,28 +7068,32 @@ mod tests {
         // No deterministic tests configured.
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Review",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            crate::storage::NewStep {
+                title: "Review",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6810,16 +7108,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -6875,28 +7173,32 @@ mod tests {
         // "agent committed but tests are green on the new tree" path.
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &["true".to_string()],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &["true".to_string()],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Review",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            crate::storage::NewStep {
+                title: "Review",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6911,16 +7213,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -7025,13 +7327,15 @@ mod tests {
         );
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[test_cmd],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
@@ -7040,15 +7344,17 @@ mod tests {
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Acc",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(1),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -7062,16 +7368,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -7211,28 +7517,32 @@ mod tests {
         );
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[test_cmd],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Acc",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(1),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -7246,16 +7556,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -7394,28 +7704,32 @@ mod tests {
         );
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[test_cmd],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Add the thing",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Add the thing",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -7429,16 +7743,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -7516,28 +7830,32 @@ mod tests {
         );
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[test_cmd],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Acc",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(1),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -7551,16 +7869,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -7607,28 +7925,32 @@ mod tests {
         );
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[test_cmd],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Acc",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(1),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -7642,16 +7964,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -7719,28 +8041,32 @@ mod tests {
         );
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[test_cmd],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Acc",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         // Step-scope OFF override — wins over the enabled global config.
@@ -7773,16 +8099,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -7821,28 +8147,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Review",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            crate::storage::NewStep {
+                title: "Review",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -7857,16 +8187,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
         assert_eq!(result.outcome, StepOutcome::Success);
@@ -7902,28 +8232,32 @@ mod tests {
         // Deterministic test that always passes.
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &["true".to_string()],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &["true".to_string()],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Review",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            crate::storage::NewStep {
+                title: "Review",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -7938,16 +8272,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
         assert_eq!(result.outcome, StepOutcome::Success);
@@ -7978,28 +8312,32 @@ mod tests {
         // Deterministic test that always fails.
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &["false".to_string()],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &["false".to_string()],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Review",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            crate::storage::NewStep {
+                title: "Review",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -8014,16 +8352,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
         // Phase B: an Optional-policy step whose tests fail with the retry
@@ -8069,28 +8407,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &["true".to_string()],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &["true".to_string()],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Implement",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            crate::storage::NewStep {
+                title: "Implement",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -8105,16 +8447,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
         assert_eq!(result.outcome, StepOutcome::Success);
@@ -8173,28 +8515,23 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("exit1"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("exit1"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0), // no retries
-            None,
-            None,
-            None,
+            crate::storage::NewStep { title: "Step", description: "desc", agent: None, harness: None, acceptance_criteria: &[], max_retries: Some(0), model: // no retries
+            None, change_policy: None, tags: None },
         )
         .unwrap();
 
@@ -8210,16 +8547,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
@@ -8294,28 +8631,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Acc",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(1),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -8329,16 +8670,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -8386,28 +8727,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("exit1"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("exit1"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Review",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            crate::storage::NewStep {
+                title: "Review",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -8423,16 +8768,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
         assert_eq!(
@@ -8468,31 +8813,27 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("exit1"),
-            None,
-            // Tests that always pass — they should NOT be run, so this choice
-            // is immaterial except to prove that even if someone later changes
-            // the code to run them, they couldn't rescue the attempt.
-            &["true".to_string()],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("exit1"),
+                agent: None,
+                // Tests that always pass — they should NOT be run, so this
+                // choice is immaterial except to prove that even if someone
+                // later changes the code to run them, they couldn't rescue the
+                // attempt.
+                deterministic_tests: &["true".to_string()],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None, // Required
-            None,
+            crate::storage::NewStep { title: "Step", description: "desc", agent: None, harness: None, acceptance_criteria: &[], max_retries: Some(0), model: None, change_policy: None, tags: // Required
+            None },
         )
         .unwrap();
 
@@ -8508,16 +8849,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
@@ -8558,28 +8899,23 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("exit1"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("exit1"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(2), // 2 retries = 3 total attempts
-            None,
-            None,
-            None,
+            crate::storage::NewStep { title: "Step", description: "desc", agent: None, harness: None, acceptance_criteria: &[], max_retries: Some(2), model: // 2 retries = 3 total attempts
+            None, change_policy: None, tags: None },
         )
         .unwrap();
 
@@ -8595,16 +8931,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
         assert_eq!(result.outcome, StepOutcome::Failed);
@@ -8875,30 +9211,17 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("noop"),
-            None,
-            // Configure deterministic tests so we can assert they were skipped
+            crate::storage::NewPlan { slug: "slug", project: &dir.to_string_lossy(), branch_name: "branch", description: "desc", harness: Some("noop"), agent: None, deterministic_tests: // Configure deterministic tests so we can assert they were skipped
             // — pause must skip the test phase even when tests are configured.
-            &["true".to_string()],
+            &["true".to_string()] },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(2), // budget > 1 to confirm pause does not retry
-            None,
-            None,
-            None,
+            crate::storage::NewStep { title: "Step", description: "desc", agent: None, harness: None, acceptance_criteria: &[], max_retries: Some(2), model: // budget > 1 to confirm pause does not retry
+            None, change_policy: None, tags: None },
         )
         .unwrap();
 
@@ -8914,16 +9237,16 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(None);
 
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -8984,28 +9307,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("touchy"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("touchy"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -9019,16 +9346,16 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(None);
 
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -9097,13 +9424,15 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("noop"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("noop"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
@@ -9112,15 +9441,17 @@ mod tests {
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(1),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -9135,16 +9466,16 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(None);
 
-        let paused = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &cfg_noop,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let paused = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &cfg_noop,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
         assert_eq!(paused.outcome, StepOutcome::PausedForQuestion);
@@ -9190,19 +9521,19 @@ mod tests {
         let step_reloaded = storage::get_step(&conn, &step.id).unwrap();
         let (_tx2, rx2) = watch::channel(None);
 
-        let done = execute_step(
-            &conn,
-            &plan,
-            &step_reloaded,
-            &cfg_commit,
-            &dir,
-            &hook_ctx,
-            rx2,
-            ExecuteOptions {
+        let done = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step_reloaded,
+            config: &cfg_commit,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx2,
+            exec_opts: ExecuteOptions {
                 resumed_parked_worktree,
                 ..ExecuteOptions::default()
             },
-        )
+        })
         .await
         .unwrap();
 
@@ -9237,28 +9568,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("happy"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("happy"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -9272,16 +9607,16 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(None);
 
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -9318,28 +9653,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("happy"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("happy"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -9365,16 +9704,16 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(None);
 
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -9449,28 +9788,23 @@ mod tests {
         );
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[test_cmd],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0), // no retries — single failing attempt
-            None,
-            None,
-            None,
+            crate::storage::NewStep { title: "Acc", description: "desc", agent: None, harness: None, acceptance_criteria: &[], max_retries: Some(0), model: // no retries — single failing attempt
+            None, change_policy: None, tags: None },
         )
         .unwrap();
 
@@ -9484,16 +9818,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -9581,28 +9915,23 @@ mod tests {
         );
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[test_cmd],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1), // max_retries=1 → up to 2 attempts
-            None,
-            None,
-            None,
+            crate::storage::NewStep { title: "Acc", description: "desc", agent: None, harness: None, acceptance_criteria: &[], max_retries: Some(1), model: // max_retries=1 → up to 2 attempts
+            None, change_policy: None, tags: None },
         )
         .unwrap();
 
@@ -9616,16 +9945,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -9694,28 +10023,23 @@ mod tests {
         // so we reach the post-test commit phase reliably.
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("changing"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("changing"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1), // max_retries=1 → up to 2 attempts
-            None,
-            None,
-            None,
+            crate::storage::NewStep { title: "Step", description: "desc", agent: None, harness: None, acceptance_criteria: &[], max_retries: Some(1), model: // max_retries=1 → up to 2 attempts
+            None, change_policy: None, tags: None },
         )
         .unwrap();
 
@@ -9747,16 +10071,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -9898,13 +10222,15 @@ mod tests {
         );
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[test_cmd],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
@@ -9914,15 +10240,17 @@ mod tests {
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(1),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Acc",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(1),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let max_attempts = 1 + step.max_retries.unwrap_or(0);
@@ -9938,16 +10266,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -10074,13 +10402,15 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("changing"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("changing"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
@@ -10089,15 +10419,17 @@ mod tests {
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -10130,16 +10462,16 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(None);
 
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -10202,28 +10534,32 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("crashy"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("crashy"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -10256,16 +10592,16 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(None);
 
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -10299,28 +10635,23 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None, // change_policy defaults to Required
-            None,
+            crate::storage::NewStep { title: "Step", description: "desc", agent: None, harness: None, acceptance_criteria: &[], max_retries: Some(0), model: None, change_policy: None, tags: // change_policy defaults to Required
+            None },
         )
         .unwrap();
 
@@ -10334,16 +10665,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -10381,13 +10712,15 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
@@ -10396,15 +10729,17 @@ mod tests {
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -10421,16 +10756,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -10485,28 +10820,30 @@ mod tests {
         let (step2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step2",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step2",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (_tx2, rx2) = watch::channel(None);
-        let result2 = execute_step(
-            &conn,
-            &plan,
-            &step2,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx2,
-            ExecuteOptions::default(),
-        )
+        let result2 = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step2,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx2,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
         assert_eq!(result2.outcome, StepOutcome::PausedForQuestion);
@@ -10589,28 +10926,32 @@ mod tests {
         );
         let plan = storage::create_plan(
             &conn,
-            "slug",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            Some("poly"),
-            None,
-            &[test_cmd],
+            crate::storage::NewPlan {
+                slug: "slug",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("poly"),
+                agent: None,
+                deterministic_tests: &[test_cmd],
+            },
         )
         .unwrap();
         seed_run_lock_row(&conn, &dir.to_string_lossy());
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Acc",
-            "desc",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Acc",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -10658,16 +10999,16 @@ mod tests {
             hook_timeout_secs: 30,
         };
         let (_tx, rx) = watch::channel(None);
-        let result = execute_step(
-            &conn,
-            &plan,
-            &step,
-            &config,
-            &dir,
-            &hook_ctx,
-            rx,
-            ExecuteOptions::default(),
-        )
+        let result = execute_step(ExecuteStepArgs {
+            conn: &conn,
+            plan: &plan,
+            step: &step,
+            config: &config,
+            workdir: &dir,
+            hook_ctx: &hook_ctx,
+            abort_rx: rx,
+            exec_opts: ExecuteOptions::default(),
+        })
         .await
         .unwrap();
 
@@ -10692,27 +11033,31 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "big-out",
-            "/proj-big",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "big-out",
+                project: "/proj-big",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -10730,20 +11075,13 @@ mod tests {
             storage::update_execution_log(
                 &conn,
                 log.id,
-                Some(0.1),
-                None,
-                &[format!("attempt-{attempt}-FAIL:\n{big}")],
-                false,
-                false,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(crate::plan::TerminationReason::TestFailed),
-                Some(crate::plan::TestStatus::Failed),
+                crate::storage::ExecutionLogUpdate {
+                    duration_secs: Some(0.1),
+                    test_results: &[format!("attempt-{attempt}-FAIL:\n{big}")],
+                    termination_reason: Some(crate::plan::TerminationReason::TestFailed),
+                    test_status: Some(crate::plan::TestStatus::Failed),
+                    ..Default::default()
+                },
             )
             .unwrap();
         }
@@ -10820,8 +11158,8 @@ mod tests {
             .find(signature)
             .expect("finalize_paused_for_question must exist");
         // Take a slice that includes the entire body but stops before the
-        // next top-level item (`raise_retry_exhausted_blocker`'s comment
-        // block / `#[allow(clippy::too_many_arguments)]`).
+        // next top-level item (`raise_retry_exhausted_blocker`'s doc/comment
+        // block).
         let after_sig = &src[fn_start..];
         let next_fn = after_sig
             .find("\n/// Phase B — auto-raise a `Blocker` interruption")
@@ -10915,27 +11253,31 @@ mod tests {
         let conn = crate::db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "park-preserve",
-            &dir.to_string_lossy(),
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "park-preserve",
+                project: &dir.to_string_lossy(),
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 

@@ -142,14 +142,23 @@ fn resolve_step_depends_on(conn: &Connection, steps: &[Step]) -> Result<Vec<Vec<
         .map(|s| (s.id.as_str(), s.short_id.as_str()))
         .collect();
 
+    // Every step belongs to the same plan, so load the whole edge set in a
+    // single query rather than one `list_step_dependencies` call per step
+    // (the scheduler/runner/TUI already use this bulk path).
+    let edges = match steps.first() {
+        Some(first) => storage::list_step_dependency_edges(conn, &first.plan_id)?,
+        None => return Ok(Vec::new()),
+    };
+
     let mut resolved: Vec<Vec<String>> = Vec::with_capacity(steps.len());
     for s in steps {
-        let dep_ids = storage::list_step_dependencies(conn, &s.id)?;
         // Only edges whose target is also a step of this plan are portable;
         // anything else (shouldn't happen in practice) is silently dropped,
         // mirroring the plan-level dependency resolution in `export_plan`.
-        let mut shorts: Vec<String> = dep_ids
-            .iter()
+        let mut shorts: Vec<String> = edges
+            .get(&s.id)
+            .into_iter()
+            .flatten()
             .filter_map(|id| id_to_short.get(id.as_str()).map(|x| x.to_string()))
             .collect();
         shorts.sort();
@@ -281,43 +290,49 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "test-export",
-            "/tmp/proj",
-            "feat/export",
-            "Export test plan",
-            Some("claude"),
-            Some("opus"),
-            &["cargo test".to_string(), "cargo clippy".to_string()],
+            crate::storage::NewPlan {
+                slug: "test-export",
+                project: "/tmp/proj",
+                branch_name: "feat/export",
+                description: "Export test plan",
+                harness: Some("claude"),
+                agent: Some("opus"),
+                deterministic_tests: &["cargo test".to_string(), "cargo clippy".to_string()],
+            },
         )
         .unwrap();
 
         let (_s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step one",
-            "First step desc",
-            Some("sonnet"),
-            None,
-            &["tests pass".to_string()],
-            Some(3),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step one",
+                description: "First step desc",
+                agent: Some("sonnet"),
+                harness: None,
+                acceptance_criteria: &["tests pass".to_string()],
+                max_retries: Some(3),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
         let (_s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step two",
-            "Second step desc",
-            None,
-            Some("codex"),
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step two",
+                description: "Second step desc",
+                agent: None,
+                harness: Some("codex"),
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -360,28 +375,32 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "json-test",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "json-test",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
 
         storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -412,28 +431,32 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "valid-json",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            Some("claude"),
-            None,
-            &["cargo test".to_string()],
+            crate::storage::NewPlan {
+                slug: "valid-json",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: Some("claude"),
+                agent: None,
+                deterministic_tests: &["cargo test".to_string()],
+            },
         )
         .unwrap();
 
         storage::create_step(
             &conn,
             &plan.id,
-            "Step A",
-            "desc a",
-            None,
-            None,
-            &["criterion".to_string()],
-            Some(2),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step A",
+                description: "desc a",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &["criterion".to_string()],
+                max_retries: Some(2),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -454,28 +477,32 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "file-export",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "file-export",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
 
         storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -501,13 +528,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "order-test",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "order-test",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
 
@@ -515,43 +544,49 @@ mod tests {
         storage::create_step(
             &conn,
             &plan.id,
-            "Alpha",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Alpha",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "Beta",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Beta",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "Gamma",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Gamma",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -568,28 +603,32 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "status-test",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "status-test",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
 
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -615,13 +654,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "questions-export",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "questions-export",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
 
@@ -644,13 +685,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "tags-export",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "tags-export",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
 
@@ -658,30 +701,34 @@ mod tests {
         storage::create_step(
             &conn,
             &plan.id,
-            "Tagged",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            Some(&tags),
+            crate::storage::NewStep {
+                title: "Tagged",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: Some(&tags),
+            },
         )
         .unwrap();
         // Untagged sibling.
         storage::create_step(
             &conn,
             &plan.id,
-            "Untagged",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Untagged",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -706,15 +753,17 @@ mod tests {
         let (s, _) = storage::create_step(
             conn,
             plan_id,
-            title,
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title,
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         s
@@ -731,13 +780,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "chain",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "chain",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let a = mk_step(&conn, &plan.id, "A");
@@ -788,13 +839,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "branched",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "branched",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let a = mk_step(&conn, &plan.id, "A");
@@ -833,13 +886,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "rev-exp",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "rev-exp",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::set_plan_review_enabled(&conn, &plan.id, Some(true)).unwrap();
@@ -847,15 +902,17 @@ mod tests {
         let (s, _) = storage::create_step(
             &conn,
             &plan.id,
-            "S",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "S",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::set_step_review_enabled(&conn, &s.id, Some(false)).unwrap();
@@ -882,20 +939,33 @@ mod tests {
         assert!(!json.contains("corrects_step_id"), "{json}");
 
         // An all-default plan omits every new key (skip_serializing_if).
-        let plain =
-            storage::create_plan(&conn, "plain", "/tmp/proj", "b", "d", None, None, &[]).unwrap();
+        let plain = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "plain",
+                project: "/tmp/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::create_step(
             &conn,
             &plain.id,
-            "x",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "x",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let psteps = storage::list_steps(&conn, &plain.id).unwrap();
@@ -912,13 +982,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "stable",
-            "/tmp/proj",
-            "branch",
-            "desc",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "stable",
+                project: "/tmp/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let a = mk_step(&conn, &plan.id, "A");

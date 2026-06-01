@@ -1045,13 +1045,15 @@ pub(crate) fn plan_list_apply_create(
 
     match storage::create_plan(
         conn,
-        slug,
-        project,
-        branch_name,
-        description,
-        harness,
-        agent,
-        tests,
+        storage::NewPlan {
+            slug,
+            project,
+            branch_name,
+            description,
+            harness,
+            agent,
+            deterministic_tests: tests,
+        },
     ) {
         Ok(plan) => {
             let new_tiles = build_plan_tiles(conn, project)?;
@@ -2334,6 +2336,247 @@ fn plan_detail_init_preferred_run_mode(
     }
 }
 
+/// Per-tick subscription/NDJSON poll for the plan-detail view.
+///
+/// The runner subscription is owned by the parent dispatcher
+/// (`run_plan_list_tui`) and survives navigation, so on every tick we:
+///   1. Attach (once) when the parent's subscription matches our plan and
+///      the App hasn't yet noted the binding.
+///   2. Drain the NDJSON stream and dispatch events into the App.
+///   3. Detect producer hang-up (subprocess exited) and release the
+///      subscription so the next `R` press can spawn a fresh run.
+///
+/// Pure side effects on the App / subscription slot / attach flag — no
+/// control flow escapes, so the caller simply invokes it once per loop
+/// iteration. The subscription is matched against this view's plan by
+/// `slug`; a subscription bound to a *different* plan is still
+/// drain-and-discarded so its unbounded mpsc channel doesn't accumulate.
+fn poll_plan_detail_subscription(
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    subscription: &mut Option<crate::tui::events::HostedSubscription>,
+    attached_this_instance: &mut bool,
+    slug: &str,
+) {
+    use crate::tui::events as tui_events;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let subscription_matches =
+        |sub: &Option<tui_events::HostedSubscription>| sub.as_ref().is_some_and(|h| h.slug == slug);
+
+    if subscription_matches(subscription) {
+        if !*attached_this_instance {
+            app.attach_subscription();
+            *attached_this_instance = true;
+        }
+        let hosted = subscription.as_mut().expect("matched above");
+        for evt in hosted.sub.drain() {
+            tui_events::dispatch_event(app, &evt);
+        }
+        if hosted.sub.is_disconnected() {
+            // The subscription belongs to *this* plan, so any failure
+            // message goes straight to this view's toast queue without
+            // a slug prefix — the user is staring at the plan it
+            // refers to.
+            match hosted.sub.poll_failure_status() {
+                tui_events::FailureStatus::Pending => {}
+                tui_events::FailureStatus::Clean => {
+                    *subscription = None;
+                    app.detach_subscription();
+                    *attached_this_instance = false;
+                }
+                tui_events::FailureStatus::Message(msg) => {
+                    *subscription = None;
+                    app.detach_subscription();
+                    *attached_this_instance = false;
+                    app.toasts.push(msg, ToastKind::Error, Instant::now());
+                }
+            }
+        }
+    } else {
+        if *attached_this_instance {
+            // Parent dropped the subscription while we were attached
+            // (e.g. another view popped after a disconnect we missed).
+            app.detach_subscription();
+            *attached_this_instance = false;
+        }
+        // Subscription exists but is bound to another plan: still
+        // drain-and-discard so the unbounded mpsc channel doesn't
+        // accumulate events while the user is parked here. Surface a
+        // failure message with the slug prefix so the user knows which
+        // plan failed even though they're viewing a different one.
+        if let Some(hosted) = subscription.as_mut() {
+            let _ = hosted.sub.drain();
+            if hosted.sub.is_disconnected() {
+                match hosted.sub.poll_failure_status() {
+                    tui_events::FailureStatus::Pending => {}
+                    tui_events::FailureStatus::Clean => {
+                        *subscription = None;
+                    }
+                    tui_events::FailureStatus::Message(msg) => {
+                        let slug = hosted.slug.clone();
+                        *subscription = None;
+                        app.toasts.push(
+                            format!("[{slug}] {msg}"),
+                            ToastKind::Error,
+                            Instant::now(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handle a submitted palette command in the plan-detail view.
+///
+/// Dispatches via `plan_detail_palette_action` and applies the resulting
+/// `PaletteAction`. Terminal-bound variants (confirm dialogs that render
+/// over the live plan-detail view, run-choice dialogs, sub-view pushes)
+/// are driven here because they need the `terminal` the apply helper
+/// can't reach; the in-view-only actions are handled by
+/// `plan_detail_apply_palette_action`. All effects land on `app` /
+/// `terminal` / the DB; the caller's loop unconditionally `continue`s
+/// after this returns.
+fn handle_plan_detail_palette_submit<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
+    input: &str,
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
+    use crate::tui::palette_dispatch::PaletteAction;
+    use std::time::Instant;
+
+    let action = plan_detail_palette_action(input, &config.default_harness, app);
+    app.close_palette();
+    match plan_detail_apply_palette_action(conn, project, app, action)? {
+        Some(PaletteAction::PushPlanDetail { slug: target_slug })
+            if target_slug != app.plan.slug =>
+        {
+            // Switching plans = pop and let plan-list push the
+            // new plan-detail. Keeps the navigation stack
+            // honest (no recursion).
+            app.toasts.push(
+                "Pop back to the plan list to switch plans.",
+                crate::tui::toast::ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        Some(PaletteAction::OpenConfirmArchive { plan_id, slug }) => {
+            let body = format!("Archive plan `{slug}`?");
+            let confirm = crate::tui::dialog::Confirm {
+                title: "Archive plan",
+                body: &body,
+                default: false,
+            };
+            if confirm_with_plan_detail_background(terminal, app, &confirm)? {
+                storage::update_plan_status(conn, &plan_id, crate::plan::PlanStatus::Archived)?;
+                app.toasts.push(
+                    "Plan archived.",
+                    crate::tui::toast::ToastKind::Success,
+                    Instant::now(),
+                );
+                app.should_pop = true;
+            }
+        }
+        Some(PaletteAction::OpenConfirmDelete { plan_id, slug }) => {
+            let body = format!("Permanently delete plan `{slug}`? This cannot be undone.");
+            let confirm = crate::tui::dialog::Confirm {
+                title: "Permanently delete plan",
+                body: &body,
+                default: false,
+            };
+            if confirm_with_plan_detail_background(terminal, app, &confirm)? {
+                storage::delete_plan(conn, &plan_id)?;
+                app.toasts.push(
+                    "Plan deleted.",
+                    crate::tui::toast::ToastKind::Success,
+                    Instant::now(),
+                );
+                app.should_pop = true;
+            }
+        }
+        // §9.1 run-choice dialog. The dialog renders over the
+        // live plan-detail; on success the caller spawns a
+        // non-streaming runner (the streaming `R` keybinding
+        // remains the in-view live-attach path).
+        Some(PaletteAction::OpenRunDialog {
+            default_branch,
+            plan_count,
+            targets,
+        }) => {
+            let outcome = run_dialog_loop_with_bg(
+                terminal,
+                |f| crate::tui::views::plan_detail_ui::draw(f, app),
+                default_branch,
+                plan_count,
+            )?;
+            let report = apply_palette_run_outcome(
+                terminal,
+                |f| crate::tui::views::plan_detail_ui::draw(f, app),
+                project,
+                outcome,
+                &targets,
+                plan_count > 1,
+            )?;
+            flush_palette_run_toasts(report, &mut app.toasts);
+        }
+        Some(PaletteAction::RunOnBranch {
+            branch,
+            targets,
+            force_current_branch,
+        }) => {
+            let report = apply_palette_run_outcome(
+                terminal,
+                |f| crate::tui::views::plan_detail_ui::draw(f, app),
+                project,
+                crate::tui::run_dialog::Outcome::NewBranch(branch),
+                &targets,
+                force_current_branch,
+            )?;
+            flush_palette_run_toasts(report, &mut app.toasts);
+        }
+        // §9 sub-view routing — push the corresponding
+        // sub-view dispatcher against the resolved plan /
+        // step. The action carries the IDs the dispatcher
+        // already substituted from focus context, so we can
+        // hand them through without another lookup.
+        Some(PaletteAction::OpenPlanDependencies { plan_id, slug }) => {
+            let project_path = app.plan.project.clone();
+            run_plan_dependencies_tui(terminal, conn, &project_path, &plan_id, &slug)?;
+        }
+        Some(PaletteAction::OpenPlanHooks { plan_id, slug }) => {
+            let project_path = app.plan.project.clone();
+            run_plan_hooks_tui(terminal, conn, &project_path, &plan_id, &slug)?;
+        }
+        // Plan-detail's palette context doesn't set
+        // `focused_step`, so the dispatcher already toasted
+        // "Open a step first…" before reaching apply. The
+        // forwarded variant is defensive: if a future
+        // change adds a focused-step pointer, the sub-view
+        // pushes correctly without another wiring pass.
+        Some(PaletteAction::OpenStepHooks { step_id, .. }) => {
+            run_step_hooks_tui(terminal, conn, project, &step_id)?;
+        }
+        Some(PaletteAction::OpenStepTags { step_id, .. }) => {
+            run_step_tags_tui(terminal, conn, &step_id)?;
+        }
+        // docs/dag-redesign.md §12.3: `/inbox` opens the
+        // cross-branch interruptions inbox.
+        Some(PaletteAction::OpenInbox) => {
+            let project_path = app.plan.project.clone();
+            run_inbox_tui(terminal, conn, &project_path)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn run_plan_detail_tui<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     conn: &Connection,
@@ -2346,7 +2589,6 @@ fn run_plan_detail_tui<B: ratatui::backend::Backend>(
 where
     <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
 {
-    use crate::tui::events as tui_events;
     use crate::tui::read_only::{self, ReadOnly, ReadOnlyTracker, Transition};
     use crate::tui::toast::ToastKind;
     use crate::tui::views::plan_detail::{self, PlanDetailApp};
@@ -2365,8 +2607,7 @@ where
     // tear down the subprocess. We only attach to it when its slug matches
     // the plan being viewed; otherwise the parent's drain keeps its
     // channel from filling and we render this plan's static state.
-    let subscription_matches =
-        |sub: &Option<tui_events::HostedSubscription>| sub.as_ref().is_some_and(|h| h.slug == slug);
+    // (see `poll_plan_detail_subscription`).
 
     // Local "have we already done the attach handshake for the current
     // subscription instance?" flag. Tracked separately from
@@ -2408,68 +2649,7 @@ where
         //      mid-flight re-attaches both get their `LiveRun` snapshot
         //      populated (the `elapsed_secs` priority order keeps NDJSON
         //      timestamps authoritative when present).
-        if subscription_matches(subscription) {
-            if !attached_this_instance {
-                app.attach_subscription();
-                attached_this_instance = true;
-            }
-            let hosted = subscription.as_mut().expect("matched above");
-            for evt in hosted.sub.drain() {
-                tui_events::dispatch_event(&mut app, &evt);
-            }
-            if hosted.sub.is_disconnected() {
-                // The subscription belongs to *this* plan, so any failure
-                // message goes straight to this view's toast queue without
-                // a slug prefix — the user is staring at the plan it
-                // refers to.
-                match hosted.sub.poll_failure_status() {
-                    tui_events::FailureStatus::Pending => {}
-                    tui_events::FailureStatus::Clean => {
-                        *subscription = None;
-                        app.detach_subscription();
-                        attached_this_instance = false;
-                    }
-                    tui_events::FailureStatus::Message(msg) => {
-                        *subscription = None;
-                        app.detach_subscription();
-                        attached_this_instance = false;
-                        app.toasts.push(msg, ToastKind::Error, Instant::now());
-                    }
-                }
-            }
-        } else {
-            if attached_this_instance {
-                // Parent dropped the subscription while we were attached
-                // (e.g. another view popped after a disconnect we missed).
-                app.detach_subscription();
-                attached_this_instance = false;
-            }
-            // Subscription exists but is bound to another plan: still
-            // drain-and-discard so the unbounded mpsc channel doesn't
-            // accumulate events while the user is parked here. Surface a
-            // failure message with the slug prefix so the user knows which
-            // plan failed even though they're viewing a different one.
-            if let Some(hosted) = subscription.as_mut() {
-                let _ = hosted.sub.drain();
-                if hosted.sub.is_disconnected() {
-                    match hosted.sub.poll_failure_status() {
-                        tui_events::FailureStatus::Pending => {}
-                        tui_events::FailureStatus::Clean => {
-                            *subscription = None;
-                        }
-                        tui_events::FailureStatus::Message(msg) => {
-                            let slug = hosted.slug.clone();
-                            *subscription = None;
-                            app.toasts.push(
-                                format!("[{slug}] {msg}"),
-                                ToastKind::Error,
-                                Instant::now(),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        poll_plan_detail_subscription(&mut app, subscription, &mut attached_this_instance, slug);
         let live_snapshot = storage::get_live_run(conn, project)
             .ok()
             .flatten()
@@ -2593,145 +2773,14 @@ where
         // `PaletteAction`. Terminal-bound variants (confirm dialogs,
         // PushPlanDetail) are returned for the loop to handle.
         if let Some(bar) = app.palette_bar.as_mut() {
-            use crate::tui::palette_dispatch::PaletteAction;
             use crate::tui::widgets::palette_bar::PaletteBarOutcome;
             match bar.on_key(key) {
                 PaletteBarOutcome::Pending => {}
                 PaletteBarOutcome::Cancel => app.close_palette(),
                 PaletteBarOutcome::Submit(input) => {
-                    let action = plan_detail_palette_action(&input, &config.default_harness, &app);
-                    app.close_palette();
-                    match plan_detail_apply_palette_action(conn, project, &mut app, action)? {
-                        Some(PaletteAction::PushPlanDetail { slug: target_slug })
-                            if target_slug != app.plan.slug =>
-                        {
-                            // Switching plans = pop and let plan-list push the
-                            // new plan-detail. Keeps the navigation stack
-                            // honest (no recursion).
-                            app.toasts.push(
-                                "Pop back to the plan list to switch plans.",
-                                crate::tui::toast::ToastKind::Info,
-                                Instant::now(),
-                            );
-                        }
-                        Some(PaletteAction::OpenConfirmArchive { plan_id, slug }) => {
-                            let body = format!("Archive plan `{slug}`?");
-                            let confirm = crate::tui::dialog::Confirm {
-                                title: "Archive plan",
-                                body: &body,
-                                default: false,
-                            };
-                            if confirm_with_plan_detail_background(terminal, &mut app, &confirm)? {
-                                storage::update_plan_status(
-                                    conn,
-                                    &plan_id,
-                                    crate::plan::PlanStatus::Archived,
-                                )?;
-                                app.toasts.push(
-                                    "Plan archived.",
-                                    crate::tui::toast::ToastKind::Success,
-                                    Instant::now(),
-                                );
-                                app.should_pop = true;
-                            }
-                        }
-                        Some(PaletteAction::OpenConfirmDelete { plan_id, slug }) => {
-                            let body =
-                                format!("Permanently delete plan `{slug}`? This cannot be undone.");
-                            let confirm = crate::tui::dialog::Confirm {
-                                title: "Permanently delete plan",
-                                body: &body,
-                                default: false,
-                            };
-                            if confirm_with_plan_detail_background(terminal, &mut app, &confirm)? {
-                                storage::delete_plan(conn, &plan_id)?;
-                                app.toasts.push(
-                                    "Plan deleted.",
-                                    crate::tui::toast::ToastKind::Success,
-                                    Instant::now(),
-                                );
-                                app.should_pop = true;
-                            }
-                        }
-                        // §9.1 run-choice dialog. The dialog renders over the
-                        // live plan-detail; on success the caller spawns a
-                        // non-streaming runner (the streaming `R` keybinding
-                        // remains the in-view live-attach path).
-                        Some(PaletteAction::OpenRunDialog {
-                            default_branch,
-                            plan_count,
-                            targets,
-                        }) => {
-                            let outcome = run_dialog_loop_with_bg(
-                                terminal,
-                                |f| crate::tui::views::plan_detail_ui::draw(f, &mut app),
-                                default_branch,
-                                plan_count,
-                            )?;
-                            let report = apply_palette_run_outcome(
-                                terminal,
-                                |f| crate::tui::views::plan_detail_ui::draw(f, &mut app),
-                                project,
-                                outcome,
-                                &targets,
-                                plan_count > 1,
-                            )?;
-                            flush_palette_run_toasts(report, &mut app.toasts);
-                        }
-                        Some(PaletteAction::RunOnBranch {
-                            branch,
-                            targets,
-                            force_current_branch,
-                        }) => {
-                            let report = apply_palette_run_outcome(
-                                terminal,
-                                |f| crate::tui::views::plan_detail_ui::draw(f, &mut app),
-                                project,
-                                crate::tui::run_dialog::Outcome::NewBranch(branch),
-                                &targets,
-                                force_current_branch,
-                            )?;
-                            flush_palette_run_toasts(report, &mut app.toasts);
-                        }
-                        // §9 sub-view routing — push the corresponding
-                        // sub-view dispatcher against the resolved plan /
-                        // step. The action carries the IDs the dispatcher
-                        // already substituted from focus context, so we can
-                        // hand them through without another lookup.
-                        Some(PaletteAction::OpenPlanDependencies { plan_id, slug }) => {
-                            let project_path = app.plan.project.clone();
-                            run_plan_dependencies_tui(
-                                terminal,
-                                conn,
-                                &project_path,
-                                &plan_id,
-                                &slug,
-                            )?;
-                        }
-                        Some(PaletteAction::OpenPlanHooks { plan_id, slug }) => {
-                            let project_path = app.plan.project.clone();
-                            run_plan_hooks_tui(terminal, conn, &project_path, &plan_id, &slug)?;
-                        }
-                        // Plan-detail's palette context doesn't set
-                        // `focused_step`, so the dispatcher already toasted
-                        // "Open a step first…" before reaching apply. The
-                        // forwarded variant is defensive: if a future
-                        // change adds a focused-step pointer, the sub-view
-                        // pushes correctly without another wiring pass.
-                        Some(PaletteAction::OpenStepHooks { step_id, .. }) => {
-                            run_step_hooks_tui(terminal, conn, project, &step_id)?;
-                        }
-                        Some(PaletteAction::OpenStepTags { step_id, .. }) => {
-                            run_step_tags_tui(terminal, conn, &step_id)?;
-                        }
-                        // docs/dag-redesign.md §12.3: `/inbox` opens the
-                        // cross-branch interruptions inbox.
-                        Some(PaletteAction::OpenInbox) => {
-                            let project_path = app.plan.project.clone();
-                            run_inbox_tui(terminal, conn, &project_path)?;
-                        }
-                        _ => {}
-                    }
+                    handle_plan_detail_palette_submit(
+                        terminal, conn, config, project, &mut app, &input,
+                    )?;
                 }
             }
             continue;
@@ -2856,15 +2905,17 @@ pub(crate) fn plan_detail_apply_add(
         conn,
         &plan_id,
         &sort_key,
-        title,
-        "",
-        None,
-        None,
-        &[],
-        None,
-        None,
-        None,
-        None,
+        crate::storage::NewStep {
+            title,
+            description: "",
+            agent: None,
+            harness: None,
+            acceptance_criteria: &[],
+            max_retries: None,
+            model: None,
+            change_policy: None,
+            tags: None,
+        },
     );
 
     match result {
@@ -3047,90 +3098,17 @@ where
     Ok(())
 }
 
-/// Persist an `R` run / resume action: spawn `ralph run --non-interactive
-/// <slug>` as a child process so the TUI can keep polling the DB while the
-/// runner advances the plan. Stdio is redirected to /dev/null so the
-/// subprocess output doesn't conflict with the TUI's raw-mode display.
+/// Persist an `R` run / resume action by forking a runner subprocess and
+/// streaming its NDJSON event output back into the plan-detail view
+/// (TUI-plan.md §13).
 ///
-/// Superseded by [`plan_detail_apply_run_streaming`] (TUI-plan.md §13) for
-/// the live plan-detail event loop, which forks via
-/// [`tui::events::spawn_streaming_runner`] and consumes the NDJSON event
-/// stream directly. Kept here because callers that don't need the right-pane
-/// tails — currently none in production but referenced from tests — can
-/// still spawn a fire-and-forget runner.
-///
-/// No-op (info toast) if a run is already live for this plan, matching the
-/// acceptance criteria in TUI-plan.md §7.
-#[allow(dead_code)]
-pub(crate) fn plan_detail_apply_run(
-    conn: &Connection,
-    app: &mut crate::tui::views::plan_detail::PlanDetailApp,
-    project: &str,
-    slug: &str,
-    runner_child: &mut Option<std::process::Child>,
-) -> Result<()> {
-    use crate::tui::toast::ToastKind;
-    use std::time::Instant;
-
-    let already_live = storage::get_live_run(conn, project)?
-        .map(|l| l.plan_slug.as_deref() == Some(slug))
-        .unwrap_or(false);
-    if already_live {
-        app.toasts.push(
-            "Run already live for this plan.",
-            ToastKind::Info,
-            Instant::now(),
-        );
-        return Ok(());
-    }
-
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => {
-            app.toasts.push(
-                format!("Cannot locate ralph binary: {e}"),
-                ToastKind::Error,
-                Instant::now(),
-            );
-            return Ok(());
-        }
-    };
-
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("-C")
-        .arg(project)
-        .arg("--non-interactive")
-        .arg("run")
-        .arg(slug)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    match cmd.spawn() {
-        Ok(child) => {
-            *runner_child = Some(child);
-            app.toasts.push(
-                format!("Started run for {slug}"),
-                ToastKind::Success,
-                Instant::now(),
-            );
-        }
-        Err(e) => {
-            app.toasts.push(
-                format!("Failed to start run: {e}"),
-                ToastKind::Error,
-                Instant::now(),
-            );
-        }
-    }
-    Ok(())
-}
-
-/// NDJSON-streaming variant of [`plan_detail_apply_run`] (TUI-plan.md §13).
 /// Forks `ralph run --json --non-interactive <slug>` via
 /// [`tui::events::spawn_streaming_runner`] and stashes the resulting
 /// [`RunSubscription`] on the dispatcher's stack so the next poll iteration
 /// can drain its events into the right-pane state.
+///
+/// No-op (info toast) if a run is already live for this plan, matching the
+/// acceptance criteria in TUI-plan.md §7.
 ///
 /// `mode` selects between `ralph run` and `ralph resume` — both share the
 /// same NDJSON pipe, App-side dispatch, and toast UX, so the auto-start
@@ -3511,15 +3489,17 @@ pub(crate) fn plan_detail_apply_palette_action(
                 conn,
                 &plan_id,
                 &sort_key,
-                &title,
-                "",
-                None,
-                None,
-                &[],
-                None,
-                None,
-                None,
-                None,
+                crate::storage::NewStep {
+                    title: &title,
+                    description: "",
+                    agent: None,
+                    harness: None,
+                    acceptance_criteria: &[],
+                    max_retries: None,
+                    model: None,
+                    change_policy: None,
+                    tags: None,
+                },
             ) {
                 Ok((new_step, _)) => {
                     let new_id = new_step.id.clone();
@@ -4330,15 +4310,10 @@ where
                 storage::update_step_fields_ext(
                     conn,
                     step_id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(&tags),
+                    crate::storage::StepFieldUpdates {
+                        tags_update: Some(&tags),
+                        ..Default::default()
+                    },
                 )?;
                 return Ok(());
             }
@@ -4564,7 +4539,9 @@ fn run_rendered_prompt_tui<B: ratatui::backend::Backend>(
 where
     <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
 {
-    use crate::tui::views::rendered_prompt::{Outcome, RenderedPromptApp, render};
+    use crate::tui::views::rendered_prompt::{
+        BuildAttemptsArgs, Outcome, RenderedPromptApp, render,
+    };
     use crossterm::event::{self, Event, KeyEventKind};
 
     let all_steps = storage::list_steps(conn, &plan.id)?;
@@ -4610,17 +4587,17 @@ where
 
     let logs = storage::list_execution_logs_for_step(conn, &step.id)?;
 
-    let attempts = RenderedPromptApp::build_attempts(
+    let attempts = RenderedPromptApp::build_attempts(&BuildAttemptsArgs {
         plan,
         step,
-        &all_steps,
+        all_steps: &all_steps,
         agent_name,
-        supports_agent_file,
-        &prompts,
-        &resolved_interruptions,
+        harness_supports_agent_file: supports_agent_file,
+        prompts: &prompts,
+        resolved_interruptions: &resolved_interruptions,
         max_attempts,
-        &logs,
-    );
+        logs: &logs,
+    });
 
     let mut app = RenderedPromptApp::new(plan.slug.clone(), step_label, attempts);
 
@@ -4643,6 +4620,105 @@ where
             Outcome::Pop => return Ok(()),
         }
     }
+}
+
+/// Handle a submitted palette command in the step-detail view.
+///
+/// Dispatches via `step_detail_palette_action` and applies the resulting
+/// `PaletteAction`. Step-detail can't easily host a confirm dialog (its
+/// layered panes / pickers), so terminal-bound plan-level actions toast a
+/// redirect instead; run-choice dialogs and step-level sub-view pushes are
+/// driven here. All effects land on `app` / `terminal` / the DB; the
+/// caller's loop unconditionally `continue`s after this returns.
+fn handle_step_detail_palette_submit<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    conn: &Connection,
+    config: &Config,
+    project: &str,
+    app: &mut crate::tui::views::step_detail::StepDetailApp,
+    input: &str,
+) -> Result<()>
+where
+    <B as ratatui::backend::Backend>::Error: Send + Sync + 'static,
+{
+    use crate::tui::palette_dispatch::PaletteAction;
+    use crate::tui::toast::ToastKind;
+    use std::time::Instant;
+
+    let action = step_detail_palette_action(input, &config.default_harness, app);
+    app.close_palette();
+    match step_detail_apply_palette_action(conn, project, app, action)? {
+        Some(PaletteAction::PushPlanDetail { .. })
+        | Some(PaletteAction::OpenConfirmArchive { .. })
+        | Some(PaletteAction::OpenConfirmDelete { .. }) => {
+            app.toasts.push(
+                "Pop back to the plan list to do that.",
+                ToastKind::Info,
+                Instant::now(),
+            );
+        }
+        // §9.1 run-choice dialog. Step-detail renders the
+        // dialog over its own surface; success spawns a
+        // non-streaming runner via the palette path (the
+        // streaming attach path remains plan-detail's `R`).
+        Some(PaletteAction::OpenRunDialog {
+            default_branch,
+            plan_count,
+            targets,
+        }) => {
+            let outcome = run_dialog_loop_with_bg(
+                terminal,
+                |f| crate::tui::views::step_detail::draw(f, app),
+                default_branch,
+                plan_count,
+            )?;
+            let report = apply_palette_run_outcome(
+                terminal,
+                |f| crate::tui::views::step_detail::draw(f, app),
+                project,
+                outcome,
+                &targets,
+                plan_count > 1,
+            )?;
+            flush_palette_run_toasts(report, &mut app.toasts);
+        }
+        Some(PaletteAction::RunOnBranch {
+            branch,
+            targets,
+            force_current_branch,
+        }) => {
+            let report = apply_palette_run_outcome(
+                terminal,
+                |f| crate::tui::views::step_detail::draw(f, app),
+                project,
+                crate::tui::run_dialog::Outcome::NewBranch(branch),
+                &targets,
+                force_current_branch,
+            )?;
+            flush_palette_run_toasts(report, &mut app.toasts);
+        }
+        // §9 sub-view routing — step-detail is the host for
+        // step-level sub-views (`H`/`T` keybindings already
+        // open these), and is the only view that resolves
+        // `focused_step`. Plan-level entries route to the
+        // same dispatchers as plan-detail's keybindings.
+        Some(PaletteAction::OpenPlanDependencies { plan_id, slug }) => {
+            let project_path = app.plan.project.clone();
+            run_plan_dependencies_tui(terminal, conn, &project_path, &plan_id, &slug)?;
+        }
+        Some(PaletteAction::OpenPlanHooks { plan_id, slug }) => {
+            let project_path = app.plan.project.clone();
+            run_plan_hooks_tui(terminal, conn, &project_path, &plan_id, &slug)?;
+        }
+        Some(PaletteAction::OpenStepHooks { step_id, .. }) => {
+            run_step_hooks_tui(terminal, conn, project, &step_id)?;
+        }
+        Some(PaletteAction::OpenStepTags { step_id, .. }) => {
+            run_step_tags_tui(terminal, conn, &step_id)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn run_step_detail_tui<B: ratatui::backend::Backend>(
@@ -4799,91 +4875,14 @@ where
         // confirm dialog (its layered panes / pickers), so terminal-bound
         // actions toast a redirect instead.
         if let Some(bar) = app.palette_bar.as_mut() {
-            use crate::tui::palette_dispatch::PaletteAction;
             use crate::tui::widgets::palette_bar::PaletteBarOutcome;
             match bar.on_key(key) {
                 PaletteBarOutcome::Pending => {}
                 PaletteBarOutcome::Cancel => app.close_palette(),
                 PaletteBarOutcome::Submit(input) => {
-                    let action = step_detail_palette_action(&input, &config.default_harness, &app);
-                    app.close_palette();
-                    match step_detail_apply_palette_action(conn, project, &mut app, action)? {
-                        Some(PaletteAction::PushPlanDetail { .. })
-                        | Some(PaletteAction::OpenConfirmArchive { .. })
-                        | Some(PaletteAction::OpenConfirmDelete { .. }) => {
-                            app.toasts.push(
-                                "Pop back to the plan list to do that.",
-                                ToastKind::Info,
-                                Instant::now(),
-                            );
-                        }
-                        // §9.1 run-choice dialog. Step-detail renders the
-                        // dialog over its own surface; success spawns a
-                        // non-streaming runner via the palette path (the
-                        // streaming attach path remains plan-detail's `R`).
-                        Some(PaletteAction::OpenRunDialog {
-                            default_branch,
-                            plan_count,
-                            targets,
-                        }) => {
-                            let outcome = run_dialog_loop_with_bg(
-                                terminal,
-                                |f| crate::tui::views::step_detail::draw(f, &mut app),
-                                default_branch,
-                                plan_count,
-                            )?;
-                            let report = apply_palette_run_outcome(
-                                terminal,
-                                |f| crate::tui::views::step_detail::draw(f, &mut app),
-                                project,
-                                outcome,
-                                &targets,
-                                plan_count > 1,
-                            )?;
-                            flush_palette_run_toasts(report, &mut app.toasts);
-                        }
-                        Some(PaletteAction::RunOnBranch {
-                            branch,
-                            targets,
-                            force_current_branch,
-                        }) => {
-                            let report = apply_palette_run_outcome(
-                                terminal,
-                                |f| crate::tui::views::step_detail::draw(f, &mut app),
-                                project,
-                                crate::tui::run_dialog::Outcome::NewBranch(branch),
-                                &targets,
-                                force_current_branch,
-                            )?;
-                            flush_palette_run_toasts(report, &mut app.toasts);
-                        }
-                        // §9 sub-view routing — step-detail is the host for
-                        // step-level sub-views (`H`/`T` keybindings already
-                        // open these), and is the only view that resolves
-                        // `focused_step`. Plan-level entries route to the
-                        // same dispatchers as plan-detail's keybindings.
-                        Some(PaletteAction::OpenPlanDependencies { plan_id, slug }) => {
-                            let project_path = app.plan.project.clone();
-                            run_plan_dependencies_tui(
-                                terminal,
-                                conn,
-                                &project_path,
-                                &plan_id,
-                                &slug,
-                            )?;
-                        }
-                        Some(PaletteAction::OpenPlanHooks { plan_id, slug }) => {
-                            let project_path = app.plan.project.clone();
-                            run_plan_hooks_tui(terminal, conn, &project_path, &plan_id, &slug)?;
-                        }
-                        Some(PaletteAction::OpenStepHooks { step_id, .. }) => {
-                            run_step_hooks_tui(terminal, conn, project, &step_id)?;
-                        }
-                        Some(PaletteAction::OpenStepTags { step_id, .. }) => {
-                            run_step_tags_tui(terminal, conn, &step_id)?;
-                        }
-                        _ => {}
-                    }
+                    handle_step_detail_palette_submit(
+                        terminal, conn, config, project, &mut app, &input,
+                    )?;
                 }
             }
             continue;
@@ -5279,10 +5278,12 @@ pub(crate) fn step_detail_handle_esc(
     }
 }
 
-/// Drive one key event into the open answer modal. Persists the chosen
-/// answer (suggestion or `$EDITOR` round-trip) and refreshes the open
-/// question list. When the just-applied answer was the plan's last open
-/// question, opens the resume-implementation modal via
+/// Drive one key event into the open answer modal (the §12.4
+/// `InterruptionModal`, the same modal the inbox uses). `f`/`m` hand off to
+/// `$EDITOR` for the freeform answer / comment; `enter` resolves the chosen
+/// option-or-freeform plus comment through the shared inbox resolution path
+/// and refreshes the open-question list. When the just-applied answer was the
+/// plan's last open question, opens the resume-implementation modal via
 /// [`StepDetailApp::note_answer_persisted`].
 fn handle_answer_modal_key<E>(
     conn: &Connection,
@@ -5295,63 +5296,65 @@ where
     E: FnOnce(&str) -> Result<Option<String>>,
 {
     use crate::tui::toast::ToastKind;
-    use crate::tui::views::answer_modal::AnswerModalAction;
-    use std::time::Instant;
+    use crate::tui::views::answer_modal::InterruptionModalAction;
+    use crate::tui::views::step_detail::NO_EDITOR_TOAST;
 
-    let Some(modal) = app.answer_modal.as_ref() else {
+    let Some(modal) = app.answer_modal.as_mut() else {
         return Ok(());
     };
     let action = modal.handle_key(key);
     match action {
-        AnswerModalAction::Pending => {}
-        AnswerModalAction::Cancel => {
+        InterruptionModalAction::Pending => {}
+        InterruptionModalAction::Cancel => {
             app.close_answer_modal();
         }
-        AnswerModalAction::Submit { index } => {
-            let modal = app.answer_modal.as_ref().expect("modal still open");
-            let Some(answer) = modal.suggestion_text(index).map(|s| s.to_string()) else {
-                app.toasts.push(
-                    "No suggestion at that index.",
-                    ToastKind::Error,
-                    Instant::now(),
-                );
-                return Ok(());
-            };
-            let qid = modal.question_id.clone();
-            persist_answer_and_refresh(conn, project, app, &qid, &answer)?;
-        }
-        AnswerModalAction::EditCustom => {
-            let modal = app.answer_modal.as_ref().expect("modal still open");
-            let qid = modal.question_id.clone();
-            // Seed the editor with a short hint so the user knows what
-            // they're answering — stripped on persist.
-            let seed = format!(
-                "# Replace this with your answer to:\n# {q}\n\n",
-                q = modal.question
-            );
-            let edited = match editor_fn(&seed)? {
-                Some(s) => s,
+        InterruptionModalAction::EditFreeform => {
+            // Seed the editor with the current freeform so re-opening it
+            // amends rather than wipes the captured text (mirrors the inbox).
+            let seed = app
+                .answer_modal
+                .as_ref()
+                .map(|m| m.freeform.clone())
+                .unwrap_or_default();
+            match editor_fn(&seed)? {
+                Some(text) => app.set_answer_modal_freeform(text),
+                // `edit_in_editor` collapses "no $EDITOR" and "editor exited
+                // non-zero" into `None`; surface the same missing-editor toast
+                // the prompt-pane editor path does so the keypress isn't a
+                // silent no-op (the legacy AnswerModal also showed an error).
                 None => {
-                    app.toasts.push(
-                        crate::tui::views::step_detail::NO_EDITOR_TOAST,
-                        ToastKind::Error,
-                        Instant::now(),
-                    );
-                    app.close_answer_modal();
-                    return Ok(());
+                    app.toasts
+                        .push(NO_EDITOR_TOAST, ToastKind::Error, std::time::Instant::now());
                 }
-            };
-            let answer = strip_answer_comments(&edited);
-            if answer.trim().is_empty() {
-                app.toasts.push(
-                    "Empty answer — modal closed without writing.",
-                    ToastKind::Info,
-                    Instant::now(),
-                );
-                app.close_answer_modal();
-                return Ok(());
             }
-            persist_answer_and_refresh(conn, project, app, &qid, &answer)?;
+        }
+        InterruptionModalAction::EditComment => {
+            let seed = app
+                .answer_modal
+                .as_ref()
+                .map(|m| m.comment.clone())
+                .unwrap_or_default();
+            match editor_fn(&seed)? {
+                Some(text) => app.set_answer_modal_comment(text),
+                None => {
+                    app.toasts
+                        .push(NO_EDITOR_TOAST, ToastKind::Error, std::time::Instant::now());
+                }
+            }
+        }
+        InterruptionModalAction::Resolve {
+            interruption_id,
+            resolution,
+            comment,
+        } => {
+            persist_answer_and_refresh(
+                conn,
+                project,
+                app,
+                &interruption_id,
+                &resolution,
+                comment.as_deref(),
+            )?;
         }
     }
     Ok(())
@@ -5380,6 +5383,7 @@ fn persist_answer_and_refresh(
     app: &mut crate::tui::views::step_detail::StepDetailApp,
     question_id: &str,
     answer: &str,
+    comment: Option<&str>,
 ) -> Result<()> {
     use crate::tui::toast::ToastKind;
     use std::time::Instant;
@@ -5387,7 +5391,16 @@ fn persist_answer_and_refresh(
     let step_id_for_event = storage::get_interruption(conn, question_id)
         .ok()
         .map(|q| q.step_id);
-    if let Err(e) = storage::set_question_answer(conn, question_id, answer) {
+    // Reuse the inbox's resolution path so the bounded-injection write and
+    // any retry-exhausted side-effect stay atomic and share one source of
+    // truth (Phase E Fix 1).
+    if let Err(e) = crate::commands::interruption::resolve_interruption_with_retry_handling(
+        conn,
+        project,
+        question_id,
+        answer,
+        comment,
+    ) {
         app.toasts.push(
             format!("Failed to save answer: {e}"),
             ToastKind::Error,
@@ -5400,7 +5413,7 @@ fn persist_answer_and_refresh(
         // Mirrors the inbox resolve path: the TUI itself is never JSON-mode,
         // but wiring the emit here keeps "every resolve goes through the
         // helper" true for this answer-modal path too.
-        output::emit_interruption_resolved(conn, false, question_id, &step_id, answer, None);
+        output::emit_interruption_resolved(conn, false, question_id, &step_id, answer, comment);
     }
     refresh_step_detail_questions(conn, project, app)?;
     let prev_current_branch = previous_run_current_branch(conn, project, &app.plan.slug)?;
@@ -5489,22 +5502,6 @@ fn spawn_resume_run(
     }
     // Pop back to plan-detail so the user sees the live status.
     app.request_pop();
-}
-
-/// Strip leading `#`-prefixed comment lines (and any trailing blank line)
-/// from a custom-answer editor blob, mirroring git commit-message
-/// conventions. The seed text the modal injects starts each hint line
-/// with `#` so this leaves only the user's actual answer.
-fn strip_answer_comments(text: &str) -> String {
-    let mut out = String::new();
-    for line in text.lines() {
-        if line.trim_start().starts_with('#') {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    out.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -6667,20 +6664,33 @@ mod cancel_tests {
     const DEAD_PID: i64 = 0x7FFF_FFFE;
 
     fn seed_plan_and_step(conn: &Connection, slug: &str, project: &str) -> (String, String) {
-        let plan =
-            storage::create_plan(conn, slug, project, "br", "desc", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            conn,
+            storage::NewPlan {
+                slug,
+                project,
+                branch_name: "br",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             conn,
             &plan.id,
-            "t",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "t",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         (plan.id, step.id)
@@ -6797,20 +6807,13 @@ mod cancel_tests {
         storage::update_execution_log(
             &conn,
             log.id,
-            Some(2.5),
-            Some("+runner wrote this diff"),
-            &[],
-            false,
-            false,
-            None,
-            Some("runner stdout"),
-            Some("runner stderr"),
-            None,
-            None,
-            None,
-            None,
-            None, // termination_reason still NULL
-            None,
+            crate::storage::ExecutionLogUpdate {
+                duration_secs: Some(2.5),
+                diff: Some("+runner wrote this diff"),
+                harness_stdout: Some("runner stdout"),
+                harness_stderr: Some("runner stderr"),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -6864,20 +6867,14 @@ mod cancel_tests {
         storage::update_execution_log(
             &conn,
             log.id,
-            Some(1.0),
-            None,
-            &[],
-            false,
-            true,
-            Some("abc"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(TerminationReason::Success),
-            Some(TestStatus::Passed),
+            crate::storage::ExecutionLogUpdate {
+                duration_secs: Some(1.0),
+                committed: true,
+                commit_hash: Some("abc"),
+                termination_reason: Some(TerminationReason::Success),
+                test_status: Some(TestStatus::Passed),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -7025,20 +7022,33 @@ mod status_live_view_tests {
     use rusqlite::params;
 
     fn seed_plan_and_step(conn: &Connection, slug: &str, project: &str) -> (String, String) {
-        let plan =
-            storage::create_plan(conn, slug, project, "br", "desc", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            conn,
+            storage::NewPlan {
+                slug,
+                project,
+                branch_name: "br",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             conn,
             &plan.id,
-            "t",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "t",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         (plan.id, step.id)
@@ -7187,20 +7197,12 @@ mod status_live_view_tests {
         storage::update_execution_log(
             &conn,
             log.id,
-            Some(1.0),
-            None,
-            &[],
-            false,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(TerminationReason::UserInterrupted),
-            Some(TestStatus::Passed),
+            crate::storage::ExecutionLogUpdate {
+                duration_secs: Some(1.0),
+                termination_reason: Some(TerminationReason::UserInterrupted),
+                test_status: Some(TestStatus::Passed),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -7311,13 +7313,15 @@ mod status_live_view_tests {
             &conn,
             project,
             Phase::Tests,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Clear,
+            crate::storage::LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Clear,
+            },
         )
         .unwrap();
 
@@ -7368,34 +7372,49 @@ mod status_live_view_tests {
         let project = dir.canonicalize().unwrap().to_string_lossy().into_owned();
 
         let conn = db::open_memory().unwrap();
-        let plan =
-            storage::create_plan(&conn, "logp", &project, &branch, "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "logp",
+                project: &project,
+                branch_name: &branch,
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step one",
-            "",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step one",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (_s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step two",
-            "",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step two",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -7444,34 +7463,49 @@ mod status_live_view_tests {
         let project = dir.canonicalize().unwrap().to_string_lossy().into_owned();
 
         let conn = db::open_memory().unwrap();
-        let plan =
-            storage::create_plan(&conn, "itp", &project, &branch, "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "itp",
+                project: &project,
+                branch_name: &branch,
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step one",
-            "",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step one",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step two",
-            "",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step two",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -7538,13 +7572,15 @@ mod status_live_view_tests {
         let conn = db::open_memory().unwrap();
         let plan = storage::create_plan(
             &conn,
-            "norepo2",
-            "/tmp/definitely-not-a-git-repo-xyz",
-            "br",
-            "d",
-            None,
-            None,
-            &[],
+            storage::NewPlan {
+                slug: "norepo2",
+                project: "/tmp/definitely-not-a-git-repo-xyz",
+                branch_name: "br",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         assert!(collect_iteration_commits_by_step(&conn, &plan).is_empty());
@@ -7556,13 +7592,15 @@ mod status_live_view_tests {
         // Project path that isn't a git repo → best-effort empty, no panic.
         let plan = storage::create_plan(
             &conn,
-            "norepo",
-            "/tmp/definitely-not-a-git-repo-xyz",
-            "br",
-            "d",
-            None,
-            None,
-            &[],
+            storage::NewPlan {
+                slug: "norepo",
+                project: "/tmp/definitely-not-a-git-repo-xyz",
+                branch_name: "br",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         assert!(collect_skip_wip_commits(&conn, &plan).is_empty());
@@ -7996,9 +8034,33 @@ mod plan_list_action_tests {
         // undefined, so without this gap the test cursor could land on
         // either plan depending on which side of the millisecond boundary
         // both inserts fell on.
-        storage::create_plan(&conn, "alpha", project, "b1", "d", None, None, &[]).unwrap();
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "alpha",
+                project,
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        storage::create_plan(&conn, "beta", project, "b2", "d", None, None, &[]).unwrap();
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "beta",
+                project,
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let tiles = build_plan_tiles(&conn, project).unwrap();
         let app = PlanListApp::new(tiles, project, "UTC");
         (conn, app)
@@ -8071,7 +8133,19 @@ mod plan_list_action_tests {
         // Simulate an external mutation: another process inserts a plan
         // while the TUI is open. Without `r`, the in-memory tile list would
         // remain stale.
-        storage::create_plan(&conn, "gamma", project, "b3", "d", None, None, &[]).unwrap();
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "gamma",
+                project,
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         assert_eq!(app.tiles.len(), initial_len);
 
         plan_list_refresh(&conn, project, &mut app).unwrap();
@@ -8293,9 +8367,45 @@ mod archived_list_dispatcher_tests {
 
     fn seed_archived(project: &str) -> (Connection, ArchivedListApp) {
         let conn = db::open_memory().unwrap();
-        let a = storage::create_plan(&conn, "alpha", project, "b1", "d", None, None, &[]).unwrap();
-        let b = storage::create_plan(&conn, "beta", project, "b2", "d", None, None, &[]).unwrap();
-        let g = storage::create_plan(&conn, "gamma", project, "b3", "d", None, None, &[]).unwrap();
+        let a = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "alpha",
+                project,
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let b = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "beta",
+                project,
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let g = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "gamma",
+                project,
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         // Archive every plan so the archived view sees three rows.
         storage::update_plan_status(&conn, &a.id, PlanStatus::Archived).unwrap();
         storage::update_plan_status(&conn, &b.id, PlanStatus::Archived).unwrap();
@@ -8397,7 +8507,19 @@ mod archived_list_dispatcher_tests {
     fn unarchive_empties_view_when_last_archived_plan_returns() {
         let project = "/tmp/archived-unarchive-last";
         let conn = db::open_memory().unwrap();
-        let only = storage::create_plan(&conn, "only", project, "b", "d", None, None, &[]).unwrap();
+        let only = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "only",
+                project,
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &only.id, PlanStatus::Archived).unwrap();
         let tiles = build_archived_tiles(&conn, project).unwrap();
         let mut app = ArchivedListApp::new(tiles, project, "UTC");
@@ -8444,8 +8566,19 @@ mod archived_list_dispatcher_tests {
         let (conn, mut app) = seed_archived(project);
         let initial_len = app.tiles.len();
 
-        let delta =
-            storage::create_plan(&conn, "delta", project, "b4", "d", None, None, &[]).unwrap();
+        let delta = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "delta",
+                project,
+                branch_name: "b4",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &delta.id, PlanStatus::Archived).unwrap();
         // Without a refresh, the tile list is still stale.
         assert_eq!(app.tiles.len(), initial_len);
@@ -8676,21 +8809,33 @@ mod step_detail_dispatcher_tests {
     /// Build a step-detail app whose plan + first step are materialized in
     /// `conn`, so dispatcher edits land on real rows we can read back.
     fn db_app(conn: &Connection, project: &str) -> StepDetailApp {
-        let plan =
-            storage::create_plan(conn, "tui-c", project, "branch-c", "desc", None, None, &[])
-                .unwrap();
+        let plan = storage::create_plan(
+            conn,
+            storage::NewPlan {
+                slug: "tui-c",
+                project,
+                branch_name: "branch-c",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _pos) = storage::create_step(
             conn,
             &plan.id,
-            "Original title",
-            "Original description",
-            None,
-            None,
-            &["original-crit".to_string()],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Original title",
+                description: "Original description",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &["original-crit".to_string()],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         StepDetailApp::new(
@@ -8996,6 +9141,52 @@ mod step_detail_dispatcher_tests {
             "an open picker must be torn down when an external lock engages"
         );
     }
+
+    /// Regression (codex review of the AnswerModal→InterruptionModal
+    /// migration): pressing `f` (freeform) in the step-detail answer modal
+    /// when the editor handoff yields `None` — no `$EDITOR`, or the editor
+    /// exited non-zero — must surface the missing-editor toast rather than
+    /// silently no-op. The legacy AnswerModal showed a visible error here;
+    /// the migrated path must keep parity with that and with the prompt-pane
+    /// editor flow.
+    #[test]
+    fn answer_modal_freeform_no_editor_surfaces_toast() {
+        use crate::tui::views::step_detail::NO_EDITOR_TOAST;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let conn = crate::db::open_memory().unwrap();
+        let project = "/proj-answer-noeditor";
+        let mut app = db_app(&conn, project);
+        app.focused_pane = Pane::OpenQuestions;
+        app.set_open_questions_for_step(vec![storage::OpenQuestion {
+            id: "q1".into(),
+            step_id: app.steps[0].id.clone(),
+            plan_id: app.plan.id.clone(),
+            plan_slug: app.plan.slug.clone(),
+            step_num: 1,
+            step_title: app.steps[0].title.clone(),
+            attempt: 1,
+            question: "Q?".into(),
+            suggestions: vec!["yes".into()],
+            kind: crate::plan::InterruptionKind::Question,
+            asked_at: "2026-05-05T00:00:00Z".into(),
+        }]);
+        assert!(
+            app.open_answer_modal(),
+            "modal should open on a focused open question"
+        );
+
+        // `f` requests the freeform editor; the fake editor reports "no editor"
+        // (the real `edit_in_editor` returns `Ok(None)` for that case).
+        let key = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE);
+        handle_answer_modal_key(&conn, project, &mut app, key, |_| Ok(None)).unwrap();
+
+        assert_eq!(
+            app.toasts.current().map(|t| t.text.as_str()),
+            Some(NO_EDITOR_TOAST),
+            "a missing/aborted editor must surface a toast, not a silent no-op"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9019,9 +9210,33 @@ mod palette_action_tests {
         // values differ — list_plans_sorted_by_recency orders by
         // created_at DESC and SQLite's tie-break on equal timestamps is
         // undefined, which makes downstream tests fragile.
-        storage::create_plan(&conn, "alpha", project, "b1", "d", None, None, &[]).unwrap();
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "alpha",
+                project,
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        storage::create_plan(&conn, "beta", project, "b2", "d", None, None, &[]).unwrap();
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "beta",
+                project,
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let tiles = build_plan_tiles(&conn, project).unwrap();
         let app = PlanListApp::new(tiles, project, "UTC");
         (conn, app)
@@ -9186,7 +9401,19 @@ mod run_dialog_apply_tests {
 
     fn seed_plan(project: &str) -> (Connection, PlanListApp) {
         let conn = db::open_memory().unwrap();
-        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[]).unwrap();
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "alpha",
+                project,
+                branch_name: "feature-x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let tiles = build_plan_tiles(&conn, project).unwrap();
         let app = PlanListApp::new(tiles, project, "UTC");
         (conn, app)
@@ -9478,7 +9705,19 @@ mod sub_view_routing_tests {
 
     fn seed_plan_list(project: &str) -> (Connection, PlanListApp) {
         let conn = db::open_memory().unwrap();
-        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[]).unwrap();
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "alpha",
+                project,
+                branch_name: "feature-x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let tiles = build_plan_tiles(&conn, project).unwrap();
         let app = PlanListApp::new(tiles, project, "UTC");
         (conn, app)
@@ -9486,7 +9725,19 @@ mod sub_view_routing_tests {
 
     fn seed_plan_detail(project: &str) -> (Connection, PlanDetailApp) {
         let conn = db::open_memory().unwrap();
-        storage::create_plan(&conn, "alpha", project, "feature-x", "d", None, None, &[]).unwrap();
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "alpha",
+                project,
+                branch_name: "feature-x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let plan = storage::get_plan_by_slug(&conn, "alpha", project)
             .unwrap()
             .unwrap();
@@ -10157,8 +10408,19 @@ mod pause_tests {
     const DEAD_PID: i64 = 0x7FFF_FFFE;
 
     fn seed_plan(conn: &Connection, slug: &str, project: &str) -> String {
-        let plan =
-            storage::create_plan(conn, slug, project, "br", "desc", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            conn,
+            storage::NewPlan {
+                slug,
+                project,
+                branch_name: "br",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(conn, &plan.id, crate::plan::PlanStatus::Ready).unwrap();
         plan.id
     }

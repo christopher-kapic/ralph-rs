@@ -905,15 +905,17 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            Some("A test plan"),
-            Some("feat/test"),
-            None,
-            None,
-            None,
-            &["cargo build".to_string()],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: Some("A test plan"),
+                branch: Some("feat/test"),
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &["cargo build".to_string()],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -933,15 +935,17 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -959,15 +963,17 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -984,15 +990,17 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1008,55 +1016,61 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "First step",
-            Some("Do something"),
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "First step",
+                description: Some("Do something"),
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Second step",
-            Some("Do another thing"),
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Second step",
+                description: Some("Do another thing"),
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1076,56 +1090,62 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         // First is the root; Third depends on First (a First -> Third chain).
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "First",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "First",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Third",
-            None,
-            Some("1"), // depends on First (step #1)
-            None,
-            false,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Third",
+                description: None,
+                after: Some("1"),
+                before: None,
+                root: false,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1134,21 +1154,23 @@ mod tests {
         // (Replaces the old positional "insert after position 1".)
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Second",
-            None,
-            None,
-            Some("2"), // before Third (step #2); Second inherits its incoming edges
-            false,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Second",
+                description: None,
+                after: None,
+                before: Some("2"),
+                root: false,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1182,36 +1204,40 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         let criteria = vec!["Tests pass".to_string(), "No warnings".to_string()];
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Build it",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &criteria,
-            Some(5),
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Build it",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &criteria,
+                max_retries: Some(5),
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1231,35 +1257,39 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "First",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "First",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1269,21 +1299,23 @@ mod tests {
         // positional "insert after position 1".)
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Inserted",
-            None,
-            Some("1"), // depends on First (step #1)
-            None,
-            false,
-            None,
-            None,
-            None,
-            &criteria,
-            Some(2),
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Inserted",
+                description: None,
+                after: Some("1"),
+                before: None,
+                root: false,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &criteria,
+                max_retries: Some(2),
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1310,55 +1342,61 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "First",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "First",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Second",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Second",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1388,58 +1426,64 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Old title",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Old title",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
 
         step_edit(
             &conn,
-            "my-plan",
-            &project,
-            Some("1"),
-            None,
-            Some("New title"),
-            Some("New desc"),
-            None,
-            None,
-            None,
-            &[],
-            false,
-            None,
-            false,
-            None,
-            None, // review (--review absent)
-            &[],
-            false,
+            StepEditArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                step_sel: Some("1"),
+                step_id: None,
+                title: Some("New title"),
+                description: Some("New desc"),
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                clear_criteria: false,
+                max_retries: None,
+                clear_max_retries: false,
+                change_policy: None,
+                review: None,
+                tags: &[],
+                clear_tags: false,
+            },
             &test_out(),
         )
         .unwrap();
@@ -1458,35 +1502,39 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Step",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Step",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1519,75 +1567,83 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "A",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "A",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "B",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "B",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "C",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "C",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1610,75 +1666,83 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "A",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "A",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "B",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "B",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "C",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "C",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1703,43 +1767,49 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-b",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-b",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-c",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &["plan-a".to_string(), "plan-b".to_string()],
+            PlanCreateArgs {
+                slug: "plan-c",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["plan-a".to_string(), "plan-b".to_string()],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1765,15 +1835,17 @@ mod tests {
 
         let result = plan_create(
             &conn,
-            "plan-x",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &["nonexistent".to_string()],
+            PlanCreateArgs {
+                slug: "plan-x",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["nonexistent".to_string()],
+            },
             &test_out(),
         );
         assert!(result.is_err());
@@ -1789,29 +1861,33 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-b",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-b",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1838,15 +1914,17 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1867,29 +1945,33 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-b",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-b",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1920,29 +2002,33 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-b",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &["plan-a".to_string()],
+            PlanCreateArgs {
+                slug: "plan-b",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["plan-a".to_string()],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1975,43 +2061,49 @@ mod tests {
 
         plan_create(
             &conn,
-            "plan-a",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "plan-a",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-b",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &["plan-a".to_string()],
+            PlanCreateArgs {
+                slug: "plan-b",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["plan-a".to_string()],
+            },
             &test_out(),
         )
         .unwrap();
         plan_create(
             &conn,
-            "plan-c",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &["plan-a".to_string()],
+            PlanCreateArgs {
+                slug: "plan-c",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["plan-a".to_string()],
+            },
             &test_out(),
         )
         .unwrap();
@@ -2095,35 +2187,39 @@ mod tests {
 
         plan_create(
             &conn,
-            "my-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "my-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
         step_add(
             &conn,
-            "my-plan",
-            &project,
-            "Step",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "my-plan",
+                project: &project,
+                title: "Step",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -2180,8 +2276,19 @@ mod tests {
     fn test_resolve_resume_plan_with_slug_uses_exact_lookup() {
         let (_tmp, dir, project, _branch) = git_repo_for_resume();
         let conn = db::open_memory().unwrap();
-        let plan =
-            storage::create_plan(&conn, "exact", &project, "any", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "exact",
+                project: &project,
+                branch_name: "any",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Failed).unwrap();
 
         let p = resolve_resume_plan(&conn, Some("exact".to_string()), &project, &dir).unwrap();
@@ -2192,8 +2299,19 @@ mod tests {
     fn test_resolve_resume_plan_no_slug_single_branch_match() {
         let (_tmp, dir, project, branch) = git_repo_for_resume();
         let conn = db::open_memory().unwrap();
-        let plan =
-            storage::create_plan(&conn, "only", &project, "x", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "only",
+                project: &project,
+                branch_name: "x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Failed).unwrap();
         storage::set_plan_last_run_branch(&conn, &plan.id, &branch).unwrap();
 
@@ -2205,8 +2323,32 @@ mod tests {
     fn test_resolve_resume_plan_no_slug_picks_most_recent_when_ambiguous() {
         let (_tmp, dir, project, branch) = git_repo_for_resume();
         let conn = db::open_memory().unwrap();
-        let p1 = storage::create_plan(&conn, "older", &project, "x", "d", None, None, &[]).unwrap();
-        let p2 = storage::create_plan(&conn, "newer", &project, "x", "d", None, None, &[]).unwrap();
+        let p1 = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "older",
+                project: &project,
+                branch_name: "x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p2 = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "newer",
+                project: &project,
+                branch_name: "x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &p1.id, PlanStatus::Failed).unwrap();
         storage::update_plan_status(&conn, &p2.id, PlanStatus::Failed).unwrap();
         storage::set_plan_last_run_branch(&conn, &p1.id, &branch).unwrap();
@@ -2226,8 +2368,19 @@ mod tests {
         let conn = db::open_memory().unwrap();
         // A plan whose last_run_branch is some OTHER branch — must not
         // match by branch.
-        let other =
-            storage::create_plan(&conn, "elsewhere", &project, "x", "d", None, None, &[]).unwrap();
+        let other = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "elsewhere",
+                project: &project,
+                branch_name: "x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &other.id, PlanStatus::Failed).unwrap();
         let bogus_branch = format!("not-{branch}");
         storage::set_plan_last_run_branch(&conn, &other.id, &bogus_branch).unwrap();
@@ -2246,7 +2399,19 @@ mod tests {
     fn test_resolve_resume_plan_falls_back_to_aborted_plan_when_no_branch_match() {
         let (_tmp, dir, project, branch) = git_repo_for_resume();
         let conn = db::open_memory().unwrap();
-        let p = storage::create_plan(&conn, "ab", &project, "x", "d", None, None, &[]).unwrap();
+        let p = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "ab",
+                project: &project,
+                branch_name: "x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &p.id, PlanStatus::Aborted).unwrap();
         // Last run executed on a branch that is NOT the current one, so
         // the branch-based resolver finds nothing.
@@ -2285,8 +2450,19 @@ mod tests {
 
         // Plan A: slug='deploy', branch_name='deploy'. Last run on
         // 'old-master' (some branch that is NOT the current one).
-        let a = storage::create_plan(&conn, "deploy", &project, "deploy", "d", None, None, &[])
-            .unwrap();
+        let a = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "deploy",
+                project: &project,
+                branch_name: "deploy",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &a.id, PlanStatus::Failed).unwrap();
         let unrelated = format!("unrelated-{current_branch}");
         storage::set_plan_last_run_branch(&conn, &a.id, &unrelated).unwrap();
@@ -2330,13 +2506,15 @@ mod tests {
         // last_run_branch stays NULL.
         let p = storage::create_plan(
             &conn,
-            "fresh",
-            &project,
-            &current_branch,
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "fresh",
+                project: &project,
+                branch_name: &current_branch,
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::update_plan_status(&conn, &p.id, PlanStatus::Ready).unwrap();
@@ -2354,21 +2532,35 @@ mod tests {
     /// Build a plan with `n` appended steps titled `Step {i}` (0-based).
     /// Returns `(plan_id, short_ids_in_order)`.
     fn plan_with_steps(conn: &Connection, project: &str, n: usize) -> (String, Vec<String>) {
-        let plan = storage::create_plan(conn, "sel", project, "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            conn,
+            crate::storage::NewPlan {
+                slug: "sel",
+                project,
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let mut sids = Vec::with_capacity(n);
         for i in 0..n {
             let (s, _) = storage::create_step(
                 conn,
                 &plan.id,
-                &format!("Step {i}"),
-                "",
-                None,
-                None,
-                &[],
-                None,
-                None,
-                None,
-                None,
+                crate::storage::NewStep {
+                    title: &format!("Step {i}"),
+                    description: "",
+                    agent: None,
+                    harness: None,
+                    acceptance_criteria: &[],
+                    max_retries: None,
+                    model: None,
+                    change_policy: None,
+                    tags: None,
+                },
             )
             .unwrap();
             sids.push(s.short_id);
@@ -2454,20 +2646,33 @@ mod tests {
         let a_step = resolve_step(&conn, &_plan_a, Some(a_sids[0].as_str()), None)
             .unwrap()
             .0;
-        let plan_b =
-            storage::create_plan(&conn, "other", &project, "b", "d", None, None, &[]).unwrap();
+        let plan_b = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "other",
+                project: &project,
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::create_step(
             &conn,
             &plan_b.id,
-            "B0",
-            "",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "B0",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 

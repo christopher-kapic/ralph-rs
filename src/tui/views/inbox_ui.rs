@@ -101,8 +101,9 @@ fn draw_list(frame: &mut Frame, app: &InboxState, area: Rect) {
     frame.render_stateful_widget(list, area, &mut ls);
 }
 
-/// The §12.4 ranked-answer / blocker modal.
-fn render_interruption_modal(frame: &mut Frame, area: Rect, modal: &InterruptionModal) {
+/// The §12.4 ranked-answer / blocker modal. Shared with step-detail's inline
+/// answer flow so both surfaces render one identical modal.
+pub(crate) fn render_interruption_modal(frame: &mut Frame, area: Rect, modal: &InterruptionModal) {
     let mut lines: Vec<Line> = Vec::new();
     let title = if modal.is_blocker() {
         " Resolve blocker "

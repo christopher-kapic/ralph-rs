@@ -522,18 +522,34 @@ pub fn cmd_interruption_show(
 ///
 /// When PLAN is supplied, the selector is resolved (and any index is
 /// interpreted) against only the open interruptions for that plan.
-#[allow(clippy::too_many_arguments)]
+/// The selection + resolution payload for [`cmd_interruption_resolve`]: which
+/// interruption (`plan_slug` scope + `selector`), the chosen `option` /
+/// freeform `answer` / `comment`, and the `require_question` guard for the
+/// legacy `ralph question answer` alias. `conn` / `project` / `out` stay
+/// separate lead arguments.
+pub struct ResolveArgs<'a> {
+    pub plan_slug: Option<&'a str>,
+    pub selector: &'a str,
+    pub option: Option<usize>,
+    pub answer: Option<&'a str>,
+    pub comment: Option<&'a str>,
+    pub require_question: bool,
+}
+
 pub fn cmd_interruption_resolve(
     conn: &Connection,
     project: &str,
-    plan_slug: Option<&str>,
-    selector: &str,
-    option: Option<usize>,
-    answer: Option<&str>,
-    comment: Option<&str>,
-    require_question: bool,
+    args: ResolveArgs<'_>,
     out: &OutputContext,
 ) -> Result<()> {
+    let ResolveArgs {
+        plan_slug,
+        selector,
+        option,
+        answer,
+        comment,
+        require_question,
+    } = args;
     let opens = storage::list_open_interruptions_enriched(conn, project, plan_slug)?;
     let q = match resolve_selector(&opens, selector) {
         Some(q) => q.clone(),
@@ -689,20 +705,33 @@ mod tests {
     }
 
     fn seed_plan_and_step(conn: &Connection, slug: &str, project: &str) -> (String, String) {
-        let plan = storage::create_plan(conn, slug, project, "br", "desc", None, None, &[])
-            .expect("create_plan");
+        let plan = storage::create_plan(
+            conn,
+            crate::storage::NewPlan {
+                slug,
+                project,
+                branch_name: "br",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .expect("create_plan");
         let (step, _) = storage::create_step(
             conn,
             &plan.id,
-            "title",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "title",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .expect("create_step");
         (plan.id, step.id)
@@ -755,12 +784,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &qid,
-            Some(2),
-            None,
-            Some("go with file db"),
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &qid,
+                option: Some(2),
+                answer: None,
+                comment: Some("go with file db"),
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
@@ -774,12 +805,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &bid,
-            None,
-            Some("granted"),
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &bid,
+                option: None,
+                answer: Some("granted"),
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
@@ -808,12 +841,14 @@ mod tests {
         let err = cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &qid,
-            Some(5),
-            None,
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &qid,
+                option: Some(5),
+                answer: None,
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap_err();
@@ -832,12 +867,14 @@ mod tests {
         let err = cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            "nope",
-            None,
-            Some("x"),
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: "nope",
+                option: None,
+                answer: Some("x"),
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap_err();
@@ -870,12 +907,14 @@ mod tests {
         let err = cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &bid,
-            None,
-            Some("granted"),
-            None,
-            true,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &bid,
+                option: None,
+                answer: Some("granted"),
+                comment: None,
+                require_question: true,
+            },
             &quiet_out(),
         )
         .unwrap_err();
@@ -892,17 +931,22 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &bid,
-            None,
-            Some("granted"),
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &bid,
+                option: None,
+                answer: Some("granted"),
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
         let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
-        assert!(after.is_empty(), "blocker resolved via interruption resolve");
+        assert!(
+            after.is_empty(),
+            "blocker resolved via interruption resolve"
+        );
     }
 
     // -- Phase C: apply_retry_exhausted_resolution -------------------------
@@ -1164,12 +1208,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &id,
-            Some(1), // priority 1 = Retry
-            None,
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &id,
+                option: Some(1),
+                answer: None,
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
@@ -1198,8 +1244,20 @@ mod tests {
         storage::update_step_status(&conn, &step_id, StepStatus::Pending).unwrap();
         let id = seed_auto_blocker(&conn, &step_id);
 
-        cmd_interruption_resolve(&conn, project, None, &id, Some(1), None, None, false, &quiet_out())
-            .unwrap();
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &id,
+                option: Some(1),
+                answer: None,
+                comment: None,
+                require_question: false,
+            },
+            &quiet_out(),
+        )
+        .unwrap();
 
         // Retry-with-parked-changes preserved the old audit rows. A fresh logical
         // attempt=1 log must now insert successfully for the new cycle.
@@ -1262,8 +1320,20 @@ mod tests {
             quiet: true,
             color: false,
         };
-        cmd_interruption_resolve(&conn, project, None, &qid, Some(2), None, None, false, &json_out)
-            .unwrap();
+        cmd_interruption_resolve(
+            &conn,
+            project,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &qid,
+                option: Some(2),
+                answer: None,
+                comment: None,
+                require_question: false,
+            },
+            &json_out,
+        )
+        .unwrap();
 
         let after = storage::list_open_interruptions_enriched(&conn, project, None).unwrap();
         assert!(after.is_empty(), "resolved row drops out of the open set");
@@ -1281,12 +1351,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &id,
-            None,
-            Some(RETRY_EXHAUSTED_OPTION_FAIL), // freeform that matches the Fail option text
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &id,
+                option: None,
+                answer: Some(RETRY_EXHAUSTED_OPTION_FAIL),
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
@@ -1424,12 +1496,14 @@ mod tests {
         let err = cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &id,
-            None,
-            None,
-            Some("just a note, not a decision"),
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &id,
+                option: None,
+                answer: None,
+                comment: Some("just a note, not a decision"),
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap_err();
@@ -1484,12 +1558,14 @@ mod tests {
         let err = cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &bid,
-            None,
-            None,
-            Some("looked into it"),
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &bid,
+                option: None,
+                answer: None,
+                comment: Some("looked into it"),
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap_err();
@@ -1528,12 +1604,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &qid,
-            None,
-            None,
-            Some("Postgres please, found prior art"),
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &qid,
+                option: None,
+                answer: None,
+                comment: Some("Postgres please, found prior art"),
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
@@ -1680,12 +1758,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &id,
-            None,
-            Some(&padded),
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &id,
+                option: None,
+                answer: Some(&padded),
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
@@ -1709,12 +1789,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &id,
-            None,
-            Some("  skip and mark failed  "),
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &id,
+                option: None,
+                answer: Some("  skip and mark failed  "),
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
@@ -1739,12 +1821,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &id,
-            Some(1), // priority 1 = MARK_FAILED
-            None,
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &id,
+                option: Some(1),
+                answer: None,
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
@@ -1778,12 +1862,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &id,
-            Some(2), // priority 2 = MARK_PENDING
-            None,
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &id,
+                option: Some(2),
+                answer: None,
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
@@ -1815,12 +1901,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &id,
-            None,
-            Some("the disk was full"),
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &id,
+                option: None,
+                answer: Some("the disk was full"),
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
@@ -1911,12 +1999,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &id,
-            None,
-            Some("approved, take one more pass"),
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &id,
+                option: None,
+                answer: Some("approved, take one more pass"),
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();
@@ -1956,12 +2046,14 @@ mod tests {
         cmd_interruption_resolve(
             &conn,
             project,
-            None,
-            &id,
-            None,
-            Some("granted"),
-            None,
-            false,
+            ResolveArgs {
+                plan_slug: None,
+                selector: &id,
+                option: None,
+                answer: Some("granted"),
+                comment: None,
+                require_question: false,
+            },
             &quiet_out(),
         )
         .unwrap();

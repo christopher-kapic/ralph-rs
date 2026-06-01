@@ -181,6 +181,29 @@ pub(crate) fn render_budget_tag(step: &Step, config: &Config) -> String {
     format!(" (attempts: {}/{})", step.attempts, max_attempts)
 }
 
+/// The inputs to [`step_add`]: the owning `plan_slug` / `project`, the new
+/// step's body (`title` / `description`), its placement (`after` / `before` /
+/// `root` / `depends_on`), the optional per-step `agent` / `harness` /
+/// `model` overrides, the acceptance `criteria`, `max_retries`,
+/// `change_policy`, and `tags`. `conn` and the `out` sink stay separate.
+pub struct StepAddArgs<'a> {
+    pub plan_slug: &'a str,
+    pub project: &'a str,
+    pub title: &'a str,
+    pub description: Option<&'a str>,
+    pub after: Option<&'a str>,
+    pub before: Option<&'a str>,
+    pub root: bool,
+    pub agent: Option<&'a str>,
+    pub harness: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub criteria: &'a [String],
+    pub max_retries: Option<i32>,
+    pub change_policy: Option<ChangePolicy>,
+    pub tags: &'a [String],
+    pub depends_on: &'a [String],
+}
+
 /// Add a single step, placing it explicitly in the dependency DAG.
 ///
 /// Placement is mandatory on a non-empty plan (the first step of an empty
@@ -199,26 +222,24 @@ pub(crate) fn render_budget_tag(step: &Step, config: &Config) -> String {
 /// - `--after X --before Y`: splice the new step between them — it depends
 ///   on `X`, and the `X → Y` edge is rerouted so `Y` depends on the new
 ///   step instead.
-#[allow(clippy::too_many_arguments)]
-pub fn step_add(
-    conn: &Connection,
-    plan_slug: &str,
-    project: &str,
-    title: &str,
-    description: Option<&str>,
-    after: Option<&str>,
-    before: Option<&str>,
-    root: bool,
-    agent: Option<&str>,
-    harness: Option<&str>,
-    model: Option<&str>,
-    criteria: &[String],
-    max_retries: Option<i32>,
-    change_policy: Option<ChangePolicy>,
-    tags: &[String],
-    depends_on: &[String],
-    out: &OutputContext,
-) -> Result<()> {
+pub fn step_add(conn: &Connection, args: StepAddArgs<'_>, out: &OutputContext) -> Result<()> {
+    let StepAddArgs {
+        plan_slug,
+        project,
+        title,
+        description,
+        after,
+        before,
+        root,
+        agent,
+        harness,
+        model,
+        criteria,
+        max_retries,
+        change_policy,
+        tags,
+        depends_on,
+    } = args;
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
@@ -297,15 +318,17 @@ pub fn step_add(
         let (step, pos) = storage::create_step(
             conn,
             &plan.id,
-            title,
-            desc,
-            agent,
-            harness,
-            criteria,
-            max_retries,
-            model,
-            change_policy,
-            tags_arg,
+            crate::storage::NewStep {
+                title,
+                description: desc,
+                agent,
+                harness,
+                acceptance_criteria: criteria,
+                max_retries,
+                model,
+                change_policy,
+                tags: tags_arg,
+            },
         )?;
 
         // --depends-on: the general/join form. The new step has no edges
@@ -531,15 +554,17 @@ pub fn step_add_bulk(
             let (mut step, pos) = storage::create_step(
                 conn,
                 &plan.id,
-                &s.title,
-                &s.description,
-                s.agent.as_deref(),
-                s.harness.as_deref(),
-                &s.acceptance_criteria,
-                s.max_retries,
-                s.model.as_deref(),
-                Some(s.change_policy),
-                tags_arg,
+                crate::storage::NewStep {
+                    title: &s.title,
+                    description: &s.description,
+                    agent: s.agent.as_deref(),
+                    harness: s.harness.as_deref(),
+                    acceptance_criteria: &s.acceptance_criteria,
+                    max_retries: s.max_retries,
+                    model: s.model.as_deref(),
+                    change_policy: Some(s.change_policy),
+                    tags: tags_arg,
+                },
             )?;
             if let Some(sid) = s.short_id.as_deref() {
                 // Pin the (validated, 8-char) persisted handle. The
@@ -644,32 +669,53 @@ pub fn step_remove(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn step_edit(
-    conn: &Connection,
-    plan_slug: &str,
-    project: &str,
-    step_sel: Option<&str>,
-    step_id: Option<&str>,
-    title: Option<&str>,
-    description: Option<&str>,
-    agent: Option<&str>,
-    harness: Option<&str>,
-    model: Option<&str>,
-    criteria: &[String],
-    clear_criteria: bool,
-    max_retries: Option<i32>,
-    clear_max_retries: bool,
-    change_policy: Option<ChangePolicy>,
-    // `--review on|off|inherit` resolved to the nullable column value:
-    // outer `None` = flag absent (leave the stored override untouched);
-    // `Some(Some(true|false))` = explicit per-step on/off override;
-    // `Some(None)` = `inherit` (clear the override → defer to plan/global).
-    review: Option<Option<bool>>,
-    tags: &[String],
-    clear_tags: bool,
-    out: &OutputContext,
-) -> Result<()> {
+/// The inputs to [`step_edit`]: the owning `plan_slug` / `project`, the step
+/// selector (`step_sel` / `step_id`), and every editable field as an
+/// apply-this-change option (a bare `Option`/`&[]`/`clear_*` bool per field).
+pub struct StepEditArgs<'a> {
+    pub plan_slug: &'a str,
+    pub project: &'a str,
+    pub step_sel: Option<&'a str>,
+    pub step_id: Option<&'a str>,
+    pub title: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub harness: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub criteria: &'a [String],
+    pub clear_criteria: bool,
+    pub max_retries: Option<i32>,
+    pub clear_max_retries: bool,
+    pub change_policy: Option<ChangePolicy>,
+    /// `--review on|off|inherit` resolved to the nullable column value:
+    /// outer `None` = flag absent (leave the stored override untouched);
+    /// `Some(Some(true|false))` = explicit per-step on/off override;
+    /// `Some(None)` = `inherit` (clear the override → defer to plan/global).
+    pub review: Option<Option<bool>>,
+    pub tags: &'a [String],
+    pub clear_tags: bool,
+}
+
+pub fn step_edit(conn: &Connection, args: StepEditArgs<'_>, out: &OutputContext) -> Result<()> {
+    let StepEditArgs {
+        plan_slug,
+        project,
+        step_sel,
+        step_id,
+        title,
+        description,
+        agent,
+        harness,
+        model,
+        criteria,
+        clear_criteria,
+        max_retries,
+        clear_max_retries,
+        change_policy,
+        review,
+        tags,
+        clear_tags,
+    } = args;
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
@@ -742,15 +788,17 @@ pub fn step_edit(
     storage::update_step_fields_ext(
         conn,
         &step.id,
-        title,
-        description,
-        agent_update,
-        harness_update,
-        criteria_update,
-        retries_update,
-        model_update,
-        change_policy,
-        tags_update,
+        crate::storage::StepFieldUpdates {
+            title,
+            description,
+            agent_update,
+            harness_update,
+            criteria_update,
+            retries_update,
+            model_update,
+            change_policy_update: change_policy,
+            tags_update,
+        },
     )?;
 
     // Per-step review override (docs/dag-redesign.md §6/§7). This lives on
@@ -772,7 +820,6 @@ pub fn step_edit(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn step_reset(
     conn: &Connection,
     plan_slug: &str,
@@ -1044,17 +1091,32 @@ pub fn step_move(
 // Step hook attachment commands
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
+/// Identifies the step + lifecycle + hook for [`cmd_step_set_hook`] /
+/// [`cmd_step_unset_hook`]: the owning `plan_slug` / `project`, the step
+/// selector (`step_sel` short_id/num or explicit `step_id` UUID), the
+/// `lifecycle` phase, and the `hook_name`.
+pub struct StepHookTarget<'a> {
+    pub plan_slug: &'a str,
+    pub project: &'a str,
+    pub step_sel: Option<&'a str>,
+    pub step_id: Option<&'a str>,
+    pub lifecycle: Lifecycle,
+    pub hook_name: &'a str,
+}
+
 pub fn cmd_step_set_hook(
     conn: &Connection,
-    plan_slug: &str,
-    project: &str,
-    step_sel: Option<&str>,
-    step_id: Option<&str>,
-    lifecycle: Lifecycle,
-    hook_name: &str,
+    target: StepHookTarget<'_>,
     _out: &OutputContext,
 ) -> Result<()> {
+    let StepHookTarget {
+        plan_slug,
+        project,
+        step_sel,
+        step_id,
+        lifecycle,
+        hook_name,
+    } = target;
     // Warn if the hook isn't in the library (user can still attach — it will
     // be warn-and-skipped at run time until they import it).
     if hook_library::try_load(hook_name)?.is_none() {
@@ -1073,17 +1135,19 @@ pub fn cmd_step_set_hook(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn cmd_step_unset_hook(
     conn: &Connection,
-    plan_slug: &str,
-    project: &str,
-    step_sel: Option<&str>,
-    step_id: Option<&str>,
-    lifecycle: Lifecycle,
-    hook_name: &str,
+    target: StepHookTarget<'_>,
     _out: &OutputContext,
 ) -> Result<()> {
+    let StepHookTarget {
+        plan_slug,
+        project,
+        step_sel,
+        step_id,
+        lifecycle,
+        hook_name,
+    } = target;
     let plan = storage::get_plan_by_slug(conn, plan_slug, project)?
         .with_context(|| format!("Plan not found: {plan_slug}"))?;
 
@@ -1297,15 +1361,17 @@ mod tests {
         let project = "/tmp/bulk-test".to_string();
         plan_create(
             &conn,
-            "bulk-plan",
-            &project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            crate::commands::PlanCreateArgs {
+                slug: "bulk-plan",
+                project: &project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1452,21 +1518,23 @@ mod tests {
         let (conn, project) = setup_with_plan();
         step_add(
             &conn,
-            "bulk-plan",
-            &project,
-            "With custom retries",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            Some(3),
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                title: "With custom retries",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: Some(3),
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1495,21 +1563,23 @@ mod tests {
         // No max_retries override, no attempts yet, Pending.
         step_add(
             &conn,
-            "bulk-plan",
-            &project,
-            "Plain pending",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                title: "Plain pending",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1529,21 +1599,23 @@ mod tests {
         let (conn, project) = setup_with_plan();
         step_add(
             &conn,
-            "bulk-plan",
-            &project,
-            "No override",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None, // no max_retries override — falls back to config default.
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                title: "No override",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1569,21 +1641,23 @@ mod tests {
     fn add_with_tags(conn: &Connection, project: &str, title: &str, tags: &[String]) {
         step_add(
             conn,
-            "bulk-plan",
-            project,
-            title,
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            tags,
-            &[],
+            StepAddArgs {
+                plan_slug: "bulk-plan",
+                project,
+                title,
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags,
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1609,21 +1683,23 @@ mod tests {
         let tags = vec!["FIX".to_string(), "  ".to_string()];
         let err = step_add(
             &conn,
-            "bulk-plan",
-            &project,
-            "t",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &tags,
-            &[],
+            StepAddArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                title: "t",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &tags,
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap_err();
@@ -1658,21 +1734,23 @@ mod tests {
         let tags = vec!["FIX".to_string(), "FIX".to_string()];
         let err = step_add(
             &conn,
-            "bulk-plan",
-            &project,
-            "t",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &tags,
-            &[],
+            StepAddArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                title: "t",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &tags,
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap_err();
@@ -1697,23 +1775,25 @@ mod tests {
         let new_tags = vec!["REVIEW".to_string()];
         step_edit(
             &conn,
-            "bulk-plan",
-            &project,
-            Some("1"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            false,
-            None,
-            false,
-            None,
-            None, // review (--review absent)
-            &new_tags,
-            false,
+            StepEditArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                step_sel: Some("1"),
+                step_id: None,
+                title: None,
+                description: None,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                clear_criteria: false,
+                max_retries: None,
+                clear_max_retries: false,
+                change_policy: None,
+                review: None,
+                tags: &new_tags,
+                clear_tags: false,
+            },
             &test_out(),
         )
         .unwrap();
@@ -1742,23 +1822,25 @@ mod tests {
         let edit_review = |rv: Option<Option<bool>>| {
             step_edit(
                 &conn,
-                "bulk-plan",
-                &project,
-                Some("1"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                &[],
-                false,
-                None,
-                false,
-                None,
-                rv,
-                &[],
-                false,
+                StepEditArgs {
+                    plan_slug: "bulk-plan",
+                    project: &project,
+                    step_sel: Some("1"),
+                    step_id: None,
+                    title: None,
+                    description: None,
+                    agent: None,
+                    harness: None,
+                    model: None,
+                    criteria: &[],
+                    clear_criteria: false,
+                    max_retries: None,
+                    clear_max_retries: false,
+                    change_policy: None,
+                    review: rv,
+                    tags: &[],
+                    clear_tags: false,
+                },
                 &test_out(),
             )
         };
@@ -1797,23 +1879,25 @@ mod tests {
 
         step_edit(
             &conn,
-            "bulk-plan",
-            &project,
-            Some("1"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            false,
-            None,
-            false,
-            None,
-            None, // review (--review absent)
-            &[],
-            true, // clear_tags
+            StepEditArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                step_sel: Some("1"),
+                step_id: None,
+                title: None,
+                description: None,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                clear_criteria: false,
+                max_retries: None,
+                clear_max_retries: false,
+                change_policy: None,
+                review: None,
+                tags: &[],
+                clear_tags: true,
+            },
             &test_out(),
         )
         .unwrap();
@@ -1828,21 +1912,23 @@ mod tests {
         let initial_criteria = vec!["tests pass".to_string(), "lint clean".to_string()];
         step_add(
             &conn,
-            "bulk-plan",
-            &project,
-            "with criteria",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &initial_criteria,
-            None,
-            None,
-            &[],
-            &[],
+            StepAddArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                title: "with criteria",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &initial_criteria,
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &[],
+            },
             &test_out(),
         )
         .unwrap();
@@ -1857,23 +1943,25 @@ mod tests {
 
         step_edit(
             &conn,
-            "bulk-plan",
-            &project,
-            Some("1"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            true, // clear_criteria
-            None,
-            false,
-            None,
-            None, // review (--review absent)
-            &[],
-            false,
+            StepEditArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                step_sel: Some("1"),
+                step_id: None,
+                title: None,
+                description: None,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                clear_criteria: true,
+                max_retries: None,
+                clear_max_retries: false,
+                change_policy: None,
+                review: None,
+                tags: &[],
+                clear_tags: false,
+            },
             &test_out(),
         )
         .unwrap();
@@ -1895,23 +1983,25 @@ mod tests {
         // Edit just the title — tags should be unchanged.
         step_edit(
             &conn,
-            "bulk-plan",
-            &project,
-            Some("1"),
-            None,
-            Some("new title"),
-            None,
-            None,
-            None,
-            None,
-            &[],
-            false,
-            None,
-            false,
-            None,
-            None, // review (--review absent)
-            &[],
-            false,
+            StepEditArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                step_sel: Some("1"),
+                step_id: None,
+                title: Some("new title"),
+                description: None,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                clear_criteria: false,
+                max_retries: None,
+                clear_max_retries: false,
+                change_policy: None,
+                review: None,
+                tags: &[],
+                clear_tags: false,
+            },
             &test_out(),
         )
         .unwrap();
@@ -2031,20 +2121,33 @@ mod tests {
         let project = dir.canonicalize().unwrap().to_string_lossy().into_owned();
 
         let conn = db::open_memory().unwrap();
-        let plan =
-            storage::create_plan(&conn, "p", &project, &branch, "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "p",
+                project: &project,
+                branch_name: &branch,
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Wire it",
-            "",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Wire it",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         (conn, project, dir, step.id, branch, tmp)
@@ -2101,34 +2204,49 @@ mod tests {
         let project = dir.canonicalize().unwrap().to_string_lossy().into_owned();
 
         let conn = db::open_memory().unwrap();
-        let plan =
-            storage::create_plan(&conn, "p", &project, &branch, "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "p",
+                project: &project,
+                branch_name: &branch,
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step one",
-            "",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step one",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step two",
-            "",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step two",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -2303,21 +2421,23 @@ mod tests {
     fn add_plain(conn: &Connection, project: &str, title: &str, depends_on: &[String]) {
         step_add(
             conn,
-            "bulk-plan",
-            project,
-            title,
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            depends_on,
+            StepAddArgs {
+                plan_slug: "bulk-plan",
+                project,
+                title,
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on,
+            },
             &test_out(),
         )
         .unwrap();
@@ -2414,21 +2534,23 @@ mod tests {
         let (conn, project) = setup_with_plan();
         let err = step_add(
             &conn,
-            "bulk-plan",
-            &project,
-            "orphan",
-            None,
-            None,
-            None,
-            true,
-            None,
-            None,
-            None,
-            &[],
-            None,
-            None,
-            &[],
-            &["99".to_string()],
+            StepAddArgs {
+                plan_slug: "bulk-plan",
+                project: &project,
+                title: "orphan",
+                description: None,
+                after: None,
+                before: None,
+                root: true,
+                agent: None,
+                harness: None,
+                model: None,
+                criteria: &[],
+                max_retries: None,
+                change_policy: None,
+                tags: &[],
+                depends_on: &["99".to_string()],
+            },
             &test_out(),
         )
         .unwrap_err();

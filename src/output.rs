@@ -225,7 +225,6 @@ pub enum RunEvent {
     /// human-readable summary consumers. `plan_complete` is **kept** for one
     /// release as a compat shim (still emitted alongside `summary`) so
     /// meta-harnesses pinned to it don't break.
-    #[allow(dead_code)] // Emit site lands in a later step (TUI-plan §13.1).
     Summary {
         plan_status: PlanStatus,
         steps_complete: usize,
@@ -358,7 +357,6 @@ pub struct OutputContext {
     /// Whether to emit JSON or human-readable output.
     pub format: OutputFormat,
     /// Suppress progress / banner output when true.
-    #[allow(dead_code)] // Wired in a later step.
     pub quiet: bool,
     /// Whether ANSI color codes should be emitted.
     pub color: bool,

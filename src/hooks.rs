@@ -237,17 +237,33 @@ async fn run_one_hook(
 /// Resolve every hook name attached to this plan+step+lifecycle from the db,
 /// then run each one via the library. Unknown hook names log a warning and
 /// are skipped (warn-and-skip policy).
-#[allow(clippy::too_many_arguments)]
+/// The per-invocation inputs to [`run_lifecycle`]: which plan/step/attempt at
+/// which `lifecycle` phase, the working directory, and any phase-specific
+/// extra environment. `conn` and `ctx` stay separate (DB handle + hook
+/// library) since they are cross-cutting, not part of this one invocation's
+/// payload.
+pub struct LifecycleRun<'a> {
+    pub plan: &'a Plan,
+    pub step: &'a Step,
+    pub attempt: i32,
+    pub lifecycle: Lifecycle,
+    pub workdir: &'a Path,
+    pub extra_env: &'a [(&'static str, String)],
+}
+
 async fn run_lifecycle(
     conn: &Connection,
     ctx: &HookContext,
-    plan: &Plan,
-    step: &Step,
-    attempt: i32,
-    lifecycle: Lifecycle,
-    workdir: &Path,
-    extra_env: &[(&'static str, String)],
+    run: &LifecycleRun<'_>,
 ) -> Result<(), HookFailure> {
+    let &LifecycleRun {
+        plan,
+        step,
+        attempt,
+        lifecycle,
+        workdir,
+        extra_env,
+    } = run;
     let rows = storage::list_hooks_for_step(conn, &plan.id, &step.id, lifecycle.as_str())
         .map_err(HookFailure::Db)?;
     if rows.is_empty() {
@@ -290,12 +306,14 @@ pub async fn run_pre_step(
     run_lifecycle(
         conn,
         ctx,
-        plan,
-        step,
-        attempt,
-        Lifecycle::PreStep,
-        workdir,
-        &[],
+        &LifecycleRun {
+            plan,
+            step,
+            attempt,
+            lifecycle: Lifecycle::PreStep,
+            workdir,
+            extra_env: &[],
+        },
     )
     .await
     .map_err(|e| anyhow!(e))
@@ -320,12 +338,14 @@ pub async fn run_post_step(
         run_lifecycle(
             conn,
             ctx,
-            plan,
-            step,
-            attempt,
-            Lifecycle::PostStep,
-            workdir,
-            &extra,
+            &LifecycleRun {
+                plan,
+                step,
+                attempt,
+                lifecycle: Lifecycle::PostStep,
+                workdir,
+                extra_env: &extra,
+            },
         )
         .await,
     )
@@ -343,12 +363,14 @@ pub async fn run_pre_test(
     run_lifecycle(
         conn,
         ctx,
-        plan,
-        step,
-        attempt,
-        Lifecycle::PreTest,
-        workdir,
-        &[],
+        &LifecycleRun {
+            plan,
+            step,
+            attempt,
+            lifecycle: Lifecycle::PreTest,
+            workdir,
+            extra_env: &[],
+        },
     )
     .await
     .map_err(|e| anyhow!(e))
@@ -373,12 +395,14 @@ pub async fn run_post_test(
         run_lifecycle(
             conn,
             ctx,
-            plan,
-            step,
-            attempt,
-            Lifecycle::PostTest,
-            workdir,
-            &extra,
+            &LifecycleRun {
+                plan,
+                step,
+                attempt,
+                lifecycle: Lifecycle::PostTest,
+                workdir,
+                extra_env: &extra,
+            },
         )
         .await,
     )

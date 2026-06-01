@@ -53,6 +53,18 @@ pub fn review_badge(rs: ReviewStatus) -> Option<(&'static str, Color)> {
     }
 }
 
+/// The presentational inputs to [`render`] besides the `frame` / `area` /
+/// `list_state` rendering handles: the visible `rows`, the `[N]`-badge
+/// `selection`, the optional `cursor_index`, the `active_run` flag, and the
+/// bordered block `title`.
+pub struct RenderOutline<'a> {
+    pub rows: &'a [OutlineRow],
+    pub selection: &'a Selection<String>,
+    pub cursor_index: Option<usize>,
+    pub active_run: bool,
+    pub title: &'a str,
+}
+
 /// Render the dependency outline into `area`.
 ///
 /// - `rows`: the visible (possibly focus-filtered) projection.
@@ -60,17 +72,14 @@ pub fn review_badge(rs: ReviewStatus) -> Option<(&'static str, Color)> {
 /// - `cursor_index`: `Some` highlights that row; `None` = read-only preview.
 /// - `active_run`: layers REVERSED on the cursor row when a runner is bound.
 /// - `title`: the bordered block title (plan slug, or `focus: <short_id>`).
-#[allow(clippy::too_many_arguments)]
-pub fn render(
-    frame: &mut Frame,
-    area: Rect,
-    rows: &[OutlineRow],
-    selection: &Selection<String>,
-    cursor_index: Option<usize>,
-    active_run: bool,
-    title: &str,
-    list_state: &mut ListState,
-) {
+pub fn render(frame: &mut Frame, area: Rect, args: RenderOutline<'_>, list_state: &mut ListState) {
+    let RenderOutline {
+        rows,
+        selection,
+        cursor_index,
+        active_run,
+        title,
+    } = args;
     let items: Vec<ListItem> = rows
         .iter()
         .map(|row| {
@@ -196,7 +205,18 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, rows, &sel, Some(0), false, title, &mut ls);
+                render(
+                    f,
+                    area,
+                    RenderOutline {
+                        rows,
+                        selection: &sel,
+                        cursor_index: Some(0),
+                        active_run: false,
+                        title,
+                    },
+                    &mut ls,
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -337,7 +357,18 @@ mod tests {
         terminal
             .draw(|f| {
                 let area = f.area();
-                render(f, area, &rows, &sel, None, false, "p", &mut ls);
+                render(
+                    f,
+                    area,
+                    RenderOutline {
+                        rows: &rows,
+                        selection: &sel,
+                        cursor_index: None,
+                        active_run: false,
+                        title: "p",
+                    },
+                    &mut ls,
+                );
             })
             .unwrap();
         let buf = terminal.backend().buffer().clone();

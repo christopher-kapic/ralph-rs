@@ -39,6 +39,22 @@ use crate::tui::theme;
 // Per-attempt model
 // ---------------------------------------------------------------------------
 
+/// Grouped inputs to [`RenderedPromptApp::build_attempts`]. Bundles the
+/// `build_step_prompt` payload (plan/step/prompts/resolved-interruptions)
+/// with the per-attempt reconstruction inputs (`max_attempts`, `logs`).
+#[derive(Debug)]
+pub struct BuildAttemptsArgs<'a> {
+    pub plan: &'a Plan,
+    pub step: &'a Step,
+    pub all_steps: &'a [Step],
+    pub agent_name: Option<&'a str>,
+    pub harness_supports_agent_file: bool,
+    pub prompts: &'a Prompts,
+    pub resolved_interruptions: &'a [Interruption],
+    pub max_attempts: i32,
+    pub logs: &'a [ExecutionLog],
+}
+
 /// One attempt's fully-assembled prompt plus the metadata needed for the
 /// `Attempt N of M (started <relative-time>)` header line. `started_at` is
 /// `None` for the synthetic attempt-1 entry shown when the step has zero
@@ -282,32 +298,32 @@ impl RenderedPromptApp {
     /// single attempt-1 entry is produced by re-assembly (no attempt has run,
     /// so there is nothing persisted yet) — a genuine "what would be sent now"
     /// preview.
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_attempts(
-        plan: &Plan,
-        step: &Step,
-        all_steps: &[Step],
-        agent_name: Option<&str>,
-        harness_supports_agent_file: bool,
-        prompts: &Prompts,
-        resolved_interruptions: &[Interruption],
-        max_attempts: i32,
-        logs: &[ExecutionLog],
-    ) -> Vec<AttemptPrompt> {
+    pub fn build_attempts(args: &BuildAttemptsArgs<'_>) -> Vec<AttemptPrompt> {
+        let &BuildAttemptsArgs {
+            plan,
+            step,
+            all_steps,
+            agent_name,
+            harness_supports_agent_file,
+            prompts,
+            resolved_interruptions,
+            max_attempts,
+            logs,
+        } = args;
         let mut out: Vec<AttemptPrompt> = Vec::new();
 
         if logs.is_empty() {
             // Zero execution logs → attempt 1, no retry context.
-            let prompt = prompt::build_step_prompt(
+            let prompt = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
                 plan,
                 step,
                 all_steps,
                 agent_name,
-                None,
+                retry_context: None,
                 harness_supports_agent_file,
                 prompts,
                 resolved_interruptions,
-            );
+            });
             out.push(AttemptPrompt {
                 attempt: 1,
                 cycle_index: 0,
@@ -331,16 +347,16 @@ impl RenderedPromptApp {
                 Some(persisted) if !persisted.is_empty() => persisted.to_string(),
                 _ => {
                     let retry = build_retry_context_for_attempt(i, max_attempts, logs);
-                    prompt::build_step_prompt(
+                    prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
                         plan,
                         step,
                         all_steps,
                         agent_name,
-                        retry.as_ref(),
+                        retry_context: retry.as_ref(),
                         harness_supports_agent_file,
                         prompts,
                         resolved_interruptions,
-                    )
+                    })
                 }
             };
             out.push(AttemptPrompt {
@@ -855,17 +871,17 @@ mod tests {
             "logical attempt=1 after a retry-from-scratch reset must not inherit retry context"
         );
 
-        let attempts = RenderedPromptApp::build_attempts(
-            &plan,
-            &step,
-            &all,
-            None,
-            true,
-            &prompts,
-            &[],
-            4,
-            &logs,
-        );
+        let attempts = RenderedPromptApp::build_attempts(&BuildAttemptsArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+            max_attempts: 4,
+            logs: &logs,
+        });
         assert_eq!(attempts.len(), 3);
         assert_eq!(attempts[2].attempt, 1);
         assert!(
@@ -873,8 +889,16 @@ mod tests {
             "a post-reset attempt 1 preview must rebuild with no retry section"
         );
 
-        let expected =
-            prompt::build_step_prompt(&plan, &step, &all, None, None, true, &prompts, &[]);
+        let expected = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
         assert_eq!(attempts[2].prompt, expected);
     }
 
@@ -887,24 +911,32 @@ mod tests {
         let all = vec![step.clone()];
         let prompts = prompts_for(&plan);
 
-        let attempts = RenderedPromptApp::build_attempts(
-            &plan,
-            &step,
-            &all,
-            None,
-            true,
-            &prompts,
-            &[],
-            4,
-            &[],
-        );
+        let attempts = RenderedPromptApp::build_attempts(&BuildAttemptsArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+            max_attempts: 4,
+            logs: &[],
+        });
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].attempt, 1);
         assert!(attempts[0].started_at.is_none());
 
         // Byte-identical to a direct build_step_prompt call with no retry ctx.
-        let expected =
-            prompt::build_step_prompt(&plan, &step, &all, None, None, true, &prompts, &[]);
+        let expected = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
         assert_eq!(attempts[0].prompt, expected);
     }
 
@@ -927,28 +959,45 @@ mod tests {
         l2.prompt_text = None;
         let logs = vec![l1, l2];
 
-        let attempts = RenderedPromptApp::build_attempts(
-            &plan,
-            &step,
-            &all,
-            None,
-            true,
-            &prompts,
-            &[],
-            4,
-            &logs,
-        );
+        let attempts = RenderedPromptApp::build_attempts(&BuildAttemptsArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+            max_attempts: 4,
+            logs: &logs,
+        });
         assert_eq!(attempts.len(), 2);
 
         // Attempt 1: no retry context.
-        let exp1 = prompt::build_step_prompt(&plan, &step, &all, None, None, true, &prompts, &[]);
+        let exp1 = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
         assert_eq!(attempts[0].prompt, exp1);
         assert!(!attempts[0].prompt.contains("# Retry Context"));
 
         // Attempt 2: retry context reconstructed from attempt 1's log.
         let ctx = build_retry_context_for_attempt(1, 4, &logs).unwrap();
-        let exp2 =
-            prompt::build_step_prompt(&plan, &step, &all, None, Some(&ctx), true, &prompts, &[]);
+        let exp2 = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            retry_context: Some(&ctx),
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
         assert_eq!(attempts[1].prompt, exp2);
         assert!(attempts[1].prompt.contains("# Retry Context"));
         assert!(attempts[1].prompt.contains("attempt 2 of 4"));
@@ -981,17 +1030,17 @@ mod tests {
         l2.prompt_text = None;
         let logs = vec![l1, l2];
 
-        let attempts = RenderedPromptApp::build_attempts(
-            &plan,
-            &step,
-            &all,
-            None,
-            true,
-            &prompts,
-            &[],
-            4,
-            &logs,
-        );
+        let attempts = RenderedPromptApp::build_attempts(&BuildAttemptsArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+            max_attempts: 4,
+            logs: &logs,
+        });
         assert_eq!(attempts.len(), 2);
 
         // Attempt 1: the persisted prompt is returned byte-for-byte — NOT a
@@ -1002,8 +1051,16 @@ mod tests {
         // Attempt 2: no persisted prompt → re-assembled fallback (carries the
         // reconstructed retry context for attempt 2).
         let ctx = build_retry_context_for_attempt(1, 4, &logs).unwrap();
-        let exp2 =
-            prompt::build_step_prompt(&plan, &step, &all, None, Some(&ctx), true, &prompts, &[]);
+        let exp2 = prompt::build_step_prompt(&prompt::BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all,
+            agent_name: None,
+            retry_context: Some(&ctx),
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
         assert_eq!(attempts[1].prompt, exp2);
     }
 

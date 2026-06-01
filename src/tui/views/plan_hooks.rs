@@ -1119,13 +1119,15 @@ mod tests {
     fn make_plan(conn: &rusqlite::Connection, slug: &str, project: &str) -> String {
         storage::create_plan(
             conn,
-            slug,
-            project,
-            &format!("br-{slug}"),
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug,
+                project,
+                branch_name: &format!("br-{slug}"),
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .expect("create_plan")
         .id

@@ -221,7 +221,6 @@ pub fn has_uncommitted_changes(workdir: &Path) -> Result<bool> {
 /// Stage **all** changes (tracked + untracked) and commit with `message`.
 ///
 /// This is a convenience wrapper equivalent to `git add -A && git commit -m <message>`.
-#[allow(dead_code)]
 pub fn commit_changes(workdir: &Path, message: &str) -> Result<()> {
     git(workdir, &["add", "-A"]).context("git add -A failed")?;
     git(workdir, &["commit", "-m", message]).context("git commit failed")?;
@@ -1003,7 +1002,6 @@ impl ParkStrategyKind {
 /// How [`park_changes`] should dispose of the working-tree changes left
 /// behind when a step is skipped mid-run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // wired into the skip flow in a later step
 pub enum ParkStrategy {
     /// `git stash push --include-untracked -m <label>` — recoverable later.
     Stash { label: String },
@@ -1016,7 +1014,6 @@ pub enum ParkStrategy {
 
 /// What [`park_changes`] actually did.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // consumed by the skip flow in a later step
 pub enum ParkOutcome {
     /// Changes were stashed; `stash_ref` recovers them.
     Stashed { stash_ref: StashRef },
@@ -1043,7 +1040,6 @@ pub enum ParkOutcome {
 ///
 /// `trailer_id` is only consulted for `Commit`; `pre_existing_untracked`
 /// only for `Discard`.
-#[allow(dead_code)] // called by the skip flow in a later step
 pub fn park_changes(
     workdir: &Path,
     strategy: ParkStrategy,

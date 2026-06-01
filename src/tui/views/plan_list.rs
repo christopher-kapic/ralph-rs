@@ -702,11 +702,13 @@ fn render_step_preview(frame: &mut Frame, area: Rect, app: &mut PlanListApp) {
     step_list::render(
         frame,
         area,
-        steps,
-        &app.preview_selection,
-        None,
-        false,
-        plan_slug.as_str(),
+        step_list::RenderSteps {
+            steps,
+            selection: &app.preview_selection,
+            cursor_index: None,
+            active_run: false,
+            title: plan_slug.as_str(),
+        },
         &mut app.preview_list_state,
     );
 }

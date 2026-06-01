@@ -558,7 +558,7 @@ pub struct StepDetailApp {
     /// Active answer modal, or `None` when no question is being answered.
     /// Set by [`Self::open_answer_modal`]; cleared by either a Cancel or a
     /// successful Submit.
-    pub answer_modal: Option<crate::tui::views::answer_modal::AnswerModal>,
+    pub answer_modal: Option<crate::tui::views::answer_modal::InterruptionModal>,
 
     /// Active resume-implementation modal, or `None`. Spawned by
     /// [`Self::note_answer_persisted`] when the just-applied answer was the
@@ -977,17 +977,30 @@ impl StepDetailApp {
         let Some(q) = self.focused_open_question() else {
             return false;
         };
-        self.answer_modal = Some(crate::tui::views::answer_modal::AnswerModal::new(
-            q.id.clone(),
-            q.question.clone(),
-            q.suggestions.clone(),
-        ));
+        self.answer_modal =
+            Some(crate::tui::views::answer_modal::InterruptionModal::from_open_question(q));
         true
     }
 
     /// Close the answer modal (Cancel path). Idempotent.
     pub fn close_answer_modal(&mut self) {
         self.answer_modal = None;
+    }
+
+    /// Apply editor-captured freeform text to the active answer modal (the
+    /// dispatcher calls this after the `$EDITOR` round-trip — mirrors the
+    /// inbox's `set_modal_freeform`).
+    pub fn set_answer_modal_freeform(&mut self, text: String) {
+        if let Some(m) = self.answer_modal.as_mut() {
+            m.freeform = text;
+        }
+    }
+
+    /// Apply editor-captured comment text to the active answer modal.
+    pub fn set_answer_modal_comment(&mut self, text: String) {
+        if let Some(m) = self.answer_modal.as_mut() {
+            m.comment = text;
+        }
     }
 
     // -- Resume-implementation modal -------------------------------------
@@ -1169,15 +1182,10 @@ impl StepDetailApp {
                 storage::update_step_fields_ext(
                     conn,
                     &step.id,
-                    None,
-                    None,
-                    None,
-                    Some(Some(value)),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    crate::storage::StepFieldUpdates {
+                        harness_update: Some(Some(value)),
+                        ..Default::default()
+                    },
                 )?;
                 if let Some(s) = self.steps.get_mut(self.selected_step_index) {
                     s.harness = Some(value.to_string());
@@ -1187,15 +1195,10 @@ impl StepDetailApp {
                 storage::update_step_fields_ext(
                     conn,
                     &step.id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(Some(value)),
-                    None,
-                    None,
+                    crate::storage::StepFieldUpdates {
+                        model_update: Some(Some(value)),
+                        ..Default::default()
+                    },
                 )?;
                 if let Some(s) = self.steps.get_mut(self.selected_step_index) {
                     s.model = Some(value.to_string());
@@ -1205,15 +1208,10 @@ impl StepDetailApp {
                 storage::update_step_fields_ext(
                     conn,
                     &step.id,
-                    None,
-                    None,
-                    Some(Some(value)),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
+                    crate::storage::StepFieldUpdates {
+                        agent_update: Some(Some(value)),
+                        ..Default::default()
+                    },
                 )?;
                 if let Some(s) = self.steps.get_mut(self.selected_step_index) {
                     s.agent = Some(value.to_string());
@@ -1226,15 +1224,10 @@ impl StepDetailApp {
                 storage::update_step_fields_ext(
                     conn,
                     &step.id,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(policy),
-                    None,
+                    crate::storage::StepFieldUpdates {
+                        change_policy_update: Some(policy),
+                        ..Default::default()
+                    },
                 )?;
                 if let Some(s) = self.steps.get_mut(self.selected_step_index) {
                     s.change_policy = policy;
@@ -1482,15 +1475,12 @@ impl StepDetailApp {
         storage::update_step_fields_ext(
             conn,
             &step.id,
-            title_changed.then_some(parts.title.as_str()),
-            description_changed.then_some(parts.description.as_str()),
-            None,
-            None,
-            criteria_changed.then_some(parts.acceptance_criteria.as_slice()),
-            None,
-            None,
-            None,
-            None,
+            crate::storage::StepFieldUpdates {
+                title: title_changed.then_some(parts.title.as_str()),
+                description: description_changed.then_some(parts.description.as_str()),
+                criteria_update: criteria_changed.then_some(parts.acceptance_criteria.as_slice()),
+                ..Default::default()
+            },
         )?;
         // Refresh the in-memory step so the pane re-renders without a reload.
         if let Some(step_mut) = self.steps.get_mut(self.selected_step_index) {
@@ -1600,7 +1590,7 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
 
     // §17 modals are last so they composite over everything else.
     if let Some(modal) = &app.answer_modal {
-        render_answer_modal(frame, frame.area(), modal);
+        super::inbox_ui::render_interruption_modal(frame, frame.area(), modal);
     } else if let Some(modal) = &app.resume_modal {
         render_resume_modal(frame, frame.area(), modal);
     }
@@ -1632,74 +1622,6 @@ pub fn draw(frame: &mut Frame, app: &mut StepDetailApp) {
             palette_bar::render(frame, palette_area, state);
         }
     }
-}
-
-/// Render the answer modal as a centered overlay. Layout mirrors the §17
-/// sketch: the question line, suggestions numbered from `[1]`, then `[c]
-/// Custom answer` and `[esc] Cancel` rows.
-fn render_answer_modal(
-    frame: &mut Frame,
-    area: Rect,
-    modal: &crate::tui::views::answer_modal::AnswerModal,
-) {
-    // An open interruption is the §12.5 "blocked / interrupted" concept;
-    // style its modal via the single mapping so it matches the plan-list
-    // dot and a blocked step glyph (one concept, one color).
-    let interrupted = theme::plan_status_color(crate::plan::PlanStatus::Interrupted);
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            "❓ ",
-            Style::default()
-                .fg(interrupted)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            modal.question.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    lines.push(Line::from(""));
-    for (i, sug) in modal.suggestions.iter().enumerate() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  [{}] ", i + 1),
-                Style::default()
-                    .fg(theme::SELECTION)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(sug.clone()),
-        ]));
-    }
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  [c] ",
-            Style::default()
-                .fg(theme::CURSOR)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("Custom answer (opens $EDITOR)"),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(
-            "  [esc] ",
-            Style::default()
-                .fg(theme::CHROME_DIM)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("Cancel"),
-    ]));
-
-    let dialog = centered_modal_rect(area, &lines, " Answer question ");
-    frame.render_widget(Clear, dialog);
-    let block = Block::default()
-        .title(" Answer question ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(interrupted));
-    let para = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    frame.render_widget(para, dialog);
 }
 
 /// Render the resume-implementation prompt as a centered overlay. The text
@@ -2066,7 +1988,7 @@ fn render_open_questions(frame: &mut Frame, app: &mut StepDetailApp, area: Rect)
         }
         if q.suggestions.is_empty() {
             lines.push(Line::from(Span::styled(
-                "    (no suggestions — use [c] for a custom answer)",
+                "    (no suggestions — use [f] for a freeform answer)",
                 dim,
             )));
         }
@@ -2744,14 +2666,23 @@ mod tests {
         assert!(!app.open_answer_modal());
         assert!(app.answer_modal.is_none());
 
-        // Pane focused → modal opens with the focused question's data.
+        // Pane focused → modal opens with the focused question's data,
+        // mapped into the §12.4 InterruptionModal (body + priority options).
         app.focused_pane = Pane::OpenQuestions;
         assert!(app.open_answer_modal());
         let modal = app.answer_modal.as_ref().expect("modal opened");
-        assert_eq!(modal.question, "Pick crate");
+        assert_eq!(modal.body, "Pick crate");
         assert_eq!(
-            modal.suggestions,
-            vec!["tracing".to_string(), "log".to_string()]
+            modal
+                .options
+                .iter()
+                .map(|o| (o.text.as_str(), o.priority))
+                .collect::<Vec<_>>(),
+            vec![("tracing", 1), ("log", 2)]
+        );
+        assert_eq!(
+            modal.focus,
+            crate::tui::views::answer_modal::InterruptionFocus::Options
         );
     }
 
@@ -3993,9 +3924,19 @@ mod tests {
     /// match at construction time so writes can be verified by reading the
     /// row back.
     fn setup_project_app(conn: &Connection, project: &str) -> StepDetailApp {
-        let plan =
-            crate::storage::create_plan(conn, "tui-v1", project, "tui-v1", "desc", None, None, &[])
-                .unwrap();
+        let plan = crate::storage::create_plan(
+            conn,
+            crate::storage::NewPlan {
+                slug: "tui-v1",
+                project,
+                branch_name: "tui-v1",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         StepDetailApp::new(
             plan,
             Vec::new(),
@@ -4380,21 +4321,33 @@ cargo clippy
     /// so writes via `update_step_fields_ext` land on a real row that can
     /// then be reloaded.
     fn setup_step_app(conn: &Connection) -> StepDetailApp {
-        let plan =
-            crate::storage::create_plan(conn, "tui-v1", "/proj", "tui-v1", "desc", None, None, &[])
-                .unwrap();
+        let plan = crate::storage::create_plan(
+            conn,
+            crate::storage::NewPlan {
+                slug: "tui-v1",
+                project: "/proj",
+                branch_name: "tui-v1",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _pos) = crate::storage::create_step(
             conn,
             &plan.id,
-            "Original title",
-            "Original description",
-            None,
-            None,
-            &["original-crit".to_string()],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Original title",
+                description: "Original description",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &["original-crit".to_string()],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         StepDetailApp::new(
@@ -4618,21 +4571,33 @@ cargo clippy
     /// submissions can be verified by reloading the row. Mirrors
     /// `setup_step_app` but used here for picker tests.
     fn setup_picker_app(conn: &Connection) -> StepDetailApp {
-        let plan =
-            crate::storage::create_plan(conn, "tui-v1", "/proj", "tui-v1", "desc", None, None, &[])
-                .unwrap();
+        let plan = crate::storage::create_plan(
+            conn,
+            crate::storage::NewPlan {
+                slug: "tui-v1",
+                project: "/proj",
+                branch_name: "tui-v1",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _pos) = crate::storage::create_step(
             conn,
             &plan.id,
-            "Original title",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Original title",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         StepDetailApp::new(
@@ -4912,9 +4877,19 @@ cargo clippy
         // Empty plan ⇒ no step row to write to. The apply path silently
         // returns Ok rather than panicking on the missing index.
         let conn = crate::db::open_memory().unwrap();
-        let plan =
-            crate::storage::create_plan(&conn, "empty", "/proj2", "empty", "desc", None, None, &[])
-                .unwrap();
+        let plan = crate::storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "empty",
+                project: "/proj2",
+                branch_name: "empty",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let mut app = StepDetailApp::new(
             plan,
             Vec::new(),

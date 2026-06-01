@@ -68,7 +68,6 @@ pub struct ChunkEmitter {
 /// disable emission, or a configured emitter to also stream chunk events);
 /// this no-emitter convenience wrapper is preserved for any future caller
 /// that doesn't need streaming.
-#[allow(dead_code)]
 pub fn drain_bounded<R>(reader: Option<R>, cap: usize) -> JoinHandle<Vec<u8>>
 where
     R: AsyncRead + Unpin + Send + 'static,

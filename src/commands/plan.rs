@@ -12,20 +12,34 @@ use crate::storage;
 // Plan commands
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-pub fn plan_create(
-    conn: &Connection,
-    slug: &str,
-    project: &str,
-    description: Option<&str>,
-    branch: Option<&str>,
-    harness: Option<&str>,
-    agent: Option<&str>,
-    max_review_corrections: Option<i32>,
-    tests: &[String],
-    depends_on: &[String],
-    out: &OutputContext,
-) -> Result<()> {
+/// The user-supplied inputs to [`plan_create`]: the new plan's `slug` /
+/// `project`, optional `description` / `branch` / default `harness` / `agent`,
+/// the optional review recursion cap, the deterministic `tests`, and the
+/// `depends_on` plan slugs. `conn` and the `out` sink stay separate.
+pub struct PlanCreateArgs<'a> {
+    pub slug: &'a str,
+    pub project: &'a str,
+    pub description: Option<&'a str>,
+    pub branch: Option<&'a str>,
+    pub harness: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub max_review_corrections: Option<i32>,
+    pub tests: &'a [String],
+    pub depends_on: &'a [String],
+}
+
+pub fn plan_create(conn: &Connection, args: PlanCreateArgs<'_>, out: &OutputContext) -> Result<()> {
+    let PlanCreateArgs {
+        slug,
+        project,
+        description,
+        branch,
+        harness,
+        agent,
+        max_review_corrections,
+        tests,
+        depends_on,
+    } = args;
     let desc = description.unwrap_or(slug);
     let branch_name = branch.unwrap_or(slug);
 
@@ -59,13 +73,15 @@ pub fn plan_create(
     let plan = crate::db::with_tx(conn, |conn| {
         let plan = storage::create_plan(
             conn,
-            slug,
-            project,
-            branch_name,
-            desc,
-            harness,
-            agent,
-            tests,
+            storage::NewPlan {
+                slug,
+                project,
+                branch_name,
+                description: desc,
+                harness,
+                agent,
+                deterministic_tests: tests,
+            },
         )?;
 
         // Persist the per-plan review recursion cap only when explicitly given.
@@ -712,8 +728,19 @@ mod tests {
     fn test_cmd_plan_review_toggles_on_then_off_persists() {
         let conn = crate::db::open_memory().expect("open_memory");
         let project = "/tmp/r-toggle";
-        let plan =
-            storage::create_plan(&conn, "rp", project, "br", "desc", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "rp",
+                project,
+                branch_name: "br",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         // New plans default to review_enabled = NULL (inherit global).
         assert_eq!(plan.review_enabled, None, "default is inherit (NULL)");
 
@@ -753,20 +780,33 @@ mod tests {
         use crate::config::{Config, effective_review_enabled};
         let conn = crate::db::open_memory().expect("open_memory");
         let project = "/tmp/r-prec";
-        let plan =
-            storage::create_plan(&conn, "pp", project, "br", "desc", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "pp",
+                project,
+                branch_name: "br",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "S",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "S",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -821,15 +861,17 @@ mod tests {
 
         let err = plan_create(
             &conn,
-            "myslug",
-            project,
-            None,
-            Some("feat/bad..branch"), // `..` is rejected by git check-ref-format
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "myslug",
+                project,
+                description: None,
+                branch: Some("feat/bad..branch"),
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &quiet_out(),
         )
         .expect_err("an invalid branch name must fail fast");
@@ -854,15 +896,17 @@ mod tests {
 
         let err = plan_create(
             &conn,
-            "   ",
-            project,
-            None,
-            None,
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "   ",
+                project,
+                description: None,
+                branch: None,
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &quiet_out(),
         )
         .expect_err("a blank slug must fail fast");
@@ -882,15 +926,17 @@ mod tests {
         let project = "/tmp/pc-okbranch";
         plan_create(
             &conn,
-            "good-slug",
-            project,
-            Some("a description"),
-            Some("feat/ok"),
-            None,
-            None,
-            None,
-            &[],
-            &[],
+            PlanCreateArgs {
+                slug: "good-slug",
+                project,
+                description: Some("a description"),
+                branch: Some("feat/ok"),
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &[],
+            },
             &quiet_out(),
         )
         .expect("a valid branch must create the plan");
@@ -921,22 +967,36 @@ mod tests {
         let project = "/tmp/pc-rollback";
 
         // A pre-existing dependency plan that the new plan will depend on.
-        storage::create_plan(&conn, "dep-a", project, "dep-a", "dep", None, None, &[]).unwrap();
+        storage::create_plan(
+            &conn,
+            storage::NewPlan {
+                slug: "dep-a",
+                project,
+                branch_name: "dep-a",
+                description: "dep",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // Trigger a late failure by listing the same dependency twice: the
         // second `add_plan_dependency` INSERT hits the PRIMARY KEY constraint
         // *after* the plan row has already been inserted in the same tx.
         let err = plan_create(
             &conn,
-            "rolled-back",
-            project,
-            Some("desc"),
-            Some("feat/rb"),
-            None,
-            None,
-            None,
-            &[],
-            &["dep-a".to_string(), "dep-a".to_string()],
+            PlanCreateArgs {
+                slug: "rolled-back",
+                project,
+                description: Some("desc"),
+                branch: Some("feat/rb"),
+                harness: None,
+                agent: None,
+                max_review_corrections: None,
+                tests: &[],
+                depends_on: &["dep-a".to_string(), "dep-a".to_string()],
+            },
             &quiet_out(),
         )
         .expect_err("a duplicate dependency must fail inside the transaction");

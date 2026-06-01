@@ -23,6 +23,9 @@ mod runner;
 mod signal;
 mod storage;
 mod test_runner;
+// Blanket dead-code suppression for the TUI module: it carries substantial
+// intentional scaffolding (views/widgets wired up across later DAG-redesign
+// phases). Per-item gating would be noise; this single allow covers it.
 #[allow(dead_code)]
 mod tui;
 mod validate;
@@ -119,15 +122,17 @@ fn main() -> Result<()> {
                 let h = harness.as_deref().or(cli.harness.as_deref());
                 commands::plan_create(
                     &conn,
-                    &slug,
-                    &project,
-                    description.as_deref(),
-                    branch.as_deref(),
-                    h,
-                    agent.as_deref(),
-                    max_review_corrections,
-                    &tests,
-                    &depends_on,
+                    commands::PlanCreateArgs {
+                        slug: &slug,
+                        project: &project,
+                        description: description.as_deref(),
+                        branch: branch.as_deref(),
+                        harness: h,
+                        agent: agent.as_deref(),
+                        max_review_corrections,
+                        tests: &tests,
+                        depends_on: &depends_on,
+                    },
                     &out,
                 )
             }
@@ -281,21 +286,23 @@ fn main() -> Result<()> {
                     let title = title.as_deref().expect("clap guarantees title is present");
                     commands::step_add(
                         &conn,
-                        &p.slug,
-                        &project,
-                        title,
-                        description.as_deref(),
-                        after.as_deref(),
-                        before.as_deref(),
-                        root,
-                        agent.as_deref(),
-                        h,
-                        model.as_deref(),
-                        &criteria,
-                        max_retries,
-                        change_policy,
-                        &tags,
-                        &depends_on,
+                        commands::StepAddArgs {
+                            plan_slug: &p.slug,
+                            project: &project,
+                            title,
+                            description: description.as_deref(),
+                            after: after.as_deref(),
+                            before: before.as_deref(),
+                            root,
+                            agent: agent.as_deref(),
+                            harness: h,
+                            model: model.as_deref(),
+                            criteria: &criteria,
+                            max_retries,
+                            change_policy,
+                            tags: &tags,
+                            depends_on: &depends_on,
+                        },
                         &out,
                     )
                 }
@@ -338,23 +345,25 @@ fn main() -> Result<()> {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::step_edit(
                     &conn,
-                    &p.slug,
-                    &project,
-                    step.as_deref(),
-                    step_id.as_deref(),
-                    title.as_deref(),
-                    description.as_deref(),
-                    agent.as_deref(),
-                    harness.as_deref(),
-                    model.as_deref(),
-                    &criteria,
-                    clear_criteria,
-                    max_retries,
-                    clear_max_retries,
-                    change_policy,
-                    review.map(|r| r.to_override()),
-                    &tags,
-                    clear_tags,
+                    commands::StepEditArgs {
+                        plan_slug: &p.slug,
+                        project: &project,
+                        step_sel: step.as_deref(),
+                        step_id: step_id.as_deref(),
+                        title: title.as_deref(),
+                        description: description.as_deref(),
+                        agent: agent.as_deref(),
+                        harness: harness.as_deref(),
+                        model: model.as_deref(),
+                        criteria: &criteria,
+                        clear_criteria,
+                        max_retries,
+                        clear_max_retries,
+                        change_policy,
+                        review: review.map(|r| r.to_override()),
+                        tags: &tags,
+                        clear_tags,
+                    },
                     &out,
                 )
             }
@@ -402,12 +411,14 @@ fn main() -> Result<()> {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::cmd_step_set_hook(
                     &conn,
-                    &p.slug,
-                    &project,
-                    step.as_deref(),
-                    step_id.as_deref(),
-                    lifecycle,
-                    &hook,
+                    commands::StepHookTarget {
+                        plan_slug: &p.slug,
+                        project: &project,
+                        step_sel: step.as_deref(),
+                        step_id: step_id.as_deref(),
+                        lifecycle,
+                        hook_name: &hook,
+                    },
                     &out,
                 )
             }
@@ -421,12 +432,14 @@ fn main() -> Result<()> {
                 let p = resolve_plan(&conn, plan, &project, false)?;
                 commands::cmd_step_unset_hook(
                     &conn,
-                    &p.slug,
-                    &project,
-                    step.as_deref(),
-                    step_id.as_deref(),
-                    lifecycle,
-                    &hook,
+                    commands::StepHookTarget {
+                        plan_slug: &p.slug,
+                        project: &project,
+                        step_sel: step.as_deref(),
+                        step_id: step_id.as_deref(),
+                        lifecycle,
+                        hook_name: &hook,
+                    },
                     &out,
                 )
             }
@@ -609,13 +622,15 @@ fn main() -> Result<()> {
             import::import_plan(
                 &conn,
                 &file,
-                &project,
-                slug.as_deref(),
-                branch.as_deref(),
-                h,
-                strict,
-                review_harness_configured,
-                global_review_enabled,
+                &import::ImportOptions {
+                    slug: slug.as_deref(),
+                    branch: branch.as_deref(),
+                    harness: h,
+                    project: &project,
+                    strict,
+                    review_harness_configured,
+                    global_review_enabled,
+                },
             )
         }
 
@@ -662,12 +677,15 @@ fn main() -> Result<()> {
                 commands::interruption::cmd_interruption_resolve(
                     &conn,
                     &project,
-                    None,
-                    &id,
-                    None,
-                    Some(&text),
-                    None,
-                    true, // `question answer` alias: only resolve questions, not blockers
+                    commands::interruption::ResolveArgs {
+                        plan_slug: None,
+                        selector: &id,
+                        option: None,
+                        answer: Some(&text),
+                        comment: None,
+                        // legacy `question answer` alias: only questions, not blockers
+                        require_question: true,
+                    },
                     &out,
                 )
             }
@@ -758,12 +776,14 @@ fn main() -> Result<()> {
             } => commands::interruption::cmd_interruption_resolve(
                 &conn,
                 &project,
-                plan.as_deref(),
-                &id,
-                option,
-                answer.as_deref(),
-                comment.as_deref(),
-                false, // `interruption resolve` works on both questions and blockers
+                commands::interruption::ResolveArgs {
+                    plan_slug: plan.as_deref(),
+                    selector: &id,
+                    option,
+                    answer: answer.as_deref(),
+                    comment: comment.as_deref(),
+                    require_question: false,
+                },
                 &out,
             ),
         },

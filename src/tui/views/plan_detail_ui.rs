@@ -200,11 +200,13 @@ fn draw_step_list(frame: &mut Frame, app: &mut PlanDetailApp, area: Rect) {
     outline_list::render(
         frame,
         area,
-        &rows,
-        &app.selection,
-        cursor,
-        app.is_run_live(),
-        &title,
+        outline_list::RenderOutline {
+            rows: &rows,
+            selection: &app.selection,
+            cursor_index: cursor,
+            active_run: app.is_run_live(),
+            title: &title,
+        },
         &mut app.list_state,
     );
 }

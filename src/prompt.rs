@@ -199,17 +199,33 @@ fn non_empty(s: Option<&str>) -> Option<&str> {
 /// closing the one pre-existing unbounded-context leak (docs/dag-redesign.md
 /// §4). Callers must pass the result of the bounded query — there is no
 /// unbounded slice anywhere in prompt assembly.
-#[allow(clippy::too_many_arguments)]
-pub fn build_step_prompt(
-    plan: &Plan,
-    step: &Step,
-    all_steps: &[Step],
-    agent_name: Option<&str>,
-    retry_context: Option<&RetryContext>,
-    harness_supports_agent_file: bool,
-    prompts: &Prompts,
-    resolved_interruptions: &[Interruption],
-) -> String {
+/// Grouped inputs to [`build_step_prompt`]. Bundles the step's plan/step
+/// context, the four-layer `prompts`, retry context, and the bounded
+/// resolved-interruptions slice into one cohesive argument so the builder
+/// reads as a single "what goes into this prompt" payload.
+#[derive(Debug)]
+pub struct BuildStepPromptArgs<'a> {
+    pub plan: &'a Plan,
+    pub step: &'a Step,
+    pub all_steps: &'a [Step],
+    pub agent_name: Option<&'a str>,
+    pub retry_context: Option<&'a RetryContext>,
+    pub harness_supports_agent_file: bool,
+    pub prompts: &'a Prompts,
+    pub resolved_interruptions: &'a [Interruption],
+}
+
+pub fn build_step_prompt(args: &BuildStepPromptArgs<'_>) -> String {
+    let BuildStepPromptArgs {
+        plan,
+        step,
+        all_steps,
+        agent_name,
+        retry_context,
+        harness_supports_agent_file,
+        prompts,
+        resolved_interruptions,
+    } = *args;
     let mut sections: Vec<String> = Vec::new();
 
     // Plan layer — the plan-context block. This is the SINGLE place the plan
@@ -890,16 +906,16 @@ mod tests {
             project: None,
             plan: Some(plan.description.clone()),
         };
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true, // harness supports agent file natively
-            &prompts,
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
 
         // Should contain plan context
         assert!(prompt.contains("# Plan: test-plan"));
@@ -955,7 +971,16 @@ mod tests {
             plan: Some(plan.description.clone()),
         };
 
-        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
 
         assert_eq!(
             prompt.matches("ZZZ_UNIQUE_PLAN_DESCRIPTION_MARKER").count(),
@@ -989,16 +1014,16 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         assert!(!prompt.contains("# Ralph context"));
         assert!(!prompt.contains("## Introspecting the plan"));
@@ -1019,7 +1044,16 @@ mod tests {
             plan: None,
         };
 
-        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
 
         assert!(prompt.contains("# Ralph context"));
         assert!(prompt.contains("## Introspecting the plan"));
@@ -1038,16 +1072,16 @@ mod tests {
         let s3 = make_step_with("s3", "Future thing", StepStatus::Pending);
         let all_steps = vec![s1.clone(), s2.clone(), s3.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &s2,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &s2,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         // Titles ARE present in the step map.
         assert!(prompt.contains("Done thing"));
@@ -1081,16 +1115,16 @@ mod tests {
         let s3 = make_step_with("s3", "Gamma", StepStatus::Pending);
         let all_steps = vec![s1.clone(), s2.clone(), s3.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &s2,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &s2,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         // Only the current step line has the arrow prefix.
         assert!(prompt.contains("→ #2. [IN_PROGRESS] Beta"));
@@ -1107,16 +1141,16 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            Some("senior-engineer"),
-            None,
-            false, // harness does NOT support agent file natively
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: Some("senior-engineer"),
+            retry_context: None,
+            harness_supports_agent_file: false,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         // Pointer section should be present telling the agent to run
         // `ralph agents show <name>` rather than inlining the full file.
@@ -1130,16 +1164,16 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            Some("senior-engineer"),
-            None,
-            true, // harness supports agent file natively
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: Some("senior-engineer"),
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         // Pointer section should NOT be in the prompt — the harness gets
         // the agent file by reference via its native flag/env var.
@@ -1153,16 +1187,16 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            false, // non-native, but no agent assigned
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: false,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         assert!(!prompt.contains("# Agent Profile"));
     }
@@ -1181,16 +1215,16 @@ mod tests {
             previous_failure_reason: Some("tests failed".to_string()),
         };
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            Some(&retry),
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: Some(&retry),
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         assert!(prompt.contains("# Retry Context"));
         assert!(prompt.contains("attempt 2 of 3"));
@@ -1209,16 +1243,16 @@ mod tests {
         step.acceptance_criteria = vec![];
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         assert!(!prompt.contains("Acceptance criteria"));
     }
@@ -1230,16 +1264,16 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         assert!(!prompt.contains("Post-harness validation"));
     }
@@ -1253,16 +1287,16 @@ mod tests {
         let plan = make_plan();
         let step = make_step();
         let all_steps = vec![step.clone()];
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
         assert!(
             !prompt.contains("All must pass"),
             "imperative wording re-introduced: prompt should frame tests as ralph-owned \
@@ -1464,16 +1498,16 @@ mod tests {
             plan: Some(plan.description.clone()),
         };
 
-        let prompt = build_step_prompt(
-            &plan,
-            &s2,
-            &all_steps,
-            Some("senior-engineer"),
-            Some(&retry),
-            false,
-            &prompts,
-            &resolved,
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &s2,
+            all_steps: &all_steps,
+            agent_name: Some("senior-engineer"),
+            retry_context: Some(&retry),
+            harness_supports_agent_file: false,
+            prompts: &prompts,
+            resolved_interruptions: &resolved,
+        });
 
         // Verify ordering:
         // global -> project -> plan -> agent -> retry -> resolved-interruptions
@@ -1515,7 +1549,16 @@ mod tests {
             plan: Some("PLAN-LAYER".to_string()),
         };
 
-        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
 
         // Global and Project stack as plain prefix sections in
         // global → project order. The Plan layer is rendered through
@@ -1560,7 +1603,16 @@ mod tests {
             plan: Some("PLAN-LAYER".to_string()),
         };
 
-        let prompt = build_step_prompt(&plan, &step, &all_steps, None, None, true, &prompts, &[]);
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &prompts,
+            resolved_interruptions: &[],
+        });
 
         // Global is blank and Project is None, so the first section is the
         // Plan-context block. The configured plan-layer text lives inside it.
@@ -1585,16 +1637,16 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         // Header + a few load-bearing markers from the ask block.
         assert!(prompt.contains("## Asking the user a question"));
@@ -1629,16 +1681,16 @@ mod tests {
             ),
         ];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &resolved,
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &resolved,
+        });
 
         // Section heading present; old heading gone.
         assert!(prompt.contains("## Resolved interruptions"));
@@ -1672,16 +1724,16 @@ mod tests {
         let step = make_step();
         let all_steps = vec![step.clone()];
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
 
         assert!(!prompt.contains("## Resolved interruptions"));
         // No stray section blockquote markers.
@@ -1707,31 +1759,31 @@ mod tests {
 
         // Case 1: a resolution exists. Section IS rendered; ask-instruction
         // is ALSO rendered.
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &resolved,
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &resolved,
+        });
         assert!(prompt.contains("## Resolved interruptions"));
         assert!(prompt.contains("## Asking the user a question"));
 
         // Case 2: nothing resolved yet. Ask-instruction IS rendered; resolved
         // section is NOT.
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &[],
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &[],
+        });
         assert!(!prompt.contains("## Resolved interruptions"));
         assert!(prompt.contains("## Asking the user a question"));
     }
@@ -1853,16 +1905,16 @@ mod tests {
             .map(|_| resolved_intr(InterruptionKind::Question, &huge, Some(&huge), Some(&huge)))
             .collect();
 
-        let prompt = build_step_prompt(
-            &plan,
-            &step,
-            &all_steps,
-            None,
-            None,
-            true,
-            &Prompts::default(),
-            &resolved,
-        );
+        let prompt = build_step_prompt(&BuildStepPromptArgs {
+            plan: &plan,
+            step: &step,
+            all_steps: &all_steps,
+            agent_name: None,
+            retry_context: None,
+            harness_supports_agent_file: true,
+            prompts: &Prompts::default(),
+            resolved_interruptions: &resolved,
+        });
 
         // Isolate the rendered section (from its heading to the next `## `
         // heading) so we measure only this section's contribution.

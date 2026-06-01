@@ -1,9 +1,10 @@
-// Question answer modal + resume-implementation modal (TUI-plan.md §17).
+// Interruption answer modal + resume-implementation modal (TUI-plan.md §17,
+// docs/dag-redesign.md §12.4).
 //
-// The answer modal is what step-detail surfaces when the user presses `a` on
-// a focused open question: it shows the question text, the harness's
-// suggestions numbered from 1, and lets the user pick a suggestion verbatim,
-// open `$EDITOR` for a custom answer, or cancel. The resume modal pops after
+// The answer flow step-detail surfaces when the user presses `a` on a focused
+// open question is driven by the §12.4 `InterruptionModal` (the same ranked-
+// options modal the inbox uses), built from the step's `storage::OpenQuestion`
+// via [`InterruptionModal::from_open_question`]. The resume modal pops after
 // the *last* open question for the plan is answered, asking whether to kick
 // off `ralph run` immediately. Both modals are pure state — the dispatcher
 // owns the storage write and the runner spawn.
@@ -12,101 +13,6 @@
 // without a real terminal.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-/// State of a single open answer modal. Constructed by step-detail when the
-/// user presses `a` on a focused question; consumed by the dispatcher via
-/// [`AnswerModal::handle_key`] until it returns a non-Pending action.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnswerModal {
-    /// The `interruptions.id` (question) row this modal is targeting. The
-    /// dispatcher passes this back to `storage::set_question_answer`
-    /// (→ `storage::resolve_interruption`) once the user commits an answer.
-    pub question_id: String,
-    /// Verbatim question text — rendered as the modal's title row.
-    pub question: String,
-    /// Suggestions exactly as the harness wrote them. The renderer prefixes
-    /// each with `[N]` (1-based); selecting `[N]` submits the corresponding
-    /// suggestion verbatim, with no further editing.
-    pub suggestions: Vec<String>,
-}
-
-/// Outcome of one key event on the answer modal. Drives the dispatcher's
-/// next move: persist the answer, hand off to `$EDITOR`, close the modal,
-/// or keep waiting for input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AnswerModalAction {
-    /// Key was unrecognized — keep the modal open.
-    Pending,
-    /// User picked suggestion at this 1-based index — the dispatcher
-    /// persists `suggestions[idx-1]` as the answer and closes the modal.
-    Submit { index: usize },
-    /// User pressed `c` — the dispatcher should suspend the TUI, open
-    /// `$EDITOR` for free-form input, persist whatever comes back, and
-    /// close the modal.
-    EditCustom,
-    /// User pressed Esc / Ctrl-C — the dispatcher closes the modal without
-    /// writing anything.
-    Cancel,
-}
-
-impl AnswerModal {
-    /// Build a modal targeting the given question row. `suggestions` may be
-    /// empty; in that case only the `[c]` (custom) and `[esc]` (cancel)
-    /// rows are interactable.
-    pub fn new(
-        question_id: impl Into<String>,
-        question: impl Into<String>,
-        suggestions: Vec<String>,
-    ) -> Self {
-        Self {
-            question_id: question_id.into(),
-            question: question.into(),
-            suggestions,
-        }
-    }
-
-    /// Map a key event to an [`AnswerModalAction`]. Pure for tests.
-    ///
-    /// Number keys 1..=9 select the suggestion at that 1-based index — the
-    /// caller is expected to bound-check (`index <= suggestions.len()`)
-    /// before calling `storage::set_question_answer`. `c`/`C` requests the
-    /// editor handoff. Esc / Ctrl-C cancels. Unrecognized keys return
-    /// [`AnswerModalAction::Pending`].
-    pub fn handle_key(&self, key: KeyEvent) -> AnswerModalAction {
-        match key.code {
-            KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                let idx = (c as u8 - b'0') as usize;
-                if idx <= self.suggestions.len() {
-                    AnswerModalAction::Submit { index: idx }
-                } else {
-                    // Pressed a number with no corresponding suggestion —
-                    // treat as no-op so the user gets feedback by re-trying.
-                    AnswerModalAction::Pending
-                }
-            }
-            KeyCode::Char('c') | KeyCode::Char('C')
-                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                AnswerModalAction::EditCustom
-            }
-            KeyCode::Esc => AnswerModalAction::Cancel,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                AnswerModalAction::Cancel
-            }
-            _ => AnswerModalAction::Pending,
-        }
-    }
-
-    /// Resolve a 1-based suggestion index to its text. Returns `None` when
-    /// the index is out of range (defensively — `handle_key` already
-    /// bound-checks before emitting `Submit`).
-    pub fn suggestion_text(&self, index_1based: usize) -> Option<&str> {
-        if index_1based == 0 {
-            return None;
-        }
-        self.suggestions.get(index_1based - 1).map(|s| s.as_str())
-    }
-}
 
 /// State of the resume-implementation prompt that pops after the user
 /// answers the last open question for a plan (TUI-plan.md §17).
@@ -273,6 +179,40 @@ impl InterruptionModal {
         }
     }
 
+    /// Build a modal from a step-detail [`storage::OpenQuestion`]. Step-detail
+    /// has an `OpenQuestion` rather than a full [`Interruption`], but the modal
+    /// surface is identical: `q.suggestions` are already in priority order, so
+    /// they map to `options` with `priority = index + 1`. Mirrors the
+    /// `focus`/field defaults of [`Self::from_interruption`] (Options focus when
+    /// there are options, else Freeform).
+    pub fn from_open_question(q: &crate::storage::OpenQuestion) -> Self {
+        let options: Vec<InterruptionOption> = q
+            .suggestions
+            .iter()
+            .enumerate()
+            .map(|(i, text)| InterruptionOption {
+                text: text.clone(),
+                priority: (i + 1) as i32,
+            })
+            .collect();
+        let focus = if options.is_empty() {
+            InterruptionFocus::Freeform
+        } else {
+            InterruptionFocus::Options
+        };
+        Self {
+            interruption_id: q.id.clone(),
+            kind: q.kind,
+            body: q.question.clone(),
+            options,
+            selected_option: 0,
+            focus,
+            freeform: String::new(),
+            comment: String::new(),
+            option_touched: false,
+        }
+    }
+
     /// Whether this is a blocker (no options — resolve / resolve-with-comment
     /// only, §12.4).
     pub fn is_blocker(&self) -> bool {
@@ -405,121 +345,6 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::CONTROL)
     }
 
-    fn modal_with_suggestions(n: usize) -> AnswerModal {
-        let suggestions = (0..n).map(|i| format!("opt{}", i + 1)).collect();
-        AnswerModal::new("q1", "Pick a logging crate", suggestions)
-    }
-
-    // -- AnswerModal.handle_key -----------------------------------------------
-
-    #[test]
-    fn digit_1_selects_first_suggestion() {
-        let m = modal_with_suggestions(2);
-        let action = m.handle_key(key(KeyCode::Char('1')));
-        assert_eq!(action, AnswerModalAction::Submit { index: 1 });
-    }
-
-    #[test]
-    fn digit_2_selects_second_suggestion() {
-        let m = modal_with_suggestions(2);
-        let action = m.handle_key(key(KeyCode::Char('2')));
-        assert_eq!(action, AnswerModalAction::Submit { index: 2 });
-    }
-
-    #[test]
-    fn digit_out_of_range_is_pending() {
-        // Only 2 suggestions, but user pressed `3`.
-        let m = modal_with_suggestions(2);
-        let action = m.handle_key(key(KeyCode::Char('3')));
-        assert_eq!(action, AnswerModalAction::Pending);
-    }
-
-    #[test]
-    fn digit_zero_is_pending() {
-        // 0 is not a valid suggestion index per the §17 grammar.
-        let m = modal_with_suggestions(3);
-        let action = m.handle_key(key(KeyCode::Char('0')));
-        assert_eq!(action, AnswerModalAction::Pending);
-    }
-
-    #[test]
-    fn digit_with_no_suggestions_is_pending() {
-        // Open-ended question (no harness suggestions) — the only valid
-        // submission is custom or cancel.
-        let m = modal_with_suggestions(0);
-        let action = m.handle_key(key(KeyCode::Char('1')));
-        assert_eq!(action, AnswerModalAction::Pending);
-    }
-
-    #[test]
-    fn lowercase_c_opens_custom_editor() {
-        let m = modal_with_suggestions(2);
-        let action = m.handle_key(key(KeyCode::Char('c')));
-        assert_eq!(action, AnswerModalAction::EditCustom);
-    }
-
-    #[test]
-    fn uppercase_c_opens_custom_editor() {
-        let m = modal_with_suggestions(2);
-        let action = m.handle_key(key(KeyCode::Char('C')));
-        assert_eq!(action, AnswerModalAction::EditCustom);
-    }
-
-    #[test]
-    fn esc_cancels_modal() {
-        let m = modal_with_suggestions(2);
-        assert_eq!(m.handle_key(key(KeyCode::Esc)), AnswerModalAction::Cancel);
-    }
-
-    #[test]
-    fn ctrl_c_cancels_modal() {
-        // Ctrl-C is treated as cancel — never as the custom-answer trigger,
-        // matching the global `Ctrl-C = leave` convention used elsewhere in
-        // the TUI.
-        let m = modal_with_suggestions(2);
-        assert_eq!(
-            m.handle_key(ctrl(KeyCode::Char('c'))),
-            AnswerModalAction::Cancel
-        );
-    }
-
-    #[test]
-    fn unrecognized_key_is_pending() {
-        let m = modal_with_suggestions(2);
-        assert_eq!(
-            m.handle_key(key(KeyCode::Char('x'))),
-            AnswerModalAction::Pending
-        );
-        assert_eq!(m.handle_key(key(KeyCode::Tab)), AnswerModalAction::Pending);
-        assert_eq!(
-            m.handle_key(key(KeyCode::Char(' '))),
-            AnswerModalAction::Pending
-        );
-    }
-
-    // -- AnswerModal.suggestion_text ------------------------------------------
-
-    #[test]
-    fn suggestion_text_returns_indexed_value() {
-        let m = modal_with_suggestions(3);
-        assert_eq!(m.suggestion_text(1), Some("opt1"));
-        assert_eq!(m.suggestion_text(2), Some("opt2"));
-        assert_eq!(m.suggestion_text(3), Some("opt3"));
-    }
-
-    #[test]
-    fn suggestion_text_zero_is_none() {
-        let m = modal_with_suggestions(3);
-        assert_eq!(m.suggestion_text(0), None);
-    }
-
-    #[test]
-    fn suggestion_text_out_of_range_is_none() {
-        let m = modal_with_suggestions(2);
-        assert_eq!(m.suggestion_text(3), None);
-        assert_eq!(m.suggestion_text(99), None);
-    }
-
     // -- ResumeModal.handle_key -----------------------------------------------
 
     #[test]
@@ -629,6 +454,60 @@ mod tests {
             asked_at: Utc::now(),
             resolved_at: None,
         }
+    }
+
+    #[test]
+    fn from_open_question_maps_suggestions_to_priority_options() {
+        // Step-detail builds the modal from an `OpenQuestion` whose
+        // `suggestions` are already in priority order; they map to options
+        // with `priority = index + 1`, Options focus, #1 pre-selected.
+        let q = crate::storage::OpenQuestion {
+            id: "q-step0-pick".to_string(),
+            step_id: "step0".to_string(),
+            plan_id: "p1".to_string(),
+            plan_slug: "plan".to_string(),
+            step_num: 1,
+            step_title: "Step".to_string(),
+            attempt: 1,
+            question: "Pick a crate".to_string(),
+            suggestions: vec!["tracing".to_string(), "log".to_string()],
+            kind: InterruptionKind::Question,
+            asked_at: "2026-05-04T00:00:00Z".to_string(),
+        };
+        let m = InterruptionModal::from_open_question(&q);
+        assert_eq!(m.interruption_id, "q-step0-pick");
+        assert_eq!(m.body, "Pick a crate");
+        assert_eq!(m.kind, InterruptionKind::Question);
+        assert_eq!(
+            m.options
+                .iter()
+                .map(|o| (o.text.as_str(), o.priority))
+                .collect::<Vec<_>>(),
+            vec![("tracing", 1), ("log", 2)]
+        );
+        assert_eq!(m.selected_option, 0);
+        assert_eq!(m.focus, InterruptionFocus::Options);
+        assert_eq!(m.chosen_resolution().as_deref(), Some("tracing"));
+    }
+
+    #[test]
+    fn from_open_question_with_no_suggestions_focuses_freeform() {
+        let q = crate::storage::OpenQuestion {
+            id: "q-step0-open".to_string(),
+            step_id: "step0".to_string(),
+            plan_id: "p1".to_string(),
+            plan_slug: "plan".to_string(),
+            step_num: 1,
+            step_title: "Step".to_string(),
+            attempt: 1,
+            question: "Open-ended?".to_string(),
+            suggestions: vec![],
+            kind: InterruptionKind::Question,
+            asked_at: "2026-05-04T00:00:00Z".to_string(),
+        };
+        let m = InterruptionModal::from_open_question(&q);
+        assert!(m.options.is_empty());
+        assert_eq!(m.focus, InterruptionFocus::Freeform);
     }
 
     #[test]

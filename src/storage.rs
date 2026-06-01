@@ -37,17 +37,29 @@ pub struct ParkedWorktreeState {
 // ---------------------------------------------------------------------------
 
 /// Insert a new plan and return it.
-#[allow(clippy::too_many_arguments)]
-pub fn create_plan(
-    conn: &Connection,
-    slug: &str,
-    project: &str,
-    branch_name: &str,
-    description: &str,
-    harness: Option<&str>,
-    agent: Option<&str>,
-    deterministic_tests: &[String],
-) -> Result<Plan> {
+/// The columns of a new plan row, passed to [`create_plan`]. Groups the
+/// identity (`slug` / `project` / `branch_name`), the `description`, the
+/// optional default `harness` / `agent`, and the plan's deterministic tests.
+pub struct NewPlan<'a> {
+    pub slug: &'a str,
+    pub project: &'a str,
+    pub branch_name: &'a str,
+    pub description: &'a str,
+    pub harness: Option<&'a str>,
+    pub agent: Option<&'a str>,
+    pub deterministic_tests: &'a [String],
+}
+
+pub fn create_plan(conn: &Connection, new: NewPlan<'_>) -> Result<Plan> {
+    let NewPlan {
+        slug,
+        project,
+        branch_name,
+        description,
+        harness,
+        agent,
+        deterministic_tests,
+    } = new;
     let id = Uuid::new_v4().to_string();
     let tests_json = serde_json::to_string(deterministic_tests)?;
 
@@ -824,25 +836,6 @@ pub fn list_open_interruptions_enriched(
 // now uses the **bounded** `list_resolved_interruptions_for_step` above,
 // which `LIMIT`s to the most-recent N resolved interruptions and is
 // interruption-native (questions *and* blockers).
-
-/// Resolve a *question* interruption with a freeform `answer` (no comment).
-///
-/// Thin native wrapper over [`resolve_interruption`] that provides a
-/// question-shaped entry point for the TUI answer modal (and any other
-/// question-only call sites). "Question not found" is preserved as the
-/// not-found message while [`resolve_interruption`] itself reports
-/// "Interruption …".
-pub fn set_question_answer(conn: &Connection, question_id: &str, answer: &str) -> Result<()> {
-    let exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM interruptions WHERE id = ?1",
-        params![question_id],
-        |r| r.get(0),
-    )?;
-    if exists == 0 {
-        anyhow::bail!("Question not found: {question_id}");
-    }
-    resolve_interruption(conn, question_id, answer, None)
-}
 
 /// Count *open* interruptions (questions **or** blockers) for a specific
 /// (step, attempt) pair.
@@ -1692,20 +1685,37 @@ pub fn plan_has_step_short_id(conn: &Connection, plan_id: &str, short_id: &str) 
 /// `tags`: optional per-step free-form string tags. Pass `None` to default
 /// to an empty list (the pre-V13 behavior). Callers that already care about
 /// tags can pass `Some(&tags)` to seed them at creation time.
-#[allow(clippy::too_many_arguments)]
-pub fn create_step(
-    conn: &Connection,
-    plan_id: &str,
-    title: &str,
-    description: &str,
-    agent: Option<&str>,
-    harness: Option<&str>,
-    acceptance_criteria: &[String],
-    max_retries: Option<i32>,
-    model: Option<&str>,
-    change_policy: Option<ChangePolicy>,
-    tags: Option<&[String]>,
-) -> Result<(Step, usize)> {
+/// The authorable columns of a new step row, shared by [`create_step`]
+/// (append) and [`create_step_at`] (positioned). Groups the body
+/// (`title` / `description`), the optional per-step `agent` / `harness` /
+/// `model` overrides, the `acceptance_criteria`, `max_retries`,
+/// `change_policy`, and `tags`. The `plan_id` and `sort_key` placement stay
+/// separate arguments since only one of the two creators takes a `sort_key`.
+#[derive(Default)]
+pub struct NewStep<'a> {
+    pub title: &'a str,
+    pub description: &'a str,
+    pub agent: Option<&'a str>,
+    pub harness: Option<&'a str>,
+    pub acceptance_criteria: &'a [String],
+    pub max_retries: Option<i32>,
+    pub model: Option<&'a str>,
+    pub change_policy: Option<ChangePolicy>,
+    pub tags: Option<&'a [String]>,
+}
+
+pub fn create_step(conn: &Connection, plan_id: &str, new: NewStep<'_>) -> Result<(Step, usize)> {
+    let NewStep {
+        title,
+        description,
+        agent,
+        harness,
+        acceptance_criteria,
+        max_retries,
+        model,
+        change_policy,
+        tags,
+    } = new;
     let id = Uuid::new_v4().to_string();
     let criteria_json = serde_json::to_string(acceptance_criteria)?;
     let change_policy = change_policy.unwrap_or_default();
@@ -2005,21 +2015,23 @@ pub fn delete_step(conn: &Connection, step_id: &str) -> Result<()> {
 /// `change_policy`: see [`create_step`] — `None` defaults to
 /// [`ChangePolicy::Required`].
 /// `tags`: see [`create_step`] — `None` defaults to an empty list.
-#[allow(clippy::too_many_arguments)]
 pub fn create_step_at(
     conn: &Connection,
     plan_id: &str,
     sort_key: &str,
-    title: &str,
-    description: &str,
-    agent: Option<&str>,
-    harness: Option<&str>,
-    acceptance_criteria: &[String],
-    max_retries: Option<i32>,
-    model: Option<&str>,
-    change_policy: Option<ChangePolicy>,
-    tags: Option<&[String]>,
+    new: NewStep<'_>,
 ) -> Result<(Step, usize)> {
+    let NewStep {
+        title,
+        description,
+        agent,
+        harness,
+        acceptance_criteria,
+        max_retries,
+        model,
+        change_policy,
+        tags,
+    } = new;
     let id = Uuid::new_v4().to_string();
     let criteria_json = serde_json::to_string(acceptance_criteria)?;
     let change_policy = change_policy.unwrap_or_default();
@@ -2047,6 +2059,24 @@ pub fn create_step_at(
     Ok((get_step(conn, &id)?, position as usize))
 }
 
+/// A partial step update for [`update_step_fields_ext`]. Every field is an
+/// "apply this change?" option: `None` leaves the column untouched; the
+/// nested `Option` on the override fields distinguishes set-to-value
+/// (`Some(Some(_))`) from clear-to-NULL (`Some(None)`). `#[derive(Default)]`
+/// lets callers touch one column with `..Default::default()`.
+#[derive(Default)]
+pub struct StepFieldUpdates<'a> {
+    pub title: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub agent_update: Option<Option<&'a str>>,
+    pub harness_update: Option<Option<&'a str>>,
+    pub criteria_update: Option<&'a [String]>,
+    pub retries_update: Option<Option<i32>>,
+    pub model_update: Option<Option<&'a str>>,
+    pub change_policy_update: Option<ChangePolicy>,
+    pub tags_update: Option<&'a [String]>,
+}
+
 /// Extended step update: title, description, agent, harness, criteria, max_retries, model, change_policy, tags.
 ///
 /// - `agent_update`: `Some(Some("name"))` sets the agent, `Some(None)` clears it
@@ -2065,20 +2095,22 @@ pub fn create_step_at(
 ///   for another.
 /// - `tags_update`: `Some(slice)` replaces the entire tag list (pass an
 ///   empty slice to clear all tags), `None` means don't change.
-#[allow(clippy::too_many_arguments)]
 pub fn update_step_fields_ext(
     conn: &Connection,
     step_id: &str,
-    title: Option<&str>,
-    description: Option<&str>,
-    agent_update: Option<Option<&str>>,
-    harness_update: Option<Option<&str>>,
-    criteria_update: Option<&[String]>,
-    retries_update: Option<Option<i32>>,
-    model_update: Option<Option<&str>>,
-    change_policy_update: Option<ChangePolicy>,
-    tags_update: Option<&[String]>,
+    updates: StepFieldUpdates<'_>,
 ) -> Result<()> {
+    let StepFieldUpdates {
+        title,
+        description,
+        agent_update,
+        harness_update,
+        criteria_update,
+        retries_update,
+        model_update,
+        change_policy_update,
+        tags_update,
+    } = updates;
     // Build a single UPDATE with dynamic SET clauses so all changed fields
     // share one `updated_at` and a partial failure can't leave the row half
     // updated.
@@ -2478,25 +2510,50 @@ pub fn get_latest_log_for_step(conn: &Connection, step_id: &str) -> Result<Optio
 /// values. At every *terminal* callsite in the executor, callers MUST pass
 /// `Some(...)` for `termination_reason`; `test_status` should be
 /// `Some(TestStatus::NotRun)` for rows that never reached the test phase.
-#[allow(clippy::too_many_arguments)]
+/// The outcome columns written by [`update_execution_log`] for one attempt:
+/// timing, the diff / test results, the rolled-back/committed flags + commit
+/// hash, the harness stdout+stderr, usage metrics, and the optional
+/// termination-reason / test-status (COALESCE-d, so `None` keeps the existing
+/// value). `#[derive(Default)]` keeps the many `None` fields off call sites.
+#[derive(Default)]
+pub struct ExecutionLogUpdate<'a> {
+    pub duration_secs: Option<f64>,
+    pub diff: Option<&'a str>,
+    pub test_results: &'a [String],
+    pub rolled_back: bool,
+    pub committed: bool,
+    pub commit_hash: Option<&'a str>,
+    pub harness_stdout: Option<&'a str>,
+    pub harness_stderr: Option<&'a str>,
+    pub cost_usd: Option<f64>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub session_id: Option<&'a str>,
+    pub termination_reason: Option<crate::plan::TerminationReason>,
+    pub test_status: Option<crate::plan::TestStatus>,
+}
+
 pub fn update_execution_log(
     conn: &Connection,
     log_id: i64,
-    duration_secs: Option<f64>,
-    diff: Option<&str>,
-    test_results: &[String],
-    rolled_back: bool,
-    committed: bool,
-    commit_hash: Option<&str>,
-    harness_stdout: Option<&str>,
-    harness_stderr: Option<&str>,
-    cost_usd: Option<f64>,
-    input_tokens: Option<i64>,
-    output_tokens: Option<i64>,
-    session_id: Option<&str>,
-    termination_reason: Option<crate::plan::TerminationReason>,
-    test_status: Option<crate::plan::TestStatus>,
+    update: ExecutionLogUpdate<'_>,
 ) -> Result<()> {
+    let ExecutionLogUpdate {
+        duration_secs,
+        diff,
+        test_results,
+        rolled_back,
+        committed,
+        commit_hash,
+        harness_stdout,
+        harness_stderr,
+        cost_usd,
+        input_tokens,
+        output_tokens,
+        session_id,
+        termination_reason,
+        test_status,
+    } = update;
     debug_assert!(
         !(rolled_back && committed),
         "execution log cannot be both rolled_back and committed",
@@ -2917,7 +2974,6 @@ pub fn topo_sort_plans(conn: &Connection, plan_ids: &[String]) -> Result<Vec<Str
 /// dependency`, `--depends-on`, the topological scheduler); until then tests
 /// are the only consumers, so `#[allow(dead_code)]` marks the binary surface
 /// area, not the function itself.
-#[allow(dead_code)]
 pub fn add_step_dependency(
     conn: &Connection,
     step_id: &str,
@@ -3427,7 +3483,6 @@ pub fn list_all_hooks_for_plan(conn: &Connection, plan_id: &str) -> Result<Vec<S
 /// Production callers are `ralph cancel` and `ralph status`. Tests exercise it
 /// to verify phase writes, so the `#[allow(dead_code)]` marks the binary
 /// surface area, not the function itself.
-#[allow(dead_code)]
 pub fn get_live_run(conn: &Connection, project: &str) -> Result<Option<LiveRun>> {
     let query = format!("SELECT {LIVE_RUN_COLUMNS} FROM run_locks WHERE project = ?1");
     let mut stmt = conn.prepare(&query)?;
@@ -3572,19 +3627,36 @@ pub enum ChildUpdate<'a> {
 /// Errors when no row exists for `project` — the run_locks row is created by
 /// [`crate::run_lock::acquire`] before the executor starts, so a missing row
 /// indicates a programming error (likely a test forgot to seed the row).
-#[allow(clippy::too_many_arguments)]
+/// The COALESCE-able step bookkeeping written alongside a phase transition by
+/// [`update_live_phase`]: the step identity (`step_id` / `step_num`), the
+/// `attempt` / `max_attempts`, the `execution_log_id`, the (always-overwritten)
+/// `current_command`, and the explicit [`ChildUpdate`] for the child pid/token
+/// columns. `conn` / `project` / `phase` stay separate lead arguments.
+pub struct LivePhase<'a> {
+    pub step_id: Option<&'a str>,
+    pub step_num: Option<i32>,
+    pub attempt: Option<i32>,
+    pub max_attempts: Option<i32>,
+    pub execution_log_id: Option<i64>,
+    pub current_command: Option<&'a str>,
+    pub child: ChildUpdate<'a>,
+}
+
 pub fn update_live_phase(
     conn: &Connection,
     project: &str,
     phase: Phase,
-    step_id: Option<&str>,
-    step_num: Option<i32>,
-    attempt: Option<i32>,
-    max_attempts: Option<i32>,
-    execution_log_id: Option<i64>,
-    current_command: Option<&str>,
-    child: ChildUpdate<'_>,
+    live: LivePhase<'_>,
 ) -> Result<()> {
+    let LivePhase {
+        step_id,
+        step_num,
+        attempt,
+        max_attempts,
+        execution_log_id,
+        current_command,
+        child,
+    } = live;
     // Build the child-column fragment + bound params depending on the mode.
     // Keep uses COALESCE so Nones don't clobber; Set writes the values
     // directly; Clear overwrites both to NULL.
@@ -3664,7 +3736,19 @@ mod tests {
     #[test]
     fn test_mint_short_id_unique_length_charset() {
         let conn = setup();
-        let plan = create_plan(&conn, "mint", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "mint",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // Mint a short_id per step, persisting each so the next mint's
         // collision check (against steps.short_id) actually observes prior
@@ -3674,15 +3758,17 @@ mod tests {
             let (step, _) = create_step(
                 &conn,
                 &plan.id,
-                &format!("Step {i}"),
-                "d",
-                None,
-                None,
-                &[],
-                None,
-                None,
-                None,
-                None,
+                NewStep {
+                    title: &format!("Step {i}"),
+                    description: "d",
+                    agent: None,
+                    harness: None,
+                    acceptance_criteria: &[],
+                    max_retries: None,
+                    model: None,
+                    change_policy: None,
+                    tags: None,
+                },
             )
             .unwrap();
             let sid = mint_short_id(&conn, &plan.id).expect("mint_short_id");
@@ -3708,34 +3794,50 @@ mod tests {
     #[test]
     fn test_create_step_assigns_unique_short_id() {
         let conn = setup();
-        let plan = create_plan(&conn, "sid", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "sid",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let (s1, _) = create_step(
             &conn,
             &plan.id,
-            "Step one",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step one",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = create_step(
             &conn,
             &plan.id,
-            "Step two",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step two",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -3758,15 +3860,17 @@ mod tests {
             &conn,
             &plan.id,
             "z",
-            "Step three",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step three",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         assert!(!s3.short_id.is_empty());
@@ -3783,13 +3887,15 @@ mod tests {
 
         let plan = create_plan(
             &conn,
-            "my-plan",
-            "/tmp/proj",
-            "feat/branch",
-            "A test plan",
-            Some("claude"),
-            Some("opus"),
-            &tests,
+            NewPlan {
+                slug: "my-plan",
+                project: "/tmp/proj",
+                branch_name: "feat/branch",
+                description: "A test plan",
+                harness: Some("claude"),
+                agent: Some("opus"),
+                deterministic_tests: &tests,
+            },
         )
         .expect("create_plan");
 
@@ -3820,9 +3926,45 @@ mod tests {
     fn test_list_plans_filters_by_project() {
         let conn = setup();
 
-        create_plan(&conn, "p1", "/proj-a", "b1", "desc", None, None, &[]).unwrap();
-        create_plan(&conn, "p2", "/proj-b", "b2", "desc", None, None, &[]).unwrap();
-        create_plan(&conn, "p3", "/proj-a", "b3", "desc", None, None, &[]).unwrap();
+        create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj-a",
+                branch_name: "b1",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj-b",
+                branch_name: "b2",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        create_plan(
+            &conn,
+            NewPlan {
+                slug: "p3",
+                project: "/proj-a",
+                branch_name: "b3",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let proj_a = list_plans(&conn, "/proj-a", false).unwrap();
         assert_eq!(proj_a.len(), 2);
@@ -3839,20 +3981,56 @@ mod tests {
         // With no execution_logs rows, the order should be `created_at DESC`.
         let conn = setup();
 
-        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let p1 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         // Force distinct created_at stamps so ordering is deterministic.
         conn.execute(
             "UPDATE plans SET created_at = ?1 WHERE id = ?2",
             params!["2026-01-01T00:00:00.000Z", p1.id],
         )
         .unwrap();
-        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let p2 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         conn.execute(
             "UPDATE plans SET created_at = ?1 WHERE id = ?2",
             params!["2026-03-01T00:00:00.000Z", p2.id],
         )
         .unwrap();
-        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        let p3 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p3",
+                project: "/proj",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         conn.execute(
             "UPDATE plans SET created_at = ?1 WHERE id = ?2",
             params!["2026-02-01T00:00:00.000Z", p3.id],
@@ -3871,14 +4049,38 @@ mod tests {
         let conn = setup();
 
         // p1 created earliest, but will get a recent log.
-        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
+        let p1 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         conn.execute(
             "UPDATE plans SET created_at = ?1 WHERE id = ?2",
             params!["2026-01-01T00:00:00.000Z", p1.id],
         )
         .unwrap();
         // p2 created most recently, but never run.
-        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let p2 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         conn.execute(
             "UPDATE plans SET created_at = ?1 WHERE id = ?2",
             params!["2026-04-01T00:00:00.000Z", p2.id],
@@ -3889,15 +4091,17 @@ mod tests {
         let (step, _) = create_step(
             &conn,
             &p1.id,
-            "s",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "s",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -3917,22 +4121,48 @@ mod tests {
         // When a plan has multiple logs, the MAX(started_at) wins.
         let conn = setup();
 
-        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let p1 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p2 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // p1 has an old log + a fresh log → MAX is fresh.
         let (s1, _) = create_step(
             &conn,
             &p1.id,
-            "s1",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "s1",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let l_old = create_execution_log(&conn, &s1.id, 1, None, None).unwrap();
@@ -3952,15 +4182,17 @@ mod tests {
         let (s2, _) = create_step(
             &conn,
             &p2.id,
-            "s2",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "s2",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let l_p2 = create_execution_log(&conn, &s2.id, 1, None, None).unwrap();
@@ -3979,10 +4211,46 @@ mod tests {
     fn test_list_plans_sorted_by_recency_excludes_archived_and_other_projects() {
         let conn = setup();
 
-        let _own = create_plan(&conn, "own", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let archived = create_plan(&conn, "archived", "/proj", "b2", "d", None, None, &[]).unwrap();
+        let _own = create_plan(
+            &conn,
+            NewPlan {
+                slug: "own",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let archived = create_plan(
+            &conn,
+            NewPlan {
+                slug: "archived",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &archived.id, PlanStatus::Archived).unwrap();
-        let _other = create_plan(&conn, "other", "/elsewhere", "b3", "d", None, None, &[]).unwrap();
+        let _other = create_plan(
+            &conn,
+            NewPlan {
+                slug: "other",
+                project: "/elsewhere",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let plans = list_plans_sorted_by_recency(&conn, "/proj").unwrap();
         let slugs: Vec<&str> = plans.iter().map(|p| p.slug.as_str()).collect();
@@ -3993,10 +4261,58 @@ mod tests {
     fn test_list_archived_plans_sorted_by_recency_only_returns_archived() {
         let conn = setup();
 
-        let active = create_plan(&conn, "active", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let arch_a = create_plan(&conn, "arch-a", "/proj", "b2", "d", None, None, &[]).unwrap();
-        let arch_b = create_plan(&conn, "arch-b", "/proj", "b3", "d", None, None, &[]).unwrap();
-        let other = create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
+        let active = create_plan(
+            &conn,
+            NewPlan {
+                slug: "active",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let arch_a = create_plan(
+            &conn,
+            NewPlan {
+                slug: "arch-a",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let arch_b = create_plan(
+            &conn,
+            NewPlan {
+                slug: "arch-b",
+                project: "/proj",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let other = create_plan(
+            &conn,
+            NewPlan {
+                slug: "other",
+                project: "/elsewhere",
+                branch_name: "b4",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &arch_a.id, PlanStatus::Archived).unwrap();
         update_plan_status(&conn, &arch_b.id, PlanStatus::Archived).unwrap();
         update_plan_status(&conn, &other.id, PlanStatus::Archived).unwrap();
@@ -4018,11 +4334,59 @@ mod tests {
 
         assert_eq!(count_archived_plans(&conn, "/proj").unwrap(), 0);
 
-        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
-        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        let p1 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p2 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p3 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p3",
+                project: "/proj",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         // Different project — must not count.
-        let other = create_plan(&conn, "other", "/elsewhere", "b4", "d", None, None, &[]).unwrap();
+        let other = create_plan(
+            &conn,
+            NewPlan {
+                slug: "other",
+                project: "/elsewhere",
+                branch_name: "b4",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // p1 still planning; only p2 and p3 archived.
         update_plan_status(&conn, &p2.id, PlanStatus::Archived).unwrap();
@@ -4039,14 +4403,110 @@ mod tests {
         let conn = setup();
 
         // Seed one plan per status, plus a same-status plan in another project.
-        let planning = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let ready = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
-        let in_progress = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
-        let failed = create_plan(&conn, "p4", "/proj", "b4", "d", None, None, &[]).unwrap();
-        let complete = create_plan(&conn, "p5", "/proj", "b5", "d", None, None, &[]).unwrap();
-        let archived = create_plan(&conn, "p6", "/proj", "b6", "d", None, None, &[]).unwrap();
-        let aborted = create_plan(&conn, "p7", "/proj", "b7", "d", None, None, &[]).unwrap();
-        let other = create_plan(&conn, "p8", "/other", "b8", "d", None, None, &[]).unwrap();
+        let planning = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let ready = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let in_progress = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p3",
+                project: "/proj",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let failed = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p4",
+                project: "/proj",
+                branch_name: "b4",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let complete = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p5",
+                project: "/proj",
+                branch_name: "b5",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let archived = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p6",
+                project: "/proj",
+                branch_name: "b6",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let aborted = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p7",
+                project: "/proj",
+                branch_name: "b7",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let other = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p8",
+                project: "/other",
+                branch_name: "b8",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         update_plan_status(&conn, &ready.id, PlanStatus::Ready).unwrap();
         update_plan_status(&conn, &in_progress.id, PlanStatus::InProgress).unwrap();
@@ -4093,7 +4553,19 @@ mod tests {
     #[test]
     fn test_update_plan_status() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         assert_eq!(plan.status, PlanStatus::Planning);
 
         update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
@@ -4114,19 +4586,33 @@ mod tests {
         // Fresh DB: nothing enables review.
         assert!(!any_review_enabled(&conn, false).unwrap());
 
-        let plan = create_plan(&conn, "rv", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "rv",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "s",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "s",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         // Defaults (NULL/inherit) ⇒ still false.
@@ -4172,7 +4658,19 @@ mod tests {
     #[test]
     fn test_set_plan_pause_requested_round_trips() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         assert!(!plan.pause_requested, "default should be false");
         assert!(!get_plan_pause_requested(&conn, &plan.id).unwrap());
 
@@ -4191,7 +4689,19 @@ mod tests {
     #[test]
     fn test_take_plan_pause_requested_clears_flag_atomically() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // Unset → take returns false, flag stays cleared.
         assert!(!take_plan_pause_requested(&conn, &plan.id).unwrap());
@@ -4221,7 +4731,19 @@ mod tests {
     #[test]
     fn test_request_skip_round_trips_and_take_clears_atomically() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // No pending skip → take returns None, peek returns None.
         assert!(take_skip_request(&conn, &plan.id).unwrap().is_none());
@@ -4271,7 +4793,19 @@ mod tests {
     #[test]
     fn test_request_skip_overwrites_prior_and_unknown_token_defaults_stash() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         request_skip(
             &conn,
@@ -4308,7 +4842,19 @@ mod tests {
     #[test]
     fn test_clear_skip_request_is_idempotent_noop_when_empty() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         // No-op on an empty slot.
         clear_skip_request(&conn, &plan.id).unwrap();
         assert!(peek_skip_request(&conn, &plan.id).unwrap().is_none());
@@ -4324,7 +4870,19 @@ mod tests {
     #[test]
     fn test_take_skip_request_for_step_is_targeted_and_atomic() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // Nothing pending → None for any step.
         assert!(
@@ -4404,7 +4962,19 @@ mod tests {
     #[test]
     fn test_set_plan_last_run_branch_round_trips() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         assert!(plan.last_run_branch.is_none());
 
         set_plan_last_run_branch(&conn, &plan.id, "feature/x").unwrap();
@@ -4431,9 +5001,45 @@ mod tests {
         // Three resumable plans on master; stamp last_run_started_at via
         // set_plan_last_run_branch in p1 → p2 → p3 order so DESC reflects
         // insertion order.
-        let p1 = create_plan(&conn, "p1", "/proj", "b1", "d", None, None, &[]).unwrap();
-        let p2 = create_plan(&conn, "p2", "/proj", "b2", "d", None, None, &[]).unwrap();
-        let p3 = create_plan(&conn, "p3", "/proj", "b3", "d", None, None, &[]).unwrap();
+        let p1 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p1",
+                project: "/proj",
+                branch_name: "b1",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p2 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p2",
+                project: "/proj",
+                branch_name: "b2",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p3 = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p3",
+                project: "/proj",
+                branch_name: "b3",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &p1.id, PlanStatus::Failed).unwrap();
         update_plan_status(&conn, &p2.id, PlanStatus::InProgress).unwrap();
         update_plan_status(&conn, &p3.id, PlanStatus::Aborted).unwrap();
@@ -4458,8 +5064,32 @@ mod tests {
     #[test]
     fn test_find_resumable_plans_orders_by_run_time_not_updated_at() {
         let conn = setup();
-        let stale = create_plan(&conn, "stale", "/proj", "b", "d", None, None, &[]).unwrap();
-        let fresh = create_plan(&conn, "fresh", "/proj", "b", "d", None, None, &[]).unwrap();
+        let stale = create_plan(
+            &conn,
+            NewPlan {
+                slug: "stale",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let fresh = create_plan(
+            &conn,
+            NewPlan {
+                slug: "fresh",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &stale.id, PlanStatus::Failed).unwrap();
         update_plan_status(&conn, &fresh.id, PlanStatus::Failed).unwrap();
 
@@ -4487,7 +5117,19 @@ mod tests {
     #[test]
     fn test_set_plan_last_run_branch_stamps_last_run_started_at() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         assert!(plan.last_run_started_at.is_none());
 
         set_plan_last_run_branch(&conn, &plan.id, "master").unwrap();
@@ -4502,7 +5144,19 @@ mod tests {
     fn test_find_resumable_plan_returns_aborted_in_any_branch_context() {
         let conn = setup();
         // No matching branch row, but Aborted plan must still come back.
-        let plan = create_plan(&conn, "ab", "/proj", "any", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "ab",
+                project: "/proj",
+                branch_name: "any",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &plan.id, PlanStatus::Aborted).unwrap();
 
         let p = find_resumable_plan(&conn, "/proj").unwrap();
@@ -4514,10 +5168,46 @@ mod tests {
     fn test_find_resumable_plan_excludes_complete_and_planning() {
         let conn = setup();
         // Planning (default), complete, archived must not be returned.
-        let _planning = create_plan(&conn, "pl", "/proj", "b", "d", None, None, &[]).unwrap();
-        let cp = create_plan(&conn, "cp", "/proj", "b", "d", None, None, &[]).unwrap();
+        let _planning = create_plan(
+            &conn,
+            NewPlan {
+                slug: "pl",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let cp = create_plan(
+            &conn,
+            NewPlan {
+                slug: "cp",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &cp.id, PlanStatus::Complete).unwrap();
-        let ar = create_plan(&conn, "ar", "/proj", "b", "d", None, None, &[]).unwrap();
+        let ar = create_plan(
+            &conn,
+            NewPlan {
+                slug: "ar",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &ar.id, PlanStatus::Archived).unwrap();
 
         let p = find_resumable_plan(&conn, "/proj").unwrap();
@@ -4527,8 +5217,32 @@ mod tests {
     #[test]
     fn test_find_resumable_plan_orders_by_run_time_not_updated_at() {
         let conn = setup();
-        let stale = create_plan(&conn, "stale", "/proj", "b", "d", None, None, &[]).unwrap();
-        let fresh = create_plan(&conn, "fresh", "/proj", "b", "d", None, None, &[]).unwrap();
+        let stale = create_plan(
+            &conn,
+            NewPlan {
+                slug: "stale",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let fresh = create_plan(
+            &conn,
+            NewPlan {
+                slug: "fresh",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &stale.id, PlanStatus::Failed).unwrap();
         update_plan_status(&conn, &fresh.id, PlanStatus::Aborted).unwrap();
 
@@ -4554,16 +5268,64 @@ mod tests {
         ];
         for (i, status) in resumable_statuses.iter().enumerate() {
             let slug = format!("rp{i}");
-            let plan = create_plan(&conn, &slug, "/proj", "main", "d", None, None, &[]).unwrap();
+            let plan = create_plan(
+                &conn,
+                NewPlan {
+                    slug: &slug,
+                    project: "/proj",
+                    branch_name: "main",
+                    description: "d",
+                    harness: None,
+                    agent: None,
+                    deterministic_tests: &[],
+                },
+            )
+            .unwrap();
             update_plan_status(&conn, &plan.id, *status).unwrap();
             set_plan_last_run_branch(&conn, &plan.id, "main").unwrap();
         }
         // Non-resumable: planning (default), complete, archived.
-        let _planning = create_plan(&conn, "pl", "/proj", "main", "d", None, None, &[]).unwrap();
-        let cp = create_plan(&conn, "cp", "/proj", "main", "d", None, None, &[]).unwrap();
+        let _planning = create_plan(
+            &conn,
+            NewPlan {
+                slug: "pl",
+                project: "/proj",
+                branch_name: "main",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let cp = create_plan(
+            &conn,
+            NewPlan {
+                slug: "cp",
+                project: "/proj",
+                branch_name: "main",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &cp.id, PlanStatus::Complete).unwrap();
         set_plan_last_run_branch(&conn, &cp.id, "main").unwrap();
-        let ar = create_plan(&conn, "ar", "/proj", "main", "d", None, None, &[]).unwrap();
+        let ar = create_plan(
+            &conn,
+            NewPlan {
+                slug: "ar",
+                project: "/proj",
+                branch_name: "main",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &ar.id, PlanStatus::Archived).unwrap();
         set_plan_last_run_branch(&conn, &ar.id, "main").unwrap();
 
@@ -4580,11 +5342,34 @@ mod tests {
     #[test]
     fn test_find_resumable_plans_for_branch_scopes_to_project() {
         let conn = setup();
-        let here = create_plan(&conn, "here", "/proj", "main", "d", None, None, &[]).unwrap();
+        let here = create_plan(
+            &conn,
+            NewPlan {
+                slug: "here",
+                project: "/proj",
+                branch_name: "main",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &here.id, PlanStatus::Failed).unwrap();
         set_plan_last_run_branch(&conn, &here.id, "main").unwrap();
-        let elsewhere =
-            create_plan(&conn, "elsewhere", "/other", "main", "d", None, None, &[]).unwrap();
+        let elsewhere = create_plan(
+            &conn,
+            NewPlan {
+                slug: "elsewhere",
+                project: "/other",
+                branch_name: "main",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &elsewhere.id, PlanStatus::Failed).unwrap();
         set_plan_last_run_branch(&conn, &elsewhere.id, "main").unwrap();
 
@@ -4598,7 +5383,19 @@ mod tests {
         // A plan that has never run (last_run_branch IS NULL) should still
         // match when current_branch == branch_name.
         let conn = setup();
-        let plan = create_plan(&conn, "fresh", "/proj", "feat-x", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "fresh",
+                project: "/proj",
+                branch_name: "feat-x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
         assert!(plan.last_run_branch.is_none());
 
@@ -4620,7 +5417,19 @@ mod tests {
         // that branch must NOT match A — A's last_run_branch='master' is
         // set, so the NULL+branch_name fallback is skipped.
         let conn = setup();
-        let a = create_plan(&conn, "deploy", "/proj", "deploy", "d", None, None, &[]).unwrap();
+        let a = create_plan(
+            &conn,
+            NewPlan {
+                slug: "deploy",
+                project: "/proj",
+                branch_name: "deploy",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         update_plan_status(&conn, &a.id, PlanStatus::Failed).unwrap();
         set_plan_last_run_branch(&conn, &a.id, "master").unwrap();
 
@@ -4652,19 +5461,33 @@ mod tests {
     #[test]
     fn test_count_unanswered_questions_for_attempt_scopes_by_step_and_attempt() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4724,19 +5547,33 @@ mod tests {
     #[test]
     fn test_plan_effective_status_returns_interrupted_when_open_interruption_exists() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         // Set the underlying lifecycle to in_progress so we can verify the
@@ -4782,19 +5619,33 @@ mod tests {
     #[test]
     fn test_plan_effective_status_returns_underlying_when_no_open_questions() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         update_plan_status(&conn, &plan.id, PlanStatus::Complete).unwrap();
@@ -4813,19 +5664,33 @@ mod tests {
     #[test]
     fn test_delete_plan_cascades() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -4852,48 +5717,66 @@ mod tests {
     #[test]
     fn test_create_step_generates_sort_keys() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let (s1, _) = create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s3, _) = create_step(
             &conn,
             &plan.id,
-            "Third",
-            "d3",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Third",
+                description: "d3",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4918,48 +5801,66 @@ mod tests {
     #[test]
     fn test_list_steps_ordered_by_sort_key() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         create_step(
             &conn,
             &plan.id,
-            "First",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "First",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Second",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         create_step(
             &conn,
             &plan.id,
-            "Third",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Third",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4978,21 +5879,35 @@ mod tests {
     #[test]
     fn test_step_acceptance_criteria_roundtrip() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let criteria = vec!["tests pass".to_string(), "lint clean".to_string()];
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &criteria,
-            Some(3),
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &criteria,
+                max_retries: Some(3),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5005,21 +5920,35 @@ mod tests {
     #[test]
     fn test_create_step_stores_tags() {
         let conn = setup();
-        let plan = create_plan(&conn, "tagged", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "tagged",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let tags = vec!["FIX".to_string(), "REGRESSION".to_string()];
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Fix bug",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            Some(&tags),
+            NewStep {
+                title: "Fix bug",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: Some(&tags),
+            },
         )
         .unwrap();
 
@@ -5038,7 +5967,19 @@ mod tests {
         // backfilled). Reading through Step::from_row must yield an empty
         // Vec without panicking.
         let conn = setup();
-        let plan = create_plan(&conn, "legacy", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "legacy",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         conn.execute(
             "INSERT INTO steps (id, plan_id, sort_key, title, description) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -5064,21 +6005,35 @@ mod tests {
     #[test]
     fn test_update_step_fields_ext_replaces_tags() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let initial = vec!["FIX".to_string()];
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "T",
-            "",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            Some(&initial),
+            NewStep {
+                title: "T",
+                description: "",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: Some(&initial),
+            },
         )
         .unwrap();
 
@@ -5087,15 +6042,10 @@ mod tests {
         update_step_fields_ext(
             &conn,
             &step.id,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&replacement),
+            StepFieldUpdates {
+                tags_update: Some(&replacement),
+                ..Default::default()
+            },
         )
         .unwrap();
         let updated = get_step(&conn, &step.id).unwrap();
@@ -5105,15 +6055,10 @@ mod tests {
         update_step_fields_ext(
             &conn,
             &step.id,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&[]),
+            StepFieldUpdates {
+                tags_update: Some(&[]),
+                ..Default::default()
+            },
         )
         .unwrap();
         let cleared = get_step(&conn, &step.id).unwrap();
@@ -5123,19 +6068,33 @@ mod tests {
     #[test]
     fn test_update_step_status() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5151,19 +6110,33 @@ mod tests {
         // so setting multiple fields in one call leaves no window for a
         // partial write with inconsistent timestamps.
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5174,15 +6147,17 @@ mod tests {
         update_step_fields_ext(
             &conn,
             &step.id,
-            Some("New Title"),
-            Some("New Desc"),
-            Some(Some("new-agent")),
-            Some(Some("new-harness")),
-            Some(&["criterion".to_string()]),
-            Some(Some(5)),
-            Some(Some("new-model")),
-            Some(ChangePolicy::Optional),
-            None,
+            StepFieldUpdates {
+                title: Some("New Title"),
+                description: Some("New Desc"),
+                agent_update: Some(Some("new-agent")),
+                harness_update: Some(Some("new-harness")),
+                criteria_update: Some(&["criterion".to_string()]),
+                retries_update: Some(Some(5)),
+                model_update: Some(Some("new-model")),
+                change_policy_update: Some(ChangePolicy::Optional),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -5203,19 +6178,33 @@ mod tests {
         // When the step doesn't exist the transaction rolls back, leaving
         // other rows untouched.
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (other, _) = create_step(
             &conn,
             &plan.id,
-            "Other",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Other",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let other_before = get_step(&conn, &other.id).unwrap();
@@ -5223,15 +6212,12 @@ mod tests {
         let err = update_step_fields_ext(
             &conn,
             "nonexistent-id",
-            Some("New Title"),
-            Some("New Desc"),
-            Some(Some("agent")),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            StepFieldUpdates {
+                title: Some("New Title"),
+                description: Some("New Desc"),
+                agent_update: Some(Some("agent")),
+                ..Default::default()
+            },
         )
         .unwrap_err();
         assert!(err.to_string().contains("Step not found"));
@@ -5244,34 +6230,46 @@ mod tests {
     #[test]
     fn test_update_step_fields_ext_clears_nullable_fields() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            Some("agent"),
-            Some("harness"),
-            &[],
-            Some(3),
-            Some("model"),
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: Some("agent"),
+                harness: Some("harness"),
+                acceptance_criteria: &[],
+                max_retries: Some(3),
+                model: Some("model"),
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
         update_step_fields_ext(
             &conn,
             &step.id,
-            None,
-            None,
-            Some(None),
-            Some(None),
-            None,
-            Some(None),
-            Some(None),
-            None,
-            None,
+            StepFieldUpdates {
+                agent_update: Some(None),
+                harness_update: Some(None),
+                retries_update: Some(None),
+                model_update: Some(None),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -5285,27 +6283,38 @@ mod tests {
     #[test]
     fn test_update_step_fields_ext_noop_when_all_none() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let before = get_step(&conn, &step.id).unwrap();
 
-        update_step_fields_ext(
-            &conn, &step.id, None, None, None, None, None, None, None, None, None,
-        )
-        .unwrap();
+        update_step_fields_ext(&conn, &step.id, StepFieldUpdates::default()).unwrap();
 
         let after = get_step(&conn, &step.id).unwrap();
         assert_eq!(before.updated_at, after.updated_at);
@@ -5314,19 +6323,33 @@ mod tests {
     #[test]
     fn test_delete_step() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -5345,19 +6368,33 @@ mod tests {
         // next run then tried to create attempt=1 again and tripped the
         // UNIQUE(step_id, attempt) constraint.
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();
@@ -5377,34 +6414,50 @@ mod tests {
     #[test]
     fn test_get_next_pending_step() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let (s1, _) = create_step(
             &conn,
             &plan.id,
-            "First",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "First",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Second",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5430,19 +6483,33 @@ mod tests {
     #[test]
     fn test_create_and_get_execution_log() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5461,19 +6528,33 @@ mod tests {
     #[test]
     fn test_get_latest_log_for_step() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5488,19 +6569,33 @@ mod tests {
     #[test]
     fn test_update_execution_log() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -5509,20 +6604,20 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(45.5),
-            Some("+added line"),
-            &test_results,
-            false,
-            true,
-            Some("abc123"),
-            Some("stdout"),
-            Some("stderr"),
-            Some(0.05),
-            Some(1000),
-            Some(500),
-            Some("session-abc"),
-            None,
-            None,
+            ExecutionLogUpdate {
+                duration_secs: Some(45.5),
+                diff: Some("+added line"),
+                test_results: &test_results,
+                committed: true,
+                commit_hash: Some("abc123"),
+                harness_stdout: Some("stdout"),
+                harness_stderr: Some("stderr"),
+                cost_usd: Some(0.05),
+                input_tokens: Some(1000),
+                output_tokens: Some(500),
+                session_id: Some("session-abc"),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -5547,19 +6642,33 @@ mod tests {
     fn test_update_execution_log_persists_termination_and_test_status() {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -5567,20 +6676,14 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(1.0),
-            None,
-            &[],
-            false,
-            true,
-            Some("abc"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(TerminationReason::Success),
-            Some(TestStatus::Passed),
+            ExecutionLogUpdate {
+                duration_secs: Some(1.0),
+                committed: true,
+                commit_hash: Some("abc"),
+                termination_reason: Some(TerminationReason::Success),
+                test_status: Some(TestStatus::Passed),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -5599,19 +6702,33 @@ mod tests {
     fn test_update_execution_log_coalesces_termination_and_test_status() {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -5620,20 +6737,13 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(1.0),
-            None,
-            &[],
-            true,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(TerminationReason::TestFailed),
-            Some(TestStatus::Failed),
+            ExecutionLogUpdate {
+                duration_secs: Some(1.0),
+                rolled_back: true,
+                termination_reason: Some(TerminationReason::TestFailed),
+                test_status: Some(TestStatus::Failed),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -5641,20 +6751,11 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(2.0),
-            None,
-            &[],
-            true,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            ExecutionLogUpdate {
+                duration_secs: Some(2.0),
+                rolled_back: true,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -5676,19 +6777,33 @@ mod tests {
     #[should_panic(expected = "execution log cannot be both rolled_back and committed")]
     fn test_update_execution_log_rolled_back_and_committed_panics() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -5696,39 +6811,44 @@ mod tests {
         let _ = update_execution_log(
             &conn,
             log.id,
-            None,
-            None,
-            &[],
-            true,
-            true,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            ExecutionLogUpdate {
+                rolled_back: true,
+                committed: true,
+                ..Default::default()
+            },
         );
     }
 
     #[test]
     fn test_update_execution_log_preserves_session_id_when_none() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, Some("initial-session")).unwrap();
@@ -5736,20 +6856,11 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(10.0),
-            None,
-            &[],
-            false,
-            true,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            ExecutionLogUpdate {
+                duration_secs: Some(10.0),
+                committed: true,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -5770,7 +6881,19 @@ mod tests {
             "cargo clippy -- -D warnings".to_string(),
         ];
 
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &tests).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &tests,
+            },
+        )
+        .unwrap();
         let found = get_plan_by_slug(&conn, "s", "/p").unwrap().unwrap();
         assert_eq!(found.deterministic_tests, tests);
         assert_eq!(found.id, plan.id);
@@ -5779,7 +6902,19 @@ mod tests {
     #[test]
     fn test_json_roundtrip_acceptance_criteria() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let criteria = vec![
             "All tests pass".to_string(),
@@ -5787,7 +6922,19 @@ mod tests {
             "Code coverage > 80%".to_string(),
         ];
         let (step, _) = create_step(
-            &conn, &plan.id, "Step", "d", None, None, &criteria, None, None, None, None,
+            &conn,
+            &plan.id,
+            NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &criteria,
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5798,21 +6945,35 @@ mod tests {
     #[test]
     fn test_json_roundtrip_empty_arrays() {
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         assert!(plan.deterministic_tests.is_empty());
 
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         assert!(step.acceptance_criteria.is_empty());
@@ -5825,9 +6986,20 @@ mod tests {
         (1..=n)
             .map(|i| {
                 let slug = format!("p{i}");
-                create_plan(conn, &slug, "/proj", "branch", "desc", None, None, &[])
-                    .expect("create_plan")
-                    .id
+                create_plan(
+                    conn,
+                    NewPlan {
+                        slug: &slug,
+                        project: "/proj",
+                        branch_name: "branch",
+                        description: "desc",
+                        harness: None,
+                        agent: None,
+                        deterministic_tests: &[],
+                    },
+                )
+                .expect("create_plan")
+                .id
             })
             .collect()
     }
@@ -5951,22 +7123,35 @@ mod tests {
 
     /// Create one plan plus `n` steps named s1..sn in it; return the step IDs.
     fn make_steps(conn: &Connection, n: usize) -> Vec<String> {
-        let plan = create_plan(conn, "sp", "/proj", "branch", "desc", None, None, &[])
-            .expect("create_plan");
+        let plan = create_plan(
+            conn,
+            NewPlan {
+                slug: "sp",
+                project: "/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .expect("create_plan");
         (1..=n)
             .map(|i| {
                 create_step(
                     conn,
                     &plan.id,
-                    &format!("s{i}"),
-                    "d",
-                    None,
-                    None,
-                    &[],
-                    None,
-                    None,
-                    None,
-                    None,
+                    NewStep {
+                        title: &format!("s{i}"),
+                        description: "d",
+                        agent: None,
+                        harness: None,
+                        acceptance_criteria: &[],
+                        max_retries: None,
+                        model: None,
+                        change_policy: None,
+                        tags: None,
+                    },
                 )
                 .expect("create_step")
                 .0
@@ -6002,36 +7187,62 @@ mod tests {
     #[test]
     fn test_add_step_dependency_rejects_cross_plan_edge() {
         let conn = setup();
-        let plan_a = create_plan(&conn, "spa", "/proj", "branch", "desc", None, None, &[])
-            .expect("create_plan a");
-        let plan_b = create_plan(&conn, "spb", "/proj", "branch", "desc", None, None, &[])
-            .expect("create_plan b");
+        let plan_a = create_plan(
+            &conn,
+            NewPlan {
+                slug: "spa",
+                project: "/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .expect("create_plan a");
+        let plan_b = create_plan(
+            &conn,
+            NewPlan {
+                slug: "spb",
+                project: "/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .expect("create_plan b");
         let (a, _) = create_step(
             &conn,
             &plan_a.id,
-            "a",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "a",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (b, _) = create_step(
             &conn,
             &plan_b.id,
-            "b",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "b",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6153,22 +7364,35 @@ mod tests {
 
     /// Create a plan with `n` steps; return `(plan_id, step_ids)`.
     fn make_plan_with_steps(conn: &Connection, slug: &str, n: usize) -> (String, Vec<String>) {
-        let plan = create_plan(conn, slug, "/proj", "branch", "desc", None, None, &[])
-            .expect("create_plan");
+        let plan = create_plan(
+            conn,
+            NewPlan {
+                slug,
+                project: "/proj",
+                branch_name: "branch",
+                description: "desc",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .expect("create_plan");
         let ids = (1..=n)
             .map(|i| {
                 create_step(
                     conn,
                     &plan.id,
-                    &format!("s{i}"),
-                    "d",
-                    None,
-                    None,
-                    &[],
-                    None,
-                    None,
-                    None,
-                    None,
+                    NewStep {
+                        title: &format!("s{i}"),
+                        description: "d",
+                        agent: None,
+                        harness: None,
+                        acceptance_criteria: &[],
+                        max_retries: None,
+                        model: None,
+                        change_policy: None,
+                        tags: None,
+                    },
                 )
                 .expect("create_step")
                 .0
@@ -6338,19 +7562,33 @@ mod tests {
     #[test]
     fn test_attach_hook_to_step_rejects_duplicate() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "t",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "t",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6370,7 +7608,19 @@ mod tests {
     #[test]
     fn test_attach_hook_to_plan_rejects_duplicate() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         attach_hook_to_plan(&conn, &plan.id, "post-step", "h1").unwrap();
 
@@ -6387,33 +7637,49 @@ mod tests {
     #[test]
     fn test_attach_hook_allows_distinct_combinations() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = create_step(
             &conn,
             &plan.id,
-            "t1",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "t1",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = create_step(
             &conn,
             &plan.id,
-            "t2",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "t2",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6436,21 +7702,35 @@ mod tests {
     #[test]
     fn test_create_step_persists_change_policy_required_by_default() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // None argument → Required default.
         let (s_default, _) = create_step(
             &conn,
             &plan.id,
-            "def",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "def",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         assert_eq!(s_default.change_policy, ChangePolicy::Required);
@@ -6462,20 +7742,34 @@ mod tests {
     #[test]
     fn test_create_step_persists_change_policy_optional() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let (s_opt, _) = create_step(
             &conn,
             &plan.id,
-            "review",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            NewStep {
+                title: "review",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
         assert_eq!(s_opt.change_policy, ChangePolicy::Optional);
@@ -6492,21 +7786,35 @@ mod tests {
     #[test]
     fn test_create_step_at_persists_change_policy() {
         let conn = setup();
-        let plan = create_plan(&conn, "p", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "p",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let (s, _) = create_step_at(
             &conn,
             &plan.id,
             "m5",
-            "mid",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            Some(ChangePolicy::Optional),
-            None,
+            NewStep {
+                title: "mid",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: Some(ChangePolicy::Optional),
+                tags: None,
+            },
         )
         .unwrap();
         assert_eq!(s.change_policy, ChangePolicy::Optional);
@@ -6520,7 +7828,19 @@ mod tests {
     #[test]
     fn test_sweep_stale_in_progress_resets_in_flight_review_status() {
         let conn = setup();
-        let plan = create_plan(&conn, "sweep", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "sweep",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // Step A: InProgress + InFlight but with NO committed execution-log
         // row. In real runs InFlight always implies a commit, but a row
@@ -6531,15 +7851,17 @@ mod tests {
         let (a, _) = create_step(
             &conn,
             &plan.id,
-            "A",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         update_step_status(&conn, &a.id, StepStatus::InProgress).unwrap();
@@ -6550,15 +7872,17 @@ mod tests {
         let (b, _) = create_step(
             &conn,
             &plan.id,
-            "B",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "B",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         update_step_status(&conn, &b.id, StepStatus::InProgress).unwrap();
@@ -6568,15 +7892,17 @@ mod tests {
         let (c, _) = create_step(
             &conn,
             &plan.id,
-            "C",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "C",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         update_step_status(&conn, &c.id, StepStatus::Complete).unwrap();
@@ -6629,20 +7955,34 @@ mod tests {
     #[test]
     fn test_sweep_keeps_committed_review_pending_step() {
         let conn = setup();
-        let plan = create_plan(&conn, "sweep2", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "sweep2",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         let (a, _) = create_step(
             &conn,
             &plan.id,
-            "A",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         update_step_status(&conn, &a.id, StepStatus::InProgress).unwrap();
@@ -6688,21 +8028,35 @@ mod tests {
     #[test]
     fn test_sweep_skips_step_with_open_corrective_request() {
         let conn = setup();
-        let plan = create_plan(&conn, "sweep-corr", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "sweep-corr",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // A: InProgress + an OPEN corrective request → must be preserved.
         let (a, _) = create_step(
             &conn,
             &plan.id,
-            "A",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         update_step_status(&conn, &a.id, StepStatus::InProgress).unwrap();
@@ -6712,15 +8066,17 @@ mod tests {
         let (b, _) = create_step(
             &conn,
             &plan.id,
-            "B",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "B",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         update_step_status(&conn, &b.id, StepStatus::InProgress).unwrap();
@@ -6775,15 +8131,17 @@ mod tests {
             &conn,
             "/proj-lp1",
             Phase::Harness,
-            Some("step-uuid"),
-            Some(2),
-            Some(1),
-            Some(3),
-            Some(42),
-            Some("claude-code"),
-            ChildUpdate::Set {
-                pid: 99_999,
-                start_token: Some("token-abc"),
+            LivePhase {
+                step_id: Some("step-uuid"),
+                step_num: Some(2),
+                attempt: Some(1),
+                max_attempts: Some(3),
+                execution_log_id: Some(42),
+                current_command: Some("claude-code"),
+                child: ChildUpdate::Set {
+                    pid: 99_999,
+                    start_token: Some("token-abc"),
+                },
             },
         )
         .unwrap();
@@ -6814,15 +8172,17 @@ mod tests {
             &conn,
             "/proj-lp2",
             Phase::Harness,
-            Some("step-1"),
-            Some(1),
-            Some(1),
-            Some(3),
-            Some(7),
-            None,
-            ChildUpdate::Set {
-                pid: 12345,
-                start_token: Some("tok-initial"),
+            LivePhase {
+                step_id: Some("step-1"),
+                step_num: Some(1),
+                attempt: Some(1),
+                max_attempts: Some(3),
+                execution_log_id: Some(7),
+                current_command: None,
+                child: ChildUpdate::Set {
+                    pid: 12345,
+                    start_token: Some("tok-initial"),
+                },
             },
         )
         .unwrap();
@@ -6833,13 +8193,15 @@ mod tests {
             &conn,
             "/proj-lp2",
             Phase::Tests,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Keep,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Keep,
+            },
         )
         .unwrap();
 
@@ -6869,15 +8231,17 @@ mod tests {
             &conn,
             "/proj-keep",
             Phase::Harness,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Set {
-                pid: 42,
-                start_token: Some("tok"),
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Set {
+                    pid: 42,
+                    start_token: Some("tok"),
+                },
             },
         )
         .unwrap();
@@ -6886,13 +8250,15 @@ mod tests {
             &conn,
             "/proj-keep",
             Phase::PreTestHook,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Keep,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Keep,
+            },
         )
         .unwrap();
 
@@ -6913,15 +8279,17 @@ mod tests {
             &conn,
             "/proj-clear",
             Phase::Harness,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Set {
-                pid: 7777,
-                start_token: Some("tok-set"),
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Set {
+                    pid: 7777,
+                    start_token: Some("tok-set"),
+                },
             },
         )
         .unwrap();
@@ -6934,13 +8302,15 @@ mod tests {
             &conn,
             "/proj-clear",
             Phase::Tests,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Clear,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Clear,
+            },
         )
         .unwrap();
 
@@ -6962,13 +8332,15 @@ mod tests {
             &conn,
             "/proj-lp3",
             Phase::Tests,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("cargo test"),
-            ChildUpdate::Keep,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: Some("cargo test"),
+                child: ChildUpdate::Keep,
+            },
         )
         .unwrap();
         let before = get_live_run(&conn, "/proj-lp3").unwrap().unwrap();
@@ -6980,13 +8352,15 @@ mod tests {
             &conn,
             "/proj-lp3",
             Phase::PostTestHook,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Keep,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Keep,
+            },
         )
         .unwrap();
         let after = get_live_run(&conn, "/proj-lp3").unwrap().unwrap();
@@ -7004,13 +8378,15 @@ mod tests {
             &conn,
             "/proj-missing",
             Phase::Harness,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ChildUpdate::Keep,
+            LivePhase {
+                step_id: None,
+                step_num: None,
+                attempt: None,
+                max_attempts: None,
+                execution_log_id: None,
+                current_command: None,
+                child: ChildUpdate::Keep,
+            },
         )
         .unwrap_err();
         assert!(
@@ -7133,15 +8509,17 @@ mod tests {
             &conn,
             "/proj-a-to-b",
             Phase::Harness,
-            Some("step-A"),
-            Some(1),
-            Some(1),
-            Some(3),
-            Some(10),
-            Some("claude-A"),
-            ChildUpdate::Set {
-                pid: 100,
-                start_token: Some("tok-A"),
+            LivePhase {
+                step_id: Some("step-A"),
+                step_num: Some(1),
+                attempt: Some(1),
+                max_attempts: Some(3),
+                execution_log_id: Some(10),
+                current_command: Some("claude-A"),
+                child: ChildUpdate::Set {
+                    pid: 100,
+                    start_token: Some("tok-A"),
+                },
             },
         )
         .unwrap();
@@ -7163,15 +8541,17 @@ mod tests {
             &conn,
             "/proj-a-to-b",
             Phase::Harness,
-            Some("step-B"),
-            Some(2),
-            Some(1),
-            Some(3),
-            Some(11),
-            Some("claude-B"),
-            ChildUpdate::Set {
-                pid: 200,
-                start_token: Some("tok-B"),
+            LivePhase {
+                step_id: Some("step-B"),
+                step_num: Some(2),
+                attempt: Some(1),
+                max_attempts: Some(3),
+                execution_log_id: Some(11),
+                current_command: Some("claude-B"),
+                child: ChildUpdate::Set {
+                    pid: 200,
+                    start_token: Some("tok-B"),
+                },
             },
         )
         .unwrap();
@@ -7202,19 +8582,33 @@ mod tests {
     fn test_finalize_execution_log_as_interrupted_sets_fields() {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -7223,20 +8617,14 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(3.0),
-            Some("+some diff"),
-            &["unit: pass".to_string()],
-            false,
-            false,
-            None,
-            Some("hello stdout"),
-            Some("warn stderr"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            ExecutionLogUpdate {
+                duration_secs: Some(3.0),
+                diff: Some("+some diff"),
+                test_results: &["unit: pass".to_string()],
+                harness_stdout: Some("hello stdout"),
+                harness_stderr: Some("warn stderr"),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -7260,19 +8648,33 @@ mod tests {
     fn test_finalize_execution_log_as_interrupted_preserves_existing_terminal() {
         use crate::plan::{TerminationReason, TestStatus};
         let conn = setup();
-        let plan = create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             &conn,
             &plan.id,
-            "Step",
-            "desc",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step",
+                description: "desc",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let log = create_execution_log(&conn, &step.id, 1, None, None).unwrap();
@@ -7281,20 +8683,14 @@ mod tests {
         update_execution_log(
             &conn,
             log.id,
-            Some(1.0),
-            None,
-            &[],
-            false,
-            true,
-            Some("abc"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(TerminationReason::Success),
-            Some(TestStatus::Passed),
+            ExecutionLogUpdate {
+                duration_secs: Some(1.0),
+                committed: true,
+                commit_hash: Some("abc"),
+                termination_reason: Some(TerminationReason::Success),
+                test_status: Some(TestStatus::Passed),
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -7378,13 +8774,15 @@ mod tests {
         let conn = setup();
         let plan = create_plan(
             &conn,
-            "tests-rt",
-            "/proj",
-            "b",
-            "d",
-            None,
-            None,
-            &["cargo build".to_string()],
+            NewPlan {
+                slug: "tests-rt",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &["cargo build".to_string()],
+            },
         )
         .unwrap();
 
@@ -7578,19 +8976,33 @@ mod tests {
 
     /// Create a plan + one step and return the step id.
     fn step_for_interruptions(conn: &Connection) -> String {
-        let plan = create_plan(conn, "intr", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            conn,
+            NewPlan {
+                slug: "intr",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = create_step(
             conn,
             &plan.id,
-            "Step A",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "Step A",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         step.id
@@ -8167,7 +9579,19 @@ mod tests {
     #[test]
     fn test_corrective_chain_len_recursive_cte_handles_long_chains() {
         let conn = setup();
-        let plan = create_plan(&conn, "chain", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "chain",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // Build a chain of 10 corrective steps: s0 (ordinary) <- s1
         // (corrects s0) <- s2 (corrects s1) <- … <- s10 (corrects s9).
@@ -8176,15 +9600,17 @@ mod tests {
             let (step, _) = create_step(
                 &conn,
                 &plan.id,
-                &format!("S{i}"),
-                "d",
-                None,
-                None,
-                &[],
-                None,
-                None,
-                None,
-                None,
+                NewStep {
+                    title: &format!("S{i}"),
+                    description: "d",
+                    agent: None,
+                    harness: None,
+                    acceptance_criteria: &[],
+                    max_retries: None,
+                    model: None,
+                    change_policy: None,
+                    tags: None,
+                },
             )
             .unwrap();
             ids.push(step.id);
@@ -8214,33 +9640,49 @@ mod tests {
     #[test]
     fn test_list_interruptions_for_step_scopes_to_step() {
         let conn = setup();
-        let plan = create_plan(&conn, "scope", "/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = create_plan(
+            &conn,
+            NewPlan {
+                slug: "scope",
+                project: "/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = create_step(
             &conn,
             &plan.id,
-            "S1",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "S1",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = create_step(
             &conn,
             &plan.id,
-            "S2",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            NewStep {
+                title: "S2",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 

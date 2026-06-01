@@ -1129,7 +1129,6 @@ fn visible_window(tail: &VecDeque<String>, visible: usize, scroll: usize) -> Vec
     tail.iter().skip(start).take(end - start).cloned().collect()
 }
 
-#[allow(dead_code)]
 const _: () = {
     // Sanity check: we expect the visible window default to be smaller than
     // the buffered total so users can scroll beyond the on-screen tail.

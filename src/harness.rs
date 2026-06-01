@@ -66,15 +66,16 @@ pub fn resolve_harness<'a>(
     config: &'a Config,
 ) -> Result<(&'a str, &'a HarnessConfig)> {
     let name = resolve_harness_name(step, plan, config);
-    let harness_config = config.harnesses.get(&name).with_context(|| {
+    // `get_key_value` returns the stored key (whose lifetime is tied to
+    // `config`, so it can be handed back) alongside the value in one lookup —
+    // no second lookup + unwrap needed.
+    let (name_ref, harness_config) = config.harnesses.get_key_value(&name).with_context(|| {
         format!(
             "Unknown harness '{name}'. Available: {:?}",
             config.harnesses.keys().collect::<Vec<_>>()
         )
     })?;
-    // Return a reference tied to the config lifetime
-    let name_ref = config.harnesses.get_key_value(&name).unwrap().0.as_str();
-    Ok((name_ref, harness_config))
+    Ok((name_ref.as_str(), harness_config))
 }
 
 /// Build the full argument list for a harness invocation.

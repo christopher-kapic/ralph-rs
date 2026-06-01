@@ -236,13 +236,62 @@ struct TeardownState {
     stashed: Option<StashedState>,
 }
 
+/// Read-only context shared by the scheduler loop helpers (`scheduler_tick`,
+/// `drain_remaining_reviews`, `finalize_plan_run`). These are the immutable
+/// borrows the original `run_plan_inner` body closed over; bundling them keeps
+/// the extracted helper signatures readable without changing any borrow.
+struct SchedulerCtx<'a> {
+    conn: &'a Connection,
+    effective_plan: &'a Plan,
+    config: &'a Config,
+    workdir: &'a Path,
+    options: &'a RunOptions,
+    out: &'a OutputContext,
+    window: &'a RunWindow,
+    hook_ctx: &'a HookContext,
+    impl_slot: &'a Arc<tokio::sync::Semaphore>,
+    chunk_seq: &'a Arc<AtomicU64>,
+    one_target_id: &'a Option<String>,
+}
+
+/// Mutable scheduler state threaded through the loop and the post-loop drain.
+/// Each field is exactly the corresponding `mut` local from the original
+/// `run_plan_inner`; the helpers mutate them in place so control flow and DB
+/// writes stay byte-identical.
+struct SchedulerState {
+    known_step_ids: HashSet<String>,
+    executed_step_ids: HashSet<String>,
+    reviews: tokio::task::JoinSet<crate::review::SpawnedReview>,
+    review_respawns: HashMap<String, u32>,
+    last_review_error: HashMap<String, String>,
+    abort_rx: watch::Receiver<CancelState>,
+}
+
+/// How one scheduler-loop iteration ended. Each variant maps 1:1 to a control
+/// path in the original inline loop body:
+///   * `Continue` — the loop's `continue` (normal tick / parked branch /
+///     already-done step / blocked-after-failure / paused).
+///   * `Break`    — the loop's `break` (empty runnable set, `--one` target
+///     reached / moved, or the captured `--one` target completed).
+///   * `Return`   — an inline `return Ok(result)` (abort, pause, review-drain
+///     terminal status, step Failed/Timeout). `result` is mutated in place via
+///     the `&mut PlanRunResult` the tick receives, so the caller returns it by
+///     value on this signal.
+///
+/// Errors propagate via `?` exactly as before.
+enum TickOutcome {
+    Continue,
+    Break,
+    Return,
+}
+
 async fn run_plan_inner(
     conn: &Connection,
     effective_plan: &Plan,
     config: &Config,
     workdir: &Path,
     options: &RunOptions,
-    mut abort_rx: watch::Receiver<CancelState>,
+    abort_rx: watch::Receiver<CancelState>,
     out: &OutputContext,
 ) -> Result<PlanRunResult> {
     let effective_plan = effective_plan.clone();
@@ -346,8 +395,8 @@ async fn run_plan_inner(
         step_results: Vec::new(),
     };
 
-    let mut known_step_ids: HashSet<String> = initial_steps.iter().map(|s| s.id.clone()).collect();
-    let mut executed_step_ids: HashSet<String> = HashSet::new();
+    let known_step_ids: HashSet<String> = initial_steps.iter().map(|s| s.id.clone()).collect();
+    let executed_step_ids: HashSet<String> = HashSet::new();
 
     // Monotonic per-run counter for `HarnessChunk` / `TestChunk` event
     // `seq` fields. Created once here so the same `Arc<AtomicU64>` is
@@ -372,41 +421,48 @@ async fn run_plan_inner(
     // un-reviewed output.
     let impl_slot = Arc::new(tokio::sync::Semaphore::new(1));
 
-    // In-flight read-only reviews (docs/dag-redesign.md §3.5 item 3 / §9).
-    // Each entry is a DETACHED `tokio::spawn`ed `run_review_subprocess`
-    // future — `Send`, holds NO `rusqlite::Connection` and NO implementation
-    // permit — so it runs CONCURRENTLY with whatever the scheduler picks
-    // next. The orchestrator (this loop = the SOLE DB writer, §9-inv-3)
-    // drains finished tasks at every scheduler tick via
+    // Mutable scheduler state threaded through the loop and post-loop drain.
+    //
+    // `reviews`: In-flight read-only reviews (docs/dag-redesign.md §3.5 item
+    // 3 / §9). Each entry is a DETACHED `tokio::spawn`ed
+    // `run_review_subprocess` future — `Send`, holds NO `rusqlite::Connection`
+    // and NO implementation permit — so it runs CONCURRENTLY with whatever the
+    // scheduler picks next. The orchestrator (this loop = the SOLE DB writer,
+    // §9-inv-3) drains finished tasks at every scheduler tick via
     // `drain_finished_reviews`, where ALL DB / git-note side effects happen
     // serialized. A linear / no-review plan never spawns into this set (the
     // executor returns `needs_review: None`), so `reviews.is_empty()` is
     // always true on that path and the loop is byte-identical to before.
-    let mut reviews: tokio::task::JoinSet<crate::review::SpawnedReview> =
-        tokio::task::JoinSet::new();
-
-    // Per-run, per-step count of how many times the scheduler has (re-)spawned
-    // a step's review. A committed-but-unreviewed step whose review state is
-    // lost — a hard crash mid-review (recovered by the stale sweep, which now
-    // KEEPS such a step `InProgress` and resets `review_status` to `Pending`),
-    // or a transient reviewer error (the drain resets it to `Pending`) — is
-    // recovered by RE-RUNNING ONLY THE REVIEW against the durable committed
-    // SHA, never by re-implementing the step. `respawn_pending_reviews` retries
-    // up to `MAX_REVIEW_RESPAWNS` times and then escalates to a needs-human
-    // blocker, so a persistently-broken reviewer can't loop forever. In-memory
-    // (not durable): a fresh process / a human-resolved escalation grants a
-    // fresh budget, which is exactly the desired recovery semantics.
-    let mut review_respawns: HashMap<String, u32> = HashMap::new();
-
-    // The most recent reviewer-subprocess error per step (e.g. "review harness
-    // auth failed: 401", a timeout, or the read-only-invariant tripping).
-    // Captured by `drain_finished_reviews` when a review task errors and
-    // surfaced in the needs-human escalation blocker raised by
-    // `respawn_pending_reviews` after `MAX_REVIEW_RESPAWNS`, so the human
-    // triaging the blocker can see *why* the review keeps failing instead of a
-    // generic "could not run". In-memory like `review_respawns`: advisory
+    //
+    // `review_respawns`: Per-run, per-step count of how many times the
+    // scheduler has (re-)spawned a step's review. A committed-but-unreviewed
+    // step whose review state is lost — a hard crash mid-review (recovered by
+    // the stale sweep, which now KEEPS such a step `InProgress` and resets
+    // `review_status` to `Pending`), or a transient reviewer error (the drain
+    // resets it to `Pending`) — is recovered by RE-RUNNING ONLY THE REVIEW
+    // against the durable committed SHA, never by re-implementing the step.
+    // `respawn_pending_reviews` retries up to `MAX_REVIEW_RESPAWNS` times and
+    // then escalates to a needs-human blocker, so a persistently-broken
+    // reviewer can't loop forever. In-memory (not durable): a fresh process /
+    // a human-resolved escalation grants a fresh budget, which is exactly the
+    // desired recovery semantics.
+    //
+    // `last_review_error`: The most recent reviewer-subprocess error per step
+    // (e.g. "review harness auth failed: 401", a timeout, or the
+    // read-only-invariant tripping). Captured by `drain_finished_reviews` when
+    // a review task errors and surfaced in the needs-human escalation blocker
+    // raised by `respawn_pending_reviews` after `MAX_REVIEW_RESPAWNS`, so the
+    // human triaging the blocker can see *why* the review keeps failing instead
+    // of a generic "could not run". In-memory like `review_respawns`: advisory
     // diagnostic context, not durable state.
-    let mut last_review_error: HashMap<String, String> = HashMap::new();
+    let mut state = SchedulerState {
+        known_step_ids,
+        executed_step_ids,
+        reviews: tokio::task::JoinSet::new(),
+        review_respawns: HashMap::new(),
+        last_review_error: HashMap::new(),
+        abort_rx,
+    };
 
     // For `--one`, we need to stop after the first step actually executed;
     // capture its ID at the start (the step the topological scheduler would
@@ -437,573 +493,661 @@ async fn run_plan_inner(
         None
     };
 
+    let ctx = SchedulerCtx {
+        conn,
+        effective_plan: &effective_plan,
+        config,
+        workdir,
+        options,
+        out,
+        window: &window,
+        hook_ctx: &hook_ctx,
+        impl_slot: &impl_slot,
+        chunk_seq: &chunk_seq,
+        one_target_id: &one_target_id,
+    };
+
+    // Drive the topological scheduler. Each `scheduler_tick` runs exactly one
+    // iteration of the original inline loop and reports how it ended:
+    // `Continue` re-ticks, `Break` exits to the post-loop drain, `Return`
+    // short-circuits the whole run (abort / pause / step Failed/Timeout /
+    // review-drain terminal status). Errors propagate via `?`.
     loop {
-        // Check the cancel signal between steps. Only `Aborted` (Ctrl+C)
-        // terminates the whole run here; a `Skipped` reason only ever
-        // targets the in-flight step (consumed inside the executor) and
-        // must NOT end the run — fall through and pick the next step.
-        if matches!(
-            *abort_rx.borrow(),
-            Some(crate::signal::CancelReason::Aborted)
-        ) {
-            // Best-effort drain of any review verdicts that already
-            // completed before the abort latched, then `shutdown()` the
-            // still-in-flight ones so `kill_on_drop` fires on each review
-            // child. Without this, a review whose subprocess finished but
-            // whose verdict hasn't been drained would be silently dropped:
-            //   * no `update_step_review_status` write,
-            //   * no git-note annotation,
-            //   * no V29 corrective-step request row,
-            // leaving the reviewed step `review_status=InFlight`. The next
-            // run's stale-InProgress sweep would then re-implement the
-            // step and re-run the reviewer (burning tokens), and a Fail
-            // verdict that lost its bridge row would silently skip the
-            // §10 corrective step entirely — the §9-inv-2 violation the
-            // pipeline guards against.
-            drain_reviews_on_abort(
-                conn,
-                &effective_plan,
-                &mut reviews,
-                workdir,
-                out,
-                &mut abort_rx,
-            )
-            .await;
-            eprintln!("Aborted");
-            storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
-            result.final_status = PlanStatus::Aborted;
-            return Ok(result);
+        match scheduler_tick(&ctx, &mut state, &mut result).await? {
+            TickOutcome::Continue => {}
+            TickOutcome::Break => break,
+            TickOutcome::Return => return Ok(result),
         }
+    }
 
-        // Check the operator's graceful-pause flag between steps. The read +
-        // clear is atomic so a subsequent `ralph resume` doesn't immediately
-        // re-pause. We leave `plans.status` as-is (InProgress) — pause is a
-        // transient runner-control signal, not a status transition — so
-        // resume's normal "find earliest non-complete step" path Just Works.
-        if storage::take_plan_pause_requested(conn, &effective_plan.id)? {
-            if out.format == OutputFormat::Json {
-                output::emit_ndjson(&RunEvent::PausedByUser {
-                    plan_slug: effective_plan.slug.clone(),
-                })?;
-            } else {
-                eprintln!(
-                    "> Paused by user request after {} step(s). Use `ralph resume` to continue.",
-                    result.steps_executed,
-                );
-            }
-            result.final_status = PlanStatus::InProgress;
-            return Ok(result);
-        }
+    // Post-loop review drain. If it returns a terminal status, short-circuit.
+    if drain_remaining_reviews(&ctx, &mut state, &mut result).await? {
+        return Ok(result);
+    }
+    debug_assert!(
+        state.reviews.is_empty(),
+        "the plan must not be finalized with a review still in flight (§3.3)"
+    );
 
-        // Drain any stranded corrective-step requests BEFORE the scheduler
-        // picks its next step. This closes the restart window where a crash
-        // after a failed review but before request consumption would otherwise
-        // let the resumed run re-execute the reviewed step instead of first
-        // materializing its already-requested corrective step.
-        consume_open_corrective_requests(conn, &effective_plan, out)?;
+    finalize_plan_run(&ctx, result)
+}
 
-        // Re-fetch the step list. This is the core of the mid-run-insert fix.
-        let all_steps = storage::list_steps(conn, &effective_plan.id)?;
+/// One iteration of the topological scheduler loop (the body of
+/// `run_plan_inner`'s `loop`). Returns a [`TickOutcome`] describing how the
+/// iteration ended so the caller's `loop` can `continue` / `break` / `return`
+/// with byte-identical control flow to the original inline body.
+async fn scheduler_tick(
+    ctx: &SchedulerCtx<'_>,
+    state: &mut SchedulerState,
+    result: &mut PlanRunResult,
+) -> Result<TickOutcome> {
+    let SchedulerCtx {
+        conn,
+        effective_plan,
+        config,
+        workdir,
+        options,
+        out,
+        window,
+        hook_ctx,
+        impl_slot,
+        chunk_seq,
+        one_target_id,
+    } = *ctx;
 
-        // Detect and report new inserts.
-        let new_inserts: Vec<Step> = all_steps
-            .iter()
-            .filter(|s| !known_step_ids.contains(&s.id))
-            .filter(|s| window.contains_key(&s.sort_key))
-            .cloned()
-            .collect();
-        if !new_inserts.is_empty() {
-            report_plan_grew(&new_inserts, &all_steps, out)?;
-        }
-        for s in &all_steps {
-            known_step_ids.insert(s.id.clone());
-        }
-
-        let total_now = all_steps.len();
-
-        // Topological scheduler tick (docs/dag-redesign.md §3.5). Re-read
-        // the dependency edges every iteration so a step inserted mid-run
-        // with `--depends-on` is scheduled correctly. `pick_next_step`
-        // returns the runnable step with the smallest
-        // `(topological depth, sort_key, short_id)`; with no edges every
-        // depth is 0 and this is exactly the old "first actionable step by
-        // sort_key" behavior.
-        let deps_of = storage::list_step_dependency_edges(conn, &effective_plan.id)?;
-        let depths = compute_step_depths(&all_steps, &deps_of);
-        // Recompute the blocked set every tick: a cross-process resolution
-        // (§9 invariant 4) drops a step out of it here, re-queuing the step
-        // on the very next iteration with the resolution injected (the
-        // injection is already done by prompt.rs via the bounded
-        // resolved-interruption section). An empty set ⇒ pre-interruption
-        // behavior, so a linear plan is byte-identical.
-        let blocked = blocked_step_ids(conn, &effective_plan.id)?;
-
-        // Recover/retry reviews for committed steps whose review is pending
-        // but not in flight — a crash mid-review or a transient reviewer
-        // error. This re-runs ONLY the review against the durable committed
-        // SHA; it never re-implements the step. The returned `under_review`
-        // set (every committed step whose review is pending or in flight) is
-        // unioned into the pick exclusion so the scheduler does not re-pick a
-        // committed step for re-implementation while its review is
-        // outstanding (mirrors how a freshly-reviewed step is excluded during
-        // a live run). Empty for any linear / no-review plan, so that path is
-        // byte-identical to before.
-        let under_review = respawn_pending_reviews(
+    // Check the cancel signal between steps. Only `Aborted` (Ctrl+C)
+    // terminates the whole run here; a `Skipped` reason only ever
+    // targets the in-flight step (consumed inside the executor) and
+    // must NOT end the run — fall through and pick the next step.
+    if matches!(
+        *state.abort_rx.borrow(),
+        Some(crate::signal::CancelReason::Aborted)
+    ) {
+        // Best-effort drain of any review verdicts that already
+        // completed before the abort latched, then `shutdown()` the
+        // still-in-flight ones so `kill_on_drop` fires on each review
+        // child. Without this, a review whose subprocess finished but
+        // whose verdict hasn't been drained would be silently dropped:
+        //   * no `update_step_review_status` write,
+        //   * no git-note annotation,
+        //   * no V29 corrective-step request row,
+        // leaving the reviewed step `review_status=InFlight`. The next
+        // run's stale-InProgress sweep would then re-implement the
+        // step and re-run the reviewer (burning tokens), and a Fail
+        // verdict that lost its bridge row would silently skip the
+        // §10 corrective step entirely — the §9-inv-2 violation the
+        // pipeline guards against.
+        drain_reviews_on_abort(
             conn,
-            &effective_plan,
-            &all_steps,
-            &window,
-            &blocked,
-            &mut reviews,
-            &mut review_respawns,
-            &last_review_error,
-            config,
+            effective_plan,
+            &mut state.reviews,
             workdir,
             out,
-        )?;
-        // Steps excluded from this tick's pick: blocked (open interruption) or
-        // committed-and-awaiting-review. `chain` yields `blocked` verbatim when
-        // `under_review` is empty — i.e. byte-identical to the linear/no-review
-        // path — so no special-case branch is needed.
-        let not_runnable: HashSet<String> =
-            blocked.iter().chain(under_review.iter()).cloned().collect();
-        let next = pick_next_step(
-            &all_steps,
-            &deps_of,
-            &depths,
-            &window,
-            &executed_step_ids,
-            &not_runnable,
+            &mut state.abort_rx,
         )
-        .cloned();
+        .await;
+        eprintln!("Aborted");
+        storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
+        result.final_status = PlanStatus::Aborted;
+        return Ok(TickOutcome::Return);
+    }
 
-        let current_step = match next {
-            Some(s) => s,
-            None => {
-                // Nothing is runnable *right now*. If a read-only review is
-                // still in flight, the runnable set is not final: when that
-                // review returns, the orchestrator either promotes the
-                // reviewed step to `Complete` (un-gating its dependents) or
-                // inserts a corrective step `A′` (a fresh runnable step) —
-                // either of which re-populates the runnable set. So instead
-                // of declaring the plan done, BLOCK on the next finished
-                // review, drain it (sole DB writer), then loop and re-tick.
-                // This is what makes the plan not complete with a review
-                // still pending/undrained (§3.3). With no in-flight reviews
-                // (the linear / no-review path always) this is an immediate
-                // `break`, byte-identical to before.
-                if reviews.is_empty() {
-                    break;
-                }
-                if let Some(fs) = drain_finished_reviews(
-                    conn,
-                    &effective_plan,
-                    &mut reviews,
-                    workdir,
-                    out,
-                    true, // block: wait for at least one review to finish
-                    &mut abort_rx,
-                    &mut last_review_error,
-                )
-                .await?
-                {
-                    result.final_status = fs;
-                    return Ok(result);
-                }
-                continue;
-            }
-        };
-
-        // `--one`: once we've executed the captured target, stop. We also
-        // refuse to pivot to a later step if the original target has moved
-        // out of the actionable set (e.g. it was skipped out-of-band).
-        if let Some(ref target) = one_target_id
-            && current_step.id != *target
-        {
-            break;
-        }
-
-        // Skip already-completed or skipped steps that happen to fall in
-        // the window but weren't filtered out above (defensive: the
-        // is_actionable filter already excludes these).
-        if current_step.status == StepStatus::Complete || current_step.status == StepStatus::Skipped
-        {
-            if current_step.status == StepStatus::Skipped {
-                result.steps_skipped += 1;
-            }
-            executed_step_ids.insert(current_step.id.clone());
-            continue;
-        }
-
-        // Cluster 3 Fix #2: per-step granularity on parked-restore failure.
-        // A NotFound (admin `git stash clear`) or Conflicted apply used to
-        // bail the whole run via `?`, killing every other branch in the
-        // DAG. The new outcome raises a blocker on JUST this step and
-        // skips it; the scheduler then picks another runnable branch on
-        // the next tick (the blocker's open interruption shadows the step
-        // via the derived `Blocked` overlay, so `pick_next_step` excludes
-        // it).
-        let resumed_parked_worktree =
-            match restore_parked_step_worktree(conn, &current_step, workdir, out).await? {
-                RestoreParkedOutcome::Resumed => true,
-                RestoreParkedOutcome::NotParked => false,
-                RestoreParkedOutcome::BlockedAfterFailure => {
-                    // Mark as "seen this tick" so the immediate re-pick
-                    // doesn't return the same step (defense-in-depth — the
-                    // blocked-set query below will also exclude it once the
-                    // open interruption is visible, but the in-tick
-                    // bookkeeping makes the skip immediate and explicit).
-                    executed_step_ids.insert(current_step.id.clone());
-                    continue;
-                }
-            };
-        if resumed_parked_worktree && out.format != OutputFormat::Json {
+    // Check the operator's graceful-pause flag between steps. The read +
+    // clear is atomic so a subsequent `ralph resume` doesn't immediately
+    // re-pause. We leave `plans.status` as-is (InProgress) — pause is a
+    // transient runner-control signal, not a status transition — so
+    // resume's normal "find earliest non-complete step" path Just Works.
+    if storage::take_plan_pause_requested(conn, &effective_plan.id)? {
+        if out.format == OutputFormat::Json {
+            output::emit_ndjson(&RunEvent::PausedByUser {
+                plan_slug: effective_plan.slug.clone(),
+            })?;
+        } else {
             eprintln!(
-                "> Restored parked worktree for step {} '{}' before re-running.",
-                current_step.short_id, current_step.title
+                "> Paused by user request after {} step(s). Use `ralph resume` to continue.",
+                result.steps_executed,
             );
         }
+        result.final_status = PlanStatus::InProgress;
+        return Ok(TickOutcome::Return);
+    }
 
-        // Print progress header / emit step_started event.
-        let step_num = step_number_in_plan(&all_steps, &current_step);
+    // Drain any stranded corrective-step requests BEFORE the scheduler
+    // picks its next step. This closes the restart window where a crash
+    // after a failed review but before request consumption would otherwise
+    // let the resumed run re-execute the reviewed step instead of first
+    // materializing its already-requested corrective step.
+    consume_open_corrective_requests(conn, effective_plan, out)?;
+
+    // Re-fetch the step list. This is the core of the mid-run-insert fix.
+    let all_steps = storage::list_steps(conn, &effective_plan.id)?;
+
+    // Detect and report new inserts.
+    let new_inserts: Vec<Step> = all_steps
+        .iter()
+        .filter(|s| !state.known_step_ids.contains(&s.id))
+        .filter(|s| window.contains_key(&s.sort_key))
+        .cloned()
+        .collect();
+    if !new_inserts.is_empty() {
+        report_plan_grew(&new_inserts, &all_steps, out)?;
+    }
+    for s in &all_steps {
+        state.known_step_ids.insert(s.id.clone());
+    }
+
+    let total_now = all_steps.len();
+
+    // Topological scheduler tick (docs/dag-redesign.md §3.5). Re-read
+    // the dependency edges every iteration so a step inserted mid-run
+    // with `--depends-on` is scheduled correctly. `pick_next_step`
+    // returns the runnable step with the smallest
+    // `(topological depth, sort_key, short_id)`; with no edges every
+    // depth is 0 and this is exactly the old "first actionable step by
+    // sort_key" behavior.
+    let deps_of = storage::list_step_dependency_edges(conn, &effective_plan.id)?;
+    let depths = compute_step_depths(&all_steps, &deps_of);
+    // Recompute the blocked set every tick: a cross-process resolution
+    // (§9 invariant 4) drops a step out of it here, re-queuing the step
+    // on the very next iteration with the resolution injected (the
+    // injection is already done by prompt.rs via the bounded
+    // resolved-interruption section). An empty set ⇒ pre-interruption
+    // behavior, so a linear plan is byte-identical.
+    let blocked = blocked_step_ids(conn, &effective_plan.id)?;
+
+    // Recover/retry reviews for committed steps whose review is pending
+    // but not in flight — a crash mid-review or a transient reviewer
+    // error. This re-runs ONLY the review against the durable committed
+    // SHA; it never re-implements the step. The returned `under_review`
+    // set (every committed step whose review is pending or in flight) is
+    // unioned into the pick exclusion so the scheduler does not re-pick a
+    // committed step for re-implementation while its review is
+    // outstanding (mirrors how a freshly-reviewed step is excluded during
+    // a live run). Empty for any linear / no-review plan, so that path is
+    // byte-identical to before.
+    let under_review = respawn_pending_reviews(
+        conn,
+        &mut state.reviews,
+        RespawnReviews {
+            plan: effective_plan,
+            all_steps: &all_steps,
+            window,
+            blocked: &blocked,
+            review_respawns: &mut state.review_respawns,
+            last_review_error: &state.last_review_error,
+            config,
+            workdir,
+        },
+        out,
+    )?;
+    // Steps excluded from this tick's pick: blocked (open interruption) or
+    // committed-and-awaiting-review. `chain` yields `blocked` verbatim when
+    // `under_review` is empty — i.e. byte-identical to the linear/no-review
+    // path — so no special-case branch is needed.
+    let not_runnable: HashSet<String> =
+        blocked.iter().chain(under_review.iter()).cloned().collect();
+    let next = pick_next_step(
+        &all_steps,
+        &deps_of,
+        &depths,
+        window,
+        &state.executed_step_ids,
+        &not_runnable,
+    )
+    .cloned();
+
+    let current_step = match next {
+        Some(s) => s,
+        None => {
+            // Nothing is runnable *right now*. If a read-only review is
+            // still in flight, the runnable set is not final: when that
+            // review returns, the orchestrator either promotes the
+            // reviewed step to `Complete` (un-gating its dependents) or
+            // inserts a corrective step `A′` (a fresh runnable step) —
+            // either of which re-populates the runnable set. So instead
+            // of declaring the plan done, BLOCK on the next finished
+            // review, drain it (sole DB writer), then loop and re-tick.
+            // This is what makes the plan not complete with a review
+            // still pending/undrained (§3.3). With no in-flight reviews
+            // (the linear / no-review path always) this is an immediate
+            // `break`, byte-identical to before.
+            if state.reviews.is_empty() {
+                return Ok(TickOutcome::Break);
+            }
+            if let Some(fs) = drain_finished_reviews(
+                conn,
+                &mut state.reviews,
+                DrainReviews {
+                    plan: effective_plan,
+                    workdir,
+                    block: true, // wait for at least one review to finish
+                    abort_rx: &mut state.abort_rx,
+                    last_review_error: &mut state.last_review_error,
+                },
+                out,
+            )
+            .await?
+            {
+                result.final_status = fs;
+                return Ok(TickOutcome::Return);
+            }
+            return Ok(TickOutcome::Continue);
+        }
+    };
+
+    // `--one`: once we've executed the captured target, stop. We also
+    // refuse to pivot to a later step if the original target has moved
+    // out of the actionable set (e.g. it was skipped out-of-band).
+    if let Some(target) = one_target_id
+        && current_step.id != *target
+    {
+        return Ok(TickOutcome::Break);
+    }
+
+    // Skip already-completed or skipped steps that happen to fall in
+    // the window but weren't filtered out above (defensive: the
+    // is_actionable filter already excludes these).
+    if current_step.status == StepStatus::Complete || current_step.status == StepStatus::Skipped {
+        if current_step.status == StepStatus::Skipped {
+            result.steps_skipped += 1;
+        }
+        state.executed_step_ids.insert(current_step.id.clone());
+        return Ok(TickOutcome::Continue);
+    }
+
+    // Cluster 3 Fix #2: per-step granularity on parked-restore failure.
+    // A NotFound (admin `git stash clear`) or Conflicted apply used to
+    // bail the whole run via `?`, killing every other branch in the
+    // DAG. The new outcome raises a blocker on JUST this step and
+    // skips it; the scheduler then picks another runnable branch on
+    // the next tick (the blocker's open interruption shadows the step
+    // via the derived `Blocked` overlay, so `pick_next_step` excludes
+    // it).
+    let resumed_parked_worktree =
+        match restore_parked_step_worktree(conn, &current_step, workdir, out).await? {
+            RestoreParkedOutcome::Resumed => true,
+            RestoreParkedOutcome::NotParked => false,
+            RestoreParkedOutcome::BlockedAfterFailure => {
+                // Mark as "seen this tick" so the immediate re-pick
+                // doesn't return the same step (defense-in-depth — the
+                // blocked-set query below will also exclude it once the
+                // open interruption is visible, but the in-tick
+                // bookkeeping makes the skip immediate and explicit).
+                state.executed_step_ids.insert(current_step.id.clone());
+                return Ok(TickOutcome::Continue);
+            }
+        };
+    if resumed_parked_worktree && out.format != OutputFormat::Json {
+        eprintln!(
+            "> Restored parked worktree for step {} '{}' before re-running.",
+            current_step.short_id, current_step.title
+        );
+    }
+
+    // Print progress header / emit step_started event.
+    let step_num = step_number_in_plan(&all_steps, &current_step);
+    if out.format == OutputFormat::Json {
+        output::emit_ndjson(&RunEvent::StepStarted {
+            step_id: current_step.id.clone(),
+            step_title: current_step.title.clone(),
+            step_num,
+            step_total: total_now,
+        })?;
+    } else {
+        // Resolve the step-level harness label (hooks into the executor's
+        // per-attempt sub-header below). Per-step override falls back to
+        // the plan-level harness, then to config default.
+        let (harness_name, harness_config) =
+            harness::resolve_harness(&current_step, effective_plan, config)?;
+        let harness_label = output::format_harness_label_with_override(
+            harness_name,
+            harness_config.color.as_deref(),
+            out.color,
+        );
+        eprintln!(
+            "[{}/{}] > Step {} \"{}\" ({})",
+            step_num, total_now, step_num, current_step.title, harness_label
+        );
+    }
+
+    let started = Instant::now();
+
+    // Mark this step in-flight for the duration of `execute_step` so a
+    // same-process `ralph skip` (CLI or TUI) routes through the cancel
+    // ladder instead of just flipping the DB status. The guard clears
+    // the flag on drop — covering the `?`-early-return path too.
+    let _in_flight = crate::signal::StepInFlightGuard::enter();
+
+    // Acquire the single implementation slot (§9-inv-1 / §3.5 item 2).
+    // Held ONLY for implement+test+commit; explicitly released before any
+    // read-only review so a review never occupies the implementation
+    // slot (§9-inv-2). `acquire_owned` cannot fail here — the semaphore
+    // is never closed — but we surface it rather than `unwrap` to keep
+    // the runner panic-free.
+    let impl_permit = impl_slot
+        .clone()
+        .acquire_owned()
+        .await
+        .context("implementation semaphore closed unexpectedly")?;
+
+    // Execute the step.
+    let step_result = executor::execute_step(executor::ExecuteStepArgs {
+        conn,
+        plan: effective_plan,
+        step: &current_step,
+        config,
+        workdir,
+        hook_ctx,
+        abort_rx: state.abort_rx.clone(),
+        exec_opts: executor::ExecuteOptions {
+            verbose: options.verbose,
+            step_num_in_plan: step_num,
+            step_total: total_now,
+            json_output: out.format == OutputFormat::Json,
+            color: out.color,
+            chunk_seq: Some(chunk_seq.clone()),
+            chunk_max_bytes: config.harness_chunk_max_bytes,
+            resumed_parked_worktree,
+        },
+    })
+    .await?;
+    drop(_in_flight);
+
+    // Fix #4: widen the `run_locks.step_id` window between consecutive
+    // steps to be honest about the gap. `update_live_phase` uses
+    // COALESCE on the per-step fields, so absent this call
+    // `run_locks.step_id` would still name the *previous* step until
+    // the next step's first `write_phase` fires. An orphan subprocess
+    // from the prior step calling `ralph question ask` during that
+    // window would bind the question to the wrong step (already
+    // Complete). `bind_live_run_to_plan` widens the same row to "no
+    // live step" on a cross-plan rebind; this is the within-plan
+    // equivalent.
+    storage::clear_live_run_step(conn, &effective_plan.project)?;
+
+    // Release the implementation slot BEFORE any review (§9-inv-2 /
+    // §3.5 item 3): a read-only review must never hold the
+    // implementation permit, so the scheduler is free to take it for the
+    // next *unrelated* implementation while this step's review is
+    // outstanding. Direct dependents of `current_step` are NOT in the
+    // runnable set yet — `execute_step` left a review-gated step
+    // `InProgress` (not `Complete`), and `deps_satisfied` requires
+    // `Complete` — so concurrency never starts work on un-reviewed
+    // output.
+    drop(impl_permit);
+
+    // Built-in review pipeline (docs/dag-redesign.md §3.2-§3.3 / §3.5
+    // item 3 / §9 / §10). When the step's success carries `needs_review`,
+    // the executor deliberately left it `InProgress` with
+    // `review_status = Pending`. We DO NOT review inline — that would
+    // serialize the scheduler behind the reviewer and defeat the entire
+    // §2-Decision-3 / §3.5-item-3 promise that *unrelated branches run
+    // concurrently with a review*. Instead we:
+    //
+    //  1. mark the step `review_status = InFlight` and emit
+    //     `ReviewStarted` HERE (the orchestrator is the SOLE DB writer —
+    //     §9-inv-3 — so this status write must NOT happen in the task);
+    //  2. `tokio::spawn` the read-only `run_review_subprocess` future
+    //     (it is `Send`, holds NO `Connection` and NO impl permit, and
+    //     runs `git show <fixed sha>` only — §9-inv-2) into the
+    //     `reviews` JoinSet;
+    //  3. CONTINUE the scheduler loop. The impl permit is already
+    //     dropped, so the next *unrelated* runnable step implements
+    //     concurrently with this outstanding review. `current_step`'s
+    //     direct dependents stay non-runnable (it is `InProgress`, not
+    //     `Complete`; `deps_satisfied` requires `Complete`), so
+    //     concurrency never starts work on un-reviewed output.
+    //
+    // The orchestrator drains finished reviews at every tick via
+    // `drain_finished_reviews` (below) — the ONLY place
+    // `review_status` Passed/Failed, the git-note verdict, the V29
+    // bridge row, and the §10 insert + re-parent are written, all
+    // serialized on this single loop. A linear / no-review plan never
+    // sets `needs_review`, so nothing is ever spawned and behavior is
+    // byte-identical to before.
+    if let StepResult {
+        outcome: StepOutcome::Success,
+        needs_review: Some((ref commit_sha, iteration)),
+        ..
+    } = step_result
+    {
+        spawn_step_review(
+            conn,
+            &mut state.reviews,
+            ReviewSpawn {
+                plan: effective_plan,
+                step: &current_step,
+                config,
+                workdir,
+                commit_sha: commit_sha.clone(),
+                iteration,
+                step_num,
+            },
+            out,
+        )?;
+    }
+
+    // Drain any reviews that finished while this step implemented
+    // (non-blocking). This is the SOLE DAG-writer point for review
+    // verdicts (§9-inv-3): finalize verdict + git-note, promote a passed
+    // step to `Complete`, and consume corrective requests (§10). A review
+    // *error* (reviewer failed to execute) raises a recoverable blocker
+    // and the run continues; only a task *panic* returns `Some(Failed)`.
+    if let Some(fs) = drain_finished_reviews(
+        conn,
+        &mut state.reviews,
+        DrainReviews {
+            plan: effective_plan,
+            workdir,
+            block: false,
+            abort_rx: &mut state.abort_rx,
+            last_review_error: &mut state.last_review_error,
+        },
+        out,
+    )
+    .await?
+    {
+        result.final_status = fs;
+        result.step_results.push(step_result);
+        return Ok(TickOutcome::Return);
+    }
+
+    let elapsed = started.elapsed();
+    result.steps_executed += 1;
+    state.executed_step_ids.insert(current_step.id.clone());
+
+    // Print result / emit step_finished event.
+    let outcome_str = match step_result.outcome {
+        StepOutcome::Success => "success",
+        StepOutcome::Failed => "failed",
+        StepOutcome::Aborted => "aborted",
+        StepOutcome::Skipped => "skipped",
+        StepOutcome::Timeout => "timeout",
+        StepOutcome::PausedForQuestion => "paused_for_question",
+    };
+
+    let emit_finished = |outcome: &str| -> Result<()> {
         if out.format == OutputFormat::Json {
-            output::emit_ndjson(&RunEvent::StepStarted {
+            output::emit_ndjson(&RunEvent::StepFinished {
                 step_id: current_step.id.clone(),
                 step_title: current_step.title.clone(),
                 step_num,
                 step_total: total_now,
+                outcome: outcome.to_string(),
+                attempts: step_result.attempts_used,
+                duration_secs: elapsed.as_secs_f64(),
             })?;
-        } else {
-            // Resolve the step-level harness label (hooks into the executor's
-            // per-attempt sub-header below). Per-step override falls back to
-            // the plan-level harness, then to config default.
-            let (harness_name, harness_config) =
-                harness::resolve_harness(&current_step, &effective_plan, config)?;
-            let harness_label = output::format_harness_label_with_override(
-                harness_name,
-                harness_config.color.as_deref(),
-                out.color,
-            );
-            eprintln!(
-                "[{}/{}] > Step {} \"{}\" ({})",
-                step_num, total_now, step_num, current_step.title, harness_label
-            );
         }
+        Ok(())
+    };
 
-        let started = Instant::now();
-
-        // Mark this step in-flight for the duration of `execute_step` so a
-        // same-process `ralph skip` (CLI or TUI) routes through the cancel
-        // ladder instead of just flipping the DB status. The guard clears
-        // the flag on drop — covering the `?`-early-return path too.
-        let _in_flight = crate::signal::StepInFlightGuard::enter();
-
-        // Acquire the single implementation slot (§9-inv-1 / §3.5 item 2).
-        // Held ONLY for implement+test+commit; explicitly released before any
-        // read-only review so a review never occupies the implementation
-        // slot (§9-inv-2). `acquire_owned` cannot fail here — the semaphore
-        // is never closed — but we surface it rather than `unwrap` to keep
-        // the runner panic-free.
-        let impl_permit = impl_slot
-            .clone()
-            .acquire_owned()
-            .await
-            .context("implementation semaphore closed unexpectedly")?;
-
-        // Execute the step.
-        let step_result = executor::execute_step(
-            conn,
-            &effective_plan,
-            &current_step,
-            config,
-            workdir,
-            &hook_ctx,
-            abort_rx.clone(),
-            executor::ExecuteOptions {
-                verbose: options.verbose,
-                step_num_in_plan: step_num,
-                step_total: total_now,
-                json_output: out.format == OutputFormat::Json,
-                color: out.color,
-                chunk_seq: Some(chunk_seq.clone()),
-                chunk_max_bytes: config.harness_chunk_max_bytes,
-                resumed_parked_worktree,
-            },
-        )
-        .await?;
-        drop(_in_flight);
-
-        // Fix #4: widen the `run_locks.step_id` window between consecutive
-        // steps to be honest about the gap. `update_live_phase` uses
-        // COALESCE on the per-step fields, so absent this call
-        // `run_locks.step_id` would still name the *previous* step until
-        // the next step's first `write_phase` fires. An orphan subprocess
-        // from the prior step calling `ralph question ask` during that
-        // window would bind the question to the wrong step (already
-        // Complete). `bind_live_run_to_plan` widens the same row to "no
-        // live step" on a cross-plan rebind; this is the within-plan
-        // equivalent.
-        storage::clear_live_run_step(conn, &effective_plan.project)?;
-
-        // Release the implementation slot BEFORE any review (§9-inv-2 /
-        // §3.5 item 3): a read-only review must never hold the
-        // implementation permit, so the scheduler is free to take it for the
-        // next *unrelated* implementation while this step's review is
-        // outstanding. Direct dependents of `current_step` are NOT in the
-        // runnable set yet — `execute_step` left a review-gated step
-        // `InProgress` (not `Complete`), and `deps_satisfied` requires
-        // `Complete` — so concurrency never starts work on un-reviewed
-        // output.
-        drop(impl_permit);
-
-        // Built-in review pipeline (docs/dag-redesign.md §3.2-§3.3 / §3.5
-        // item 3 / §9 / §10). When the step's success carries `needs_review`,
-        // the executor deliberately left it `InProgress` with
-        // `review_status = Pending`. We DO NOT review inline — that would
-        // serialize the scheduler behind the reviewer and defeat the entire
-        // §2-Decision-3 / §3.5-item-3 promise that *unrelated branches run
-        // concurrently with a review*. Instead we:
-        //
-        //  1. mark the step `review_status = InFlight` and emit
-        //     `ReviewStarted` HERE (the orchestrator is the SOLE DB writer —
-        //     §9-inv-3 — so this status write must NOT happen in the task);
-        //  2. `tokio::spawn` the read-only `run_review_subprocess` future
-        //     (it is `Send`, holds NO `Connection` and NO impl permit, and
-        //     runs `git show <fixed sha>` only — §9-inv-2) into the
-        //     `reviews` JoinSet;
-        //  3. CONTINUE the scheduler loop. The impl permit is already
-        //     dropped, so the next *unrelated* runnable step implements
-        //     concurrently with this outstanding review. `current_step`'s
-        //     direct dependents stay non-runnable (it is `InProgress`, not
-        //     `Complete`; `deps_satisfied` requires `Complete`), so
-        //     concurrency never starts work on un-reviewed output.
-        //
-        // The orchestrator drains finished reviews at every tick via
-        // `drain_finished_reviews` (below) — the ONLY place
-        // `review_status` Passed/Failed, the git-note verdict, the V29
-        // bridge row, and the §10 insert + re-parent are written, all
-        // serialized on this single loop. A linear / no-review plan never
-        // sets `needs_review`, so nothing is ever spawned and behavior is
-        // byte-identical to before.
-        if let StepResult {
-            outcome: StepOutcome::Success,
-            needs_review: Some((ref commit_sha, iteration)),
-            ..
-        } = step_result
-        {
-            spawn_step_review(
-                conn,
-                &mut reviews,
-                &effective_plan,
-                &current_step,
-                config,
-                workdir,
-                commit_sha.clone(),
-                iteration,
-                step_num,
-                out,
-            )?;
-        }
-
-        // Drain any reviews that finished while this step implemented
-        // (non-blocking). This is the SOLE DAG-writer point for review
-        // verdicts (§9-inv-3): finalize verdict + git-note, promote a passed
-        // step to `Complete`, and consume corrective requests (§10). A review
-        // *error* (reviewer failed to execute) raises a recoverable blocker
-        // and the run continues; only a task *panic* returns `Some(Failed)`.
-        if let Some(fs) = drain_finished_reviews(
-            conn,
-            &effective_plan,
-            &mut reviews,
-            workdir,
-            out,
-            false,
-            &mut abort_rx,
-            &mut last_review_error,
-        )
-        .await?
-        {
-            result.final_status = fs;
-            result.step_results.push(step_result);
-            return Ok(result);
-        }
-
-        let elapsed = started.elapsed();
-        result.steps_executed += 1;
-        executed_step_ids.insert(current_step.id.clone());
-
-        // Print result / emit step_finished event.
-        let outcome_str = match step_result.outcome {
-            StepOutcome::Success => "success",
-            StepOutcome::Failed => "failed",
-            StepOutcome::Aborted => "aborted",
-            StepOutcome::Skipped => "skipped",
-            StepOutcome::Timeout => "timeout",
-            StepOutcome::PausedForQuestion => "paused_for_question",
-        };
-
-        let emit_finished = |outcome: &str| -> Result<()> {
-            if out.format == OutputFormat::Json {
-                output::emit_ndjson(&RunEvent::StepFinished {
-                    step_id: current_step.id.clone(),
-                    step_title: current_step.title.clone(),
+    match step_result.outcome {
+        StepOutcome::Success => {
+            result.steps_succeeded += 1;
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... OK ({:.0}s)",
                     step_num,
-                    step_total: total_now,
-                    outcome: outcome.to_string(),
-                    attempts: step_result.attempts_used,
-                    duration_secs: elapsed.as_secs_f64(),
-                })?;
-            }
-            Ok(())
-        };
-
-        match step_result.outcome {
-            StepOutcome::Success => {
-                result.steps_succeeded += 1;
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... OK ({:.0}s)",
-                        step_num,
-                        total_now,
-                        current_step.title,
-                        elapsed.as_secs_f64()
-                    );
-                }
-            }
-            StepOutcome::Failed => {
-                result.steps_failed += 1;
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... FAILED (after {} attempts, {:.0}s)",
-                        step_num,
-                        total_now,
-                        current_step.title,
-                        step_result.attempts_used,
-                        elapsed.as_secs_f64()
-                    );
-                }
-                // Mark plan as failed and stop.
-                storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
-                result.final_status = PlanStatus::Failed;
-                result.step_results.push(step_result);
-                return Ok(result);
-            }
-            StepOutcome::Aborted => {
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... ABORTED",
-                        step_num, total_now, current_step.title
-                    );
-                }
-                // Mirror the top-of-loop abort handler: best-effort drain of
-                // any review verdicts that already completed before this abort
-                // latched, then `shutdown()` the still-in-flight ones. Without
-                // this, a review whose subprocess finished but whose verdict
-                // hasn't been drained would be silently dropped (no
-                // `update_step_review_status` write, no git-note annotation, no
-                // V29 corrective-step request row), leaving the reviewed step
-                // `review_status=InFlight`. This arm fires when the executor
-                // observes the abort *inside* a step, so it can leave undrained
-                // reviews just like the between-steps check does.
-                drain_reviews_on_abort(
-                    conn,
-                    &effective_plan,
-                    &mut reviews,
-                    workdir,
-                    out,
-                    &mut abort_rx,
-                )
-                .await;
-                storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
-                result.final_status = PlanStatus::Aborted;
-                result.step_results.push(step_result);
-                return Ok(result);
-            }
-            StepOutcome::Skipped => {
-                // `ralph skip` killed the in-flight harness for THIS step
-                // only. Unlike Aborted, the run does NOT end — count the
-                // skip and fall through so the loop advances to the next
-                // actionable step.
-                result.steps_skipped += 1;
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... SKIPPED",
-                        step_num, total_now, current_step.title
-                    );
-                }
-            }
-            StepOutcome::Timeout => {
-                result.steps_failed += 1;
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... TIMEOUT",
-                        step_num, total_now, current_step.title
-                    );
-                }
-                storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
-                result.final_status = PlanStatus::Failed;
-                result.step_results.push(step_result);
-                return Ok(result);
-            }
-            StepOutcome::PausedForQuestion => {
-                emit_finished(outcome_str)?;
-                if out.format != OutputFormat::Json {
-                    eprintln!(
-                        "[{}/{}] > {} ... BLOCKED (open interruption — resolve to resume)",
-                        step_num, total_now, current_step.title
-                    );
-                }
-                // DAG scheduler change (docs/dag-redesign.md §1/§3.4/§3.5):
-                // a blocked branch must NOT pause the whole plan. While the
-                // interruption is open the step is in the recomputed
-                // `blocked` set, so the next scheduler tick excludes it and
-                // picks another runnable branch instead of stalling — the §1
-                // payoff. We do NOT `return` here and do NOT write
-                // `Interrupted` to plans.status (it's a *derived* status).
-                // The plan only reports `Interrupted` once the runnable set
-                // is exhausted (handled after the loop), so a *linear* plan —
-                // whose one blocked step starves all dependents — still
-                // pauses exactly as before (§1: linear plans get zero benefit
-                // and must not regress).
-                //
-                // Crucially, a paused step must NOT stay in
-                // `executed_step_ids`: that set permanently excludes a step
-                // from `pick_next_step` for the rest of this run, so leaving
-                // it there means a *same-run* resolution (a human answers
-                // while the loop keeps ticking on another branch — the exact
-                // §1 scenario, or the §9-invariant-4 cross-process bridge)
-                // would drop the step out of `blocked` but it would still
-                // never be re-picked until a fresh `ralph resume` process.
-                // Drop it back out so the next tick after the interruption is
-                // resolved re-queues it (the resolution is injected by
-                // prompt.rs via the bounded resolved-interruption section);
-                // while the interruption stays open `blocked` keeps it
-                // excluded, so this does not busy-spin.
-                executed_step_ids.remove(&current_step.id);
-                // Undo the unconditional `steps_executed += 1` above: this step
-                // did not complete an execution — it parked and will be
-                // re-picked (and re-counted) once the interruption is resolved.
-                // Without this, a step that pauses then succeeds is counted
-                // twice in the summary / "paused after N steps" totals. Mirrors
-                // the `executed_step_ids.remove` directly above.
-                result.steps_executed = result.steps_executed.saturating_sub(1);
-                result.step_results.push(step_result);
-                continue;
+                    total_now,
+                    current_step.title,
+                    elapsed.as_secs_f64()
+                );
             }
         }
-
-        result.step_results.push(step_result);
-
-        // `--one`: stop after executing the captured target.
-        if one_target_id.is_some() {
-            break;
+        StepOutcome::Failed => {
+            result.steps_failed += 1;
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... FAILED (after {} attempts, {:.0}s)",
+                    step_num,
+                    total_now,
+                    current_step.title,
+                    step_result.attempts_used,
+                    elapsed.as_secs_f64()
+                );
+            }
+            // Mark plan as failed and stop.
+            storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
+            result.final_status = PlanStatus::Failed;
+            result.step_results.push(step_result);
+            return Ok(TickOutcome::Return);
+        }
+        StepOutcome::Aborted => {
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... ABORTED",
+                    step_num, total_now, current_step.title
+                );
+            }
+            // Mirror the top-of-loop abort handler: best-effort drain of
+            // any review verdicts that already completed before this abort
+            // latched, then `shutdown()` the still-in-flight ones. Without
+            // this, a review whose subprocess finished but whose verdict
+            // hasn't been drained would be silently dropped (no
+            // `update_step_review_status` write, no git-note annotation, no
+            // V29 corrective-step request row), leaving the reviewed step
+            // `review_status=InFlight`. This arm fires when the executor
+            // observes the abort *inside* a step, so it can leave undrained
+            // reviews just like the between-steps check does.
+            drain_reviews_on_abort(
+                conn,
+                effective_plan,
+                &mut state.reviews,
+                workdir,
+                out,
+                &mut state.abort_rx,
+            )
+            .await;
+            storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
+            result.final_status = PlanStatus::Aborted;
+            result.step_results.push(step_result);
+            return Ok(TickOutcome::Return);
+        }
+        StepOutcome::Skipped => {
+            // `ralph skip` killed the in-flight harness for THIS step
+            // only. Unlike Aborted, the run does NOT end — count the
+            // skip and fall through so the loop advances to the next
+            // actionable step.
+            result.steps_skipped += 1;
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... SKIPPED",
+                    step_num, total_now, current_step.title
+                );
+            }
+        }
+        StepOutcome::Timeout => {
+            result.steps_failed += 1;
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... TIMEOUT",
+                    step_num, total_now, current_step.title
+                );
+            }
+            storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Failed)?;
+            result.final_status = PlanStatus::Failed;
+            result.step_results.push(step_result);
+            return Ok(TickOutcome::Return);
+        }
+        StepOutcome::PausedForQuestion => {
+            emit_finished(outcome_str)?;
+            if out.format != OutputFormat::Json {
+                eprintln!(
+                    "[{}/{}] > {} ... BLOCKED (open interruption — resolve to resume)",
+                    step_num, total_now, current_step.title
+                );
+            }
+            // DAG scheduler change (docs/dag-redesign.md §1/§3.4/§3.5):
+            // a blocked branch must NOT pause the whole plan. While the
+            // interruption is open the step is in the recomputed
+            // `blocked` set, so the next scheduler tick excludes it and
+            // picks another runnable branch instead of stalling — the §1
+            // payoff. We do NOT `return` here and do NOT write
+            // `Interrupted` to plans.status (it's a *derived* status).
+            // The plan only reports `Interrupted` once the runnable set
+            // is exhausted (handled after the loop), so a *linear* plan —
+            // whose one blocked step starves all dependents — still
+            // pauses exactly as before (§1: linear plans get zero benefit
+            // and must not regress).
+            //
+            // Crucially, a paused step must NOT stay in
+            // `state.executed_step_ids`: that set permanently excludes a step
+            // from `pick_next_step` for the rest of this run, so leaving
+            // it there means a *same-run* resolution (a human answers
+            // while the loop keeps ticking on another branch — the exact
+            // §1 scenario, or the §9-invariant-4 cross-process bridge)
+            // would drop the step out of `blocked` but it would still
+            // never be re-picked until a fresh `ralph resume` process.
+            // Drop it back out so the next tick after the interruption is
+            // resolved re-queues it (the resolution is injected by
+            // prompt.rs via the bounded resolved-interruption section);
+            // while the interruption stays open `blocked` keeps it
+            // excluded, so this does not busy-spin.
+            state.executed_step_ids.remove(&current_step.id);
+            // Undo the unconditional `steps_executed += 1` above: this step
+            // did not complete an execution — it parked and will be
+            // re-picked (and re-counted) once the interruption is resolved.
+            // Without this, a step that pauses then succeeds is counted
+            // twice in the summary / "paused after N steps" totals. Mirrors
+            // the `state.executed_step_ids.remove` directly above.
+            result.steps_executed = result.steps_executed.saturating_sub(1);
+            result.step_results.push(step_result);
+            return Ok(TickOutcome::Continue);
         }
     }
+
+    result.step_results.push(step_result);
+
+    // `--one`: stop after executing the captured target.
+    if one_target_id.is_some() {
+        return Ok(TickOutcome::Break);
+    }
+
+    Ok(TickOutcome::Continue)
+}
+
+/// Post-loop review drain (`run_plan_inner`'s `while !reviews.is_empty()`
+/// block). Returns `true` if a terminal status was reached (review-drain panic
+/// verdict, or an abort latched while parked on a reviewer) — `final_status` is
+/// written into `result` in that case and the caller returns it; `false` lets
+/// the caller proceed to finalization.
+async fn drain_remaining_reviews(
+    ctx: &SchedulerCtx<'_>,
+    state: &mut SchedulerState,
+    result: &mut PlanRunResult,
+) -> Result<bool> {
+    let SchedulerCtx {
+        conn,
+        effective_plan,
+        workdir,
+        out,
+        ..
+    } = *ctx;
 
     // The scheduler loop exited because the runnable set is empty. Three
     // terminal shapes (docs/dag-redesign.md §3.4/§3.5):
@@ -1022,28 +1166,30 @@ async fn run_plan_inner(
     //
     // The loop only reaches here once the runnable set is empty AND every
     // in-flight review has been drained (the `None`-branch blocks on
-    // `drain_finished_reviews` and re-ticks while `!reviews.is_empty()`, so
+    // `drain_finished_reviews` and re-ticks while `!state.reviews.is_empty()`, so
     // a corrective step a failed review inserts is itself picked up before
     // the loop can exit). Therefore a plan is never declared `Complete`
     // with a review pending or undrained (docs/dag-redesign.md §3.3). The
     // ONE exception is `--one` (it `break`s after its single target): drain
     // that step's outstanding review here so its status is finalized before
     // we compute terminal status / return.
-    while !reviews.is_empty() {
+    while !state.reviews.is_empty() {
         if let Some(fs) = drain_finished_reviews(
             conn,
-            &effective_plan,
-            &mut reviews,
-            workdir,
+            &mut state.reviews,
+            DrainReviews {
+                plan: effective_plan,
+                workdir,
+                block: true,
+                abort_rx: &mut state.abort_rx,
+                last_review_error: &mut state.last_review_error,
+            },
             out,
-            true,
-            &mut abort_rx,
-            &mut last_review_error,
         )
         .await?
         {
             result.final_status = fs;
-            return Ok(result);
+            return Ok(true);
         }
         // If the abort signal latched while we were parked on a reviewer,
         // `drain_finished_reviews` returns `Ok(None)` early. Route through
@@ -1052,28 +1198,39 @@ async fn run_plan_inner(
         // `kill_on_drop` fires on each review child. This keeps the
         // §3.3-no-in-flight-review invariant satisfied even on Ctrl+C.
         if matches!(
-            *abort_rx.borrow(),
+            *state.abort_rx.borrow(),
             Some(crate::signal::CancelReason::Aborted)
         ) {
             drain_reviews_on_abort(
                 conn,
-                &effective_plan,
-                &mut reviews,
+                effective_plan,
+                &mut state.reviews,
                 workdir,
                 out,
-                &mut abort_rx,
+                &mut state.abort_rx,
             )
             .await;
             eprintln!("Aborted");
             storage::update_plan_status(conn, &effective_plan.id, PlanStatus::Aborted)?;
             result.final_status = PlanStatus::Aborted;
-            return Ok(result);
+            return Ok(true);
         }
     }
-    debug_assert!(
-        reviews.is_empty(),
-        "the plan must not be finalized with a review still in flight (§3.3)"
-    );
+    Ok(false)
+}
+
+/// Final status reconciliation (`run_plan_inner`'s post-drain tail). Computes
+/// the terminal `PlanStatus` from the durable step states + open
+/// interruptions, writes it (Complete only), and emits the `PlanComplete`
+/// NDJSON event. `result` is moved in and returned with `final_status` set.
+fn finalize_plan_run(ctx: &SchedulerCtx<'_>, mut result: PlanRunResult) -> Result<PlanRunResult> {
+    let SchedulerCtx {
+        conn,
+        effective_plan,
+        out,
+        ..
+    } = *ctx;
+
     let final_steps = storage::list_steps(conn, &effective_plan.id)?;
     let all_done = final_steps
         .iter()
@@ -1096,7 +1253,7 @@ async fn run_plan_inner(
     debug_assert!(
         !(all_done && any_open_interruption),
         "plan {} finalized all-done with an open interruption — a skip path \
-         failed to resolve it (see resolve_open_interruptions_for_step)",
+     failed to resolve it (see resolve_open_interruptions_for_step)",
         effective_plan.slug
     );
 
@@ -1314,15 +1471,17 @@ pub async fn run_all_plans(
 
     let inner = run_all_plans_inner(
         conn,
-        project,
-        config,
-        workdir,
-        options,
+        AllPlansRun {
+            project,
+            config,
+            workdir,
+            options,
+            topo_order,
+            plan_by_id,
+            run_start_sha,
+        },
         abort_rx,
         out,
-        topo_order,
-        plan_by_id,
-        run_start_sha,
     )
     .await;
 
@@ -1342,19 +1501,35 @@ pub async fn run_all_plans(
     inner
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_all_plans_inner(
-    conn: &Connection,
-    project: &str,
-    config: &Config,
-    workdir: &Path,
-    options: &RunOptions,
-    abort_rx: watch::Receiver<CancelState>,
-    out: &OutputContext,
+/// The `--all` run scope passed to [`run_all_plans_inner`]: the project /
+/// config / working dir, the run `options`, the topologically-ordered plan
+/// set (`topo_order` + `plan_by_id`), and the SHA the run started at. The DB
+/// handle, abort receiver, and output sink stay separate lead arguments.
+struct AllPlansRun<'a> {
+    project: &'a str,
+    config: &'a Config,
+    workdir: &'a Path,
+    options: &'a RunOptions,
     topo_order: Vec<String>,
     plan_by_id: HashMap<String, Plan>,
     run_start_sha: String,
+}
+
+async fn run_all_plans_inner(
+    conn: &Connection,
+    run: AllPlansRun<'_>,
+    abort_rx: watch::Receiver<CancelState>,
+    out: &OutputContext,
 ) -> Result<Vec<PlanRunResult>> {
+    let AllPlansRun {
+        project,
+        config,
+        workdir,
+        options,
+        topo_order,
+        plan_by_id,
+        run_start_sha,
+    } = run;
     // 4. Build deps_of map for the in-scope plan set.
     let mut deps_of: HashMap<String, Vec<String>> = HashMap::new();
     for pid in &topo_order {
@@ -3129,19 +3304,35 @@ fn truncate_review_error(msg: &str) -> String {
 /// spawns a review. The task carries the step identity back even on `Err` so
 /// the sole-writer drain can reset `review_status` and let the scan re-run
 /// the review (never re-implement) — see [`drain_finished_reviews`].
-#[allow(clippy::too_many_arguments)]
-fn spawn_step_review(
-    conn: &Connection,
-    reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
-    plan: &Plan,
-    step: &Step,
-    config: &Config,
-    workdir: &Path,
+/// The review target for [`spawn_step_review`]: which plan/step at which
+/// committed `commit_sha` / `iteration` / 1-based `step_num`, plus the config
+/// (selects the review harness) and working dir. The DB handle, the reviews
+/// `JoinSet`, and the output sink stay separate lead arguments.
+struct ReviewSpawn<'a> {
+    plan: &'a Plan,
+    step: &'a Step,
+    config: &'a Config,
+    workdir: &'a Path,
     commit_sha: String,
     iteration: i32,
     step_num: usize,
+}
+
+fn spawn_step_review(
+    conn: &Connection,
+    reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
+    spawn: ReviewSpawn<'_>,
     out: &OutputContext,
 ) -> Result<()> {
+    let ReviewSpawn {
+        plan,
+        step,
+        config,
+        workdir,
+        commit_sha,
+        iteration,
+        step_num,
+    } = spawn;
     // Orchestrator-side DB write (sole writer): Pending -> InFlight.
     storage::update_step_review_status(conn, &step.id, crate::plan::ReviewStatus::InFlight)?;
     if out.format == OutputFormat::Json {
@@ -3159,15 +3350,15 @@ fn spawn_step_review(
     let workdir_for_review = workdir.to_path_buf();
     let review_step_id = step_for_review.id.clone();
     reviews.spawn(async move {
-        let result = crate::review::run_review_subprocess(
-            &plan_for_review,
-            &step_for_review,
-            &config_for_review,
-            &workdir_for_review,
-            &commit_sha,
+        let result = crate::review::run_review_subprocess(crate::review::ReviewSubprocessArgs {
+            plan: &plan_for_review,
+            step: &step_for_review,
+            config: &config_for_review,
+            workdir: &workdir_for_review,
+            commit_sha: &commit_sha,
             iteration,
             step_num,
-        )
+        })
         .await;
         crate::review::SpawnedReview {
             step_id: review_step_id,
@@ -3202,20 +3393,37 @@ fn spawn_step_review(
 ///
 /// Returns an empty set for any linear / no-review plan, so that path stays
 /// byte-identical to before.
-#[allow(clippy::too_many_arguments)]
+/// Inputs to [`respawn_pending_reviews`] besides the lead `conn` / `reviews`
+/// JoinSet / `out` sink: the plan + its `all_steps`, the run `window`, the
+/// derived-`blocked` set, the in-memory respawn budget + last-error maps, and
+/// the config / working dir needed to (re)spawn a reviewer.
+struct RespawnReviews<'a> {
+    plan: &'a Plan,
+    all_steps: &'a [Step],
+    window: &'a RunWindow,
+    blocked: &'a HashSet<String>,
+    review_respawns: &'a mut HashMap<String, u32>,
+    last_review_error: &'a HashMap<String, String>,
+    config: &'a Config,
+    workdir: &'a Path,
+}
+
 fn respawn_pending_reviews(
     conn: &Connection,
-    plan: &Plan,
-    all_steps: &[Step],
-    window: &RunWindow,
-    blocked: &HashSet<String>,
     reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
-    review_respawns: &mut HashMap<String, u32>,
-    last_review_error: &HashMap<String, String>,
-    config: &Config,
-    workdir: &Path,
+    args: RespawnReviews<'_>,
     out: &OutputContext,
 ) -> Result<HashSet<String>> {
+    let RespawnReviews {
+        plan,
+        all_steps,
+        window,
+        blocked,
+        review_respawns,
+        last_review_error,
+        config,
+        workdir,
+    } = args;
     let mut under_review: HashSet<String> = HashSet::new();
     for step in all_steps {
         // Respect the run window. A committed-but-unreviewed step outside the
@@ -3278,7 +3486,18 @@ fn respawn_pending_reviews(
         *attempts += 1;
         let step_num = step_number_in_plan(all_steps, step);
         spawn_step_review(
-            conn, reviews, plan, step, config, workdir, commit_sha, iteration, step_num, out,
+            conn,
+            reviews,
+            ReviewSpawn {
+                plan,
+                step,
+                config,
+                workdir,
+                commit_sha,
+                iteration,
+                step_num,
+            },
+            out,
         )?;
     }
     Ok(under_review)
@@ -3408,13 +3627,15 @@ async fn drain_reviews_on_abort(
     let mut discarded_review_errors = HashMap::new();
     let drained_result = drain_finished_reviews(
         conn,
-        plan,
         reviews,
-        workdir,
+        DrainReviews {
+            plan,
+            workdir,
+            block: false,
+            abort_rx,
+            last_review_error: &mut discarded_review_errors,
+        },
         out,
-        false,
-        abort_rx,
-        &mut discarded_review_errors,
     )
     .await;
     if let Err(e) = drained_result {
@@ -3486,17 +3707,31 @@ async fn drain_reviews_on_abort(
 ///
 /// Returns `Ok(None)` on success (drained, or nothing to drain) and
 /// `Ok(Some(final_status))` when the run must terminate.
-#[allow(clippy::too_many_arguments)]
+/// Inputs to [`drain_finished_reviews`] besides the lead `conn` / `reviews`
+/// JoinSet / `out` sink: the plan, the working dir, whether to `block` on the
+/// first finished review, the abort receiver, and the mutable last-error map
+/// the drain records reviewer-subprocess failures into.
+struct DrainReviews<'a> {
+    plan: &'a Plan,
+    workdir: &'a Path,
+    block: bool,
+    abort_rx: &'a mut watch::Receiver<CancelState>,
+    last_review_error: &'a mut HashMap<String, String>,
+}
+
 async fn drain_finished_reviews(
     conn: &Connection,
-    plan: &Plan,
     reviews: &mut tokio::task::JoinSet<crate::review::SpawnedReview>,
-    workdir: &Path,
+    args: DrainReviews<'_>,
     out: &OutputContext,
-    block: bool,
-    abort_rx: &mut watch::Receiver<CancelState>,
-    last_review_error: &mut HashMap<String, String>,
 ) -> Result<Option<PlanStatus>> {
+    let DrainReviews {
+        plan,
+        workdir,
+        block,
+        abort_rx,
+        last_review_error,
+    } = args;
     if reviews.is_empty() {
         consume_open_corrective_requests(conn, plan, out)?;
         return Ok(None);
@@ -3822,12 +4057,16 @@ mod tests {
     #[test]
     fn test_orchestrator_clears_live_run_step_between_iterations() {
         let src = include_str!("runner.rs");
-        // The clear must appear in `run_plan_inner` AFTER the `execute_step`
+        // The clear must appear in the scheduler tick AFTER the `execute_step`
         // await and BEFORE the impl-permit drop (so the next iteration's
-        // pick can't observe a stale step_id).
+        // pick can't observe a stale step_id). Anchor on the unique
+        // `drop(_in_flight);` site that immediately follows the
+        // `execute_step(...).await?` — indentation-agnostic so a future
+        // re-extraction that changes the nesting level still passes as long as
+        // the ordering invariant holds.
         let exec_step_pos = src
-            .find(".await?;\n        drop(_in_flight);")
-            .expect("execute_step .await? followed by drop(_in_flight) not found");
+            .find("drop(_in_flight);")
+            .expect("execute_step followed by drop(_in_flight) not found");
         let after = &src[exec_step_pos..];
         let clear_pos = after.find("storage::clear_live_run_step(").expect(
             "clear_live_run_step must be called immediately after execute_step returns \
@@ -4094,34 +4333,50 @@ mod tests {
     #[test]
     fn test_resume_resets_aborted_step_to_pending() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s2.id, StepStatus::Aborted).unwrap();
@@ -4154,19 +4409,33 @@ mod tests {
     #[test]
     fn test_resume_skips_failed_steps() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "rsf", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "rsf",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (failed_step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Will fail",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Will fail",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         // Simulate the post-Mark-Failed shape: attempts at max, status
@@ -4179,15 +4448,17 @@ mod tests {
         let (pending_step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Independent",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Independent",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         // pending_step is left Pending by create_step.
@@ -4222,34 +4493,50 @@ mod tests {
     #[test]
     fn test_resume_with_only_failed_steps_does_nothing() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "rof", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "rof",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::set_step_attempts(&conn, &s2.id, 3).unwrap();
@@ -4276,19 +4563,33 @@ mod tests {
     #[test]
     fn test_explicit_step_reset_still_works_on_failed() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "esr", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "esr",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Failed step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Failed step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::set_step_attempts(&conn, &step.id, 3).unwrap();
@@ -4336,33 +4637,49 @@ mod tests {
     #[test]
     fn test_skip_step_by_number() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
-        storage::create_step(
+        let plan = storage::create_plan(
             &conn,
-            &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
+        )
+        .unwrap();
+        storage::create_step(
+            &conn,
+            &plan.id,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4383,33 +4700,49 @@ mod tests {
     #[test]
     fn test_skip_step_current() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4447,19 +4780,33 @@ mod tests {
         let _guard = crate::signal::lock_exit_cleanup_test();
 
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
@@ -4503,19 +4850,33 @@ mod tests {
         crate::signal::set_step_in_flight(false);
 
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
@@ -4545,22 +4906,46 @@ mod tests {
 
         let conn = setup();
         let project = "/p";
-        let plan =
-            storage::create_plan(&conn, "target", project, "b", "d", None, None, &[]).unwrap();
-        let other =
-            storage::create_plan(&conn, "other", project, "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "target",
+                project,
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let other = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "other",
+                project,
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
@@ -4602,19 +4987,33 @@ mod tests {
     #[test]
     fn test_skip_step_rejects_complete() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -4632,19 +5031,33 @@ mod tests {
     #[test]
     fn test_skip_step_out_of_range() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4661,19 +5074,33 @@ mod tests {
     #[test]
     fn test_skip_step_persists_reason() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4698,19 +5125,33 @@ mod tests {
     #[test]
     fn test_skip_step_no_reason_stores_null() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4731,19 +5172,33 @@ mod tests {
     #[test]
     fn test_reset_clears_skipped_reason() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4765,19 +5220,33 @@ mod tests {
     #[test]
     fn test_skip_step_allows_failed() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Failed).unwrap();
@@ -4815,27 +5284,31 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "s",
-            &dir.to_string_lossy(),
-            "b",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "s",
+                project: &dir.to_string_lossy(),
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         // Pending (NOT in-flight). request_skip_in_flight will be a no-op
@@ -4925,7 +5398,19 @@ mod tests {
     #[test]
     fn test_plan_status_transitions_in_storage() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // planning -> ready
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
@@ -4952,7 +5437,19 @@ mod tests {
     #[test]
     fn test_plan_status_failed_transition() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Failed).unwrap();
@@ -4967,19 +5464,33 @@ mod tests {
     #[test]
     fn test_step_status_transitions() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -4997,19 +5508,33 @@ mod tests {
     #[test]
     fn test_step_status_failed_and_skipped() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5131,10 +5656,32 @@ mod tests {
         use tokio::sync::watch;
 
         let conn = setup();
-        let p1 =
-            storage::create_plan(&conn, "cyc-a", "/tmp/cyc", "b1", "d1", None, None, &[]).unwrap();
-        let p2 =
-            storage::create_plan(&conn, "cyc-b", "/tmp/cyc", "b2", "d2", None, None, &[]).unwrap();
+        let p1 = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "cyc-a",
+                project: "/tmp/cyc",
+                branch_name: "b1",
+                description: "d1",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
+        let p2 = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "cyc-b",
+                project: "/tmp/cyc",
+                branch_name: "b2",
+                description: "d2",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
 
         // Mark both as Ready so they're runnable.
         storage::update_plan_status(&conn, &p1.id, PlanStatus::Ready).unwrap();
@@ -5214,24 +5761,28 @@ mod tests {
 
         let parent = storage::create_plan(
             &conn,
-            "parent",
-            &project,
-            "feat/parent",
-            "d",
-            Some("impl"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "parent",
+                project: &project,
+                branch_name: "feat/parent",
+                description: "d",
+                harness: Some("impl"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let child = storage::create_plan(
             &conn,
-            "child",
-            &project,
-            "feat/child",
-            "d",
-            Some("impl"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "child",
+                project: &project,
+                branch_name: "feat/child",
+                description: "d",
+                harness: Some("impl"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::update_plan_status(&conn, &parent.id, PlanStatus::Aborted).unwrap();
@@ -5241,29 +5792,33 @@ mod tests {
         storage::create_step(
             &conn,
             &parent.id,
-            "Parent step",
-            "d",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Parent step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::create_step(
             &conn,
             &child.id,
-            "Child step",
-            "d",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Child step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5517,38 +6072,53 @@ mod tests {
         let project = dir.to_string_lossy().to_string();
 
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "s", &project, "feat/x", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: &project,
+                branch_name: "feat/x",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
 
         // Two pre-completed steps from an earlier run.
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s2.id, StepStatus::Complete).unwrap();
@@ -5590,8 +6160,19 @@ mod tests {
         let project = dir.to_string_lossy().to_string();
 
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "p", &project, "feat/p", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "p",
+                project: &project,
+                branch_name: "feat/p",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
 
         // Three steps. Mark step 1 Complete so the runner enters the loop
@@ -5602,15 +6183,17 @@ mod tests {
             let (s, _) = storage::create_step(
                 &conn,
                 &plan.id,
-                title,
-                "d",
-                None,
-                None,
-                &[],
-                None,
-                None,
-                None,
-                None,
+                crate::storage::NewStep {
+                    title,
+                    description: "d",
+                    agent: None,
+                    harness: None,
+                    acceptance_criteria: &[],
+                    max_retries: None,
+                    model: None,
+                    change_policy: None,
+                    tags: None,
+                },
             )
             .unwrap();
             if i == 0 {
@@ -5668,38 +6251,53 @@ mod tests {
         let project = dir.to_string_lossy().to_string();
 
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "p", &project, "feat/p", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "p",
+                project: &project,
+                branch_name: "feat/p",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::InProgress).unwrap();
 
         // Two steps — step 1 already complete, step 2 pending.
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "first",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "first",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
         let (_s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "second",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "second",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -5755,13 +6353,15 @@ mod tests {
         // runner records `branch_name` instead of the workdir's HEAD.
         let plan = storage::create_plan(
             &conn,
-            "s",
-            &project,
-            "would-be-branch",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "s",
+                project: &project,
+                branch_name: "would-be-branch",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
@@ -5770,15 +6370,17 @@ mod tests {
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Done",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Done",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -5825,22 +6427,34 @@ mod tests {
         let source_branch = git::get_current_branch(&dir).unwrap();
 
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "s", &project, "feat/run-here", "d", None, None, &[])
-                .unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: &project,
+                branch_name: "feat/run-here",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Done",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Done",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -5922,13 +6536,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "demo",
-            &project,
-            "would-be-branch",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &project,
+                branch_name: "would-be-branch",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
@@ -5937,15 +6553,17 @@ mod tests {
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Done",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Done",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -6034,27 +6652,31 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "demo",
-            &dir.to_string_lossy(),
-            "demo",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &dir.to_string_lossy(),
+                branch_name: "demo",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6133,27 +6755,31 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "demo",
-            &dir.to_string_lossy(),
-            "demo",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &dir.to_string_lossy(),
+                branch_name: "demo",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6218,27 +6844,31 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "demo",
-            &dir.to_string_lossy(),
-            "demo",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &dir.to_string_lossy(),
+                branch_name: "demo",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6378,20 +7008,33 @@ mod tests {
         let (_tmp, dir) = init_git_repo();
         let conn = setup();
         let project = dir.to_string_lossy().to_string();
-        let plan =
-            storage::create_plan(&conn, "demo", &project, "demo", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &project,
+                branch_name: "demo",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6465,20 +7108,33 @@ mod tests {
         let (_tmp, dir) = init_git_repo();
         let conn = setup();
         let project = dir.to_string_lossy().to_string();
-        let plan =
-            storage::create_plan(&conn, "demo", &project, "demo", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "demo",
+                project: &project,
+                branch_name: "demo",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Step",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Step",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6719,9 +7375,19 @@ mod tests {
         // A plan with zero steps will hit `bail!("Plan ... has no steps")`
         // inside run_plan_inner — i.e. after the stash + branch setup.
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "empty", &project, "feat/empty", "d", None, None, &[])
-                .unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "empty",
+                project: &project,
+                branch_name: "feat/empty",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
         let plan = storage::get_plan_by_slug(&conn, "empty", &project)
             .unwrap()
@@ -6790,13 +7456,15 @@ mod tests {
         let conn = setup();
         let plan = storage::create_plan(
             &conn,
-            "bad",
-            &project,
-            "feat/bad..branch",
-            "d",
-            None,
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "bad",
+                project: &project,
+                branch_name: "feat/bad..branch",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
@@ -6877,33 +7545,49 @@ mod tests {
     #[test]
     fn test_stale_in_progress_swept_on_run_start() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -6926,33 +7610,49 @@ mod tests {
     #[test]
     fn test_stale_sweep_noop_without_in_progress() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::Complete).unwrap();
@@ -6973,19 +7673,33 @@ mod tests {
     #[test]
     fn test_sweep_and_log_wrapper_flips_and_returns_rows() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &s1.id, StepStatus::InProgress).unwrap();
@@ -7014,13 +7728,15 @@ mod tests {
         seed_run_lock_row(&conn, &project);
         let plan = storage::create_plan(
             &conn,
-            "resume-corrective",
-            &project,
-            "feat/resume-corrective",
-            "d",
-            Some("impl"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "resume-corrective",
+                project: &project,
+                branch_name: "feat/resume-corrective",
+                description: "d",
+                harness: Some("impl"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
@@ -7028,15 +7744,17 @@ mod tests {
         let (reviewed, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Original",
-            "d",
-            None,
-            None,
-            &[],
-            Some(0),
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Original",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: Some(0),
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &reviewed.id, StepStatus::Aborted).unwrap();
@@ -7246,33 +7964,49 @@ mod tests {
         use std::collections::HashSet;
 
         let conn = setup();
-        let plan = storage::create_plan(&conn, "s", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "s",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (s1, _) = storage::create_step(
             &conn,
             &plan.id,
-            "First",
-            "d1",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "First",
+                description: "d1",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         let (s2, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Second",
-            "d2",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Second",
+                description: "d2",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -7301,15 +8035,17 @@ mod tests {
             &conn,
             &plan.id,
             &mid_key,
-            "Inserted",
-            "dN",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Inserted",
+                description: "dN",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -7370,19 +8106,33 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_raise_parked_restore_blocker_inserts_marker_and_options() {
         let conn = setup();
-        let plan = storage::create_plan(&conn, "prb", "/p", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "prb",
+                project: "/p",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "s",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "s",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
 
@@ -8145,13 +8895,15 @@ mod tests {
         seed_run_lock_row(&conn, &project);
         let plan = storage::create_plan(
             &conn,
-            "concurrent",
-            &project,
-            "feat/concurrent",
-            "d",
-            Some("impl"),
-            None,
-            &[],
+            crate::storage::NewPlan {
+                slug: "concurrent",
+                project: &project,
+                branch_name: "feat/concurrent",
+                description: "d",
+                harness: Some("impl"),
+                agent: None,
+                deterministic_tests: &[],
+            },
         )
         .unwrap();
         storage::update_plan_status(&conn, &plan.id, PlanStatus::Ready).unwrap();
@@ -8162,15 +8914,17 @@ mod tests {
             storage::create_step(
                 &conn,
                 &plan.id,
-                title,
-                "d",
-                None,
-                None,
-                &[],
-                Some(0),
-                None,
-                None,
-                None,
+                crate::storage::NewStep {
+                    title,
+                    description: "d",
+                    agent: None,
+                    harness: None,
+                    acceptance_criteria: &[],
+                    max_retries: Some(0),
+                    model: None,
+                    change_policy: None,
+                    tags: None,
+                },
             )
             .unwrap();
         }
@@ -8694,16 +9448,18 @@ mod tests {
     #[test]
     fn test_drain_finished_reviews_blocking_wait_is_abort_cancellable() {
         let src = include_str!("runner.rs");
+        // The abort receiver is now threaded through the `DrainReviews` param
+        // struct; the blocking arm still races `join_next` against it.
+        assert!(
+            src.contains("abort_rx: &'a mut watch::Receiver<CancelState>"),
+            "drain_finished_reviews must accept an abort_rx (via DrainReviews) \
+             so its blocking join_next call can race on the cancel signal"
+        );
         let sig = "async fn drain_finished_reviews(";
         let start = src.find(sig).expect("drain_finished_reviews must exist");
         let after = &src[start..];
         // Take enough to cover the blocking arm.
         let body = &after[..after.len().min(8192)];
-        assert!(
-            body.contains("abort_rx: &mut watch::Receiver<CancelState>"),
-            "drain_finished_reviews must accept an abort_rx so its blocking \
-             join_next call can race on the cancel signal"
-        );
         assert!(
             body.contains("tokio::select!") && body.contains("abort_rx.changed()"),
             "drain_finished_reviews(block=true) must race join_next against \
@@ -8736,23 +9492,36 @@ mod tests {
         use std::time::Duration;
 
         let conn = setup();
-        let plan =
-            storage::create_plan(&conn, "abrt", "/tmp/proj", "b", "d", None, None, &[]).unwrap();
+        let plan = storage::create_plan(
+            &conn,
+            crate::storage::NewPlan {
+                slug: "abrt",
+                project: "/tmp/proj",
+                branch_name: "b",
+                description: "d",
+                harness: None,
+                agent: None,
+                deterministic_tests: &[],
+            },
+        )
+        .unwrap();
         // The reviewed step is mid-review: InProgress + review_status =
         // InFlight, exactly the state the runner leaves it in after spawning
         // a detached review (see run_plan_inner around line 742).
         let (step, _) = storage::create_step(
             &conn,
             &plan.id,
-            "Reviewed",
-            "d",
-            None,
-            None,
-            &[],
-            None,
-            None,
-            None,
-            None,
+            crate::storage::NewStep {
+                title: "Reviewed",
+                description: "d",
+                agent: None,
+                harness: None,
+                acceptance_criteria: &[],
+                max_retries: None,
+                model: None,
+                change_policy: None,
+                tags: None,
+            },
         )
         .unwrap();
         storage::update_step_status(&conn, &step.id, StepStatus::InProgress).unwrap();

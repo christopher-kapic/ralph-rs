@@ -238,7 +238,7 @@ pub struct RunTarget {
 /// spawn), so tests can inspect the args without forking a real process.
 ///
 /// The shape mirrors the existing `R`-keybinding spawner in
-/// `commands::run::plan_detail_apply_run` (TUI-plan.md §7) plus a flag for
+/// `commands::run::plan_detail_apply_run_streaming` (TUI-plan.md §7) plus a flag for
 /// `--current-branch`.
 pub fn build_run_command(exe: &Path, project: &Path, slug: &str, current_branch: bool) -> Command {
     let mut cmd = Command::new(exe);
